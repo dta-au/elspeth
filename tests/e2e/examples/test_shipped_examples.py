@@ -382,17 +382,32 @@ class TestShippedExamples:
                     assert isinstance(t, dict), f"{name}/{path.name}: transform[{i}] must be a dict"
                     assert "plugin" in t, f"{name}/{path.name}: transform[{i}] missing 'plugin'"
 
-    def test_openrouter_journal_path_resolves_next_to_audit_db_with_hostile_env(
+    @pytest.mark.parametrize(
+        ("example_name", "settings_name", "required_env_var"),
+        [
+            pytest.param("landscape_journal", "settings.yaml", None, id="landscape-journal"),
+            pytest.param(
+                "openrouter_multi_query_assessment",
+                "settings_journal.yaml",
+                "OPENROUTER_API_KEY",
+                id="openrouter-multi-query-assessment",
+            ),
+        ],
+    )
+    def test_shipped_journal_paths_resolve_next_to_audit_db_with_hostile_env(
         self,
         example_pipeline_dir: Path,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        example_name: str,
+        settings_name: str,
+        required_env_var: str | None,
     ) -> None:
-        """The journal example keeps its SQLite journal beside its audit DB."""
+        """Shipped journal examples keep their SQLite journal beside the audit DB."""
         example_dir = self._copy_example_to_tmp(
             example_pipeline_dir,
             tmp_path,
-            "openrouter_multi_query_assessment",
+            example_name,
         )
         monkeypatch.chdir(tmp_path)
         # A process-wide override must not redirect or disable this copied fixture.
@@ -400,8 +415,9 @@ class TestShippedExamples:
         for variable_name in tuple(os.environ):
             if variable_name.startswith("ELSPETH_"):
                 monkeypatch.delenv(variable_name)
-        monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
-        settings = load_settings(example_dir / "settings_journal.yaml")
+        if required_env_var is not None:
+            monkeypatch.setenv(required_env_var, "test-openrouter-key")
+        settings = load_settings(example_dir / settings_name)
 
         db = LandscapeDB.from_url(
             settings.landscape.url,
