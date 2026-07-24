@@ -4,8 +4,9 @@ ELSPETH ships one container image and a small set of maintained deployment
 artifacts. The image contains PostgreSQL clients, not a PostgreSQL server:
 both `postgresql+psycopg://` (psycopg v3) and
 `postgresql+psycopg2://` (psycopg2) URLs work. Compose is the only shipped
-bundle that provisions PostgreSQL. Every other production topology supplies
-its own external PostgreSQL service.
+bundle that provisions PostgreSQL. AWS ECS, Azure production, and Kubernetes
+BYO deployments require operator-provided external PostgreSQL. Native Linux
+may instead use SQLite on one persistent host or external PostgreSQL.
 
 Use an immutable, release-specific image tag or digest. ELSPETH web currently
 supports one web process or replica. Payload persistence is separate from

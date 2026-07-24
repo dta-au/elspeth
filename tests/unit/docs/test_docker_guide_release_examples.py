@@ -61,3 +61,7 @@ def test_docker_guide_explains_the_container_database_boundary() -> None:
     assert "one web process" in text
     assert "payload persistence" in text.lower()
     assert "database persistence" in text.lower()
+    assert "AWS, an Azure Ubuntu VM, or BYO Kubernetes manifests must connect" not in normalized
+    assert "AWS ECS, Azure production, and BYO Kubernetes deployments require external PostgreSQL" in normalized
+    assert "An Azure VM may use SQLite only for explicitly non-production, single-persistent-host use" in normalized
+    assert "Native Linux may use SQLite on one persistent host" in normalized

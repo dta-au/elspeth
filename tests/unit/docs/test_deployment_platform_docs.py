@@ -75,6 +75,10 @@ def test_support_matrix_states_the_shared_runtime_contract() -> None:
     ):
         assert phrase in text
 
+    assert "Every other production topology supplies its own external PostgreSQL service" not in text
+    assert "AWS ECS, Azure production, and Kubernetes BYO deployments require operator-provided external PostgreSQL" in text
+    assert "Native Linux may instead use SQLite on one persistent host" in text
+
 
 def test_maintained_entry_points_repeat_the_database_and_process_boundaries() -> None:
     for path in (README, DOCKER_GUIDE, AWS_RUNBOOK, UBUNTU_RUNBOOK):

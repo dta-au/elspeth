@@ -73,8 +73,11 @@ Pass secrets and configuration via environment variables. See the [Environment V
 The image contains PostgreSQL clients, not a PostgreSQL server. It supports
 `postgresql+psycopg://` with psycopg v3 and
 `postgresql+psycopg2://` with psycopg2. Compose is the only shipped bundle
-that provisions PostgreSQL; AWS, an Azure Ubuntu VM, or BYO Kubernetes
-manifests must connect ELSPETH to an operator-provided external service.
+that provisions PostgreSQL. AWS ECS, Azure production, and BYO Kubernetes
+deployments require external PostgreSQL. Native Linux may use SQLite on one
+persistent host. An Azure VM may use SQLite only for explicitly
+non-production, single-persistent-host use; production Azure uses Azure
+Database for PostgreSQL.
 
 ```bash
 docker run --rm \
