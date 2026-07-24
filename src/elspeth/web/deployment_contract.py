@@ -192,6 +192,61 @@ def _check_required_operator_identity(name: str, env_var: str, value: str | None
     return ContractCheck(name, True, f"{env_var} is set")
 
 
+def _check_external_deployment_state_mode(
+    settings: WebSettings,
+    *,
+    target_ok: bool,
+    resolved_state_mode: ResolvedDeploymentStateMode | None,
+) -> ContractCheck:
+    if resolved_state_mode is None:
+        try:
+            resolved_state_mode = resolve_deployment_state_mode(settings)
+        except DeploymentConfigurationError:
+            return ContractCheck(
+                "deployment_state_mode",
+                False,
+                "ELSPETH_WEB__DEPLOYMENT_STATE_MODE must resolve to external PostgreSQL for this startup contract",
+            )
+
+    mode_ok = target_ok and resolved_state_mode == "external-postgresql"
+    return ContractCheck(
+        "deployment_state_mode",
+        mode_ok,
+        (
+            "deployment state resolves to external PostgreSQL"
+            if mode_ok
+            else "ELSPETH_WEB__DEPLOYMENT_STATE_MODE must resolve to external PostgreSQL for this startup contract"
+        ),
+    )
+
+
+def _check_distinct_postgres_targets(
+    settings: WebSettings,
+    *,
+    session_check: ContractCheck,
+    landscape_check: ContractCheck,
+) -> ContractCheck:
+    failure = ContractCheck(
+        "separate_db_targets",
+        False,
+        "session and Landscape database targets must be statically provable as distinct",
+    )
+    if not session_check.ok or not landscape_check.ok:
+        return failure
+
+    assert settings.session_db_url is not None
+    assert settings.landscape_url is not None
+    try:
+        require_distinct_postgres_targets(settings.session_db_url, settings.landscape_url)
+    except DatabaseTargetConflictError:
+        return failure
+    return ContractCheck(
+        "separate_db_targets",
+        True,
+        "session and Landscape database targets are statically distinct",
+    )
+
+
 def validate_aws_ecs_settings(
     settings: WebSettings,
     *,
@@ -279,13 +334,11 @@ def validate_external_postgresql_settings(
 ) -> list[ContractCheck]:
     """Run redacted checks for the provider-neutral external PostgreSQL contract."""
     target_ok = settings.deployment_target in _EXTERNAL_STATE_TARGETS
-    resolved_mode = resolved_state_mode
-    if resolved_mode is None:
-        try:
-            resolved_mode = resolve_deployment_state_mode(settings)
-        except DeploymentConfigurationError:
-            resolved_mode = None
-    mode_ok = target_ok and resolved_mode == "external-postgresql"
+    mode_check = _check_external_deployment_state_mode(
+        settings,
+        target_ok=target_ok,
+        resolved_state_mode=resolved_state_mode,
+    )
 
     session_check = _check_external_postgres_url(
         "session_db_url",
@@ -297,16 +350,11 @@ def validate_external_postgresql_settings(
         "ELSPETH_WEB__LANDSCAPE_URL",
         settings.landscape_url,
     )
-    targets_ok = False
-    if session_check.ok and landscape_check.ok:
-        assert settings.session_db_url is not None
-        assert settings.landscape_url is not None
-        try:
-            require_distinct_postgres_targets(settings.session_db_url, settings.landscape_url)
-        except DatabaseTargetConflictError:
-            pass
-        else:
-            targets_ok = True
+    distinct_targets_check = _check_distinct_postgres_targets(
+        settings,
+        session_check=session_check,
+        landscape_check=landscape_check,
+    )
 
     return [
         ContractCheck(
@@ -318,26 +366,10 @@ def validate_external_postgresql_settings(
                 else "ELSPETH_WEB__DEPLOYMENT_TARGET does not support external PostgreSQL state"
             ),
         ),
-        ContractCheck(
-            "deployment_state_mode",
-            mode_ok,
-            (
-                "deployment state resolves to external PostgreSQL"
-                if mode_ok
-                else "ELSPETH_WEB__DEPLOYMENT_STATE_MODE must resolve to external PostgreSQL for this startup contract"
-            ),
-        ),
+        mode_check,
         session_check,
         landscape_check,
-        ContractCheck(
-            "separate_db_targets",
-            targets_ok,
-            (
-                "session and Landscape database targets are statically distinct"
-                if targets_ok
-                else "session and Landscape database targets must be statically provable as distinct"
-            ),
-        ),
+        distinct_targets_check,
         _check_required_path(
             "data_dir",
             "ELSPETH_WEB__DATA_DIR",
