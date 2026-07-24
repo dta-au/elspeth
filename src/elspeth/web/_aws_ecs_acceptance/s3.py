@@ -37,6 +37,14 @@ _S3_MAX_OBJECT_BYTES = 4096
 _S3_MAX_RECORD_CHARS = 256
 
 
+class _S3EffectFailure(Exception):
+    """Carry only cleanup ownership across the static acceptance boundary."""
+
+    def __init__(self, *, cleanup_owned: bool) -> None:
+        super().__init__()
+        self.cleanup_owned = cleanup_owned
+
+
 class _S3AcceptanceContext:
     """Minimal ordinary plugin context with an in-memory safe audit projection."""
 
@@ -174,9 +182,22 @@ def _drive_s3_acceptance_effect(
     if require_existing:
         raise AcceptanceCheckError("s3_collision")
 
-    result = sink.commit_effect(plan, context)  # type: ignore[attr-defined]
+    try:
+        result = sink.commit_effect(plan, context)  # type: ignore[attr-defined]
+    except Exception:
+        cleanup_owned = False
+        try:
+            post_commit = sink.reconcile_effect(plan, context)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        else:
+            cleanup_owned = (
+                post_commit.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR
+                and post_commit.descriptor == plan.expected_descriptor
+            )
+        raise _S3EffectFailure(cleanup_owned=cleanup_owned) from None
     if tuple(result.accepted_ordinals) != (0,) or result.diverted_ordinals:
-        raise AcceptanceCheckError("s3_integrity")
+        raise _S3EffectFailure(cleanup_owned=True)
     return result.descriptor, False
 
 
@@ -209,6 +230,7 @@ def verify_s3(
     failure_check: str | None = None
     resource_close_failed = False
     cleanup_failed = False
+    cleanup_owned = False
     source_hash: str | None = None
 
     try:
@@ -222,6 +244,10 @@ def verify_s3(
                 expected_hash=expected_hash,
                 require_existing=False,
             )
+            cleanup_owned = True
+        except _S3EffectFailure as exc:
+            cleanup_owned = exc.cleanup_owned
+            failure_check = "s3_sink_write"
         except Exception:
             failure_check = "s3_sink_write"
         if failure_check is None:
@@ -276,10 +302,11 @@ def verify_s3(
                 resource_close_failed = True
 
         cleanup_client: Any | None = None
-        try:
-            cleanup_client = s3_client_factory(region, None)
-        except Exception:
-            cleanup_failed = True
+        if cleanup_owned:
+            try:
+                cleanup_client = s3_client_factory(region, None)
+            except Exception:
+                cleanup_failed = True
         if cleanup_client is not None:
             try:
                 cleanup_client.delete_object(Bucket=bucket, Key=key)

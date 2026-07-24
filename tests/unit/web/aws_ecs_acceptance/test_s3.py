@@ -240,8 +240,87 @@ def test_verify_s3_rejects_credential_endpoint_profile_and_role_overrides_by_pre
     assert raw_sentinel not in str(raised.value)
 
 
+def test_verify_s3_does_not_delete_when_primary_effect_fails_before_ownership() -> None:
+    events: list[str] = []
+    target: dict[str, ArtifactDescriptor] = {}
+
+    class Sink(_EffectS3SinkBase):
+        def __init__(self) -> None:
+            super().__init__(index=1, events=events, target=target, failure="sink")
+
+        def close(self) -> None:
+            events.append("sink-close")
+
+    with pytest.raises(AcceptanceCheckError, match="s3_sink_write") as raised:
+        s3.verify_s3(
+            _s3_env(),
+            sink_factory=lambda _config: Sink(),
+            s3_client_factory=lambda _region, _endpoint: pytest.fail("unowned key must not be deleted"),
+        )
+
+    assert events == ["sink-1-inspect", "sink-close"]
+    assert "sentinel" not in str(raised.value)
+
+
+@pytest.mark.parametrize("post_commit_observation", ["exact", "mismatched-exact", "unknown"])
+def test_verify_s3_deletes_after_ambiguous_commit_only_with_exact_reconciliation(
+    post_commit_observation: str,
+) -> None:
+    events: list[str] = []
+    target: dict[str, ArtifactDescriptor] = {}
+
+    class Sink(_EffectS3SinkBase):
+        reconcile_calls = 0
+
+        def __init__(self) -> None:
+            super().__init__(index=1, events=events, target=target)
+
+        def reconcile_effect(self, plan: SinkEffectPlan, _ctx: object) -> SinkEffectReconcileResult:
+            self.reconcile_calls += 1
+            events.append(f"sink-1-reconcile-{self.reconcile_calls}")
+            if self.reconcile_calls == 1:
+                return SinkEffectReconcileResult.not_applied(evidence={"missing": True})
+            if post_commit_observation == "exact":
+                assert plan.expected_descriptor is not None
+                return SinkEffectReconcileResult.applied(plan.expected_descriptor, evidence={"matched": True})
+            if post_commit_observation == "mismatched-exact":
+                assert plan.expected_descriptor is not None
+                return SinkEffectReconcileResult.applied(
+                    ArtifactDescriptor(
+                        artifact_type=plan.expected_descriptor.artifact_type,
+                        path_or_uri=plan.expected_descriptor.path_or_uri,
+                        content_hash="f" * 64,
+                        size_bytes=plan.expected_descriptor.size_bytes,
+                    ),
+                    evidence={"matched": False},
+                )
+            return SinkEffectReconcileResult.unknown(evidence={"ambiguous": True})
+
+        def commit_effect(self, _plan: SinkEffectPlan, _ctx: object) -> SinkEffectCommitResult:
+            events.append("sink-1-commit")
+            raise RuntimeError("raw ambiguous commit sentinel")
+
+        def close(self) -> None:
+            events.append("sink-close")
+
+    def cleanup_factory(_region: str | None, _endpoint: str | None) -> _S3CleanupClient:
+        if post_commit_observation == "exact":
+            return _S3CleanupClient(events)
+        pytest.fail("unproven key must not be deleted")
+
+    with pytest.raises(AcceptanceCheckError, match="s3_sink_write") as raised:
+        s3.verify_s3(
+            _s3_env(),
+            sink_factory=lambda _config: Sink(),
+            s3_client_factory=cleanup_factory,
+        )
+
+    assert ("delete" in events) is (post_commit_observation == "exact")
+    assert "sentinel" not in str(raised.value)
+
+
 @pytest.mark.parametrize("failure", ["sink", "source", "integrity", "rows", "collision"])
-def test_verify_s3_provider_and_integrity_failures_are_static_and_still_delete(failure: str) -> None:
+def test_verify_s3_provider_and_integrity_failures_are_static_and_clean_up_only_owned_effects(failure: str) -> None:
     events: list[str] = []
     sink_count = 0
     target: dict[str, ArtifactDescriptor] = {}
@@ -290,8 +369,8 @@ def test_verify_s3_provider_and_integrity_failures_are_static_and_still_delete(f
         )
 
     assert "sentinel" not in str(raised.value)
-    assert "delete" in events
-    assert "cleanup-close" in events
+    assert ("delete" in events) is (failure != "sink")
+    assert ("cleanup-close" in events) is (failure != "sink")
 
 
 def test_verify_s3_cleanup_continues_after_resource_close_failure_and_fails_closed() -> None:
