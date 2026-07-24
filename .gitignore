@@ -278,8 +278,14 @@ landscape.db-wal
 
 
 
-# Deployment artifacts
-deploy/
+# Deployment support artifacts are tracked. Only operator-local values and
+# generated backups remain private.
+deploy/**/*.env
+!deploy/**/*.env.example
+deploy/**/*.local.yaml
+deploy/**/*.local.yml
+deploy/**/*.bak-*
+deploy/Caddyfile
 
 # FINAL RULE: Always keep .gitkeep files (preserve directory structure)
 # This must be at the end to override any earlier ignore patterns
