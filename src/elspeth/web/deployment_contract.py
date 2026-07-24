@@ -46,7 +46,14 @@ def _database_dialect(field_name: Literal["session_db_url", "landscape_url"], ur
     except (ArgumentError, ValueError):
         raise DeploymentConfigurationError(f"{field_name} could not be parsed as a SQLAlchemy URL") from None
 
-    base_dialect = drivername.split("+", 1)[0]
+    driver_parts = drivername.split("+")
+    valid_shape = len(driver_parts) == 1 or (len(driver_parts) == 2 and bool(driver_parts[1]))
+    if not valid_shape:
+        raise DeploymentConfigurationError(
+            "session_db_url and landscape_url SQLAlchemy driver names must use a base dialect alone or exactly one non-empty +driver suffix"
+        )
+
+    base_dialect = driver_parts[0]
     if base_dialect == "sqlite":
         return "sqlite"
     if base_dialect == "postgresql":

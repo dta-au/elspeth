@@ -269,6 +269,24 @@ def test_auto_rejects_two_urls_with_unsupported_dialect(unsupported_base: str) -
     assert "landscape_password" not in detail
 
 
+@pytest.mark.parametrize("malformed_driver", ["postgresql+", "postgresql+psycopg+extra"])
+def test_auto_rejects_malformed_postgresql_driver_suffixes_and_redacts(malformed_driver: str) -> None:
+    session_url = f"{malformed_driver}://session_user:session_password@db/session"
+    landscape_url = f"{malformed_driver}://landscape_user:landscape_password@db/landscape"
+    settings = _settings(session_db_url=session_url, landscape_url=landscape_url)
+
+    with pytest.raises(deployment_contract.DeploymentConfigurationError) as caught:
+        deployment_contract.resolve_deployment_state_mode(settings)
+
+    detail = str(caught.value)
+    assert "session_db_url" in detail
+    assert "landscape_url" in detail
+    assert session_url not in detail
+    assert landscape_url not in detail
+    assert "session_password" not in detail
+    assert "landscape_password" not in detail
+
+
 def test_url_parse_failure_is_caught_and_redacted() -> None:
     raw_url = "not a url containing secret_password"
     settings = _settings(
