@@ -400,7 +400,7 @@ def test_cleanup_evidence_finalize_is_two_phase_refuses_pending_and_clears_only_
     protected_writes: list[Path] = []
     cleanup_appends: list[str] = []
     original_protected_write = cleanup._write_protected_document
-    original_cleanup_append = cleanup.gate_ledger_record_cleanup
+    original_cleanup_append = cleanup._gate_ledger_record_cleanup_bound
 
     def record_protected_write(path: Path, payload: Mapping[str, object], **kwargs: object) -> None:
         protected_writes.append(path)
@@ -411,7 +411,7 @@ def test_cleanup_evidence_finalize_is_two_phase_refuses_pending_and_clears_only_
         return original_cleanup_append(path, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(cleanup, "_write_protected_document", record_protected_write)
-    monkeypatch.setattr(cleanup, "gate_ledger_record_cleanup", record_cleanup_append)
+    monkeypatch.setattr(cleanup, "_gate_ledger_record_cleanup_bound", record_cleanup_append)
     final_receipt.unlink()
     with pytest.raises(acceptance.AcceptanceCheckError, match="cleanup_finalize_receipt"):
         acceptance.cleanup_evidence_finalize(
@@ -425,7 +425,7 @@ def test_cleanup_evidence_finalize_is_two_phase_refuses_pending_and_clears_only_
     assert cleanup_appends == []
     assert not final_receipt.exists()
     monkeypatch.setattr(cleanup, "_write_protected_document", original_protected_write)
-    monkeypatch.setattr(cleanup, "gate_ledger_record_cleanup", original_cleanup_append)
+    monkeypatch.setattr(cleanup, "_gate_ledger_record_cleanup_bound", original_cleanup_append)
     original_protected_write(final_receipt, final_payload, create=True, exists_check="test", write_check="test")
     final_receipt.write_text(json.dumps({**final_payload, "receipts_sha256": "f" * 64}))
     os.chmod(final_receipt, 0o600)
@@ -548,7 +548,7 @@ def test_cleanup_finalize_recovers_after_each_durable_write_and_committed_replay
 
     final_receipt_path = manifest_path.with_name(f"{manifest_path.name}.final-receipt.json")
     original_write = cleanup._write_protected_document
-    original_append = cleanup.gate_ledger_record_cleanup
+    original_append = cleanup._gate_ledger_record_cleanup_bound
     interrupted = False
 
     def protected_write(path: Path, payload: Mapping[str, object], **kwargs: object) -> None:
@@ -602,7 +602,7 @@ def test_cleanup_finalize_recovers_after_each_durable_write_and_committed_replay
             now=lambda: datetime(2026, 7, 14, 1, 4, tzinfo=UTC),
         )
         monkeypatch.setattr(cleanup, "_write_protected_document", protected_write)
-        monkeypatch.setattr(cleanup, "gate_ledger_record_cleanup", append_terminal)
+        monkeypatch.setattr(cleanup, "_gate_ledger_record_cleanup_bound", append_terminal)
         with pytest.raises(acceptance.AcceptanceCheckError, match=f"simulated_{interrupt_after}_interrupt"):
             acceptance.cleanup_evidence_finalize(
                 manifest_path,
@@ -612,7 +612,7 @@ def test_cleanup_finalize_recovers_after_each_durable_write_and_committed_replay
                 now=lambda: datetime(2026, 7, 14, 1, 6, tzinfo=UTC),
             )
         monkeypatch.setattr(cleanup, "_write_protected_document", original_write)
-        monkeypatch.setattr(cleanup, "gate_ledger_record_cleanup", original_append)
+        monkeypatch.setattr(cleanup, "_gate_ledger_record_cleanup_bound", original_append)
 
     recovered = acceptance.cleanup_evidence_finalize(
         manifest_path,
@@ -638,7 +638,7 @@ def test_cleanup_finalize_recovers_after_each_durable_write_and_committed_replay
         return original_append(path, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(cleanup, "_write_protected_document", spy_write)
-    monkeypatch.setattr(cleanup, "gate_ledger_record_cleanup", spy_append)
+    monkeypatch.setattr(cleanup, "_gate_ledger_record_cleanup_bound", spy_append)
     replayed = acceptance.cleanup_evidence_finalize(
         manifest_path,
         ledger_path=ledger_path,
@@ -649,6 +649,81 @@ def test_cleanup_finalize_recovers_after_each_durable_write_and_committed_replay
     assert replayed == recovered
     assert protected_writes == []
     assert cleanup_appends == []
+
+
+def test_cleanup_commit_rejects_success_record_winning_before_bound_terminal_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def before_deadline() -> datetime:
+        return datetime(2026, 7, 14, 1, 0, tzinfo=UTC)
+
+    manifest_path = tmp_path / "control.json"
+    manifest = _init_control_manifest(manifest_path)
+    ledger_path = Path(manifest["gate_ledger_path"])
+    _gate_ledger_init(ledger_path)
+    acceptance.gate_ledger_record(
+        ledger_path,
+        check_id="candidate",
+        exit_status=0,
+        receipt_hash="b" * 64,
+        candidate_sha="c" * 40,
+    )
+    acceptance.gate_ledger_bind_candidate(ledger_path, candidate_sha="c" * 40)
+    acceptance.control_manifest_update(
+        manifest_path,
+        cleanup_required=True,
+        ecr_baseline_tag="acceptance-4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48-baseline",
+        ecr_candidate_tag="acceptance-4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48-candidate",
+        ecr_registry="123456789012.dkr.ecr.ap-southeast-2.amazonaws.com",
+        ecr_repository="elspeth-acceptance",
+        now=before_deadline,
+    )
+    _checkpoint_evidence_export(manifest_path, ledger_path)
+    for surface in acceptance.CLEANUP_SURFACES:
+        if surface != "coordinator":
+            acceptance.control_manifest_update(
+                manifest_path,
+                cleanup_checkpoint=f"{surface}:confirmed",
+                now=before_deadline,
+            )
+    acceptance.cleanup_evidence_finalize(
+        manifest_path,
+        ledger_path=ledger_path,
+        phase="prepare",
+        clear_cleanup_required=False,
+        now=before_deadline,
+    )
+
+    original_bound_append = cleanup._gate_ledger_record_cleanup_bound
+
+    def append_after_competing_success(path: Path, **kwargs: object) -> dict[str, object]:
+        acceptance.gate_ledger_record(
+            path,
+            check_id="static",
+            exit_status=0,
+            receipt_hash="d" * 64,
+            candidate_sha="c" * 40,
+        )
+        return original_bound_append(path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cleanup, "_gate_ledger_record_cleanup_bound", append_after_competing_success)
+    with pytest.raises(acceptance.AcceptanceCheckError, match="cleanup_finalize_conflict"):
+        acceptance.cleanup_evidence_finalize(
+            manifest_path,
+            ledger_path=ledger_path,
+            phase="commit",
+            clear_cleanup_required=True,
+            now=before_deadline,
+        )
+
+    current_manifest = json.loads(manifest_path.read_text())
+    current_ledger = json.loads(ledger_path.read_text())
+    assert current_manifest["cleanup_required"] is True
+    assert current_manifest["final_evidence"]["phase"] == "prepared"
+    assert [record["check_id"] for record in current_ledger["records"]] == ["candidate", "static"]
+    assert current_ledger["cleanup_records"] == []
+    assert not manifest_path.with_name(f"{manifest_path.name}.final-receipt.json").exists()
 
 
 def test_cleanup_evidence_finalize_preserves_failed_deadline_as_a_valid_cleanup_terminal_state(tmp_path: Path) -> None:

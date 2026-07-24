@@ -18,9 +18,9 @@ from .evidence import (
 from .gate_ledger import (
     _CLEANUP_GATE_CHECK_ORDER,
     _TERMINAL_GATE_CHECK_ID,
+    _gate_ledger_record_cleanup_bound,
     _gate_ledger_records_hash,
     _read_gate_ledger,
-    gate_ledger_record_cleanup,
 )
 from .manifest_schema import _read_control_manifest, _validate_control_manifest
 from .secure_documents import (
@@ -196,26 +196,22 @@ def cleanup_evidence_finalize(
     cleanup_states["coordinator"] = "confirmed"
     if manifest["deadline_failure_recorded"] is True and cleanup_states["teardown_deadline"] != "confirmed":
         cleanup_states["teardown_deadline"] = "failed"
-    if not terminal_records:
-        gate_ledger_record_cleanup(
+    try:
+        ledger = _gate_ledger_record_cleanup_bound(
             ledger_path,
             check_id=_TERMINAL_GATE_CHECK_ID,
             exit_status=0,
             receipt_hash=terminal_receipt_hash,
             candidate_sha=candidate_sha,
+            expected_prefix_records_sha256=ledger_records_sha256,
             started_at=timestamp,
             ended_at=timestamp,
             now=now,
         )
-    else:
-        terminal = terminal_records[0]
-        if (
-            terminal.get("candidate_sha") != candidate_sha
-            or terminal.get("exit_status") != 0
-            or terminal.get("receipt_hash") != terminal_receipt_hash
-        ):
-            raise AcceptanceCheckError("cleanup_finalize_conflict")
-    ledger = _read_gate_ledger(ledger_path)
+    except AcceptanceCheckError as exc:
+        if exc.check == "gate_ledger_conflict":
+            raise AcceptanceCheckError("cleanup_finalize_conflict") from None
+        raise
     cleanup_records = ledger["cleanup_records"]
     assert isinstance(cleanup_records, list)
     terminal = cleanup_records[-1]

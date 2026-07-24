@@ -66,6 +66,16 @@ def _gate_ledger_records_hash(ledger: Mapping[str, object]) -> str:
     )
 
 
+def _gate_ledger_cleanup_prefix_hash(ledger: Mapping[str, object]) -> str:
+    cleanup_records = ledger["cleanup_records"]
+    if not isinstance(cleanup_records, list):
+        raise AcceptanceCheckError("gate_ledger_schema")
+    prefix_records = [
+        record for record in cleanup_records if not isinstance(record, dict) or record.get("check_id") != _TERMINAL_GATE_CHECK_ID
+    ]
+    return _gate_ledger_records_hash({**ledger, "cleanup_records": prefix_records})
+
+
 def _validate_gate_record_stream(records: object, order: tuple[str, ...]) -> list[dict[str, object]]:
     if not isinstance(records, list) or len(records) > len(order):
         raise AcceptanceCheckError("gate_ledger_schema")
@@ -412,6 +422,46 @@ def gate_ledger_record_cleanup(
             candidate_sha=candidate_sha,
             started_at=started_at,
             ended_at=ended_at,
+            now=now,
+        )
+
+
+def _gate_ledger_record_cleanup_bound(
+    path: Path,
+    *,
+    check_id: str,
+    exit_status: int,
+    receipt_hash: str,
+    candidate_sha: str,
+    expected_prefix_records_sha256: str,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> dict[str, object]:
+    """Append cleanup evidence only while its prepared ledger prefix still matches."""
+
+    with _receipt_manifest_write_lock(path, check="gate_ledger_file"):
+        ledger = _read_gate_ledger(path)
+        if ledger["candidate_sha"] is None:
+            raise AcceptanceCheckError("gate_ledger_candidate")
+        if (
+            _SHA256_PATTERN.fullmatch(expected_prefix_records_sha256) is None
+            or _gate_ledger_cleanup_prefix_hash(ledger) != expected_prefix_records_sha256
+        ):
+            raise AcceptanceCheckError("gate_ledger_conflict")
+        cleanup_records = ledger["cleanup_records"]
+        assert isinstance(cleanup_records, list)
+        replay = any(isinstance(record, dict) and record.get("check_id") == check_id for record in cleanup_records)
+        return _gate_ledger_record_stream(
+            path,
+            stream="cleanup_records",
+            order=_CLEANUP_GATE_CHECK_ORDER,
+            check_id=check_id,
+            exit_status=exit_status,
+            receipt_hash=receipt_hash,
+            candidate_sha=candidate_sha,
+            started_at=None if replay else started_at,
+            ended_at=None if replay else ended_at,
             now=now,
         )
 
