@@ -431,8 +431,39 @@ class TestShippedExamples:
 
     def test_blob_transform_offline_launcher_runs_from_clean_copy(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
         """blob_transforms ships a self-contained offline launcher."""
-        copied_example_dir = self._copy_example_to_tmp(example_pipeline_dir, tmp_path, "blob_transforms")
-        (tmp_path / ".venv").symlink_to(example_pipeline_dir.parent / ".venv")
+        repository_root = example_pipeline_dir.parent
+        tracked_result = subprocess.run(
+            ["git", "ls-files", "--", "examples/blob_transforms"],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        tracked_paths = {Path(line) for line in tracked_result.stdout.splitlines() if line}
+        required_paths = {
+            Path("examples/blob_transforms/run.sh"),
+            Path("examples/blob_transforms/input/feed_a.csv"),
+            Path("examples/blob_transforms/input/feed_b.csv"),
+        }
+        assert required_paths <= tracked_paths
+
+        for tracked_path in sorted(tracked_paths):
+            source_path = repository_root / tracked_path
+            copied_path = tmp_path / tracked_path
+            copied_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, copied_path)
+
+        copied_example_dir = tmp_path / "examples" / "blob_transforms"
+        (tmp_path / ".venv").symlink_to(repository_root / ".venv")
+
+        hosted_state = {
+            copied_example_dir / "payloads" / "hosted-sentinel": b"hosted payload sentinel\n",
+            copied_example_dir / "runs" / "audit.db": b"hosted audit sentinel\n",
+            copied_example_dir / "output" / "tutorial_html_blobs.jsonl": b'{"blob_ref":"hosted-sentinel"}\n',
+        }
+        for path, content in hosted_state.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
 
         result = subprocess.run(
             ["bash", copied_example_dir / "run.sh"],
@@ -444,6 +475,9 @@ class TestShippedExamples:
         )
         assert result.returncode == 0, result.stdout + result.stderr
 
+        observed_hosted_state = {path: path.read_bytes() if path.is_file() else None for path in hosted_state}
+        assert observed_hosted_state == hosted_state
+
         with (copied_example_dir / "input" / "csv_blob_manifest.csv").open(newline="", encoding="utf-8") as f:
             manifest = list(csv.DictReader(f))
         assert [row["source_name"] for row in manifest] == ["feed_a", "feed_b"]
@@ -451,15 +485,31 @@ class TestShippedExamples:
         blob_refs = [row["blob_ref"] for row in manifest]
         assert len(blob_refs) == 2
         assert len(set(blob_refs)) == 2
-        payload_store = FilesystemPayloadStore(copied_example_dir / "payloads")
+        payload_store = FilesystemPayloadStore(copied_example_dir / "payloads" / "offline")
         for source_name, blob_ref in zip(("feed_a", "feed_b"), blob_refs, strict=True):
             assert payload_store.retrieve(blob_ref) == (copied_example_dir / "input" / f"{source_name}.csv").read_bytes()
-        assert (copied_example_dir / "runs" / "audit.db").is_file()
+        assert (copied_example_dir / "runs" / "offline_audit.db").is_file()
 
         with (copied_example_dir / "output" / "expanded_csv_rows.csv").open(newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
-        assert len(rows) == 200
-        assert Counter(row["source_name"] for row in rows) == Counter({"feed_a": 100, "feed_b": 100})
+
+        manifest_by_source = {row["source_name"]: row for row in manifest}
+        expected_rows: list[tuple[str, str, str, str, str]] = []
+        for source_name in ("feed_a", "feed_b"):
+            with (copied_example_dir / "input" / f"{source_name}.csv").open(newline="", encoding="utf-8") as f:
+                fixture_rows = list(csv.DictReader(f))
+            expected_rows.extend(
+                (
+                    source_name,
+                    manifest_by_source[source_name]["blob_ref"],
+                    fixture_row["id"],
+                    fixture_row["text"],
+                    str(row_index),
+                )
+                for row_index, fixture_row in enumerate(fixture_rows)
+            )
+
+        assert [(row["source_name"], row["blob_ref"], row["id"], row["text"], row["csv_row_index"]) for row in rows] == expected_rows
 
     def test_blob_transform_documents_canonical_launcher(self, example_pipeline_dir: Path) -> None:
         """blob_transforms documents its clean-checkout launcher everywhere."""

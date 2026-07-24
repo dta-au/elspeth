@@ -4,7 +4,7 @@
 
 **Goal:** Make every in-scope example runnable from a clean checkout through one documented command, beginning with a self-contained offline blob-transform launcher, and verify the complete non-Azure/non-PostgreSQL/non-endurance matrix for release 0.7.2.
 
-**Architecture:** Standalone examples keep their direct settings command; setup-bearing examples own setup in a fail-fast `run.sh`. The blob-transform example packages its source fixtures locally, generates only ignored runtime state, and receives a clean-copy end-to-end regression. The work runs directly in the exclusive-custody `release/0.7.2` checkout, as requested by the repository owner.
+**Architecture:** Standalone examples keep their direct settings command; setup-bearing examples own setup in a fail-fast `run.sh`. The blob-transform example packages its source fixtures locally, isolates offline payloads and audit state from the hosted-fetch mode, generates only ignored runtime state, and receives a tracked-only clean-copy end-to-end regression. The work runs directly in the exclusive-custody `release/0.7.2` checkout, as requested by the repository owner.
 
 **Tech Stack:** Bash, Python 3.13, pytest, Typer `CliRunner`, CSV fixtures, ELSPETH CLI, SQLite, Docker, ChaosLLM/ChaosWeb, ChromaDB, OpenRouter.
 
@@ -15,11 +15,12 @@
 - Create `examples/blob_transforms/input/feed_a.csv`: first packaged CSV blob fixture.
 - Create `examples/blob_transforms/input/feed_b.csv`: second packaged CSV blob fixture.
 - Create `examples/blob_transforms/run.sh`: canonical offline preparation and execution entry point.
-- Modify `examples/blob_transforms/scripts/prepare_csv_blob_manifest.py`: remove the sibling-example fixture dependency.
+- Modify `examples/blob_transforms/scripts/prepare_csv_blob_manifest.py`: remove the sibling-example fixture dependency and write only to the isolated offline payload store.
+- Modify `examples/blob_transforms/settings_expand_csv_blobs.yaml`: isolate offline payload and audit state from the hosted-fetch configuration.
 - Modify `examples/blob_transforms/README.md`: document the one-command offline path and generated artifacts.
 - Modify `examples/README.md`: identify the blob example's canonical launcher.
 - Modify `examples/AGENTS.md`: make the agent-facing run instruction match the user-facing command.
-- Modify `tests/e2e/examples/test_shipped_examples.py`: prove the launcher works from a clean copied example and that all three catalogs advertise it.
+- Modify `tests/e2e/examples/test_shipped_examples.py`: prove the launcher works from tracked-only copied content, preserves hosted state, derives every output row from the packaged fixtures, and is advertised by all three catalogs.
 
 No production module changes are planned. If validation reveals a separate runtime defect, stop that matrix lane, add a focused red regression at the owning layer, and amend this plan before changing production code.
 
@@ -39,6 +40,9 @@ import shutil
 import subprocess
 ```
 
+Import `FilesystemPayloadStore` so the test retrieves both manifest blobs
+through the public payload-store API.
+
 - [ ] **Step 2: Add the failing clean-copy execution test**
 
 Append this test to `TestShippedExamples`:
@@ -50,10 +54,39 @@ def test_blob_transform_offline_launcher_runs_from_clean_copy(
     tmp_path: Path,
 ) -> None:
     """The canonical offline blob example owns all local preparation."""
-    example_dir = self._copy_example_to_tmp(example_pipeline_dir, tmp_path, "blob_transforms")
-    repository_venv = example_pipeline_dir.parent / ".venv"
-    assert repository_venv.is_dir(), "documented repository environment is missing"
-    (tmp_path / ".venv").symlink_to(repository_venv, target_is_directory=True)
+    repository_root = example_pipeline_dir.parent
+    tracked_result = subprocess.run(
+        ["git", "ls-files", "--", "examples/blob_transforms"],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    tracked_paths = {Path(line) for line in tracked_result.stdout.splitlines() if line}
+    required_paths = {
+        Path("examples/blob_transforms/run.sh"),
+        Path("examples/blob_transforms/input/feed_a.csv"),
+        Path("examples/blob_transforms/input/feed_b.csv"),
+    }
+    assert required_paths <= tracked_paths
+
+    for tracked_path in sorted(tracked_paths):
+        source_path = repository_root / tracked_path
+        copied_path = tmp_path / tracked_path
+        copied_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, copied_path)
+
+    example_dir = tmp_path / "examples" / "blob_transforms"
+    (tmp_path / ".venv").symlink_to(repository_root / ".venv")
+
+    hosted_state = {
+        example_dir / "payloads" / "hosted-sentinel": b"hosted payload sentinel\n",
+        example_dir / "runs" / "audit.db": b"hosted audit sentinel\n",
+        example_dir / "output" / "tutorial_html_blobs.jsonl": b'{"blob_ref":"hosted-sentinel"}\n',
+    }
+    for path, content in hosted_state.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
 
     result = subprocess.run(
         ["bash", str(example_dir / "run.sh")],
@@ -65,6 +98,9 @@ def test_blob_transform_offline_launcher_runs_from_clean_copy(
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
+    observed_hosted_state = {path: path.read_bytes() if path.is_file() else None for path in hosted_state}
+    assert observed_hosted_state == hosted_state
+
     manifest_path = example_dir / "input" / "csv_blob_manifest.csv"
     with manifest_path.open(newline="", encoding="utf-8") as manifest_file:
         manifest_rows = list(csv.DictReader(manifest_file))
@@ -73,15 +109,34 @@ def test_blob_transform_offline_launcher_runs_from_clean_copy(
     blob_refs = [row["blob_ref"] for row in manifest_rows]
     assert len(blob_refs) == 2
     assert len(set(blob_refs)) == 2
-    payload_store = FilesystemPayloadStore(example_dir / "payloads")
+    payload_store = FilesystemPayloadStore(example_dir / "payloads" / "offline")
     for source_name, blob_ref in zip(("feed_a", "feed_b"), blob_refs, strict=True):
         assert payload_store.retrieve(blob_ref) == (example_dir / "input" / f"{source_name}.csv").read_bytes()
-    assert (example_dir / "runs" / "audit.db").is_file()
+    assert (example_dir / "runs" / "offline_audit.db").is_file()
 
     with (example_dir / "output" / "expanded_csv_rows.csv").open(newline="", encoding="utf-8") as output_file:
         output_rows = list(csv.DictReader(output_file))
-    assert len(output_rows) == 200
-    assert Counter(row["source_name"] for row in output_rows) == Counter({"feed_a": 100, "feed_b": 100})
+
+    manifest_by_source = {row["source_name"]: row for row in manifest_rows}
+    expected_rows: list[tuple[str, str, str, str, str]] = []
+    for source_name in ("feed_a", "feed_b"):
+        with (example_dir / "input" / f"{source_name}.csv").open(newline="", encoding="utf-8") as fixture_file:
+            fixture_rows = list(csv.DictReader(fixture_file))
+        expected_rows.extend(
+            (
+                source_name,
+                manifest_by_source[source_name]["blob_ref"],
+                fixture_row["id"],
+                fixture_row["text"],
+                str(row_index),
+            )
+            for row_index, fixture_row in enumerate(fixture_rows)
+        )
+
+    assert [
+        (row["source_name"], row["blob_ref"], row["id"], row["text"], row["csv_row_index"])
+        for row in output_rows
+    ] == expected_rows
 ```
 
 - [ ] **Step 3: Add the failing documentation-contract test**
@@ -120,6 +175,7 @@ Expected: both tests fail because `examples/blob_transforms/run.sh` and its docu
 - Create: `examples/blob_transforms/input/feed_a.csv`
 - Create: `examples/blob_transforms/input/feed_b.csv`
 - Modify: `examples/blob_transforms/scripts/prepare_csv_blob_manifest.py`
+- Modify: `examples/blob_transforms/settings_expand_csv_blobs.yaml`
 
 - [ ] **Step 1: Copy the existing deterministic fixtures into the owning example**
 
@@ -136,16 +192,35 @@ Expected: both `cmp` commands exit zero. These are independent packaged fixtures
 
 - [ ] **Step 2: Point the generator only at its local fixtures**
 
-Replace `INPUTS` in `prepare_csv_blob_manifest.py` with:
+Point the helper at the isolated offline payload store and replace `INPUTS` in
+`prepare_csv_blob_manifest.py` with:
 
 ```python
+PAYLOAD_DIR = EXAMPLE_DIR / "payloads" / "offline"
+
 INPUTS = (
     ("feed_a", EXAMPLE_DIR / "input" / "feed_a.csv"),
     ("feed_b", EXAMPLE_DIR / "input" / "feed_b.csv"),
 )
 ```
 
-- [ ] **Step 3: Verify the generator is self-contained in a copied example**
+- [ ] **Step 3: Isolate the offline settings from hosted runtime state**
+
+Configure `settings_expand_csv_blobs.yaml` with offline-only paths:
+
+```yaml
+landscape:
+  url: sqlite:///examples/blob_transforms/runs/offline_audit.db
+
+payload_store:
+  backend: filesystem
+  base_path: examples/blob_transforms/payloads/offline
+```
+
+Leave `settings_fetch_tutorial_html.yaml` unchanged on the root payload store
+and `runs/audit.db`.
+
+- [ ] **Step 4: Verify the generator is self-contained in a copied example**
 
 Run:
 
@@ -156,7 +231,7 @@ mkdir -p "$scratch_dir/examples"
 cp -a examples/blob_transforms "$scratch_dir/examples/blob_transforms"
 PYTHONPATH=src .venv/bin/python "$scratch_dir/examples/blob_transforms/scripts/prepare_csv_blob_manifest.py"
 test -f "$scratch_dir/examples/blob_transforms/input/csv_blob_manifest.csv"
-find "$scratch_dir/examples/blob_transforms/payloads" -type f ! -name .gitkeep | wc -l
+find "$scratch_dir/examples/blob_transforms/payloads/offline" -type f ! -name .gitkeep | wc -l
 ```
 
 Expected: the helper reports two stored blobs, the manifest exists, and the final count is `2`. Remove the explicit `scratch_dir` after recording the result.
@@ -184,17 +259,17 @@ cd "$PROJECT_ROOT"
 mkdir -p \
   examples/blob_transforms/input \
   examples/blob_transforms/output \
-  examples/blob_transforms/payloads \
+  examples/blob_transforms/payloads/offline \
   examples/blob_transforms/runs
 rm -f \
   examples/blob_transforms/input/csv_blob_manifest.csv \
   examples/blob_transforms/output/expanded_csv_rows.csv \
   examples/blob_transforms/output/expansion_failures.jsonl \
-  examples/blob_transforms/runs/audit.db \
-  examples/blob_transforms/runs/audit.db-shm \
-  examples/blob_transforms/runs/audit.db-wal
-find examples/blob_transforms/payloads -mindepth 1 -type f ! -name .gitkeep -delete
-find examples/blob_transforms/payloads -mindepth 1 -type d -empty -delete
+  examples/blob_transforms/runs/offline_audit.db \
+  examples/blob_transforms/runs/offline_audit.db-shm \
+  examples/blob_transforms/runs/offline_audit.db-wal
+find examples/blob_transforms/payloads/offline -mindepth 1 -type f ! -name .gitkeep -delete
+find examples/blob_transforms/payloads/offline -mindepth 1 -depth -type d -empty -delete
 
 echo "Preparing local CSV payload blobs..."
 "$PYTHON_BIN" examples/blob_transforms/scripts/prepare_csv_blob_manifest.py
@@ -205,7 +280,7 @@ echo "Running offline blob CSV expansion..."
   --execute
 
 echo "Output: examples/blob_transforms/output/expanded_csv_rows.csv"
-echo "Audit: examples/blob_transforms/runs/audit.db"
+echo "Audit: examples/blob_transforms/runs/offline_audit.db"
 ```
 
 - [ ] **Step 2: Mark the launcher executable**
@@ -226,10 +301,13 @@ Run:
   -v
 ```
 
-Expected: PASS with 200 output rows, two source names, two unique manifest blob
-refs that resolve to the locally packaged fixture bytes, and a local audit
-database. The payload store also retains runtime audit payloads for source and
-expanded rows, so its total file count is intentionally not asserted.
+Expected: PASS with every output row matching the packaged fixtures in source,
+blob ref, ID, text, and CSV row-index order; two unique manifest blob refs that
+resolve to the locally packaged fixture bytes; and a local offline audit
+database. Root hosted payloads, `runs/audit.db`, and
+`output/tutorial_html_blobs.jsonl` remain byte-identical. The isolated offline
+payload store also retains runtime audit payloads for source and expanded rows,
+so its total file count is intentionally not asserted.
 
 ### Task 4: Publish the one-command documentation
 
@@ -250,8 +328,9 @@ Run the self-contained offline example from the repository root:
 ```
 
 The launcher clears only this example's generated offline artifacts, stores the
-two packaged CSV fixtures in the local payload store, writes the blob manifest,
-and executes `settings_expand_csv_blobs.yaml`.
+two packaged CSV fixtures in `payloads/offline/`, writes the blob manifest, and
+executes `settings_expand_csv_blobs.yaml` against `runs/offline_audit.db`.
+Hosted-fetch payloads, output, and audit state remain untouched.
 ````
 
 Keep the hosted tutorial HTML command unchanged and label it as an opt-in network example.
@@ -311,12 +390,14 @@ git diff --check
 pre-commit run --files \
   tests/e2e/examples/test_shipped_examples.py \
   examples/blob_transforms/scripts/prepare_csv_blob_manifest.py \
+  examples/blob_transforms/settings_expand_csv_blobs.yaml \
   examples/blob_transforms/run.sh \
   examples/blob_transforms/input/feed_a.csv \
   examples/blob_transforms/input/feed_b.csv \
   examples/blob_transforms/README.md \
   examples/README.md \
-  examples/AGENTS.md
+  examples/AGENTS.md \
+  docs/superpowers/plans/2026-07-24-out-of-box-example-packaging.md
 ```
 
 Expected: all commands exit zero.
@@ -329,13 +410,11 @@ Run:
 git add \
   tests/e2e/examples/test_shipped_examples.py \
   examples/blob_transforms/scripts/prepare_csv_blob_manifest.py \
+  examples/blob_transforms/settings_expand_csv_blobs.yaml \
   examples/blob_transforms/run.sh \
-  examples/blob_transforms/input/feed_a.csv \
-  examples/blob_transforms/input/feed_b.csv \
   examples/blob_transforms/README.md \
-  examples/README.md \
-  examples/AGENTS.md
-git commit -m "fix(examples): package blob transform launcher"
+  docs/superpowers/plans/2026-07-24-out-of-box-example-packaging.md
+git commit -m "fix(examples): isolate blob transform runtime state"
 ```
 
 Expected: commit succeeds with pre-commit hooks green.

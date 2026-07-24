@@ -61,8 +61,8 @@ sinks:
         mode: observed
 
 landscape:
-  url: sqlite:///examples/blob_transforms/runs/audit.db
+  url: sqlite:///examples/blob_transforms/runs/offline_audit.db
 
 payload_store:
   backend: filesystem
-  base_path: examples/blob_transforms/payloads
+  base_path: examples/blob_transforms/payloads/offline

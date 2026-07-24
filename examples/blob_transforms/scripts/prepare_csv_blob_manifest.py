@@ -10,7 +10,7 @@ from elspeth.core.payload_store import FilesystemPayloadStore
 
 ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_DIR = ROOT / "examples" / "blob_transforms"
-PAYLOAD_DIR = EXAMPLE_DIR / "payloads"
+PAYLOAD_DIR = EXAMPLE_DIR / "payloads" / "offline"
 MANIFEST_PATH = EXAMPLE_DIR / "input" / "csv_blob_manifest.csv"
 
 INPUTS = (

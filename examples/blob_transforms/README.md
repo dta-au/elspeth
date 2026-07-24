@@ -23,12 +23,14 @@ From a clean checkout after installation, run:
 ```
 
 The launcher clears only this example's generated offline artifacts, packages
-its two local CSV fixtures into the payload store, writes the manifest, and
-executes `settings_expand_csv_blobs.yaml`.
+its two local CSV fixtures into the isolated `payloads/offline/` store, writes
+the manifest, and executes `settings_expand_csv_blobs.yaml`. Hosted-fetch
+payloads, output, and audit state are left untouched.
 
 Output:
 
 - `examples/blob_transforms/output/expanded_csv_rows.csv`
+- `examples/blob_transforms/runs/offline_audit.db`
 
 The output keeps `source_url`, `source_name`, `manifest_index`, and `blob_ref` on
 every emitted CSV row, so rows from multiple source blobs remain disambiguated.
