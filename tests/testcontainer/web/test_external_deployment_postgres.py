@@ -2,7 +2,10 @@
 
 The target parameterization below verifies ELSPETH's runtime configuration
 contract.  It is deliberately not evidence that a maintained deployment bundle
-exists for every named target.
+exists for every named target.  Run the focused suite sequentially with
+``CI=1 uv run --frozen pytest -q -n 0 -m testcontainer``; parallel workers are
+rejected before Docker starts so the suite cannot fan out containers.  The
+complete copy-paste command is ``_SEQUENTIAL_TEST_COMMAND`` below.
 """
 
 from __future__ import annotations
@@ -54,6 +57,36 @@ _RUNTIME_CONTRACT_TARGETS = (
     "azure-container-apps",
     "kubernetes",
 )
+_SEQUENTIAL_TEST_COMMAND = (
+    "CI=1 uv run --frozen pytest -q -n 0 -m testcontainer "
+    "tests/testcontainer/web/test_external_deployment_postgres.py "
+    "tests/testcontainer/web/test_aws_ecs_validate_only_startup.py "
+    "tests/testcontainer/web/test_doctor_aws_ecs_postgres.py"
+)
+
+
+def _require_sequential_postgres_acceptance(pytest_config: pytest.Config) -> None:
+    """Reject xdist workers before any PostgreSQL container is constructed."""
+    if hasattr(pytest_config, "workerinput") or os.environ.get("PYTEST_XDIST_WORKER") is not None:
+        raise pytest.UsageError(
+            f"The PostgreSQL deployment acceptance suite must run sequentially to share one container. Run: {_SEQUENTIAL_TEST_COMMAND}"
+        )
+
+
+def test_sequential_execution_contract_is_guarded_and_documented() -> None:
+    class _WorkerConfig:
+        def __init__(self) -> None:
+            self.workerinput: dict[str, object] = {}
+
+    with pytest.raises(pytest.UsageError, match=r"-n 0 -m testcontainer") as exc_info:
+        _require_sequential_postgres_acceptance(_WorkerConfig())  # type: ignore[arg-type]
+    assert _SEQUENTIAL_TEST_COMMAND in str(exc_info.value)
+
+    plan_path = Path(__file__).parents[3] / "docs/superpowers/plans/2026-07-24-cross-platform-deployment-contract.md"
+    task12 = plan_path.read_text(encoding="utf-8").split("### Task 12:", maxsplit=1)[1]
+    focused_command = task12.split("###", maxsplit=1)[0].split("```bash", maxsplit=1)[1].split("```", maxsplit=1)[0]
+
+    assert _SEQUENTIAL_TEST_COMMAND in focused_command
 
 
 def _identifier(prefix: str) -> str:
@@ -91,8 +124,9 @@ def _psycopg_connect(url: str) -> psycopg.Connection[Any]:
 
 
 @pytest.fixture(scope="session")
-def postgres_url() -> Iterator[str]:
+def postgres_url(pytestconfig: pytest.Config) -> Iterator[str]:
     """Share one PostgreSQL container across the focused deployment suite."""
+    _require_sequential_postgres_acceptance(pytestconfig)
     with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
         yield postgres.get_connection_url()
 
@@ -151,12 +185,16 @@ class _DatabasePair:
                     )
                 )
 
+        self.role_created = True
+        self.grant_runtime_read_permissions()
+
+    def grant_runtime_read_permissions(self) -> None:
+        assert self.role_created
         for owner_url in (self.session_owner_url, self.landscape_owner_url):
             with _psycopg_connect(owner_url) as owner:
                 owner.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
                 owner.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
                 owner.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
-        self.role_created = True
 
 
 @pytest.fixture
@@ -399,22 +437,13 @@ def test_doctor_rejects_same_database_without_leaking_credentials(
         owner.dispose()
 
 
-@pytest.mark.parametrize("schema_state", ["missing", "stale"])
-def test_validate_only_startup_rejects_unready_schema_without_leaking_credentials(
+def test_validate_only_startup_rejects_missing_and_stale_schema_without_leaking_credentials(
     tmp_path: Path,
     database_pair: _DatabasePair,
-    schema_state: str,
 ) -> None:
     session_owner = create_session_engine(database_pair.session_owner_url)
     landscape_owner = create_engine(database_pair.landscape_owner_url)
     try:
-        if schema_state == "stale":
-            init_session_schema(session_owner)
-            with session_owner.begin() as connection:
-                connection.execute(update(session_schema_identity_table).values(schema_epoch=SESSION_SCHEMA_EPOCH - 1))
-            assert probe_session_schema(session_owner) is SchemaState.STALE
-        else:
-            assert probe_session_schema(session_owner) is SchemaState.MISSING
         init_landscape_schema(landscape_owner)
         database_pair.provision_runtime_role()
         settings = _settings(
@@ -428,8 +457,19 @@ def test_validate_only_startup_rejects_unready_schema_without_leaking_credential
             create_app(settings)
 
         _assert_redacted(repr(exc_info.value), database_pair)
-        expected = SchemaState.MISSING if schema_state == "missing" else SchemaState.STALE
-        assert probe_session_schema(session_owner) is expected
+        assert probe_session_schema(session_owner) is SchemaState.MISSING
+
+        init_session_schema(session_owner)
+        database_pair.grant_runtime_read_permissions()
+        with session_owner.begin() as connection:
+            connection.execute(update(session_schema_identity_table).values(schema_epoch=SESSION_SCHEMA_EPOCH - 1))
+        assert probe_session_schema(session_owner) is SchemaState.STALE
+
+        with pytest.raises(ExternalStateSchemaNotReadyError, match="session_schema") as exc_info:
+            create_app(settings)
+
+        _assert_redacted(repr(exc_info.value), database_pair)
+        assert probe_session_schema(session_owner) is SchemaState.STALE
         assert probe_landscape_schema(landscape_owner) is SchemaState.CURRENT
     finally:
         session_owner.dispose()

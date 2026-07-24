@@ -1179,12 +1179,16 @@ the schema is missing and its initializer role is denied DDL.
 - [ ] **Step 2: Run focused Docker-backed tests**
 
 ```bash
-uv run --frozen pytest -q tests/testcontainer/web/test_external_deployment_postgres.py tests/testcontainer/web/test_aws_ecs_validate_only_startup.py tests/testcontainer/web/test_doctor_aws_ecs_postgres.py
+CI=1 uv run --frozen pytest -q -n 0 -m testcontainer tests/testcontainer/web/test_external_deployment_postgres.py tests/testcontainer/web/test_aws_ecs_validate_only_startup.py tests/testcontainer/web/test_doctor_aws_ecs_postgres.py
 ```
 
 Expected: pass when Docker is available. A Docker-unavailable environment may
 skip only tests already marked for that condition; it must not convert an
-application failure into a skip.
+application failure into a skip. The explicit `-m testcontainer` overrides the
+repository's default marker exclusion, and `-n 0` prevents the local auto-xdist
+plugin from starting one PostgreSQL container per worker. The shared fixture
+fails before Docker startup with this exact command if an xdist worker reaches
+it.
 
 - [ ] **Step 3: Run a real Compose smoke test**
 
