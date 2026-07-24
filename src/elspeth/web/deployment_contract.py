@@ -20,10 +20,15 @@ from elspeth.web.config import (
     is_undersized_secret_key,
     is_uniform_byte_key,
 )
+from elspeth.web.schema_probe import DatabaseTargetConflictError, require_distinct_postgres_targets
 
 DEPLOYMENT_TARGET_AWS_ECS = "aws-ecs"
 EXTERNAL_POSTGRESQL_TARGETS: frozenset[DeploymentTarget] = frozenset({"aws-ecs", "azure-container-apps", "kubernetes"})
-_POSTGRES_DRIVER = "postgresql"
+_SUPPORTED_EXTERNAL_POSTGRES_DRIVERS = frozenset({"postgresql", "postgresql+psycopg2", "postgresql+psycopg"})
+_EXTERNAL_STATE_TARGETS: frozenset[DeploymentTarget] = frozenset(
+    {"default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"}
+)
+_CONTAINER_TARGETS: frozenset[DeploymentTarget] = frozenset({"docker-compose", "aws-ecs", "azure-container-apps", "kubernetes"})
 # This IS the container-serving check, not a bind-all bug; exact-match only --
 # IPv6 dual-stack ("::") is out of scope for this milestone.
 _CONTAINER_SERVING_HOST = "0.0.0.0"
@@ -108,20 +113,20 @@ def resolve_deployment_state_mode(settings: WebSettings) -> Literal["sqlite-sing
     raise DeploymentConfigurationError("deployment_state_mode does not match session_db_url and landscape_url base SQLAlchemy dialects")
 
 
-def _check_postgres_url(name: str, env_var: str, url: str | None) -> ContractCheck:
+def _check_external_postgres_url(name: str, env_var: str, url: str | None) -> ContractCheck:
     if url is None:
-        return ContractCheck(name, False, f"{env_var} is required in aws-ecs deployment mode")
-    driver_parts = make_url(url).drivername.split("+")
-    is_postgres = driver_parts == [_POSTGRES_DRIVER] or (
-        len(driver_parts) == 2 and driver_parts[0] == _POSTGRES_DRIVER and bool(driver_parts[1])
-    )
-    if not is_postgres:
+        return ContractCheck(name, False, f"{env_var} must be explicitly set for external PostgreSQL state")
+    try:
+        parsed = make_url(url)
+    except (ArgumentError, TypeError, ValueError):
+        return ContractCheck(name, False, f"{env_var} must be a supported synchronous PostgreSQL SQLAlchemy URL")
+    if parsed.drivername not in _SUPPORTED_EXTERNAL_POSTGRES_DRIVERS or not parsed.host or not parsed.database:
         return ContractCheck(
             name,
             False,
-            f"{env_var} must use a PostgreSQL SQLAlchemy scheme; no fallback scheme is permitted in aws-ecs mode",
+            f"{env_var} must be a supported synchronous PostgreSQL SQLAlchemy URL",
         )
-    return ContractCheck(name, True, f"{env_var} uses a PostgreSQL scheme")
+    return ContractCheck(name, True, f"{env_var} is configured for supported synchronous PostgreSQL access")
 
 
 def _check_required_path(name: str, env_var: str, value: Path | None, *, explicitly_set: bool) -> ContractCheck:
@@ -136,9 +141,48 @@ def _check_required_path(name: str, env_var: str, value: Path | None, *, explici
         return ContractCheck(
             name,
             False,
-            f"{env_var} is required and must not be blank in aws-ecs deployment mode",
+            f"{env_var} must be explicitly set and non-blank for external PostgreSQL state",
         )
     return ContractCheck(name, True, f"{env_var} is set")
+
+
+def _check_external_host(settings: WebSettings) -> ContractCheck:
+    host_ok = settings.deployment_target not in _CONTAINER_TARGETS or settings.host == _CONTAINER_SERVING_HOST
+    return ContractCheck(
+        "host",
+        host_ok,
+        (
+            "host is suitable for the selected external-state deployment"
+            if host_ok
+            else "ELSPETH_WEB__HOST must use the container-serving bind address for this deployment target"
+        ),
+    )
+
+
+def _check_secret_key(settings: WebSettings) -> ContractCheck:
+    secret_ok = not (is_default_secret_key_placeholder(settings.secret_key) or is_undersized_secret_key(settings.secret_key))
+    return ContractCheck(
+        "secret_key",
+        secret_ok,
+        (
+            "secret_key is production-shaped"
+            if secret_ok
+            else "ELSPETH_WEB__SECRET_KEY must not be the default placeholder and must meet the length floor"
+        ),
+    )
+
+
+def _check_shareable_link_signing_key(settings: WebSettings) -> ContractCheck:
+    key_ok = not is_uniform_byte_key(settings.shareable_link_signing_key.get_secret_value())
+    return ContractCheck(
+        "shareable_link_signing_key",
+        key_ok,
+        (
+            "shareable_link_signing_key is production-shaped"
+            if key_ok
+            else "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY is a known-weak uniform-byte placeholder"
+        ),
+    )
 
 
 def _check_required_operator_identity(name: str, env_var: str, value: str | None) -> ContractCheck:
@@ -150,14 +194,135 @@ def _check_required_operator_identity(name: str, env_var: str, value: str | None
 def validate_aws_ecs_settings(settings: WebSettings) -> list[ContractCheck]:
     """Run every strict AWS ECS contract check, including deployment target."""
     target_ok = settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS
+    target_check = ContractCheck(
+        "deployment_target",
+        target_ok,
+        "deployment_target is aws-ecs" if target_ok else "ELSPETH_WEB__DEPLOYMENT_TARGET must be aws-ecs",
+    )
+    aws_host_ok = settings.host == _CONTAINER_SERVING_HOST
+    host_check = ContractCheck(
+        "host",
+        aws_host_ok,
+        (
+            "host is suitable for AWS ECS container serving"
+            if aws_host_ok
+            else "ELSPETH_WEB__HOST must use the container-serving bind address for AWS ECS reachability"
+        ),
+    )
     checks = [
+        target_check if check.name == "deployment_target" else host_check if check.name == "host" else check
+        for check in validate_external_postgresql_settings(settings)
+    ]
+    checks.extend(
+        [
+            ContractCheck(
+                "operator_telemetry",
+                settings.operator_telemetry == "aws-otlp",
+                (
+                    "operator telemetry uses the task-local OTLP collector"
+                    if settings.operator_telemetry == "aws-otlp"
+                    else "ELSPETH_WEB__OPERATOR_TELEMETRY must be aws-otlp in aws-ecs deployment mode"
+                ),
+            ),
+            ContractCheck(
+                "operator_telemetry_environment",
+                settings.operator_telemetry_environment is not None,
+                (
+                    "operator telemetry environment is set"
+                    if settings.operator_telemetry_environment is not None
+                    else "ELSPETH_WEB__OPERATOR_TELEMETRY_ENVIRONMENT is required in aws-ecs deployment mode"
+                ),
+            ),
+            _check_required_operator_identity(
+                "operator_telemetry_release",
+                "ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE",
+                settings.operator_telemetry_release,
+            ),
+            _check_required_operator_identity(
+                "operator_telemetry_ecs_cluster",
+                "ELSPETH_WEB__OPERATOR_TELEMETRY_ECS_CLUSTER",
+                settings.operator_telemetry_ecs_cluster,
+            ),
+            _check_required_operator_identity(
+                "operator_telemetry_ecs_service",
+                "ELSPETH_WEB__OPERATOR_TELEMETRY_ECS_SERVICE",
+                settings.operator_telemetry_ecs_service,
+            ),
+            _check_required_operator_identity(
+                "operator_telemetry_task_definition_family",
+                "ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY",
+                settings.operator_telemetry_task_definition_family,
+            ),
+            _check_required_operator_identity(
+                "operator_telemetry_task_definition_revision",
+                "ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION",
+                settings.operator_telemetry_task_definition_revision,
+            ),
+        ]
+    )
+    return checks
+
+
+def validate_external_postgresql_settings(settings: WebSettings) -> list[ContractCheck]:
+    """Run redacted checks for the provider-neutral external PostgreSQL contract."""
+    target_ok = settings.deployment_target in _EXTERNAL_STATE_TARGETS
+    try:
+        resolved_mode = resolve_deployment_state_mode(settings)
+    except DeploymentConfigurationError:
+        resolved_mode = None
+    mode_ok = target_ok and resolved_mode == "external-postgresql"
+
+    session_check = _check_external_postgres_url(
+        "session_db_url",
+        "ELSPETH_WEB__SESSION_DB_URL",
+        settings.session_db_url,
+    )
+    landscape_check = _check_external_postgres_url(
+        "landscape_url",
+        "ELSPETH_WEB__LANDSCAPE_URL",
+        settings.landscape_url,
+    )
+    targets_ok = False
+    if session_check.ok and landscape_check.ok:
+        assert settings.session_db_url is not None
+        assert settings.landscape_url is not None
+        try:
+            require_distinct_postgres_targets(settings.session_db_url, settings.landscape_url)
+        except DatabaseTargetConflictError:
+            pass
+        else:
+            targets_ok = True
+
+    return [
         ContractCheck(
             "deployment_target",
             target_ok,
-            "deployment_target is aws-ecs" if target_ok else "ELSPETH_WEB__DEPLOYMENT_TARGET must be aws-ecs",
+            (
+                "deployment_target supports external PostgreSQL state"
+                if target_ok
+                else "ELSPETH_WEB__DEPLOYMENT_TARGET does not support external PostgreSQL state"
+            ),
         ),
-        _check_postgres_url("session_db_url", "ELSPETH_WEB__SESSION_DB_URL", settings.session_db_url),
-        _check_postgres_url("landscape_url", "ELSPETH_WEB__LANDSCAPE_URL", settings.landscape_url),
+        ContractCheck(
+            "deployment_state_mode",
+            mode_ok,
+            (
+                "deployment state resolves to external PostgreSQL"
+                if mode_ok
+                else "ELSPETH_WEB__DEPLOYMENT_STATE_MODE must resolve to external PostgreSQL for this startup contract"
+            ),
+        ),
+        session_check,
+        landscape_check,
+        ContractCheck(
+            "separate_db_targets",
+            targets_ok,
+            (
+                "session and Landscape database targets are statically distinct"
+                if targets_ok
+                else "session and Landscape database targets must be statically provable as distinct"
+            ),
+        ),
         _check_required_path(
             "data_dir",
             "ELSPETH_WEB__DATA_DIR",
@@ -170,90 +335,7 @@ def validate_aws_ecs_settings(settings: WebSettings) -> list[ContractCheck]:
             settings.payload_store_path,
             explicitly_set="payload_store_path" in settings.model_fields_set,
         ),
-        ContractCheck(
-            "operator_telemetry",
-            settings.operator_telemetry == "aws-otlp",
-            (
-                "operator telemetry uses the task-local OTLP collector"
-                if settings.operator_telemetry == "aws-otlp"
-                else "ELSPETH_WEB__OPERATOR_TELEMETRY must be aws-otlp in aws-ecs deployment mode"
-            ),
-        ),
-        ContractCheck(
-            "operator_telemetry_environment",
-            settings.operator_telemetry_environment is not None,
-            (
-                "operator telemetry environment is set"
-                if settings.operator_telemetry_environment is not None
-                else "ELSPETH_WEB__OPERATOR_TELEMETRY_ENVIRONMENT is required in aws-ecs deployment mode"
-            ),
-        ),
-        _check_required_operator_identity(
-            "operator_telemetry_release",
-            "ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE",
-            settings.operator_telemetry_release,
-        ),
-        _check_required_operator_identity(
-            "operator_telemetry_ecs_cluster",
-            "ELSPETH_WEB__OPERATOR_TELEMETRY_ECS_CLUSTER",
-            settings.operator_telemetry_ecs_cluster,
-        ),
-        _check_required_operator_identity(
-            "operator_telemetry_ecs_service",
-            "ELSPETH_WEB__OPERATOR_TELEMETRY_ECS_SERVICE",
-            settings.operator_telemetry_ecs_service,
-        ),
-        _check_required_operator_identity(
-            "operator_telemetry_task_definition_family",
-            "ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY",
-            settings.operator_telemetry_task_definition_family,
-        ),
-        _check_required_operator_identity(
-            "operator_telemetry_task_definition_revision",
-            "ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION",
-            settings.operator_telemetry_task_definition_revision,
-        ),
+        _check_external_host(settings),
+        _check_secret_key(settings),
+        _check_shareable_link_signing_key(settings),
     ]
-    host_ok = settings.host == _CONTAINER_SERVING_HOST
-    checks.append(
-        ContractCheck(
-            "host",
-            host_ok,
-            (
-                "host is suitable for container serving"
-                if host_ok
-                else f"ELSPETH_WEB__HOST must be {_CONTAINER_SERVING_HOST} for container/ALB reachability"
-            ),
-        )
-    )
-    # Outside pytest-local-host construction, WebSettings' own boot guards
-    # reject weak secret_key/signing_key values during model construction.
-    # Therefore doctor can emit these named checks only after settings load;
-    # invalid non-local values surface through Plan 03's generic settings_load
-    # ValidationError diagnostic. The explicit checks still cover successfully
-    # constructed settings, including the pytest-local-host bypass fixtures.
-    secret_ok = not (is_default_secret_key_placeholder(settings.secret_key) or is_undersized_secret_key(settings.secret_key))
-    checks.append(
-        ContractCheck(
-            "secret_key",
-            secret_ok,
-            (
-                "secret_key is production-shaped"
-                if secret_ok
-                else "ELSPETH_WEB__SECRET_KEY must not be the default placeholder and must meet the length floor"
-            ),
-        )
-    )
-    key_ok = not is_uniform_byte_key(settings.shareable_link_signing_key.get_secret_value())
-    checks.append(
-        ContractCheck(
-            "shareable_link_signing_key",
-            key_ok,
-            (
-                "shareable_link_signing_key is production-shaped"
-                if key_ok
-                else "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY is a known-weak uniform-byte placeholder"
-            ),
-        )
-    )
-    return checks

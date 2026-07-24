@@ -75,7 +75,8 @@ class PostgresLogicalTarget:
     explicit_schema: str | None
 
 
-AWS_ECS_POOL_KWARGS: Mapping[str, object] = MappingProxyType({"pool_size": 5, "max_overflow": 5, "pool_pre_ping": True})
+EXTERNAL_POSTGRES_POOL_KWARGS: Mapping[str, object] = MappingProxyType({"pool_size": 5, "max_overflow": 5, "pool_pre_ping": True})
+AWS_ECS_POOL_KWARGS = EXTERNAL_POSTGRES_POOL_KWARGS
 
 
 class PostgresEngineKwargs(TypedDict, total=False):

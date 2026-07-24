@@ -15,6 +15,7 @@ from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.web import schema_probe as schema_probe_module
 from elspeth.web.schema_probe import (
     AWS_ECS_POOL_KWARGS,
+    EXTERNAL_POSTGRES_POOL_KWARGS,
     DatabaseTargetConflictError,
     SchemaLockCleanupError,
     SchemaState,
@@ -131,6 +132,7 @@ def test_pool_kwargs_are_postgres_only_and_fresh() -> None:
     assert second["pool_size"] == 5
     assert postgres_engine_kwargs("sqlite:///audit.db") == {}
     assert isinstance(AWS_ECS_POOL_KWARGS, MappingProxyType)
+    assert EXTERNAL_POSTGRES_POOL_KWARGS is AWS_ECS_POOL_KWARGS
 
 
 @pytest.mark.parametrize("driver", ["postgresql", "postgresql+psycopg", "postgresql+psycopg2"])

@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import SecretBytes
 
 from elspeth.web import deployment_contract
 from elspeth.web.config import WebSettings
-from elspeth.web.deployment_contract import ContractCheck, validate_aws_ecs_settings
+from elspeth.web.deployment_contract import ContractCheck, validate_aws_ecs_settings, validate_external_postgresql_settings
 
 _SQLITE_SESSION_URL = "sqlite+pysqlite:///session.db"
 _SQLITE_LANDSCAPE_URL = "sqlite:///landscape.db"
@@ -35,6 +36,34 @@ def _checks(**overrides: Any) -> dict[str, ContractCheck]:
 
 def _settings(**overrides: Any) -> WebSettings:
     return WebSettings(**(_base_kwargs() | overrides))
+
+
+def _external_settings(tmp_path: Path, *, target: str = "docker-compose", **overrides: Any) -> WebSettings:
+    values: dict[str, Any] = {
+        "deployment_target": target,
+        "deployment_state_mode": "external-postgresql",
+        "session_db_url": "postgresql+psycopg://session_user:session_password@db.example/session_database",
+        "landscape_url": "postgresql+psycopg2://landscape_user:landscape_password@db.example/landscape_database",
+        "data_dir": tmp_path / "private-data-path",
+        "payload_store_path": tmp_path / "private-payload-path",
+        "host": "0.0.0.0",
+    }
+    values.update(overrides)
+    return _settings(**values)
+
+
+_EXTERNAL_CHECK_NAMES = [
+    "deployment_target",
+    "deployment_state_mode",
+    "session_db_url",
+    "landscape_url",
+    "separate_db_targets",
+    "data_dir",
+    "payload_store_path",
+    "host",
+    "secret_key",
+    "shareable_link_signing_key",
+]
 
 
 def test_external_postgresql_targets_are_the_cloud_and_orchestrated_targets() -> None:
@@ -303,6 +332,167 @@ def test_url_parse_failure_is_caught_and_redacted() -> None:
     assert "secret_password" not in detail
 
 
+@pytest.mark.parametrize(
+    "target",
+    ["docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+)
+def test_external_postgresql_check_names_are_exact_ordered_and_all_pass(tmp_path: Path, target: str) -> None:
+    checks = validate_external_postgresql_settings(_external_settings(tmp_path, target=target))
+
+    assert [check.name for check in checks] == _EXTERNAL_CHECK_NAMES
+    assert all(check.ok for check in checks)
+    rendered = repr(checks)
+    for fragment in (
+        "psycopg2",
+        "session_user",
+        "session_password",
+        "db.example",
+        "session_database",
+        "landscape_user",
+        "landscape_password",
+        "landscape_database",
+        str(tmp_path),
+    ):
+        assert fragment not in rendered
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+psycopg2", "postgresql+psycopg"])
+def test_external_postgresql_accepts_only_supported_sync_driver_forms(tmp_path: Path, driver: str) -> None:
+    settings = _external_settings(
+        tmp_path,
+        session_db_url=f"{driver}://session_user:session_password@db.example/session_database",
+        landscape_url=f"{driver}://landscape_user:landscape_password@db.example/landscape_database",
+    )
+
+    checks = {check.name: check for check in validate_external_postgresql_settings(settings)}
+
+    assert checks["session_db_url"].ok
+    assert checks["landscape_url"].ok
+    assert checks["separate_db_targets"].ok
+
+
+@pytest.mark.parametrize(
+    ("url", "secret_fragments"),
+    [
+        pytest.param(
+            "sqlite:///private-driver-path.db",
+            ("sqlite", "private-driver-path.db"),
+            id="sqlite",
+        ),
+        pytest.param(
+            "postgresql+asyncpg://driver_user:driver_password@driver-host/driver_database",
+            ("asyncpg", "driver_user", "driver_password", "driver-host", "driver_database"),
+            id="asyncpg",
+        ),
+        pytest.param(
+            "postgresql+pg8000://driver_user:driver_password@driver-host/driver_database",
+            ("pg8000", "driver_user", "driver_password", "driver-host", "driver_database"),
+            id="pg8000",
+        ),
+        pytest.param(
+            "postgresql+://driver_user:driver_password@driver-host/driver_database",
+            ("postgresql+", "driver_user", "driver_password", "driver-host", "driver_database"),
+            id="empty-driver",
+        ),
+        pytest.param(
+            "postgresql+psycopg+extra://driver_user:driver_password@driver-host/driver_database",
+            ("psycopg+extra", "driver_user", "driver_password", "driver-host", "driver_database"),
+            id="multiple-driver-suffixes",
+        ),
+        pytest.param(
+            "not-a-url-with-private-driver-fragment",
+            ("private-driver-fragment",),
+            id="unparseable-shape",
+        ),
+        pytest.param(
+            "postgresql+psycopg://driver_user:driver_password@/driver_database",
+            ("psycopg", "driver_user", "driver_password", "driver_database"),
+            id="missing-host",
+        ),
+    ],
+)
+def test_external_postgresql_rejects_unsupported_url_forms_and_redacts(
+    tmp_path: Path,
+    url: str,
+    secret_fragments: tuple[str, ...],
+) -> None:
+    settings = _external_settings(tmp_path).model_copy(update={"session_db_url": url})
+
+    checks = validate_external_postgresql_settings(settings)
+
+    assert {check.name: check for check in checks}["session_db_url"].ok is False
+    rendered = repr(checks)
+    assert url not in rendered
+    for fragment in secret_fragments:
+        assert fragment not in rendered
+
+
+def test_external_postgresql_missing_url_fails_closed_and_redacts_other_url(tmp_path: Path) -> None:
+    settings = _external_settings(tmp_path).model_copy(update={"session_db_url": None})
+
+    checks = validate_external_postgresql_settings(settings)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["deployment_state_mode"].ok is False
+    assert by_name["session_db_url"].ok is False
+    assert by_name["separate_db_targets"].ok is False
+    assert settings.landscape_url not in repr(checks)
+
+
+def test_external_postgresql_rejects_same_logical_database_through_driver_aliases(tmp_path: Path) -> None:
+    settings = _external_settings(
+        tmp_path,
+        session_db_url="postgresql://first_user:first_password@shared-host/shared_database",  # secret-scan: allow-this-line
+        landscape_url="postgresql+psycopg://second_user:second_password@shared-host/shared_database",
+    )
+
+    check = {check.name: check for check in validate_external_postgresql_settings(settings)}["separate_db_targets"]
+
+    assert check.ok is False
+    for fragment in ("first_user", "first_password", "second_user", "second_password", "shared-host", "shared_database"):
+        assert fragment not in check.detail
+
+
+@pytest.mark.parametrize("field", ["data_dir", "payload_store_path"])
+def test_external_postgresql_requires_explicit_paths_and_redacts_values(tmp_path: Path, field: str) -> None:
+    values = _external_settings(tmp_path).model_dump()
+    values.pop(field)
+    settings = _settings(**values)
+
+    checks = validate_external_postgresql_settings(settings)
+
+    assert {check.name: check for check in checks}[field].ok is False
+    assert str(tmp_path) not in repr(checks)
+
+
+def test_external_postgresql_rejects_unsupported_target_mode_pair(tmp_path: Path) -> None:
+    settings = _external_settings(
+        tmp_path,
+        target="aws-ecs",
+        deployment_state_mode="sqlite-single",
+        session_db_url="sqlite:///private-session-path.db",
+        landscape_url="sqlite:///private-landscape-path.db",
+    )
+
+    checks = validate_external_postgresql_settings(settings)
+
+    assert {check.name: check for check in checks}["deployment_state_mode"].ok is False
+    assert "private-session-path.db" not in repr(checks)
+    assert "private-landscape-path.db" not in repr(checks)
+
+
+def test_external_postgresql_rejects_unsafe_secrets(tmp_path: Path) -> None:
+    settings = _external_settings(tmp_path).model_copy(
+        update={"secret_key": "unsafe-secret-sentinel", "shareable_link_signing_key": SecretBytes(b"x" * 32)}
+    )
+
+    checks = {check.name: check for check in validate_external_postgresql_settings(settings)}
+
+    assert checks["secret_key"].ok is False
+    assert checks["shareable_link_signing_key"].ok is False
+    assert "unsafe-secret-sentinel" not in repr(checks)
+
+
 def test_default_deployment_target_fails() -> None:
     assert _checks()["deployment_target"].ok is False
 
@@ -388,10 +578,15 @@ def test_check_names_are_exact_ordered_and_unique() -> None:
 
     assert names == [
         "deployment_target",
+        "deployment_state_mode",
         "session_db_url",
         "landscape_url",
+        "separate_db_targets",
         "data_dir",
         "payload_store_path",
+        "host",
+        "secret_key",
+        "shareable_link_signing_key",
         "operator_telemetry",
         "operator_telemetry_environment",
         "operator_telemetry_release",
@@ -399,9 +594,6 @@ def test_check_names_are_exact_ordered_and_unique() -> None:
         "operator_telemetry_ecs_service",
         "operator_telemetry_task_definition_family",
         "operator_telemetry_task_definition_revision",
-        "host",
-        "secret_key",
-        "shareable_link_signing_key",
     ]
     assert len(names) == len(set(names))
 

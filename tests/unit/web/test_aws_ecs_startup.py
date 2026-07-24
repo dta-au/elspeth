@@ -14,9 +14,10 @@ from structlog.testing import capture_logs
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web import aws_ecs_startup as startup
+from elspeth.web import external_state_startup as external_startup
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ContractCheck
-from elspeth.web.schema_probe import DatabaseTargetConflictError, SchemaState
+from elspeth.web.schema_probe import SchemaState
 from elspeth.web.sessions.schema import SessionSchemaError
 
 _SENTINEL = "opaque-credential SELECT raw_secret /secret/runtime/path"
@@ -120,26 +121,21 @@ def _operational_error() -> OperationalError:
 
 
 @pytest.mark.parametrize("failed_name", ["session_db_url", "landscape_url"])
-def test_contract_url_failure_prevents_target_comparison(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_name: str) -> None:
+def test_contract_url_failure_reports_only_failed_check_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_name: str,
+) -> None:
     settings = _settings(tmp_path)
     monkeypatch.setattr(
         startup,
         "validate_aws_ecs_settings",
         lambda _settings: [ContractCheck(failed_name, False, _SENTINEL)],
     )
-    called = False
-
-    def compare(_session: str, _landscape: str) -> None:
-        nonlocal called
-        called = True
-
-    monkeypatch.setattr(startup, "require_distinct_postgres_targets", compare)
-
     with pytest.raises(startup.AwsEcsStartupContractError) as exc_info:
         startup.enforce_aws_ecs_contract(settings)
 
     assert failed_name in str(exc_info.value)
-    assert called is False
     _assert_redacted(exc_info.value)
 
 
@@ -162,13 +158,16 @@ def test_contract_preserves_ordered_duplicate_failed_check_names(tmp_path: Path,
     _assert_redacted(exc_info.value)
 
 
-def test_target_conflict_is_translated_without_cause_or_secrets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_shared_target_conflict_check_is_translated_without_cause_or_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     settings = _settings(tmp_path)
-
-    def reject(_session: str, _landscape: str) -> None:
-        raise DatabaseTargetConflictError(_SENTINEL)
-
-    monkeypatch.setattr(startup, "require_distinct_postgres_targets", reject)
+    monkeypatch.setattr(
+        startup,
+        "validate_aws_ecs_settings",
+        lambda _settings: [ContractCheck("separate_db_targets", False, _SENTINEL)],
+    )
     with capture_logs() as logs, pytest.raises(startup.AwsEcsStartupContractError) as exc_info:
         startup.enforce_aws_ecs_contract(settings)
 
@@ -487,7 +486,7 @@ def test_terminal_operational_error_and_retry_logs_are_redacted() -> None:
     _assert_redacted(logs)
     assert len(logs) == 1
     assert set(logs[0]) == {"event", "log_level", "label", "attempt", "elapsed_seconds", "exc_class"}
-    assert logs[0]["event"] == "aws_ecs_schema_probe_retry"
+    assert logs[0]["event"] == "external_state_schema_probe_retry"
     assert logs[0]["attempt"] == 1
     assert logs[0]["exc_class"] == "OperationalError"
 
@@ -505,13 +504,13 @@ def test_validate_only_probes_session_then_landscape_on_connections(tmp_path: Pa
 
     def probe(engine: _DisposableEngine, callback: Callable[[object], SchemaState], *, label: str, **_kwargs: object) -> SchemaState:
         order.append(label)
-        expected = startup.probe_session_schema if label == "session_schema" else startup.probe_landscape_schema
+        expected = external_startup.probe_session_schema if label == "session_schema" else external_startup.probe_landscape_schema
         assert callback is expected
         assert engine is (session_engine if label == "session_schema" else landscape_engine)
         return SchemaState.CURRENT
 
-    monkeypatch.setattr(startup, "create_engine", make_engine)
-    monkeypatch.setattr(startup, "_probe_with_connection_budget", probe)
+    monkeypatch.setattr(external_startup, "create_engine", make_engine)
+    monkeypatch.setattr(external_startup, "_probe_with_connection_budget", probe)
 
     startup.validate_only_schema_or_raise(settings, session_engine)  # type: ignore[arg-type]
 
@@ -529,8 +528,12 @@ def test_validate_only_probes_session_then_landscape_on_connections(tmp_path: Pa
 @pytest.mark.parametrize("state", [SchemaState.MISSING, SchemaState.PARTIAL, SchemaState.STALE])
 def test_session_noncurrent_stops_before_landscape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: SchemaState) -> None:
     settings = _settings(tmp_path)
-    monkeypatch.setattr(startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: state)
-    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: pytest.fail("Landscape engine must not be built"))
+    monkeypatch.setattr(external_startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(
+        external_startup,
+        "create_engine",
+        lambda *_args, **_kwargs: pytest.fail("Landscape engine must not be built"),
+    )
 
     with pytest.raises(startup.AwsEcsSchemaNotReadyError, match="session_schema"):
         startup.validate_only_schema_or_raise(settings, _DisposableEngine("session"))  # type: ignore[arg-type]
@@ -541,8 +544,8 @@ def test_landscape_noncurrent_fails_and_disposes(tmp_path: Path, monkeypatch: py
     settings = _settings(tmp_path)
     landscape_engine = _DisposableEngine("landscape")
     states = iter([SchemaState.CURRENT, state])
-    monkeypatch.setattr(startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: next(states))
-    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+    monkeypatch.setattr(external_startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: next(states))
+    monkeypatch.setattr(external_startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
 
     with pytest.raises(startup.AwsEcsSchemaNotReadyError, match="landscape_schema"):
         startup.validate_only_schema_or_raise(settings, _DisposableEngine("session"))  # type: ignore[arg-type]
@@ -567,10 +570,52 @@ def test_landscape_engine_disposed_for_probe_failures(
             return SchemaState.CURRENT
         raise error
 
-    monkeypatch.setattr(startup, "_probe_with_connection_budget", probe)
-    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+    monkeypatch.setattr(external_startup, "_probe_with_connection_budget", probe)
+    monkeypatch.setattr(external_startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
 
     with pytest.raises(type(error)):
         startup.validate_only_schema_or_raise(settings, _DisposableEngine("session"))  # type: ignore[arg-type]
 
     assert landscape_engine.dispose_calls == 1
+
+
+def test_aws_compatibility_errors_are_specialized_generic_errors() -> None:
+    assert issubclass(startup.AwsEcsStartupContractError, external_startup.ExternalStateStartupContractError)
+    assert issubclass(startup.AwsEcsSchemaNotReadyError, external_startup.ExternalStateSchemaNotReadyError)
+
+
+def test_aws_directory_wrapper_translates_generic_error_with_aws_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = external_startup.ExternalStateStartupContractError(
+        "External-state runtime directory data_dir (ELSPETH_WEB__DATA_DIR) is missing or invalid. "
+        "Run 'elspeth doctor deployment' for full diagnostics."
+    )
+    monkeypatch.setattr(external_startup, "require_runtime_directories_mounted", lambda _settings: (_ for _ in ()).throw(error))
+
+    with pytest.raises(startup.AwsEcsStartupContractError) as exc_info:
+        startup.require_runtime_directories_mounted(_settings(tmp_path))
+
+    assert exc_info.value.__cause__ is None
+    assert "AWS ECS runtime directory data_dir" in str(exc_info.value)
+    assert "doctor aws-ecs" in str(exc_info.value)
+    assert "doctor deployment" not in str(exc_info.value)
+
+
+def test_aws_validate_only_wrapper_translates_generic_schema_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = external_startup.ExternalStateSchemaNotReadyError(
+        "External-state session_schema is not ready and startup repair is disabled. Run 'elspeth doctor deployment' for full diagnostics."
+    )
+    monkeypatch.setattr(external_startup, "validate_only_schema_or_raise", lambda *_args: (_ for _ in ()).throw(error))
+
+    with pytest.raises(startup.AwsEcsSchemaNotReadyError) as exc_info:
+        startup.validate_only_schema_or_raise(_settings(tmp_path), _DisposableEngine("session"))  # type: ignore[arg-type]
+
+    assert exc_info.value.__cause__ is None
+    assert "AWS ECS session_schema" in str(exc_info.value)
+    assert "doctor aws-ecs" in str(exc_info.value)
+    assert "doctor deployment" not in str(exc_info.value)
