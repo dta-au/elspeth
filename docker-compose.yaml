@@ -24,8 +24,8 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ./input:/app/input:ro
-      - ./output:/app/output
-      - ./state:/app/state
+      - elspeth_output:/app/output
+      - elspeth_cli_state:/app/state
     command: ["--help"]
 
   jaeger:
@@ -37,3 +37,7 @@ services:
       - "4318:4318"
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+
+volumes:
+  elspeth_output:
+  elspeth_cli_state:

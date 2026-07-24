@@ -25,6 +25,30 @@ services:
       timeout: 5s
       retries: 12
       start_period: 5s
+    restart: unless-stopped
+
+  postgres-bootstrap:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+    command:
+      - psql
+      - --host
+      - postgres
+      - --username
+      - elspeth
+      - --dbname
+      - postgres
+      - --set
+      - ON_ERROR_STOP=1
+      - --file
+      - /bootstrap/postgres-init.sql
+    volumes:
+      - ./deploy/compose/postgres-init.sql:/bootstrap/postgres-init.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
 volumes:
   postgres_data:

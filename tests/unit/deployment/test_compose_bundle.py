@@ -19,6 +19,12 @@ ENV_EXAMPLE = REPO_ROOT / "deploy" / "compose" / ".env.example"
 
 ELSPETH_IMAGE = "${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}"
 POSTGRES_PASSWORD_REF = "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}"
+COMPOSE_TEST_ENVIRONMENT = os.environ | {
+    "IMAGE_TAG": "sha-test",
+    "POSTGRES_PASSWORD": "0123456789abcdef0123456789abcdef0123456789abcdef",
+    "ELSPETH_WEB_SECRET_KEY": "test-only-secret-key-with-more-than-32-bytes",
+    "ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+}
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -49,6 +55,31 @@ def _volume_targets(service: dict[str, Any]) -> list[str]:
     return targets
 
 
+def _rendered_bundle() -> dict[str, Any]:
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            "docker-compose.yaml",
+            "-f",
+            "deploy/compose/postgres.yaml",
+            "-f",
+            "deploy/compose/web-postgres.yaml",
+            "config",
+        ],
+        cwd=REPO_ROOT,
+        env=COMPOSE_TEST_ENVIRONMENT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    rendered = yaml.safe_load(result.stdout)
+    assert isinstance(rendered, dict)
+    return rendered
+
+
 def test_base_is_cli_first_sqlite_with_an_immutable_elspeth_image() -> None:
     document = _load(BASE_COMPOSE)
     service = _service(document, "elspeth")
@@ -57,6 +88,17 @@ def test_base_is_cli_first_sqlite_with_an_immutable_elspeth_image() -> None:
     assert service["command"] == ["--help"]
     assert _environment(service)["DATABASE_URL"].startswith("${DATABASE_URL:-sqlite:")
     assert "postgres" not in document["services"]
+
+
+def test_base_uses_named_volumes_for_writable_cli_paths() -> None:
+    document = _load(BASE_COMPOSE)
+    service = _service(document, "elspeth")
+
+    assert "elspeth_output" in document["volumes"]
+    assert "elspeth_cli_state" in document["volumes"]
+    assert "elspeth_output:/app/output" in service["volumes"]
+    assert "elspeth_cli_state:/app/state" in service["volumes"]
+    assert not any(volume.startswith("./output:") or volume.startswith("./state:") for volume in service["volumes"])
 
 
 def test_no_compose_artifact_defaults_to_latest() -> None:
@@ -79,6 +121,7 @@ def test_postgresql_overlay_wires_a_healthy_persistent_server_and_cli_database()
     assert any(volume.startswith("postgres_data:") and "/var/lib/postgresql/data" in volume for volume in postgres["volumes"])
     assert any("postgres-init.sql" in volume and "/docker-entrypoint-initdb.d/" in volume for volume in postgres["volumes"])
     assert _environment(postgres)["POSTGRES_PASSWORD"] == POSTGRES_PASSWORD_REF
+    assert postgres["restart"] == "unless-stopped"
 
     database_url = _environment(cli)["DATABASE_URL"]
     assert database_url == ("postgresql+psycopg://elspeth:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/elspeth_landscape")
@@ -87,9 +130,41 @@ def test_postgresql_overlay_wires_a_healthy_persistent_server_and_cli_database()
 
 def test_postgresql_initializer_creates_exactly_the_two_application_databases() -> None:
     sql = POSTGRES_INIT.read_text(encoding="utf-8")
-    created = re.findall(r"(?im)^\s*CREATE\s+DATABASE\s+([a-z_][a-z0-9_]*)\b", sql)
+    created = re.findall(r"CREATE\s+DATABASE\s+([a-z_][a-z0-9_]*)\b", sql, re.IGNORECASE)
 
     assert created == ["elspeth_sessions", "elspeth_landscape"]
+    assert sql.upper().count("WHERE NOT EXISTS") == 2
+    assert sql.count("\\gexec") == 2
+
+
+def test_postgresql_bootstrap_reconciles_reused_data_volumes_before_web_init() -> None:
+    static = _load(POSTGRES_COMPOSE)
+    bootstrap = _service(static, "postgres-bootstrap")
+
+    assert bootstrap["image"] == "postgres:16-alpine"
+    assert bootstrap["depends_on"]["postgres"]["condition"] == "service_healthy"
+    assert _environment(bootstrap)["PGPASSWORD"] == POSTGRES_PASSWORD_REF
+    assert bootstrap["command"] == [
+        "psql",
+        "--host",
+        "postgres",
+        "--username",
+        "elspeth",
+        "--dbname",
+        "postgres",
+        "--set",
+        "ON_ERROR_STOP=1",
+        "--file",
+        "/bootstrap/postgres-init.sql",
+    ]
+    assert any("postgres-init.sql:/bootstrap/postgres-init.sql:ro" in volume for volume in bootstrap["volumes"])
+    assert bootstrap["restart"] == "no"
+
+    rendered = _rendered_bundle()
+    rendered_bootstrap = _service(rendered, "postgres-bootstrap")
+    rendered_web_init = _service(rendered, "web-init")
+    assert rendered_bootstrap["depends_on"]["postgres"]["condition"] == "service_healthy"
+    assert rendered_web_init["depends_on"]["postgres-bootstrap"]["condition"] == "service_completed_successfully"
 
 
 def test_state_initializer_repairs_all_private_state_directories_then_exits() -> None:
@@ -152,6 +227,7 @@ def test_web_initialization_is_ordered_before_the_web_process() -> None:
 
     assert web_init["command"] == ["doctor", "deployment", "--init-schema"]
     assert web_init["depends_on"]["postgres"]["condition"] == "service_healthy"
+    assert web_init["depends_on"]["postgres-bootstrap"]["condition"] == "service_completed_successfully"
     assert web_init["depends_on"]["state-init"]["condition"] == "service_completed_successfully"
     assert _volume_targets(web_init).count("/app/state") == 1
     assert web["depends_on"] == {"web-init": {"condition": "service_completed_successfully"}}
@@ -179,27 +255,29 @@ def test_example_environment_requires_url_safe_generated_password_and_no_secrets
     assert "openssl rand -hex 24" in text
     assert "48-character lowercase hexadecimal" in text
     assert re.search(r"^[0-9a-f]{48}$", "0" * 48)
-    for name in (
+    sensitive_markers = ("PASSWORD", "SECRET", "KEY", "SIGNING", "FINGERPRINT")
+    sensitive_assignments = {
+        name: value for name, value in assignments.items() if any(marker in name.upper() for marker in sensitive_markers)
+    }
+    assert {
         "POSTGRES_PASSWORD",
         "ELSPETH_WEB_SECRET_KEY",
         "ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY",
-        "OPENROUTER_API_KEY",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "AZURE_API_KEY",
-        "AZURE_CONTENT_SAFETY_KEY",
-    ):
-        assert name in assignments
-        assert assignments[name] == ""
+        "AZURE_OPENAI_API_KEY",
+        "ELSPETH_FINGERPRINT_KEY",
+    } <= sensitive_assignments.keys()
+    assert sensitive_assignments
+    assert set(sensitive_assignments.values()) == {""}
+
+
+def test_example_environment_names_the_repository_root_destination() -> None:
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+
+    assert "cp deploy/compose/.env.example .env" in text
+    assert "repository-root .env" in text
 
 
 def test_supported_three_file_compose_bundle_renders() -> None:
-    environment = os.environ | {
-        "IMAGE_TAG": "sha-test",
-        "POSTGRES_PASSWORD": "0123456789abcdef0123456789abcdef0123456789abcdef",
-        "ELSPETH_WEB_SECRET_KEY": "test-only-secret-key-with-more-than-32-bytes",
-        "ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
-    }
     result = subprocess.run(
         [
             "docker",
@@ -214,7 +292,7 @@ def test_supported_three_file_compose_bundle_renders() -> None:
             "--quiet",
         ],
         cwd=REPO_ROOT,
-        env=environment,
+        env=COMPOSE_TEST_ENVIRONMENT,
         check=False,
         capture_output=True,
         text=True,
