@@ -19,12 +19,12 @@ processes never run concurrently.
 - `/var/lib/elspeth` on persistent host storage; and
 - either SQLite on that single host or distinct external PostgreSQL databases.
 
-For an Azure production deployment, use external Azure Database for
-PostgreSQL. SQLite is acceptable only when the Azure VM is explicitly the one
-persistent host and operators back up its local databases with the payload
-store. Azure Container Apps remains unsupported until the cross-instance
-fencing work in `elspeth-b5d7aa5655` lands; the runtime target value is
-reserved, not an alternative procedure in this runbook.
+Azure production requires external Azure Database for PostgreSQL. Azure VM
+SQLite is supported only for explicitly non-production use on one persistent
+host, and operators must back up its local databases with the payload store.
+Azure Container Apps remains unsupported until the cross-instance fencing work
+in `elspeth-b5d7aa5655` lands; the runtime target value is reserved, not an
+alternative procedure in this runbook.
 
 The ELSPETH release image contains PostgreSQL clients, not a PostgreSQL server.
 Native installs include the same two drivers: `postgresql+psycopg://` selects
@@ -54,22 +54,13 @@ network controls and validate the expected Front Door identifier at the
 origin. Do not add a second VM for availability; ELSPETH does not yet support
 that topology.
 
-## Release and integrity gate
+## Release compatibility
 
 The schema-incompatible 0.7.2 upgrade from 0.7.1 is not an in-place session
 database migration. Before a direct 0.7.1→0.7.2 upgrade, archive required
 evidence, drain and stop the old service, recreate the session database at the
 new epoch, and repair forward. Do not start 0.7.1 against the recreated 0.7.2
 session database.
-
-Run the supported trust-tier gate from the exact reviewed source checkout:
-
-`elspeth-lints check --rules trust_tier.tier_model --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model`
-
-Supply `ELSPETH_JUDGE_METADATA_HMAC_KEY` from the operator's protected secret
-store when the gate needs signed judge metadata. Never print or retain the key
-in the deployment log. Stop the deployment if this gate or the release test
-suite fails.
 
 ## Install the immutable release
 
@@ -85,11 +76,23 @@ fi
 sudo -u elspeth git -C /opt/elspeth fetch --tags --force
 sudo -u elspeth git -C /opt/elspeth checkout --detach "$ELSPETH_RELEASE_REF"
 cd /opt/elspeth
+sudo --preserve-env=ELSPETH_JUDGE_METADATA_HMAC_KEY -u elspeth \
+  uv run --frozen --extra dev elspeth-lints check --rules trust_tier.tier_model \
+  --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model
 sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra postgres
 ```
 
+The supported gate payload is
+`elspeth-lints check --rules trust_tier.tier_model --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model`;
+invoke it through the `uv run --frozen --extra dev` command above so its
+declared dependency is present.
+
 Record `git -C /opt/elspeth rev-parse HEAD` in the deployment log. Do not
-deploy a moving branch.
+deploy a moving branch. Supply `ELSPETH_JUDGE_METADATA_HMAC_KEY` from the
+operator's protected secret store before the gate; never print or retain it in
+the deployment log. The final exact `uv sync` removes the development-only
+gate dependencies and leaves the production environment with only the four
+listed runtime extras. Stop if the gate or sync fails.
 
 Install the portable service and its environment file:
 
@@ -199,20 +202,49 @@ replacement until the old process is gone.
 4. **Install the reviewed release.** Check out the immutable tag or commit,
    run the frozen `uv sync` command above, reinstall the tracked service unit,
    and run `systemctl daemon-reload`.
-5. **Validate while drained.** Run `elspeth doctor deployment` with the runtime
-   environment. Do not use `--init-schema` for an ordinary upgrade.
-6. **Start one process and verify locally.**
 
-   ```bash
-   sudo systemctl start elspeth-web.service
-   sudo systemctl is-active --quiet elspeth-web.service
-   curl -fsS http://127.0.0.1:8451/api/health
-   curl -fsS http://127.0.0.1:8451/api/ready
-   ```
+Choose exactly one validation branch from the configured state mode.
 
-7. **Restore public service.** Only after doctor and `/api/ready` succeed,
-   re-enable the reverse-proxy route or Front Door origin. Verify the public
-   `/api/ready` endpoint and one representative authenticated workflow.
+### Upgrade validation: external PostgreSQL
+
+Run the read-only external-state doctor. Do not initialize schemas during an
+ordinary upgrade.
+
+```bash
+sudo -u elspeth env -i PATH=/opt/elspeth/.venv/bin:/usr/bin:/bin \
+  /bin/bash -c 'set -a; . /etc/elspeth/elspeth-web.env; exec elspeth doctor deployment'
+sudo systemctl start elspeth-web.service
+sudo systemctl is-active --quiet elspeth-web.service
+curl -fsS http://127.0.0.1:8451/api/health
+curl -fsS http://127.0.0.1:8451/api/ready
+```
+
+### Upgrade validation: SQLite
+
+The provider-neutral external-state doctor rejects SQLite, so skip it. Verify
+the stopped databases and payload path directly, then start the replacement
+and require readiness:
+
+```bash
+for path in \
+  /var/lib/elspeth/data/sessions.db \
+  /var/lib/elspeth/data/runs/audit.db \
+  /var/lib/elspeth/payloads; do
+  sudo -u elspeth test -r "$path"
+  sudo -u elspeth test -w "$path"
+  test "$(sudo stat -c '%U:%G' "$path")" = "elspeth:elspeth"
+done
+sudo systemctl start elspeth-web.service
+sudo systemctl is-active --quiet elspeth-web.service
+curl -fsS http://127.0.0.1:8451/api/health
+curl -fsS http://127.0.0.1:8451/api/ready
+```
+
+### Restore public service
+
+Only after the selected validation branch and `/api/ready` succeed, re-enable
+the reverse-proxy route or Front Door origin. Verify the public `/api/ready`
+endpoint and one representative authenticated workflow.
 
 If any validation fails, leave the origin drained. Do not restore public
 service merely because the process started.
@@ -226,16 +258,48 @@ Rollback is also stop-before-start:
 3. Check whether the previous release supports the current database schema.
    If it does not, keep the service drained and repair forward.
 4. Restore the coordinated database and payload recovery point when required.
-5. Check out the previous immutable release, run the frozen install, and run
-   `elspeth doctor deployment`.
-6. Start one process, verify local health and readiness, then restore the
-   origin.
+5. Check out the previous immutable release and run the frozen install.
+
+Choose the branch matching the restored state mode.
+
+### Rollback validation: external PostgreSQL
+
+```bash
+sudo -u elspeth env -i PATH=/opt/elspeth/.venv/bin:/usr/bin:/bin \
+  /bin/bash -c 'set -a; . /etc/elspeth/elspeth-web.env; exec elspeth doctor deployment'
+sudo systemctl start elspeth-web.service
+sudo systemctl is-active --quiet elspeth-web.service
+curl -fsS http://127.0.0.1:8451/api/health
+curl -fsS http://127.0.0.1:8451/api/ready
+```
+
+### Rollback validation: SQLite
+
+```bash
+for path in \
+  /var/lib/elspeth/data/sessions.db \
+  /var/lib/elspeth/data/runs/audit.db \
+  /var/lib/elspeth/payloads; do
+  sudo -u elspeth test -r "$path"
+  sudo -u elspeth test -w "$path"
+  test "$(sudo stat -c '%U:%G' "$path")" = "elspeth:elspeth"
+done
+sudo systemctl start elspeth-web.service
+sudo systemctl is-active --quiet elspeth-web.service
+curl -fsS http://127.0.0.1:8451/api/health
+curl -fsS http://127.0.0.1:8451/api/ready
+```
+
+### Restore the rollback
+
+Restore the origin only after the selected branch succeeds. Verify public
+readiness and one representative authenticated workflow.
 
 Never run old and new releases together against the same state.
 
 ## Troubleshooting
 
-### Doctor reports a schema mismatch
+### External PostgreSQL doctor reports a schema mismatch
 
 Keep the service stopped. Confirm the candidate release and database target.
 Use `--init-schema` only for a new empty database with the approved schema-owner
@@ -264,11 +328,50 @@ passes.
 
 ## Completion checklist
 
+### External PostgreSQL completion
+
+```bash
+sudo -u elspeth env -i PATH=/opt/elspeth/.venv/bin:/usr/bin:/bin \
+  /bin/bash -c 'set -a; . /etc/elspeth/elspeth-web.env; exec elspeth doctor deployment'
+sudo systemctl is-active --quiet elspeth-web.service
+curl -fsS http://127.0.0.1:8451/api/health
+curl -fsS http://127.0.0.1:8451/api/ready
+```
+
 - [ ] Immutable release commit recorded.
 - [ ] Exactly one `elspeth web` process runs with `WEB_CONCURRENCY=1`.
 - [ ] `elspeth doctor deployment` passes with the runtime principal.
 - [ ] Local `/api/health` and `/api/ready` return HTTP 200.
 - [ ] Database and payload backups share a recovery-point record.
+- [ ] Public routing was restored only after readiness passed.
+- [ ] Deployment log records the availability interruption.
+
+### SQLite completion
+
+```bash
+for path in \
+  /var/lib/elspeth/data/sessions.db \
+  /var/lib/elspeth/data/runs/audit.db \
+  /var/lib/elspeth/payloads; do
+  sudo -u elspeth test -r "$path"
+  sudo -u elspeth test -w "$path"
+  test "$(sudo stat -c '%U:%G' "$path")" = "elspeth:elspeth"
+done
+sudo systemctl is-active --quiet elspeth-web.service
+curl -fsS http://127.0.0.1:8451/api/health
+curl -fsS http://127.0.0.1:8451/api/ready
+```
+
+- [ ] Immutable release commit recorded.
+- [ ] Exactly one `elspeth web` process runs with `WEB_CONCURRENCY=1`.
+- [ ] `/var/lib/elspeth/data/sessions.db` and
+  `/var/lib/elspeth/data/runs/audit.db` are readable, writable, and owned by
+  `elspeth:elspeth`.
+- [ ] `/var/lib/elspeth/payloads` is readable, writable, and owned by
+  `elspeth:elspeth`.
+- [ ] Local `/api/health` and `/api/ready` return HTTP 200 after the service
+  starts.
+- [ ] SQLite and payload backups share a recovery-point record.
 - [ ] Public routing was restored only after readiness passed.
 - [ ] Deployment log records the availability interruption.
 

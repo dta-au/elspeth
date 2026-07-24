@@ -17,14 +17,14 @@ database persistence: preserve both stores across every replacement.
 | Profile | Database | Payload storage | Deployment entry point | Status |
 | --- | --- | --- | --- | --- |
 | Docker Compose | Bundled PostgreSQL sidecar, or operator external PostgreSQL; SQLite remains suitable for CLI/local work | Named `elspeth_state` volume | [Docker guide](../guides/docker.md) and [`deploy/compose`](../../deploy/compose) three-file bundle | Maintained |
-| AWS ECS | External Aurora PostgreSQL or PostgreSQL | EFS or another external filesystem | [AWS ECS live-task clone runbook](../runbooks/aws-ecs-deployment.md) | Maintained |
-| Azure Ubuntu VM | External Azure Database for PostgreSQL in production; SQLite only for an explicitly single-host installation | Persistent host storage | [Native Linux/Azure VM runbook](../runbooks/ansible-ubuntu-deployment.md) using [`deploy/linux-systemd/elspeth-web.service`](../../deploy/linux-systemd/elspeth-web.service) | Maintained as exactly one Azure Ubuntu VM |
+| AWS ECS | External Aurora PostgreSQL or PostgreSQL | EFS or another external filesystem | [AWS ECS operator-supplied task-definition runbook/controller](../runbooks/aws-ecs-deployment.md) | Maintained |
+| Azure Ubuntu VM | External Azure Database for PostgreSQL in production; SQLite only for explicitly non-production use on one persistent host | Persistent host storage | [Native Linux/Azure VM runbook](../runbooks/ansible-ubuntu-deployment.md) using [`deploy/linux-systemd/elspeth-web.service`](../../deploy/linux-systemd/elspeth-web.service) | Maintained as exactly one Azure Ubuntu VM |
 | Kubernetes (BYO manifests) | External PostgreSQL | Operator-provided persistent payload storage | BYO manifests only | Runtime contract only; no maintained bundle in this release |
 | Native Linux | SQLite on one single host, or external PostgreSQL | Persistent host directory | [Native Linux/Azure VM runbook](../runbooks/ansible-ubuntu-deployment.md) and [portable systemd unit](../../deploy/linux-systemd/elspeth-web.service) | Maintained |
 
 There is no generated deployment-profile schema in this release. The tracked
 deployment artifacts are the Compose and portable systemd bundles plus the AWS
-live-task clone implementation described by its runbook.
+acceptance/deployment controller described by its runbook.
 
 ## Shared production contract
 
@@ -54,9 +54,11 @@ state volumes have independent lifecycles.
 ## AWS ECS
 
 AWS uses one ECS task, external Aurora PostgreSQL/PostgreSQL, and durable EFS
-paths. The [AWS runbook](../runbooks/aws-ecs-deployment.md) clones the live task
-definition and enforces `minimumHealthyPercent=0`, `maximumPercent=100`, and
-`desiredCount=1` so replacement is deliberately zero-overlap.
+paths. The operator supplies candidate, doctor, and previous task-definition
+ARNs to the [AWS runbook/controller](../runbooks/aws-ecs-deployment.md), which
+validates the exact definitions and enforces `minimumHealthyPercent=0`,
+`maximumPercent=100`, and `desiredCount=1` so replacement is deliberately
+zero-overlap.
 
 ## Azure
 
@@ -67,9 +69,9 @@ disable the origin, stop ELSPETH, prove no process remains, deploy and validate
 the replacement, then restore the origin. This causes a deliberate availability
 interruption.
 
-Use Azure Database for PostgreSQL for production. SQLite is permitted only
-when the Azure VM is the one persistent host and its database is backed up with
-the payload store.
+Azure production requires external Azure Database for PostgreSQL. Azure VM
+SQLite is supported only for explicitly non-production use on one persistent
+host. Back up its database with the payload store.
 
 The `azure-container-apps` runtime target value is reserved for a future
 deployment contract. Azure Container Apps is unsupported and its bundle is

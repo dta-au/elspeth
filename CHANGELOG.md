@@ -10,11 +10,12 @@ All notable changes to ELSPETH are documented here.
 
 - **Honest cross-platform deployment contract** — the release publishes a
   maintained three-file Docker Compose/PostgreSQL bundle, the existing AWS ECS
-  live-task clone path, and a portable native Linux systemd bundle. Azure
-  support uses exactly one Azure Ubuntu VM with the Linux stop-before-start
-  procedure. Kubernetes exposes the provider-neutral runtime contract for BYO
-  manifests but ships no maintained manifest bundle, and Azure Container Apps
-  remains deferred pending cross-instance fencing.
+  acceptance/deployment controller for operator-supplied task-definition ARNs,
+  and a portable native Linux systemd bundle. Azure support uses exactly one
+  Azure Ubuntu VM with the Linux stop-before-start procedure. Kubernetes
+  exposes the provider-neutral runtime contract for BYO manifests but ships no
+  maintained manifest bundle, and Azure Container Apps remains deferred
+  pending cross-instance fencing.
 - **PostgreSQL ownership is explicit** — release images contain psycopg and
   psycopg2 clients, not a PostgreSQL server. Compose is the only shipped bundle
   that provisions the server; AWS ECS, Azure VM production, and Kubernetes BYO

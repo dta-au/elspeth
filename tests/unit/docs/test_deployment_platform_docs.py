@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -22,6 +23,13 @@ def _read(path: Path) -> str:
 
 def _normalized(path: Path) -> str:
     return " ".join(_read(path).split())
+
+
+def _section(text: str, start: str, end: str | None = None) -> str:
+    section = text[text.index(start) :]
+    if end is not None:
+        section = section[: section.index(end)]
+    return section
 
 
 def test_support_matrix_links_only_shipped_deployment_artifacts() -> None:
@@ -145,6 +153,63 @@ def test_native_linux_documents_sqlite_or_postgresql_and_postgres_extra() -> Non
     assert "doctor deployment --init-schema" in text
 
 
+def test_native_linux_branches_upgrade_and_rollback_checks_by_state_mode() -> None:
+    text = _read(UBUNTU_RUNBOOK)
+
+    for prefix, next_heading in (
+        ("### Upgrade validation: external PostgreSQL", "### Upgrade validation: SQLite"),
+        ("### Rollback validation: external PostgreSQL", "### Rollback validation: SQLite"),
+    ):
+        external = _section(text, prefix, next_heading)
+        assert "doctor deployment" in external
+        assert "--init-schema" not in external
+        assert "curl -fsS http://127.0.0.1:8451/api/ready" in external
+
+    upgrade_sqlite = _section(text, "### Upgrade validation: SQLite", "### Restore public service")
+    rollback_sqlite = _section(text, "### Rollback validation: SQLite", "### Restore the rollback")
+    for sqlite in (upgrade_sqlite, rollback_sqlite):
+        assert "doctor deployment" not in sqlite
+        assert "/var/lib/elspeth/data/sessions.db" in sqlite
+        assert "/var/lib/elspeth/data/runs/audit.db" in sqlite
+        assert "stat -c '%U:%G'" in sqlite
+        assert "sudo systemctl start elspeth-web.service" in sqlite
+        assert "curl -fsS http://127.0.0.1:8451/api/ready" in sqlite
+
+
+def test_native_linux_completion_checks_are_state_mode_specific() -> None:
+    text = _read(UBUNTU_RUNBOOK)
+    external = _section(text, "### External PostgreSQL completion", "### SQLite completion")
+    sqlite = _section(text, "### SQLite completion", "## See also")
+
+    assert "doctor deployment" in external
+    assert "exec elspeth doctor deployment" in external
+    assert "sudo systemctl is-active --quiet elspeth-web.service" in external
+    assert "curl -fsS http://127.0.0.1:8451/api/ready" in external
+    assert "doctor deployment" not in sqlite
+    assert "/var/lib/elspeth/data/sessions.db" in sqlite
+    assert "/var/lib/elspeth/data/runs/audit.db" in sqlite
+    assert "sudo -u elspeth test -r" in sqlite
+    assert "stat -c '%U:%G'" in sqlite
+    assert "sudo systemctl is-active --quiet elspeth-web.service" in sqlite
+    assert "/api/ready" in sqlite
+
+
+def test_native_linux_trust_gate_runs_after_checkout_with_dev_dependency_then_syncs_lean() -> None:
+    text = " ".join(_read(UBUNTU_RUNBOOK).replace("\\\n", "").split())
+    gate = (
+        "uv run --frozen --extra dev elspeth-lints check --rules trust_tier.tier_model "
+        "--root src/elspeth --allowlist-dir config/cicd/enforce_tier_model"
+    )
+    lean_sync = "uv sync --frozen --extra webui --extra azure --extra llm --extra postgres"
+
+    assert text.index('git -C /opt/elspeth checkout --detach "$ELSPETH_RELEASE_REF"') < text.index(gate)
+    assert text.index(gate) < text.index(lean_sync)
+    assert "removes the development-only gate dependencies" in text
+
+    pyproject = tomllib.loads(_read(REPO_ROOT / "pyproject.toml"))
+    assert "elspeth-lints" in pyproject["project"]["optional-dependencies"]["dev"]
+
+
 def test_aws_retains_the_zero_overlap_ecs_controls() -> None:
     text = _read(AWS_RUNBOOK)
 
@@ -155,6 +220,26 @@ def test_aws_retains_the_zero_overlap_ecs_controls() -> None:
     assert "maximumPercent=100" in text
     assert "desiredCount=1" in text
     assert "doctor aws-ecs --init-schema" in text
+
+
+def test_aws_docs_require_operator_supplied_task_definition_arns_without_claiming_clone() -> None:
+    for path in (PLATFORM_DOC, README, CHANGELOG, AWS_RUNBOOK):
+        assert "live-task clone" not in _read(path).lower(), path
+
+    matrix = _normalized(PLATFORM_DOC)
+    assert "operator supplies candidate, doctor, and previous task-definition ARNs" in matrix
+    assert "CANDIDATE_TASK_DEFINITION" in _read(AWS_RUNBOOK)
+    assert "DOCTOR_TASK_DEFINITION" in _read(AWS_RUNBOOK)
+    assert "PREVIOUS_TASK_DEFINITION" in _read(AWS_RUNBOOK)
+    assert "operator-supplied task-definition ARNs" in _normalized(README)
+    assert "operator-supplied task-definition ARNs" in _normalized(CHANGELOG)
+
+
+def test_azure_sqlite_scope_is_consistent() -> None:
+    for path in (PLATFORM_DOC, DOCKER_GUIDE, UBUNTU_RUNBOOK):
+        text = _normalized(path)
+        assert "Azure production requires external Azure Database for PostgreSQL" in text, path
+        assert "Azure VM SQLite is supported only for explicitly non-production use on one persistent host" in text, path
 
 
 def test_environment_reference_documents_deployment_state_settings() -> None:

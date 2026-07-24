@@ -75,9 +75,9 @@ The image contains PostgreSQL clients, not a PostgreSQL server. It supports
 `postgresql+psycopg2://` with psycopg2. Compose is the only shipped bundle
 that provisions PostgreSQL. AWS ECS, Azure production, and BYO Kubernetes
 deployments require external PostgreSQL. Native Linux may use SQLite on one
-persistent host. An Azure VM may use SQLite only for explicitly
-non-production, single-persistent-host use; production Azure uses Azure
-Database for PostgreSQL.
+persistent host. Azure production requires external Azure Database for
+PostgreSQL. Azure VM SQLite is supported only for explicitly non-production
+use on one persistent host.
 
 ```bash
 docker run --rm \
@@ -218,6 +218,8 @@ docker compose run -it --rm elspeth explain --run latest --row 42 --database /ap
 Run the shipped bundle from the repository root. It starts one web process,
 PostgreSQL 16, distinct session and Landscape databases, schema initialization,
 and separate PostgreSQL and ELSPETH state volumes.
+The `web-init` service runs `doctor deployment --init-schema` before the web
+service starts.
 
 1. Create the repository-root `.env`:
 
@@ -255,7 +257,7 @@ and separate PostgreSQL and ELSPETH state volumes.
      -f docker-compose.yaml \
      -f deploy/compose/postgres.yaml \
      -f deploy/compose/web-postgres.yaml run --rm web-init \
-     doctor deployment --init-schema
+     doctor deployment
    curl -fsS http://127.0.0.1:8451/api/ready
    ```
 

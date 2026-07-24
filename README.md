@@ -855,7 +855,9 @@ Ubuntu VM path use external PostgreSQL in production. Run one web process and
 preserve payload persistence separately from database persistence. See the
 [deployment platform matrix](docs/reference/deployment-platforms.md) for the
 maintained Compose, AWS ECS, and native Linux paths plus the explicit Azure VM
-and Kubernetes boundaries.
+and Kubernetes boundaries. The AWS procedure validates operator-supplied
+task-definition ARNs; it does not synthesize or clone a generic task
+definition.
 
 ```bash
 IMAGE_TAG=v0.7.2

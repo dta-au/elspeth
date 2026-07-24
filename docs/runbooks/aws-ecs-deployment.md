@@ -36,6 +36,12 @@ application and collector have deliberately separate evidence roles:
   never proves an audit write, and loss of the collector never rolls back a
   committed Landscape record.
 
+The controller does not synthesize or clone a generic task definition. The
+operator supplies exact `CANDIDATE_TASK_DEFINITION` and
+`DOCTOR_TASK_DEFINITION` ARNs, plus `PREVIOUS_TASK_DEFINITION` and
+`ROLLBACK_DOCTOR_TASK_DEFINITION` ARNs for an upgrade. The runbook resolves and
+validates those definitions before any service mutation.
+
 `ELSPETH_WEB__DEPLOYMENT_TARGET=aws-ecs` requires external PostgreSQL
 `session_db_url` and `landscape_url` values. The image contains PostgreSQL
 clients, not a PostgreSQL server. Both `postgresql+psycopg2://...` (psycopg2)

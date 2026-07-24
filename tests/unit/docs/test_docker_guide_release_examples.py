@@ -48,6 +48,12 @@ def test_docker_guide_uses_the_shipped_three_file_postgresql_bundle() -> None:
     assert "48-character lowercase hexadecimal" in text
     assert "doctor deployment --init-schema" in text
 
+    verification = text[text.index("4. Verify the one-shot schema gate and readiness:") :]
+    verification = verification[: verification.index("\n---")]
+    assert "run --rm web-init" in verification
+    assert "doctor deployment" in verification
+    assert "doctor deployment --init-schema" not in verification
+
 
 def test_docker_guide_explains_the_container_database_boundary() -> None:
     text = DOCKER_GUIDE.read_text(encoding="utf-8")
@@ -63,5 +69,5 @@ def test_docker_guide_explains_the_container_database_boundary() -> None:
     assert "database persistence" in text.lower()
     assert "AWS, an Azure Ubuntu VM, or BYO Kubernetes manifests must connect" not in normalized
     assert "AWS ECS, Azure production, and BYO Kubernetes deployments require external PostgreSQL" in normalized
-    assert "An Azure VM may use SQLite only for explicitly non-production, single-persistent-host use" in normalized
+    assert "Azure VM SQLite is supported only for explicitly non-production use on one persistent host" in normalized
     assert "Native Linux may use SQLite on one persistent host" in normalized
