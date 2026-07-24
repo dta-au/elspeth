@@ -65,7 +65,6 @@ from ._aws_ecs_acceptance.capture import (
 from ._aws_ecs_acceptance.contracts import (
     _EMERGENCY_CLEANUP_SECONDS,
     _EVIDENCE_KINDS,
-    _GIT_SHA_PATTERN,
     _SHA256_PATTERN,
     MAX_CONTROL_DOCUMENT_BYTES,
     MAX_EXEC_STREAM_BYTES,
@@ -121,6 +120,43 @@ from ._aws_ecs_acceptance.contracts import (
 )
 from ._aws_ecs_acceptance.contracts import (
     plugin_policy_binding_sha256 as plugin_policy_binding_sha256,
+)
+from ._aws_ecs_acceptance.evidence import (
+    _final_cleanup_receipt_document,
+    _reverify_bound_evidence_export_receipt,
+    _validate_evidence_export_receipt,
+    _verify_final_cleanup_receipt,
+    _verify_stored_receipts,
+)
+from ._aws_ecs_acceptance.evidence import (
+    create_evidence_export_receipt as create_evidence_export_receipt,
+)
+from ._aws_ecs_acceptance.evidence import sanitize_evidence as sanitize_evidence
+from ._aws_ecs_acceptance.gate_ledger import (
+    _CLEANUP_GATE_CHECK_ORDER,
+    _GATE_LEDGER_GET_FIELDS,
+    _TERMINAL_GATE_CHECK_ID,
+    _gate_ledger_records_hash,
+    _read_gate_ledger,
+)
+from ._aws_ecs_acceptance.gate_ledger import (
+    _REQUIRED_GATE_CHECK_IDS as _REQUIRED_GATE_CHECK_IDS,
+)
+from ._aws_ecs_acceptance.gate_ledger import (
+    _SUCCESS_GATE_CHECK_ORDER as _SUCCESS_GATE_CHECK_ORDER,
+)
+from ._aws_ecs_acceptance.gate_ledger import (
+    _TASK1_GATE_CHECK_ORDER as _TASK1_GATE_CHECK_ORDER,
+)
+from ._aws_ecs_acceptance.gate_ledger import (
+    gate_ledger_bind_candidate as gate_ledger_bind_candidate,
+)
+from ._aws_ecs_acceptance.gate_ledger import gate_ledger_finalize as gate_ledger_finalize
+from ._aws_ecs_acceptance.gate_ledger import gate_ledger_get as gate_ledger_get
+from ._aws_ecs_acceptance.gate_ledger import gate_ledger_init as gate_ledger_init
+from ._aws_ecs_acceptance.gate_ledger import gate_ledger_record as gate_ledger_record
+from ._aws_ecs_acceptance.gate_ledger import (
+    gate_ledger_record_cleanup as gate_ledger_record_cleanup,
 )
 from ._aws_ecs_acceptance.http_client import AcceptanceHttpClient as AcceptanceHttpClient
 from ._aws_ecs_acceptance.manifest import (
@@ -207,7 +243,6 @@ from ._aws_ecs_acceptance.receipt_contracts import (
     _CANDIDATE_PACKAGE_VERSION,
     _ROLLBACK_PACKAGE_VERSION,
     _expected_schema_facts,
-    _validate_stored_receipt,
     encode_exec_receipt,
     extract_exec_receipt,
     resolve_exec_receipt_env,
@@ -251,9 +286,6 @@ from ._aws_ecs_acceptance.state import (
     AcceptanceState as AcceptanceState,
 )
 from ._aws_ecs_acceptance.state import (
-    _parse_state_timestamp,
-)
-from ._aws_ecs_acceptance.state import (
     read_acceptance_state as read_acceptance_state,
 )
 from ._aws_ecs_acceptance.state import (
@@ -263,34 +295,6 @@ from ._aws_ecs_acceptance.task_definition import (
     validate_task_definition_policy_binding as validate_task_definition_policy_binding,
 )
 
-_GATE_LEDGER_FIELDS = frozenset(
-    {
-        "schema",
-        "branch",
-        "starting_sha",
-        "plan_sha256",
-        "program_base_sha",
-        "reconciled_release_sha",
-        "candidate_sha",
-        "candidate_bound_record_count",
-        "records",
-        "cleanup_records",
-        "success_record_count_at_cleanup_start",
-        "finalized",
-        "created_at",
-        "updated_at",
-    }
-)
-_GATE_RECORD_FIELDS = frozenset({"check_id", "candidate_sha", "started_at", "ended_at", "exit_status", "receipt_hash"})
-_SUCCESS_GATE_CHECK_ORDER = ("candidate", "static", "tests", "image", "live")
-_CLEANUP_GATE_CHECK_ORDER = ("cleanup",)
-_REQUIRED_GATE_CHECK_ORDER = (*_SUCCESS_GATE_CHECK_ORDER, *_CLEANUP_GATE_CHECK_ORDER)
-_REQUIRED_GATE_CHECK_IDS = frozenset(_REQUIRED_GATE_CHECK_ORDER)
-_TASK1_GATE_CHECK_ORDER = ("candidate",)
-_GATE_LEDGER_GET_FIELDS = frozenset(
-    {"branch", "starting_sha", "plan_sha256", "program_base_sha", "reconciled_release_sha", "candidate_sha"}
-)
-_TERMINAL_GATE_CHECK_ID = "cleanup"
 _APPLICATION_SCENARIO_IDS = frozenset({"A", "B"})
 # Facts pinned to the Scenario B rollback baseline (the 0.7.0 image), and the
 # behaviour-named structural migration from that baseline to the current
@@ -338,115 +342,6 @@ def control_manifest_validate(
                 raise AcceptanceCheckError("control_manifest_cleanup")
         _verify_final_cleanup_receipt(path, manifest)
     return manifest
-
-
-def _validate_evidence_export_receipt(
-    path: Path,
-    *,
-    manifest: Mapping[str, object],
-    receipts_sha256: str,
-    ledger_records_sha256: str,
-) -> tuple[dict[str, object], str]:
-    receipt = _read_protected_document(path, check="evidence_export_receipt")
-    if not isinstance(receipt, dict) or set(receipt) != {
-        "schema",
-        "acceptance_run_id",
-        "destination_sha256",
-        "receipts_sha256",
-        "ledger_records_sha256",
-        "artifact_count",
-        "exported_at",
-        "verified",
-    }:
-        raise AcceptanceCheckError("evidence_export_schema")
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, Mapping)
-    if (
-        receipt["schema"] != "elspeth.aws-ecs-evidence-export.v1"
-        or receipt["acceptance_run_id"] != manifest["acceptance_run_id"]
-        or receipt["destination_sha256"] != evidence["destination_sha256"]
-        or receipt["receipts_sha256"] != receipts_sha256
-        or receipt["ledger_records_sha256"] != ledger_records_sha256
-        or receipt["verified"] is not True
-        or type(receipt["artifact_count"]) is not int
-        or receipt["artifact_count"] < 1
-    ):
-        raise AcceptanceCheckError("evidence_export_binding")
-    _control_timestamp(receipt["exported_at"])
-    canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return receipt, _sha256(canonical)
-
-
-def _reverify_bound_evidence_export_receipt(
-    path: Path,
-    *,
-    manifest: Mapping[str, object],
-    expected_sha256: str,
-) -> None:
-    document = _read_protected_document(path, check="evidence_export_receipt")
-    receipts_sha256 = document.get("receipts_sha256")
-    ledger_records_sha256 = document.get("ledger_records_sha256")
-    if (
-        type(receipts_sha256) is not str
-        or _SHA256_PATTERN.fullmatch(receipts_sha256) is None
-        or type(ledger_records_sha256) is not str
-        or _SHA256_PATTERN.fullmatch(ledger_records_sha256) is None
-    ):
-        raise AcceptanceCheckError("evidence_export_schema")
-    _receipt, observed_sha256 = _validate_evidence_export_receipt(
-        path,
-        manifest=manifest,
-        receipts_sha256=receipts_sha256,
-        ledger_records_sha256=ledger_records_sha256,
-    )
-    if observed_sha256 != expected_sha256:
-        raise AcceptanceCheckError("evidence_export_binding")
-
-
-def create_evidence_export_receipt(
-    manifest_path: Path,
-    *,
-    ledger_path: Path,
-    output_path: Path,
-    artifact_count: int,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Record an evidence owner's completed and verified external export."""
-
-    if type(artifact_count) is not int or not 1 <= artifact_count <= 100_000:
-        raise AcceptanceCheckError("evidence_export_schema")
-    manifest = _read_control_manifest(manifest_path)
-    ledger = _read_gate_ledger(ledger_path)
-    if ledger.get("candidate_sha") != manifest["candidate_sha"]:
-        raise AcceptanceCheckError("evidence_export_binding")
-    evidence_record_count, receipts_sha256 = _verify_stored_receipts(manifest_path, manifest)
-    if artifact_count < max(1, evidence_record_count):
-        raise AcceptanceCheckError("evidence_export_binding")
-    receipt = {
-        "schema": "elspeth.aws-ecs-evidence-export.v1",
-        "acceptance_run_id": manifest["acceptance_run_id"],
-        "destination_sha256": cast(Mapping[str, object], manifest["evidence"])["destination_sha256"],
-        "receipts_sha256": receipts_sha256,
-        "ledger_records_sha256": _gate_ledger_records_hash(ledger),
-        "artifact_count": artifact_count,
-        "exported_at": _utc_timestamp(now()),
-        "verified": True,
-    }
-    _write_protected_document(
-        output_path,
-        receipt,
-        create=True,
-        exists_check="evidence_export_receipt",
-        write_check="evidence_export_receipt",
-        parent_check="evidence_export_receipt",
-    )
-    _validate_evidence_export_receipt(
-        output_path,
-        manifest=manifest,
-        receipts_sha256=receipts_sha256,
-        ledger_records_sha256=cast(str, receipt["ledger_records_sha256"]),
-    )
-    return receipt
 
 
 @_serialized_control_manifest_write
@@ -1151,227 +1046,6 @@ def validate_compatibility_record(
     }
 
 
-_LOG_PROJECTION_FIELDS = (
-    "event_name",
-    "check",
-    "class_name",
-    "severity",
-    "status",
-    "outcome",
-    "task_revision",
-    "deployment_revision",
-    "count",
-    "ok",
-)
-
-
-def _safe_projection_value(field: str, value: object) -> object | None:
-    if field in {"count", "task_revision", "deployment_revision"}:
-        return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
-    if field == "ok":
-        return value if type(value) is bool else None
-    if type(value) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value) is not None and "://" not in value:
-        return value
-    return None
-
-
-def _project_log_record(record: Mapping[str, object], *, timestamp: object | None = None) -> dict[str, object]:
-    projected: dict[str, object] = {}
-    candidate_timestamp = timestamp if timestamp is not None else record.get("timestamp")
-    if type(candidate_timestamp) is int and candidate_timestamp >= 0:
-        projected["timestamp"] = candidate_timestamp
-    elif type(candidate_timestamp) is str:
-        try:
-            _parse_state_timestamp(candidate_timestamp)
-        except AcceptanceStateError:
-            pass
-        else:
-            projected["timestamp"] = candidate_timestamp
-    for field in _LOG_PROJECTION_FIELDS:
-        value = _safe_projection_value(field, record.get(field))
-        if value is not None:
-            projected[field] = value
-    return projected
-
-
-def sanitize_evidence(kind: str, payload: object) -> dict[str, object]:
-    """Project raw diagnostic JSON into one closed, content-free evidence schema."""
-
-    if kind not in _EVIDENCE_KINDS or not isinstance(payload, dict):
-        raise AcceptanceCheckError("sanitize_evidence_schema")
-    base: dict[str, object] = {
-        "schema": "elspeth.aws-ecs-sanitized-evidence.v1",
-        "kind": kind,
-    }
-    if kind in {"web-log", "doctor-log"}:
-        events = payload.get("events")
-        if not isinstance(events, list) or len(events) > 10_000:
-            raise AcceptanceCheckError("sanitize_evidence_schema")
-        records: list[dict[str, object]] = []
-        for event in events:
-            if not isinstance(event, Mapping):
-                raise AcceptanceCheckError("sanitize_evidence_schema")
-            message = event.get("message")
-            if isinstance(message, str) and len(message.encode("utf-8")) <= MAX_JSON_RESPONSE_BYTES:
-                try:
-                    decoded = json.loads(message)
-                except json.JSONDecodeError:
-                    decoded = None
-            elif isinstance(message, Mapping):
-                decoded = message
-            else:
-                decoded = None
-            source = decoded if isinstance(decoded, Mapping) else event
-            projected = _project_log_record(source, timestamp=event.get("timestamp"))
-            if projected:
-                records.append(projected)
-        return {
-            **base,
-            "records": records,
-            "counts": {"input": len(events), "projected": len(records)},
-        }
-    if kind == "deployment-event":
-        detail = payload.get("detail", payload)
-        if not isinstance(detail, Mapping):
-            raise AcceptanceCheckError("sanitize_evidence_schema")
-        projected = _project_log_record(detail, timestamp=payload.get("time"))
-        return {**base, "records": [projected] if projected else [], "counts": {"input": 1, "projected": bool(projected)}}
-    if kind == "task-definition":
-        task = payload.get("taskDefinition")
-        if not isinstance(task, Mapping):
-            raise AcceptanceCheckError("sanitize_evidence_schema")
-        revision = task.get("revision")
-        network_mode = task.get("networkMode")
-        containers = task.get("containerDefinitions")
-        volumes = task.get("volumes")
-        compatibilities = task.get("requiresCompatibilities")
-        if (
-            type(revision) is not int
-            or revision < 1
-            or network_mode not in {"awsvpc", "bridge", "host", "none"}
-            or not isinstance(containers, list)
-            or not isinstance(volumes, list)
-            or not isinstance(compatibilities, list)
-        ):
-            raise AcceptanceCheckError("sanitize_evidence_schema")
-        return {
-            **base,
-            "projection": {
-                "revision": revision,
-                "network_mode": network_mode,
-                "container_count": len(containers),
-                "volume_count": len(volumes),
-                "fargate_required": "FARGATE" in compatibilities,
-            },
-        }
-    changes = payload.get("resource_changes")
-    if not isinstance(changes, list) or len(changes) > 100_000:
-        raise AcceptanceCheckError("sanitize_evidence_schema")
-    counts = {"create": 0, "update": 0, "delete": 0, "replace": 0, "no-op": 0}
-    for resource_change in changes:
-        if not isinstance(resource_change, Mapping):
-            raise AcceptanceCheckError("sanitize_evidence_schema")
-        change = resource_change.get("change")
-        actions = change.get("actions") if isinstance(change, Mapping) else None
-        if not isinstance(actions, list) or any(action not in {"create", "update", "delete", "no-op", "read"} for action in actions):
-            raise AcceptanceCheckError("sanitize_evidence_schema")
-        if set(actions) == {"create", "delete"}:
-            counts["replace"] += 1
-        elif actions == ["create"]:
-            counts["create"] += 1
-        elif actions == ["update"]:
-            counts["update"] += 1
-        elif actions == ["delete"]:
-            counts["delete"] += 1
-        elif actions == ["no-op"]:
-            counts["no-op"] += 1
-    return {
-        **base,
-        "projection": {
-            "resource_change_count": len(changes),
-            "create_count": counts["create"],
-            "update_count": counts["update"],
-            "delete_count": counts["delete"],
-            "replace_count": counts["replace"],
-            "no_op_count": counts["no-op"],
-            "has_delete": counts["delete"] > 0,
-            "has_replace": counts["replace"] > 0,
-        },
-    }
-
-
-def _verify_stored_receipts(manifest_path: Path, manifest: Mapping[str, object]) -> tuple[int, str]:
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, dict)
-    receipts = evidence["receipts"]
-    assert isinstance(receipts, list)
-    candidate_sha = manifest["candidate_sha"]
-    assert isinstance(candidate_sha, str)
-    receipt_directory = manifest_path.parent / f"{manifest_path.name}.receipts"
-    for record in receipts:
-        assert isinstance(record, dict)
-        receipt_hash = record["receipt_sha256"]
-        scenario_id = record["scenario_id"]
-        kind = record["kind"]
-        subject_sha256 = record["subject_sha256"]
-        assert isinstance(receipt_hash, str)
-        assert isinstance(scenario_id, str) and isinstance(kind, str) and isinstance(subject_sha256, str)
-        document = _validate_stored_receipt(
-            _read_protected_document(receipt_directory / f"{receipt_hash}.json", check="cleanup_finalize_receipt"),
-            kind=kind,
-            scenario_id=scenario_id,
-            subject_sha256=subject_sha256,
-            candidate_sha=candidate_sha,
-        )
-        canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        if _sha256(canonical) != receipt_hash:
-            raise AcceptanceCheckError("cleanup_finalize_receipt")
-    approvals = evidence["approvals"]
-    assert isinstance(approvals, list)
-    evidence_records = {"receipts": receipts, "approvals": approvals}
-    return len(receipts) + len(approvals), _sha256(json.dumps(evidence_records, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-
-
-def _final_cleanup_receipt_document(
-    manifest_path: Path,
-    manifest: Mapping[str, object],
-    *,
-    ledger_sha256: str,
-    receipts_sha256: str,
-    committed_at: str,
-) -> dict[str, object]:
-    manifest_sha256 = _sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-    return {
-        "schema": "elspeth.aws-ecs-final-cleanup-receipt.v1",
-        "manifest_sha256": manifest_sha256,
-        "ledger_sha256": ledger_sha256,
-        "receipts_sha256": receipts_sha256,
-        "committed_at": committed_at,
-    }
-
-
-def _verify_final_cleanup_receipt(manifest_path: Path, manifest: Mapping[str, object]) -> None:
-    final_evidence = manifest["final_evidence"]
-    if not isinstance(final_evidence, Mapping) or final_evidence.get("phase") != "committed":
-        raise AcceptanceCheckError("cleanup_finalize_receipt")
-    ledger = _read_gate_ledger(Path(cast(str, manifest["gate_ledger_path"])))
-    ledger_sha256 = _gate_ledger_records_hash(ledger)
-    _receipt_count, receipts_sha256 = _verify_stored_receipts(manifest_path, manifest)
-    committed_at = final_evidence["committed_at"]
-    if type(committed_at) is not str:
-        raise AcceptanceCheckError("cleanup_finalize_receipt")
-    expected = _final_cleanup_receipt_document(
-        manifest_path,
-        manifest,
-        ledger_sha256=ledger_sha256,
-        receipts_sha256=receipts_sha256,
-        committed_at=committed_at,
-    )
-    final_receipt_path = manifest_path.with_name(f"{manifest_path.name}.final-receipt.json")
-    if _read_protected_document(final_receipt_path, check="cleanup_finalize_receipt") != expected:
-        raise AcceptanceCheckError("cleanup_finalize_receipt")
-
-
 def _ensure_final_cleanup_receipt(
     manifest_path: Path,
     manifest: Mapping[str, object],
@@ -1593,408 +1267,6 @@ def cleanup_evidence_finalize(
         committed_at=timestamp,
     )
     return final_manifest
-
-
-def _gate_records_hash(records: object) -> str:
-    return _sha256(json.dumps(records, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-
-
-def _gate_ledger_records_hash(ledger: Mapping[str, object]) -> str:
-    return _gate_records_hash(
-        {
-            "records": ledger["records"],
-            "cleanup_records": ledger["cleanup_records"],
-        }
-    )
-
-
-def _validate_gate_record_stream(records: object, order: tuple[str, ...]) -> list[dict[str, object]]:
-    if not isinstance(records, list) or len(records) > len(order):
-        raise AcceptanceCheckError("gate_ledger_schema")
-    seen: set[str] = set()
-    for index, record in enumerate(records):
-        if not isinstance(record, dict) or set(record) != _GATE_RECORD_FIELDS:
-            raise AcceptanceCheckError("gate_ledger_schema")
-        check_id = record["check_id"]
-        if type(check_id) is not str or check_id != order[index] or check_id in seen:
-            raise AcceptanceCheckError("gate_ledger_schema")
-        seen.add(check_id)
-        candidate_sha = record["candidate_sha"]
-        if type(candidate_sha) is not str or _GIT_SHA_PATTERN.fullmatch(candidate_sha) is None:
-            raise AcceptanceCheckError("gate_ledger_schema")
-        started = _control_timestamp(record["started_at"])
-        ended = _control_timestamp(record["ended_at"])
-        if ended < started:
-            raise AcceptanceCheckError("gate_ledger_schema")
-        exit_status = record["exit_status"]
-        receipt_hash = record["receipt_hash"]
-        if type(exit_status) is not int or not 0 <= exit_status <= 255:
-            raise AcceptanceCheckError("gate_ledger_schema")
-        if type(receipt_hash) is not str or _SHA256_PATTERN.fullmatch(receipt_hash) is None:
-            raise AcceptanceCheckError("gate_ledger_schema")
-    return cast(list[dict[str, object]], records)
-
-
-def _validate_gate_ledger(payload: object) -> dict[str, object]:
-    if not isinstance(payload, dict) or set(payload) != _GATE_LEDGER_FIELDS:
-        raise AcceptanceCheckError("gate_ledger_schema")
-    if payload["schema"] != "elspeth.aws-ecs-gate-ledger.v4":
-        raise AcceptanceCheckError("gate_ledger_schema")
-    branch = payload["branch"]
-    starting_sha = payload["starting_sha"]
-    if type(branch) is not str or re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) is None or branch.startswith("/"):
-        raise AcceptanceCheckError("gate_ledger_schema")
-    if type(starting_sha) is not str or _GIT_SHA_PATTERN.fullmatch(starting_sha) is None:
-        raise AcceptanceCheckError("gate_ledger_schema")
-    for field, pattern in (
-        ("plan_sha256", _SHA256_PATTERN),
-        ("program_base_sha", _GIT_SHA_PATTERN),
-        ("reconciled_release_sha", _GIT_SHA_PATTERN),
-    ):
-        value = payload[field]
-        if type(value) is not str or pattern.fullmatch(value) is None:
-            raise AcceptanceCheckError("gate_ledger_schema")
-    records = _validate_gate_record_stream(payload["records"], _SUCCESS_GATE_CHECK_ORDER)
-    cleanup_records = _validate_gate_record_stream(payload["cleanup_records"], _CLEANUP_GATE_CHECK_ORDER)
-    cleanup_start_count = payload["success_record_count_at_cleanup_start"]
-    if cleanup_records:
-        if type(cleanup_start_count) is not int or cleanup_start_count != len(records):
-            raise AcceptanceCheckError("gate_ledger_schema")
-    elif cleanup_start_count is not None:
-        raise AcceptanceCheckError("gate_ledger_schema")
-    bound_candidate = payload["candidate_sha"]
-    bound_record_count = payload["candidate_bound_record_count"]
-    if (bound_candidate is None) != (bound_record_count is None):
-        raise AcceptanceCheckError("gate_ledger_schema")
-    if bound_candidate is None and (len(records) > len(_TASK1_GATE_CHECK_ORDER) or cleanup_records):
-        raise AcceptanceCheckError("gate_ledger_schema")
-    if bound_candidate is not None and (
-        type(bound_candidate) is not str
-        or _GIT_SHA_PATTERN.fullmatch(bound_candidate) is None
-        or type(bound_record_count) is not int
-        or bound_record_count != len(_TASK1_GATE_CHECK_ORDER)
-        or bound_record_count > len(records)
-        or any(record["candidate_sha"] != bound_candidate for record in records[:bound_record_count])
-        or any(record["candidate_sha"] != bound_candidate for record in records[bound_record_count:])
-        or any(record["candidate_sha"] != bound_candidate for record in cleanup_records)
-    ):
-        raise AcceptanceCheckError("gate_ledger_schema")
-    finalized = payload["finalized"]
-    if finalized is not None:
-        if not isinstance(finalized, dict) or set(finalized) != {
-            "candidate_sha",
-            "record_count",
-            "records_sha256",
-            "finalized_at",
-        }:
-            raise AcceptanceCheckError("gate_ledger_schema")
-        if (
-            type(finalized["candidate_sha"]) is not str
-            or _GIT_SHA_PATTERN.fullmatch(finalized["candidate_sha"]) is None
-            or finalized["candidate_sha"] != bound_candidate
-            or finalized["record_count"] != len(records) + len(cleanup_records)
-            or finalized["records_sha256"] != _gate_ledger_records_hash(payload)
-        ):
-            raise AcceptanceCheckError("gate_ledger_schema")
-        _control_timestamp(finalized["finalized_at"])
-    created = _control_timestamp(payload["created_at"])
-    updated = _control_timestamp(payload["updated_at"])
-    if updated < created:
-        raise AcceptanceCheckError("gate_ledger_schema")
-    return payload
-
-
-def _read_gate_ledger(path: Path) -> dict[str, object]:
-    return _validate_gate_ledger(_read_protected_document(path, check="gate_ledger_file"))
-
-
-def gate_ledger_init(
-    path: Path,
-    *,
-    branch: str,
-    starting_sha: str,
-    plan_sha256: str,
-    program_base_sha: str,
-    reconciled_release_sha: str,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Create a ledger, or accept an exact-owner unfinalized resume."""
-
-    try:
-        existing = _read_gate_ledger(path)
-    except AcceptanceCheckError as exc:
-        if exc.check != "gate_ledger_file" or path.exists():
-            raise
-    else:
-        if (
-            existing["branch"] == branch
-            and existing["starting_sha"] == starting_sha
-            and existing["plan_sha256"] == plan_sha256
-            and existing["program_base_sha"] == program_base_sha
-            and existing["reconciled_release_sha"] == reconciled_release_sha
-            and existing["finalized"] is None
-            and not existing["cleanup_records"]
-        ):
-            return existing
-        raise AcceptanceCheckError("gate_ledger_conflict")
-    timestamp = _utc_timestamp(now())
-    ledger: dict[str, object] = {
-        "schema": "elspeth.aws-ecs-gate-ledger.v4",
-        "branch": branch,
-        "starting_sha": starting_sha,
-        "plan_sha256": plan_sha256,
-        "program_base_sha": program_base_sha,
-        "reconciled_release_sha": reconciled_release_sha,
-        "candidate_sha": None,
-        "candidate_bound_record_count": None,
-        "records": [],
-        "cleanup_records": [],
-        "success_record_count_at_cleanup_start": None,
-        "finalized": None,
-        "created_at": timestamp,
-        "updated_at": timestamp,
-    }
-    _validate_gate_ledger(ledger)
-    _write_protected_document(
-        path,
-        ledger,
-        create=True,
-        exists_check="gate_ledger_exists",
-        write_check="gate_ledger_file",
-        parent_check="gate_ledger_parent",
-    )
-    return ledger
-
-
-def gate_ledger_get(path: Path, field: str) -> str:
-    """Return one closed, non-secret ledger anchor for resume-safe shell use."""
-
-    if field not in _GATE_LEDGER_GET_FIELDS:
-        raise AcceptanceCheckError("gate_ledger_get")
-    value = _read_gate_ledger(path)[field]
-    if type(value) is not str:
-        raise AcceptanceCheckError("gate_ledger_get")
-    return value
-
-
-def gate_ledger_bind_candidate(
-    path: Path,
-    *,
-    candidate_sha: str,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Freeze the candidate SHA at the exact ledger boundary where it exists."""
-
-    ledger = _read_gate_ledger(path)
-    if ledger["finalized"] is not None:
-        raise AcceptanceCheckError("gate_ledger_finalized")
-    existing = ledger["candidate_sha"]
-    if existing is not None:
-        if existing == candidate_sha:
-            return ledger
-        raise AcceptanceCheckError("gate_ledger_conflict")
-    if _GIT_SHA_PATTERN.fullmatch(candidate_sha) is None:
-        raise AcceptanceCheckError("gate_ledger_schema")
-    records = ledger["records"]
-    assert isinstance(records, list)
-    if [record["check_id"] for record in records] != list(_TASK1_GATE_CHECK_ORDER):
-        raise AcceptanceCheckError("gate_ledger_incomplete")
-    if any(record["exit_status"] != 0 for record in records):
-        raise AcceptanceCheckError("gate_ledger_failed")
-    if any(record["candidate_sha"] != candidate_sha for record in records):
-        raise AcceptanceCheckError("gate_ledger_candidate")
-    timestamp = _utc_timestamp(now())
-    ledger["candidate_sha"] = candidate_sha
-    ledger["candidate_bound_record_count"] = len(records)
-    ledger["updated_at"] = timestamp
-    _validate_gate_ledger(ledger)
-    _write_protected_document(
-        path,
-        ledger,
-        create=False,
-        exists_check="gate_ledger_exists",
-        write_check="gate_ledger_file",
-        parent_check="gate_ledger_parent",
-    )
-    return ledger
-
-
-def _gate_ledger_record_stream(
-    path: Path,
-    *,
-    stream: Literal["records", "cleanup_records"],
-    order: tuple[str, ...],
-    check_id: str,
-    exit_status: int,
-    receipt_hash: str,
-    candidate_sha: str,
-    started_at: str | None = None,
-    ended_at: str | None = None,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    ledger = _read_gate_ledger(path)
-    if ledger["finalized"] is not None:
-        raise AcceptanceCheckError("gate_ledger_finalized")
-    records = ledger[stream]
-    assert isinstance(records, list)
-    bound_candidate = ledger["candidate_sha"]
-    if bound_candidate is not None and candidate_sha != bound_candidate:
-        raise AcceptanceCheckError("gate_ledger_candidate")
-    existing = next(
-        (item for item in records if isinstance(item, dict) and item.get("check_id") == check_id),
-        None,
-    )
-    if existing is not None:
-        same_evidence = (
-            existing.get("candidate_sha") == candidate_sha
-            and existing.get("exit_status") == exit_status
-            and existing.get("receipt_hash") == receipt_hash
-            and (started_at is None or existing.get("started_at") == started_at)
-            and (ended_at is None or existing.get("ended_at") == ended_at)
-        )
-        if same_evidence:
-            return ledger
-        raise AcceptanceCheckError("gate_ledger_conflict")
-    if stream == "records":
-        cleanup_records = ledger["cleanup_records"]
-        assert isinstance(cleanup_records, list)
-        if cleanup_records or (bound_candidate is None and check_id not in _TASK1_GATE_CHECK_ORDER):
-            raise AcceptanceCheckError("gate_ledger_phase")
-    expected_index = len(records)
-    if expected_index >= len(order) or check_id != order[expected_index]:
-        raise AcceptanceCheckError("gate_ledger_schema")
-    timestamp = _utc_timestamp(now())
-    record = {
-        "check_id": check_id,
-        "candidate_sha": candidate_sha,
-        "started_at": started_at or timestamp,
-        "ended_at": ended_at or timestamp,
-        "exit_status": exit_status,
-        "receipt_hash": receipt_hash,
-    }
-    candidate = {**ledger, stream: [*records, record], "updated_at": timestamp}
-    if stream == "cleanup_records" and not records:
-        success_records = ledger["records"]
-        assert isinstance(success_records, list)
-        candidate["success_record_count_at_cleanup_start"] = len(success_records)
-    _validate_gate_ledger(candidate)
-    _write_protected_document(
-        path,
-        candidate,
-        create=False,
-        exists_check="gate_ledger_exists",
-        write_check="gate_ledger_file",
-        parent_check="gate_ledger_parent",
-    )
-    return candidate
-
-
-def gate_ledger_record(
-    path: Path,
-    *,
-    check_id: str,
-    exit_status: int,
-    receipt_hash: str,
-    candidate_sha: str,
-    started_at: str | None = None,
-    ended_at: str | None = None,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    return _gate_ledger_record_stream(
-        path,
-        stream="records",
-        order=_SUCCESS_GATE_CHECK_ORDER,
-        check_id=check_id,
-        exit_status=exit_status,
-        receipt_hash=receipt_hash,
-        candidate_sha=candidate_sha,
-        started_at=started_at,
-        ended_at=ended_at,
-        now=now,
-    )
-
-
-def gate_ledger_record_cleanup(
-    path: Path,
-    *,
-    check_id: str,
-    exit_status: int,
-    receipt_hash: str,
-    candidate_sha: str,
-    started_at: str | None = None,
-    ended_at: str | None = None,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Record ordered cleanup evidence independently of incomplete success checks."""
-
-    ledger = _read_gate_ledger(path)
-    if ledger["candidate_sha"] is None:
-        raise AcceptanceCheckError("gate_ledger_candidate")
-    return _gate_ledger_record_stream(
-        path,
-        stream="cleanup_records",
-        order=_CLEANUP_GATE_CHECK_ORDER,
-        check_id=check_id,
-        exit_status=exit_status,
-        receipt_hash=receipt_hash,
-        candidate_sha=candidate_sha,
-        started_at=started_at,
-        ended_at=ended_at,
-        now=now,
-    )
-
-
-def gate_ledger_finalize(
-    path: Path,
-    *,
-    candidate_sha: str,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    ledger = _read_gate_ledger(path)
-    if ledger["finalized"] is not None:
-        finalized = ledger["finalized"]
-        if isinstance(finalized, dict) and finalized.get("candidate_sha") == candidate_sha:
-            return ledger
-        raise AcceptanceCheckError("gate_ledger_conflict")
-    records = ledger["records"]
-    cleanup_records = ledger["cleanup_records"]
-    assert isinstance(records, list)
-    if not records:
-        raise AcceptanceCheckError("gate_ledger_empty")
-    assert isinstance(cleanup_records, list)
-    if [record["check_id"] for record in records if isinstance(record, dict)] != list(_SUCCESS_GATE_CHECK_ORDER):
-        raise AcceptanceCheckError("gate_ledger_incomplete")
-    if [record["check_id"] for record in cleanup_records if isinstance(record, dict)] != list(_CLEANUP_GATE_CHECK_ORDER):
-        raise AcceptanceCheckError("gate_ledger_incomplete")
-    if ledger["candidate_sha"] != candidate_sha:
-        raise AcceptanceCheckError("gate_ledger_candidate")
-    bound_record_count = ledger["candidate_bound_record_count"]
-    if (
-        type(bound_record_count) is not int
-        or any(record["candidate_sha"] != candidate_sha for record in records[bound_record_count:])
-        or any(record["candidate_sha"] != candidate_sha for record in cleanup_records)
-    ):
-        raise AcceptanceCheckError("gate_ledger_candidate")
-    if any(record["exit_status"] != 0 for record in [*records, *cleanup_records]):
-        raise AcceptanceCheckError("gate_ledger_failed")
-    timestamp = _utc_timestamp(now())
-    ledger["finalized"] = {
-        "candidate_sha": candidate_sha,
-        "record_count": len(records) + len(cleanup_records),
-        "records_sha256": _gate_ledger_records_hash(ledger),
-        "finalized_at": timestamp,
-    }
-    ledger["updated_at"] = timestamp
-    _validate_gate_ledger(ledger)
-    _write_protected_document(
-        path,
-        ledger,
-        create=False,
-        exists_check="gate_ledger_exists",
-        write_check="gate_ledger_file",
-        parent_check="gate_ledger_parent",
-    )
-    return ledger
 
 
 def build_parser() -> argparse.ArgumentParser:
