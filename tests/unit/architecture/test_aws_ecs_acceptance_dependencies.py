@@ -175,7 +175,9 @@ def test_aws_ecs_acceptance_private_dependencies_obey_layers() -> None:
     )
 
     module_paths = {path.stem: path for path in PRIVATE_ROOT.glob("*.py") if path.name != "__init__.py"}
-    assert set(module_paths) <= set(LAYERS), f"unlisted private modules: {sorted(set(module_paths) - set(LAYERS))}"
+    assert set(module_paths) == set(LAYERS), (
+        f"private module set mismatch: missing={sorted(set(LAYERS) - set(module_paths))} unlisted={sorted(set(module_paths) - set(LAYERS))}"
+    )
 
     graph: dict[str, set[str]] = {}
     for module, path in sorted(module_paths.items()):

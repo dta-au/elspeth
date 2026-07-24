@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import fields
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._aws_ecs_acceptance import operator_telemetry
+from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import _init_control_manifest
 
 PUBLIC_OPERATOR_TELEMETRY_EXPORTS = {
     "AWSOperatorMetricEmitter",
@@ -31,6 +34,130 @@ PUBLIC_OPERATOR_TELEMETRY_EXPORTS = {
     "verify_operator_telemetry_outage",
     "xray_trace_id",
 }
+
+
+def test_positive_operator_receipt_creates_and_binds_exact_retained_checkpoint(tmp_path: Path) -> None:
+    run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
+    manifest_path = tmp_path / "control.json"
+    _init_control_manifest(manifest_path, bind_retained=False)
+    sentinel = "checkpoint-positive-sentinel"
+    sentinel_value = int(hashlib.sha256(sentinel.encode()).hexdigest()[:12], 16)
+    trace_id = acceptance.xray_trace_id("landscape-run-internal", started_at=_TELEMETRY_STARTED_AT)
+
+    class CloudWatch:
+        def get_metric_data(self, **_kwargs: object) -> object:
+            return {
+                "MetricDataResults": [
+                    {
+                        "Id": "acceptance",
+                        "StatusCode": "Complete",
+                        "Timestamps": [datetime(2026, 7, 14, 1, 4, tzinfo=UTC)],
+                        "Values": [float(sentinel_value)],
+                    }
+                ]
+            }
+
+        def close(self) -> None:
+            pass
+
+    class XRay:
+        def batch_get_traces(self, **_kwargs: object) -> object:
+            return {
+                "Traces": [
+                    {
+                        "Id": trace_id,
+                        "Segments": [
+                            {"Document": json.dumps({"name": "RunStarted", "annotations": {"run_id": "landscape-run-internal"}})},
+                            {
+                                "Document": json.dumps(
+                                    {
+                                        "name": "RunFinished",
+                                        "annotations": {"run_id": "landscape-run-internal", "status": "completed"},
+                                    }
+                                )
+                            },
+                        ],
+                    }
+                ],
+                "UnprocessedTraceIds": [],
+            }
+
+        def close(self) -> None:
+            pass
+
+    settings = SimpleNamespace(
+        deployment_target="aws-ecs",
+        operator_telemetry="aws-otlp",
+        operator_pipeline_telemetry_granularity="lifecycle",
+        operator_telemetry_service_name="elspeth-web",
+        operator_telemetry_environment="acceptance",
+        operator_telemetry_release="0.7.1",
+        operator_telemetry_ecs_cluster="cluster-a",
+        operator_telemetry_ecs_service="service-a",
+        operator_telemetry_task_definition_family="elspeth-web",
+        operator_telemetry_task_definition_revision="17",
+    )
+    details = acceptance.verify_operator_telemetry_live(
+        {
+            "AWS_REGION": "ap-southeast-2",
+            "ELSPETH_ACCEPTANCE_RUN_ID": run_id,
+            "ELSPETH_ACCEPTANCE_SCENARIO_ID": "A",
+        },
+        phase="positive",
+        settings_loader=lambda: settings,
+        audit_factory=lambda _settings, _env: _TelemetryAudit([]),
+        emitter_factory=lambda _settings: _TelemetryEmitter([]),
+        aws_client_factory=lambda service, _region: CloudWatch() if service == "cloudwatch" else XRay(),
+        policy=acceptance.AcceptancePolicy(attempts=1, interval_seconds=0),
+        sentinel_factory=lambda: sentinel,
+        now_datetime=lambda: datetime(2026, 7, 14, 1, 3, tzinfo=UTC),
+        now_epoch=lambda: 1234.5,
+    )
+    exec_receipt = {
+        "version": 1,
+        "check": "verify-operator-telemetry",
+        "ok": True,
+        "candidate_sha": "c" * 40,
+        "task_arn_sha256": "d" * 64,
+        "scenario_id": "A",
+        "details": details,
+    }
+    exec_path = tmp_path / "operator-exec.json"
+    exec_path.write_text(json.dumps(exec_receipt))
+    os.chmod(exec_path, 0o600)
+    checkpoint_path = tmp_path / "retained-from-positive.json"
+
+    bound = acceptance.control_manifest_checkpoint_operator_evidence(
+        manifest_path,
+        exec_receipt_path=str(exec_path),
+        checkpoint_path=str(checkpoint_path),
+        now=lambda: datetime(2026, 7, 14, 1, 5, tzinfo=UTC),
+    )
+
+    checkpoint = json.loads(checkpoint_path.read_text())
+    assert checkpoint["acceptance_run_id"] == run_id
+    assert checkpoint["scenarios"]["A"] == {
+        "cloudwatch_retained_metrics": [details["retained_metric_query"]],
+        "xray_retained_trace_ids": [details["retained_trace_id"]],
+        "expected_retained_metric_series": 1,
+        "expected_retained_trace_ids": 1,
+    }
+    assert checkpoint["scenarios"]["B"] == {
+        "cloudwatch_retained_metrics": [],
+        "xray_retained_trace_ids": [],
+        "expected_retained_metric_series": 0,
+        "expected_retained_trace_ids": 0,
+    }
+    assert bound["evidence"]["retained_evidence_path"] == str(checkpoint_path)  # type: ignore[index]
+    assert (
+        acceptance.control_manifest_checkpoint_operator_evidence(
+            manifest_path,
+            exec_receipt_path=str(exec_path),
+            checkpoint_path=str(checkpoint_path),
+            now=lambda: datetime(2026, 7, 14, 1, 6, tzinfo=UTC),
+        )["evidence"]["retained_evidence_path"]  # type: ignore[index]
+        == str(checkpoint_path)
+    )
 
 
 def test_operator_telemetry_symbols_are_owned_by_private_module_and_reexported_by_identity() -> None:

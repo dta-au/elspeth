@@ -11,16 +11,11 @@ import argparse
 import asyncio
 import json
 import os
-import re
-import shlex
 import sys
-from collections.abc import Callable, Mapping
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, cast
 
 from ._aws_ecs_acceptance.approvals import (
-    _require_current_approval,
+    _require_current_approval as _require_current_approval,
 )
 from ._aws_ecs_acceptance.approvals import (
     approval_require_current as approval_require_current,
@@ -62,10 +57,9 @@ from ._aws_ecs_acceptance.capture import (
     verify_local_auth,
     verify_payloads,
 )
+from ._aws_ecs_acceptance.cleanup import cleanup_evidence_finalize as cleanup_evidence_finalize
 from ._aws_ecs_acceptance.contracts import (
-    _EMERGENCY_CLEANUP_SECONDS,
     _EVIDENCE_KINDS,
-    _SHA256_PATTERN,
     MAX_CONTROL_DOCUMENT_BYTES,
     MAX_EXEC_STREAM_BYTES,
     MAX_JSON_RESPONSE_BYTES,
@@ -74,9 +68,6 @@ from ._aws_ecs_acceptance.contracts import (
     AcceptanceInputError,
     AcceptanceStateError,
     OperatorTelemetryAcceptanceError,
-    _control_timestamp,
-    _sha256,
-    _utc_timestamp,
     scenario_resource_namespace,
 )
 from ._aws_ecs_acceptance.contracts import (
@@ -121,23 +112,24 @@ from ._aws_ecs_acceptance.contracts import (
 from ._aws_ecs_acceptance.contracts import (
     plugin_policy_binding_sha256 as plugin_policy_binding_sha256,
 )
-from ._aws_ecs_acceptance.evidence import (
-    _final_cleanup_receipt_document,
-    _reverify_bound_evidence_export_receipt,
-    _validate_evidence_export_receipt,
-    _verify_final_cleanup_receipt,
-    _verify_stored_receipts,
+from ._aws_ecs_acceptance.control_service import (
+    control_manifest_load_cleanup as control_manifest_load_cleanup,
+)
+from ._aws_ecs_acceptance.control_service import control_manifest_update as control_manifest_update
+from ._aws_ecs_acceptance.control_service import control_manifest_validate as control_manifest_validate
+from ._aws_ecs_acceptance.control_service import scenario_load as scenario_load
+from ._aws_ecs_acceptance.control_service import (
+    validate_compatibility_record as validate_compatibility_record,
 )
 from ._aws_ecs_acceptance.evidence import (
     create_evidence_export_receipt as create_evidence_export_receipt,
 )
 from ._aws_ecs_acceptance.evidence import sanitize_evidence as sanitize_evidence
 from ._aws_ecs_acceptance.gate_ledger import (
-    _CLEANUP_GATE_CHECK_ORDER,
+    _CLEANUP_GATE_CHECK_ORDER as _CLEANUP_GATE_CHECK_ORDER,
+)
+from ._aws_ecs_acceptance.gate_ledger import (
     _GATE_LEDGER_GET_FIELDS,
-    _TERMINAL_GATE_CHECK_ID,
-    _gate_ledger_records_hash,
-    _read_gate_ledger,
 )
 from ._aws_ecs_acceptance.gate_ledger import (
     _REQUIRED_GATE_CHECK_IDS as _REQUIRED_GATE_CHECK_IDS,
@@ -147,6 +139,12 @@ from ._aws_ecs_acceptance.gate_ledger import (
 )
 from ._aws_ecs_acceptance.gate_ledger import (
     _TASK1_GATE_CHECK_ORDER as _TASK1_GATE_CHECK_ORDER,
+)
+from ._aws_ecs_acceptance.gate_ledger import (
+    _TERMINAL_GATE_CHECK_ID as _TERMINAL_GATE_CHECK_ID,
+)
+from ._aws_ecs_acceptance.gate_ledger import (
+    _gate_ledger_records_hash as _gate_ledger_records_hash,
 )
 from ._aws_ecs_acceptance.gate_ledger import (
     gate_ledger_bind_candidate as gate_ledger_bind_candidate,
@@ -177,9 +175,13 @@ from ._aws_ecs_acceptance.manifest_schema import (
     _load_retained_evidence as _load_retained_evidence,
 )
 from ._aws_ecs_acceptance.manifest_schema import (
-    _read_control_manifest,
-    _require_mutable_control_manifest,
-    _validate_control_manifest,
+    _read_control_manifest as _read_control_manifest,
+)
+from ._aws_ecs_acceptance.manifest_schema import (
+    _require_mutable_control_manifest as _require_mutable_control_manifest,
+)
+from ._aws_ecs_acceptance.manifest_schema import (
+    _validate_control_manifest as _validate_control_manifest,
 )
 from ._aws_ecs_acceptance.manifest_schema import (
     _validate_retained_evidence_receipt as _validate_retained_evidence_receipt,
@@ -240,9 +242,9 @@ from ._aws_ecs_acceptance.orphan_sweep import (
 )
 from ._aws_ecs_acceptance.orphan_sweep import orphan_sweep as orphan_sweep
 from ._aws_ecs_acceptance.receipt_contracts import (
-    _CANDIDATE_PACKAGE_VERSION,
-    _ROLLBACK_PACKAGE_VERSION,
-    _expected_schema_facts,
+    _expected_schema_facts as _expected_schema_facts,
+)
+from ._aws_ecs_acceptance.receipt_contracts import (
     encode_exec_receipt,
     extract_exec_receipt,
     resolve_exec_receipt_env,
@@ -256,8 +258,7 @@ from ._aws_ecs_acceptance.scenario_inventory import (
     SCENARIO_ASSIGNMENT_NAMES as SCENARIO_ASSIGNMENT_NAMES,
 )
 from ._aws_ecs_acceptance.scenario_inventory import (
-    _control_path,
-    _load_bound_scenario_inventory,
+    _load_bound_scenario_inventory as _load_bound_scenario_inventory,
 )
 from ._aws_ecs_acceptance.scenario_inventory import (
     _load_preapply_scenario_inventory as _load_preapply_scenario_inventory,
@@ -274,11 +275,6 @@ from ._aws_ecs_acceptance.scenario_inventory import (
 from ._aws_ecs_acceptance.scenario_inventory import (
     _validate_tf_binding_receipt as _validate_tf_binding_receipt,
 )
-from ._aws_ecs_acceptance.secure_documents import (
-    _read_protected_document,
-    _serialized_control_manifest_write,
-    _write_protected_document,
-)
 from ._aws_ecs_acceptance.state import (
     AcceptanceCredentials as AcceptanceCredentials,
 )
@@ -294,979 +290,6 @@ from ._aws_ecs_acceptance.state import (
 from ._aws_ecs_acceptance.task_definition import (
     validate_task_definition_policy_binding as validate_task_definition_policy_binding,
 )
-
-_APPLICATION_SCENARIO_IDS = frozenset({"A", "B"})
-# Facts pinned to the Scenario B rollback baseline (the 0.7.0 image), and the
-# behaviour-named structural migration from that baseline to the current
-# landscape epoch. The label is deliberately a literal: it must be rewritten —
-# not silently renumbered — whenever SQLITE_SCHEMA_EPOCH moves, and
-# test_compatibility_schema_facts_track_current_epochs enforces that.
-
-
-def control_manifest_validate(
-    path: Path,
-    *,
-    acceptance_run_id: str | None = None,
-    candidate_sha: str | None = None,
-    cleanup_only: bool = False,
-    require_cleanup_cleared: bool = False,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    manifest = _read_control_manifest(path)
-    current = now()
-    if (acceptance_run_id is not None and manifest["acceptance_run_id"] != acceptance_run_id) or (
-        candidate_sha is not None and manifest["candidate_sha"] != candidate_sha
-    ):
-        raise AcceptanceCheckError("control_manifest_binding")
-    expired = current >= _control_timestamp(manifest["teardown_deadline_utc"])
-    if expired and not (cleanup_only and require_cleanup_cleared):
-        raise AcceptanceCheckError("control_manifest_expired")
-    if require_cleanup_cleared:
-        if not cleanup_only or manifest["cleanup_required"] is not False:
-            raise AcceptanceCheckError("control_manifest_cleanup")
-        cleanup_states = manifest["cleanup_states"]
-        assert isinstance(cleanup_states, dict)
-        for surface, state in cleanup_states.items():
-            if state == "confirmed":
-                continue
-            if surface == "teardown_deadline" and state == "failed" and manifest["deadline_failure_recorded"] is True:
-                continue
-            raise AcceptanceCheckError("control_manifest_cleanup")
-        if expired and manifest["deadline_failure_recorded"] is not True:
-            final_evidence = manifest["final_evidence"]
-            if (
-                not isinstance(final_evidence, Mapping)
-                or final_evidence.get("phase") != "committed"
-                or _control_timestamp(final_evidence.get("committed_at")) > _control_timestamp(manifest["teardown_deadline_utc"])
-            ):
-                raise AcceptanceCheckError("control_manifest_cleanup")
-        _verify_final_cleanup_receipt(path, manifest)
-    return manifest
-
-
-@_serialized_control_manifest_write
-def control_manifest_update(
-    path: Path,
-    *,
-    cleanup_required: bool | None = None,
-    ecr_baseline_tag: str | None = None,
-    ecr_candidate_tag: str | None = None,
-    ecr_registry: str | None = None,
-    ecr_repository: str | None = None,
-    ecr_baseline_digest: str | None = None,
-    ecr_candidate_digest: str | None = None,
-    acceptance_state_path: str | None = None,
-    oidc_evidence_dir: str | None = None,
-    evidence_export_receipt: str | None = None,
-    final_evidence_export_receipt: str | None = None,
-    terraform_plan_receipt: str | None = None,
-    terraform_applied: str | None = None,
-    terraform_noop_receipt: str | None = None,
-    cleanup_checkpoint: str | None = None,
-    verdict_failure: str | None = None,
-    emergency_cleanup_deadline_utc: str | None = None,
-    cleanup_escalation: str | None = None,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    manifest = _read_control_manifest(path)
-    _require_mutable_control_manifest(manifest)
-    current = now()
-    tag_shape = (
-        cleanup_required is True
-        and evidence_export_receipt is None
-        and final_evidence_export_receipt is None
-        and all(value is not None for value in (ecr_baseline_tag, ecr_candidate_tag, ecr_registry, ecr_repository))
-        and all(
-            value is None
-            for value in (
-                ecr_baseline_digest,
-                ecr_candidate_digest,
-                acceptance_state_path,
-                oidc_evidence_dir,
-                terraform_plan_receipt,
-                terraform_applied,
-                terraform_noop_receipt,
-                cleanup_checkpoint,
-                verdict_failure,
-                emergency_cleanup_deadline_utc,
-                cleanup_escalation,
-            )
-        )
-    )
-    digest_shape = (
-        ecr_baseline_digest is not None
-        and ecr_candidate_digest is not None
-        and evidence_export_receipt is None
-        and final_evidence_export_receipt is None
-        and all(
-            value is None
-            for value in (
-                cleanup_required,
-                ecr_baseline_tag,
-                ecr_candidate_tag,
-                ecr_registry,
-                ecr_repository,
-                acceptance_state_path,
-                oidc_evidence_dir,
-                terraform_plan_receipt,
-                terraform_applied,
-                terraform_noop_receipt,
-                cleanup_checkpoint,
-                verdict_failure,
-                emergency_cleanup_deadline_utc,
-                cleanup_escalation,
-            )
-        )
-    )
-    evidence_path_shape = (
-        (acceptance_state_path is not None) != (oidc_evidence_dir is not None)
-        and evidence_export_receipt is None
-        and final_evidence_export_receipt is None
-        and all(
-            value is None
-            for value in (
-                cleanup_required,
-                ecr_baseline_tag,
-                ecr_candidate_tag,
-                ecr_registry,
-                ecr_repository,
-                ecr_baseline_digest,
-                ecr_candidate_digest,
-                terraform_plan_receipt,
-                terraform_applied,
-                terraform_noop_receipt,
-                cleanup_checkpoint,
-                verdict_failure,
-                emergency_cleanup_deadline_utc,
-                cleanup_escalation,
-            )
-        )
-    )
-    terraform_shape = (
-        sum(value is not None for value in (terraform_plan_receipt, terraform_applied, terraform_noop_receipt)) == 1
-        and evidence_export_receipt is None
-        and final_evidence_export_receipt is None
-        and all(
-            value is None
-            for value in (
-                cleanup_required,
-                ecr_baseline_tag,
-                ecr_candidate_tag,
-                ecr_registry,
-                ecr_repository,
-                ecr_baseline_digest,
-                ecr_candidate_digest,
-                acceptance_state_path,
-                oidc_evidence_dir,
-                cleanup_checkpoint,
-                verdict_failure,
-                emergency_cleanup_deadline_utc,
-                cleanup_escalation,
-            )
-        )
-    )
-    checkpoint_shape = (
-        cleanup_checkpoint is not None
-        and evidence_export_receipt is None
-        and final_evidence_export_receipt is None
-        and all(
-            value is None
-            for value in (
-                cleanup_required,
-                ecr_baseline_tag,
-                ecr_candidate_tag,
-                ecr_registry,
-                ecr_repository,
-                ecr_baseline_digest,
-                ecr_candidate_digest,
-                acceptance_state_path,
-                oidc_evidence_dir,
-                terraform_plan_receipt,
-                terraform_applied,
-                terraform_noop_receipt,
-                verdict_failure,
-                emergency_cleanup_deadline_utc,
-                cleanup_escalation,
-            )
-        )
-    )
-    verdict_shape = (
-        verdict_failure == "teardown_deadline"
-        and evidence_export_receipt is None
-        and final_evidence_export_receipt is None
-        and (emergency_cleanup_deadline_utc is None) == (cleanup_escalation is None)
-        and all(
-            value is None
-            for value in (
-                cleanup_required,
-                ecr_baseline_tag,
-                ecr_candidate_tag,
-                ecr_registry,
-                ecr_repository,
-                ecr_baseline_digest,
-                ecr_candidate_digest,
-                acceptance_state_path,
-                oidc_evidence_dir,
-                terraform_plan_receipt,
-                terraform_applied,
-                terraform_noop_receipt,
-                cleanup_checkpoint,
-            )
-        )
-    )
-    export_shape = (
-        evidence_export_receipt is not None
-        and final_evidence_export_receipt is None
-        and all(
-            value is None
-            for value in (
-                cleanup_required,
-                ecr_baseline_tag,
-                ecr_candidate_tag,
-                ecr_registry,
-                ecr_repository,
-                ecr_baseline_digest,
-                ecr_candidate_digest,
-                acceptance_state_path,
-                oidc_evidence_dir,
-                terraform_plan_receipt,
-                terraform_applied,
-                terraform_noop_receipt,
-                cleanup_checkpoint,
-                verdict_failure,
-                emergency_cleanup_deadline_utc,
-                cleanup_escalation,
-            )
-        )
-    )
-    final_export_shape = (
-        final_evidence_export_receipt is not None
-        and evidence_export_receipt is None
-        and all(
-            value is None
-            for value in (
-                cleanup_required,
-                ecr_baseline_tag,
-                ecr_candidate_tag,
-                ecr_registry,
-                ecr_repository,
-                ecr_baseline_digest,
-                ecr_candidate_digest,
-                acceptance_state_path,
-                oidc_evidence_dir,
-                terraform_plan_receipt,
-                terraform_applied,
-                terraform_noop_receipt,
-                cleanup_checkpoint,
-                verdict_failure,
-                emergency_cleanup_deadline_utc,
-                cleanup_escalation,
-            )
-        )
-    )
-    if (
-        sum(
-            (
-                tag_shape,
-                digest_shape,
-                evidence_path_shape,
-                terraform_shape,
-                checkpoint_shape,
-                verdict_shape,
-                export_shape,
-                final_export_shape,
-            )
-        )
-        != 1
-    ):
-        raise AcceptanceCheckError("control_manifest_update")
-    cleanup_mutation = any(
-        value is not None
-        for value in (
-            cleanup_checkpoint,
-            verdict_failure,
-            emergency_cleanup_deadline_utc,
-            cleanup_escalation,
-            evidence_export_receipt,
-            final_evidence_export_receipt,
-        )
-    )
-    expired = current >= _control_timestamp(manifest["teardown_deadline_utc"])
-    acceptance_mutation = any(
-        value is not None
-        for value in (
-            cleanup_required,
-            ecr_baseline_tag,
-            ecr_candidate_tag,
-            ecr_registry,
-            ecr_repository,
-            ecr_baseline_digest,
-            ecr_candidate_digest,
-            acceptance_state_path,
-            oidc_evidence_dir,
-            terraform_plan_receipt,
-            terraform_applied,
-            terraform_noop_receipt,
-        )
-    )
-    if expired and acceptance_mutation:
-        raise AcceptanceCheckError("control_manifest_expired")
-    if not cleanup_mutation and not acceptance_mutation:
-        raise AcceptanceCheckError("control_manifest_update")
-    if cleanup_required is not None:
-        if cleanup_required is False:
-            raise AcceptanceCheckError("control_manifest_cleanup")
-        manifest["cleanup_required"] = True
-    ecr = manifest["ecr"]
-    assert isinstance(ecr, dict)
-    for field, value in (
-        ("baseline_tag", ecr_baseline_tag),
-        ("candidate_tag", ecr_candidate_tag),
-        ("registry", ecr_registry),
-        ("repository", ecr_repository),
-        ("baseline_digest", ecr_baseline_digest),
-        ("candidate_digest", ecr_candidate_digest),
-    ):
-        if value is not None:
-            if ecr[field] is not None and ecr[field] != value:
-                raise AcceptanceCheckError("control_manifest_conflict")
-            ecr[field] = value
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, dict)
-    if acceptance_state_path is not None:
-        if evidence["acceptance_state_path"] is not None and evidence["acceptance_state_path"] != acceptance_state_path:
-            raise AcceptanceCheckError("control_manifest_conflict")
-        evidence["acceptance_state_path"] = acceptance_state_path
-    if oidc_evidence_dir is not None:
-        if evidence["oidc_evidence_dir"] is not None and evidence["oidc_evidence_dir"] != oidc_evidence_dir:
-            raise AcceptanceCheckError("control_manifest_conflict")
-        evidence["oidc_evidence_dir"] = oidc_evidence_dir
-    if evidence_export_receipt is not None:
-        export_path = Path(_control_path(evidence_export_receipt))
-        existing_export_path = evidence["export_receipt_path"]
-        existing_export_sha256 = evidence["export_receipt_sha256"]
-        if existing_export_path is not None:
-            if existing_export_path != evidence_export_receipt or type(existing_export_sha256) is not str:
-                raise AcceptanceCheckError("control_manifest_conflict")
-            _reverify_bound_evidence_export_receipt(
-                export_path,
-                manifest=manifest,
-                expected_sha256=existing_export_sha256,
-            )
-        else:
-            _receipt_count, receipts_sha256 = _verify_stored_receipts(path, manifest)
-            ledger = _read_gate_ledger(Path(cast(str, manifest["gate_ledger_path"])))
-            ledger_records_sha256 = _gate_ledger_records_hash(ledger)
-            _receipt, export_sha256 = _validate_evidence_export_receipt(
-                export_path,
-                manifest=manifest,
-                receipts_sha256=receipts_sha256,
-                ledger_records_sha256=ledger_records_sha256,
-            )
-            evidence["export_receipt_path"] = evidence_export_receipt
-            evidence["export_receipt_sha256"] = export_sha256
-    if final_evidence_export_receipt is not None:
-        initial_export_path = evidence["export_receipt_path"]
-        initial_export_sha256 = evidence["export_receipt_sha256"]
-        if type(initial_export_path) is not str or type(initial_export_sha256) is not str:
-            raise AcceptanceCheckError("control_manifest_update")
-        if final_evidence_export_receipt == initial_export_path:
-            raise AcceptanceCheckError("control_manifest_conflict")
-        _reverify_bound_evidence_export_receipt(
-            Path(initial_export_path),
-            manifest=manifest,
-            expected_sha256=initial_export_sha256,
-        )
-        export_path = Path(_control_path(final_evidence_export_receipt))
-        _receipt_count, receipts_sha256 = _verify_stored_receipts(path, manifest)
-        ledger = _read_gate_ledger(Path(cast(str, manifest["gate_ledger_path"])))
-        ledger_records_sha256 = _gate_ledger_records_hash(ledger)
-        _receipt, export_sha256 = _validate_evidence_export_receipt(
-            export_path,
-            manifest=manifest,
-            receipts_sha256=receipts_sha256,
-            ledger_records_sha256=ledger_records_sha256,
-        )
-        if manifest["final_evidence"] is not None and (
-            evidence["final_export_receipt_path"] != final_evidence_export_receipt
-            or evidence["final_export_receipt_sha256"] != export_sha256
-        ):
-            raise AcceptanceCheckError("control_manifest_conflict")
-        evidence["final_export_receipt_path"] = final_evidence_export_receipt
-        evidence["final_export_receipt_sha256"] = export_sha256
-    scenarios = manifest["scenarios"]
-    assert isinstance(scenarios, dict)
-    if terraform_plan_receipt is not None:
-        parts = terraform_plan_receipt.split(":")
-        if len(parts) != 4 or parts[0] not in {"A", "B"} or any(_SHA256_PATTERN.fullmatch(value) is None for value in parts[1:]):
-            raise AcceptanceCheckError("control_manifest_update")
-        scenario = scenarios[parts[0]]
-        assert isinstance(scenario, dict)
-        receipts = evidence["receipts"]
-        approvals = evidence["approvals"]
-        assert isinstance(receipts, list) and isinstance(approvals, list)
-        subject_sha256 = _sha256(parts[1].encode("utf-8"))
-        approval_matches = [
-            approval
-            for approval in approvals
-            if isinstance(approval, dict)
-            and approval.get("scenario_id") == parts[0]
-            and approval.get("kind") == "terraform-plan"
-            and approval.get("plan_receipt_sha256") == parts[2]
-            and approval.get("approval_sha256") == parts[3]
-        ]
-        if (
-            not any(
-                isinstance(receipt, dict)
-                and receipt.get("scenario_id") == parts[0]
-                and receipt.get("kind") == "terraform-plan"
-                and receipt.get("subject_sha256") == subject_sha256
-                and receipt.get("receipt_sha256") == parts[2]
-                for receipt in receipts
-            )
-            or len(approval_matches) != 1
-        ):
-            raise AcceptanceCheckError("control_manifest_update")
-        _require_current_approval(
-            cast(list[object], approvals),
-            scenario_id=parts[0],
-            kind="terraform-plan",
-            plan_receipt_sha256=parts[2],
-            approval_sha256=parts[3],
-            current=current,
-        )
-        receipt_value = ":".join(parts[1:])
-        if scenario["terraform_plan_receipt"] is not None and scenario["terraform_plan_receipt"] != receipt_value:
-            raise AcceptanceCheckError("control_manifest_conflict")
-        scenario["terraform_plan_receipt"] = receipt_value
-    if terraform_applied is not None:
-        parts = terraform_applied.split(":")
-        if len(parts) != 4 or parts[0] not in {"A", "B"} or any(_SHA256_PATTERN.fullmatch(value) is None for value in parts[1:]):
-            raise AcceptanceCheckError("control_manifest_update")
-        scenario = scenarios[parts[0]]
-        assert isinstance(scenario, dict)
-        if scenario["terraform_plan_receipt"] != ":".join(parts[1:]):
-            raise AcceptanceCheckError("control_manifest_update")
-        approvals = evidence["approvals"]
-        assert isinstance(approvals, list)
-        _require_current_approval(
-            cast(list[object], approvals),
-            scenario_id=parts[0],
-            kind="terraform-plan",
-            plan_receipt_sha256=parts[2],
-            approval_sha256=parts[3],
-            current=current,
-        )
-        scenario["terraform_applied"] = True
-    if terraform_noop_receipt is not None:
-        parts = terraform_noop_receipt.split(":")
-        if len(parts) != 3 or parts[0] not in {"A", "B"} or any(_SHA256_PATTERN.fullmatch(value) is None for value in parts[1:]):
-            raise AcceptanceCheckError("control_manifest_update")
-        scenario = scenarios[parts[0]]
-        assert isinstance(scenario, dict)
-        if scenario["terraform_applied"] is not True:
-            raise AcceptanceCheckError("control_manifest_update")
-        receipts = evidence["receipts"]
-        assert isinstance(receipts, list)
-        if not any(
-            isinstance(receipt, dict)
-            and receipt.get("scenario_id") == parts[0]
-            and receipt.get("kind") == "terraform-noop"
-            and receipt.get("subject_sha256") == _sha256(parts[1].encode("utf-8"))
-            and receipt.get("receipt_sha256") == parts[2]
-            for receipt in receipts
-        ):
-            raise AcceptanceCheckError("control_manifest_update")
-        receipt_value = ":".join(parts[1:])
-        if scenario["terraform_noop_receipt"] is not None and scenario["terraform_noop_receipt"] != receipt_value:
-            raise AcceptanceCheckError("control_manifest_conflict")
-        scenario["terraform_noop_receipt"] = receipt_value
-    if cleanup_checkpoint is not None:
-        try:
-            surface, state_value = cleanup_checkpoint.split(":", 1)
-        except ValueError:
-            raise AcceptanceCheckError("control_manifest_update") from None
-        cleanup_states = manifest["cleanup_states"]
-        assert isinstance(cleanup_states, dict)
-        if surface not in cleanup_states or state_value not in {"pending", "confirmed", "failed", "interrupted"}:
-            raise AcceptanceCheckError("control_manifest_update")
-        if cleanup_states[surface] == "confirmed" and state_value != "confirmed":
-            raise AcceptanceCheckError("control_manifest_update")
-        cleanup_states[surface] = state_value
-    if verdict_failure is not None:
-        failures = manifest["verdict_failures"]
-        assert isinstance(failures, list)
-        if verdict_failure not in failures:
-            failures.append(verdict_failure)
-        if verdict_failure == "teardown_deadline":
-            manifest["deadline_failure_recorded"] = True
-    if emergency_cleanup_deadline_utc is not None:
-        existing_emergency = manifest["emergency_cleanup_deadline_utc"]
-        if existing_emergency is not None and existing_emergency != emergency_cleanup_deadline_utc:
-            raise AcceptanceCheckError("control_manifest_conflict")
-        manifest["emergency_cleanup_deadline_utc"] = emergency_cleanup_deadline_utc
-    if cleanup_escalation is not None:
-        escalations = manifest["cleanup_escalations"]
-        assert isinstance(escalations, list)
-        if cleanup_escalation not in escalations:
-            escalations.append(cleanup_escalation)
-    manifest["updated_at"] = _utc_timestamp(current)
-    _validate_control_manifest(manifest)
-    _write_protected_document(
-        path,
-        manifest,
-        create=False,
-        exists_check="control_manifest_exists",
-        write_check="control_manifest_file",
-    )
-    return manifest
-
-
-def control_manifest_load_cleanup(
-    path: Path,
-    *,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> str:
-    manifest = _read_control_manifest(path)
-    current = now()
-    expired = current >= _control_timestamp(manifest["teardown_deadline_utc"])
-    cleanup_committed = (
-        manifest["cleanup_required"] is False
-        and isinstance(manifest["final_evidence"], Mapping)
-        and manifest["final_evidence"].get("phase") == "committed"
-    )
-    if (
-        expired
-        and not cleanup_committed
-        and (manifest["deadline_failure_recorded"] is not True or manifest["emergency_cleanup_deadline_utc"] is None)
-    ):
-        emergency_deadline = manifest["emergency_cleanup_deadline_utc"]
-        if emergency_deadline is None:
-            emergency_deadline = _utc_timestamp(current + timedelta(seconds=_EMERGENCY_CLEANUP_SECONDS))
-        assert isinstance(emergency_deadline, str)
-        control_manifest_update(
-            path,
-            verdict_failure="teardown_deadline",
-            emergency_cleanup_deadline_utc=emergency_deadline,
-            cleanup_escalation="teardown_deadline",
-            now=lambda: current,
-        )
-        manifest = _read_control_manifest(path)
-    aws = manifest["aws"]
-    scenarios = manifest["scenarios"]
-    ecr = manifest["ecr"]
-    evidence = manifest["evidence"]
-    assert isinstance(aws, dict) and isinstance(scenarios, dict) and isinstance(ecr, dict) and isinstance(evidence, dict)
-    scenario_a = scenarios["A"]
-    scenario_b = scenarios["B"]
-    assert isinstance(scenario_a, dict) and isinstance(scenario_b, dict)
-    inventory_a = _load_bound_scenario_inventory(manifest, "A")
-    inventory_b = _load_bound_scenario_inventory(manifest, "B")
-    values_a = inventory_a["values"]
-    values_b = inventory_b["values"]
-    assert isinstance(values_a, dict) and isinstance(values_b, dict)
-    assignments: dict[str, object] = {
-        "ACCEPTANCE_REENTRY_FORBIDDEN": 1 if expired else 0,
-        "ACCEPTANCE_RUN_ID": manifest["acceptance_run_id"],
-        "ACCEPTANCE_TEARDOWN_DEADLINE_UTC": manifest["teardown_deadline_utc"],
-        "AWS_ACCOUNT_ID": aws["account_id"],
-        "AWS_REGION": aws["region"],
-        "CANDIDATE_SHA": manifest["candidate_sha"],
-        "CANDIDATE_TAG": ecr["candidate_tag"] or "",
-        "CLEANUP_REQUIRED": 1 if manifest["cleanup_required"] else 0,
-        "DEADLINE_EXPIRED": 1 if expired else 0,
-        "ELSPETH_CLEANUP_MODE": 1,
-        "ECR_REGISTRY": ecr["registry"] or "",
-        "ECR_REPOSITORY": ecr["repository"] or "",
-        "EMERGENCY_CLEANUP_DEADLINE_UTC": manifest["emergency_cleanup_deadline_utc"] or "",
-        "GATE_LEDGER": manifest["gate_ledger_path"],
-        "ROLLBACK_BASELINE_TAG": ecr["baseline_tag"] or "",
-        "ROLLBACK_BASELINE_DIGEST": ecr["baseline_digest"] or "",
-        "IMAGE_DIGEST": ecr["candidate_digest"] or "",
-        "ROLLBACK_BASELINE_IMAGE": (
-            f"{ecr['registry']}/{ecr['repository']}@{ecr['baseline_digest']}"
-            if ecr["registry"] and ecr["repository"] and ecr["baseline_digest"]
-            else ""
-        ),
-        "CANDIDATE_IMAGE": (
-            f"{ecr['registry']}/{ecr['repository']}@{ecr['candidate_digest']}"
-            if ecr["registry"] and ecr["repository"] and ecr["candidate_digest"]
-            else ""
-        ),
-        "ACCEPTANCE_STATE": evidence["acceptance_state_path"] or "",
-        "OIDC_EVIDENCE_DIR": evidence["oidc_evidence_dir"] or "",
-        "EVIDENCE_DESTINATION_SHA256": evidence["destination_sha256"],
-        "EVIDENCE_EXPORT_RECEIPT": evidence["export_receipt_path"] or "",
-        "FINAL_EVIDENCE_EXPORT_RECEIPT": evidence["final_export_receipt_path"] or "",
-        "SCENARIO_A_INVENTORY": scenario_a["inventory_path"],
-        "SCENARIO_A_TF_DIR": values_a["SCENARIO_TF_DIR"],
-        "SCENARIO_A_TF_VARS": values_a["SCENARIO_TF_VARS"],
-        "SCENARIO_A_TF_BINDING_SHA": scenario_a["tf_binding_sha256"],
-        "SCENARIO_A_TF_BINDING_FILE": scenario_a["tf_binding_path"],
-        "SCENARIO_B_INVENTORY": scenario_b["inventory_path"],
-        "SCENARIO_B_TF_DIR": values_b["SCENARIO_TF_DIR"],
-        "SCENARIO_B_TF_VARS": values_b["SCENARIO_TF_VARS"],
-        "SCENARIO_B_TF_BINDING_SHA": scenario_b["tf_binding_sha256"],
-        "SCENARIO_B_TF_BINDING_FILE": scenario_b["tf_binding_path"],
-    }
-    return "\n".join(f"{name}={shlex.quote(str(value))}" for name, value in assignments.items()) + "\n"
-
-
-def scenario_load(
-    path: Path,
-    *,
-    scenario_id: str,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> str:
-    """Render one bound scenario inventory as a closed shell assignment set."""
-
-    if scenario_id not in {"A", "B"}:
-        raise AcceptanceCheckError("scenario_inventory_binding")
-    manifest = control_manifest_validate(path, now=now)
-    inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-    values = inventory["values"]
-    assert isinstance(values, dict)
-    assignments = {
-        "ACTIVE_SCENARIO_ID": scenario_id,
-        "ACCEPTANCE_RUN_ID": manifest["acceptance_run_id"],
-        **{name: values[name] for name in SCENARIO_ASSIGNMENT_NAMES[2:]},
-    }
-    return "\n".join(f"{name}={shlex.quote(str(assignments[name]))}" for name in SCENARIO_ASSIGNMENT_NAMES) + "\n"
-
-
-def validate_compatibility_record(
-    record_path: Path,
-    *,
-    manifest_path: Path,
-    scenario_id: str,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Validate the release/schema authority bound to one resolved scenario."""
-
-    if scenario_id not in _APPLICATION_SCENARIO_IDS:
-        raise AcceptanceCheckError("compatibility_record_binding")
-    manifest = _read_control_manifest(manifest_path)
-    inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-    values = inventory["values"]
-    ecr = manifest["ecr"]
-    assert isinstance(values, dict) and isinstance(ecr, dict)
-    record = _read_protected_document(record_path, check="compatibility_record_file")
-    fields = {
-        "schema",
-        "record_id",
-        "acceptance_run_id",
-        "scenario_id",
-        "candidate_sha",
-        "candidate_image_digest",
-        "candidate_task_definition",
-        "candidate_doctor_task_definition",
-        "candidate_package_version",
-        "previous_source_sha",
-        "previous_image_digest",
-        "previous_task_definition",
-        "rollback_doctor_task_definition",
-        "previous_package_version",
-        "schema_facts",
-        "forward_compatible",
-        "backward_compatible",
-        "rollback_permitted",
-        "decision",
-        "approver_identity",
-        "countersigner_identity",
-        "approved_at",
-        "countersigned_at",
-        "expires_at",
-    }
-    if set(record) != fields or record["schema"] != "elspeth.aws-ecs-compatibility-record.v2":
-        raise AcceptanceCheckError("compatibility_record_schema")
-    previous = values["PREVIOUS_TASK_DEFINITION"] if scenario_id == "B" else ""
-    rollback_doctor = values["ROLLBACK_DOCTOR_TASK_DEFINITION"] if scenario_id == "B" else ""
-    previous_digest = ecr["baseline_digest"] if scenario_id == "B" else ""
-    baseline_tag = ecr["baseline_tag"] if scenario_id == "B" else ""
-    baseline_match = re.search(r"baseline-([0-9a-f]{40})$", cast(str, baseline_tag)) if baseline_tag else None
-    previous_source_sha = baseline_match.group(1) if baseline_match is not None else ""
-    expected_schema_facts = _expected_schema_facts(scenario_id)
-    if (
-        record["acceptance_run_id"] != manifest["acceptance_run_id"]
-        or record["scenario_id"] != scenario_id
-        or record["candidate_sha"] != manifest["candidate_sha"]
-        or record["candidate_image_digest"] != ecr["candidate_digest"]
-        or record["candidate_task_definition"] != values["CANDIDATE_TASK_DEFINITION"]
-        or record["candidate_doctor_task_definition"] != values["DOCTOR_TASK_DEFINITION"]
-        or record["candidate_package_version"] != _CANDIDATE_PACKAGE_VERSION
-        or record["previous_source_sha"] != previous_source_sha
-        or record["previous_image_digest"] != previous_digest
-        or record["previous_task_definition"] != previous
-        or record["rollback_doctor_task_definition"] != rollback_doctor
-        or record["previous_package_version"] != (_ROLLBACK_PACKAGE_VERSION if scenario_id == "B" else "")
-        or record["schema_facts"] != expected_schema_facts
-        or record["decision"] != "approved"
-        or record["forward_compatible"] is not True
-        or record["backward_compatible"] is not False
-        or record["rollback_permitted"] is not False
-    ):
-        raise AcceptanceCheckError("compatibility_record_binding")
-    if any(type(record[field]) is not bool for field in ("forward_compatible", "backward_compatible", "rollback_permitted")):
-        raise AcceptanceCheckError("compatibility_record_schema")
-    for field in ("record_id", "approver_identity", "countersigner_identity"):
-        value = record[field]
-        if type(value) is not str or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}", value) is None:
-            raise AcceptanceCheckError("compatibility_record_schema")
-    if record["approver_identity"] == record["countersigner_identity"]:
-        raise AcceptanceCheckError("compatibility_record_schema")
-    approved_at = _control_timestamp(record["approved_at"])
-    countersigned_at = _control_timestamp(record["countersigned_at"])
-    expires_at = _control_timestamp(record["expires_at"])
-    current = now()
-    if current.tzinfo is None or current.utcoffset() is None or not approved_at <= countersigned_at <= current < expires_at:
-        raise AcceptanceCheckError("compatibility_record_expired")
-    canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return {
-        "schema": "elspeth.aws-ecs-compatibility-receipt.v2",
-        "record_sha256": _sha256(canonical),
-        "acceptance_run_id_sha256": _sha256(cast(str, manifest["acceptance_run_id"]).encode()),
-        "scenario_id": scenario_id,
-        "candidate_sha": manifest["candidate_sha"],
-        "candidate_image_digest": ecr["candidate_digest"],
-        "candidate_task_definition_sha256": _sha256(cast(str, values["CANDIDATE_TASK_DEFINITION"]).encode()),
-        "candidate_doctor_task_definition_sha256": _sha256(cast(str, values["DOCTOR_TASK_DEFINITION"]).encode()),
-        "candidate_package_version": _CANDIDATE_PACKAGE_VERSION,
-        "previous_source_sha": previous_source_sha or None,
-        "previous_image_digest": previous_digest or None,
-        "previous_task_definition_sha256": _sha256(cast(str, previous).encode()) if previous else None,
-        "rollback_doctor_task_definition_sha256": _sha256(cast(str, rollback_doctor).encode()) if rollback_doctor else None,
-        "previous_package_version": _ROLLBACK_PACKAGE_VERSION if scenario_id == "B" else None,
-        "schema_facts": expected_schema_facts,
-        "forward_compatible": record["forward_compatible"],
-        "backward_compatible": record["backward_compatible"],
-        "rollback_permitted": record["rollback_permitted"],
-        "decision": "approved",
-        "approvals_present": True,
-        "expires_at": _utc_timestamp(expires_at),
-    }
-
-
-def _ensure_final_cleanup_receipt(
-    manifest_path: Path,
-    manifest: Mapping[str, object],
-    *,
-    ledger_sha256: str,
-    receipts_sha256: str,
-    committed_at: str,
-) -> None:
-    final_receipt = _final_cleanup_receipt_document(
-        manifest_path,
-        manifest,
-        ledger_sha256=ledger_sha256,
-        receipts_sha256=receipts_sha256,
-        committed_at=committed_at,
-    )
-    final_receipt_path = manifest_path.with_name(f"{manifest_path.name}.final-receipt.json")
-    if final_receipt_path.exists():
-        if _read_protected_document(final_receipt_path, check="cleanup_finalize_receipt") != final_receipt:
-            raise AcceptanceCheckError("cleanup_finalize_conflict")
-        return
-    _write_protected_document(
-        final_receipt_path,
-        final_receipt,
-        create=True,
-        exists_check="cleanup_finalize_conflict",
-        write_check="cleanup_finalize_receipt",
-    )
-
-
-@_serialized_control_manifest_write
-def cleanup_evidence_finalize(
-    manifest_path: Path,
-    *,
-    ledger_path: Path,
-    phase: Literal["prepare", "commit"],
-    clear_cleanup_required: bool,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Prepare and commit final cleanup evidence without prematurely clearing teardown."""
-
-    manifest = _read_control_manifest(manifest_path)
-    if manifest["gate_ledger_path"] != str(ledger_path):
-        raise AcceptanceCheckError("cleanup_finalize_binding")
-    ledger = _read_gate_ledger(ledger_path)
-    cleanup_records = ledger["cleanup_records"]
-    assert isinstance(cleanup_records, list)
-    terminal_records = [
-        record for record in cleanup_records if isinstance(record, dict) and record.get("check_id") == _TERMINAL_GATE_CHECK_ID
-    ]
-    if len(terminal_records) > 1:
-        raise AcceptanceCheckError("gate_ledger_conflict")
-    prefix_records = [
-        record for record in cleanup_records if not isinstance(record, dict) or record.get("check_id") != _TERMINAL_GATE_CHECK_ID
-    ]
-    if [record["check_id"] for record in prefix_records if isinstance(record, dict)] != list(_CLEANUP_GATE_CHECK_ORDER[:-1]):
-        raise AcceptanceCheckError("gate_ledger_incomplete")
-    receipt_count, receipts_sha256 = _verify_stored_receipts(manifest_path, manifest)
-    ledger_records_sha256 = _gate_ledger_records_hash({**ledger, "cleanup_records": prefix_records})
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, Mapping)
-    export_receipt_path = evidence["final_export_receipt_path"]
-    export_receipt_sha256 = evidence["final_export_receipt_sha256"]
-    if type(export_receipt_path) is not str or type(export_receipt_sha256) is not str:
-        raise AcceptanceCheckError("cleanup_finalize_export")
-    _export_receipt, observed_export_sha256 = _validate_evidence_export_receipt(
-        Path(export_receipt_path),
-        manifest=manifest,
-        receipts_sha256=receipts_sha256,
-        ledger_records_sha256=ledger_records_sha256,
-    )
-    if observed_export_sha256 != export_receipt_sha256:
-        raise AcceptanceCheckError("cleanup_finalize_export")
-    timestamp = _utc_timestamp(now())
-    candidate_sha = manifest["candidate_sha"]
-    assert isinstance(candidate_sha, str)
-    terminal_receipt_hash = _sha256(
-        json.dumps(
-            {
-                "check_id": _TERMINAL_GATE_CHECK_ID,
-                "prefix_records_sha256": ledger_records_sha256,
-                "receipts_sha256": receipts_sha256,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
-    if phase == "prepare":
-        if clear_cleanup_required or ledger["finalized"] is not None:
-            raise AcceptanceCheckError("cleanup_finalize_phase")
-        existing = manifest["final_evidence"]
-        prepared = {
-            "phase": "prepared",
-            "prepared_at": timestamp,
-            "receipt_count": receipt_count,
-            "receipts_sha256": receipts_sha256,
-            "ledger_records_sha256": ledger_records_sha256,
-            "precommit_manifest_sha256": None,
-            "committed_at": None,
-            "ledger_sha256": None,
-        }
-        if isinstance(existing, dict):
-            if existing["phase"] == "committed":
-                return manifest
-            comparable = {**prepared, "prepared_at": existing["prepared_at"]}
-            if existing != comparable:
-                raise AcceptanceCheckError("cleanup_finalize_conflict")
-            if terminal_records:
-                terminal = terminal_records[0]
-                if (
-                    terminal.get("candidate_sha") != candidate_sha
-                    or terminal.get("exit_status") != 0
-                    or terminal.get("receipt_hash") != terminal_receipt_hash
-                ):
-                    raise AcceptanceCheckError("cleanup_finalize_conflict")
-            return manifest
-        if terminal_records:
-            raise AcceptanceCheckError("cleanup_finalize_phase")
-        manifest["final_evidence"] = prepared
-        manifest["updated_at"] = timestamp
-        _validate_control_manifest(manifest)
-        _write_protected_document(
-            manifest_path,
-            manifest,
-            create=False,
-            exists_check="control_manifest_exists",
-            write_check="control_manifest_file",
-        )
-        return manifest
-    if phase != "commit" or not clear_cleanup_required:
-        raise AcceptanceCheckError("cleanup_finalize_phase")
-    final_evidence = manifest["final_evidence"]
-    if isinstance(final_evidence, dict) and final_evidence["phase"] == "committed" and manifest["cleanup_required"] is False:
-        ledger_sha256 = _gate_ledger_records_hash(ledger)
-        if (
-            final_evidence["ledger_sha256"] != ledger_sha256
-            or final_evidence["receipts_sha256"] != receipts_sha256
-            or type(final_evidence["committed_at"]) is not str
-        ):
-            raise AcceptanceCheckError("cleanup_finalize_conflict")
-        _ensure_final_cleanup_receipt(
-            manifest_path,
-            manifest,
-            ledger_sha256=ledger_sha256,
-            receipts_sha256=receipts_sha256,
-            committed_at=final_evidence["committed_at"],
-        )
-        return manifest
-    if manifest["cleanup_required"] is not True or not isinstance(final_evidence, dict):
-        raise AcceptanceCheckError("cleanup_finalize_pending")
-    assert isinstance(final_evidence, dict)
-    if final_evidence["phase"] != "prepared":
-        raise AcceptanceCheckError("cleanup_finalize_pending")
-    if (
-        final_evidence["receipt_count"] != receipt_count
-        or final_evidence["receipts_sha256"] != receipts_sha256
-        or final_evidence["ledger_records_sha256"] != ledger_records_sha256
-    ):
-        raise AcceptanceCheckError("cleanup_finalize_conflict")
-    cleanup_states = manifest["cleanup_states"]
-    assert isinstance(cleanup_states, dict)
-    for surface, state_value in cleanup_states.items():
-        if surface == "coordinator":
-            continue
-        if surface == "teardown_deadline" and manifest["deadline_failure_recorded"] is True:
-            if state_value not in {"confirmed", "failed", "pending"}:
-                raise AcceptanceCheckError("cleanup_finalize_pending")
-            continue
-        if state_value != "confirmed":
-            raise AcceptanceCheckError("cleanup_finalize_pending")
-    cleanup_states["coordinator"] = "confirmed"
-    if manifest["deadline_failure_recorded"] is True and cleanup_states["teardown_deadline"] != "confirmed":
-        cleanup_states["teardown_deadline"] = "failed"
-    if not terminal_records:
-        gate_ledger_record_cleanup(
-            ledger_path,
-            check_id=_TERMINAL_GATE_CHECK_ID,
-            exit_status=0,
-            receipt_hash=terminal_receipt_hash,
-            candidate_sha=candidate_sha,
-            started_at=timestamp,
-            ended_at=timestamp,
-            now=now,
-        )
-    else:
-        terminal = terminal_records[0]
-        if (
-            terminal.get("candidate_sha") != candidate_sha
-            or terminal.get("exit_status") != 0
-            or terminal.get("receipt_hash") != terminal_receipt_hash
-        ):
-            raise AcceptanceCheckError("cleanup_finalize_conflict")
-    ledger = _read_gate_ledger(ledger_path)
-    ledger_sha256 = _gate_ledger_records_hash(ledger)
-    precommit_manifest_sha256 = _sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-    final_evidence.update(
-        {
-            "phase": "committed",
-            "precommit_manifest_sha256": precommit_manifest_sha256,
-            "committed_at": timestamp,
-            "ledger_sha256": ledger_sha256,
-        }
-    )
-    manifest["cleanup_required"] = False
-    manifest["updated_at"] = timestamp
-    _validate_control_manifest(manifest)
-    _write_protected_document(
-        manifest_path,
-        manifest,
-        create=False,
-        exists_check="control_manifest_exists",
-        write_check="control_manifest_file",
-    )
-    final_manifest = _read_control_manifest(manifest_path)
-    _ensure_final_cleanup_receipt(
-        manifest_path,
-        final_manifest,
-        ledger_sha256=ledger_sha256,
-        receipts_sha256=receipts_sha256,
-        committed_at=timestamp,
-    )
-    return final_manifest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1498,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
     """Dispatch the closed acceptance command surface with static failures."""
 
     args = build_parser().parse_args(argv)
+
     try:
         if args.command == "capture":
             capture(os.environ, state_file=Path(args.state_file))
