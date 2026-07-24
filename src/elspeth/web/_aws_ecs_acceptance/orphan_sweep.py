@@ -336,11 +336,20 @@ def orphan_sweep(
     retained_traces = 0
     observed_retained_metrics = 0
     observed_retained_traces = 0
-    with contextlib.ExitStack() as stack:
-        for client in clients:
+    resource_close_failed = False
+
+    def close_client(client: Any) -> None:
+        nonlocal resource_close_failed
+        try:
             close = getattr(client, "close", None)
             if callable(close):
-                stack.callback(close)
+                close()
+        except Exception:
+            resource_close_failed = True
+
+    with contextlib.ExitStack() as stack:
+        for client in clients:
+            stack.callback(close_client, client)
         try:
             repository = ecr_manifest["repository"]
             tags = (ecr_manifest["baseline_tag"], ecr_manifest["candidate_tag"])
@@ -903,4 +912,6 @@ def orphan_sweep(
     _validate_bounded_receipt_document(receipt)
     if total_survivors:
         raise AcceptanceCheckError("orphan_sweep_survivors")
+    if resource_close_failed:
+        raise AcceptanceCheckError("orphan_sweep_resource_close")
     return receipt

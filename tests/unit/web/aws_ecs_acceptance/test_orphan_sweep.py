@@ -131,6 +131,8 @@ class _FakeOrphanClient:
         self.responses = dict(responses)
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.closed = False
+        self.close_calls = 0
+        self.close_error: Exception | None = None
 
     def __getattr__(self, name: str) -> Callable[..., object]:
         def call(**kwargs: object) -> object:
@@ -150,6 +152,9 @@ class _FakeOrphanClient:
 
     def close(self) -> None:
         self.closed = True
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class _OrphanNotFound(RuntimeError):
@@ -257,6 +262,70 @@ def test_orphan_sweep_closes_all_clients_emits_only_counts_and_accepts_zero_surv
     assert receipt["ok"] is True
     assert "4adf8a87" not in json.dumps(receipt)
     assert all(client.closed for client in clients)
+
+
+def test_orphan_sweep_attempts_every_close_and_translates_close_failures(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "control.json"
+    _init_control_manifest(manifest_path)
+    acceptance.control_manifest_update(
+        manifest_path,
+        cleanup_required=True,
+        ecr_baseline_tag="acceptance-4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48-baseline",
+        ecr_candidate_tag="acceptance-4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48-candidate",
+        ecr_registry="123456789012.dkr.ecr.ap-southeast-2.amazonaws.com",
+        ecr_repository="elspeth-acceptance",
+        now=lambda: datetime(2026, 7, 14, 1, 1, tzinfo=UTC),
+    )
+    clients = _empty_orphan_clients()
+    assert isinstance(clients.tagging, _FakeOrphanClient)
+    assert isinstance(clients.ecr, _FakeOrphanClient)
+    clients.tagging.close_error = RuntimeError("provider tagging close detail")
+    clients.ecr.close_error = RuntimeError("provider ecr close detail")
+
+    with pytest.raises(acceptance.AcceptanceCheckError) as exc_info:
+        owner.orphan_sweep(
+            manifest_path,
+            acceptance_run_id="4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48",
+            clients=clients,
+            environ={},
+            now=lambda: datetime(2026, 7, 14, 1, 2, tzinfo=UTC),
+        )
+
+    assert exc_info.value.check == "orphan_sweep_resource_close"
+    assert "provider" not in str(exc_info.value)
+    assert all(client.close_calls == 1 for client in clients)
+
+
+def test_orphan_sweep_preserves_primary_failure_when_client_close_also_fails(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "control.json"
+    _init_control_manifest(manifest_path)
+    acceptance.control_manifest_update(
+        manifest_path,
+        cleanup_required=True,
+        ecr_baseline_tag="acceptance-4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48-baseline",
+        ecr_candidate_tag="acceptance-4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48-candidate",
+        ecr_registry="123456789012.dkr.ecr.ap-southeast-2.amazonaws.com",
+        ecr_repository="elspeth-acceptance",
+        now=lambda: datetime(2026, 7, 14, 1, 1, tzinfo=UTC),
+    )
+    clients = _empty_orphan_clients()
+    assert isinstance(clients.tagging, _FakeOrphanClient)
+    assert isinstance(clients.ecr, _FakeOrphanClient)
+    clients.tagging.responses["get_resources"] = RuntimeError("provider api detail")
+    clients.tagging.close_error = RuntimeError("provider tagging close detail")
+    clients.ecr.close_error = RuntimeError("provider ecr close detail")
+
+    with pytest.raises(acceptance.AcceptanceCheckError) as exc_info:
+        owner.orphan_sweep(
+            manifest_path,
+            acceptance_run_id="4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48",
+            clients=clients,
+            environ={},
+        )
+
+    assert exc_info.value.check == "orphan_sweep_api"
+    assert "provider" not in str(exc_info.value)
+    assert all(client.close_calls == 1 for client in clients)
 
 
 @pytest.mark.parametrize("surface", ["guardrail-draft", "iam-role", "logs-resource-policy"])
