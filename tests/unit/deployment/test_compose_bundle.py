@@ -116,7 +116,11 @@ def test_postgresql_overlay_wires_a_healthy_persistent_server_and_cli_database()
     assert postgres["image"] == "postgres:16-alpine"
     assert "profiles" not in postgres
     assert postgres["healthcheck"]["test"]
-    assert "pg_isready" in " ".join(postgres["healthcheck"]["test"])
+    health_command = " ".join(postgres["healthcheck"]["test"])
+    assert "pg_isready" in health_command
+    assert "--host 127.0.0.1" in health_command
+    assert "-U elspeth" in health_command
+    assert "-d postgres" in health_command
     assert "postgres_data" in document["volumes"]
     assert any(volume.startswith("postgres_data:") and "/var/lib/postgresql/data" in volume for volume in postgres["volumes"])
     assert any("postgres-init.sql" in volume and "/docker-entrypoint-initdb.d/" in volume for volume in postgres["volumes"])
@@ -126,6 +130,14 @@ def test_postgresql_overlay_wires_a_healthy_persistent_server_and_cli_database()
     database_url = _environment(cli)["DATABASE_URL"]
     assert database_url == ("postgresql+psycopg://elspeth:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/elspeth_landscape")
     assert cli["depends_on"]["postgres"]["condition"] == "service_healthy"
+
+
+def test_postgresql_cli_waits_for_recurring_database_bootstrap() -> None:
+    static_cli = _service(_load(POSTGRES_COMPOSE), "elspeth")
+    rendered_cli = _service(_rendered_bundle(), "elspeth")
+
+    assert static_cli["depends_on"]["postgres-bootstrap"]["condition"] == "service_completed_successfully"
+    assert rendered_cli["depends_on"]["postgres-bootstrap"]["condition"] == "service_completed_successfully"
 
 
 def test_postgresql_initializer_creates_exactly_the_two_application_databases() -> None:
@@ -163,6 +175,8 @@ def test_postgresql_bootstrap_reconciles_reused_data_volumes_before_web_init() -
     rendered = _rendered_bundle()
     rendered_bootstrap = _service(rendered, "postgres-bootstrap")
     rendered_web_init = _service(rendered, "web-init")
+    rendered_postgres = _service(rendered, "postgres")
+    assert "--host 127.0.0.1" in " ".join(rendered_postgres["healthcheck"]["test"])
     assert rendered_bootstrap["depends_on"]["postgres"]["condition"] == "service_healthy"
     assert rendered_web_init["depends_on"]["postgres-bootstrap"]["condition"] == "service_completed_successfully"
 
