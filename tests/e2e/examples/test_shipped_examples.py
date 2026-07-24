@@ -18,7 +18,6 @@ import csv
 import json
 import os
 import shutil
-import sqlite3
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -26,7 +25,7 @@ from typing import Any
 
 import pytest
 import yaml
-from sqlalchemy import select
+from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, select
 from typer.testing import CliRunner
 
 from elspeth.cli import app
@@ -489,30 +488,39 @@ class TestShippedExamples:
         """Showcase stats distinguish successful and failed terminal outcomes."""
         run_id = "run-under-test"
         db_path = tmp_path / "audit.db"
-        with sqlite3.connect(db_path) as conn:
-            conn.executescript(
-                """
-                CREATE TABLE token_work_items (run_id TEXT NOT NULL, status TEXT NOT NULL);
-                CREATE TABLE token_outcomes (
-                    run_id TEXT NOT NULL,
-                    outcome TEXT,
-                    completed INTEGER NOT NULL
-                );
-                """
-            )
-            conn.executemany(
-                "INSERT INTO token_work_items (run_id, status) VALUES (?, 'terminal')",
-                [(run_id,)] * 200,
-            )
-            conn.executemany(
-                "INSERT INTO token_outcomes (run_id, outcome, completed) VALUES (?, ?, 1)",
-                [(run_id, "success")] * 192 + [(run_id, "failure")] * 8,
-            )
-            conn.execute(
-                "INSERT INTO token_outcomes (run_id, outcome, completed) VALUES (?, 'failure', 0)",
-                (run_id,),
-            )
-            conn.execute("INSERT INTO token_outcomes (run_id, outcome, completed) VALUES ('other-run', 'failure', 1)")
+        metadata = MetaData()
+        work_item_rows = Table(
+            "token_work_items",
+            metadata,
+            Column("run_id", String, nullable=False),
+            Column("status", String, nullable=False),
+        )
+        terminal_outcome_rows = Table(
+            "token_outcomes",
+            metadata,
+            Column("run_id", String, nullable=False),
+            Column("outcome", String, nullable=True),
+            Column("completed", Integer, nullable=False),
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        metadata.create_all(engine)
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    work_item_rows.insert(),
+                    [{"run_id": run_id, "status": "terminal"} for _ in range(200)],
+                )
+                conn.execute(
+                    terminal_outcome_rows.insert(),
+                    [{"run_id": run_id, "outcome": "success", "completed": 1} for _ in range(192)]
+                    + [{"run_id": run_id, "outcome": "failure", "completed": 1} for _ in range(8)]
+                    + [
+                        {"run_id": run_id, "outcome": "failure", "completed": 0},
+                        {"run_id": "other-run", "outcome": "failure", "completed": 1},
+                    ],
+                )
+        finally:
+            engine.dispose()
 
         stats_helper = example_pipeline_dir / "multi_worker_showcase" / "outcome_stats.sh"
         assert stats_helper.is_file(), "multi_worker_showcase must ship its outcome stats helper"
