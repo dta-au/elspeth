@@ -13,7 +13,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.web.config import WebSettings
-from elspeth.web.deployment_contract import validate_external_postgresql_settings
+from elspeth.web.deployment_contract import ResolvedDeploymentStateMode, validate_external_postgresql_settings
 from elspeth.web.paths import managed_blob_directory
 from elspeth.web.schema_probe import SchemaState, postgres_engine_kwargs, probe_landscape_schema, probe_session_schema
 from elspeth.web.sessions.schema import SessionSchemaError
@@ -43,9 +43,18 @@ def _schema_error(label: str) -> ExternalStateSchemaNotReadyError:
     return ExternalStateSchemaNotReadyError(f"External-state {label} is not ready and startup repair is disabled. {_DOCTOR_GUIDANCE}")
 
 
-def enforce_external_state_contract(settings: WebSettings) -> None:
+def enforce_external_state_contract(
+    settings: WebSettings,
+    *,
+    resolved_state_mode: ResolvedDeploymentStateMode | None = None,
+) -> None:
     """Enforce the external-state settings contract."""
-    failed_names = [check.name for check in validate_external_postgresql_settings(settings) if not check.ok]
+    checks = (
+        validate_external_postgresql_settings(settings)
+        if resolved_state_mode is None
+        else validate_external_postgresql_settings(settings, resolved_state_mode=resolved_state_mode)
+    )
+    failed_names = [check.name for check in checks if not check.ok]
     if failed_names:
         raise _contract_error(
             "External-state deployment settings failed checks: "

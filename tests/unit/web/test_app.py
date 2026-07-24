@@ -27,6 +27,7 @@ from starlette.responses import Response as StarletteResponse
 from structlog.testing import capture_logs
 
 import elspeth.web.app as app_module
+import elspeth.web.deployment_contract as deployment_contract_module
 from elspeth.contracts import RunStatus
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
@@ -1227,6 +1228,14 @@ class TestLifespanShutdown:
     @pytest.mark.asyncio
     async def test_lifespan_aborts_on_composer_config_rejection(self, monkeypatch, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
+        app.state._session_engine_finalizer()
+        finalizer_calls = 0
+
+        def finalize_session_engine() -> None:
+            nonlocal finalizer_calls
+            finalizer_calls += 1
+
+        app.state._session_engine_finalizer = finalize_session_engine
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
@@ -1248,6 +1257,7 @@ class TestLifespanShutdown:
         assert attributes["probe_status"] == "rejected"
         assert attributes["probed_model"] == "gpt-5.5"
         assert len(latency.calls) == 1
+        assert finalizer_calls == 1
 
     @pytest.mark.asyncio
     async def test_lifespan_skips_composer_probe_when_disabled(self, monkeypatch, tmp_path) -> None:
@@ -2709,6 +2719,37 @@ class TestDeploymentStateModeStartup:
         "deployment_target",
         ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
     )
+    def test_create_app_resolves_external_state_mode_exactly_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
+    ) -> None:
+        settings = _external_settings(tmp_path / deployment_target, deployment_target)
+        engine = create_engine("sqlite:///:memory:")
+        real_resolve = deployment_contract_module.resolve_deployment_state_mode
+        resolve_calls = 0
+
+        def resolve(passed_settings: WebSettings) -> str:
+            nonlocal resolve_calls
+            resolve_calls += 1
+            return real_resolve(passed_settings)
+
+        monkeypatch.setattr(app_module, "resolve_deployment_state_mode", resolve)
+        monkeypatch.setattr(deployment_contract_module, "resolve_deployment_state_mode", resolve)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
+
+        app = create_app(settings)
+
+        assert resolve_calls == 1
+        app.state._session_engine_finalizer()
+
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
     def test_external_mode_uses_raw_urls_validate_only_and_one_session_engine(
         self,
         tmp_path: Path,
@@ -3085,7 +3126,8 @@ class TestAwsEcsValidateOnlyStartup:
         original_catalog = app_module.create_catalog_service
         original_mkdir = Path.mkdir
 
-        def enforce(_settings: WebSettings) -> None:
+        def enforce(_settings: WebSettings, *, resolved_state_mode: str | None = None) -> None:
+            assert resolved_state_mode == "external-postgresql"
             order.append("contract")
 
         def directories(_settings: WebSettings) -> None:

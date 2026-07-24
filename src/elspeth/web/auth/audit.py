@@ -20,6 +20,7 @@ from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
+from elspeth.web.schema_probe import postgres_engine_kwargs
 
 if TYPE_CHECKING:
     from elspeth.web.config import WebSettings
@@ -210,6 +211,7 @@ class AuthAuditRecorder:
                 self.landscape_url,
                 passphrase=self.landscape_passphrase,
                 create_tables=self.create_tables,
+                **postgres_engine_kwargs(self.landscape_url),
             ) as db:
                 yield db
         except (SchemaCompatibilityError, LandscapeRecordError, SQLAlchemyError, OSError) as exc:

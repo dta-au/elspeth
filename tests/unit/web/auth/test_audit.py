@@ -16,6 +16,7 @@ from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.web.auth import audit as audit_module
 from elspeth.web.auth.audit import AuthAuditRecorder
+from elspeth.web.schema_probe import EXTERNAL_POSTGRES_POOL_KWARGS
 
 _STATE_POLICY_MATRIX = [
     ("default", "sqlite-single", True),
@@ -73,6 +74,45 @@ def test_direct_construction_requires_create_tables_policy() -> None:
             landscape_url="sqlite:///auth-audit.db",
             landscape_passphrase=None,
         )
+
+
+def test_external_recorder_open_forwards_postgres_engine_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
+    open_calls: list[tuple[str, dict[str, object]]] = []
+
+    class _DBContext:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class _FakeLandscapeDB:
+        @classmethod
+        def from_url(cls, url: str, **kwargs: object) -> _DBContext:
+            open_calls.append((url, kwargs))
+            return _DBContext()
+
+    landscape_url = "postgresql+psycopg://runtime@db/landscape"
+    monkeypatch.setattr(audit_module, "LandscapeDB", _FakeLandscapeDB)
+    recorder = AuthAuditRecorder(
+        landscape_url=landscape_url,
+        landscape_passphrase=None,
+        create_tables=False,
+    )
+
+    with recorder._open_landscape(audit_module.AuthAuditOperation.LOGIN_FAILURE):
+        pass
+
+    assert open_calls == [
+        (
+            landscape_url,
+            {
+                "passphrase": None,
+                "create_tables": False,
+                **EXTERNAL_POSTGRES_POOL_KWARGS,
+            },
+        )
+    ]
 
 
 def _request() -> Request:

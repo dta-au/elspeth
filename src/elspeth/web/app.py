@@ -352,6 +352,29 @@ async def _periodic_orphan_cleanup(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Own the session engine for the complete application lifespan."""
+    primary_error: BaseException | None = None
+    try:
+        async with _service_lifespan(app):
+            yield
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            app.state._session_engine_finalizer()
+        except BaseException as finalization_exc:
+            if primary_error is None:
+                raise
+            structlog.get_logger().error(
+                "session_engine_finalization_failed",
+                primary_exc_class=type(primary_error).__name__,
+                finalization_exc_class=type(finalization_exc).__name__,
+            )
+
+
+@asynccontextmanager
+async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Async lifespan context manager for the FastAPI application.
 
     Services that require a running event loop must be constructed here,
@@ -662,7 +685,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from elspeth.web.async_workers import shutdown_async_workers
 
         await shutdown_async_workers()
-        app.state._session_engine_finalizer()
 
 
 class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
@@ -823,9 +845,9 @@ def _create_app(
     # provider. A failed first create_app() must not strand a later corrected
     # boot on a provider selected from invalid settings.
     if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-        enforce_aws_ecs_contract(settings)
-    if external_state:
-        enforce_external_state_contract(settings)
+        enforce_aws_ecs_contract(settings, resolved_state_mode=resolved_state_mode)
+    elif external_state:
+        enforce_external_state_contract(settings, resolved_state_mode=resolved_state_mode)
 
     operator_runtime = bootstrap_operator_telemetry(settings)
     operator_meter = metrics.get_meter(__name__)

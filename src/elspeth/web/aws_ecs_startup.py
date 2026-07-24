@@ -9,7 +9,7 @@ from sqlalchemy import Connection, Engine, create_engine
 
 from elspeth.web import external_state_startup
 from elspeth.web.config import WebSettings
-from elspeth.web.deployment_contract import validate_aws_ecs_settings
+from elspeth.web.deployment_contract import ResolvedDeploymentStateMode, validate_aws_ecs_settings
 from elspeth.web.schema_probe import SchemaState
 
 _CONNECT_TIMEOUT_SECONDS = external_state_startup._CONNECT_TIMEOUT_SECONDS
@@ -37,9 +37,18 @@ def _aws_detail(exc: RuntimeError) -> str:
     return detail.replace("External-state", "AWS ECS", 1)
 
 
-def enforce_aws_ecs_contract(settings: WebSettings) -> None:
+def enforce_aws_ecs_contract(
+    settings: WebSettings,
+    *,
+    resolved_state_mode: ResolvedDeploymentStateMode | None = None,
+) -> None:
     """Enforce the shared external-state contract plus AWS identity settings."""
-    failed_names = [check.name for check in validate_aws_ecs_settings(settings) if not check.ok]
+    checks = (
+        validate_aws_ecs_settings(settings)
+        if resolved_state_mode is None
+        else validate_aws_ecs_settings(settings, resolved_state_mode=resolved_state_mode)
+    )
+    failed_names = [check.name for check in checks if not check.ok]
     if not failed_names:
         return
     if "separate_db_targets" in failed_names:

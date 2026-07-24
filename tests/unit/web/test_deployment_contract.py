@@ -70,6 +70,24 @@ def test_external_postgresql_targets_are_the_cloud_and_orchestrated_targets() ->
     assert frozenset({"aws-ecs", "azure-container-apps", "kubernetes"}) == deployment_contract.EXTERNAL_POSTGRESQL_TARGETS
 
 
+@pytest.mark.parametrize("validator", [validate_external_postgresql_settings, validate_aws_ecs_settings])
+def test_validators_accept_pre_resolved_mode_without_resolving_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    validator: Any,
+) -> None:
+    settings = _external_settings(tmp_path, target="aws-ecs")
+    monkeypatch.setattr(
+        deployment_contract,
+        "resolve_deployment_state_mode",
+        lambda *_args, **_kwargs: pytest.fail("pre-resolved validation must not resolve again"),
+    )
+
+    checks = validator(settings, resolved_state_mode="external-postgresql")
+
+    assert {check.name: check for check in checks}["deployment_state_mode"].ok is True
+
+
 @pytest.mark.parametrize(
     ("target", "overrides", "expected"),
     [

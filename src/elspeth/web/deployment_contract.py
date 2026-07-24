@@ -22,6 +22,7 @@ from elspeth.web.config import (
 )
 from elspeth.web.schema_probe import DatabaseTargetConflictError, require_distinct_postgres_targets
 
+ResolvedDeploymentStateMode = Literal["sqlite-single", "external-postgresql"]
 DEPLOYMENT_TARGET_AWS_ECS = "aws-ecs"
 EXTERNAL_POSTGRESQL_TARGETS: frozenset[DeploymentTarget] = frozenset({"aws-ecs", "azure-container-apps", "kubernetes"})
 _SUPPORTED_EXTERNAL_POSTGRES_DRIVERS = frozenset({"postgresql", "postgresql+psycopg2", "postgresql+psycopg"})
@@ -68,7 +69,7 @@ def _database_dialect(field_name: Literal["session_db_url", "landscape_url"], ur
     )
 
 
-def resolve_deployment_state_mode(settings: WebSettings) -> Literal["sqlite-single", "external-postgresql"]:
+def resolve_deployment_state_mode(settings: WebSettings) -> ResolvedDeploymentStateMode:
     """Resolve and validate the deployment's database state mode."""
     requested_mode = settings.deployment_state_mode
 
@@ -191,7 +192,11 @@ def _check_required_operator_identity(name: str, env_var: str, value: str | None
     return ContractCheck(name, True, f"{env_var} is set")
 
 
-def validate_aws_ecs_settings(settings: WebSettings) -> list[ContractCheck]:
+def validate_aws_ecs_settings(
+    settings: WebSettings,
+    *,
+    resolved_state_mode: ResolvedDeploymentStateMode | None = None,
+) -> list[ContractCheck]:
     """Run every strict AWS ECS contract check, including deployment target."""
     target_ok = settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS
     target_check = ContractCheck(
@@ -209,9 +214,13 @@ def validate_aws_ecs_settings(settings: WebSettings) -> list[ContractCheck]:
             else "ELSPETH_WEB__HOST must use the container-serving bind address for AWS ECS reachability"
         ),
     )
+    external_checks = (
+        validate_external_postgresql_settings(settings)
+        if resolved_state_mode is None
+        else validate_external_postgresql_settings(settings, resolved_state_mode=resolved_state_mode)
+    )
     checks = [
-        target_check if check.name == "deployment_target" else host_check if check.name == "host" else check
-        for check in validate_external_postgresql_settings(settings)
+        target_check if check.name == "deployment_target" else host_check if check.name == "host" else check for check in external_checks
     ]
     checks.extend(
         [
@@ -263,13 +272,19 @@ def validate_aws_ecs_settings(settings: WebSettings) -> list[ContractCheck]:
     return checks
 
 
-def validate_external_postgresql_settings(settings: WebSettings) -> list[ContractCheck]:
+def validate_external_postgresql_settings(
+    settings: WebSettings,
+    *,
+    resolved_state_mode: ResolvedDeploymentStateMode | None = None,
+) -> list[ContractCheck]:
     """Run redacted checks for the provider-neutral external PostgreSQL contract."""
     target_ok = settings.deployment_target in _EXTERNAL_STATE_TARGETS
-    try:
-        resolved_mode = resolve_deployment_state_mode(settings)
-    except DeploymentConfigurationError:
-        resolved_mode = None
+    resolved_mode = resolved_state_mode
+    if resolved_mode is None:
+        try:
+            resolved_mode = resolve_deployment_state_mode(settings)
+        except DeploymentConfigurationError:
+            resolved_mode = None
     mode_ok = target_ok and resolved_mode == "external-postgresql"
 
     session_check = _check_external_postgres_url(

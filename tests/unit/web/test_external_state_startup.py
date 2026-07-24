@@ -142,6 +142,21 @@ def test_contract_failure_reports_only_ordered_check_names(tmp_path: Path, monke
     _assert_redacted(exc_info.value)
 
 
+def test_contract_enforcement_forwards_pre_resolved_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings(tmp_path)
+    captured: dict[str, object] = {}
+
+    def validate(_settings: WebSettings, *, resolved_state_mode: str | None = None) -> list[ContractCheck]:
+        captured["resolved_state_mode"] = resolved_state_mode
+        return []
+
+    monkeypatch.setattr(startup, "validate_external_postgresql_settings", validate)
+
+    startup.enforce_external_state_contract(settings, resolved_state_mode="external-postgresql")
+
+    assert captured == {"resolved_state_mode": "external-postgresql"}
+
+
 @pytest.mark.parametrize(
     ("mutate", "label", "env_var"),
     [
