@@ -35,6 +35,12 @@ PUBLIC_OPERATOR_TELEMETRY_EXPORTS = {
     "xray_trace_id",
 }
 
+_CONNECTION_BUDGET_RUN_ID = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
+_CONNECTION_BUDGET_ENV = {
+    "AWS_REGION": "ap-southeast-2",
+    "ELSPETH_ACCEPTANCE_RUN_ID": _CONNECTION_BUDGET_RUN_ID,
+}
+
 
 def test_positive_operator_receipt_creates_and_binds_exact_retained_checkpoint(tmp_path: Path) -> None:
     run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
@@ -661,7 +667,7 @@ def test_verify_connection_budget_live_queries_cluster_metric_and_database_limit
             calls.append({"closed": True})
 
     receipt = operator_telemetry.verify_connection_budget_live(
-        {"AWS_REGION": "ap-southeast-2"},
+        _CONNECTION_BUDGET_ENV,
         cluster_id="a-0123456789abcdef0123-db",
         start_time="2026-07-14T01:00:00Z",
         approved_budget=20,
@@ -676,7 +682,8 @@ def test_verify_connection_budget_live_queries_cluster_metric_and_database_limit
     )
 
     assert receipt == {
-        "schema": "elspeth.rds-connection-budget.v2",
+        "schema": "elspeth.rds-connection-budget.v3",
+        "acceptance_run_id_sha256": hashlib.sha256(_CONNECTION_BUDGET_RUN_ID.encode()).hexdigest(),
         "cluster_id_sha256": hashlib.sha256(b"a-0123456789abcdef0123-db").hexdigest(),
         "window_start": "2026-07-14T01:00:00Z",
         "window_end": "2026-07-14T01:10:00Z",
@@ -704,9 +711,25 @@ def test_verify_connection_budget_live_queries_cluster_metric_and_database_limit
 def test_verify_connection_budget_live_rejects_non_minute_aligned_start() -> None:
     with pytest.raises(operator_telemetry.AcceptanceCheckError, match="connection_budget_input"):
         operator_telemetry.verify_connection_budget_live(
-            {"AWS_REGION": "ap-southeast-2"},
+            _CONNECTION_BUDGET_ENV,
             cluster_id="a-0123456789abcdef0123-db",
             start_time="2026-07-14T01:00:59Z",
+            approved_budget=20,
+            safety_margin=10,
+            now=lambda: datetime(2026, 7, 14, 1, 11, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize("acceptance_run_id", [None, "4ADF8A87-7FE2-44CC-9C9F-E39F9F51AC48", "not-a-uuid"])
+def test_verify_connection_budget_live_requires_canonical_acceptance_run_id(acceptance_run_id: str | None) -> None:
+    env = {"AWS_REGION": "ap-southeast-2"}
+    if acceptance_run_id is not None:
+        env["ELSPETH_ACCEPTANCE_RUN_ID"] = acceptance_run_id
+    with pytest.raises(operator_telemetry.AcceptanceCheckError, match="connection_budget_input"):
+        operator_telemetry.verify_connection_budget_live(
+            env,
+            cluster_id="a-0123456789abcdef0123-db",
+            start_time="2026-07-14T01:00:00Z",
             approved_budget=20,
             safety_margin=10,
             now=lambda: datetime(2026, 7, 14, 1, 11, tzinfo=UTC),
@@ -746,7 +769,7 @@ def test_verify_connection_budget_live_retries_partial_data_even_when_it_has_poi
             pass
 
     receipt = operator_telemetry.verify_connection_budget_live(
-        {"AWS_REGION": "ap-southeast-2"},
+        _CONNECTION_BUDGET_ENV,
         cluster_id="a-0123456789abcdef0123-db",
         start_time="2026-07-14T01:00:00Z",
         approved_budget=20,
@@ -779,7 +802,7 @@ def test_verify_connection_budget_live_retries_complete_but_sparse_grid() -> Non
             pass
 
     receipt = operator_telemetry.verify_connection_budget_live(
-        {"AWS_REGION": "ap-southeast-2"},
+        _CONNECTION_BUDGET_ENV,
         cluster_id="a-0123456789abcdef0123-db",
         start_time="2026-07-14T01:00:00Z",
         approved_budget=20,
@@ -999,7 +1022,7 @@ def test_connection_budget_rejects_high_water_or_an_approved_budget_without_safe
 
     with pytest.raises(operator_telemetry.AcceptanceCheckError, match=expected_error):
         operator_telemetry.verify_connection_budget_live(
-            {"AWS_REGION": "ap-southeast-2"},
+            _CONNECTION_BUDGET_ENV,
             cluster_id="a-0123456789abcdef0123-db",
             start_time="2026-07-14T01:00:00Z",
             approved_budget=approved_budget,

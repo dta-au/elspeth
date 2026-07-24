@@ -943,7 +943,8 @@ chmod 600 "$BOOTSTRAP_PLAN"
 BOOTSTRAP_PLAN_SHA=$(sha256sum "$BOOTSTRAP_PLAN" | awk '{print $1}')
 terraform_capture -chdir="$BOOTSTRAP_TF_DIR" show -json "$BOOTSTRAP_PLAN" \
   | uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-      sanitize-evidence --kind terraform-plan >"$BOOTSTRAP_PLAN_RECEIPT"
+      sanitize-evidence --kind terraform-plan \
+      --plan-sha256 "$BOOTSTRAP_PLAN_SHA" >"$BOOTSTRAP_PLAN_RECEIPT"
 BOOTSTRAP_PLAN_RECEIPT_HASH=$(persist_sanitized_receipt bootstrap terraform-plan \
   "$BOOTSTRAP_PLAN_SHA" "$BOOTSTRAP_PLAN_RECEIPT")
 request_signed_tf_approval bootstrap terraform-plan "$BOOTSTRAP_PLAN_RECEIPT_HASH" \
@@ -1214,11 +1215,11 @@ plan_and_apply_scenario() {
     -var="candidate_image=$CANDIDATE_IMAGE" \
     -var="rollback_baseline_image=$ROLLBACK_BASELINE_IMAGE" -out="$plan" >/dev/null
   chmod 600 "$plan"
+  plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
   terraform_capture -chdir="$directory" show -json "$plan" | \
     uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-      sanitize-evidence --kind terraform-plan >"$receipt"
+      sanitize-evidence --kind terraform-plan --plan-sha256 "$plan_sha" >"$receipt"
   chmod 600 "$receipt"
-  plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
   receipt_hash="$(persist_sanitized_receipt "$scenario_id" terraform-plan "$plan_sha" "$receipt")"
   request_signed_tf_approval "$scenario_id" terraform-plan "$receipt_hash" \
     "$receipt" "$TERRAFORM_PLAN_APPROVAL_FILE"
@@ -1240,11 +1241,11 @@ plan_and_apply_scenario() {
     -var="candidate_image=$CANDIDATE_IMAGE" \
     -var="rollback_baseline_image=$ROLLBACK_BASELINE_IMAGE" -out="$plan" >/dev/null
   chmod 600 "$plan"
+  noop_sha="$(sha256sum "$plan" | awk '{print $1}')"
   terraform_capture -chdir="$directory" show -json "$plan" | \
     uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-      sanitize-evidence --kind terraform-plan >"$receipt"
+      sanitize-evidence --kind terraform-plan --plan-sha256 "$noop_sha" >"$receipt"
   chmod 600 "$receipt"
-  noop_sha="$(sha256sum "$plan" | awk '{print $1}')"
   receipt_hash="$(persist_sanitized_receipt "$scenario_id" terraform-noop "$noop_sha" "$receipt")"
   render_resolved_inventory "$scenario_id" "$directory" "$resolved_inventory"
   checkpoint_terraform_noop_and_bind "$scenario_id" "$noop_sha" \
@@ -2784,7 +2785,7 @@ checkpoint_operator_retained_evidence() {
 }
 
 run_connection_budget_check() {
-  local task_arn="$1" stream envelope_file details_file command
+  local task_arn="$1" stream envelope_file command
   [[ "$ACCEPTANCE_START_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
   [[ "$ACCEPTANCE_CONNECTION_BUDGET" =~ ^[1-9][0-9]{0,8}$ ]]
   [[ "$ACCEPTANCE_CONNECTION_SAFETY_MARGIN" =~ ^[0-9]{1,9}$ ]]
@@ -2796,17 +2797,15 @@ run_connection_budget_check() {
     --cluster "$ECS_CLUSTER" --task "$task_arn" --container "$WEB_CONTAINER_NAME" \
     --interactive --command "$command")
   envelope_file=$(mktemp -p /tmp elspeth-connection-envelope.XXXXXX)
-  details_file=$(mktemp -p /tmp elspeth-connection-budget.XXXXXX)
-  chmod 600 "$envelope_file" "$details_file"
+  chmod 600 "$envelope_file"
   printf '%s' "$stream" | uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
     extract-exec-receipt --check verify-connection-budget \
     --candidate-sha "$CANDIDATE_SHA" --task-arn "$task_arn" \
     --scenario-id "$ACTIVE_SCENARIO_ID" >"$envelope_file"
   unset stream
-  jq -e '.details' "$envelope_file" >"$details_file"
   persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" connection-budget \
-    "$DB_CLUSTER_IDENTIFIER" "$details_file" >/dev/null
-  rm -f -- "$envelope_file" "$details_file"
+    "$task_arn" "$envelope_file" >/dev/null
+  rm -f -- "$envelope_file"
 }
 
 run_candidate_role_check "$CANDIDATE_TASK_ARN" verify-s3
@@ -3108,11 +3107,12 @@ destroy_scenario() {
       -var="candidate_image=$CANDIDATE_IMAGE" \
       -var="rollback_baseline_image=$ROLLBACK_BASELINE_IMAGE" -out="$plan" >/dev/null
     chmod 600 "$plan"
+    plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
     terraform_capture -chdir="$directory" show -json "$plan" | \
       uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-        sanitize-evidence --kind terraform-destroy-plan >"$receipt"
+        sanitize-evidence --kind terraform-destroy-plan \
+        --plan-sha256 "$plan_sha" >"$receipt"
     chmod 600 "$receipt"
-    plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
     receipt_hash="$(persist_sanitized_receipt "$scenario_id" terraform-destroy-plan "$plan_sha" "$receipt")"
     request_signed_tf_approval "$scenario_id" terraform-destroy-plan "$receipt_hash" \
       "$receipt" "$approval_file"
@@ -3182,11 +3182,12 @@ destroy_shared_bootstrap() {
           -var="backend_state_bucket=$BACKEND_STATE_BUCKET" \
           -var="ecr_repository=$ECR_REPOSITORY" -out="$plan" >/dev/null
         chmod 600 "$plan"
+        plan_sha=$(sha256sum "$plan" | awk '{print $1}')
         terraform_capture -chdir="$BOOTSTRAP_TF_DIR" show -json "$plan" | \
           uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-            sanitize-evidence --kind terraform-destroy-plan >"$receipt"
+            sanitize-evidence --kind terraform-destroy-plan \
+            --plan-sha256 "$plan_sha" >"$receipt"
         chmod 600 "$receipt"
-        plan_sha=$(sha256sum "$plan" | awk '{print $1}')
         receipt_hash=$(persist_sanitized_receipt bootstrap terraform-destroy-plan "$plan_sha" "$receipt")
         request_signed_tf_approval bootstrap terraform-destroy-plan "$receipt_hash" \
           "$receipt" "${BOOTSTRAP_DESTROY_APPROVAL_FILE:?set bootstrap destroy approval file}"

@@ -96,7 +96,10 @@ def test_sanitize_evidence_projects_logs_task_definitions_and_terraform_without_
             ],
             "planned_values": {"root_module": {"resources": [{"values": {"password": secret}}]}},
         },
+        plan_sha256="a" * 64,
     )
+    assert terraform["schema"] == "elspeth.aws-ecs-sanitized-evidence.v2"
+    assert terraform["plan_sha256"] == "a" * 64
     assert terraform["projection"] == {
         "resource_change_count": 3,
         "create_count": 1,
@@ -108,6 +111,17 @@ def test_sanitize_evidence_projects_logs_task_definitions_and_terraform_without_
         "has_replace": True,
     }
     assert secret not in json.dumps([logs, task_definition, terraform])
+
+
+@pytest.mark.parametrize("plan_sha256", [None, "A" * 64, "a" * 63])
+def test_sanitize_terraform_evidence_requires_exact_lowercase_plan_sha(plan_sha256: str | None) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="sanitize_evidence_schema"):
+        acceptance.sanitize_evidence("terraform-plan", {"resource_changes": []}, plan_sha256=plan_sha256)
+
+
+def test_sanitize_non_terraform_evidence_rejects_plan_sha() -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="sanitize_evidence_schema"):
+        acceptance.sanitize_evidence("web-log", {"events": []}, plan_sha256="a" * 64)
 
 
 @pytest.mark.parametrize("kind", sorted(acceptance.EVIDENCE_KINDS))
@@ -269,7 +283,7 @@ def test_final_evidence_export_refreshes_receipts_created_during_cleanup(tmp_pat
     baseline_evidence_count = len(baseline_evidence["receipts"]) + len(baseline_evidence["approvals"])
 
     receipt_path = tmp_path / "destroy-receipt.json"
-    receipt_path.write_text(json.dumps(_terraform_receipt(kind="terraform-destroy-plan", deletes=1)))
+    receipt_path.write_text(json.dumps(_terraform_receipt(kind="terraform-destroy-plan", deletes=1, plan_sha256="d" * 64)))
     os.chmod(receipt_path, 0o600)
     acceptance.receipt_store(
         manifest_path,
@@ -309,7 +323,7 @@ def test_initial_evidence_export_binding_replays_after_cleanup_evidence_advances
     initial_hash = checkpointed["evidence"]["export_receipt_sha256"]
 
     receipt_path = tmp_path / "destroy-plan-receipt.json"
-    receipt_path.write_text(json.dumps(_terraform_receipt(kind="terraform-destroy-plan", deletes=1)))
+    receipt_path.write_text(json.dumps(_terraform_receipt(kind="terraform-destroy-plan", deletes=1, plan_sha256="d" * 64)))
     os.chmod(receipt_path, 0o600)
     acceptance.receipt_store(
         manifest_path,

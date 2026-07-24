@@ -48,10 +48,11 @@ def test_manifest_and_inventory_owners_are_facade_reexports_by_identity() -> Non
         assert getattr(scenario_inventory, name) is getattr(contracts, name)
 
 
-def _terraform_receipt(*, kind: str = "terraform-plan", deletes: int = 0) -> dict[str, object]:
+def _terraform_receipt(*, kind: str = "terraform-plan", deletes: int = 0, plan_sha256: str = "a" * 64) -> dict[str, object]:
     return {
-        "schema": "elspeth.aws-ecs-sanitized-evidence.v1",
+        "schema": "elspeth.aws-ecs-sanitized-evidence.v2",
         "kind": kind,
+        "plan_sha256": plan_sha256,
         "projection": {
             "resource_change_count": deletes,
             "create_count": 0,
@@ -334,7 +335,7 @@ def _init_control_manifest(
         for scenario, plan_character, noop_character in (("A", "1", "3"), ("B", "2", "4")):
             plan_sha = plan_character * 64
             plan_path = path.parent / f"{scenario.lower()}-plan-receipt.json"
-            plan_path.write_text(json.dumps(_terraform_receipt()))
+            plan_path.write_text(json.dumps(_terraform_receipt(plan_sha256=plan_sha)))
             os.chmod(plan_path, 0o600)
             plan_receipt_hash = acceptance.receipt_store(
                 path,
@@ -386,7 +387,7 @@ def _init_control_manifest(
             )
             noop_sha = noop_character * 64
             noop_path = path.parent / f"{scenario.lower()}-noop-receipt.json"
-            noop_path.write_text(json.dumps(_terraform_receipt()))
+            noop_path.write_text(json.dumps(_terraform_receipt(plan_sha256=noop_sha)))
             os.chmod(noop_path, 0o600)
             noop_receipt_hash = acceptance.receipt_store(
                 path,

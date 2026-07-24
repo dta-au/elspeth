@@ -942,6 +942,10 @@ def verify_connection_budget_live(
     ):
         raise AcceptanceCheckError("connection_budget_input")
     try:
+        acceptance_run_id = _canonical_uuid(env.get("ELSPETH_ACCEPTANCE_RUN_ID", ""), label="acceptance run ID")
+    except AcceptanceInputError:
+        raise AcceptanceCheckError("connection_budget_input") from None
+    try:
         window_start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
     except (TypeError, ValueError):
         raise AcceptanceCheckError("connection_budget_input") from None
@@ -1062,7 +1066,8 @@ def verify_connection_budget_live(
     if high_water > approved_budget or maximum - high_water < safety_margin:
         raise AcceptanceCheckError("connection_budget_exceeded")
     return {
-        "schema": "elspeth.rds-connection-budget.v2",
+        "schema": "elspeth.rds-connection-budget.v3",
+        "acceptance_run_id_sha256": _sha256(acceptance_run_id.encode("utf-8")),
         "cluster_id_sha256": _sha256(cluster_id.encode("utf-8")),
         "window_start": _utc_timestamp(window_start),
         "window_end": _utc_timestamp(window_end),

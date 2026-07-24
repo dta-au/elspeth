@@ -22,6 +22,7 @@ from .contracts import (
 from .gate_ledger import _gate_ledger_records_hash, _read_gate_ledger
 from .manifest_schema import _read_control_manifest
 from .receipt_contracts import _validate_stored_receipt
+from .scenario_inventory import _load_bound_scenario_inventory
 from .secure_documents import _read_protected_document, _write_protected_document
 from .state import _parse_state_timestamp
 
@@ -68,15 +69,23 @@ def _project_log_record(record: Mapping[str, object], *, timestamp: object | Non
     return projected
 
 
-def sanitize_evidence(kind: str, payload: object) -> dict[str, object]:
+def sanitize_evidence(kind: str, payload: object, *, plan_sha256: str | None = None) -> dict[str, object]:
     """Project raw diagnostic JSON into one closed, content-free evidence schema."""
 
     if kind not in _EVIDENCE_KINDS or not isinstance(payload, dict):
         raise AcceptanceCheckError("sanitize_evidence_schema")
+    terraform_evidence = kind in {"terraform-plan", "terraform-destroy-plan"}
+    if terraform_evidence:
+        if type(plan_sha256) is not str or _SHA256_PATTERN.fullmatch(plan_sha256) is None:
+            raise AcceptanceCheckError("sanitize_evidence_schema")
+    elif plan_sha256 is not None:
+        raise AcceptanceCheckError("sanitize_evidence_schema")
     base: dict[str, object] = {
-        "schema": "elspeth.aws-ecs-sanitized-evidence.v1",
+        "schema": "elspeth.aws-ecs-sanitized-evidence.v2" if terraform_evidence else "elspeth.aws-ecs-sanitized-evidence.v1",
         "kind": kind,
     }
+    if terraform_evidence:
+        base["plan_sha256"] = plan_sha256
     if kind in {"web-log", "doctor-log"}:
         events = payload.get("events")
         if not isinstance(events, list) or len(events) > 10_000:
@@ -190,12 +199,25 @@ def _verify_stored_receipts(manifest_path: Path, manifest: Mapping[str, object])
         subject_sha256 = record["subject_sha256"]
         assert isinstance(receipt_hash, str)
         assert isinstance(scenario_id, str) and isinstance(kind, str) and isinstance(subject_sha256, str)
+        expected_acceptance_run_id_sha256: str | None = None
+        expected_cluster_id_sha256: str | None = None
+        if kind == "connection-budget":
+            inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
+            values = inventory["values"]
+            acceptance_run_id = manifest["acceptance_run_id"]
+            assert isinstance(values, dict) and isinstance(acceptance_run_id, str)
+            cluster_id = values["DB_CLUSTER_IDENTIFIER"]
+            assert isinstance(cluster_id, str)
+            expected_acceptance_run_id_sha256 = _sha256(acceptance_run_id.encode("utf-8"))
+            expected_cluster_id_sha256 = _sha256(cluster_id.encode("utf-8"))
         document = _validate_stored_receipt(
             _read_protected_document(receipt_directory / f"{receipt_hash}.json", check="cleanup_finalize_receipt"),
             kind=kind,
             scenario_id=scenario_id,
             subject_sha256=subject_sha256,
             candidate_sha=candidate_sha,
+            expected_acceptance_run_id_sha256=expected_acceptance_run_id_sha256,
+            expected_cluster_id_sha256=expected_cluster_id_sha256,
         )
         canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if _sha256(canonical) != receipt_hash:

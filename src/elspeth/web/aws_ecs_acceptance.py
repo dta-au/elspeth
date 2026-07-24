@@ -502,6 +502,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sanitize_evidence = commands.add_parser("sanitize-evidence")
     sanitize_evidence.add_argument("--kind", required=True, choices=_EVIDENCE_KINDS)
+    sanitize_evidence.add_argument("--plan-sha256")
     return parser
 
 
@@ -765,7 +766,7 @@ def main(argv: list[str] | None = None) -> int:
                 raw_evidence = json.loads(content)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 raise AcceptanceCheckError("sanitize_evidence_schema") from None
-            _print_json(sanitize_evidence(args.kind, raw_evidence))
+            _print_json(sanitize_evidence(args.kind, raw_evidence, plan_sha256=args.plan_sha256))
         else:
             raise AcceptanceCheckError("command_not_implemented")
     except AcceptanceCheckError as exc:

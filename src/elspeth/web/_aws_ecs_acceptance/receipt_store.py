@@ -93,6 +93,17 @@ def _receipt_store_locked(
     candidate_sha = manifest["candidate_sha"]
     assert isinstance(candidate_sha, str)
     expected_plugin_policy_binding_sha256: str | None = None
+    expected_acceptance_run_id_sha256: str | None = None
+    expected_cluster_id_sha256: str | None = None
+    if kind == "connection-budget":
+        inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
+        values = inventory["values"]
+        acceptance_run_id = manifest["acceptance_run_id"]
+        assert isinstance(values, dict) and isinstance(acceptance_run_id, str)
+        cluster_id = values["DB_CLUSTER_IDENTIFIER"]
+        assert isinstance(cluster_id, str)
+        expected_acceptance_run_id_sha256 = _sha256(acceptance_run_id.encode("utf-8"))
+        expected_cluster_id_sha256 = _sha256(cluster_id.encode("utf-8"))
     if kind == "verify-bedrock-guardrails":
         inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
         values = inventory["values"]
@@ -132,6 +143,8 @@ def _receipt_store_locked(
         candidate_sha=candidate_sha,
         subject_id=subject_id,
         expected_plugin_policy_binding_sha256=expected_plugin_policy_binding_sha256,
+        expected_acceptance_run_id_sha256=expected_acceptance_run_id_sha256,
+        expected_cluster_id_sha256=expected_cluster_id_sha256,
     )
     canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
     receipt_sha256 = _sha256(canonical)
@@ -153,6 +166,8 @@ def _receipt_store_locked(
             candidate_sha=candidate_sha,
             subject_id=subject_id,
             expected_plugin_policy_binding_sha256=expected_plugin_policy_binding_sha256,
+            expected_acceptance_run_id_sha256=expected_acceptance_run_id_sha256,
+            expected_cluster_id_sha256=expected_cluster_id_sha256,
         )
         if existing != document:
             raise AcceptanceCheckError("receipt_store_conflict")

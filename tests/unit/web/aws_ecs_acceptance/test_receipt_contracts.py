@@ -142,7 +142,8 @@ def _operator_receipt_details(*, phase: str = "positive") -> dict[str, object]:
 
 def _connection_budget_details() -> dict[str, object]:
     return {
-        "schema": "elspeth.rds-connection-budget.v2",
+        "schema": "elspeth.rds-connection-budget.v3",
+        "acceptance_run_id_sha256": "b" * 64,
         "cluster_id_sha256": "a" * 64,
         "window_start": "2026-07-14T01:00:00Z",
         "window_end": "2026-07-14T01:10:00Z",
@@ -154,6 +155,24 @@ def _connection_budget_details() -> dict[str, object]:
         "approved_budget": 20,
         "safety_margin": 10,
         "ok": True,
+    }
+
+
+def _terraform_plan_receipt(plan_sha256: str) -> dict[str, object]:
+    return {
+        "schema": "elspeth.aws-ecs-sanitized-evidence.v2",
+        "kind": "terraform-plan",
+        "plan_sha256": plan_sha256,
+        "projection": {
+            "resource_change_count": 0,
+            "create_count": 0,
+            "update_count": 0,
+            "delete_count": 0,
+            "replace_count": 0,
+            "no_op_count": 0,
+            "has_delete": False,
+            "has_replace": False,
+        },
     }
 
 
@@ -410,6 +429,18 @@ def _stored_exec_receipt(check: str = "verify-s3", details: dict[str, object] | 
     )
 
 
+def _stored_connection_budget_receipt() -> dict[str, object]:
+    return {
+        "version": 1,
+        "check": "verify-connection-budget",
+        "ok": True,
+        "candidate_sha": "c" * 40,
+        "task_arn_sha256": "d" * 64,
+        "scenario_id": "A",
+        "details": _connection_budget_details(),
+    }
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_check"),
     [
@@ -449,31 +480,96 @@ def test_stored_exec_receipt_rejects_open_keys_hashes_and_wrong_bindings(mutatio
 
 @pytest.mark.parametrize("field", ["high_water", "max_connections", "approved_budget", "safety_margin"])
 def test_stored_connection_budget_rejects_bool_as_number(field: str) -> None:
-    payload = _connection_budget_details()
-    payload[field] = True
+    payload = _stored_connection_budget_receipt()
+    details = payload["details"]
+    assert isinstance(details, dict)
+    details[field] = True
 
     with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
         receipt_contracts._validate_stored_receipt(
             payload,
             kind="connection-budget",
             scenario_id="A",
-            subject_sha256="a" * 64,
+            subject_sha256="d" * 64,
             candidate_sha="c" * 40,
+            expected_acceptance_run_id_sha256="b" * 64,
+            expected_cluster_id_sha256="a" * 64,
         )
 
 
 @pytest.mark.parametrize("field", ["max_connections", "approved_budget", "safety_margin"])
 def test_stored_connection_budget_rejects_integral_float_for_integer_limit(field: str) -> None:
-    payload = _connection_budget_details()
-    payload[field] = float(payload[field])
+    payload = _stored_connection_budget_receipt()
+    details = payload["details"]
+    assert isinstance(details, dict)
+    details[field] = float(details[field])
 
     with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
         receipt_contracts._validate_stored_receipt(
             payload,
             kind="connection-budget",
             scenario_id="A",
-            subject_sha256="a" * 64,
+            subject_sha256="d" * 64,
             candidate_sha="c" * 40,
+            expected_acceptance_run_id_sha256="b" * 64,
+            expected_cluster_id_sha256="a" * 64,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["candidate", "scenario", "task", "run", "cluster"])
+def test_stored_connection_budget_binds_full_exec_and_runtime_identity(mutation: str) -> None:
+    payload = _stored_connection_budget_receipt()
+    subject_sha256 = "d" * 64
+    expected_run_sha256 = "b" * 64
+    expected_cluster_sha256 = "a" * 64
+    details = payload["details"]
+    assert isinstance(details, dict)
+    if mutation == "candidate":
+        payload["candidate_sha"] = "e" * 40
+    elif mutation == "scenario":
+        payload["scenario_id"] = "B"
+    elif mutation == "task":
+        subject_sha256 = "e" * 64
+    elif mutation == "run":
+        expected_run_sha256 = "e" * 64
+    else:
+        expected_cluster_sha256 = "e" * 64
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_binding"):
+        receipt_contracts._validate_stored_receipt(
+            payload,
+            kind="connection-budget",
+            scenario_id="A",
+            subject_sha256=subject_sha256,
+            candidate_sha="c" * 40,
+            expected_acceptance_run_id_sha256=expected_run_sha256,
+            expected_cluster_id_sha256=expected_cluster_sha256,
+        )
+
+
+def test_stored_connection_budget_rejects_unbound_bare_details() -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="exec_receipt_schema"):
+        receipt_contracts._validate_stored_receipt(
+            _connection_budget_details(),
+            kind="connection-budget",
+            scenario_id="A",
+            subject_sha256="d" * 64,
+            candidate_sha="c" * 40,
+            expected_acceptance_run_id_sha256="b" * 64,
+            expected_cluster_id_sha256="a" * 64,
+        )
+
+
+@pytest.mark.parametrize("include_subject_id", [False, True])
+def test_stored_terraform_receipt_binds_exact_plan_sha_even_during_final_verification(include_subject_id: bool) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_binding"):
+        receipt_contracts._validate_stored_receipt(
+            _terraform_plan_receipt("a" * 64),
+            kind="terraform-plan",
+            scenario_id="A",
+            subject_sha256=hashlib.sha256(("b" * 64).encode()).hexdigest(),
+            candidate_sha="c" * 40,
+            subject_id="b" * 64 if include_subject_id else None,
         )
 
 

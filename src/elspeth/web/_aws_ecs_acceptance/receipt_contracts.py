@@ -415,10 +415,7 @@ def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
     elif check == "verify-bedrock-guardrails":
         _validate_guardrail_receipt_details(details)
     elif check == "verify-connection-budget":
-        cluster_sha256 = details.get("cluster_id_sha256")
-        if type(cluster_sha256) is not str:
-            raise AcceptanceCheckError("exec_receipt_schema")
-        _validate_connection_budget_receipt(details, subject_sha256=cluster_sha256)
+        _validate_connection_budget_receipt(details)
     else:
         _validate_operator_receipt_details(details)
     return payload
@@ -628,9 +625,15 @@ def _receipt_nonnegative_integer(value: object) -> int:
     return value
 
 
-def _validate_connection_budget_receipt(payload: object, *, subject_sha256: str) -> dict[str, object]:
+def _validate_connection_budget_receipt(
+    payload: object,
+    *,
+    expected_acceptance_run_id_sha256: str | None = None,
+    expected_cluster_id_sha256: str | None = None,
+) -> dict[str, object]:
     if not isinstance(payload, dict) or set(payload) != {
         "schema",
+        "acceptance_run_id_sha256",
         "cluster_id_sha256",
         "window_start",
         "window_end",
@@ -645,10 +648,15 @@ def _validate_connection_budget_receipt(payload: object, *, subject_sha256: str)
     }:
         raise AcceptanceCheckError("receipt_store_schema")
     if (
-        payload["schema"] != "elspeth.rds-connection-budget.v2"
+        payload["schema"] != "elspeth.rds-connection-budget.v3"
+        or type(payload["acceptance_run_id_sha256"]) is not str
+        or _SHA256_PATTERN.fullmatch(payload["acceptance_run_id_sha256"]) is None
         or type(payload["cluster_id_sha256"]) is not str
         or _SHA256_PATTERN.fullmatch(payload["cluster_id_sha256"]) is None
-        or payload["cluster_id_sha256"] != subject_sha256
+    ):
+        raise AcceptanceCheckError("receipt_store_schema")
+    if (expected_acceptance_run_id_sha256 is not None and payload["acceptance_run_id_sha256"] != expected_acceptance_run_id_sha256) or (
+        expected_cluster_id_sha256 is not None and payload["cluster_id_sha256"] != expected_cluster_id_sha256
     ):
         raise AcceptanceCheckError("receipt_store_binding")
     points = payload["points"]
@@ -689,14 +697,28 @@ def _validate_connection_budget_receipt(payload: object, *, subject_sha256: str)
     return payload
 
 
-def _validate_terraform_receipt(payload: object, *, kind: str, subject_id: str | None) -> dict[str, object]:
+def _validate_terraform_receipt(
+    payload: object,
+    *,
+    kind: str,
+    subject_sha256: str,
+    subject_id: str | None,
+) -> dict[str, object]:
     if subject_id is not None and _SHA256_PATTERN.fullmatch(subject_id) is None:
         raise AcceptanceCheckError("receipt_store_binding")
-    if not isinstance(payload, dict) or set(payload) != {"schema", "kind", "projection"}:
+    if not isinstance(payload, dict) or set(payload) != {"schema", "kind", "plan_sha256", "projection"}:
         raise AcceptanceCheckError("receipt_store_schema")
     expected_kind = "terraform-destroy-plan" if kind == "terraform-destroy-plan" else "terraform-plan"
-    if payload["schema"] != "elspeth.aws-ecs-sanitized-evidence.v1" or payload["kind"] != expected_kind:
+    plan_sha256 = payload["plan_sha256"]
+    if (
+        payload["schema"] != "elspeth.aws-ecs-sanitized-evidence.v2"
+        or payload["kind"] != expected_kind
+        or type(plan_sha256) is not str
+        or _SHA256_PATTERN.fullmatch(plan_sha256) is None
+    ):
         raise AcceptanceCheckError("receipt_store_schema")
+    if _sha256(plan_sha256.encode("utf-8")) != subject_sha256 or (subject_id is not None and plan_sha256 != subject_id):
+        raise AcceptanceCheckError("receipt_store_binding")
     projection = payload["projection"]
     fields = {
         "resource_change_count",
@@ -860,10 +882,25 @@ def _validate_stored_receipt(
     candidate_sha: str,
     subject_id: str | None = None,
     expected_plugin_policy_binding_sha256: str | None = None,
+    expected_acceptance_run_id_sha256: str | None = None,
+    expected_cluster_id_sha256: str | None = None,
 ) -> dict[str, object]:
     document = _validate_bounded_receipt_document(payload)
     if kind == "connection-budget":
-        return _validate_connection_budget_receipt(document, subject_sha256=subject_sha256)
+        receipt = _validate_exec_receipt_schema(document)
+        if (
+            receipt["check"] != "verify-connection-budget"
+            or receipt["scenario_id"] != scenario_id
+            or receipt["candidate_sha"] != candidate_sha
+            or receipt["task_arn_sha256"] != subject_sha256
+        ):
+            raise AcceptanceCheckError("receipt_store_binding")
+        _validate_connection_budget_receipt(
+            receipt["details"],
+            expected_acceptance_run_id_sha256=expected_acceptance_run_id_sha256,
+            expected_cluster_id_sha256=expected_cluster_id_sha256,
+        )
+        return receipt
     if kind == "compatibility-record":
         return _validate_compatibility_receipt(
             document,
@@ -874,7 +911,12 @@ def _validate_stored_receipt(
     if kind == "deployment-event-canary":
         return _validate_event_canary_receipt(document)
     if kind in {"terraform-plan", "terraform-noop", "terraform-destroy-plan"}:
-        return _validate_terraform_receipt(document, kind=kind, subject_id=subject_id)
+        return _validate_terraform_receipt(
+            document,
+            kind=kind,
+            subject_sha256=subject_sha256,
+            subject_id=subject_id,
+        )
     if kind not in _RECEIPT_KINDS:
         raise AcceptanceCheckError("receipt_store_schema")
     receipt = _validate_exec_receipt_schema(document)

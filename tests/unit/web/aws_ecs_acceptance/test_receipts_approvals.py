@@ -19,6 +19,7 @@ import pytest
 
 from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._aws_ecs_acceptance import approvals as approvals_owner
+from elspeth.web._aws_ecs_acceptance import evidence as evidence_owner
 from elspeth.web._aws_ecs_acceptance import receipt_store as receipt_store_owner
 from elspeth.web._aws_ecs_acceptance import secure_documents as secure_documents_owner
 from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import (
@@ -34,6 +35,39 @@ def _s3_receipt_details() -> dict[str, object]:
         "sink_sha256": "a" * 64,
         "collision_rejected": True,
         "cleanup_succeeded": True,
+    }
+
+
+def _connection_budget_receipt(
+    *,
+    run_id: str,
+    candidate_sha: str,
+    scenario_id: str,
+    task_arn: str,
+    cluster_id: str,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "check": "verify-connection-budget",
+        "ok": True,
+        "candidate_sha": candidate_sha,
+        "task_arn_sha256": hashlib.sha256(task_arn.encode()).hexdigest(),
+        "scenario_id": scenario_id,
+        "details": {
+            "schema": "elspeth.rds-connection-budget.v3",
+            "acceptance_run_id_sha256": hashlib.sha256(run_id.encode()).hexdigest(),
+            "cluster_id_sha256": hashlib.sha256(cluster_id.encode()).hexdigest(),
+            "window_start": "2026-07-14T01:00:00Z",
+            "window_end": "2026-07-14T01:10:00Z",
+            "period_seconds": 60,
+            "expected_points": 10,
+            "points": [{"timestamp": f"2026-07-14T01:{minute:02d}:00Z", "count": 8.0} for minute in range(10)],
+            "high_water": 8.0,
+            "max_connections": 100,
+            "approved_budget": 20,
+            "safety_margin": 10,
+            "ok": True,
+        },
     }
 
 
@@ -216,7 +250,7 @@ def test_receipt_store_serializes_processes_and_preserves_both_updates(tmp_path:
     receipt_a_path = tmp_path / "terraform-receipt-a.json"
     receipt_b_path = tmp_path / "terraform-receipt-b.json"
     receipt_a_path.write_text(json.dumps(_terraform_receipt(deletes=0)))
-    receipt_b_path.write_text(json.dumps(_terraform_receipt(deletes=1)))
+    receipt_b_path.write_text(json.dumps(_terraform_receipt(deletes=1, plan_sha256="b" * 64)))
     os.chmod(receipt_a_path, 0o600)
     os.chmod(receipt_b_path, 0o600)
     lock_path = manifest_path.with_name(f".{manifest_path.name}.lock")
@@ -342,7 +376,7 @@ def test_receipt_store_persists_only_canonical_sanitized_content_and_checkpoints
     manifest_path = tmp_path / "control.json"
     _init_control_manifest(manifest_path, bind_resolved=False, prepare_apply_evidence=False)
     receipt_path = tmp_path / "receipt.json"
-    receipt_path.write_text(json.dumps(_terraform_receipt()))
+    receipt_path.write_text(json.dumps(_terraform_receipt(plan_sha256="d" * 64)))
     os.chmod(receipt_path, 0o600)
 
     receipt_hash = acceptance.receipt_store(
@@ -379,6 +413,68 @@ def test_receipt_store_persists_only_canonical_sanitized_content_and_checkpoints
         == receipt_hash
     )
     assert len(json.loads(manifest_path.read_text())["evidence"]["receipts"]) == 1
+
+
+def test_identical_terraform_projections_for_different_plans_have_distinct_receipt_hashes(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "control.json"
+    _init_control_manifest(manifest_path, bind_resolved=False, prepare_apply_evidence=False)
+    hashes: set[str] = set()
+    for scenario_id, plan_sha256 in (("A", "a" * 64), ("B", "b" * 64)):
+        receipt_path = tmp_path / f"{scenario_id}-plan.json"
+        receipt_path.write_text(json.dumps(_terraform_receipt(plan_sha256=plan_sha256)))
+        os.chmod(receipt_path, 0o600)
+        hashes.add(
+            acceptance.receipt_store(
+                manifest_path,
+                scenario_id=scenario_id,
+                kind="terraform-plan",
+                subject_id=plan_sha256,
+                receipt_file=receipt_path,
+            )
+        )
+
+    assert len(hashes) == 2
+
+
+def test_connection_budget_store_and_final_verification_bind_run_cluster_candidate_scenario_and_task(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "control.json"
+    _init_control_manifest(manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    initial_receipt_count = len(manifest["evidence"]["receipts"]) + len(manifest["evidence"]["approvals"])
+    scenario = manifest["scenarios"]["A"]
+    inventory = json.loads(Path(scenario["inventory_path"]).read_text())
+    run_id = manifest["acceptance_run_id"]
+    candidate_sha = manifest["candidate_sha"]
+    cluster_id = inventory["values"]["DB_CLUSTER_IDENTIFIER"]
+    task_arn = "arn:aws:ecs:ap-southeast-2:123456789012:task/cluster/private-task-id"
+    receipt = _connection_budget_receipt(
+        run_id=run_id,
+        candidate_sha=candidate_sha,
+        scenario_id="A",
+        task_arn=task_arn,
+        cluster_id=cluster_id,
+    )
+    receipt_path = tmp_path / "connection-budget.json"
+    receipt_path.write_text(json.dumps(receipt))
+    os.chmod(receipt_path, 0o600)
+
+    receipt_hash = acceptance.receipt_store(
+        manifest_path,
+        scenario_id="A",
+        kind="connection-budget",
+        subject_id=task_arn,
+        receipt_file=receipt_path,
+    )
+    current_manifest = json.loads(manifest_path.read_text())
+    assert evidence_owner._verify_stored_receipts(manifest_path, current_manifest)[0] == initial_receipt_count + 1
+
+    stored_path = manifest_path.parent / f"{manifest_path.name}.receipts" / f"{receipt_hash}.json"
+    stored = json.loads(stored_path.read_text())
+    stored["details"]["acceptance_run_id_sha256"] = "f" * 64
+    stored_path.write_text(json.dumps(stored))
+    os.chmod(stored_path, 0o600)
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_binding"):
+        evidence_owner._verify_stored_receipts(manifest_path, current_manifest)
 
 
 def test_receipt_store_accepts_bootstrap_terraform_but_rejects_application_receipts(tmp_path: Path) -> None:
@@ -496,7 +592,7 @@ def test_receipt_store_binds_exec_receipts_and_allows_shared_content_for_distinc
     )
 
     terraform_path = tmp_path / "terraform-receipt.json"
-    terraform_path.write_text(json.dumps(_terraform_receipt()))
+    terraform_path.write_text(json.dumps(_terraform_receipt(plan_sha256="d" * 64)))
     os.chmod(terraform_path, 0o600)
     hashes = {
         acceptance.receipt_store(
@@ -689,7 +785,7 @@ def test_approval_verify_binds_receipt_run_scenario_authority_decision_and_expir
         now=lambda: datetime(2026, 7, 14, 1, 7, 40, tzinfo=UTC),
     )
     noop_path = tmp_path / "noop.json"
-    noop_path.write_text(json.dumps(_terraform_receipt()))
+    noop_path.write_text(json.dumps(_terraform_receipt(plan_sha256="b" * 64)))
     os.chmod(noop_path, 0o600)
     noop_hash = acceptance.receipt_store(
         manifest_path,

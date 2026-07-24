@@ -872,6 +872,21 @@ def test_runbook_starts_connection_observation_on_a_future_minute_boundary() -> 
     assert "ACCEPTANCE_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" not in observe
 
 
+def test_runbook_binds_terraform_receipts_to_plan_bytes_and_retains_connection_envelope() -> None:
+    text = _text()
+    assert text.count("sanitize-evidence --kind terraform-plan") == 3
+    assert text.count("sanitize-evidence --kind terraform-destroy-plan") == 2
+    assert text.count("--plan-sha256") == 5
+
+    connection = text[
+        text.index("run_connection_budget_check()") : text.index("run_candidate_role_check", text.index("run_connection_budget_check()"))
+    ]
+    assert "jq -e '.details'" not in connection
+    assert 'persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" connection-budget' in connection
+    assert '"$task_arn" "$envelope_file"' in connection
+    assert "details_file" not in connection
+
+
 def test_runbook_validates_task_definitions_and_compatibility_before_baseline_mutation() -> None:
     text = _text()
     for scenario, end_marker in (("A", "### Fresh Scenario B upgrade baseline"), ("B", "## ECS probe wiring")):
