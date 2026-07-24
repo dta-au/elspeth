@@ -138,52 +138,6 @@ def test_sanitize_evidence_kinds_are_closed() -> None:
     }
 
 
-def test_http_boundary_constants_are_the_reviewed_budgets() -> None:
-    assert acceptance.CONNECT_TIMEOUT_SECONDS == 5.0
-    assert acceptance.READ_TIMEOUT_SECONDS == 15.0
-    assert acceptance.WRITE_TIMEOUT_SECONDS == 10.0
-    assert acceptance.POOL_TIMEOUT_SECONDS == 5.0
-    assert acceptance.MAX_JSON_RESPONSE_BYTES == 1024 * 1024
-    assert acceptance.MAX_BLOB_RESPONSE_BYTES == 8 * 1024 * 1024
-    assert acceptance.RUN_POLL_DEADLINE_SECONDS == 5 * 60
-    assert acceptance.RUN_POLL_INTERVAL_SECONDS == 1.0
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("https://staging.example", "https://staging.example"),
-        ("https://staging.example:8443", "https://staging.example:8443"),
-        ("http://localhost:8451", "http://localhost:8451"),
-        ("http://127.0.0.1:8451", "http://127.0.0.1:8451"),
-        ("http://[::1]:8451", "http://[::1]:8451"),
-    ],
-)
-def test_acceptance_origin_accepts_https_and_exact_loopback(raw: str, expected: str) -> None:
-    assert acceptance.normalize_acceptance_origin(raw) == expected
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "http://staging.example",
-        "http://localhost.example:8451",
-        "https://user@staging.example",
-        "https://staging.example/",
-        "https://staging.example/path",
-        "https://staging.example?query=yes",
-        "https://staging.example#fragment",
-        "https://staging.example:443",
-        "HTTPS://staging.example",
-        "https://STAGING.example",
-        "",
-    ],
-)
-def test_acceptance_origin_rejects_non_normalized_or_ambiguous_values(raw: str) -> None:
-    with pytest.raises(acceptance.AcceptanceInputError, match="base origin"):
-        acceptance.normalize_acceptance_origin(raw)
-
-
 def _auth_env(**updates: str) -> Mapping[str, str]:
     values = {
         "ELSPETH_ACCEPTANCE_BASE_URL": "https://staging.example",
@@ -192,48 +146,6 @@ def _auth_env(**updates: str) -> Mapping[str, str]:
     }
     values.update(updates)
     return values
-
-
-def test_auth_input_accepts_local_or_bearer_modes() -> None:
-    local = acceptance.AcceptanceCredentials.from_env(
-        {
-            "ELSPETH_ACCEPTANCE_USERNAME": "operator",
-            "ELSPETH_ACCEPTANCE_PASSWORD": "password-secret",
-        }
-    )
-    bearer = acceptance.AcceptanceCredentials.from_env({"ELSPETH_ACCEPTANCE_BEARER_TOKEN": "bearer-secret"})
-
-    assert local.mode == "local"
-    assert local.username == "operator"
-    assert local.password == "password-secret"
-    assert local.bearer_token is None
-    assert bearer.mode == "bearer"
-    assert bearer.username is None
-    assert bearer.password is None
-    assert bearer.bearer_token == "bearer-secret"
-
-
-@pytest.mark.parametrize(
-    "env",
-    [
-        {},
-        {"ELSPETH_ACCEPTANCE_USERNAME": "operator"},
-        {"ELSPETH_ACCEPTANCE_PASSWORD": "password-secret"},
-        {
-            "ELSPETH_ACCEPTANCE_USERNAME": "operator",
-            "ELSPETH_ACCEPTANCE_PASSWORD": "password-secret",
-            "ELSPETH_ACCEPTANCE_BEARER_TOKEN": "bearer-secret",
-        },
-    ],
-)
-def test_auth_input_rejects_missing_partial_or_mixed_modes_without_echo(env: Mapping[str, str]) -> None:
-    with pytest.raises(acceptance.AcceptanceInputError) as raised:
-        acceptance.AcceptanceCredentials.from_env(env)
-
-    rendered = str(raised.value)
-    assert "operator" not in rendered
-    assert "password-secret" not in rendered
-    assert "bearer-secret" not in rendered
 
 
 def test_http_client_disables_redirects_and_never_replays_bearer_token() -> None:
@@ -332,106 +244,6 @@ def _valid_state() -> acceptance.AcceptanceState:
             "completed_at": "2026-07-14T04:00:01Z",
         }
     )
-
-
-def test_state_file_round_trip_is_mode_0600_and_closed_schema(tmp_path: Path) -> None:
-    path = tmp_path / "acceptance-state.json"
-    state = _valid_state()
-
-    acceptance.write_acceptance_state(path, state)
-
-    assert acceptance.read_acceptance_state(path) == state
-    assert path.stat().st_mode & 0o777 == 0o600
-    assert set(json.loads(path.read_text())) == {
-        "schema_version",
-        "session_id",
-        "tutorial_session_id",
-        "blob_id",
-        "run_id",
-        "landscape_run_id",
-        "artifact_id",
-        "uploaded_sha256",
-        "blob_sha256",
-        "artifact_sha256",
-        "run_status",
-        "source_rows",
-        "failed_tokens",
-        "captured_at",
-        "completed_at",
-    }
-
-
-def test_state_file_rejects_symlink_and_permissive_destinations(tmp_path: Path) -> None:
-    target = tmp_path / "target.json"
-    target.write_text("{}")
-    target.chmod(0o600)
-    symlink = tmp_path / "state.json"
-    symlink.symlink_to(target)
-
-    with pytest.raises(acceptance.AcceptanceStateError, match="regular owner-only file"):
-        acceptance.write_acceptance_state(symlink, _valid_state())
-    with pytest.raises(acceptance.AcceptanceStateError, match="regular owner-only file"):
-        acceptance.read_acceptance_state(symlink)
-
-    symlink.unlink()
-    symlink.write_text("{}")
-    symlink.chmod(0o640)
-    with pytest.raises(acceptance.AcceptanceStateError, match="regular owner-only file"):
-        acceptance.write_acceptance_state(symlink, _valid_state())
-    with pytest.raises(acceptance.AcceptanceStateError, match="regular owner-only file"):
-        acceptance.read_acceptance_state(symlink)
-
-
-def test_state_file_rejects_extra_fields_and_oversized_input(tmp_path: Path) -> None:
-    path = tmp_path / "state.json"
-    payload = _valid_state().to_dict()
-    payload["password"] = "must-not-survive"
-    path.write_text(json.dumps(payload))
-    path.chmod(0o600)
-
-    with pytest.raises(acceptance.AcceptanceStateError, match="schema") as raised:
-        acceptance.read_acceptance_state(path)
-    assert "must-not-survive" not in str(raised.value)
-
-    path.write_bytes(b"x" * (acceptance.MAX_STATE_FILE_BYTES + 1))
-    path.chmod(0o600)
-    with pytest.raises(acceptance.AcceptanceStateError, match="too large"):
-        acceptance.read_acceptance_state(path)
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("session_id", "not-a-uuid"),
-        ("uploaded_sha256", "ABC"),
-        ("run_status", "failed"),
-        ("source_rows", 0),
-        ("source_rows", True),
-        ("failed_tokens", 1),
-        ("captured_at", "not-a-timestamp"),
-        ("completed_at", "2026-07-14T04:00:01"),
-    ],
-)
-def test_state_schema_rejects_invalid_identifiers_hashes_accounting_and_timestamps(field: str, value: object) -> None:
-    payload = _valid_state().to_dict()
-    payload[field] = value
-
-    with pytest.raises(acceptance.AcceptanceStateError, match="schema"):
-        acceptance.AcceptanceState.from_dict(payload)
-
-
-def test_state_write_cleans_temporary_file_when_atomic_replace_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    path = tmp_path / "state.json"
-
-    def fail_replace(_source: str | os.PathLike[str], _destination: str | os.PathLike[str]) -> None:
-        raise OSError("replace failed with /private/path")
-
-    monkeypatch.setattr(os, "replace", fail_replace)
-    with pytest.raises(acceptance.AcceptanceStateError, match="write failed") as raised:
-        acceptance.write_acceptance_state(path, _valid_state())
-
-    assert "/private/path" not in str(raised.value)
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_fixed_pipeline_yaml_parses_and_passes_the_ordinary_runtime_validator(tmp_path: Path) -> None:
@@ -3340,20 +3152,6 @@ def _scenario_inventory(
             "expected_retained_trace_ids": 0,
         },
     }
-
-
-def test_scenario_resource_namespace_fits_strict_aws_name_limits() -> None:
-    run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
-
-    scenario_a = acceptance.scenario_resource_namespace(run_id, "A")
-    scenario_b = acceptance.scenario_resource_namespace(run_id, "B")
-
-    assert re.fullmatch(r"a-[0-9a-f]{20}", scenario_a)
-    assert re.fullmatch(r"b-[0-9a-f]{20}", scenario_b)
-    assert scenario_a != scenario_b
-    assert len(f"{scenario_a}-alb") <= 32
-    assert len(f"{scenario_a}-target") <= 32
-    assert len(f"{scenario_a}-xray") <= 32
 
 
 def _init_control_manifest(

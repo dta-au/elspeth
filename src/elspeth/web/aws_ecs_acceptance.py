@@ -13,8 +13,6 @@ import base64
 import binascii
 import contextlib
 import hashlib
-import importlib.util
-import inspect
 import json
 import math
 import os
@@ -29,7 +27,6 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from functools import wraps
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any, Literal, Protocol, Self, cast
@@ -98,64 +95,75 @@ from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
-_fcntl: Any
-if os.name == "posix" and importlib.util.find_spec("fcntl") is not None:
-    import fcntl as _fcntl
-else:
-    _fcntl = None
+from ._aws_ecs_acceptance.contracts import (
+    _EMERGENCY_CLEANUP_SECONDS,
+    _EVIDENCE_KINDS,
+    _GIT_SHA_PATTERN,
+    _MAX_IDENTITY_CHARS,
+    _SCENARIO_ID_PATTERN,
+    _SCENARIO_VALUE_FIELDS,
+    _SHA256_PATTERN,
+    _TERMINAL_RUN_STATUSES,
+    CONNECT_TIMEOUT_SECONDS,
+    FORBIDDEN_AWS_OVERRIDE_ENV,
+    MAX_BLOB_RESPONSE_BYTES,
+    MAX_CONTROL_DOCUMENT_BYTES,
+    MAX_EXEC_RECEIPT_CHARS,
+    MAX_EXEC_STREAM_BYTES,
+    MAX_JSON_RESPONSE_BYTES,
+    PLUGIN_POLICY_ASSIGNMENT_NAMES,
+    POOL_TIMEOUT_SECONDS,
+    READ_TIMEOUT_SECONDS,
+    RUN_POLL_DEADLINE_SECONDS,
+    RUN_POLL_INTERVAL_SECONDS,
+    SCENARIO_ASSIGNMENT_NAMES,
+    WRITE_TIMEOUT_SECONDS,
+    AcceptanceCheckError,
+    AcceptanceHttpError,
+    AcceptanceInputError,
+    AcceptanceStateError,
+    OperatorTelemetryAcceptanceError,
+    SanitizedResourceIdentity,
+    _bounded_identity,
+    _canonical_uuid,
+    _control_timestamp,
+    _mapping,
+    _resolve_aws_region,
+    _sha256,
+    _sha256_field,
+    _string_field,
+    _task_definition_family,
+    _utc_timestamp,
+    _uuid_field,
+    normalize_acceptance_origin,
+    plugin_policy_binding_sha256,
+    scenario_resource_namespace,
+)
+from ._aws_ecs_acceptance.contracts import (
+    EVIDENCE_KINDS as EVIDENCE_KINDS,
+)
+from ._aws_ecs_acceptance.contracts import (
+    MAX_STATE_FILE_BYTES as MAX_STATE_FILE_BYTES,
+)
+from ._aws_ecs_acceptance.secure_documents import (
+    _read_protected_document,
+    _receipt_manifest_write_lock,
+    _serialized_control_manifest_write,
+    _write_protected_document,
+)
+from ._aws_ecs_acceptance.state import (
+    AcceptanceCredentials,
+    AcceptanceState,
+    _parse_state_timestamp,
+    read_acceptance_state,
+    write_acceptance_state,
+)
 
 _METRIC_NAME = "operator.acceptance.sentinel"
 _TRACE_NAMES = ("RunStarted", "RunFinished")
-_MAX_IDENTITY_CHARS = 128
-_EVIDENCE_KINDS = (
-    "web-log",
-    "doctor-log",
-    "deployment-event",
-    "task-definition",
-    "terraform-plan",
-    "terraform-destroy-plan",
-)
-EVIDENCE_KINDS = _EVIDENCE_KINDS
-CONNECT_TIMEOUT_SECONDS = 5.0
-READ_TIMEOUT_SECONDS = 15.0
-WRITE_TIMEOUT_SECONDS = 10.0
-POOL_TIMEOUT_SECONDS = 5.0
-MAX_JSON_RESPONSE_BYTES = 1024 * 1024
-MAX_BLOB_RESPONSE_BYTES = 8 * 1024 * 1024
-RUN_POLL_DEADLINE_SECONDS = 5 * 60
-RUN_POLL_INTERVAL_SECONDS = 1.0
-MAX_STATE_FILE_BYTES = 64 * 1024
-MAX_EXEC_RECEIPT_CHARS = 16 * 1024
-MAX_EXEC_STREAM_BYTES = 2 * 1024 * 1024
-MAX_CONTROL_DOCUMENT_BYTES = 256 * 1024
-_EMERGENCY_CLEANUP_SECONDS = 3 * 60 * 60
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
-_STATE_FIELDS = frozenset(
-    {
-        "schema_version",
-        "session_id",
-        "tutorial_session_id",
-        "blob_id",
-        "run_id",
-        "landscape_run_id",
-        "artifact_id",
-        "uploaded_sha256",
-        "blob_sha256",
-        "artifact_sha256",
-        "run_status",
-        "source_rows",
-        "failed_tokens",
-        "captured_at",
-        "completed_at",
-    }
-)
-_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
-_GIT_SHA_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_SCENARIO_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 FIXED_INPUT_BYTES = b"id,name\n1,alpha\n"
 TUTORIAL_INPUT_BYTES = b"url\nhttps://example.invalid/\n"
 _NO_BODY = object()
-_TERMINAL_RUN_STATUSES = frozenset({"completed", "completed_with_failures", "failed", "empty", "cancelled"})
 _EXEC_RECEIPT_PREFIX = "ELSPETH_ACCEPTANCE_RECEIPT_V1:"
 _EXEC_RECEIPT_FIELDS = frozenset({"version", "check", "ok", "candidate_sha", "task_arn_sha256", "scenario_id", "details"})
 _S3_DETAIL_FIELDS = frozenset({"object_count", "source_sha256", "sink_sha256", "collision_rejected", "cleanup_succeeded"})
@@ -217,34 +225,6 @@ _OPERATOR_DETAIL_FIELDS = frozenset(
     }
 )
 _OPERATOR_RESOURCE_FIELDS = frozenset({"service_name", "service_version", "deployment_environment", "cloud_provider"})
-FORBIDDEN_AWS_OVERRIDE_ENV = frozenset(
-    {
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_SECURITY_TOKEN",
-        "AWS_CREDENTIAL_EXPIRATION",
-        "AWS_PROFILE",
-        "AWS_DEFAULT_PROFILE",
-        "AWS_CONFIG_FILE",
-        "AWS_SHARED_CREDENTIALS_FILE",
-        "AWS_CREDENTIAL_FILE",
-        "BOTO_CONFIG",
-        "AWS_ENDPOINT_URL",
-        "AWS_ENDPOINT_URL_S3",
-        "AWS_ENDPOINT_URL_BEDROCK",
-        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
-        "AWS_ENDPOINT_URL_CLOUDWATCH",
-        "AWS_ENDPOINT_URL_XRAY",
-        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
-        "AWS_ROLE_ARN",
-        "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AWS_ROLE_SESSION_NAME",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-    }
-)
 _TASK_DEFINITION_PLAINTEXT_SECRET_ENV = frozenset(
     {
         "DATABASE_URL",
@@ -422,72 +402,6 @@ def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
 
 
 _INFRASTRUCTURE_APPROVAL_SCOPES = frozenset({"A", "B", "bootstrap"})
-SCENARIO_ASSIGNMENT_NAMES = (
-    "ACTIVE_SCENARIO_ID",
-    "ACCEPTANCE_RUN_ID",
-    "DEPLOYMENT_MODE",
-    "TARGET_PLATFORM",
-    "AWS_REGION",
-    "ECS_CLUSTER",
-    "ECS_SERVICE",
-    "WEB_CONTAINER_NAME",
-    "ELSPETH_WEB__DATA_DIR",
-    "ELSPETH_WEB__PAYLOAD_STORE_PATH",
-    "ELSPETH_WEB__COMPOSER_MODEL",
-    "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL",
-    "ELSPETH_WEB__PLUGIN_ALLOWLIST",
-    "ELSPETH_WEB__PLUGIN_PREFERENCES",
-    "ELSPETH_WEB__PLUGIN_CONTROL_MODES",
-    "ELSPETH_WEB__LLM_PROFILES",
-    "ELSPETH_WEB__TUTORIAL_LLM_PROFILE",
-    "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES",
-    "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES",
-    "ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256",
-    "ELSPETH_BEDROCK_LIVE_TEST_MODEL",
-    "TARGET_GROUP_ARN",
-    "ALB_BASE_URL",
-    "ALB_ARN",
-    "CANDIDATE_TASK_DEFINITION",
-    "DOCTOR_TASK_DEFINITION",
-    "DOCTOR_CONTAINER_NAME",
-    "DOCTOR_NETWORK_CONFIGURATION",
-    "PAYLOAD_VERIFIER_TASK_DEFINITION",
-    "LOCAL_AUTH_VERIFIER_TASK_DEFINITION",
-    "ROLLBACK_DOCTOR_TASK_DEFINITION",
-    "WEB_LOG_GROUP",
-    "WEB_LOG_STREAM_PREFIX",
-    "DOCTOR_LOG_GROUP",
-    "DOCTOR_LOG_STREAM_PREFIX",
-    "OPERATOR_METRICS_LOG_GROUP",
-    "ECS_DEPLOYMENT_EVENT_RULE",
-    "ECS_DEPLOYMENT_EVENT_TARGET_ID",
-    "ECS_DEPLOYMENT_EVENT_LOG_GROUP",
-    "PREVIOUS_TASK_DEFINITION",
-    "FIRST_DEPLOY_LISTENER_RULE_ARN",
-    "FIRST_DEPLOY_FORWARD_ACTIONS",
-    "FIRST_DEPLOY_DISABLED_ACTIONS",
-    "COGNITO_USER_POOL_ID",
-    "DB_CLUSTER_IDENTIFIER",
-    "ELSPETH_TEST_S3_BUCKET",
-    "OIDC_EXPECTED_ISSUER",
-    "OIDC_EXPECTED_AUDIENCE",
-    "OIDC_EXPECTED_AUTHORIZATION_ORIGIN",
-    "OIDC_EXPECTED_AUDIENCE_CLAIM",
-    "SCENARIO_TF_DIR",
-    "SCENARIO_TF_VARS",
-    "SCENARIO_TF_BINDING_SHA",
-    "SCENARIO_TF_BINDING_FILE",
-)
-_SCENARIO_VALUE_FIELDS = frozenset(SCENARIO_ASSIGNMENT_NAMES[2:])
-PLUGIN_POLICY_ASSIGNMENT_NAMES = (
-    "ELSPETH_WEB__PLUGIN_ALLOWLIST",
-    "ELSPETH_WEB__PLUGIN_PREFERENCES",
-    "ELSPETH_WEB__PLUGIN_CONTROL_MODES",
-    "ELSPETH_WEB__LLM_PROFILES",
-    "ELSPETH_WEB__TUTORIAL_LLM_PROFILE",
-    "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES",
-    "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES",
-)
 _ORPHAN_INVENTORY_FIELDS = frozenset(
     {
         "tag_key",
@@ -583,75 +497,6 @@ _RETAINED_EVIDENCE_FIELDS = frozenset(
 )
 
 
-class AcceptanceInputError(RuntimeError):
-    """Static failure raised before an acceptance request is sent."""
-
-
-class AcceptanceHttpError(RuntimeError):
-    """Static HTTP failure that never includes a response or exception body."""
-
-
-class AcceptanceStateError(RuntimeError):
-    """Static protected-state failure that never includes file content."""
-
-
-class AcceptanceCheckError(RuntimeError):
-    """A static named acceptance check failure safe for operator output."""
-
-    def __init__(self, check: str) -> None:
-        super().__init__(f"acceptance check failed: {check}")
-        self.check = check
-
-
-def normalize_acceptance_origin(raw: str) -> str:
-    """Validate and return one exact canonical acceptance origin."""
-
-    try:
-        parsed = urlsplit(raw)
-        hostname = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        raise AcceptanceInputError("acceptance base origin is invalid") from None
-    if (
-        not raw
-        or parsed.scheme not in {"http", "https"}
-        or hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise AcceptanceInputError("acceptance base origin is invalid")
-    try:
-        hostname.encode("ascii")
-    except UnicodeEncodeError:
-        raise AcceptanceInputError("acceptance base origin is invalid") from None
-    if parsed.scheme == "http" and hostname not in _LOOPBACK_HOSTS:
-        raise AcceptanceInputError("acceptance base origin requires HTTPS except for exact loopback hosts")
-    if port is not None and not 1 <= port <= 65535:
-        raise AcceptanceInputError("acceptance base origin is invalid")
-
-    default_port = 443 if parsed.scheme == "https" else 80
-    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
-    canonical = f"{parsed.scheme}://{rendered_host}"
-    if port is not None and port != default_port:
-        canonical = f"{canonical}:{port}"
-    if raw != canonical:
-        raise AcceptanceInputError("acceptance base origin must be an exact normalized origin")
-    return canonical
-
-
-def _canonical_uuid(value: str, *, label: str) -> str:
-    try:
-        parsed = uuid.UUID(value)
-    except (ValueError, AttributeError):
-        raise AcceptanceInputError(f"acceptance {label} is invalid") from None
-    if str(parsed) != value:
-        raise AcceptanceInputError(f"acceptance {label} is invalid")
-    return value
-
-
 def build_fixed_pipeline_yaml(*, session_id: str, source_path: str = "blobs/aws-ecs-acceptance-input.csv") -> str:
     """Return the fixed no-LLM CSV source-to-sink acceptance pipeline."""
 
@@ -727,226 +572,6 @@ def build_canonical_tutorial_pipeline_yaml(*, profile_alias: str) -> str:
     if type(profile_alias) is not str or not profile_alias.strip() or profile_alias != profile_alias.strip():
         raise AcceptanceInputError("tutorial profile alias is invalid")
     return generate_public_yaml(_canonical_tutorial_policy_state(profile_alias=profile_alias))
-
-
-@dataclass(frozen=True, slots=True)
-class AcceptanceCredentials:
-    """One mutually exclusive acceptance authentication mode."""
-
-    mode: Literal["local", "bearer"]
-    username: str | None = None
-    password: str | None = None
-    bearer_token: str | None = None
-
-    @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> Self:
-        username = env.get("ELSPETH_ACCEPTANCE_USERNAME") or None
-        password = env.get("ELSPETH_ACCEPTANCE_PASSWORD") or None
-        bearer_token = env.get("ELSPETH_ACCEPTANCE_BEARER_TOKEN") or None
-        has_local_part = username is not None or password is not None
-        has_local = username is not None and password is not None
-        if bearer_token is not None and not has_local_part:
-            return cls(mode="bearer", bearer_token=bearer_token)
-        if has_local and bearer_token is None:
-            return cls(mode="local", username=username, password=password)
-        raise AcceptanceInputError("acceptance authentication must use exactly one complete environment mode")
-
-
-@dataclass(frozen=True, slots=True)
-class AcceptanceState:
-    """Closed, non-secret evidence needed to re-verify one captured run."""
-
-    schema_version: int
-    session_id: str
-    tutorial_session_id: str
-    blob_id: str
-    run_id: str
-    landscape_run_id: str
-    artifact_id: str
-    uploaded_sha256: str
-    blob_sha256: str
-    artifact_sha256: str
-    run_status: Literal["completed"]
-    source_rows: int
-    failed_tokens: int
-    captured_at: str
-    completed_at: str
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, object]) -> Self:
-        if set(data) != _STATE_FIELDS:
-            raise AcceptanceStateError("acceptance state schema is invalid")
-        if data["schema_version"] != 1 or type(data["schema_version"]) is not int:
-            raise AcceptanceStateError("acceptance state schema is invalid")
-
-        identities = {
-            field: _state_string(data, field)
-            for field in ("session_id", "tutorial_session_id", "blob_id", "run_id", "landscape_run_id", "artifact_id")
-        }
-        for value in identities.values():
-            try:
-                parsed = uuid.UUID(value)
-            except (ValueError, AttributeError):
-                raise AcceptanceStateError("acceptance state schema is invalid") from None
-            if str(parsed) != value:
-                raise AcceptanceStateError("acceptance state schema is invalid")
-
-        hashes = {field: _state_string(data, field) for field in ("uploaded_sha256", "blob_sha256", "artifact_sha256")}
-        if any(_SHA256_PATTERN.fullmatch(value) is None for value in hashes.values()):
-            raise AcceptanceStateError("acceptance state schema is invalid")
-
-        run_status = _state_string(data, "run_status")
-        source_rows = data["source_rows"]
-        failed_tokens = data["failed_tokens"]
-        if run_status != "completed" or type(source_rows) is not int or source_rows <= 0:
-            raise AcceptanceStateError("acceptance state schema is invalid")
-        if type(failed_tokens) is not int or failed_tokens != 0:
-            raise AcceptanceStateError("acceptance state schema is invalid")
-
-        captured_at = _state_timestamp(data, "captured_at")
-        completed_at = _state_timestamp(data, "completed_at")
-        if _parse_state_timestamp(completed_at) < _parse_state_timestamp(captured_at):
-            raise AcceptanceStateError("acceptance state schema is invalid")
-
-        return cls(
-            schema_version=1,
-            session_id=identities["session_id"],
-            tutorial_session_id=identities["tutorial_session_id"],
-            blob_id=identities["blob_id"],
-            run_id=identities["run_id"],
-            landscape_run_id=identities["landscape_run_id"],
-            artifact_id=identities["artifact_id"],
-            uploaded_sha256=hashes["uploaded_sha256"],
-            blob_sha256=hashes["blob_sha256"],
-            artifact_sha256=hashes["artifact_sha256"],
-            run_status="completed",
-            source_rows=source_rows,
-            failed_tokens=failed_tokens,
-            captured_at=captured_at,
-            completed_at=completed_at,
-        )
-
-    def to_dict(self) -> dict[str, object]:
-        return {field: getattr(self, field) for field in _STATE_FIELDS}
-
-
-def _state_string(data: Mapping[str, object], field: str) -> str:
-    value = data[field]
-    if type(value) is not str or not value:
-        raise AcceptanceStateError("acceptance state schema is invalid")
-    return value
-
-
-def _parse_state_timestamp(value: str) -> datetime:
-    if not value.endswith("Z"):
-        raise AcceptanceStateError("acceptance state schema is invalid")
-    try:
-        parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
-    except ValueError:
-        raise AcceptanceStateError("acceptance state schema is invalid") from None
-    if parsed.tzinfo != UTC:
-        raise AcceptanceStateError("acceptance state schema is invalid")
-    return parsed
-
-
-def _state_timestamp(data: Mapping[str, object], field: str) -> str:
-    value = _state_string(data, field)
-    _parse_state_timestamp(value)
-    return value
-
-
-def _validate_protected_stat(stat_result: os.stat_result) -> None:
-    if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_uid != os.getuid() or stat_result.st_mode & 0o077:
-        raise AcceptanceStateError("acceptance state must be a regular owner-only file")
-
-
-def _validate_existing_state_destination(path: Path) -> None:
-    try:
-        stat_result = path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError:
-        raise AcceptanceStateError("acceptance state destination validation failed") from None
-    _validate_protected_stat(stat_result)
-
-
-def write_acceptance_state(path: Path, state: AcceptanceState) -> None:
-    """Atomically persist a closed state document beside its destination."""
-
-    _validate_existing_state_destination(path)
-    payload = json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
-    if len(payload) > MAX_STATE_FILE_BYTES:
-        raise AcceptanceStateError("acceptance state is too large")
-
-    temporary_path: str | None = None
-    old_umask = os.umask(0o077)
-    try:
-        descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary_path, 0o600)
-        os.replace(temporary_path, path)
-        temporary_path = None
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-    except OSError:
-        raise AcceptanceStateError("acceptance state write failed") from None
-    finally:
-        os.umask(old_umask)
-        if temporary_path is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_path)
-
-
-def read_acceptance_state(path: Path) -> AcceptanceState:
-    """Read and validate one bounded protected state document without following links."""
-
-    try:
-        before = path.lstat()
-        _validate_protected_stat(before)
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except AcceptanceStateError:
-        raise
-    except OSError:
-        raise AcceptanceStateError("acceptance state must be a regular owner-only file") from None
-
-    try:
-        opened = os.fstat(descriptor)
-        _validate_protected_stat(opened)
-        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
-            raise AcceptanceStateError("acceptance state changed during protected read")
-        if opened.st_size > MAX_STATE_FILE_BYTES:
-            raise AcceptanceStateError("acceptance state is too large")
-        chunks: list[bytes] = []
-        remaining = MAX_STATE_FILE_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 8192))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        content = b"".join(chunks)
-        if len(content) > MAX_STATE_FILE_BYTES:
-            raise AcceptanceStateError("acceptance state is too large")
-    except AcceptanceStateError:
-        raise
-    except OSError:
-        raise AcceptanceStateError("acceptance state read failed") from None
-    finally:
-        os.close(descriptor)
-
-    try:
-        decoded = json.loads(content)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise AcceptanceStateError("acceptance state schema is invalid") from None
-    if not isinstance(decoded, dict):
-        raise AcceptanceStateError("acceptance state schema is invalid")
-    return AcceptanceState.from_dict(decoded)
 
 
 class AcceptanceHttpClient:
@@ -1166,66 +791,6 @@ class AcceptanceHttpClient:
                 raise AcceptanceHttpError("acceptance response body was too large")
             chunks.append(chunk)
         return b"".join(chunks)
-
-
-def _mapping(value: object, *, check: str) -> Mapping[str, object]:
-    if not isinstance(value, dict):
-        raise AcceptanceCheckError(check)
-    return value
-
-
-def _string_field(value: Mapping[str, object], field: str, *, check: str) -> str:
-    candidate = value.get(field)
-    if type(candidate) is not str or not candidate:
-        raise AcceptanceCheckError(check)
-    return candidate
-
-
-def _uuid_field(value: Mapping[str, object], field: str, *, check: str) -> str:
-    candidate = _string_field(value, field, check=check)
-    try:
-        return _canonical_uuid(candidate, label="response identity")
-    except AcceptanceInputError:
-        raise AcceptanceCheckError(check) from None
-
-
-def _sha256_field(value: Mapping[str, object], field: str, *, check: str) -> str:
-    candidate = _string_field(value, field, check=check)
-    if _SHA256_PATTERN.fullmatch(candidate) is None:
-        raise AcceptanceCheckError(check)
-    return candidate
-
-
-def _sha256(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
-
-
-def scenario_resource_namespace(acceptance_run_id: str, scenario_id: str) -> str:
-    """Return the stable AWS-name-safe namespace for one acceptance scenario."""
-
-    try:
-        canonical_run_id = _canonical_uuid(acceptance_run_id, label="acceptance run ID")
-    except AcceptanceInputError:
-        raise AcceptanceCheckError("scenario_inventory_binding") from None
-    if scenario_id not in {"A", "B"}:
-        raise AcceptanceCheckError("scenario_inventory_binding")
-    digest = _sha256(f"{canonical_run_id}\0{scenario_id}".encode())[:20]
-    return f"{scenario_id.lower()}-{digest}"
-
-
-def plugin_policy_binding_sha256(values: Mapping[str, str]) -> str:
-    """Hash the exact protected seven-setting web policy assignment."""
-
-    projection: dict[str, str] = {}
-    for name in PLUGIN_POLICY_ASSIGNMENT_NAMES:
-        value = values.get(name)
-        if type(value) is not str or not value or len(value) > 16 * 1024:
-            raise AcceptanceCheckError("plugin_policy_binding")
-        if any(ord(character) < 32 or ord(character) == 127 for character in value):
-            raise AcceptanceCheckError("plugin_policy_binding")
-        projection[name] = value
-    encoded = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return _sha256(encoded)
 
 
 def _validate_s3_receipt_details(details: Mapping[str, object]) -> None:
@@ -1621,12 +1186,6 @@ def extract_exec_receipt(
         if not isinstance(plugin_policy, Mapping) or plugin_policy.get("binding_sha256") != expected_plugin_policy_binding_sha256:
             raise AcceptanceCheckError("plugin_policy_binding")
     return payload
-
-
-def _utc_timestamp(value: datetime) -> str:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise AcceptanceCheckError("timestamp")
-    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _run_facts(payload: object, *, check: str) -> tuple[str, int, int]:
@@ -2118,21 +1677,6 @@ class _S3AcceptanceContext:
 
     def record_validation_error(self, *_args: object, **_kwargs: object) -> None:
         raise AcceptanceCheckError("s3_source_rows")
-
-
-def _resolve_aws_region(env: Mapping[str, str], *, check: str) -> str:
-    primary_region = env.get("AWS_REGION")
-    default_region = env.get("AWS_DEFAULT_REGION")
-    if primary_region is not None and not primary_region:
-        raise AcceptanceCheckError(check)
-    if default_region is not None and not default_region:
-        raise AcceptanceCheckError(check)
-    if primary_region is not None and default_region is not None and primary_region != default_region:
-        raise AcceptanceCheckError(check)
-    region = primary_region or default_region
-    if region is None or len(region) > 64 or re.fullmatch(r"[A-Za-z0-9-]+", region) is None:
-        raise AcceptanceCheckError(check)
-    return region
 
 
 def _resolve_s3_acceptance_inputs(env: Mapping[str, str]) -> tuple[str, str, str]:
@@ -2964,10 +2508,6 @@ def run_bedrock_guardrails_live(
     return result
 
 
-class OperatorTelemetryAcceptanceError(RuntimeError):
-    """Static acceptance failure safe for an operator receipt."""
-
-
 class AuditSentinel(Protocol):
     def execute_lifecycle_run(self) -> str: ...
 
@@ -3218,33 +2758,6 @@ class AWSOperatorTelemetryQueries:
 
     def trace_terminal_status(self, *, run_id: str) -> str | None:
         return self._trace_terminal_statuses.get(run_id)
-
-
-def _bounded_identity(field: str, value: str) -> str:
-    if (
-        not value.strip()
-        or value != value.strip()
-        or len(value) > _MAX_IDENTITY_CHARS
-        or any(ord(char) < 32 or ord(char) == 127 for char in value)
-    ):
-        raise ValueError(f"{field} must be a non-blank bounded string without control characters")
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class SanitizedResourceIdentity:
-    """Closed non-content identity persisted in acceptance evidence."""
-
-    service_name: str
-    service_version: str
-    deployment_environment: str
-    cloud_provider: str
-
-    def __post_init__(self) -> None:
-        for field in ("service_name", "service_version", "deployment_environment", "cloud_provider"):
-            _bounded_identity(field, getattr(self, field))
-        if self.cloud_provider != "aws":
-            raise ValueError("cloud_provider must be aws")
 
 
 @dataclass(frozen=True, slots=True)
@@ -4012,208 +3525,6 @@ def verify_connection_budget_live(
     }
 
 
-def _validate_control_parent(path: Path, *, check: str = "control_manifest_parent") -> None:
-    try:
-        parent = path.parent.stat()
-    except OSError:
-        raise AcceptanceCheckError(check) from None
-    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
-        raise AcceptanceCheckError(check)
-
-
-def _read_protected_document(path: Path, *, check: str) -> dict[str, object]:
-    try:
-        before = path.lstat()
-        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o077:
-            raise AcceptanceCheckError(check)
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except AcceptanceCheckError:
-        raise
-    except OSError:
-        raise AcceptanceCheckError(check) from None
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != os.getuid()
-            or opened.st_mode & 0o077
-            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
-            or opened.st_size > MAX_CONTROL_DOCUMENT_BYTES
-        ):
-            raise AcceptanceCheckError(check)
-        content = os.read(descriptor, MAX_CONTROL_DOCUMENT_BYTES + 1)
-        if len(content) > MAX_CONTROL_DOCUMENT_BYTES or os.read(descriptor, 1):
-            raise AcceptanceCheckError(check)
-    except AcceptanceCheckError:
-        raise
-    except OSError:
-        raise AcceptanceCheckError(check) from None
-    finally:
-        os.close(descriptor)
-    try:
-        decoded = json.loads(content)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise AcceptanceCheckError(check) from None
-    if not isinstance(decoded, dict):
-        raise AcceptanceCheckError(check)
-    return decoded
-
-
-def _open_receipt_manifest_lock(lock_path: Path, *, check: str) -> int:
-    """Open an existing exact-0600 lock, or atomically publish a new one."""
-
-    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
-    try:
-        return os.open(lock_path, flags)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        raise AcceptanceCheckError(check) from None
-    temporary_path: str | None = None
-    temporary_descriptor: int | None = None
-    try:
-        temporary_descriptor, temporary_path = tempfile.mkstemp(
-            prefix=f".{lock_path.name}.",
-            suffix=".tmp",
-            dir=lock_path.parent,
-        )
-        os.fchmod(temporary_descriptor, 0o600)
-        try:
-            os.link(temporary_path, lock_path, follow_symlinks=False)
-        except FileExistsError:
-            os.close(temporary_descriptor)
-            temporary_descriptor = None
-            return os.open(lock_path, flags)
-        os.unlink(temporary_path)
-        temporary_path = None
-        descriptor = temporary_descriptor
-        temporary_descriptor = None
-        return descriptor
-    except OSError:
-        raise AcceptanceCheckError(check) from None
-    finally:
-        if temporary_descriptor is not None:
-            os.close(temporary_descriptor)
-        if temporary_path is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_path)
-
-
-@contextlib.contextmanager
-def _receipt_manifest_write_lock(path: Path, *, check: str) -> Iterator[None]:
-    """Exclude cross-process receipt writers with one crash-released sidecar."""
-
-    _validate_control_parent(path, check=check)
-    if _fcntl is None:
-        raise AcceptanceCheckError(check)
-    lock_path = path.with_name(f".{path.name}.lock")
-    descriptor = _open_receipt_manifest_lock(lock_path, check=check)
-    try:
-        try:
-            opened = os.fstat(descriptor)
-            linked = lock_path.lstat()
-        except OSError:
-            raise AcceptanceCheckError(check) from None
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != os.getuid()
-            or stat.S_IMODE(opened.st_mode) != 0o600
-            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
-        ):
-            raise AcceptanceCheckError(check)
-        try:
-            _fcntl.flock(descriptor, _fcntl.LOCK_EX)
-        except OSError:
-            raise AcceptanceCheckError(check) from None
-        try:
-            yield
-        finally:
-            _fcntl.flock(descriptor, _fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
-
-
-def _serialized_control_manifest_write[**P, R](
-    operation: Callable[P, R],
-) -> Callable[P, R]:
-    """Hold the manifest sidecar lock across one complete read-modify-write."""
-
-    operation_signature = inspect.signature(operation)
-    path_parameter = next(iter(operation_signature.parameters))
-
-    @wraps(operation)
-    def serialized(
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> R:
-        bound = operation_signature.bind(*args, **kwargs)
-        path = cast(Path, bound.arguments[path_parameter])
-        with _receipt_manifest_write_lock(path, check="control_manifest_file"):
-            return operation(*args, **kwargs)
-
-    return serialized
-
-
-def _write_protected_document(
-    path: Path,
-    payload: Mapping[str, object],
-    *,
-    create: bool,
-    exists_check: str,
-    write_check: str,
-    parent_check: str = "control_manifest_parent",
-) -> None:
-    _validate_control_parent(path, check=parent_check)
-    content = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
-    if len(content) > MAX_CONTROL_DOCUMENT_BYTES:
-        raise AcceptanceCheckError(write_check)
-    if create:
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            raise AcceptanceCheckError(write_check) from None
-        else:
-            raise AcceptanceCheckError(exists_check)
-    else:
-        _read_protected_document(path, check=write_check)
-
-    temporary_path: str | None = None
-    old_umask = os.umask(0o077)
-    try:
-        descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary_path, 0o600)
-        if create:
-            try:
-                os.link(temporary_path, path, follow_symlinks=False)
-            except FileExistsError:
-                raise AcceptanceCheckError(exists_check) from None
-            os.unlink(temporary_path)
-            temporary_path = None
-        else:
-            os.replace(temporary_path, path)
-            temporary_path = None
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-    except AcceptanceCheckError:
-        raise
-    except OSError:
-        raise AcceptanceCheckError(write_check) from None
-    finally:
-        os.umask(old_umask)
-        if temporary_path is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_path)
-
-
 def _control_path(value: str) -> str:
     if (
         type(value) is not str
@@ -4224,15 +3535,6 @@ def _control_path(value: str) -> str:
     ):
         raise AcceptanceCheckError("control_manifest_schema")
     return value
-
-
-def _control_timestamp(value: object) -> datetime:
-    if type(value) is not str:
-        raise AcceptanceCheckError("control_manifest_schema")
-    try:
-        return _parse_state_timestamp(value)
-    except AcceptanceStateError:
-        raise AcceptanceCheckError("control_manifest_schema") from None
 
 
 def _validate_control_manifest(payload: object) -> dict[str, object]:
@@ -7093,18 +6395,6 @@ def _orphan_inventory_values(inventory: Mapping[str, object]) -> tuple[dict[str,
     orphan = inventory["orphan_sweep"]
     assert isinstance(values, dict) and isinstance(orphan, dict)
     return values, orphan
-
-
-def _task_definition_family(task_definition_arn: object) -> str:
-    if type(task_definition_arn) is not str:
-        raise AcceptanceCheckError("orphan_sweep_api")
-    match = re.fullmatch(
-        r"arn:(?:aws|aws-us-gov|aws-cn):ecs:[a-z0-9-]+:[0-9]{12}:task-definition/([A-Za-z0-9_-]{1,255}):[1-9][0-9]*",
-        task_definition_arn,
-    )
-    if match is None:
-        raise AcceptanceCheckError("orphan_sweep_api")
-    return match.group(1)
 
 
 def _task_definition_owned(
