@@ -156,12 +156,8 @@ echo "╚═══════════════════════�
 if [ -n "$RUN_ID" ]; then
     WORKERS_SPAWNED="$(sqlite3 "file:${DB}?mode=ro" \
         "PRAGMA query_only=ON; SELECT COUNT(*) FROM run_workers WHERE run_id='$RUN_ID';" 2>/dev/null || echo 0)"
-    TOTAL_ROWS="$(sqlite3 "file:${DB}?mode=ro" \
-        "PRAGMA query_only=ON; SELECT COUNT(*) FROM token_work_items WHERE run_id='$RUN_ID' AND status IN ('terminal','failed');" 2>/dev/null || echo 0)"
-    SUCCEEDED="$(sqlite3 "file:${DB}?mode=ro" \
-        "PRAGMA query_only=ON; SELECT COUNT(*) FROM token_work_items WHERE run_id='$RUN_ID' AND status='terminal';" 2>/dev/null || echo 0)"
-    FAILED="$(sqlite3 "file:${DB}?mode=ro" \
-        "PRAGMA query_only=ON; SELECT COUNT(*) FROM token_work_items WHERE run_id='$RUN_ID' AND status='failed';" 2>/dev/null || echo 0)"
+    OUTCOME_COUNTS="$(bash "$SCRIPT_DIR/outcome_stats.sh" "$DB" "$RUN_ID" 2>/dev/null || echo "0|0|0")"
+    IFS='|' read -r TOTAL_ROWS SUCCEEDED FAILED <<< "$OUTCOME_COUNTS"
     ROWS_PER_SEC=$((TOTAL_ROWS / ELAPSED))
 
     echo ""

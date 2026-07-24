@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import json
 import shutil
+import sqlite3
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -428,6 +429,47 @@ class TestShippedExamples:
         assert "input.<rows>.csv" in readme
         assert "CHAOSLLM_ENDURANCE_ROWS=20" in readme
         assert "not gate dogfood" in agent_guide
+
+    def test_multi_worker_showcase_stats_use_completed_terminal_outcomes(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
+        """Showcase stats distinguish successful and quarantined terminal outcomes."""
+        run_id = "run-under-test"
+        db_path = tmp_path / "audit.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE token_work_items (run_id TEXT NOT NULL, status TEXT NOT NULL);
+                CREATE TABLE token_outcomes (
+                    run_id TEXT NOT NULL,
+                    outcome TEXT,
+                    completed INTEGER NOT NULL
+                );
+                """
+            )
+            conn.executemany(
+                "INSERT INTO token_work_items (run_id, status) VALUES (?, 'terminal')",
+                [(run_id,)] * 200,
+            )
+            conn.executemany(
+                "INSERT INTO token_outcomes (run_id, outcome, completed) VALUES (?, ?, 1)",
+                [(run_id, "success")] * 192 + [(run_id, "failure")] * 8,
+            )
+            conn.execute(
+                "INSERT INTO token_outcomes (run_id, outcome, completed) VALUES (?, 'failure', 0)",
+                (run_id,),
+            )
+            conn.execute("INSERT INTO token_outcomes (run_id, outcome, completed) VALUES ('other-run', 'failure', 1)")
+
+        stats_helper = example_pipeline_dir / "multi_worker_showcase" / "outcome_stats.sh"
+        assert stats_helper.is_file(), "multi_worker_showcase must ship its outcome stats helper"
+        result = subprocess.run(
+            ["bash", stats_helper, db_path, run_id],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "200|192|8"
 
     def test_blob_transform_offline_launcher_runs_from_clean_copy(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
         """blob_transforms ships a self-contained offline launcher."""

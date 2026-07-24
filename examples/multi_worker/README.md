@@ -13,13 +13,13 @@ exit, it queries `scheduler_events` grouped by `from_lease_owner` and asserts
 ## Pipeline shape
 
 ```
-input.jsonl (1 row, items array of 600 texts)
+input.jsonl (1 row, items array of 120 texts)
   └─> [exploded] ─> json_explode ─> [llm_input] ─> llm_0 (ChaosLLM sentiment) ─> output/results.json
                                                                                   ─> output/quarantined.json
 ```
 
-The `json` source reads one JSONL row whose `items` array contains 600 short
-text strings. The `json_explode` transform fans them out into 600 individual
+The `json` source reads one JSONL row whose `items` array contains 120 short
+text strings. The `json_explode` transform fans them out into 120 individual
 tokens, each carrying a single `text` field. This gives the leader+follower
 pack enough work to share before the leader drains the queue alone.
 
@@ -60,7 +60,7 @@ unconditionally. Only `elspeth run` takes `--execute`.
 A follower can only attach while the run is `running`. The poll loop requires
 RUNNING *and* ≥1 `leased` token work item before launching followers, so the
 leader is demonstrably processing before any follower joins. The input is sized
-to 600 exploded items and `chaos_config.yaml` includes `slow_response_pct: 1.0`
+to 120 exploded items and `chaos_config.yaml` includes `slow_response_pct: 1.0`
 / `slow_response_sec: [1, 3]` so the leader cannot drain the queue before
 followers attach under normal ChaosLLM latency.
 
@@ -92,7 +92,7 @@ Per-worker attribution (scheduler_events grouped by from_lease_owner):
 <worker_id>|leader|<N>
 <worker_id>|follower|<M>
 
-✓ PASS: leader + 1 follower(s) shared 600 rows across 2 workers
+✓ PASS: leader + 1 follower(s) shared 120 rows across 2 workers
 ```
 
 Success: `output/results.json` (completed rows) and `output/quarantined.json`
@@ -123,8 +123,8 @@ retained here.*
   `PRAGMA query_only=ON` so the verification never contends with live worker
   writes. Note: `token_work_items.lease_owner` is nulled on terminal/failed
   and is not a reliable attribution source in multi-worker mode.
-- **`json_explode`** — fans one JSONL record whose `items` array has 600
-  elements into 600 individual work tokens, giving the pack enough shared work
+- **`json_explode`** — fans one JSONL record whose `items` array has 120
+  elements into 120 individual work tokens, giving the pack enough shared work
   to demonstrate concurrent processing.
 - **ChaosLLM** (`chaosllm_sentiment` shape) — keyless mock LLM with configurable
   latency and fault injection; `--workers 1` required (errorworks constraint).
