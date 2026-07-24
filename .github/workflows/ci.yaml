@@ -84,6 +84,30 @@ jobs:
           tar -xzf "$tarball" -C "$tmp_dir" actionlint
           "$tmp_dir/actionlint" -config-file .github/actionlint.yaml .github/workflows/*.yml .github/workflows/*.yaml
 
+      - name: Compile Azure Container Apps Bicep bundle
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        shell: bash
+        env:
+          BICEP_VERSION: "v0.44.1"
+          BICEP_SHA256: "e17dc9a9888184886bb0c0051a3230b83b19f342749999f707bc571c3dfd2f45"
+        run: |
+          set -euo pipefail
+          trap 'rm -f /tmp/bicep' EXIT
+          python - <<'PY' "/tmp/bicep" "$BICEP_VERSION"
+          from pathlib import Path
+          import sys
+          import urllib.request
+
+          destination = Path(sys.argv[1])
+          version = sys.argv[2]
+          url = f"https://github.com/Azure/bicep/releases/download/{version}/bicep-linux-x64"
+          urllib.request.urlretrieve(url, destination)
+          PY
+          echo "${BICEP_SHA256}  /tmp/bicep" | sha256sum -c -
+          chmod +x /tmp/bicep
+          /tmp/bicep build deploy/azure-container-apps/main.bicep --stdout >/dev/null
+          /tmp/bicep build-params deploy/azure-container-apps/main.example.bicepparam --stdout >/dev/null
+
       - name: Install uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
         with:
