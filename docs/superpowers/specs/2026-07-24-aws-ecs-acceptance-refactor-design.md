@@ -1,6 +1,6 @@
 # AWS ECS Acceptance Controller Refactor Design
 
-**Status:** Proposed for `release/0.7.2`
+**Status:** Approved for `release/0.7.2`
 **Date:** 2026-07-24
 **Decision owner:** Project developer
 
@@ -8,7 +8,7 @@
 
 Refactor `src/elspeth/web/aws_ecs_acceptance.py` into focused private modules while preserving the executable module path, command-line interface (CLI), import compatibility, security behavior, receipt and manifest semantics, and operational outputs.
 
-This refactor is part of 0.7.2. The release will perform one authoritative Judge signing and fingerprint-baseline regeneration after the refactored source is complete, locally verified, and frozen. The project will not sign the pre-refactor tree and then sign the same code again after mechanical movement.
+This refactor is part of 0.7.2. Its work ends when the refactored source is complete, locally verified, frozen, and handed back to the release owner. Signing, generated release metadata, release CI, and landing happen out of band and are not steps in this design.
 
 ## Current state
 
@@ -30,7 +30,7 @@ These values establish why the split is necessary. They are not permanent accept
 - Give each security, validation, AWS, persistence, and orchestration concern one clear owner.
 - Preserve behavior while moving code; do not combine unrelated fixes with extraction commits.
 - Keep every extraction commit independently testable and revertible.
-- Finish all source movement before the single 0.7.2 signing and baseline-generation pass.
+- Finish all source movement and hand back one locally verified, frozen source commit.
 
 ## Non-goals
 
@@ -40,6 +40,7 @@ These values establish why the split is necessary. They are not permanent accept
 - Do not create a reusable acceptance-controller framework.
 - Do not absorb unrelated release defects into extraction commits.
 - Do not create signed plans, review receipts, per-task approval records, or one Filigree child for every mechanical move.
+- Do not stage or apply Judge bundles, generate signature or fingerprint metadata, run release-candidate CI, push release branches, or land the frozen source. The release owner handles those activities out of band.
 
 ## Compatibility contract
 
@@ -162,7 +163,7 @@ Every manifest, approval, receipt-index, and cleanup mutation retains the serial
 
 ## Implementation shape
 
-Use one no-commit preflight, approximately ten independently revertible extraction commits, and one final generated-metadata commit.
+Use one no-commit preflight and approximately ten independently revertible extraction commits. Do not create a generated release-metadata commit as part of this work.
 
 Move each domain's tests with its production owner instead of postponing the test split until the end. Each extraction commit must leave the facade usable and the branch green.
 
@@ -174,7 +175,7 @@ Recommended milestones:
 4. Extract manifest schemas, inventories, low-level mutations, and task-definition admission.
 5. Extract orphan cleanup, receipt storage, approvals, evidence, and the gate ledger.
 6. Extract cleanup/control orchestration and reduce the facade.
-7. Run final local acceptance, freeze source, sign once, regenerate the baseline once, and run exact-commit CI.
+7. Run final local acceptance, freeze source, and hand the frozen commit and evidence to the release owner.
 
 Run focused owner tests on every commit. Run the complete controller/runbook/architecture milestone lane after milestones 2, 3, 5, and 6. Do not stack work on a red commit.
 
@@ -186,9 +187,9 @@ The developer first lands the other intended 0.7.2 changes and declares the rele
 2. records it once as `BASE_SHA` and captures its Git tree identity;
 3. creates a clean dedicated worktree and implementation branch from that commit;
 4. runs the complete preflight baseline before production movement; and
-5. prevents unrelated target-branch changes through final signing and landing.
+5. prevents unrelated target-branch changes through source freeze and handoff.
 
-If `release/0.7.2` moves before implementation starts, recreate the worktree from the new selected base and repeat preflight. If an authorized source change lands after implementation starts, integrate it before source freeze and rerun the complete local gate. Any source change after Judge staging invalidates the bundle, signatures, and generated baseline; restore the complete generated set and repeat finalization from the new frozen tree.
+If `release/0.7.2` moves before implementation starts, recreate the worktree from the new selected base and repeat preflight. If an authorized source change lands after implementation starts, integrate it before source freeze and rerun the complete local gate. Once the executor records the frozen source commit and tree, any later source change is outside this plan and requires a new verified handoff.
 
 ## Verification strategy
 
@@ -228,27 +229,20 @@ Every multi-command gate must fail fast with `set -Eeuo pipefail`, separate exec
 
 The exact commands and current expected counts belong in the implementation plan after the base is selected. Do not copy stale literals from the superseded plan.
 
-## Single signing and CI cycle
+## Out-of-band release handoff
 
 After final local acceptance:
 
 1. Freeze source and record `FROZEN_SOURCE_SHA` and tree identity.
-2. From a key-free agent environment, verify current signatures and create a fresh Judge staging bundle.
-3. In the operator-controlled keyed shell, dry-run and apply the bundle once.
-4. Verify signed enforcement in required mode and run the canonical fingerprint-baseline generator once.
-5. End the keyed shell. From a key-free environment, inspect and commit only operator-produced allowlist files and the generated fingerprint fixture.
-6. Run the final local enforcement lane against the signed commit.
-7. Push the exact candidate commit to a unique `RC*` branch so `CI`, Judge verification, and CodeQL evaluate that candidate SHA.
-8. Require `CI Success` and `Judge gates success` for the exact candidate.
-9. Fast-forward `release/0.7.2` to that exact candidate only if its remote head still equals `BASE_SHA`.
+2. Confirm the implementation worktree is clean and still names that commit.
+3. Record the selected `BASE_SHA`, frozen source commit and tree, extraction commit range, and local verification results on the single Filigree parent.
+4. Hand that immutable source identity and evidence to the release owner.
 
-The existing operator-owned P0 `elspeth-18fe6e759e` remains the single signing/baseline issue for 0.7.2. The refactor uses one Filigree parent linked to that P0; it does not create a second signing ticket or a child issue for every extraction task.
+This plan contains no Judge, signature, HMAC, fingerprint-baseline, release-candidate CI, push, or landing commands. The out-of-band release process owns every such action and decides how the frozen source enters the release.
 
 ## Rollback
 
-Before signing, each extraction commit is independently revertible to the prior green milestone.
-
-After signing, source plus generated allowlist metadata plus the fingerprint fixture form one coupled state. Never revert or hand-edit individual signature rows. If source must change, restore the whole generated set to the pre-signing source commit, correct the source, rerun final local acceptance, stage a fresh bundle, and perform the single authoritative signing cycle for the new final tree.
+Before handoff, each extraction commit is independently revertible to the prior green milestone. After handoff, source rollback and any consequences for release metadata belong to the out-of-band release process.
 
 The refactor does not mutate the live ECS service, so deployment rollback is outside this design.
 
@@ -260,11 +254,11 @@ This option reduces file and commit count but leaves several 800- to 1,200-line 
 
 ### Partial split before 0.7.2
 
-This option extracts only foundations and defers the remaining domains. It leaves a mixed architecture, creates more future movement, and does not satisfy the reason for completing the refactor before the release's signing pass.
+This option extracts only foundations and defers the remaining domains. It leaves a mixed architecture, creates more future movement, and does not satisfy the reason for completing the refactor before 0.7.2.
 
 ### Sign before and after the refactor
 
-This option signs the existing release tree, moves hundreds of source-bound judgments, and signs them again. It creates avoidable operator work and was explicitly rejected.
+This option performs release authorization before the structural work, moves hundreds of source-bound judgments, and repeats authorization afterward. It creates avoidable operator work and was explicitly rejected. All release authorization remains out of band after source handoff.
 
 ## Success criteria
 
@@ -274,8 +268,9 @@ This option signs the existing release tree, moves hundreds of source-bound judg
 - Private imports obey the documented layer direction and contain no cycles.
 - No baseline test identity disappears and controller/package coverage does not regress from the selected base.
 - Wheel and container smokes prove both PostgreSQL drivers, both URL dialects, runtime extras, CLI startup, and deterministic behavior.
-- All local gates and required exact-SHA CI checks pass.
-- Judge signatures and the fingerprint baseline are generated once, after final source freeze.
+- All local refactor gates pass against the frozen source commit.
+- The handoff records the frozen source commit, tree identity, selected base, commit range, clean worktree, and verification evidence.
+- Signing, generated release metadata, release CI, branch pushes, and landing remain outside this plan.
 - Live ECS deployment remains separate work.
 
 ## Superseded planning artifacts
