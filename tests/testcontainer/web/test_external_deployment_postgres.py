@@ -20,7 +20,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import psycopg
 import pytest
@@ -67,8 +67,12 @@ def test_sequential_execution_contract_is_guarded_and_documented() -> None:
         def __init__(self) -> None:
             self.workerinput: dict[str, object] = {}
 
+    class _WorkerRequest:
+        def __init__(self) -> None:
+            self.config = _WorkerConfig()
+
     with pytest.raises(pytest.UsageError, match=r"-n 0 -m testcontainer") as exc_info:
-        shared_fixtures._require_sequential_postgres_acceptance(_WorkerConfig())
+        shared_fixtures._require_sequential_postgres_acceptance(cast(pytest.FixtureRequest, _WorkerRequest()))
     assert shared_fixtures._SEQUENTIAL_TEST_COMMAND in str(exc_info.value)
 
     plan_path = Path(__file__).parents[3] / "docs/superpowers/plans/2026-07-24-cross-platform-deployment-contract.md"
@@ -79,9 +83,9 @@ def test_sequential_execution_contract_is_guarded_and_documented() -> None:
 
     aws_startup_tests = importlib.import_module("tests.testcontainer.web.test_aws_ecs_validate_only_startup")
     aws_doctor_tests = importlib.import_module("tests.testcontainer.web.test_doctor_aws_ecs_postgres")
-    assert hasattr(shared_fixtures, "external_deployment_postgres_url")
-    assert not hasattr(aws_startup_tests, "pytest_plugins")
-    assert not hasattr(aws_doctor_tests, "pytest_plugins")
+    assert "external_deployment_postgres_url" in vars(shared_fixtures)
+    assert "pytest_plugins" not in vars(aws_startup_tests)
+    assert "pytest_plugins" not in vars(aws_doctor_tests)
 
 
 def _identifier(prefix: str) -> str:
