@@ -7,8 +7,10 @@ import json
 import multiprocessing
 import os
 import re
+import threading
 from pathlib import Path
 from queue import Empty
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -408,3 +410,106 @@ def test_serialized_control_manifest_write_locks_the_complete_transaction(tmp_pa
     assert json.loads(path.read_text()) == {"items": ["first", "second"]}
     assert path.stat().st_mode & 0o777 == 0o600
     assert not [candidate for candidate in os.listdir(tmp_path) if candidate.endswith(".tmp")]
+
+
+def test_protected_document_write_rejects_symlinked_immediate_parent(tmp_path: Path) -> None:
+    secure_documents = importlib.import_module("elspeth.web._aws_ecs_acceptance.secure_documents")
+    real_parent = tmp_path / "real"
+    real_parent.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="control_manifest_parent"):
+        secure_documents._write_protected_document(
+            alias / "control.json",
+            {"items": []},
+            create=True,
+            exists_check="control_manifest_exists",
+            write_check="control_manifest_file",
+        )
+
+    assert not (real_parent / "control.json").exists()
+
+
+def test_protected_document_writers_preserve_process_umask_under_concurrency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secure_documents = importlib.import_module("elspeth.web._aws_ecs_acceptance.secure_documents")
+    real_mkstemp = secure_documents.tempfile.mkstemp
+    control_entered = threading.Event()
+    state_entered = threading.Event()
+    control_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def control_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        control_entered.set()
+        assert state_entered.wait(timeout=10)
+        return real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
+
+    def state_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        state_entered.set()
+        assert control_finished.wait(timeout=10)
+        return real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(secure_documents, "tempfile", SimpleNamespace(mkstemp=control_mkstemp))
+    monkeypatch.setattr(state_module, "tempfile", SimpleNamespace(mkstemp=state_mkstemp))
+
+    def write_control() -> None:
+        try:
+            secure_documents._write_protected_document(
+                tmp_path / "control.json",
+                {"items": []},
+                create=True,
+                exists_check="control_manifest_exists",
+                write_check="control_manifest_file",
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            control_finished.set()
+
+    def write_state() -> None:
+        try:
+            state_module.write_acceptance_state(tmp_path / "state.json", _valid_state())
+        except BaseException as exc:
+            errors.append(exc)
+
+    previous_umask = os.umask(0o022)
+    try:
+        control_thread = threading.Thread(target=write_control)
+        state_thread = threading.Thread(target=write_state)
+        control_thread.start()
+        assert control_entered.wait(timeout=10)
+        state_thread.start()
+        control_thread.join(timeout=10)
+        state_thread.join(timeout=10)
+        assert not control_thread.is_alive()
+        assert not state_thread.is_alive()
+        observed_umask = os.umask(0o022)
+    finally:
+        os.umask(previous_umask)
+
+    assert errors == []
+    assert observed_umask == 0o022
+    assert (tmp_path / "control.json").stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_protected_document_writers_force_exact_0600_under_restrictive_umask(tmp_path: Path) -> None:
+    secure_documents = importlib.import_module("elspeth.web._aws_ecs_acceptance.secure_documents")
+    previous_umask = os.umask(0o777)
+    try:
+        secure_documents._write_protected_document(
+            tmp_path / "control.json",
+            {"items": []},
+            create=True,
+            exists_check="control_manifest_exists",
+            write_check="control_manifest_file",
+        )
+        state_module.write_acceptance_state(tmp_path / "state.json", _valid_state())
+    finally:
+        os.umask(previous_umask)
+
+    assert (tmp_path / "control.json").stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600

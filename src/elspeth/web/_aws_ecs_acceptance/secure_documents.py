@@ -25,7 +25,7 @@ else:
 
 def _validate_control_parent(path: Path, *, check: str = "control_manifest_parent") -> None:
     try:
-        parent = path.parent.stat()
+        parent = path.parent.lstat()
     except OSError:
         raise AcceptanceCheckError(check) from None
     if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
@@ -191,14 +191,13 @@ def _write_protected_document(
         _read_protected_document(path, check=write_check)
 
     temporary_path: str | None = None
-    old_umask = os.umask(0o077)
     try:
         descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary_path, 0o600)
         if create:
             try:
                 os.link(temporary_path, path, follow_symlinks=False)
@@ -219,7 +218,6 @@ def _write_protected_document(
     except OSError:
         raise AcceptanceCheckError(write_check) from None
     finally:
-        os.umask(old_umask)
         if temporary_path is not None:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary_path)

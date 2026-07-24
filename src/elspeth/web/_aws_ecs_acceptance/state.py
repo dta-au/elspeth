@@ -188,14 +188,13 @@ def write_acceptance_state(path: Path, state: AcceptanceState) -> None:
         raise AcceptanceStateError("acceptance state is too large")
 
     temporary_path: str | None = None
-    old_umask = os.umask(0o077)
     try:
         descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary_path, 0o600)
         os.replace(temporary_path, path)
         temporary_path = None
         directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -206,7 +205,6 @@ def write_acceptance_state(path: Path, state: AcceptanceState) -> None:
     except OSError:
         raise AcceptanceStateError("acceptance state write failed") from None
     finally:
-        os.umask(old_umask)
         if temporary_path is not None:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary_path)
