@@ -101,10 +101,14 @@ class _WebSettingsStub:
 
     def __init__(self) -> None:
         self.deployment_target = "default"
+        self.deployment_state_mode = "sqlite-single"
         self.landscape_url = "sqlite:///test_audit.db"
         self.payload_store_path = Path("/tmp/test_payloads")
         self.landscape_passphrase = None
         self.data_dir: str | Path = "/tmp/data"
+
+    def get_session_db_url(self) -> str:
+        return f"sqlite:///{Path(self.data_dir) / 'sessions.db'}"
 
     def get_landscape_url(self) -> str:
         return self.landscape_url
@@ -1778,6 +1782,10 @@ telemetry:
         telemetry_manager = create_autospec(TelemetryManager, instance=True)
         telemetry_manager.health_metrics = {"events_dropped": 3, "queue_drops": 1}
         with (
+            patch(
+                "elspeth.web.execution.service.open_landscape_db",
+                return_value=LandscapeDB.from_url(mock_settings.landscape_url, create_tables=False),
+            ),
             patch("elspeth.telemetry.create_telemetry_manager", return_value=telemetry_manager),
             patch("elspeth.web.operator_telemetry.record_operator_pipeline_queue_drops") as record_queue_drops,
         ):
