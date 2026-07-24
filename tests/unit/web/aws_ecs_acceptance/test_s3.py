@@ -320,7 +320,7 @@ def test_verify_s3_deletes_after_ambiguous_commit_only_with_exact_reconciliation
 
 
 @pytest.mark.parametrize("failure", ["sink", "source", "integrity", "rows", "collision"])
-def test_verify_s3_provider_and_integrity_failures_are_static_and_clean_up_only_owned_effects(failure: str) -> None:
+def test_verify_s3_provider_and_integrity_failures_are_static_and_still_delete(failure: str) -> None:
     events: list[str] = []
     sink_count = 0
     target: dict[str, ArtifactDescriptor] = {}
