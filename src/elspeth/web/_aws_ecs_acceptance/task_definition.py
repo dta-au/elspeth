@@ -104,6 +104,13 @@ def validate_task_definition_policy_binding(
     containers = task.get("containerDefinitions")
     if not isinstance(containers, list) or len(containers) > 100:
         raise AcceptanceCheckError("task_definition_policy_binding")
+    container_names: list[str] = []
+    for candidate in containers:
+        if not isinstance(candidate, Mapping) or type(candidate.get("name")) is not str:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        container_names.append(cast(str, candidate["name"]))
+    if len(container_names) != len(set(container_names)) or not set(container_names) <= {container_name, "cloudwatch-agent"}:
+        raise AcceptanceCheckError("task_definition_policy_binding")
     matches = [container for container in containers if isinstance(container, Mapping) and container.get("name") == container_name]
     if len(matches) != 1:
         raise AcceptanceCheckError("task_definition_policy_binding")
@@ -207,7 +214,7 @@ def validate_task_definition_policy_binding(
         ):
             raise AcceptanceCheckError("task_definition_policy_binding")
         secret_names.add(name)
-    if not required_secret_bindings.keys() <= secret_names:
+    if secret_names != set(required_secret_bindings):
         raise AcceptanceCheckError("task_definition_policy_binding")
     if not requires_openrouter and "OPENROUTER_API_KEY" in secret_names:
         raise AcceptanceCheckError("task_definition_policy_binding")

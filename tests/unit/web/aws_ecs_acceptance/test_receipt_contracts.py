@@ -462,6 +462,21 @@ def test_stored_connection_budget_rejects_bool_as_number(field: str) -> None:
         )
 
 
+@pytest.mark.parametrize("field", ["max_connections", "approved_budget", "safety_margin"])
+def test_stored_connection_budget_rejects_integral_float_for_integer_limit(field: str) -> None:
+    payload = _connection_budget_details()
+    payload[field] = float(payload[field])
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._validate_stored_receipt(
+            payload,
+            kind="connection-budget",
+            scenario_id="A",
+            subject_sha256="a" * 64,
+            candidate_sha="c" * 40,
+        )
+
+
 def test_stored_operator_receipt_rejects_wrong_retained_namespace() -> None:
     payload = _stored_exec_receipt("verify-operator-telemetry", _operator_receipt_details())
     details = payload["details"]

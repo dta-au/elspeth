@@ -622,6 +622,12 @@ def _receipt_number(value: object) -> float:
     return float(value)
 
 
+def _receipt_nonnegative_integer(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise AcceptanceCheckError("receipt_store_schema")
+    return value
+
+
 def _validate_connection_budget_receipt(payload: object, *, subject_sha256: str) -> dict[str, object]:
     if not isinstance(payload, dict) or set(payload) != {
         "schema",
@@ -669,9 +675,9 @@ def _validate_connection_budget_receipt(payload: object, *, subject_sha256: str)
     if observed_timestamps != expected_timestamps or len(set(observed_timestamps)) != len(observed_timestamps):
         raise AcceptanceCheckError("receipt_store_schema")
     high_water = _receipt_number(payload["high_water"])
-    maximum = _receipt_number(payload["max_connections"])
-    budget = _receipt_number(payload["approved_budget"])
-    margin = _receipt_number(payload["safety_margin"])
+    maximum = _receipt_nonnegative_integer(payload["max_connections"])
+    budget = _receipt_nonnegative_integer(payload["approved_budget"])
+    margin = _receipt_nonnegative_integer(payload["safety_margin"])
     if (
         payload["ok"] is not True
         or high_water != max(counts)

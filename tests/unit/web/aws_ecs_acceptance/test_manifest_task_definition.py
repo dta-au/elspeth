@@ -171,6 +171,45 @@ def test_task_definition_policy_binding_allows_bedrock_models_without_openrouter
     )
 
 
+def test_task_definition_policy_binding_allows_only_the_cloudwatch_agent_sidecar(tmp_path: Path) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    payload["taskDefinition"]["containerDefinitions"].append({"name": "cloudwatch-agent"})
+
+    acceptance.validate_task_definition_policy_binding(
+        payload,
+        manifest_path=manifest_path,
+        scenario_id="A",
+        container_name=container_name,
+    )
+
+
+@pytest.mark.parametrize(
+    "extra_container",
+    [
+        pytest.param({"name": "unreviewed-sidecar"}, id="unknown-name"),
+        pytest.param({"name": "cloudwatch-agent"}, id="duplicate-cloudwatch-agent"),
+        pytest.param("not-a-container-definition", id="non-mapping"),
+    ],
+)
+def test_task_definition_policy_binding_rejects_unreviewed_container_definitions(
+    tmp_path: Path,
+    extra_container: object,
+) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    containers = payload["taskDefinition"]["containerDefinitions"]
+    if extra_container == {"name": "cloudwatch-agent"}:
+        containers.append({"name": "cloudwatch-agent"})
+    containers.append(extra_container)
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+
+
 @pytest.mark.parametrize(
     ("composer_model", "composer_advisor_model"),
     [
@@ -249,6 +288,25 @@ def test_task_definition_policy_binding_requires_exact_runtime_secret_selectors(
     shared_reference = container["secrets"][0]["valueFrom"]
     for entry in container["secrets"]:
         entry["valueFrom"] = shared_reference
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+
+
+def test_task_definition_policy_binding_rejects_surplus_secret_alias_to_approved_secret(tmp_path: Path) -> None:
+    manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
+    namespace = acceptance.scenario_resource_namespace(inventory["acceptance_run_id"], "A")
+    payload["taskDefinition"]["containerDefinitions"][0]["secrets"].append(
+        {
+            "name": "UNREVIEWED_SECRET_ALIAS",
+            "valueFrom": (f"arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:{namespace}-database-runtime-AbCd12:secret_key::"),
+        }
+    )
 
     with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
         acceptance.validate_task_definition_policy_binding(

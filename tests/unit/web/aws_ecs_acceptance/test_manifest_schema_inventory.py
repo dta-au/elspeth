@@ -620,6 +620,44 @@ def test_control_manifest_rejects_shared_terraform_state_and_foreign_scenario_re
         _init_control_manifest(tmp_path / "foreign-resource.json", inventory_mutator=foreign_arn)
 
 
+@pytest.mark.parametrize(
+    "authorization_origin",
+    [
+        pytest.param(
+            "https://operator:secret@elspeth-acceptance-example-b.auth.ap-southeast-2.amazoncognito.com",
+            id="userinfo",
+        ),
+        pytest.param(
+            "https://elspeth-acceptance-example-b.auth.ap-southeast-2.amazoncognito.com:444",
+            id="nonstandard-port",
+        ),
+        pytest.param(
+            "https://elspeth-acceptance-example-b.auth.ap-southeast-2.amazoncognito.com:not-a-port",
+            id="malformed-port",
+        ),
+    ],
+)
+def test_scenario_inventory_rejects_nonstandard_oidc_authorization_origin(
+    tmp_path: Path,
+    authorization_origin: str,
+) -> None:
+    def mutate_authorization_origin(inventory: dict[str, object], scenario: str) -> None:
+        if scenario == "B":
+            values = inventory["values"]
+            assert isinstance(values, dict)
+            namespace = acceptance.scenario_resource_namespace(inventory["acceptance_run_id"], scenario)
+            values["OIDC_EXPECTED_AUTHORIZATION_ORIGIN"] = authorization_origin.replace(
+                "elspeth-acceptance-example-b",
+                namespace,
+            )
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_schema"):
+        _init_control_manifest(
+            tmp_path / "unsafe-oidc-authorization-origin.json",
+            inventory_mutator=mutate_authorization_origin,
+        )
+
+
 def test_tf_binding_rejects_non_ascii_terraform_version(tmp_path: Path) -> None:
     def non_ascii_version(receipt: dict[str, object], scenario: str) -> None:
         if scenario == "A":

@@ -617,10 +617,17 @@ def _validate_resolved_scenario_values(
             raise AcceptanceCheckError("scenario_inventory_schema")
         if values["OIDC_EXPECTED_ISSUER"] != f"https://cognito-idp.{aws_region}.amazonaws.com/{pool_id}":
             raise AcceptanceCheckError("scenario_inventory_binding")
-        authorization_origin = urlsplit(cast(str, values["OIDC_EXPECTED_AUTHORIZATION_ORIGIN"]))
+        try:
+            authorization_origin = urlsplit(cast(str, values["OIDC_EXPECTED_AUTHORIZATION_ORIGIN"]))
+            authorization_port = authorization_origin.port
+        except ValueError:
+            raise AcceptanceCheckError("scenario_inventory_schema") from None
         if (
             authorization_origin.scheme != "https"
             or not authorization_origin.hostname
+            or authorization_origin.username is not None
+            or authorization_origin.password is not None
+            or authorization_port not in {None, 443}
             or authorization_origin.path not in {"", "/"}
             or authorization_origin.query
             or authorization_origin.fragment
