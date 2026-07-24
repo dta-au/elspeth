@@ -366,7 +366,7 @@ Expected: every command exits zero. A pre-existing failure blocks the refactor a
 
 - [ ] **Step 5: Run the full local base lanes**
 
-Use quiet pytest output for the two xdist repository lanes. This is not reduced coverage: a sink-effect admission-order test deliberately replaces `os.environ` with a fail-closed mapping, and verbose xdist progress can concurrently ask that mapping for terminal-width variables and crash the test runner rather than the product code.
+Use quiet pytest output for the two xdist repository lanes. This is not reduced coverage: a sink-effect admission-order test deliberately replaces `os.environ` with a fail-closed mapping, and verbose xdist progress can concurrently ask that mapping for terminal-width variables and crash the test runner rather than the product code. Pass `-n auto` explicitly on the coverage lane because ELSPETH's pytest plugin deliberately suppresses automatic xdist whenever pytest-cov is active.
 
 ```bash
 set -Eeuo pipefail
@@ -374,7 +374,7 @@ env -u VIRTUAL_ENV uv run --isolated --python 3.12 --frozen --all-extras pytest 
   -q -m "not slow and not stress and not performance and not testcontainer and not live_aws and not fingerprint_baseline"
 env -u VIRTUAL_ENV uv run --frozen pytest tests/ \
   --cov=src/elspeth --cov-report=xml --cov-report=term-missing --cov-fail-under=85 \
-  -q -m "not slow and not stress and not performance and not testcontainer and not live_aws and not fingerprint_baseline"
+  -n auto -q -m "not slow and not stress and not performance and not testcontainer and not live_aws and not fingerprint_baseline"
 coverage_status=0
 env -u VIRTUAL_ENV uv run --frozen coverage report --include='src/elspeth/core/landscape/*' --fail-under=92 || coverage_status=1
 env -u VIRTUAL_ENV uv run --frozen coverage report --include='src/elspeth/core/canonical.py' --fail-under=99 || coverage_status=1
@@ -1175,7 +1175,7 @@ env -u VIRTUAL_ENV uv run --isolated --python 3.12 --frozen --all-extras pytest 
   -q -m "not slow and not stress and not performance and not testcontainer and not live_aws and not fingerprint_baseline"
 env -u VIRTUAL_ENV uv run --frozen pytest tests/ \
   --cov=src/elspeth --cov-report=xml --cov-report=term-missing --cov-fail-under=85 \
-  -q -m "not slow and not stress and not performance and not testcontainer and not live_aws and not fingerprint_baseline"
+  -n auto -q -m "not slow and not stress and not performance and not testcontainer and not live_aws and not fingerprint_baseline"
 coverage_status=0
 env -u VIRTUAL_ENV uv run --frozen coverage report --include='src/elspeth/core/landscape/*' --fail-under=92 || coverage_status=1
 env -u VIRTUAL_ENV uv run --frozen coverage report --include='src/elspeth/core/canonical.py' --fail-under=99 || coverage_status=1
