@@ -154,9 +154,19 @@ from elspeth.web.operator_telemetry import bootstrap_operator_telemetry
     assert not _imports_facade(f"{PRIVATE_PACKAGE}.capture", source)
 
 
-def test_cycle_detection_includes_same_layer_cycles() -> None:
-    with pytest.raises(pytest.fail.Exception, match=r"bedrock -> s3 -> bedrock"):
-        _assert_acyclic({"s3": {"bedrock"}, "bedrock": {"s3"}})
+@pytest.mark.parametrize(
+    ("graph", "expected_cycle"),
+    [
+        ({"s3": {"bedrock"}, "bedrock": {"s3"}}, r"bedrock -> s3 -> bedrock"),
+        ({"capture": {"capture"}}, r"capture -> capture"),
+    ],
+)
+def test_cycle_detection_includes_same_layer_and_self_cycles(
+    graph: Mapping[str, Iterable[str]],
+    expected_cycle: str,
+) -> None:
+    with pytest.raises(pytest.fail.Exception, match=expected_cycle):
+        _assert_acyclic(graph)
 
 
 def test_aws_ecs_acceptance_private_dependencies_obey_layers() -> None:
@@ -186,7 +196,7 @@ def test_aws_ecs_acceptance_private_dependencies_obey_layers() -> None:
         dependencies, unknown = _private_dependencies(source_module, source)
         assert not unknown, f"{module} imports unlisted private modules: {sorted(unknown)}"
         assert not _imports_facade(source_module, source), f"{module} imports the public facade"
-        graph[module] = dependencies - {module}
+        graph[module] = dependencies
 
         upward = {dependency for dependency in graph[module] if LAYERS[dependency] > LAYERS[module]}
         assert not upward, f"{module} has upward dependencies: {sorted(upward)}"

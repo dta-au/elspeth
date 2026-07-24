@@ -11,6 +11,7 @@ import sys
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,7 +19,6 @@ from typing import Any
 import pytest
 
 from elspeth.web import aws_ecs_acceptance as acceptance
-from elspeth.web._aws_ecs_acceptance import operator_telemetry
 
 EXPECTED_COMMANDS = {
     "approval-require-current",
@@ -141,23 +141,115 @@ EXPECTED_PUBLIC_EXPORTS = {
     "xray_trace_id",
 }
 
-OPERATOR_TELEMETRY_OWNER_EXPORTS = {
-    "AWSOperatorMetricEmitter",
-    "AWSOperatorTelemetryQueries",
-    "AcceptancePolicy",
-    "AuditSentinel",
-    "ExistingLandscapeLifecycleAudit",
-    "OperatorTelemetryEvidence",
-    "OperatorTelemetryOutageEvidence",
-    "PublicApiLifecycleAudit",
-    "TelemetryQueries",
-    "TelemetrySentinelEmitter",
-    "operator_metric_dimensions",
-    "verify_connection_budget_live",
-    "verify_operator_telemetry",
-    "verify_operator_telemetry_live",
-    "verify_operator_telemetry_outage",
-    "xray_trace_id",
+PRIVATE_OWNER_EXPORTS = {
+    "approvals": frozenset({"approval_require_current", "approval_verify"}),
+    "bedrock": frozenset(
+        {
+            "build_plugin_policy_acceptance",
+            "run_bedrock_guardrails_live",
+            "verify_bedrock",
+            "verify_bedrock_guardrails",
+        }
+    ),
+    "capture": frozenset(
+        {
+            "FIXED_INPUT_BYTES",
+            "TUTORIAL_INPUT_BYTES",
+            "build_canonical_tutorial_pipeline_yaml",
+            "build_fixed_pipeline_yaml",
+            "capture",
+            "provision_storage",
+            "verify_api",
+            "verify_local_auth",
+            "verify_payloads",
+        }
+    ),
+    "cleanup": frozenset({"cleanup_evidence_finalize"}),
+    "contracts": frozenset(
+        {
+            "AcceptanceCheckError",
+            "AcceptanceHttpError",
+            "AcceptanceInputError",
+            "AcceptanceStateError",
+            "CONNECT_TIMEOUT_SECONDS",
+            "EVIDENCE_KINDS",
+            "FORBIDDEN_AWS_OVERRIDE_ENV",
+            "MAX_BLOB_RESPONSE_BYTES",
+            "MAX_CONTROL_DOCUMENT_BYTES",
+            "MAX_EXEC_RECEIPT_CHARS",
+            "MAX_EXEC_STREAM_BYTES",
+            "MAX_JSON_RESPONSE_BYTES",
+            "MAX_STATE_FILE_BYTES",
+            "OperatorTelemetryAcceptanceError",
+            "POOL_TIMEOUT_SECONDS",
+            "READ_TIMEOUT_SECONDS",
+            "RUN_POLL_DEADLINE_SECONDS",
+            "RUN_POLL_INTERVAL_SECONDS",
+            "SanitizedResourceIdentity",
+            "WRITE_TIMEOUT_SECONDS",
+            "normalize_acceptance_origin",
+            "plugin_policy_binding_sha256",
+            "scenario_resource_namespace",
+        }
+    ),
+    "control_service": frozenset(
+        {
+            "control_manifest_load_cleanup",
+            "control_manifest_update",
+            "control_manifest_validate",
+            "scenario_load",
+            "validate_compatibility_record",
+        }
+    ),
+    "evidence": frozenset({"create_evidence_export_receipt", "sanitize_evidence"}),
+    "gate_ledger": frozenset(
+        {
+            "gate_ledger_bind_candidate",
+            "gate_ledger_finalize",
+            "gate_ledger_get",
+            "gate_ledger_init",
+            "gate_ledger_record",
+            "gate_ledger_record_cleanup",
+        }
+    ),
+    "http_client": frozenset({"AcceptanceHttpClient"}),
+    "manifest": frozenset(
+        {
+            "control_manifest_bind_retained_evidence",
+            "control_manifest_bind_scenario",
+            "control_manifest_checkpoint_operator_evidence",
+            "control_manifest_get",
+            "control_manifest_init",
+        }
+    ),
+    "manifest_schema": frozenset({"CLEANUP_SURFACES"}),
+    "operator_telemetry": frozenset(
+        {
+            "AWSOperatorMetricEmitter",
+            "AWSOperatorTelemetryQueries",
+            "AcceptancePolicy",
+            "AuditSentinel",
+            "ExistingLandscapeLifecycleAudit",
+            "OperatorTelemetryEvidence",
+            "OperatorTelemetryOutageEvidence",
+            "PublicApiLifecycleAudit",
+            "TelemetryQueries",
+            "TelemetrySentinelEmitter",
+            "operator_metric_dimensions",
+            "verify_connection_budget_live",
+            "verify_operator_telemetry",
+            "verify_operator_telemetry_live",
+            "verify_operator_telemetry_outage",
+            "xray_trace_id",
+        }
+    ),
+    "orphan_sweep": frozenset({"OrphanSweepClients", "orphan_sweep"}),
+    "receipt_contracts": frozenset({"encode_exec_receipt", "extract_exec_receipt", "resolve_exec_receipt_env"}),
+    "receipt_store": frozenset({"receipt_store"}),
+    "s3": frozenset({"verify_s3"}),
+    "scenario_inventory": frozenset({"PLUGIN_POLICY_ASSIGNMENT_NAMES", "SCENARIO_ASSIGNMENT_NAMES"}),
+    "state": frozenset({"AcceptanceCredentials", "AcceptanceState", "read_acceptance_state", "write_acceptance_state"}),
+    "task_definition": frozenset({"validate_task_definition_policy_binding"}),
 }
 
 
@@ -461,6 +553,7 @@ EXPECTED_PARSER_SURFACE = {
                     "web-log",
                 ),
             ),
+            S("plan_sha256"),
         )
     ),
 }
@@ -527,9 +620,20 @@ def test_all_selected_base_public_exports_remain_importable() -> None:
     assert not missing
 
 
-def test_operator_telemetry_exports_are_facade_reexports_by_identity() -> None:
-    for name in OPERATOR_TELEMETRY_OWNER_EXPORTS:
-        assert getattr(acceptance, name) is getattr(operator_telemetry, name)
+def test_all_private_owned_exports_are_facade_reexports_by_identity() -> None:
+    facade_owned = {"build_parser", "main"}
+    private_owned = {name for names in PRIVATE_OWNER_EXPORTS.values() for name in names}
+    assert len(private_owned) == 89
+    assert private_owned.isdisjoint(facade_owned)
+    assert private_owned | facade_owned == EXPECTED_PUBLIC_EXPORTS
+
+    for name in facade_owned:
+        assert getattr(acceptance, name).__module__ == acceptance.__name__
+
+    for module_name, names in PRIVATE_OWNER_EXPORTS.items():
+        owner = import_module(f"elspeth.web._aws_ecs_acceptance.{module_name}")
+        for name in names:
+            assert getattr(acceptance, name) is getattr(owner, name), f"{name} is not owned by {module_name}"
 
 
 def test_public_export_literal_matches_selected_base_module_definitions() -> None:
@@ -551,43 +655,208 @@ def test_public_export_literal_matches_selected_base_module_definitions() -> Non
         assert defined == EXPECTED_PUBLIC_EXPORTS
 
 
-EXPECTED_DISPATCH_TARGETS = {
-    ("approval-require-current",): "approval_require_current",
-    ("approval-verify",): "approval_verify",
-    ("capture",): "capture",
-    ("cleanup-evidence-finalize",): "cleanup_evidence_finalize",
-    ("compatibility-record-validate",): "validate_compatibility_record",
-    ("control-manifest", "bind-retained-evidence"): "control_manifest_bind_retained_evidence",
-    ("control-manifest", "bind-scenario"): "control_manifest_bind_scenario",
-    ("control-manifest", "checkpoint-operator-evidence"): "control_manifest_checkpoint_operator_evidence",
-    ("control-manifest", "get"): "control_manifest_get",
-    ("control-manifest", "init"): "control_manifest_init",
-    ("control-manifest", "load-cleanup"): "control_manifest_load_cleanup",
-    ("control-manifest", "update"): "control_manifest_update",
-    ("control-manifest", "validate"): "control_manifest_validate",
-    ("evidence-export-receipt",): "create_evidence_export_receipt",
-    ("extract-exec-receipt",): "extract_exec_receipt",
-    ("gate-ledger", "bind-candidate"): "gate_ledger_bind_candidate",
-    ("gate-ledger", "finalize"): "gate_ledger_finalize",
-    ("gate-ledger", "get"): "gate_ledger_get",
-    ("gate-ledger", "init"): "gate_ledger_init",
-    ("gate-ledger", "record"): "gate_ledger_record",
-    ("gate-ledger", "record-cleanup"): "gate_ledger_record_cleanup",
-    ("orphan-sweep",): "orphan_sweep",
-    ("provision-storage",): "provision_storage",
-    ("receipt-store",): "receipt_store",
-    ("sanitize-evidence",): "sanitize_evidence",
-    ("scenario-load",): "scenario_load",
-    ("scenario-namespace",): "scenario_resource_namespace",
-    ("validate-task-definition-policy",): "validate_task_definition_policy_binding",
-    ("verify-api",): "verify_api",
-    ("verify-bedrock",): "verify_bedrock",
-    ("verify-bedrock-guardrails",): "run_bedrock_guardrails_live",
-    ("verify-connection-budget",): "verify_connection_budget_live",
-    ("verify-local-auth",): "verify_local_auth",
-    ("verify-operator-telemetry",): "verify_operator_telemetry_live",
-    ("verify-payloads",): "verify_payloads",
-    ("verify-s3",): "verify_s3",
+@dataclass(frozen=True)
+class DispatchContract:
+    target: str
+    positional: tuple[object, ...]
+    keywords: Mapping[str, object]
+
+
+DISPATCH_ENVIRONMENT = {"ELSPETH_DISPATCH_SENTINEL": "reviewed-environment"}
+
+
+def _dispatch_contract(target: str, *positional: object, **keywords: object) -> DispatchContract:
+    return DispatchContract(target, positional, keywords)
+
+
+D = _dispatch_contract
+EXPECTED_DISPATCH_CONTRACTS = {
+    ("approval-require-current",): D(
+        "approval_require_current",
+        Path("control.json"),
+        scenario_id="A",
+        kind="terraform-plan",
+        plan_receipt_hash="2" * 64,
+        approval_hash="3" * 64,
+    ),
+    ("approval-verify",): D(
+        "approval_verify",
+        Path("control.json"),
+        scenario_id="A",
+        kind="terraform-plan",
+        plan_receipt_hash="2" * 64,
+        approval_file=Path("approval.json"),
+    ),
+    ("capture",): D("capture", DISPATCH_ENVIRONMENT, state_file=Path("state.json")),
+    ("cleanup-evidence-finalize",): D(
+        "cleanup_evidence_finalize",
+        Path("control.json"),
+        ledger_path=Path("ledger.json"),
+        phase="prepare",
+        clear_cleanup_required=False,
+    ),
+    ("compatibility-record-validate",): D(
+        "validate_compatibility_record",
+        Path("record.json"),
+        manifest_path=Path("control.json"),
+        scenario_id="A",
+    ),
+    ("control-manifest", "bind-retained-evidence"): D(
+        "control_manifest_bind_retained_evidence",
+        Path("control.json"),
+        receipt_path="receipt.json",
+        require_complete=False,
+    ),
+    ("control-manifest", "bind-scenario"): D(
+        "control_manifest_bind_scenario",
+        Path("control.json"),
+        scenario_id="A",
+        inventory_path="inventory.json",
+    ),
+    ("control-manifest", "checkpoint-operator-evidence"): D(
+        "control_manifest_checkpoint_operator_evidence",
+        Path("control.json"),
+        exec_receipt_path="exec.json",
+        checkpoint_path="checkpoint.json",
+    ),
+    ("control-manifest", "get"): D("control_manifest_get", Path("control.json"), "branch"),
+    ("control-manifest", "init"): D(
+        "control_manifest_init",
+        Path("control.json"),
+        acceptance_run_id="00000000-0000-4000-8000-000000000001",
+        candidate_sha="a" * 40,
+        aws_account_id="123456789012",
+        aws_region="ap-southeast-2",
+        scenario_a_inventory="a.json",
+        scenario_b_inventory="b.json",
+        scenario_a_tf_binding="a-binding.json",
+        scenario_b_tf_binding="b-binding.json",
+        evidence_destination_sha256="b" * 64,
+        gate_ledger="ledger.json",
+        teardown_deadline_utc="2026-07-25T00:00:00Z",
+    ),
+    ("control-manifest", "load-cleanup"): D("control_manifest_load_cleanup", Path("control.json")),
+    ("control-manifest", "update"): D(
+        "control_manifest_update",
+        Path("control.json"),
+        cleanup_required=None,
+        ecr_baseline_tag=None,
+        ecr_candidate_tag=None,
+        ecr_registry=None,
+        ecr_repository=None,
+        ecr_baseline_digest=None,
+        ecr_candidate_digest=None,
+        acceptance_state_path=None,
+        oidc_evidence_dir=None,
+        evidence_export_receipt=None,
+        final_evidence_export_receipt=None,
+        terraform_plan_receipt=None,
+        terraform_applied=None,
+        terraform_noop_receipt=None,
+        cleanup_checkpoint=None,
+        verdict_failure=None,
+        emergency_cleanup_deadline_utc=None,
+        cleanup_escalation=None,
+    ),
+    ("control-manifest", "validate"): D(
+        "control_manifest_validate",
+        Path("control.json"),
+        acceptance_run_id="00000000-0000-4000-8000-000000000001",
+        candidate_sha="a" * 40,
+        cleanup_only=False,
+        require_cleanup_cleared=False,
+    ),
+    ("evidence-export-receipt",): D(
+        "create_evidence_export_receipt",
+        Path("control.json"),
+        ledger_path=Path("ledger.json"),
+        output_path=Path("evidence.json"),
+        artifact_count=1,
+    ),
+    ("extract-exec-receipt",): D(
+        "extract_exec_receipt",
+        "{}",
+        expected_candidate_sha="a" * 40,
+        expected_task_arn="arn:aws:ecs:ap-southeast-2:123456789012:task/cluster/task",
+        expected_scenario_id="A",
+        expected_check="verify-s3",
+        expected_plugin_policy_binding_sha256=None,
+    ),
+    ("gate-ledger", "bind-candidate"): D("gate_ledger_bind_candidate", Path("control.json"), candidate_sha="a" * 40),
+    ("gate-ledger", "finalize"): D("gate_ledger_finalize", Path("control.json"), candidate_sha="a" * 40),
+    ("gate-ledger", "get"): D("gate_ledger_get", Path("control.json"), "branch"),
+    ("gate-ledger", "init"): D(
+        "gate_ledger_init",
+        Path("control.json"),
+        branch="release/0.7.2",
+        starting_sha="c" * 40,
+        plan_sha256="d" * 64,
+        program_base_sha="e" * 40,
+        reconciled_release_sha="f" * 40,
+    ),
+    ("gate-ledger", "record"): D(
+        "gate_ledger_record",
+        Path("control.json"),
+        check_id="check",
+        exit_status=0,
+        receipt_hash="1" * 64,
+        candidate_sha="a" * 40,
+        started_at=None,
+        ended_at=None,
+    ),
+    ("gate-ledger", "record-cleanup"): D(
+        "gate_ledger_record_cleanup",
+        Path("control.json"),
+        check_id="check",
+        exit_status=0,
+        receipt_hash="1" * 64,
+        candidate_sha="a" * 40,
+        started_at=None,
+        ended_at=None,
+    ),
+    ("orphan-sweep",): D("orphan_sweep", Path("control.json"), acceptance_run_id="00000000-0000-4000-8000-000000000001"),
+    ("provision-storage",): D("provision_storage"),
+    ("receipt-store",): D(
+        "receipt_store",
+        Path("control.json"),
+        scenario_id="A",
+        kind="web-log",
+        subject_id="subject",
+        receipt_file=Path("receipt.json"),
+        receipt_bytes=None,
+    ),
+    ("sanitize-evidence",): D("sanitize_evidence", "web-log", {}, plan_sha256=None),
+    ("scenario-load",): D("scenario_load", Path("control.json"), scenario_id="A"),
+    ("scenario-namespace",): D("scenario_resource_namespace", "00000000-0000-4000-8000-000000000001", "A"),
+    ("validate-task-definition-policy",): D(
+        "validate_task_definition_policy_binding",
+        {},
+        manifest_path=Path("control.json"),
+        scenario_id="A",
+        container_name="web",
+        expected_user=None,
+        expected_image_role="candidate",
+    ),
+    ("verify-api",): D("verify_api", DISPATCH_ENVIRONMENT, state_file=Path("state.json")),
+    ("verify-bedrock",): D("verify_bedrock", DISPATCH_ENVIRONMENT),
+    ("verify-bedrock-guardrails",): D("run_bedrock_guardrails_live", DISPATCH_ENVIRONMENT),
+    ("verify-connection-budget",): D(
+        "verify_connection_budget_live",
+        DISPATCH_ENVIRONMENT,
+        cluster_id="cluster",
+        start_time="2026-07-24T00:00:00Z",
+        approved_budget=8,
+        safety_margin=2,
+    ),
+    ("verify-local-auth",): D("verify_local_auth"),
+    ("verify-operator-telemetry",): D(
+        "verify_operator_telemetry_live",
+        DISPATCH_ENVIRONMENT,
+        phase="positive",
+        landscape_run_id="run-id",
+    ),
+    ("verify-payloads",): D("verify_payloads", "run-id"),
+    ("verify-s3",): D("verify_s3", DISPATCH_ENVIRONMENT),
 }
 
 
@@ -657,7 +926,7 @@ def _dispatch_namespace(path: tuple[str, ...]) -> SimpleNamespace:
         "cleanup_escalation": None,
         "branch": "release/0.7.2",
         "starting_sha": "c" * 40,
-        "plan_sha256": "d" * 64,
+        "plan_sha256": "d" * 64 if path == ("gate-ledger", "init") else None,
         "program_base_sha": "e" * 40,
         "reconciled_release_sha": "f" * 40,
         "check_id": "check",
@@ -665,7 +934,7 @@ def _dispatch_namespace(path: tuple[str, ...]) -> SimpleNamespace:
         "receipt_hash": "1" * 64,
         "started_at": None,
         "ended_at": None,
-        "kind": "web-log",
+        "kind": "terraform-plan" if path[0].startswith("approval-") else "web-log",
         "subject_id": "subject",
         "receipt_file": "receipt.json",
         "receipt_stdin": False,
@@ -696,17 +965,17 @@ _DISPATCH_RESULTS: Mapping[str, object] = {
 }
 
 
-@pytest.mark.parametrize(("path", "target"), sorted(EXPECTED_DISPATCH_TARGETS.items()))
+@pytest.mark.parametrize(("path", "contract"), sorted(EXPECTED_DISPATCH_CONTRACTS.items()))
 def test_every_dispatch_leaf_calls_its_reviewed_target(
     path: tuple[str, ...],
-    target: str,
+    contract: DispatchContract,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    result = _DISPATCH_RESULTS.get(target, {})
+    result = _DISPATCH_RESULTS.get(contract.target, {})
 
-    if target == "verify_bedrock":
+    if contract.target == "verify_bedrock":
 
         async def target_spy(*args: object, **kwargs: object) -> object:
             calls.append((args, kwargs))
@@ -720,7 +989,8 @@ def test_every_dispatch_leaf_calls_its_reviewed_target(
 
     namespace = _dispatch_namespace(path)
     monkeypatch.setattr(acceptance, "build_parser", lambda: SimpleNamespace(parse_args=lambda _argv: namespace))
-    monkeypatch.setattr(acceptance, target, target_spy)
+    monkeypatch.setattr(acceptance, contract.target, target_spy)
+    monkeypatch.setattr(acceptance.os, "environ", DISPATCH_ENVIRONMENT)
     monkeypatch.setattr(acceptance, "_suppress_process_output", lambda: nullcontext())
     monkeypatch.setattr(acceptance, "resolve_exec_receipt_env", lambda _env: {})
     monkeypatch.setattr(acceptance, "encode_exec_receipt", lambda *_args: "encoded-receipt")
@@ -731,16 +1001,8 @@ def test_every_dispatch_leaf_calls_its_reviewed_target(
     assert capsys.readouterr().err == ""
 
     positional, keywords = calls[0]
-    if target in {"capture", "verify_api"}:
-        assert keywords["state_file"] == Path("state.json")
-    elif target == "control_manifest_init":
-        assert positional == (Path("control.json"),)
-    elif target == "receipt_store":
-        assert positional == (Path("control.json"),)
-        assert keywords["receipt_file"] == Path("receipt.json")
-    elif target == "validate_task_definition_policy_binding":
-        assert positional == ({},)
-        assert keywords["manifest_path"] == Path("control.json")
+    assert positional == contract.positional
+    assert keywords == contract.keywords
 
 
 def test_json_output_and_static_failure_envelopes(
