@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,21 +142,18 @@ def _join_after_follower_sink_preflight(
     return worker_id, plugins, execution_sinks, execution_sink_modes, admission
 
 
-@doctor_app.command("aws-ecs")
-def doctor_aws_ecs(
-    init_schema: bool = typer.Option(
-        False,
-        "--init-schema",
-        help="Initialize only eligible missing or repairable PostgreSQL schemas.",
-    ),
-    json_output: bool = typer.Option(False, "--json", help="Emit a bare ordered JSON check list."),
+def _run_doctor_command(
+    collector: Callable[..., list[Any]],
+    *,
+    init_schema: bool,
+    json_output: bool,
 ) -> None:
-    """Check whether this environment satisfies the AWS ECS contract."""
+    """Run one deployment collector behind the shared redacted CLI boundary."""
     from dataclasses import asdict
 
     from elspeth.web.config import settings_from_env
     from elspeth.web.deployment_contract import ContractCheck
-    from elspeth.web.doctor import collect_checks, sanitize_error
+    from elspeth.web.doctor import sanitize_error
 
     try:
         settings = settings_from_env()
@@ -164,7 +161,7 @@ def doctor_aws_ecs(
         checks = [ContractCheck("settings_load", False, sanitize_error("web settings could not be loaded", exc))]
     else:
         try:
-            checks = collect_checks(settings, init_schema=init_schema)
+            checks = collector(settings, init_schema=init_schema)
         except Exception as exc:
             checks = [ContractCheck("doctor_internal_error", False, sanitize_error("doctor collection failed", exc))]
 
@@ -177,6 +174,44 @@ def doctor_aws_ecs(
 
     if not all(check.ok for check in checks):
         raise typer.Exit(1)
+
+
+@doctor_app.command("deployment")
+def doctor_deployment(
+    init_schema: bool = typer.Option(
+        False,
+        "--init-schema",
+        help="Initialize only eligible missing or repairable PostgreSQL schemas.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit a bare ordered JSON check list."),
+) -> None:
+    """Check the provider-neutral external PostgreSQL deployment contract."""
+    from elspeth.web.doctor import collect_deployment_checks
+
+    _run_doctor_command(
+        collect_deployment_checks,
+        init_schema=init_schema,
+        json_output=json_output,
+    )
+
+
+@doctor_app.command("aws-ecs")
+def doctor_aws_ecs(
+    init_schema: bool = typer.Option(
+        False,
+        "--init-schema",
+        help="Initialize only eligible missing or repairable PostgreSQL schemas.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit a bare ordered JSON check list."),
+) -> None:
+    """Check whether this environment satisfies the AWS ECS contract."""
+    from elspeth.web.doctor import collect_checks
+
+    _run_doctor_command(
+        collect_checks,
+        init_schema=init_schema,
+        json_output=json_output,
+    )
 
 
 def version_callback(value: bool) -> None:

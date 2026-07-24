@@ -1,4 +1,4 @@
-"""CLI rendering and error-boundary tests for ``doctor aws-ecs``."""
+"""CLI rendering and error-boundary tests for deployment doctor commands."""
 
 from __future__ import annotations
 
@@ -35,6 +35,111 @@ def _patch_doctor(
 
     monkeypatch.setattr(doctor, "collect_checks", fake_collect)
     return init_values
+
+
+def _patch_deployment_doctor(
+    monkeypatch: pytest.MonkeyPatch,
+    checks: list[ContractCheck],
+    *,
+    settings: object | None = None,
+) -> list[bool]:
+    import elspeth.web.config as web_config
+    import elspeth.web.doctor as doctor
+
+    marker = object() if settings is None else settings
+    init_values: list[bool] = []
+
+    monkeypatch.setattr(web_config, "settings_from_env", lambda: marker)
+
+    def fake_collect(actual_settings: object, *, init_schema: bool = False) -> list[ContractCheck]:
+        assert actual_settings is marker
+        init_values.append(init_schema)
+        return checks
+
+    monkeypatch.setattr(doctor, "collect_deployment_checks", fake_collect, raising=False)
+    return init_values
+
+
+def test_deployment_json_output_is_bare_ordered_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_deployment_doctor(
+        monkeypatch,
+        [ContractCheck("first", True, "ready"), ContractCheck("second", True, "also ready")],
+    )
+
+    result = runner.invoke(app, ["--no-dotenv", "doctor", "deployment", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == [
+        {"name": "first", "ok": True, "detail": "ready"},
+        {"name": "second", "ok": True, "detail": "also ready"},
+    ]
+    assert result.stderr == ""
+
+
+def test_deployment_text_output_is_deterministic_and_failure_exits_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_deployment_doctor(
+        monkeypatch,
+        [ContractCheck("first", True, "ready"), ContractCheck("second", False, "blocked")],
+    )
+
+    first = runner.invoke(app, ["--no-dotenv", "doctor", "deployment"])
+    second = runner.invoke(app, ["--no-dotenv", "doctor", "deployment"])
+
+    assert first.exit_code == 1
+    assert first.stdout == "OK first: ready\nFAIL second: blocked\n"
+    assert second.stdout == first.stdout
+
+
+def test_deployment_settings_load_failure_is_one_sanitized_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.web.config as web_config
+
+    def fail_settings() -> object:
+        raise RuntimeError("postgresql://user:hunter2@private/db /secret/path")  # secret-scan: allow-this-line
+
+    monkeypatch.setattr(web_config, "settings_from_env", fail_settings)
+
+    result = runner.invoke(app, ["--no-dotenv", "doctor", "deployment", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == [
+        {"name": "settings_load", "ok": False, "detail": "web settings could not be loaded (RuntimeError)"}
+    ]
+    assert "hunter2" not in result.output
+    assert "/secret/path" not in result.output
+
+
+def test_deployment_last_resort_internal_error_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.web.config as web_config
+    import elspeth.web.doctor as doctor
+
+    monkeypatch.setattr(web_config, "settings_from_env", lambda: object())
+
+    def fail_collection(_settings: object, *, init_schema: bool = False) -> list[ContractCheck]:
+        del init_schema
+        raise RuntimeError("postgresql://user:hunter2@private/db")  # secret-scan: allow-this-line
+
+    monkeypatch.setattr(doctor, "collect_deployment_checks", fail_collection, raising=False)
+
+    result = runner.invoke(app, ["--no-dotenv", "doctor", "deployment", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == [
+        {"name": "doctor_internal_error", "ok": False, "detail": "doctor collection failed (RuntimeError)"}
+    ]
+    assert "hunter2" not in result.output
+
+
+@pytest.mark.parametrize("init_schema", [False, True])
+def test_deployment_init_schema_flag_is_propagated(monkeypatch: pytest.MonkeyPatch, init_schema: bool) -> None:
+    observed = _patch_deployment_doctor(monkeypatch, [ContractCheck("ready", True, "ready")])
+    args = ["--no-dotenv", "doctor", "deployment", "--json"]
+    if init_schema:
+        args.insert(-1, "--init-schema")
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0
+    assert observed == [init_schema]
 
 
 def test_json_output_is_bare_ordered_list(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -23,6 +23,7 @@ from elspeth.web.doctor import (
     _initialize_database,
     _inspect_database,
     collect_checks,
+    collect_deployment_checks,
     database_target_check,
     plugin_and_dependency_checks,
     probe_directory_writable,
@@ -334,6 +335,7 @@ def test_capability_failures_are_isolated_and_preserve_complete_report(monkeypat
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
         "psycopg_dependency",
+        "psycopg2_dependency",
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",
@@ -341,6 +343,16 @@ def test_capability_failures_are_isolated_and_preserve_complete_report(monkeypat
     assert by_name["aws_s3_plugin"].ok is False
     assert "password" not in by_name["aws_s3_plugin"].detail
     assert all(check.detail for check in checks)
+
+
+def test_shared_dependency_checks_exclude_aws_only_capabilities() -> None:
+    names = [check.name for check in plugin_and_dependency_checks(include_aws_checks=False)]
+
+    assert names == [
+        "psycopg_dependency",
+        "psycopg2_dependency",
+        "jinja2_dependency",
+    ]
 
 
 def test_operator_telemetry_check_resolves_actual_effective_policy(tmp_path: Path) -> None:
@@ -431,6 +443,7 @@ def test_guardrail_registration_check_requires_positive_detection_blocking(monke
     [
         ("elspeth.plugins.transforms.llm.transform", "bedrock_provider"),
         ("psycopg", "psycopg_dependency"),
+        ("psycopg2", "psycopg2_dependency"),
         ("boto3", "boto3_dependency"),
         ("ijson", "ijson_dependency"),
         ("jinja2", "jinja2_dependency"),
@@ -455,7 +468,7 @@ def test_each_lazy_import_failure_keeps_other_named_checks(
     checks = plugin_and_dependency_checks()
     by_name = _by_name(checks)
 
-    assert len(checks) == 8
+    assert len(checks) == 9
     assert by_name[check_name].ok is False
     assert "secret import failure" not in by_name[check_name].detail
     assert "/private/path" not in by_name[check_name].detail
@@ -476,15 +489,134 @@ def test_collection_never_touches_auth_db(tmp_path: Path, monkeypatch: pytest.Mo
     assert all("auth" not in check.name for check in checks)
 
 
+@pytest.mark.parametrize(
+    "target",
+    ["docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+)
+def test_deployment_collector_has_identical_common_contract_for_every_external_target(
+    target: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _patch_database_states(monkeypatch, SchemaState.CURRENT, SchemaState.CURRENT, events)
+
+    checks = collect_deployment_checks(
+        _settings(
+            tmp_path,
+            deployment_target=target,
+            deployment_state_mode="external-postgresql",
+        )
+    )
+
+    assert [check.name for check in checks] == [
+        "deployment_target",
+        "deployment_state_mode",
+        "session_db_url",
+        "landscape_url",
+        "separate_db_targets",
+        "data_dir",
+        "payload_store_path",
+        "host",
+        "secret_key",
+        "shareable_link_signing_key",
+        "data_dir_writable",
+        "payload_store_writable",
+        "blob_writable",
+        "psycopg_dependency",
+        "psycopg2_dependency",
+        "jinja2_dependency",
+        "session_schema",
+        "landscape_schema",
+    ]
+    assert _by_name(checks)["session_schema"] == ContractCheck("session_schema", True, "current")
+    assert _by_name(checks)["landscape_schema"] == ContractCheck("landscape_schema", True, "current")
+    assert not {
+        "aws_s3_plugin",
+        "bedrock_provider",
+        "aws_operator_telemetry",
+        "bedrock_guardrail_plugins",
+        "boto3_dependency",
+        "ijson_dependency",
+    }.intersection(_by_name(checks))
+    assert events == ["inspect:session_schema", "inspect:landscape_schema"]
+
+
+def test_deployment_init_schema_rejects_sqlite_mode_before_any_database_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.doctor as doctor
+
+    settings = _settings(
+        tmp_path,
+        deployment_target="linux-systemd",
+        deployment_state_mode="sqlite-single",
+        session_db_url="sqlite:///private-session.db",
+        landscape_url="sqlite:///private-landscape.db",
+    )
+    monkeypatch.setattr(doctor, "_inspect_database", lambda *_args, **_kwargs: pytest.fail("must not inspect SQLite"))
+    monkeypatch.setattr(
+        doctor,
+        "_initialize_database",
+        lambda *_args, **_kwargs: pytest.fail("must not initialize or replace SQLite"),
+    )
+
+    checks = _by_name(collect_deployment_checks(settings, init_schema=True))
+
+    assert checks["deployment_state_mode"] == ContractCheck(
+        "deployment_state_mode",
+        False,
+        "ELSPETH_WEB__DEPLOYMENT_STATE_MODE must resolve to external PostgreSQL for this startup contract",
+    )
+    assert checks["session_schema"].ok is False
+    assert checks["landscape_schema"].ok is False
+
+
+def test_aws_compatibility_collector_rejects_non_aws_target_before_common_collection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.doctor as doctor
+
+    monkeypatch.setattr(
+        doctor,
+        "_collect_deployment_checks",
+        lambda *_args, **_kwargs: pytest.fail("must require aws-ecs before common collection"),
+        raising=False,
+    )
+
+    checks = collect_checks(
+        _settings(
+            tmp_path,
+            deployment_target="azure-container-apps",
+            deployment_state_mode="external-postgresql",
+        )
+    )
+
+    assert checks == [
+        ContractCheck(
+            "deployment_target",
+            False,
+            "ELSPETH_WEB__DEPLOYMENT_TARGET must be aws-ecs",
+        )
+    ]
+
+
 def test_task1_check_names_are_exact_ordered_and_unique(tmp_path: Path) -> None:
     names = [check.name for check in collect_checks(_settings(tmp_path))]
 
     assert names == [
         "deployment_target",
+        "deployment_state_mode",
         "session_db_url",
         "landscape_url",
+        "separate_db_targets",
         "data_dir",
         "payload_store_path",
+        "host",
+        "secret_key",
+        "shareable_link_signing_key",
         "operator_telemetry",
         "operator_telemetry_environment",
         "operator_telemetry_release",
@@ -492,10 +624,6 @@ def test_task1_check_names_are_exact_ordered_and_unique(tmp_path: Path) -> None:
         "operator_telemetry_ecs_service",
         "operator_telemetry_task_definition_family",
         "operator_telemetry_task_definition_revision",
-        "host",
-        "secret_key",
-        "shareable_link_signing_key",
-        "separate_db_targets",
         "data_dir_writable",
         "payload_store_writable",
         "blob_writable",
@@ -504,6 +632,7 @@ def test_task1_check_names_are_exact_ordered_and_unique(tmp_path: Path) -> None:
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
         "psycopg_dependency",
+        "psycopg2_dependency",
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",
@@ -585,6 +714,7 @@ def _patch_auxiliary_checks_green(monkeypatch: pytest.MonkeyPatch) -> None:
                 "aws_operator_telemetry",
                 "bedrock_guardrail_plugins",
                 "psycopg_dependency",
+                "psycopg2_dependency",
                 "boto3_dependency",
                 "ijson_dependency",
                 "jinja2_dependency",
@@ -937,6 +1067,7 @@ def test_any_auxiliary_preflight_failure_blocks_all_initializers(
                     "aws_operator_telemetry",
                     "bedrock_guardrail_plugins",
                     "psycopg_dependency",
+                    "psycopg2_dependency",
                     "boto3_dependency",
                     "ijson_dependency",
                     "jinja2_dependency",
@@ -1005,10 +1136,15 @@ def test_task2_order_remains_exact_and_unique_after_database_inspection(tmp_path
 
     assert names == [
         "deployment_target",
+        "deployment_state_mode",
         "session_db_url",
         "landscape_url",
+        "separate_db_targets",
         "data_dir",
         "payload_store_path",
+        "host",
+        "secret_key",
+        "shareable_link_signing_key",
         "operator_telemetry",
         "operator_telemetry_environment",
         "operator_telemetry_release",
@@ -1016,10 +1152,6 @@ def test_task2_order_remains_exact_and_unique_after_database_inspection(tmp_path
         "operator_telemetry_ecs_service",
         "operator_telemetry_task_definition_family",
         "operator_telemetry_task_definition_revision",
-        "host",
-        "secret_key",
-        "shareable_link_signing_key",
-        "separate_db_targets",
         "data_dir_writable",
         "payload_store_writable",
         "blob_writable",
@@ -1028,6 +1160,7 @@ def test_task2_order_remains_exact_and_unique_after_database_inspection(tmp_path
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
         "psycopg_dependency",
+        "psycopg2_dependency",
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",

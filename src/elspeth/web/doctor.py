@@ -1,4 +1,4 @@
-"""Safe, redacted AWS ECS deployment preflight checks.
+"""Safe, redacted deployment preflight checks.
 
 The default doctor path creates no persistent application state.  Its only
 filesystem write is an unlinked temporary probe operated through one file
@@ -21,7 +21,12 @@ from sqlalchemy.engine import make_url
 
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.web.config import WebSettings
-from elspeth.web.deployment_contract import ContractCheck, validate_aws_ecs_settings
+from elspeth.web.deployment_contract import (
+    DEPLOYMENT_TARGET_AWS_ECS,
+    ContractCheck,
+    validate_aws_ecs_settings,
+    validate_external_postgresql_settings,
+)
 from elspeth.web.paths import managed_blob_directory
 from elspeth.web.schema_probe import (
     DatabaseTargetConflictError,
@@ -248,17 +253,28 @@ def _dependency_check(module_name: str, check_name: str) -> ContractCheck:
     return ContractCheck(check_name, True, f"{module_name} dependency is importable")
 
 
-def plugin_and_dependency_checks(*, settings: WebSettings | None = None) -> list[ContractCheck]:
+def plugin_and_dependency_checks(
+    *,
+    settings: WebSettings | None = None,
+    include_aws_checks: bool = True,
+) -> list[ContractCheck]:
     """Return isolated capability checks in stable report order."""
+    shared_checks = [
+        _dependency_check("psycopg", "psycopg_dependency"),
+        _dependency_check("psycopg2", "psycopg2_dependency"),
+        _dependency_check("jinja2", "jinja2_dependency"),
+    ]
+    if not include_aws_checks:
+        return shared_checks
     return [
         _aws_s3_plugin_check(),
         _bedrock_provider_check(),
         _aws_operator_telemetry_check(settings),
         _bedrock_guardrail_plugins_check(),
-        _dependency_check("psycopg", "psycopg_dependency"),
+        *shared_checks[:2],
         _dependency_check("boto3", "boto3_dependency"),
         _dependency_check("ijson", "ijson_dependency"),
-        _dependency_check("jinja2", "jinja2_dependency"),
+        shared_checks[-1],
     ]
 
 
@@ -400,20 +416,20 @@ def _initialize_database(
     return result
 
 
-def collect_checks(settings: WebSettings, *, init_schema: bool = False) -> list[ContractCheck]:
-    """Collect the ordered report and optionally initialize eligible schemas."""
-    checks = list(validate_aws_ecs_settings(settings))
+def _collect_deployment_checks(
+    settings: WebSettings,
+    *,
+    init_schema: bool,
+    include_aws_checks: bool,
+) -> list[ContractCheck]:
+    """Collect one external-PostgreSQL report with optional AWS-only checks."""
+    if include_aws_checks:
+        checks = list(validate_aws_ecs_settings(settings))
+    else:
+        checks = list(validate_external_postgresql_settings(settings))
     by_name = {check.name: check for check in checks}
     url_eligible = by_name["session_db_url"].ok and by_name["landscape_url"].ok
-    if url_eligible:
-        target_check = database_target_check(settings.session_db_url, settings.landscape_url)
-    else:
-        target_check = ContractCheck(
-            "separate_db_targets",
-            False,
-            "database target comparison was not attempted because the database URL contract failed",
-        )
-    checks.append(target_check)
+    target_check = by_name["separate_db_targets"]
     checks.extend(
         [
             probe_directory_writable("data_dir", settings.data_dir),
@@ -421,11 +437,16 @@ def collect_checks(settings: WebSettings, *, init_schema: bool = False) -> list[
             probe_directory_writable("blob", managed_blob_directory(str(settings.data_dir))),
         ]
     )
-    checks.extend(plugin_and_dependency_checks(settings=settings))
+    if include_aws_checks:
+        checks.extend(plugin_and_dependency_checks(settings=settings))
+    else:
+        checks.extend(plugin_and_dependency_checks(settings=settings, include_aws_checks=False))
 
-    database_prerequisites_pass = url_eligible and by_name["deployment_target"].ok and target_check.ok
+    database_prerequisites_pass = (
+        url_eligible and by_name["deployment_target"].ok and by_name["deployment_state_mode"].ok and target_check.ok
+    )
     if not database_prerequisites_pass:
-        blocked_detail = "schema inspection was not attempted because the AWS ECS database prerequisites failed"
+        blocked_detail = "schema inspection was not attempted because the deployment database prerequisites failed"
         checks.extend(
             [
                 ContractCheck("session_schema", False, blocked_detail),
@@ -476,3 +497,29 @@ def collect_checks(settings: WebSettings, *, init_schema: bool = False) -> list[
         )
     checks.extend([session_result, landscape_result])
     return checks
+
+
+def collect_deployment_checks(settings: WebSettings, *, init_schema: bool = False) -> list[ContractCheck]:
+    """Collect provider-neutral external PostgreSQL deployment checks."""
+    return _collect_deployment_checks(
+        settings,
+        init_schema=init_schema,
+        include_aws_checks=False,
+    )
+
+
+def collect_checks(settings: WebSettings, *, init_schema: bool = False) -> list[ContractCheck]:
+    """Collect AWS ECS checks through the shared deployment collector."""
+    if settings.deployment_target != DEPLOYMENT_TARGET_AWS_ECS:
+        return [
+            ContractCheck(
+                "deployment_target",
+                False,
+                "ELSPETH_WEB__DEPLOYMENT_TARGET must be aws-ecs",
+            )
+        ]
+    return _collect_deployment_checks(
+        settings,
+        init_schema=init_schema,
+        include_aws_checks=True,
+    )
