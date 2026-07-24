@@ -50,3 +50,13 @@ def test_elspeth_web_service_marks_uds_reverse_proxy_as_non_local() -> None:
     assert "--uds /run/elspeth/uvicorn.sock" in service_text
     assert "Environment=ELSPETH_WEB__HOST=0.0.0.0" in service_text
     assert service_text.index("Environment=ELSPETH_WEB__HOST=0.0.0.0") < service_text.index("ExecStart=")
+
+
+def test_staging_service_remains_site_specific_beside_portable_bundle() -> None:
+    """The portable bundle must not silently replace the live staging unit."""
+    service_text = _active_service_text()
+
+    assert "User=john" in service_text
+    assert "WorkingDirectory=/home/john/elspeth" in service_text
+    assert "EnvironmentFile=/home/john/elspeth/deploy/elspeth-web.env" in service_text
+    assert "ExecStart=/home/john/elspeth/.venv/bin/uvicorn" in service_text
