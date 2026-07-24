@@ -493,7 +493,7 @@ Move to `contracts.py` without behavioral edits:
 - closed field sets, bounds, command-independent constants, identity/hash/UUID/time helpers;
 - a domain-neutral strict UTC `Z` timestamp parser that raises `ValueError`, plus the Layer-0 `_control_timestamp` wrapper retaining its current `AcceptanceCheckError` mapping; `state.py` keeps the state-specific wrapper and `AcceptanceStateError` mapping;
 - `_bounded_identity` and `SanitizedResourceIdentity`, so receipt validation and telemetry share one downward owner; and
-- a pure ECS task-definition-family parser that returns a family or no match, with scenario/orphan wrappers preserving their different existing error identifiers;
+- a pure ECS task-definition-family parser that returns a family or no match, with both current scenario and orphan callers preserving the live `orphan_sweep_api` error identifier; do not invent a distinct scenario identifier during this refactor;
 - `normalize_acceptance_origin`, `scenario_resource_namespace`, and `plugin_policy_binding_sha256`;
 - shared mapping/string/UUID/SHA extraction helpers; and
 - `_resolve_aws_region`, keeping the caller-supplied `check` identifier and fail-closed region rules.
@@ -615,7 +615,7 @@ git commit -m "refactor(web): extract acceptance transport and receipts"
 
 - [ ] Import the single `_resolve_aws_region` owner from `contracts.py`. Do not import Bedrock or telemetry modules.
 
-- [ ] Move S3 tests to `test_s3.py` and preserve publication-before-cleanup, retry bounds, conditional put/delete behavior, receipt hashes, error classification, and non-leaking failures.
+- [ ] Move S3 tests to `test_s3.py` and preserve publication-before-cleanup, conditional put/delete behavior, receipt hashes, error classification, and non-leaking failures. The lane has no local retry loop or retry budget; do not invent one during extraction.
 
 - [ ] Verify and commit:
 
@@ -651,7 +651,7 @@ git commit -m "refactor(web): extract S3 acceptance lane"
 
 - [ ] Preserve provider/model/region admission, secret redaction, plugin-policy binding, exact record selection, guardrail denial behavior, output suppression restoration, and cost/request identity hashes.
 
-- [ ] Import `_resolve_aws_region` from `contracts.py`; do not import S3 or operator telemetry.
+- [ ] Import `_resolve_aws_region` from `contracts.py` and the tutorial-policy state helper from `capture.py`; do not import S3 or the new private `operator_telemetry.py`. The existing product module `elspeth.web.operator_telemetry` remains a legitimate dependency and must not be rejected by basename-only architecture checks.
 
 - [ ] Move and retarget owning tests, then verify and commit:
 
@@ -699,7 +699,7 @@ git commit -m "refactor(web): extract Bedrock acceptance lane"
 - forbidden-value absence; and
 - connection-budget arithmetic and closed receipt shape.
 
-- [ ] Import `_resolve_aws_region` from `contracts.py`; do not import S3 or Bedrock. Move/retarget owner tests, run the common gate and milestone gate, then commit:
+- [ ] Import `_resolve_aws_region` from `contracts.py`, `AcceptanceState` from `state.py`, shared receipt constants from `receipt_contracts.py`, and the public `capture` callable from `capture.py`. Keep `_read_landscape_terminal_status` and `_read_landscape_started_at` owned in `operator_telemetry.py`; do not import S3 or Bedrock. Move/retarget owner tests, run the common gate and milestone gate, then commit:
 
 ```bash
 git add src/elspeth/web/aws_ecs_acceptance.py \
@@ -725,11 +725,11 @@ git commit -m "refactor(web): extract operator telemetry acceptance"
 - Modify: `src/elspeth/web/aws_ecs_acceptance.py`
 - Modify: `tests/unit/web/test_aws_ecs_acceptance.py`
 
-- [ ] Move control-manifest validation/read helpers, closed field/order constants, retained-evidence validation, and `_require_mutable_control_manifest` to `manifest_schema.py`.
+- [ ] Move control-manifest validation/read helpers, closed field/order constants, retained-evidence validation, and `_require_mutable_control_manifest` to `manifest_schema.py`. Retained-evidence validation consumes scenario-inventory validation, so `manifest_schema.py` may import `scenario_inventory.py`; the reverse edge is forbidden.
 
-- [ ] Move `SCENARIO_ASSIGNMENT_NAMES`, scenario inventory hash/schema validation, Terraform binding validation, listener resolution, resource binding/resolved-value validation, isolation, and pre-apply/bound inventory loads to `scenario_inventory.py`. Consume the pure ECS task-family parser from `contracts.py` and map invalid values to the existing scenario-inventory binding failure.
+- [ ] Move `SCENARIO_ASSIGNMENT_NAMES`, `PLUGIN_POLICY_ASSIGNMENT_NAMES`, orphan-inventory validation, scenario inventory hash/schema validation, Terraform binding validation, listener resolution, resource binding/resolved-value validation, isolation, and pre-apply/bound inventory loads to `scenario_inventory.py`. Consume the pure ECS task-family parser from `contracts.py` and preserve the selected base's current `orphan_sweep_api` mapping for malformed task families.
 
-- [ ] Keep both modules validation-only. They may use `contracts`, `secure_documents`, and `receipt_contracts`; they must not import mutation, receipt-store, approval, evidence, cleanup, or control-service modules.
+- [ ] Keep both modules validation-only. They may use `contracts`, `secure_documents`, and `receipt_contracts`; `manifest_schema.py` may additionally depend one-way on `scenario_inventory.py`. They must not import mutation, receipt-store, approval, evidence, cleanup, or control-service modules.
 
 - [ ] Add/retain a table-driven finalization test that invokes every manifest mutator after `final_evidence.phase == "committed"` and requires the existing `control_manifest_finalized` failure. Consumers must call the guard through its owner module rather than copy a second implementation. Post-commit cleanup replay is the sole validation-only exception and must make no write.
 
@@ -759,7 +759,7 @@ git commit -m "refactor(web): extract acceptance manifest schemas"
 - Modify: `src/elspeth/web/aws_ecs_acceptance.py`
 - Modify: `tests/unit/web/test_aws_ecs_acceptance.py`
 
-- [ ] Move low-level serialized manifest initialization, retained-evidence binding, operator checkpointing, scenario binding, and field/read operations to `manifest.py`. Every mutation must retain `_serialized_control_manifest_write` or explicitly hold the same lock for the full read-modify-write transaction, and must call `_require_mutable_control_manifest` before changing state.
+- [ ] Move low-level serialized manifest initialization, retained-evidence binding, operator checkpointing, scenario binding, and the public `control_manifest_get` read operation to `manifest.py`. Every mutation must retain `_serialized_control_manifest_write` or explicitly hold the same lock for the full read-modify-write transaction, and must call `_require_mutable_control_manifest` before changing state.
 
 - [ ] Move plaintext-secret classification, Secrets Manager ARN/inventory binding, and `validate_task_definition_policy_binding` to `task_definition.py`.
 
@@ -794,7 +794,7 @@ git commit -m "refactor(web): extract manifest and task policy"
 
 - [ ] Move `OrphanSweepClients`, client construction, AWS error classification, bounded calls/pagination, inventory projection, task-family ownership, transaction-search projection, and `orphan_sweep` to `orphan_sweep.py`. Its task-family wrapper consumes the pure parser from `contracts.py` and preserves the existing orphan API/binding error mapping.
 
-- [ ] Preserve page/item/retry budgets, accepted not-found errors, namespace/ownership proof, orphan/survivor counts, dry-run versus destructive behavior, and failure-safe receipt output.
+- [ ] Preserve page/item budgets, accepted not-found errors, namespace/ownership proof, orphan/survivor counts, destructive behavior, and failure-safe receipt output. The selected base has no orphan-sweep dry-run argument or CLI option and no local retry budget; do not add either during this refactor.
 
 - [ ] Move/retarget owner tests, run the common gate, and commit:
 
@@ -823,7 +823,7 @@ git commit -m "refactor(web): extract orphan sweep ownership"
 
 - [ ] Move bounded receipt persistence, `receipt_store`, and `_receipt_store_locked` to `receipt_store.py`. Keep one receipt-manifest lock held across both receipt publication and manifest indexing. The module may consume pure validators but must not import `manifest.py` or `control_service.py`.
 
-- [ ] Add/retain a cross-process regression that interleaves two distinct receipt publications and proves neither a lost index entry nor an unindexed published receipt is observable.
+- [ ] Add/retain a cross-process regression that interleaves two distinct receipt publications and proves no lock-cooperating reader or writer can observe a partial transition: neither a lost index entry nor an unindexed published receipt. Arbitrary raw filesystem observation outside the cooperative lock is not part of this behavior-preserving contract.
 
 - [ ] Move approval base64url decoding, configured public-key verifier construction, `approval_verify`, `_require_current_approval`, `approval_require_current`, and serialized approval mutation to `approvals.py`.
 
@@ -859,7 +859,7 @@ git commit -m "refactor(web): extract receipts and runtime approvals"
 
 - [ ] Move gate record hashing/stream validation, ledger schema/read/init/get, candidate binding, ordered record append, cleanup record append, replay checks, and finalization to `gate_ledger.py`.
 
-- [ ] Preserve redaction, closed projection, receipt aggregate identity, ordered gate prefixes, candidate binding, interruption/replay behavior, terminal record uniqueness, and serialized writes. `gate_ledger.py` must not import `evidence.py`, `cleanup.py`, or `control_service.py`; callers compose their results.
+- [ ] Preserve redaction, closed projection, receipt aggregate identity, ordered gate prefixes, candidate binding, interruption/replay behavior, and terminal record uniqueness. The selected base uses atomic replacement but leaves gate-ledger read-modify-write sequences unlocked; fix that lost-update hazard under TDD by holding the shared protected-document transaction lock across candidate binding, record append, and finalization, with a cross-process pause-after-read regression. `gate_ledger.py` must not import `evidence.py`, `cleanup.py`, or `control_service.py`; callers compose their results.
 
 - [ ] Move/retarget owner tests, run the common gate and milestone gate, then commit:
 
