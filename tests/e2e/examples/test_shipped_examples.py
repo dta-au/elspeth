@@ -382,7 +382,7 @@ class TestShippedExamples:
                     assert isinstance(t, dict), f"{name}/{path.name}: transform[{i}] must be a dict"
                     assert "plugin" in t, f"{name}/{path.name}: transform[{i}] missing 'plugin'"
 
-    def test_openrouter_journal_path_resolves_next_to_audit_db(
+    def test_openrouter_journal_path_resolves_next_to_audit_db_with_hostile_env(
         self,
         example_pipeline_dir: Path,
         tmp_path: Path,
@@ -395,6 +395,11 @@ class TestShippedExamples:
             "openrouter_multi_query_assessment",
         )
         monkeypatch.chdir(tmp_path)
+        # A process-wide override must not redirect or disable this copied fixture.
+        monkeypatch.setenv("ELSPETH_LANDSCAPE__DUMP_TO_JSONL", "false")
+        for variable_name in tuple(os.environ):
+            if variable_name.startswith("ELSPETH_"):
+                monkeypatch.delenv(variable_name)
         monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
         settings = load_settings(example_dir / "settings_journal.yaml")
 

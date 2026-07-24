@@ -1018,9 +1018,12 @@ landscape:
       durability: replicated
   # Optional: JSONL change journal for emergency backup
   dump_to_jsonl: false
-  dump_to_jsonl_path: ./runs/audit.journal.jsonl
+  dump_to_jsonl_path: audit.journal.jsonl
   dump_to_jsonl_include_payloads: false
 ```
+
+For SQLite, ELSPETH resolves a relative journal path against the directory
+containing `landscape.url`. Here, both files live under `./runs/`.
 
 Committed journal batches are bound to the canonical sidecar path that
 created them. Startup recovery only drains that path's backlog; changing a
@@ -1036,7 +1039,7 @@ Concurrent drains for one path are serialized across processes.
 | `url` | string | `sqlite:///./state/audit.db` | SQLAlchemy database URL |
 | `export` | object | (disabled) | Post-run audit export configuration |
 | `dump_to_jsonl` | bool | `false` | Write append-only JSONL change journal |
-| `dump_to_jsonl_path` | string | (derived from url) | Path for JSONL journal file |
+| `dump_to_jsonl_path` | string | (derived from url) | Path for JSONL journal file; SQLite resolves relative paths against the database directory |
 | `dump_to_jsonl_fail_on_error` | bool | `false` | Fail database startup if a committed outbox batch cannot be published during recovery |
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
@@ -1196,7 +1199,7 @@ landscape:
 
   # Enable the change journal
   dump_to_jsonl: true
-  dump_to_jsonl_path: ./runs/audit.journal.jsonl
+  dump_to_jsonl_path: audit.journal.jsonl
 
   # Include LLM/HTTP request and response bodies
   dump_to_jsonl_include_payloads: true

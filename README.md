@@ -475,10 +475,13 @@ record; use it only when you need a text-based, append-only backup stream.
 ```yaml
 landscape:
   dump_to_jsonl: true
-  dump_to_jsonl_path: ./runs/audit.journal.jsonl
+  dump_to_jsonl_path: audit.journal.jsonl
   # Include request/response payloads for LLM/HTTP calls
   dump_to_jsonl_include_payloads: true
 ```
+
+For SQLite, ELSPETH resolves a relative journal path against the directory
+containing `landscape.url`, so the journal sits beside the audit database.
 
 ---
 
