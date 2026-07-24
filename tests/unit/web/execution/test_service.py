@@ -1730,9 +1730,13 @@ sinks:
         source_path.write_text("alpha\n", encoding="utf-8")
         output_path = tmp_path / "out.jsonl"
         run_id = str(uuid4())
+
+        def _external_session_db_url() -> str:
+            return "postgresql+psycopg://db.invalid/elspeth_sessions"
+
         mock_settings.deployment_target = "aws-ecs"
         mock_settings.deployment_state_mode = "external-postgresql"
-        mock_settings.get_session_db_url = MagicMock(return_value="postgresql+psycopg://db.invalid/elspeth_sessions")
+        mock_settings.get_session_db_url = _external_session_db_url
         mock_settings.landscape_url = "postgresql+psycopg2://db.invalid/elspeth_landscape"
         assert resolve_deployment_state_mode(mock_settings) == "external-postgresql"
         mock_settings.operator_telemetry_service_name = "elspeth-web-test"
