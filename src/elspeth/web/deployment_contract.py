@@ -1,15 +1,20 @@
-"""Pure AWS ECS deployment contract validator. No I/O, no network, no
-filesystem. ContractCheck.detail is pre-redacted -- never a URL, path,
-or secret value."""
+"""Pure deployment contract resolution and AWS ECS validation.
+
+No I/O, no network, no filesystem. Diagnostics and ``ContractCheck.detail``
+are pre-redacted -- never a URL, path, or secret value.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError
 
 from elspeth.web.config import (
+    DeploymentTarget,
     WebSettings,
     is_default_secret_key_placeholder,
     is_undersized_secret_key,
@@ -17,6 +22,7 @@ from elspeth.web.config import (
 )
 
 DEPLOYMENT_TARGET_AWS_ECS = "aws-ecs"
+EXTERNAL_POSTGRESQL_TARGETS: frozenset[DeploymentTarget] = frozenset({"aws-ecs", "azure-container-apps", "kubernetes"})
 _POSTGRES_DRIVER = "postgresql"
 # This IS the container-serving check, not a bind-all bug; exact-match only --
 # IPv6 dual-stack ("::") is out of scope for this milestone.
@@ -28,6 +34,71 @@ class ContractCheck:
     name: str
     ok: bool
     detail: str
+
+
+class DeploymentConfigurationError(ValueError):
+    """Raised when deployment state settings cannot form a valid contract."""
+
+
+def _database_dialect(field_name: Literal["session_db_url", "landscape_url"], url: str) -> Literal["sqlite", "postgresql"]:
+    try:
+        drivername = make_url(url).drivername
+    except (ArgumentError, ValueError):
+        raise DeploymentConfigurationError(f"{field_name} could not be parsed as a SQLAlchemy URL") from None
+
+    base_dialect = drivername.split("+", 1)[0]
+    if base_dialect == "sqlite":
+        return "sqlite"
+    if base_dialect == "postgresql":
+        return "postgresql"
+    raise DeploymentConfigurationError(
+        "session_db_url and landscape_url must use the exact base SQLAlchemy dialect 'sqlite' or 'postgresql'"
+    )
+
+
+def resolve_deployment_state_mode(settings: WebSettings) -> Literal["sqlite-single", "external-postgresql"]:
+    """Resolve and validate the deployment's database state mode."""
+    requested_mode = settings.deployment_state_mode
+
+    if settings.deployment_target in EXTERNAL_POSTGRESQL_TARGETS and requested_mode == "sqlite-single":
+        raise DeploymentConfigurationError(
+            "deployment_target requires deployment_state_mode='external-postgresql'; sqlite-single is not supported"
+        )
+
+    if settings.deployment_target in EXTERNAL_POSTGRESQL_TARGETS and requested_mode == "auto":
+        explicit_urls = {"session_db_url", "landscape_url"}.issubset(settings.model_fields_set)
+        if not explicit_urls or settings.session_db_url is None or settings.landscape_url is None:
+            raise DeploymentConfigurationError(
+                "deployment_state_mode='auto' for this deployment_target requires explicit non-null session_db_url and landscape_url"
+            )
+        session_db_url = settings.session_db_url
+        landscape_url = settings.landscape_url
+    else:
+        session_db_url = settings.get_session_db_url()
+        landscape_url = settings.get_landscape_url()
+
+    session_dialect = _database_dialect("session_db_url", session_db_url)
+    landscape_dialect = _database_dialect("landscape_url", landscape_url)
+
+    if requested_mode == "auto":
+        if settings.deployment_target in EXTERNAL_POSTGRESQL_TARGETS:
+            if session_dialect == landscape_dialect == "postgresql":
+                return "external-postgresql"
+            raise DeploymentConfigurationError(
+                "deployment_target with deployment_state_mode='auto' requires session_db_url and landscape_url to use PostgreSQL"
+            )
+        if session_dialect == landscape_dialect == "sqlite":
+            return "sqlite-single"
+        if session_dialect == landscape_dialect == "postgresql":
+            return "external-postgresql"
+        raise DeploymentConfigurationError(
+            "deployment_state_mode='auto' requires session_db_url and landscape_url to use the same supported base SQLAlchemy dialect"
+        )
+
+    expected_dialect = "sqlite" if requested_mode == "sqlite-single" else "postgresql"
+    if session_dialect == landscape_dialect == expected_dialect:
+        return requested_mode
+    raise DeploymentConfigurationError("deployment_state_mode does not match session_db_url and landscape_url base SQLAlchemy dialects")
 
 
 def _check_postgres_url(name: str, env_var: str, url: str | None) -> ContractCheck:

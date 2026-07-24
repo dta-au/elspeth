@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from elspeth.web import config as web_config
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import validate_aws_ecs_settings
 
@@ -314,8 +315,8 @@ class TestWebSettingsValidation:
             )
 
 
-class TestDeploymentTarget:
-    def test_defaults_to_default(self) -> None:
+class TestDeploymentSettings:
+    def test_defaults_to_default_target_and_auto_state_mode(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
             composer_max_discovery_turns=10,
@@ -325,12 +326,22 @@ class TestDeploymentTarget:
         )
 
         assert settings.deployment_target == "default"
+        assert settings.deployment_state_mode == "auto"
 
-    def test_accepts_aws_ecs(self) -> None:
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "default",
+            "docker-compose",
+            "linux-systemd",
+            "aws-ecs",
+            "azure-container-apps",
+            "kubernetes",
+        ],
+    )
+    def test_accepts_supported_deployment_targets(self, target: str) -> None:
         settings = WebSettings(
-            deployment_target="aws-ecs",
-            operator_telemetry="aws-otlp",
-            operator_telemetry_environment="production",
+            deployment_target=target,
             composer_max_composition_turns=15,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
@@ -338,7 +349,31 @@ class TestDeploymentTarget:
             shareable_link_signing_key=b"\x00" * 32,
         )
 
-        assert settings.deployment_target == "aws-ecs"
+        assert settings.deployment_target == target
+
+    @pytest.mark.parametrize("state_mode", ["auto", "sqlite-single", "external-postgresql"])
+    def test_accepts_supported_deployment_state_modes(self, state_mode: str) -> None:
+        settings = WebSettings(
+            deployment_state_mode=state_mode,
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+
+        assert settings.deployment_state_mode == state_mode
+
+    def test_deployment_literal_aliases_are_exact(self) -> None:
+        assert typing.get_args(web_config.DeploymentTarget) == (
+            "default",
+            "docker-compose",
+            "linux-systemd",
+            "aws-ecs",
+            "azure-container-apps",
+            "kubernetes",
+        )
+        assert typing.get_args(web_config.DeploymentStateMode) == ("auto", "sqlite-single", "external-postgresql")
 
 
 class TestOperatorTelemetrySettings:
@@ -586,7 +621,10 @@ class TestOperatorTelemetrySettings:
         assert "secret-remote-value" not in str(caught.value)
 
     def test_rejects_unknown_value(self) -> None:
-        with pytest.raises(ValidationError, match="'default' or 'aws-ecs'"):
+        with pytest.raises(
+            ValidationError,
+            match=("'default', 'docker-compose', 'linux-systemd', 'aws-ecs', 'azure-container-apps' or 'kubernetes'"),
+        ):
             WebSettings(
                 deployment_target="azure-aca",
                 composer_max_composition_turns=15,

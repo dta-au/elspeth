@@ -48,6 +48,16 @@ _DEFAULT_COMPOSER_TRANSPORT_HEADROOM_SECONDS = 30.0
 # §"Retention default divergence guard".
 _DEFAULT_PAYLOAD_STORE_RETENTION_DAYS: int = PayloadStoreSettings.model_fields["retention_days"].default
 
+DeploymentTarget = Literal[
+    "default",
+    "docker-compose",
+    "linux-systemd",
+    "aws-ecs",
+    "azure-container-apps",
+    "kubernetes",
+]
+DeploymentStateMode = Literal["auto", "sqlite-single", "external-postgresql"]
+
 
 def _allow_insecure_test_keys(host: str) -> bool:
     return host in _LOCAL_HOSTS and ("pytest" in sys.modules or os.environ.get("ELSPETH_ENV") == "test")
@@ -109,9 +119,10 @@ class WebSettings(BaseModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8451, ge=1, le=65535)
     auth_provider: AuthProviderType = "local"
-    # ``default`` preserves current behavior; ``aws-ecs`` is strictly validated by
-    # web/deployment_contract.py::validate_aws_ecs_settings.
-    deployment_target: Literal["default", "aws-ecs"] = "default"
+    # ``default`` preserves current behavior; deployment-specific state rules
+    # are resolved by web/deployment_contract.py.
+    deployment_target: DeploymentTarget = "default"
+    deployment_state_mode: DeploymentStateMode = "auto"
     # Operator telemetry is deployment policy, not pipeline-authored routing.
     # The AWS destination and headers are intentionally absent from this model:
     # web/operator_telemetry.py fixes them to the task-local collector and the

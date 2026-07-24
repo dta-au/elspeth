@@ -7,8 +7,14 @@ from typing import Any
 
 import pytest
 
+from elspeth.web import deployment_contract
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ContractCheck, validate_aws_ecs_settings
+
+_SQLITE_SESSION_URL = "sqlite+pysqlite:///session.db"
+_SQLITE_LANDSCAPE_URL = "sqlite:///landscape.db"
+_POSTGRESQL_SESSION_URL = "postgresql://session_user:session_password@db/session"  # secret-scan: allow-this-line
+_POSTGRESQL_LANDSCAPE_URL = "postgresql+future_driver://landscape_user:landscape_password@db/landscape"
 
 
 def _base_kwargs() -> dict[str, Any]:
@@ -25,6 +31,258 @@ def _base_kwargs() -> dict[str, Any]:
 def _checks(**overrides: Any) -> dict[str, ContractCheck]:
     settings = WebSettings(**(_base_kwargs() | overrides))
     return {check.name: check for check in validate_aws_ecs_settings(settings)}
+
+
+def _settings(**overrides: Any) -> WebSettings:
+    return WebSettings(**(_base_kwargs() | overrides))
+
+
+def test_external_postgresql_targets_are_the_cloud_and_orchestrated_targets() -> None:
+    assert frozenset({"aws-ecs", "azure-container-apps", "kubernetes"}) == deployment_contract.EXTERNAL_POSTGRESQL_TARGETS
+
+
+@pytest.mark.parametrize(
+    ("target", "overrides", "expected"),
+    [
+        pytest.param("default", {}, "sqlite-single", id="default-neither-url"),
+        pytest.param("default", {"session_db_url": _SQLITE_SESSION_URL}, "sqlite-single", id="default-session-sqlite"),
+        pytest.param("default", {"landscape_url": _SQLITE_LANDSCAPE_URL}, "sqlite-single", id="default-landscape-sqlite"),
+        pytest.param(
+            "default",
+            {"session_db_url": _SQLITE_SESSION_URL, "landscape_url": _SQLITE_LANDSCAPE_URL},
+            "sqlite-single",
+            id="default-both-sqlite",
+        ),
+        pytest.param("docker-compose", {}, "sqlite-single", id="docker-compose-neither-url"),
+        pytest.param("linux-systemd", {}, "sqlite-single", id="linux-systemd-neither-url"),
+        pytest.param(
+            "default",
+            {"session_db_url": _POSTGRESQL_SESSION_URL, "landscape_url": _POSTGRESQL_LANDSCAPE_URL},
+            "external-postgresql",
+            id="default-both-postgresql",
+        ),
+        pytest.param(
+            "aws-ecs",
+            {"session_db_url": _POSTGRESQL_SESSION_URL, "landscape_url": _POSTGRESQL_LANDSCAPE_URL},
+            "external-postgresql",
+            id="aws-ecs-both-postgresql",
+        ),
+        pytest.param(
+            "azure-container-apps",
+            {"session_db_url": _POSTGRESQL_SESSION_URL, "landscape_url": _POSTGRESQL_LANDSCAPE_URL},
+            "external-postgresql",
+            id="azure-container-apps-both-postgresql",
+        ),
+        pytest.param(
+            "kubernetes",
+            {"session_db_url": _POSTGRESQL_SESSION_URL, "landscape_url": _POSTGRESQL_LANDSCAPE_URL},
+            "external-postgresql",
+            id="kubernetes-both-postgresql",
+        ),
+    ],
+)
+def test_auto_mode_resolves_from_target_and_database_dialects(
+    target: str,
+    overrides: dict[str, str],
+    expected: str,
+) -> None:
+    settings = _settings(deployment_target=target, **overrides)
+
+    assert deployment_contract.resolve_deployment_state_mode(settings) == expected
+
+
+@pytest.mark.parametrize(
+    ("target", "state_mode", "urls"),
+    [
+        pytest.param(
+            "default",
+            "sqlite-single",
+            {"session_db_url": _SQLITE_SESSION_URL, "landscape_url": _SQLITE_LANDSCAPE_URL},
+            id="default-sqlite-single",
+        ),
+        pytest.param("docker-compose", "sqlite-single", {}, id="docker-compose-sqlite-single"),
+        pytest.param("linux-systemd", "sqlite-single", {}, id="linux-systemd-sqlite-single"),
+        *[
+            pytest.param(
+                target,
+                "external-postgresql",
+                {"session_db_url": _POSTGRESQL_SESSION_URL, "landscape_url": _POSTGRESQL_LANDSCAPE_URL},
+                id=f"{target}-external-postgresql",
+            )
+            for target in (
+                "default",
+                "docker-compose",
+                "linux-systemd",
+                "aws-ecs",
+                "azure-container-apps",
+                "kubernetes",
+            )
+        ],
+    ],
+)
+def test_explicit_mode_with_matching_urls_resolves_to_that_mode(
+    target: str,
+    state_mode: str,
+    urls: dict[str, str],
+) -> None:
+    settings = _settings(deployment_target=target, deployment_state_mode=state_mode, **urls)
+
+    assert deployment_contract.resolve_deployment_state_mode(settings) == state_mode
+
+
+@pytest.mark.parametrize("target", ["aws-ecs", "azure-container-apps", "kubernetes"])
+def test_external_targets_reject_sqlite_single_mode(target: str) -> None:
+    settings = _settings(
+        deployment_target=target,
+        deployment_state_mode="sqlite-single",
+        session_db_url=_SQLITE_SESSION_URL,
+        landscape_url=_SQLITE_LANDSCAPE_URL,
+    )
+
+    with pytest.raises(deployment_contract.DeploymentConfigurationError) as caught:
+        deployment_contract.resolve_deployment_state_mode(settings)
+
+    detail = str(caught.value)
+    assert "deployment_target" in detail
+    assert "deployment_state_mode" in detail
+    assert _SQLITE_SESSION_URL not in detail
+    assert _SQLITE_LANDSCAPE_URL not in detail
+
+
+@pytest.mark.parametrize("target", ["aws-ecs", "azure-container-apps", "kubernetes"])
+def test_external_target_auto_rejects_explicit_sqlite_urls(target: str) -> None:
+    settings = _settings(
+        deployment_target=target,
+        session_db_url=_SQLITE_SESSION_URL,
+        landscape_url=_SQLITE_LANDSCAPE_URL,
+    )
+
+    with pytest.raises(deployment_contract.DeploymentConfigurationError) as caught:
+        deployment_contract.resolve_deployment_state_mode(settings)
+
+    detail = str(caught.value)
+    assert "deployment_target" in detail
+    assert "deployment_state_mode" in detail
+    assert "session_db_url" in detail
+    assert "landscape_url" in detail
+    assert _SQLITE_SESSION_URL not in detail
+    assert _SQLITE_LANDSCAPE_URL not in detail
+
+
+@pytest.mark.parametrize("target", ["aws-ecs", "azure-container-apps", "kubernetes"])
+@pytest.mark.parametrize(
+    "urls",
+    [
+        pytest.param({}, id="neither"),
+        pytest.param({"session_db_url": _POSTGRESQL_SESSION_URL}, id="session-only"),
+        pytest.param({"landscape_url": _POSTGRESQL_LANDSCAPE_URL}, id="landscape-only"),
+        pytest.param(
+            {"session_db_url": None, "landscape_url": _POSTGRESQL_LANDSCAPE_URL},
+            id="session-explicit-none",
+        ),
+    ],
+)
+def test_external_target_auto_requires_two_raw_explicit_urls(target: str, urls: dict[str, str | None]) -> None:
+    settings = _settings(deployment_target=target, **urls)
+
+    with pytest.raises(deployment_contract.DeploymentConfigurationError) as caught:
+        deployment_contract.resolve_deployment_state_mode(settings)
+
+    detail = str(caught.value)
+    assert "session_db_url" in detail
+    assert "landscape_url" in detail
+    assert _POSTGRESQL_SESSION_URL not in detail
+    assert _POSTGRESQL_LANDSCAPE_URL not in detail
+
+
+@pytest.mark.parametrize(
+    "url_field",
+    [
+        pytest.param("session_db_url", id="session-explicit"),
+        pytest.param("landscape_url", id="landscape-explicit"),
+    ],
+)
+def test_local_auto_rejects_one_explicit_postgresql_url(url_field: str) -> None:
+    settings = _settings(**{url_field: _POSTGRESQL_SESSION_URL})
+
+    with pytest.raises(deployment_contract.DeploymentConfigurationError) as caught:
+        deployment_contract.resolve_deployment_state_mode(settings)
+
+    detail = str(caught.value)
+    assert "session_db_url" in detail
+    assert "landscape_url" in detail
+    assert _POSTGRESQL_SESSION_URL not in detail
+    assert "session_password" not in detail
+
+
+@pytest.mark.parametrize(
+    ("session_url", "landscape_url"),
+    [
+        pytest.param(_SQLITE_SESSION_URL, _POSTGRESQL_LANDSCAPE_URL, id="sqlite-postgresql"),
+        pytest.param(_POSTGRESQL_SESSION_URL, _SQLITE_LANDSCAPE_URL, id="postgresql-sqlite"),
+    ],
+)
+def test_auto_rejects_mixed_sqlite_and_postgresql_urls(session_url: str, landscape_url: str) -> None:
+    settings = _settings(session_db_url=session_url, landscape_url=landscape_url)
+
+    with pytest.raises(deployment_contract.DeploymentConfigurationError) as caught:
+        deployment_contract.resolve_deployment_state_mode(settings)
+
+    detail = str(caught.value)
+    assert "session_db_url" in detail
+    assert "landscape_url" in detail
+    assert session_url not in detail
+    assert landscape_url not in detail
+    assert "session_password" not in detail
+    assert "landscape_password" not in detail
+
+
+@pytest.mark.parametrize("url_field", ["session_db_url", "landscape_url"])
+def test_sqlite_single_rejects_either_postgresql_url(url_field: str) -> None:
+    settings = _settings(deployment_state_mode="sqlite-single", **{url_field: _POSTGRESQL_SESSION_URL})
+
+    with pytest.raises(deployment_contract.DeploymentConfigurationError) as caught:
+        deployment_contract.resolve_deployment_state_mode(settings)
+
+    detail = str(caught.value)
+    assert "session_db_url" in detail
+    assert "landscape_url" in detail
+    assert _POSTGRESQL_SESSION_URL not in detail
+    assert "session_password" not in detail
+
+
+@pytest.mark.parametrize("unsupported_base", ["mysql+pymysql", "postgres"])
+def test_auto_rejects_two_urls_with_unsupported_dialect(unsupported_base: str) -> None:
+    session_url = f"{unsupported_base}://session_user:session_password@db/session"
+    landscape_url = f"{unsupported_base}://landscape_user:landscape_password@db/landscape"
+    settings = _settings(session_db_url=session_url, landscape_url=landscape_url)
+
+    with pytest.raises(deployment_contract.DeploymentConfigurationError) as caught:
+        deployment_contract.resolve_deployment_state_mode(settings)
+
+    detail = str(caught.value)
+    assert "session_db_url" in detail
+    assert "landscape_url" in detail
+    assert session_url not in detail
+    assert landscape_url not in detail
+    assert "session_password" not in detail
+    assert "landscape_password" not in detail
+
+
+def test_url_parse_failure_is_caught_and_redacted() -> None:
+    raw_url = "not a url containing secret_password"
+    settings = _settings(
+        session_db_url=_POSTGRESQL_SESSION_URL,
+        landscape_url=_POSTGRESQL_LANDSCAPE_URL,
+    ).model_copy(update={"session_db_url": raw_url})
+
+    with pytest.raises(deployment_contract.DeploymentConfigurationError) as caught:
+        deployment_contract.resolve_deployment_state_mode(settings)
+
+    detail = str(caught.value)
+    assert "session_db_url" in detail
+    assert raw_url not in detail
+    assert "secret_password" not in detail
 
 
 def test_default_deployment_target_fails() -> None:
