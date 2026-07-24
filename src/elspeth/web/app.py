@@ -152,6 +152,24 @@ def _dispose_session_engine(engine: Engine) -> None:
     engine.dispose()
 
 
+def _run_session_engine_finalizer(
+    finalizer: Callable[[], object],
+    *,
+    primary_error: BaseException | None = None,
+) -> None:
+    """Run one-shot engine cleanup without replacing a primary failure."""
+    try:
+        finalizer()
+    except BaseException as finalization_exc:
+        if primary_error is None:
+            raise
+        structlog.get_logger().error(
+            "session_engine_finalization_failed",
+            primary_exc_class=type(primary_error).__name__,
+            finalization_exc_class=type(finalization_exc).__name__,
+        )
+
+
 def _close_readiness_runner(runner: ReadinessProbeRunner) -> None:
     """Close readiness workers for app instances that never run lifespan."""
     runner.close()
@@ -361,16 +379,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         primary_error = exc
         raise
     finally:
-        try:
-            app.state._session_engine_finalizer()
-        except BaseException as finalization_exc:
-            if primary_error is None:
-                raise
-            structlog.get_logger().error(
-                "session_engine_finalization_failed",
-                primary_exc_class=type(primary_error).__name__,
-                finalization_exc_class=type(finalization_exc).__name__,
-            )
+        _run_session_engine_finalizer(app.state._session_engine_finalizer, primary_error=primary_error)
 
 
 @asynccontextmanager
@@ -816,9 +825,9 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 
     try:
         return _create_app(settings, register_session_engine_finalizer)
-    except BaseException:
+    except BaseException as exc:
         if session_engine_finalizer is not None:
-            session_engine_finalizer()
+            _run_session_engine_finalizer(session_engine_finalizer, primary_error=exc)
         raise
 
 
@@ -1039,8 +1048,8 @@ def _create_app(
                 validate_only_schema_or_raise(settings, external_session_engine)
             else:
                 validate_external_schema_or_raise(settings, external_session_engine)
-        except BaseException:
-            session_engine_finalizer()
+        except BaseException as exc:
+            _run_session_engine_finalizer(session_engine_finalizer, primary_error=exc)
             raise
     else:
         # Ensure data directory and subdirectories exist before any DB access.

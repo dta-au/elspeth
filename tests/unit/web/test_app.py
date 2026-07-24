@@ -2833,6 +2833,48 @@ class TestDeploymentStateModeStartup:
 
         assert dispose_calls == 1
 
+    def test_external_schema_failure_survives_dispose_failure_with_redacted_log(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        settings = _external_settings(tmp_path, "linux-systemd")
+        engine = create_engine("sqlite:///:memory:")
+        primary = ExternalStateSchemaNotReadyError("primary schema validation failure")
+        cleanup_sentinel = "dispose-cleanup-sensitive-detail"
+        cleanup_detail = f"{cleanup_sentinel}: {settings.session_db_url}"
+        dispose_calls = 0
+
+        def dispose(*_args: object, **_kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            raise RuntimeError(cleanup_detail)
+
+        def reject(*_args: object, **_kwargs: object) -> None:
+            raise primary
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", reject)
+
+        with capture_logs() as logs, pytest.raises(ExternalStateSchemaNotReadyError) as exc_info:
+            create_app(settings)
+
+        assert exc_info.value is primary
+        assert type(exc_info.value) is ExternalStateSchemaNotReadyError
+        assert str(exc_info.value) == "primary schema validation failure"
+        assert dispose_calls == 1
+        assert logs == [
+            {
+                "event": "session_engine_finalization_failed",
+                "log_level": "error",
+                "primary_exc_class": "ExternalStateSchemaNotReadyError",
+                "finalization_exc_class": "RuntimeError",
+            }
+        ]
+        assert cleanup_sentinel not in repr(logs)
+        assert settings.session_db_url not in repr(logs)
+
     @pytest.mark.parametrize("failure", [RuntimeError("late failure"), KeyboardInterrupt()])
     def test_later_create_app_base_exception_invokes_same_one_shot_finalizer(
         self,
@@ -2862,6 +2904,49 @@ class TestDeploymentStateModeStartup:
             create_app(settings)
 
         assert dispose_calls == 1
+
+    def test_later_create_app_base_exception_survives_dispose_failure_with_redacted_log(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        settings = _external_settings(tmp_path, "linux-systemd")
+        engine = create_engine("sqlite:///:memory:")
+        primary = KeyboardInterrupt("primary synchronous startup failure")
+        cleanup_sentinel = "dispose-cleanup-sensitive-detail"
+        cleanup_detail = f"{cleanup_sentinel}: {settings.session_db_url}"
+        dispose_calls = 0
+
+        def dispose(*_args: object, **_kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            raise RuntimeError(cleanup_detail)
+
+        def fail_catalog() -> object:
+            raise primary
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(app_module, "create_catalog_service", fail_catalog)
+
+        with capture_logs() as logs, pytest.raises(KeyboardInterrupt) as exc_info:
+            create_app(settings)
+
+        assert exc_info.value is primary
+        assert type(exc_info.value) is KeyboardInterrupt
+        assert str(exc_info.value) == "primary synchronous startup failure"
+        assert dispose_calls == 1
+        assert logs == [
+            {
+                "event": "session_engine_finalization_failed",
+                "log_level": "error",
+                "primary_exc_class": "KeyboardInterrupt",
+                "finalization_exc_class": "RuntimeError",
+            }
+        ]
+        assert cleanup_sentinel not in repr(logs)
+        assert settings.session_db_url not in repr(logs)
 
     @pytest.mark.asyncio
     async def test_successful_external_lifespan_finalizes_engine_exactly_once(
