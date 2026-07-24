@@ -210,6 +210,27 @@ def test_native_linux_trust_gate_runs_after_checkout_with_dev_dependency_then_sy
     assert "elspeth-lints" in pyproject["project"]["optional-dependencies"]["dev"]
 
 
+def test_native_linux_rebuilds_frontend_after_upgrade_and_rollback_checkouts() -> None:
+    text = _read(UBUNTU_RUNBOOK)
+
+    for section_start, section_end, ref_name in (
+        ("## Stop-before-start upgrade", "### Upgrade validation: external PostgreSQL", "ELSPETH_RELEASE_REF"),
+        ("## Rollback", "### Rollback validation: external PostgreSQL", "ELSPETH_ROLLBACK_REF"),
+    ):
+        section = " ".join(_section(text, section_start, section_end).replace("\\\n", "").split())
+        checkout = f'git -C /opt/elspeth checkout --detach "${ref_name}"'
+        node = "sudo -u elspeth node --version"
+        npm = "sudo -u elspeth npm --version"
+        npm_ci = "sudo -u elspeth npm --prefix src/elspeth/web/frontend ci"
+        frontend_build = "sudo -u elspeth npm --prefix src/elspeth/web/frontend run build"
+
+        assert section.count(checkout) == 1
+        assert section.index(checkout) < section.index(node)
+        assert section.index(node) < section.index(npm)
+        assert section.index(npm) < section.index(npm_ci)
+        assert section.index(npm_ci) < section.index(frontend_build)
+
+
 def test_aws_retains_the_zero_overlap_ecs_controls() -> None:
     text = _read(AWS_RUNBOOK)
 

@@ -206,9 +206,29 @@ replacement until the old process is gone.
 3. **Back up state.** Snapshot the two external databases or the stopped SQLite
    files, then back up `/var/lib/elspeth/data` and
    `/var/lib/elspeth/payloads`. Record one recovery-point identifier for both.
-4. **Install the reviewed release.** Check out the immutable tag or commit,
-   run the frozen `uv sync` command above, reinstall the tracked service unit,
-   and run `systemctl daemon-reload`.
+4. **Install the reviewed release.** Set the approved immutable ref, then
+   check it out and rebuild both the Python environment and ignored frontend
+   output:
+
+   ```bash
+   export ELSPETH_RELEASE_REF=v0.7.2
+   sudo -u elspeth git -C /opt/elspeth fetch --tags --force
+   sudo -u elspeth git -C /opt/elspeth checkout --detach "$ELSPETH_RELEASE_REF"
+   cd /opt/elspeth
+   sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra postgres
+   sudo -u elspeth node --version  # must report v24.x
+   sudo -u elspeth npm --version   # must report 11.x
+   sudo -u elspeth npm --prefix src/elspeth/web/frontend ci
+   sudo -u elspeth npm --prefix src/elspeth/web/frontend run build
+   sudo install -D -o root -g root -m 0644 \
+     deploy/linux-systemd/elspeth-web.service \
+     /etc/systemd/system/elspeth-web.service
+   sudo systemctl daemon-reload
+   ```
+
+   Stop if any command fails. Git does not replace the ignored
+   `src/elspeth/web/frontend/dist` tree, so every release checkout must rebuild
+   it before the service starts.
 
 Choose exactly one validation branch from the configured state mode.
 
@@ -265,7 +285,27 @@ Rollback is also stop-before-start:
 3. Check whether the previous release supports the current database schema.
    If it does not, keep the service drained and repair forward.
 4. Restore the coordinated database and payload recovery point when required.
-5. Check out the previous immutable release and run the frozen install.
+5. Check out and build the previous immutable release. Replace the example ref
+   with the approved previous tag or commit:
+
+   ```bash
+   export ELSPETH_ROLLBACK_REF=v0.7.1
+   sudo -u elspeth git -C /opt/elspeth fetch --tags --force
+   sudo -u elspeth git -C /opt/elspeth checkout --detach "$ELSPETH_ROLLBACK_REF"
+   cd /opt/elspeth
+   sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra postgres
+   sudo -u elspeth node --version  # must report v24.x
+   sudo -u elspeth npm --version   # must report 11.x
+   sudo -u elspeth npm --prefix src/elspeth/web/frontend ci
+   sudo -u elspeth npm --prefix src/elspeth/web/frontend run build
+   sudo install -D -o root -g root -m 0644 \
+     deploy/linux-systemd/elspeth-web.service \
+     /etc/systemd/system/elspeth-web.service
+   sudo systemctl daemon-reload
+   ```
+
+   Stop if the previous release's frozen Python environment or frontend build
+   fails.
 
 Choose the branch matching the restored state mode.
 
