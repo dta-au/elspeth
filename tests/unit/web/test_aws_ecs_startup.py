@@ -108,12 +108,15 @@ class _AttemptEngine:
 
 
 class _DisposableEngine:
-    def __init__(self, name: str = "engine") -> None:
+    def __init__(self, name: str = "engine", *, dispose_error: BaseException | None = None) -> None:
         self.name = name
+        self.dispose_error = dispose_error
         self.dispose_calls = 0
 
     def dispose(self) -> None:
         self.dispose_calls += 1
+        if self.dispose_error is not None:
+            raise self.dispose_error
 
 
 def _operational_error() -> OperationalError:
@@ -509,8 +512,8 @@ def test_validate_only_probes_session_then_landscape_on_connections(tmp_path: Pa
         assert engine is (session_engine if label == "session_schema" else landscape_engine)
         return SchemaState.CURRENT
 
-    monkeypatch.setattr(external_startup, "create_engine", make_engine)
-    monkeypatch.setattr(external_startup, "_probe_with_connection_budget", probe)
+    monkeypatch.setattr(startup, "create_engine", make_engine)
+    monkeypatch.setattr(startup, "_probe_with_connection_budget", probe)
 
     startup.validate_only_schema_or_raise(settings, session_engine)  # type: ignore[arg-type]
 
@@ -528,9 +531,9 @@ def test_validate_only_probes_session_then_landscape_on_connections(tmp_path: Pa
 @pytest.mark.parametrize("state", [SchemaState.MISSING, SchemaState.PARTIAL, SchemaState.STALE])
 def test_session_noncurrent_stops_before_landscape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: SchemaState) -> None:
     settings = _settings(tmp_path)
-    monkeypatch.setattr(external_startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: state)
     monkeypatch.setattr(
-        external_startup,
+        startup,
         "create_engine",
         lambda *_args, **_kwargs: pytest.fail("Landscape engine must not be built"),
     )
@@ -544,8 +547,8 @@ def test_landscape_noncurrent_fails_and_disposes(tmp_path: Path, monkeypatch: py
     settings = _settings(tmp_path)
     landscape_engine = _DisposableEngine("landscape")
     states = iter([SchemaState.CURRENT, state])
-    monkeypatch.setattr(external_startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: next(states))
-    monkeypatch.setattr(external_startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+    monkeypatch.setattr(startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: next(states))
+    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
 
     with pytest.raises(startup.AwsEcsSchemaNotReadyError, match="landscape_schema"):
         startup.validate_only_schema_or_raise(settings, _DisposableEngine("session"))  # type: ignore[arg-type]
@@ -570,8 +573,8 @@ def test_landscape_engine_disposed_for_probe_failures(
             return SchemaState.CURRENT
         raise error
 
-    monkeypatch.setattr(external_startup, "_probe_with_connection_budget", probe)
-    monkeypatch.setattr(external_startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+    monkeypatch.setattr(startup, "_probe_with_connection_budget", probe)
+    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
 
     with pytest.raises(type(error)):
         startup.validate_only_schema_or_raise(settings, _DisposableEngine("session"))  # type: ignore[arg-type]
@@ -610,7 +613,11 @@ def test_aws_validate_only_wrapper_translates_generic_schema_error(
     error = external_startup.ExternalStateSchemaNotReadyError(
         "External-state session_schema is not ready and startup repair is disabled. Run 'elspeth doctor deployment' for full diagnostics."
     )
-    monkeypatch.setattr(external_startup, "validate_only_schema_or_raise", lambda *_args: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(
+        external_startup,
+        "validate_only_schema_or_raise",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
 
     with pytest.raises(startup.AwsEcsSchemaNotReadyError) as exc_info:
         startup.validate_only_schema_or_raise(_settings(tmp_path), _DisposableEngine("session"))  # type: ignore[arg-type]
@@ -619,3 +626,86 @@ def test_aws_validate_only_wrapper_translates_generic_schema_error(
     assert "AWS ECS session_schema" in str(exc_info.value)
     assert "doctor aws-ecs" in str(exc_info.value)
     assert "doctor deployment" not in str(exc_info.value)
+
+
+def test_aws_standalone_dispose_failure_is_translated_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    landscape_engine = _DisposableEngine("landscape", dispose_error=RuntimeError(_SENTINEL))
+    monkeypatch.setattr(startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: SchemaState.CURRENT)
+    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+
+    with capture_logs() as logs, pytest.raises(startup.AwsEcsSchemaNotReadyError) as exc_info:
+        startup.validate_only_schema_or_raise(settings, _DisposableEngine("session"))  # type: ignore[arg-type]
+
+    assert "landscape_schema" in str(exc_info.value)
+    assert "doctor aws-ecs" in str(exc_info.value)
+    assert "doctor deployment" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    _assert_redacted(exc_info.value)
+    _assert_redacted(logs)
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [KeyboardInterrupt(), SystemExit(3), startup.AwsEcsSchemaNotReadyError("static primary")],
+)
+def test_aws_dispose_failure_preserves_primary_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary: BaseException,
+) -> None:
+    settings = _settings(tmp_path)
+    landscape_engine = _DisposableEngine("landscape", dispose_error=RuntimeError(_SENTINEL))
+    states: list[SchemaState | BaseException] = [SchemaState.CURRENT, primary]
+
+    def probe(*_args: object, **_kwargs: object) -> SchemaState:
+        outcome = states.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(startup, "_probe_with_connection_budget", probe)
+    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+
+    with capture_logs() as logs, pytest.raises(type(primary)) as exc_info:
+        startup.validate_only_schema_or_raise(settings, _DisposableEngine("session"))  # type: ignore[arg-type]
+
+    assert exc_info.value is primary
+    _assert_redacted(logs)
+
+
+def test_aws_validate_only_routes_through_aws_probe_compatibility_seam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    session_engine = _DisposableEngine("session")
+    landscape_engine = _DisposableEngine("landscape")
+    aws_calls: list[tuple[object, object, str]] = []
+    generic_calls: list[str] = []
+
+    def aws_probe(engine: object, callback: object, *, label: str, **_kwargs: object) -> SchemaState:
+        aws_calls.append((engine, callback, label))
+        return SchemaState.CURRENT
+
+    def generic_probe(_engine: object, _callback: object, *, label: str, **_kwargs: object) -> SchemaState:
+        generic_calls.append(label)
+        return SchemaState.CURRENT
+
+    monkeypatch.setattr(startup, "_probe_with_connection_budget", aws_probe)
+    monkeypatch.setattr(external_startup, "_probe_with_connection_budget", generic_probe)
+    monkeypatch.setattr(external_startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+
+    startup.validate_only_schema_or_raise(settings, session_engine)  # type: ignore[arg-type]
+
+    assert aws_calls == [
+        (session_engine, external_startup.probe_session_schema, "session_schema"),
+        (landscape_engine, external_startup.probe_landscape_schema, "landscape_schema"),
+    ]
+    assert generic_calls == []
+    assert landscape_engine.dispose_calls == 1
+    assert session_engine.dispose_calls == 0

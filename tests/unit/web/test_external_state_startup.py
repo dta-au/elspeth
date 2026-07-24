@@ -106,12 +106,15 @@ class _AttemptEngine:
 
 
 class _DisposableEngine:
-    def __init__(self, name: str = "engine") -> None:
+    def __init__(self, name: str = "engine", *, dispose_error: BaseException | None = None) -> None:
         self.name = name
+        self.dispose_error = dispose_error
         self.dispose_calls = 0
 
     def dispose(self) -> None:
         self.dispose_calls += 1
+        if self.dispose_error is not None:
+            raise self.dispose_error
 
 
 def _operational_error() -> OperationalError:
@@ -425,6 +428,79 @@ def test_constructed_landscape_engine_is_disposed_under_base_exception(
 
     assert landscape_engine.dispose_calls == 1
     assert session_engine.dispose_calls == 0
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [KeyboardInterrupt(), SystemExit(2), startup.ExternalStateSchemaNotReadyError("static primary")],
+)
+def test_dispose_failure_preserves_primary_base_exception_and_logs_bounded_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary: BaseException,
+) -> None:
+    settings = _settings(tmp_path)
+    session_engine = _DisposableEngine("session")
+    cleanup_error = RuntimeError(_SENTINEL)
+    landscape_engine = _DisposableEngine("landscape", dispose_error=cleanup_error)
+    calls = 0
+
+    def probe(*_args: object, **_kwargs: object) -> SchemaState:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return SchemaState.CURRENT
+        raise primary
+
+    monkeypatch.setattr(startup, "_probe_with_connection_budget", probe)
+    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+
+    with capture_logs() as logs, pytest.raises(type(primary)) as exc_info:
+        startup.validate_only_schema_or_raise(settings, session_engine)  # type: ignore[arg-type]
+
+    assert exc_info.value is primary
+    assert landscape_engine.dispose_calls == 1
+    assert session_engine.dispose_calls == 0
+    _assert_redacted(logs)
+    assert logs == [
+        {
+            "event": "external_state_engine_disposal_failed",
+            "log_level": "error",
+            "label": "landscape_schema",
+            "original_exc_class": type(primary).__name__,
+            "cleanup_exc_class": "RuntimeError",
+        }
+    ]
+
+
+def test_standalone_dispose_failure_is_translated_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    session_engine = _DisposableEngine("session")
+    landscape_engine = _DisposableEngine("landscape", dispose_error=RuntimeError(_SENTINEL))
+    monkeypatch.setattr(startup, "_probe_with_connection_budget", lambda *_args, **_kwargs: SchemaState.CURRENT)
+    monkeypatch.setattr(startup, "create_engine", lambda *_args, **_kwargs: landscape_engine)
+
+    with capture_logs() as logs, pytest.raises(startup.ExternalStateSchemaNotReadyError) as exc_info:
+        startup.validate_only_schema_or_raise(settings, session_engine)  # type: ignore[arg-type]
+
+    assert "landscape_schema" in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert landscape_engine.dispose_calls == 1
+    assert session_engine.dispose_calls == 0
+    _assert_redacted(exc_info.value)
+    _assert_redacted(logs)
+    assert logs == [
+        {
+            "event": "external_state_engine_disposal_failed",
+            "log_level": "error",
+            "label": "landscape_schema",
+            "original_exc_class": None,
+            "cleanup_exc_class": "RuntimeError",
+        }
+    ]
 
 
 def test_validate_only_module_has_no_schema_creation_or_ddl_imports() -> None:

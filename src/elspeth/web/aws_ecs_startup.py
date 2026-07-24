@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
-from sqlalchemy import Connection, Engine
+from sqlalchemy import Connection, Engine, create_engine
 
 from elspeth.web import external_state_startup
 from elspeth.web.config import WebSettings
@@ -85,7 +85,14 @@ def _probe_with_connection_budget(
 def validate_only_schema_or_raise(settings: WebSettings, session_engine: Engine) -> None:
     """Validate AWS ECS database schemas through the shared implementation."""
     try:
-        external_state_startup.validate_only_schema_or_raise(settings, session_engine)
+        external_state_startup.validate_only_schema_or_raise(
+            settings,
+            session_engine,
+            _probe=_probe_with_connection_budget,
+            _engine_factory=create_engine,
+        )
+    except AwsEcsSchemaNotReadyError:
+        raise
     except external_state_startup.ExternalStateSchemaNotReadyError as exc:
         detail = _aws_detail(exc)
         label = "landscape_schema" if "landscape_schema" in detail else "session_schema"

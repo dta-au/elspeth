@@ -134,9 +134,32 @@ def _probe_with_connection_budget(
             raise _schema_error(label) from None
 
 
-def validate_only_schema_or_raise(settings: WebSettings, session_engine: Engine) -> None:
+def _dispose_owned_engine(engine: Engine, *, label: str, original: BaseException | None) -> None:
+    try:
+        engine.dispose()
+    except BaseException as cleanup_error:
+        _slog.error(
+            "external_state_engine_disposal_failed",
+            label=label,
+            original_exc_class=type(original).__name__ if original is not None else None,
+            cleanup_exc_class=type(cleanup_error).__name__,
+        )
+        if original is None:
+            raise _schema_error(label) from None
+
+
+def validate_only_schema_or_raise(
+    settings: WebSettings,
+    session_engine: Engine,
+    *,
+    _probe: Callable[..., SchemaState] | None = None,
+    _engine_factory: Callable[..., Engine] | None = None,
+) -> None:
     """Validate external database schemas without repair."""
-    session_state = _probe_with_connection_budget(
+    probe_with_budget = _probe or _probe_with_connection_budget
+    engine_factory = _engine_factory or create_engine
+
+    session_state = probe_with_budget(
         session_engine,
         probe_session_schema,
         label="session_schema",
@@ -147,7 +170,7 @@ def validate_only_schema_or_raise(settings: WebSettings, session_engine: Engine)
     raw_landscape_url = settings.landscape_url
     assert raw_landscape_url is not None
     try:
-        landscape_engine = create_engine(
+        landscape_engine = engine_factory(
             raw_landscape_url,
             connect_args={"connect_timeout": _CONNECT_TIMEOUT_SECONDS},
             **postgres_engine_kwargs(raw_landscape_url),
@@ -155,13 +178,17 @@ def validate_only_schema_or_raise(settings: WebSettings, session_engine: Engine)
     except SQLAlchemyError:
         raise _schema_error("landscape_schema") from None
 
+    primary_error: BaseException | None = None
     try:
-        landscape_state = _probe_with_connection_budget(
+        landscape_state = probe_with_budget(
             landscape_engine,
             probe_landscape_schema,
             label="landscape_schema",
         )
         if landscape_state is not SchemaState.CURRENT:
             raise _schema_error("landscape_schema")
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        landscape_engine.dispose()
+        _dispose_owned_engine(landscape_engine, label="landscape_schema", original=primary_error)
