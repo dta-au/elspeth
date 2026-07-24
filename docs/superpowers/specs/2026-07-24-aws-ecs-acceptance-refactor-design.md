@@ -71,7 +71,7 @@ Create `src/elspeth/web/_aws_ecs_acceptance/` with a side-effect-free `__init__.
 
 | Module | Responsibility |
 |---|---|
-| `contracts.py` | Shared errors, closed field sets, budgets, identity/hash/time helpers, AWS region validation, namespace helpers, and provider-neutral constants. |
+| `contracts.py` | Shared errors, closed field sets, budgets, identity/hash/time helpers, domain-neutral UTC parsing, sanitized resource identity, pure ECS task-family parsing, AWS region validation, namespace helpers, and provider-neutral constants. |
 | `secure_documents.py` | Protected reads/writes, parent/destination validation, exact file modes, atomic replacement, receipt-manifest lock creation, cross-process locking, and the serialized mutation decorator. |
 | `state.py` | `AcceptanceCredentials`, `AcceptanceState`, state serialization, and state-specific timestamp/error mapping. |
 | `http_client.py` | Bounded authenticated HTTP transport and response handling. |
@@ -163,7 +163,7 @@ Every manifest, approval, receipt-index, and cleanup mutation retains the serial
 
 ## Implementation shape
 
-Use one no-commit preflight and approximately ten independently revertible extraction commits. Do not create a generated release-metadata commit as part of this work.
+Use one no-commit preflight, approximately ten independently revertible extraction commits, and a mandatory post-extraction cleanup review. Do not create a generated release-metadata commit as part of this work.
 
 Move each domain's tests with its production owner instead of postponing the test split until the end. Each extraction commit must leave the facade usable and the branch green.
 
@@ -175,7 +175,8 @@ Recommended milestones:
 4. Extract manifest schemas, inventories, low-level mutations, and task-definition admission.
 5. Extract orphan cleanup, receipt storage, approvals, evidence, and the gate ledger.
 6. Extract cleanup/control orchestration and reduce the facade.
-7. Run final local acceptance, freeze source, and hand the frozen commit and evidence to the release owner.
+7. Have fresh read-only subagents review the smaller modules from first principles, fix scoped defects with regressions, and re-review the corrected package.
+8. Run final local acceptance, freeze source, and hand the frozen commit and evidence to the release owner.
 
 Run focused owner tests on every commit. Run the complete controller/runbook/architecture milestone lane after milestones 2, 3, 5, and 6. Do not stack work on a red commit.
 
@@ -189,7 +190,7 @@ The developer first lands the other intended 0.7.2 changes and declares the rele
 4. runs the complete preflight baseline before production movement; and
 5. prevents unrelated target-branch changes through source freeze and handoff.
 
-If `release/0.7.2` moves before implementation starts, recreate the worktree from the new selected base and repeat preflight. If an authorized source change lands after implementation starts, integrate it before source freeze and rerun the complete local gate. Once the executor records the frozen source commit and tree, any later source change is outside this plan and requires a new verified handoff.
+The developer must freeze `release/0.7.2` for the duration of this refactor. If it moves before implementation starts, recreate the worktree from the new selected base and repeat preflight. If it moves at any point after implementation starts, stop: do not merge, rebase, or redefine `BASE_SHA` inside the active execution. The release owner must select a new exact base; execution then restarts in a clean worktree with freshly captured baselines and the extraction series replayed and reverified. Once the executor records the frozen source commit and tree, any later source change is outside this plan and requires a new verified handoff.
 
 ## Verification strategy
 
@@ -210,6 +211,15 @@ Every multi-command gate must fail fast with `set -Eeuo pipefail`, separate exec
 - Run the architecture/layer guard.
 - Run Ruff and mypy on touched production/test paths.
 - Run `git diff --check` and inspect staged paths.
+
+### Post-extraction cleanup review
+
+- Dispatch independent read-only subagents across facade/architecture, protected mutation and finalization, AWS/provider/telemetry behavior, receipt/approval/evidence/cleanup state machines, and test/packaging integrity.
+- Review the complete new modules and their direct callers/tests from first principles rather than limiting review to the extraction diff.
+- Require each finding to name a concrete file/line, violated invariant, failure scenario, evidence or reproduction, and minimal correction.
+- Deduplicate and validate findings before editing. Defects introduced by or exposed within this refactor remain in scope and must be fixed with a failing regression test; unrelated defects become explicit tracker work rather than observations or opportunistic cleanup.
+- Keep review agents read-only. Apply validated fixes serially, rerun owner/common gates after each fix commit, and have reviewers recheck their resolved findings.
+- Finish with a fresh clean-room review wave over the complete private package and its load-bearing seams. Unresolved correctness, security, data-integrity, or compatibility findings block source freeze.
 
 ### Final local acceptance
 
@@ -269,6 +279,7 @@ This option performs release authorization before the structural work, moves hun
 - No baseline test identity disappears and controller/package coverage does not regress from the selected base.
 - Wheel and container smokes prove both PostgreSQL drivers, both URL dialects, runtime extras, CLI startup, and deterministic behavior.
 - All local refactor gates pass against the frozen source commit.
+- The post-extraction first-principles review has no unresolved scoped correctness, security, integrity, or compatibility findings.
 - The handoff records the frozen source commit, tree identity, selected base, commit range, clean worktree, and verification evidence.
 - Signing, generated release metadata, release CI, branch pushes, and landing remain outside this plan.
 - Live ECS deployment remains separate work.
