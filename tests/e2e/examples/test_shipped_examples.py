@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -431,7 +432,7 @@ class TestShippedExamples:
         assert "not gate dogfood" in agent_guide
 
     def test_multi_worker_showcase_stats_use_completed_terminal_outcomes(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
-        """Showcase stats distinguish successful and quarantined terminal outcomes."""
+        """Showcase stats distinguish successful and failed terminal outcomes."""
         run_id = "run-under-test"
         db_path = tmp_path / "audit.db"
         with sqlite3.connect(db_path) as conn:
@@ -470,6 +471,58 @@ class TestShippedExamples:
 
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "200|192|8"
+
+    def test_multi_worker_showcase_stats_reject_invalid_inputs(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
+        """Outcome stats fail closed for invalid identity, storage, and output."""
+        stats_helper = example_pipeline_dir / "multi_worker_showcase" / "outcome_stats.sh"
+
+        empty_run_id = subprocess.run(
+            ["bash", stats_helper, tmp_path / "unused.db", ""],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert empty_run_id.returncode == 2
+        assert "invalid run id" in empty_run_id.stderr
+
+        missing_db = subprocess.run(
+            ["bash", stats_helper, tmp_path / "missing.db", "run-under-test"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert missing_db.returncode != 0
+        assert missing_db.stderr
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_sqlite = fake_bin / "sqlite3"
+        fake_sqlite.write_text("#!/usr/bin/env bash\necho 'not|valid'\n")
+        fake_sqlite.chmod(0o755)
+        invalid_result = subprocess.run(
+            ["bash", stats_helper, tmp_path / "unused.db", "run-under-test"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+        assert invalid_result.returncode != 0
+        assert "invalid outcome counts" in invalid_result.stderr
+
+    def test_multi_worker_showcase_launcher_fails_closed_on_invalid_stats(self, example_pipeline_dir: Path) -> None:
+        """The showcase launcher propagates and validates outcome helper output."""
+        run_sh = (example_pipeline_dir / "multi_worker_showcase" / "run.sh").read_text()
+
+        assert "set -euo pipefail" in run_sh
+        assert 'OUTCOME_COUNTS="$(bash "$SCRIPT_DIR/outcome_stats.sh" "$DB" "$RUN_ID")"' in run_sh
+        assert "IFS='|' read -r TOTAL_ROWS SUCCEEDED FAILED EXTRA_COUNT" in run_sh
+        assert '[ -n "${EXTRA_COUNT:-}" ]' in run_sh
+        for field in ("TOTAL_ROWS", "SUCCEEDED", "FAILED"):
+            assert f'[[ ! "${field}" =~ ^[0-9]+$ ]]' in run_sh
+        assert "invalid outcome counts" in run_sh
+        assert '2>/dev/null || echo "0|0|0"' not in run_sh
+        assert "Failed outcomes:" in run_sh
+        assert "Quarantined:" not in run_sh
 
     def test_blob_transform_offline_launcher_runs_from_clean_copy(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
         """blob_transforms ships a self-contained offline launcher."""

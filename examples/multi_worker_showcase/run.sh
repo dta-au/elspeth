@@ -5,7 +5,7 @@
 # Backgrounds a LEADER (elspeth run), polls the audit DB read-only until the
 # run is RUNNING with >=1 claimed work item, then launches WORKERS (default 3)
 # FOLLOWERS via `elspeth join <run_id>`. After all processes exit it renders an
-# ASCII stats card (workers spawned, total rows, rows/sec, succeeded/quarantined).
+# ASCII stats card (workers spawned, total rows, rows/sec, succeeded/failed).
 # ADR-030 "One-Host WAL Pack".
 #
 # This is a DEMONSTRATIVE example — there is no PASS/FAIL assertion.
@@ -156,15 +156,22 @@ echo "╚═══════════════════════�
 if [ -n "$RUN_ID" ]; then
     WORKERS_SPAWNED="$(sqlite3 "file:${DB}?mode=ro" \
         "PRAGMA query_only=ON; SELECT COUNT(*) FROM run_workers WHERE run_id='$RUN_ID';" 2>/dev/null || echo 0)"
-    OUTCOME_COUNTS="$(bash "$SCRIPT_DIR/outcome_stats.sh" "$DB" "$RUN_ID" 2>/dev/null || echo "0|0|0")"
-    IFS='|' read -r TOTAL_ROWS SUCCEEDED FAILED <<< "$OUTCOME_COUNTS"
+    OUTCOME_COUNTS="$(bash "$SCRIPT_DIR/outcome_stats.sh" "$DB" "$RUN_ID")"
+    IFS='|' read -r TOTAL_ROWS SUCCEEDED FAILED EXTRA_COUNT <<< "$OUTCOME_COUNTS"
+    if [ -n "${EXTRA_COUNT:-}" ] \
+        || [[ ! "$TOTAL_ROWS" =~ ^[0-9]+$ ]] \
+        || [[ ! "$SUCCEEDED" =~ ^[0-9]+$ ]] \
+        || [[ ! "$FAILED" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: invalid outcome counts: $OUTCOME_COUNTS" >&2
+        exit 1
+    fi
     ROWS_PER_SEC=$((TOTAL_ROWS / ELAPSED))
 
     echo ""
     printf "  Workers spawned:   %s\n" "$WORKERS_SPAWNED"
     printf "  Total rows done:   %s\n" "$TOTAL_ROWS"
     printf "  Succeeded:         %s\n" "$SUCCEEDED"
-    printf "  Quarantined:       %s\n" "$FAILED"
+    printf "  Failed outcomes:   %s\n" "$FAILED"
     printf "  Wall-clock:        %ss\n" "$ELAPSED"
     printf "  Aggregate rows/s:  %s\n" "$ROWS_PER_SEC"
     echo ""

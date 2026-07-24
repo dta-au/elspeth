@@ -49,8 +49,8 @@ The script:
 4. Tails live `token_work_items` status counts every ~2s while the leader runs.
 5. Reaps all PIDs and renders an ASCII stats card.
 
-Expected output: exit 0 + a stats card showing workers spawned ≈ 4, total rows
-≈ 200 (minus any quarantined by fault injection), rows/sec, and per-worker
+Expected output: exit 0 + a stats card showing workers spawned ≈ 4, total
+completed outcomes ≈ 200 (successful plus failed), rows/sec, and per-worker
 attribution.
 
 ---
@@ -113,4 +113,4 @@ Both files plus the audit DB are git-ignored (`examples/**/output/*` +
 
 `multi_worker_showcase` is the heaviest example (~200 rows × 4 workers).
 Do not gate dogfood completion on this example. Use `examples/multi_worker/`
-(leader + 1 follower, 60 rows) for bounded smoke testing.
+(leader + 1 follower, 120 rows) for bounded smoke testing.
