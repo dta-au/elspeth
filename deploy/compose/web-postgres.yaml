@@ -1,0 +1,81 @@
+# Production web overlay for the PostgreSQL Compose bundle.
+
+x-web-environment: &web-environment
+  ELSPETH_WEB__DEPLOYMENT_TARGET: docker-compose
+  ELSPETH_WEB__DEPLOYMENT_STATE_MODE: external-postgresql
+  ELSPETH_WEB__SESSION_DB_URL: postgresql+psycopg://elspeth:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/elspeth_sessions
+  ELSPETH_WEB__LANDSCAPE_URL: postgresql+psycopg://elspeth:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/elspeth_landscape
+  ELSPETH_WEB__DATA_DIR: /app/state/data
+  ELSPETH_WEB__PAYLOAD_STORE_PATH: /app/state/payloads
+  ELSPETH_WEB__SECRET_KEY: ${ELSPETH_WEB_SECRET_KEY:?ELSPETH_WEB_SECRET_KEY required}
+  ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY: ${ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY:?ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY required}
+  ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED: ${ELSPETH_WEB_COMPOSER_BOOT_PROBE_ENABLED:-true}
+  ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS: "15"
+  ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS: "10"
+  ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS: "85"
+  ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE: "10"
+  WEB_CONCURRENCY: "1"
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  AZURE_API_KEY: ${AZURE_API_KEY:-}
+  AZURE_CONTENT_SAFETY_KEY: ${AZURE_CONTENT_SAFETY_KEY:-}
+  AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+  AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+  ELSPETH_FINGERPRINT_KEY: ${ELSPETH_FINGERPRINT_KEY:-}
+
+services:
+  state-init:
+    image: ${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        install -d -m 0700
+        /app/state/data
+        /app/state/data/blobs
+        /app/state/payloads
+    user: "1000:1000"
+    volumes:
+      - elspeth_state:/app/state
+    restart: "no"
+
+  web-init:
+    image: ${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
+    command: ["doctor", "deployment", "--init-schema"]
+    environment: *web-environment
+    volumes:
+      - elspeth_state:/app/state
+    depends_on:
+      postgres:
+        condition: service_healthy
+      state-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  web:
+    image: ${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}
+    command: ["web", "--host", "0.0.0.0", "--port", "8451"]
+    environment: *web-environment
+    ports:
+      - "8451:8451"
+    volumes:
+      - elspeth_state:/app/state
+    depends_on:
+      web-init:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8451/api/ready', timeout=5).read()
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  elspeth_state:
