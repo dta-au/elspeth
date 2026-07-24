@@ -100,22 +100,21 @@ Imports may point only to the same or a lower-numbered layer. Also enforce:
 
 ## Execution and commit discipline
 
-Use two explicit full commit IDs. `RELEASE_BASE_SHA` is the developer-frozen local `release/0.7.2` tip. `BASE_SHA` is the reviewed plan-bearing start commit, which must contain this plan and approved design and have `RELEASE_BASE_SHA` as an ancestor. Never derive either pin with `merge-base`, never silently advance either pin, and never begin from a red base. The developer must declare the local `release/0.7.2` branch frozen for this refactor before Task 0. The plan-bearing commits remain on the implementation lineage and enter the release only with the completed refactor; no early release-branch merge or remote publication is required.
+Use two explicit historical commit IDs. `RELEASE_BASE_SHA` is the selected local `release/0.7.2` tip from which the reviewed plan lineage began. `BASE_SHA` is the reviewed plan-bearing start commit, which must contain this plan and approved design and have `RELEASE_BASE_SHA` as an ancestor. Never derive either pin with `merge-base`, silently advance either pin, or begin from a red base. The plan-bearing commits remain on the implementation lineage and enter the release only with the completed refactor; no early release-branch merge or remote publication is required.
 
-Recheck the local release branch in every common extraction gate, every milestone, before the Task 13 review, and at final handoff. Any drift is a hard stop: do not merge, rebase, or redefine either pin in the active worktree. Return to the release owner for a newly selected exact release base and reviewed plan-bearing start, then restart from a clean attempt-specific worktree/branch, recapture all dynamic baselines, replay the extraction series, and rerun every gate. Preserve and reuse the same Filigree `PARENT_ID` across attempts; record the abandoned pins/attempt before restarting.
+The local release branch may advance while this isolated refactor runs. That expected drift does not redefine either historical pin and must not trigger a rebase, restart, or replay. Implement and review against the stable `BASE_SHA` lineage, then reconcile exactly once with the then-current local release tip at the merge boundary and run the complete post-merge qualification there.
 
 Use this shell setup in every new executor shell:
 
 ```bash
 set -Eeuo pipefail
-: "${RELEASE_BASE_SHA:?export the developer-frozen local release/0.7.2 commit}"
+: "${RELEASE_BASE_SHA:?export the selected historical release/0.7.2 commit}"
 : "${BASE_SHA:?export the reviewed plan-bearing start commit}"
 : "${PARENT_ID:?export the single Filigree parent issue ID}"
 WORKTREE="/home/john/elspeth-aws-ecs-acceptance-${BASE_SHA:0:12}"
 IMPLEMENTATION_BRANCH="refactor/aws-ecs-acceptance-${BASE_SHA:0:12}"
 cd "$WORKTREE"
 test "$(git rev-parse "${BASE_SHA}^{commit}")" = "$BASE_SHA"
-test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
 git merge-base --is-ancestor "$RELEASE_BASE_SHA" "$BASE_SHA"
 ```
 
@@ -133,7 +132,6 @@ Common extraction gate, used after Tasks 2-12:
 
 ```bash
 set -Eeuo pipefail
-test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
 env -u VIRTUAL_ENV uv run --frozen pytest \
   tests/unit/web/test_aws_ecs_acceptance.py \
   tests/unit/web/aws_ecs_acceptance \
@@ -165,7 +163,6 @@ At the milestone ends named below, additionally run:
 ```bash
 set -Eeuo pipefail
 BASELINE_DIR=.elspeth/aws-ecs-acceptance-refactor
-test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
 COVERAGE_FILE="$BASELINE_DIR/current.coverage" \
 env -u VIRTUAL_ENV uv run --frozen pytest \
   tests/unit/web/test_aws_ecs_acceptance.py \
@@ -218,13 +215,13 @@ This permits new regression tests and test-file movement but rejects disappearan
 - Read: `tests/unit/web/test_aws_ecs_acceptance.py`
 - Create ignored evidence only under: `.elspeth/aws-ecs-acceptance-refactor/`
 
-- [ ] **Step 1: Fail closed on the frozen local release and create the worktree**
+- [ ] **Step 1: Pin the selected release ancestry and create the worktree**
 
 From `/home/john/elspeth`:
 
 ```bash
 set -Eeuo pipefail
-: "${RELEASE_BASE_SHA:?developer must export the frozen local release SHA}"
+: "${RELEASE_BASE_SHA:?developer must export the selected release SHA}"
 : "${BASE_SHA:?developer must export the reviewed plan-bearing start SHA}"
 TARGET_RELEASE_BRANCH=release/0.7.2
 PLAN_BRANCH=plan/aws-ecs-acceptance-refactor
@@ -247,7 +244,7 @@ env -u VIRTUAL_ENV uv sync --frozen --all-extras
 git diff --exit-code -- uv.lock
 ```
 
-Expected: the frozen local release branch still names `RELEASE_BASE_SHA`, the reviewed plan branch still names `BASE_SHA`, the isolated worktree starts exactly at `BASE_SHA`, the plan/design are present, dependencies sync without lock-file movement, and the worktree is clean. If either local pin moved, stop and ask the developer to select a new base; do not merge or repin autonomously. The remote may legitimately lag the local release and is not consulted or mutated by this source-only plan.
+Expected: at worktree creation the selected local release names `RELEASE_BASE_SHA`, the reviewed plan branch names `BASE_SHA`, the isolated worktree starts exactly at `BASE_SHA`, the plan/design are present, dependencies sync without lock-file movement, and the worktree is clean. The historical pins remain fixed after this point even when the release branch advances. The remote is not consulted or mutated by this source-only plan.
 
 - [ ] **Step 2: Reuse or create and atomically start one Filigree parent**
 
@@ -940,7 +937,6 @@ This is a mandatory correctness cleanup, not a style pass and not a review artif
 ```bash
 set -Eeuo pipefail
 test -z "$(git status --porcelain)"
-test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
 REVIEW_SHA=$(git rev-parse HEAD^{commit})
 REVIEW_TREE=$(git rev-parse HEAD^{tree})
 printf '%s\n' "$REVIEW_SHA" > .elspeth/aws-ecs-acceptance-refactor/review-sha.txt
@@ -1313,7 +1309,6 @@ test "$(git rev-parse HEAD^{tree})" = "$CANDIDATE_TREE"
 test "$(<.elspeth/aws-ecs-acceptance-refactor/base-sha.txt)" = "$BASE_SHA"
 BASE_TREE=$(<.elspeth/aws-ecs-acceptance-refactor/base-tree.txt)
 test "$(git rev-parse "${BASE_SHA}^{tree}")" = "$BASE_TREE"
-test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
 test "$(<.elspeth/aws-ecs-acceptance-refactor/release-base-sha.txt)" = "$RELEASE_BASE_SHA"
 RELEASE_BASE_TREE=$(<.elspeth/aws-ecs-acceptance-refactor/release-base-tree.txt)
 test "$(git rev-parse "${RELEASE_BASE_SHA}^{tree}")" = "$RELEASE_BASE_TREE"
@@ -1336,7 +1331,7 @@ test "$(git rev-parse HEAD^{commit})" = "$FROZEN_SOURCE_SHA"
 test "$(git rev-parse HEAD^{tree})" = "$FROZEN_SOURCE_TREE"
 test -z "$(git status --porcelain)"
 filigree add-comment "$PARENT_ID" \
-  "Frozen source handoff: RELEASE_BASE_SHA=$RELEASE_BASE_SHA RELEASE_BASE_TREE=$RELEASE_BASE_TREE BASE_SHA=$BASE_SHA BASE_TREE=$BASE_TREE FROZEN_SOURCE_SHA=$FROZEN_SOURCE_SHA FROZEN_SOURCE_TREE=$FROZEN_SOURCE_TREE. Tasks 0-14 local source-only gates passed; first-principles cleanup review has no unresolved scoped findings; ordered implementation commit range is recorded in the preceding parent comments." \
+  "Pinned source handoff: RELEASE_BASE_SHA=$RELEASE_BASE_SHA RELEASE_BASE_TREE=$RELEASE_BASE_TREE BASE_SHA=$BASE_SHA BASE_TREE=$BASE_TREE FROZEN_SOURCE_SHA=$FROZEN_SOURCE_SHA FROZEN_SOURCE_TREE=$FROZEN_SOURCE_TREE. Tasks 0-14 local source-only gates passed; first-principles cleanup review has no unresolved scoped findings; ordered implementation commit range is recorded in the preceding parent comments." \
   --actor codex-aws-ecs
 filigree close "$PARENT_ID" \
   --reason "Source-only refactor locally verified and handed off at $FROZEN_SOURCE_SHA" \
@@ -1354,7 +1349,7 @@ Any later source or test correction invalidates this handoff. Commit the correct
 
 ## Final acceptance checklist
 
-- [ ] `RELEASE_BASE_SHA` and plan-bearing `BASE_SHA` were explicit and present; the local release stayed frozen, `RELEASE_BASE_SHA` was an ancestor of `BASE_SHA`, and the source was green before movement.
+- [ ] `RELEASE_BASE_SHA` and plan-bearing `BASE_SHA` were explicit and present; `RELEASE_BASE_SHA` was an ancestor of `BASE_SHA`, the source was green before movement, and expected release drift was deferred to one final merge reconciliation.
 - [ ] One Filigree parent tracked the refactor; no per-commit issue hierarchy or review sidecar was created.
 - [ ] The facade retains executable CLI behavior, every characterized dispatch leaf, safe stdout/stderr/error behavior, and public re-export identity.
 - [ ] Baseline normalized test identities remain present and focused controller/package coverage did not regress from the selected base.
