@@ -34,7 +34,7 @@ These examples run locally with no credentials or external services.
 | [`database_sink`](database_sink/) | Write pipeline output to a SQLite database |
 | [`checkpoint_resume`](checkpoint_resume/) | Crash recovery via checkpointing and `elspeth resume` |
 | [`retention_purge`](retention_purge/) | Payload retention lifecycle and `elspeth purge` |
-| [`blob_transforms`](blob_transforms/) | Blob-backed ingestion: offline CSV blob row expansion plus an opt-in hosted tutorial HTML fetch |
+| [`blob_transforms`](blob_transforms/) | Blob-backed ingestion: self-contained offline CSV expansion via `./examples/blob_transforms/run.sh`, plus an opt-in hosted tutorial HTML fetch |
 | [`audit_export`](audit_export/) | Export the Landscape audit trail to JSON |
 | [`landscape_journal`](landscape_journal/) | Event journaling for real-time audit monitoring |
 | [`multi_flow`](multi_flow/) | Two independent named source flows in one run |

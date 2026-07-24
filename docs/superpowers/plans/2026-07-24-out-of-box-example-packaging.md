@@ -70,12 +70,12 @@ def test_blob_transform_offline_launcher_runs_from_clean_copy(
         manifest_rows = list(csv.DictReader(manifest_file))
     assert [row["source_name"] for row in manifest_rows] == ["feed_a", "feed_b"]
 
-    payload_files = [
-        path
-        for path in (example_dir / "payloads").rglob("*")
-        if path.is_file() and path.name != ".gitkeep"
-    ]
-    assert len(payload_files) == 2
+    blob_refs = [row["blob_ref"] for row in manifest_rows]
+    assert len(blob_refs) == 2
+    assert len(set(blob_refs)) == 2
+    payload_store = FilesystemPayloadStore(example_dir / "payloads")
+    for source_name, blob_ref in zip(("feed_a", "feed_b"), blob_refs, strict=True):
+        assert payload_store.retrieve(blob_ref) == (example_dir / "input" / f"{source_name}.csv").read_bytes()
     assert (example_dir / "runs" / "audit.db").is_file()
 
     with (example_dir / "output" / "expanded_csv_rows.csv").open(newline="", encoding="utf-8") as output_file:
@@ -226,7 +226,10 @@ Run:
   -v
 ```
 
-Expected: PASS with 200 output rows, two source names, two payload files, and a local audit database.
+Expected: PASS with 200 output rows, two source names, two unique manifest blob
+refs that resolve to the locally packaged fixture bytes, and a local audit
+database. The payload store also retains runtime audit payloads for source and
+expanded rows, so its total file count is intentionally not asserted.
 
 ### Task 4: Publish the one-command documentation
 

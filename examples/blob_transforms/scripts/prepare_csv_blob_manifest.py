@@ -14,8 +14,8 @@ PAYLOAD_DIR = EXAMPLE_DIR / "payloads"
 MANIFEST_PATH = EXAMPLE_DIR / "input" / "csv_blob_manifest.csv"
 
 INPUTS = (
-    ("feed_a", ROOT / "examples" / "multi_worker_showcase" / "input" / "feed_a.csv"),
-    ("feed_b", ROOT / "examples" / "multi_worker_showcase" / "input" / "feed_b.csv"),
+    ("feed_a", EXAMPLE_DIR / "input" / "feed_a.csv"),
+    ("feed_b", EXAMPLE_DIR / "input" / "feed_b.csv"),
 )
 
 

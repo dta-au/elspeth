@@ -14,8 +14,10 @@ so they are tested for structural validity only.
 
 from __future__ import annotations
 
+import csv
 import json
 import shutil
+import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,7 @@ from elspeth.contracts import RunStatus
 from elspeth.core.config import ElspethSettings, load_settings
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import rows_table, run_sources_table
+from elspeth.core.payload_store import FilesystemPayloadStore
 
 # Examples that contain ${VAR} env var references that would fail
 # load_settings without the env vars being set.
@@ -425,3 +428,42 @@ class TestShippedExamples:
         assert "input.<rows>.csv" in readme
         assert "CHAOSLLM_ENDURANCE_ROWS=20" in readme
         assert "not gate dogfood" in agent_guide
+
+    def test_blob_transform_offline_launcher_runs_from_clean_copy(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
+        """blob_transforms ships a self-contained offline launcher."""
+        copied_example_dir = self._copy_example_to_tmp(example_pipeline_dir, tmp_path, "blob_transforms")
+        (tmp_path / ".venv").symlink_to(example_pipeline_dir.parent / ".venv")
+
+        result = subprocess.run(
+            ["bash", copied_example_dir / "run.sh"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        with (copied_example_dir / "input" / "csv_blob_manifest.csv").open(newline="", encoding="utf-8") as f:
+            manifest = list(csv.DictReader(f))
+        assert [row["source_name"] for row in manifest] == ["feed_a", "feed_b"]
+
+        blob_refs = [row["blob_ref"] for row in manifest]
+        assert len(blob_refs) == 2
+        assert len(set(blob_refs)) == 2
+        payload_store = FilesystemPayloadStore(copied_example_dir / "payloads")
+        for source_name, blob_ref in zip(("feed_a", "feed_b"), blob_refs, strict=True):
+            assert payload_store.retrieve(blob_ref) == (copied_example_dir / "input" / f"{source_name}.csv").read_bytes()
+        assert (copied_example_dir / "runs" / "audit.db").is_file()
+
+        with (copied_example_dir / "output" / "expanded_csv_rows.csv").open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 200
+        assert Counter(row["source_name"] for row in rows) == Counter({"feed_a": 100, "feed_b": 100})
+
+    def test_blob_transform_documents_canonical_launcher(self, example_pipeline_dir: Path) -> None:
+        """blob_transforms documents its clean-checkout launcher everywhere."""
+        command = "./examples/blob_transforms/run.sh"
+        assert command in (example_pipeline_dir / "blob_transforms" / "README.md").read_text()
+        assert command in (example_pipeline_dir / "README.md").read_text()
+        assert command in (example_pipeline_dir / "AGENTS.md").read_text()

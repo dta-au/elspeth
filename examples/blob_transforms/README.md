@@ -6,8 +6,8 @@ depends on live network behaviour.
 Two combinations are included:
 
 - `settings_expand_csv_blobs.yaml` — offline row expansion. A helper script
-  stores existing local example CSV files in the payload store, writes a manifest
-  of `blob_ref` rows, then `blob_csv_expand` emits one row per CSV record while
+  stores two packaged CSV fixtures in the payload store, writes a manifest of
+  `blob_ref` rows, then `blob_csv_expand` emits one row per CSV record while
   preserving the manifest fields.
 - `settings_fetch_tutorial_html.yaml` — opt-in public fetch. It reads the same
   three hosted tutorial HTML URLs used by the first-run tutorial and stores them
@@ -16,17 +16,15 @@ Two combinations are included:
 
 ## Offline CSV Expansion
 
-Prepare the manifest and payload-store blobs:
+From a clean checkout after installation, run:
 
 ```bash
-python examples/blob_transforms/scripts/prepare_csv_blob_manifest.py
+./examples/blob_transforms/run.sh
 ```
 
-Run the expansion pipeline:
-
-```bash
-elspeth run --settings examples/blob_transforms/settings_expand_csv_blobs.yaml --execute
-```
+The launcher clears only this example's generated offline artifacts, packages
+its two local CSV fixtures into the payload store, writes the manifest, and
+executes `settings_expand_csv_blobs.yaml`.
 
 Output:
 
