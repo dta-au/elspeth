@@ -18,6 +18,7 @@ POSTGRES_INIT = REPO_ROOT / "deploy" / "compose" / "postgres-init.sql"
 ENV_EXAMPLE = REPO_ROOT / "deploy" / "compose" / ".env.example"
 
 ELSPETH_IMAGE = "${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}"
+POSTGRES_IMAGE = "postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
 POSTGRES_PASSWORD_REF = "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}"
 COMPOSE_TEST_ENVIRONMENT = os.environ | {
     "IMAGE_TAG": "sha-test",
@@ -113,7 +114,7 @@ def test_postgresql_overlay_wires_a_healthy_persistent_server_and_cli_database()
     postgres = _service(document, "postgres")
     cli = _service(document, "elspeth")
 
-    assert postgres["image"] == "postgres:16-alpine"
+    assert postgres["image"] == POSTGRES_IMAGE
     assert "profiles" not in postgres
     assert postgres["healthcheck"]["test"]
     health_command = " ".join(postgres["healthcheck"]["test"])
@@ -153,7 +154,7 @@ def test_postgresql_bootstrap_reconciles_reused_data_volumes_before_web_init() -
     static = _load(POSTGRES_COMPOSE)
     bootstrap = _service(static, "postgres-bootstrap")
 
-    assert bootstrap["image"] == "postgres:16-alpine"
+    assert bootstrap["image"] == POSTGRES_IMAGE
     assert bootstrap["depends_on"]["postgres"]["condition"] == "service_healthy"
     assert _environment(bootstrap)["PGPASSWORD"] == POSTGRES_PASSWORD_REF
     assert bootstrap["command"] == [
@@ -179,6 +180,14 @@ def test_postgresql_bootstrap_reconciles_reused_data_volumes_before_web_init() -
     assert "--host 127.0.0.1" in " ".join(rendered_postgres["healthcheck"]["test"])
     assert rendered_bootstrap["depends_on"]["postgres"]["condition"] == "service_healthy"
     assert rendered_web_init["depends_on"]["postgres-bootstrap"]["condition"] == "service_completed_successfully"
+
+
+def test_postgresql_dependency_images_are_digest_pinned_in_source_and_rendered_bundle() -> None:
+    for document in (_load(POSTGRES_COMPOSE), _rendered_bundle()):
+        for service_name in ("postgres", "postgres-bootstrap"):
+            image = _service(document, service_name)["image"]
+            assert image == POSTGRES_IMAGE
+            assert re.fullmatch(r"postgres:16-alpine@sha256:[0-9a-f]{64}", image)
 
 
 def test_state_initializer_repairs_all_private_state_directories_then_exits() -> None:
