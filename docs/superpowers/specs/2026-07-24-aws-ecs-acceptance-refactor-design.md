@@ -184,13 +184,13 @@ Run focused owner tests on every commit. Run the complete controller/runbook/arc
 
 The developer first lands the other intended 0.7.2 changes and declares the release branch ready for structural work. The executor then:
 
-1. resolves the exact remote `release/0.7.2` commit;
-2. records it once as `BASE_SHA` and captures its Git tree identity;
-3. creates a clean dedicated worktree and implementation branch from that commit;
+1. resolves and freezes the exact local `release/0.7.2` commit as `RELEASE_BASE_SHA`;
+2. records the reviewed plan-bearing descendant once as `BASE_SHA` and captures both Git tree identities;
+3. creates a clean dedicated worktree and implementation branch from `BASE_SHA` without publishing or advancing the release branch;
 4. runs the complete preflight baseline before production movement; and
 5. prevents unrelated target-branch changes through source freeze and handoff.
 
-The developer must freeze `release/0.7.2` for the duration of this refactor. If it moves before implementation starts, recreate the worktree from the new selected base and repeat preflight. If it moves at any point after implementation starts, stop: do not merge, rebase, or redefine `BASE_SHA` inside the active execution. The release owner must select a new exact base; execution then restarts in a clean worktree with freshly captured baselines and the extraction series replayed and reverified. Once the executor records the frozen source commit and tree, any later source change is outside this plan and requires a new verified handoff.
+The developer must freeze the local `release/0.7.2` branch for the duration of this refactor. The remote may lag and is neither a base authority nor a publication target for this source-only work. If the local release or reviewed plan-bearing branch moves before implementation starts, recreate the worktree from newly selected pins and repeat preflight. If the local release moves at any point after implementation starts, stop: do not merge, rebase, or redefine either pin inside the active execution. The release owner must select a new exact release base and reviewed plan-bearing start; execution then restarts in a clean worktree with freshly captured baselines and the extraction series replayed and reverified. Once the executor records the frozen source commit and tree, any later source change is outside this plan and requires a new verified handoff.
 
 ## Verification strategy
 
@@ -245,7 +245,7 @@ After final local acceptance:
 
 1. Freeze source and record `FROZEN_SOURCE_SHA` and tree identity.
 2. Confirm the implementation worktree is clean and still names that commit.
-3. Record the selected `BASE_SHA`, frozen source commit and tree, extraction commit range, and local verification results on the single Filigree parent.
+3. Record the selected release-base and plan-bearing SHA/tree pairs, frozen source commit and tree, extraction commit range, and local verification results on the single Filigree parent.
 4. Hand that immutable source identity and evidence to the release owner.
 
 This plan contains no Judge, signature, HMAC, fingerprint-baseline, release-candidate CI, push, or landing commands. The out-of-band release process owns every such action and decides how the frozen source enters the release.

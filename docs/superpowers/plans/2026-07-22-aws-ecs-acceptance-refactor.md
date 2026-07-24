@@ -100,20 +100,23 @@ Imports may point only to the same or a lower-numbered layer. Also enforce:
 
 ## Execution and commit discipline
 
-Use `BASE_SHA` as an explicit developer-selected full commit ID. Never derive it with `merge-base`, never silently advance it, and never begin from a red base. The selected commit must contain this plan and the approved design. The developer must declare `release/0.7.2` frozen for this refactor before Task 0.
+Use two explicit full commit IDs. `RELEASE_BASE_SHA` is the developer-frozen local `release/0.7.2` tip. `BASE_SHA` is the reviewed plan-bearing start commit, which must contain this plan and approved design and have `RELEASE_BASE_SHA` as an ancestor. Never derive either pin with `merge-base`, never silently advance either pin, and never begin from a red base. The developer must declare the local `release/0.7.2` branch frozen for this refactor before Task 0. The plan-bearing commits remain on the implementation lineage and enter the release only with the completed refactor; no early release-branch merge or remote publication is required.
 
-Recheck the remote branch in every common extraction gate, every milestone, before the Task 13 review, and at final handoff. Any drift is a hard stop: do not merge, rebase, or redefine `BASE_SHA` in the active worktree. Return to the release owner for a newly selected exact base, then restart from a clean attempt-specific worktree/branch, recapture all dynamic baselines, replay the extraction series, and rerun every gate. Preserve and reuse the same Filigree `PARENT_ID` across attempts; record the abandoned base/attempt before restarting.
+Recheck the local release branch in every common extraction gate, every milestone, before the Task 13 review, and at final handoff. Any drift is a hard stop: do not merge, rebase, or redefine either pin in the active worktree. Return to the release owner for a newly selected exact release base and reviewed plan-bearing start, then restart from a clean attempt-specific worktree/branch, recapture all dynamic baselines, replay the extraction series, and rerun every gate. Preserve and reuse the same Filigree `PARENT_ID` across attempts; record the abandoned pins/attempt before restarting.
 
 Use this shell setup in every new executor shell:
 
 ```bash
 set -Eeuo pipefail
-: "${BASE_SHA:?export the developer-selected release/0.7.2 commit}"
+: "${RELEASE_BASE_SHA:?export the developer-frozen local release/0.7.2 commit}"
+: "${BASE_SHA:?export the reviewed plan-bearing start commit}"
 : "${PARENT_ID:?export the single Filigree parent issue ID}"
 WORKTREE="/home/john/elspeth-aws-ecs-acceptance-${BASE_SHA:0:12}"
 IMPLEMENTATION_BRANCH="refactor/aws-ecs-acceptance-${BASE_SHA:0:12}"
 cd "$WORKTREE"
 test "$(git rev-parse "${BASE_SHA}^{commit}")" = "$BASE_SHA"
+test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
+git merge-base --is-ancestor "$RELEASE_BASE_SHA" "$BASE_SHA"
 ```
 
 For every extraction task:
@@ -130,7 +133,7 @@ Common extraction gate, used after Tasks 2-12:
 
 ```bash
 set -Eeuo pipefail
-test "$(git ls-remote origin refs/heads/release/0.7.2 | awk '{print $1}')" = "$BASE_SHA"
+test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
 env -u VIRTUAL_ENV uv run --frozen pytest \
   tests/unit/web/test_aws_ecs_acceptance.py \
   tests/unit/web/aws_ecs_acceptance \
@@ -162,7 +165,7 @@ At the milestone ends named below, additionally run:
 ```bash
 set -Eeuo pipefail
 BASELINE_DIR=.elspeth/aws-ecs-acceptance-refactor
-test "$(git ls-remote origin refs/heads/release/0.7.2 | awk '{print $1}')" = "$BASE_SHA"
+test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
 COVERAGE_FILE="$BASELINE_DIR/current.coverage" \
 env -u VIRTUAL_ENV uv run --frozen pytest \
   tests/unit/web/test_aws_ecs_acceptance.py \
@@ -215,23 +218,22 @@ This permits new regression tests and test-file movement but rejects disappearan
 - Read: `tests/unit/web/test_aws_ecs_acceptance.py`
 - Create ignored evidence only under: `.elspeth/aws-ecs-acceptance-refactor/`
 
-- [ ] **Step 1: Fail closed on the selected remote base and create the worktree**
+- [ ] **Step 1: Fail closed on the frozen local release and create the worktree**
 
 From `/home/john/elspeth`:
 
 ```bash
 set -Eeuo pipefail
-: "${BASE_SHA:?developer must export the reviewed full release base SHA}"
+: "${RELEASE_BASE_SHA:?developer must export the frozen local release SHA}"
+: "${BASE_SHA:?developer must export the reviewed plan-bearing start SHA}"
 TARGET_RELEASE_BRANCH=release/0.7.2
+PLAN_BRANCH=plan/aws-ecs-acceptance-refactor
 IMPLEMENTATION_BRANCH="refactor/aws-ecs-acceptance-${BASE_SHA:0:12}"
 WORKTREE="/home/john/elspeth-aws-ecs-acceptance-${BASE_SHA:0:12}"
-remote_sha=$(git ls-remote origin "refs/heads/$TARGET_RELEASE_BRANCH" | awk '{print $1}')
-test -n "$remote_sha"
-test "$remote_sha" = "$BASE_SHA"
-git fetch --no-tags origin "refs/heads/$TARGET_RELEASE_BRANCH"
-test "$(git rev-parse FETCH_HEAD^{commit})" = "$BASE_SHA"
-test "$(git ls-remote origin "refs/heads/$TARGET_RELEASE_BRANCH" | awk '{print $1}')" = "$BASE_SHA"
+test "$(git rev-parse "$TARGET_RELEASE_BRANCH^{commit}")" = "$RELEASE_BASE_SHA"
+test "$(git rev-parse "$PLAN_BRANCH^{commit}")" = "$BASE_SHA"
 test "$(git cat-file -t "$BASE_SHA")" = commit
+git merge-base --is-ancestor "$RELEASE_BASE_SHA" "$BASE_SHA"
 test ! -e "$WORKTREE"
 ! git show-ref --verify --quiet "refs/heads/$IMPLEMENTATION_BRANCH"
 git worktree add "$WORKTREE" -b "$IMPLEMENTATION_BRANCH" "$BASE_SHA"
@@ -245,7 +247,7 @@ env -u VIRTUAL_ENV uv sync --frozen --all-extras
 git diff --exit-code -- uv.lock
 ```
 
-Expected: the remote branch still names the developer-selected commit, the isolated worktree starts exactly there, the plan/design are present, dependencies sync without lock-file movement, and the worktree is clean. If the remote moved, stop and ask the developer to select a new base; do not merge or repin autonomously.
+Expected: the frozen local release branch still names `RELEASE_BASE_SHA`, the reviewed plan branch still names `BASE_SHA`, the isolated worktree starts exactly at `BASE_SHA`, the plan/design are present, dependencies sync without lock-file movement, and the worktree is clean. If either local pin moved, stop and ask the developer to select a new base; do not merge or repin autonomously. The remote may legitimately lag the local release and is not consulted or mutated by this source-only plan.
 
 - [ ] **Step 2: Reuse or create and atomically start one Filigree parent**
 
@@ -278,8 +280,9 @@ filigree start-work "$PARENT_ID" \
   --assignee codex-aws-ecs --actor codex-aws-ecs \
   --commit "$IMPLEMENTATION_BRANCH@$BASE_SHA"
 BASE_TREE=$(git rev-parse "${BASE_SHA}^{tree}")
+RELEASE_BASE_TREE=$(git rev-parse "${RELEASE_BASE_SHA}^{tree}")
 filigree add-comment "$PARENT_ID" \
-  "Selected source base: BASE_SHA=$BASE_SHA BASE_TREE=$BASE_TREE" \
+  "Selected source bases: RELEASE_BASE_SHA=$RELEASE_BASE_SHA RELEASE_BASE_TREE=$RELEASE_BASE_TREE BASE_SHA=$BASE_SHA BASE_TREE=$BASE_TREE" \
   --actor codex-aws-ecs
 ```
 
@@ -293,6 +296,8 @@ BASELINE_DIR=.elspeth/aws-ecs-acceptance-refactor
 install -d -m 0700 "$BASELINE_DIR"
 printf '%s\n' "$BASE_SHA" > "$BASELINE_DIR/base-sha.txt"
 git rev-parse "${BASE_SHA}^{tree}" > "$BASELINE_DIR/base-tree.txt"
+printf '%s\n' "$RELEASE_BASE_SHA" > "$BASELINE_DIR/release-base-sha.txt"
+git rev-parse "${RELEASE_BASE_SHA}^{tree}" > "$BASELINE_DIR/release-base-tree.txt"
 env -u VIRTUAL_ENV uv run --frozen pytest --collect-only -q \
   tests/unit/web/test_aws_ecs_acceptance.py \
   tests/unit/web/test_aws_ecs_runbook_contract.py \
@@ -933,7 +938,7 @@ This is a mandatory correctness cleanup, not a style pass and not a review artif
 ```bash
 set -Eeuo pipefail
 test -z "$(git status --porcelain)"
-test "$(git ls-remote origin refs/heads/release/0.7.2 | awk '{print $1}')" = "$BASE_SHA"
+test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
 REVIEW_SHA=$(git rev-parse HEAD^{commit})
 REVIEW_TREE=$(git rev-parse HEAD^{tree})
 printf '%s\n' "$REVIEW_SHA" > .elspeth/aws-ecs-acceptance-refactor/review-sha.txt
@@ -1304,10 +1309,11 @@ test "$(git rev-parse HEAD^{tree})" = "$CANDIDATE_TREE"
 test "$(<.elspeth/aws-ecs-acceptance-refactor/base-sha.txt)" = "$BASE_SHA"
 BASE_TREE=$(<.elspeth/aws-ecs-acceptance-refactor/base-tree.txt)
 test "$(git rev-parse "${BASE_SHA}^{tree}")" = "$BASE_TREE"
-test "$(git ls-remote origin refs/heads/release/0.7.2 | awk '{print $1}')" = "$BASE_SHA"
-git fetch --no-tags origin refs/heads/release/0.7.2
-test "$(git rev-parse FETCH_HEAD^{commit})" = "$BASE_SHA"
-test "$(git ls-remote origin refs/heads/release/0.7.2 | awk '{print $1}')" = "$BASE_SHA"
+test "$(git rev-parse release/0.7.2^{commit})" = "$RELEASE_BASE_SHA"
+test "$(<.elspeth/aws-ecs-acceptance-refactor/release-base-sha.txt)" = "$RELEASE_BASE_SHA"
+RELEASE_BASE_TREE=$(<.elspeth/aws-ecs-acceptance-refactor/release-base-tree.txt)
+test "$(git rev-parse "${RELEASE_BASE_SHA}^{tree}")" = "$RELEASE_BASE_TREE"
+git merge-base --is-ancestor "$RELEASE_BASE_SHA" "$BASE_SHA"
 git merge-base --is-ancestor "$BASE_SHA" HEAD
 test "$(git rev-list --min-parents=2 --count "$BASE_SHA..HEAD")" -eq 0
 FROZEN_SOURCE_SHA=$CANDIDATE_SHA
@@ -1326,7 +1332,7 @@ test "$(git rev-parse HEAD^{commit})" = "$FROZEN_SOURCE_SHA"
 test "$(git rev-parse HEAD^{tree})" = "$FROZEN_SOURCE_TREE"
 test -z "$(git status --porcelain)"
 filigree add-comment "$PARENT_ID" \
-  "Frozen source handoff: BASE_SHA=$BASE_SHA BASE_TREE=$BASE_TREE FROZEN_SOURCE_SHA=$FROZEN_SOURCE_SHA FROZEN_SOURCE_TREE=$FROZEN_SOURCE_TREE. Tasks 0-14 local source-only gates passed; first-principles cleanup review has no unresolved scoped findings; ordered commit range is recorded in the preceding parent comments." \
+  "Frozen source handoff: RELEASE_BASE_SHA=$RELEASE_BASE_SHA RELEASE_BASE_TREE=$RELEASE_BASE_TREE BASE_SHA=$BASE_SHA BASE_TREE=$BASE_TREE FROZEN_SOURCE_SHA=$FROZEN_SOURCE_SHA FROZEN_SOURCE_TREE=$FROZEN_SOURCE_TREE. Tasks 0-14 local source-only gates passed; first-principles cleanup review has no unresolved scoped findings; ordered implementation commit range is recorded in the preceding parent comments." \
   --actor codex-aws-ecs
 filigree close "$PARENT_ID" \
   --reason "Source-only refactor locally verified and handed off at $FROZEN_SOURCE_SHA" \
@@ -1344,7 +1350,7 @@ Any later source or test correction invalidates this handoff. Commit the correct
 
 ## Final acceptance checklist
 
-- [ ] The selected `BASE_SHA` was explicit, remote-current at start, present in history, and green before movement.
+- [ ] `RELEASE_BASE_SHA` and plan-bearing `BASE_SHA` were explicit and present; the local release stayed frozen, `RELEASE_BASE_SHA` was an ancestor of `BASE_SHA`, and the source was green before movement.
 - [ ] One Filigree parent tracked the refactor; no per-commit issue hierarchy or review sidecar was created.
 - [ ] The facade retains executable CLI behavior, every characterized dispatch leaf, safe stdout/stderr/error behavior, and public re-export identity.
 - [ ] Baseline normalized test identities remain present and focused controller/package coverage did not regress from the selected base.
@@ -1358,5 +1364,5 @@ Any later source or test correction invalidates this handoff. Commit the correct
 - [ ] The authoritative AST graph has the exact module set, correct layer direction, no load-bearing forbidden edge, and no private-package cycle; every private module imports without side effects.
 - [ ] Ruff, formatting, mypy, locally owned static gates, Python 3.12/3.13 lanes, focused/full PostgreSQL testcontainers, wheel smoke, and local container smoke pass.
 - [ ] `uv.lock` and the tracked runbook are unchanged from the selected base.
-- [ ] The Filigree parent comments record `BASE_SHA`, `BASE_TREE`, `FROZEN_SOURCE_SHA`, `FROZEN_SOURCE_TREE`, the ordered commit range, and the concrete local verification result.
+- [ ] The Filigree parent comments record the release-base SHA/tree, plan-bearing base SHA/tree, frozen-source SHA/tree, ordered implementation commit range, and concrete local verification result.
 - [ ] Work stopped at frozen-source handoff.
