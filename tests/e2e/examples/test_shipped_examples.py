@@ -382,6 +382,39 @@ class TestShippedExamples:
                     assert isinstance(t, dict), f"{name}/{path.name}: transform[{i}] must be a dict"
                     assert "plugin" in t, f"{name}/{path.name}: transform[{i}] missing 'plugin'"
 
+    def test_openrouter_journal_path_resolves_next_to_audit_db(
+        self,
+        example_pipeline_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The journal example keeps its SQLite journal beside its audit DB."""
+        example_dir = self._copy_example_to_tmp(
+            example_pipeline_dir,
+            tmp_path,
+            "openrouter_multi_query_assessment",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+        settings = load_settings(example_dir / "settings_journal.yaml")
+
+        db = LandscapeDB.from_url(
+            settings.landscape.url,
+            dump_to_jsonl=settings.landscape.dump_to_jsonl,
+            dump_to_jsonl_path=settings.landscape.dump_to_jsonl_path,
+            dump_to_jsonl_include_payloads=settings.landscape.dump_to_jsonl_include_payloads,
+            dump_to_jsonl_payload_base_path=(
+                str(settings.payload_store.base_path)
+                if settings.landscape.dump_to_jsonl_payload_base_path is None
+                else settings.landscape.dump_to_jsonl_payload_base_path
+            ),
+        )
+        try:
+            assert db._journal is not None
+            assert db._journal._path == example_dir / "runs" / "audit.journal.jsonl"
+        finally:
+            db.close()
+
     def test_no_duplicate_sink_names(self, example_pipeline_dir: Path) -> None:
         """Sink names are unique within each settings file (YAML keys are unique by spec)."""
         settings = self._find_example_settings(example_pipeline_dir)

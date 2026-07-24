@@ -301,5 +301,5 @@ sinks:
 landscape:
   url: sqlite:///examples/openrouter_multi_query_assessment/runs/audit.db
   dump_to_jsonl: true
-  dump_to_jsonl_path: examples/openrouter_multi_query_assessment/runs/audit.journal.jsonl
+  dump_to_jsonl_path: audit.journal.jsonl
   dump_to_jsonl_include_payloads: true
