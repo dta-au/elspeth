@@ -40,6 +40,9 @@ recovery point.
 - Root or sudo access to the VM.
 - A dedicated `elspeth` system user and group.
 - `git`, `curl`, and `uv` installed from reviewed sources.
+- Node.js 24 with npm 11 installed from a reviewed source. If your organization
+  approves NodeSource, use the NodeSource Node 24.x apt repository
+  (`https://deb.nodesource.com/node_24.x`) and pin its signing key.
 - An immutable, release-specific Git tag or commit. If you build an image for
   another environment, use an immutable, release-specific image tag or digest.
 - TLS termination at Caddy, another reverse proxy, or Azure Front Door.
@@ -80,6 +83,10 @@ sudo --preserve-env=ELSPETH_JUDGE_METADATA_HMAC_KEY -u elspeth \
   uv run --frozen --extra dev elspeth-lints check --rules trust_tier.tier_model \
   --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model
 sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra postgres
+node --version  # must report v24.x
+npm --version   # must report 11.x
+sudo -u elspeth npm --prefix src/elspeth/web/frontend ci
+sudo -u elspeth npm --prefix src/elspeth/web/frontend run build
 ```
 
 The supported gate payload is
