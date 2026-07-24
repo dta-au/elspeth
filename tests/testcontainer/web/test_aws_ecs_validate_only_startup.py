@@ -30,7 +30,6 @@ from elspeth.web.schema_probe import (
 from elspeth.web.sessions.engine import create_session_engine
 
 pytestmark = pytest.mark.testcontainer
-pytest_plugins = ("tests.testcontainer.web.test_external_deployment_postgres",)
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 
@@ -126,23 +125,23 @@ class _RuntimeDatabases:
 
 
 @pytest.fixture
-def runtime_databases(postgres_url: str) -> Iterator[_RuntimeDatabases]:
+def runtime_databases(external_deployment_postgres_url: str) -> Iterator[_RuntimeDatabases]:
     databases = _RuntimeDatabases(
-        postgres_url=postgres_url,
+        postgres_url=external_deployment_postgres_url,
         session_database=_identifier("session"),
         landscape_database=_identifier("landscape"),
         runtime_role=_identifier("runtime"),
         runtime_password=f"runtime-{uuid.uuid4().hex}",
     )
     assert databases.session_database != databases.landscape_database
-    with _psycopg_connect(postgres_url) as admin:
+    with _psycopg_connect(external_deployment_postgres_url) as admin:
         for database in (databases.session_database, databases.landscape_database):
             admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
 
     try:
         yield databases
     finally:
-        with _psycopg_connect(postgres_url) as admin:
+        with _psycopg_connect(external_deployment_postgres_url) as admin:
             for database in (databases.session_database, databases.landscape_database):
                 admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
             if databases.role_created:

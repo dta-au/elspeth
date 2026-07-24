@@ -5,12 +5,14 @@ contract.  It is deliberately not evidence that a maintained deployment bundle
 exists for every named target.  Run the focused suite sequentially with
 ``CI=1 uv run --frozen pytest -q -n 0 -m testcontainer``; parallel workers are
 rejected before Docker starts so the suite cannot fan out containers.  The
-complete copy-paste command is ``_SEQUENTIAL_TEST_COMMAND`` below.
+complete copy-paste command is ``_SEQUENTIAL_TEST_COMMAND`` in the sibling
+``conftest.py``.
 """
 
 from __future__ import annotations
 
 import base64
+import importlib
 import json
 import os
 import re
@@ -29,7 +31,6 @@ from pydantic import SecretBytes
 from sqlalchemy import create_engine, inspect, update
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ProgrammingError
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
 from elspeth.cli import app as cli_app
@@ -57,36 +58,30 @@ _RUNTIME_CONTRACT_TARGETS = (
     "azure-container-apps",
     "kubernetes",
 )
-_SEQUENTIAL_TEST_COMMAND = (
-    "CI=1 uv run --frozen pytest -q -n 0 -m testcontainer "
-    "tests/testcontainer/web/test_external_deployment_postgres.py "
-    "tests/testcontainer/web/test_aws_ecs_validate_only_startup.py "
-    "tests/testcontainer/web/test_doctor_aws_ecs_postgres.py"
-)
-
-
-def _require_sequential_postgres_acceptance(pytest_config: pytest.Config) -> None:
-    """Reject xdist workers before any PostgreSQL container is constructed."""
-    if hasattr(pytest_config, "workerinput") or os.environ.get("PYTEST_XDIST_WORKER") is not None:
-        raise pytest.UsageError(
-            f"The PostgreSQL deployment acceptance suite must run sequentially to share one container. Run: {_SEQUENTIAL_TEST_COMMAND}"
-        )
 
 
 def test_sequential_execution_contract_is_guarded_and_documented() -> None:
+    shared_fixtures = importlib.import_module("tests.testcontainer.web.conftest")
+
     class _WorkerConfig:
         def __init__(self) -> None:
             self.workerinput: dict[str, object] = {}
 
     with pytest.raises(pytest.UsageError, match=r"-n 0 -m testcontainer") as exc_info:
-        _require_sequential_postgres_acceptance(_WorkerConfig())  # type: ignore[arg-type]
-    assert _SEQUENTIAL_TEST_COMMAND in str(exc_info.value)
+        shared_fixtures._require_sequential_postgres_acceptance(_WorkerConfig())
+    assert shared_fixtures._SEQUENTIAL_TEST_COMMAND in str(exc_info.value)
 
     plan_path = Path(__file__).parents[3] / "docs/superpowers/plans/2026-07-24-cross-platform-deployment-contract.md"
     task12 = plan_path.read_text(encoding="utf-8").split("### Task 12:", maxsplit=1)[1]
     focused_command = task12.split("###", maxsplit=1)[0].split("```bash", maxsplit=1)[1].split("```", maxsplit=1)[0]
 
-    assert _SEQUENTIAL_TEST_COMMAND in focused_command
+    assert shared_fixtures._SEQUENTIAL_TEST_COMMAND in focused_command
+
+    aws_startup_tests = importlib.import_module("tests.testcontainer.web.test_aws_ecs_validate_only_startup")
+    aws_doctor_tests = importlib.import_module("tests.testcontainer.web.test_doctor_aws_ecs_postgres")
+    assert hasattr(shared_fixtures, "external_deployment_postgres_url")
+    assert not hasattr(aws_startup_tests, "pytest_plugins")
+    assert not hasattr(aws_doctor_tests, "pytest_plugins")
 
 
 def _identifier(prefix: str) -> str:
@@ -121,14 +116,6 @@ def _psycopg_connect(url: str) -> psycopg.Connection[Any]:
         password=parsed.password,
         autocommit=True,
     )
-
-
-@pytest.fixture(scope="session")
-def postgres_url(pytestconfig: pytest.Config) -> Iterator[str]:
-    """Share one PostgreSQL container across the focused deployment suite."""
-    _require_sequential_postgres_acceptance(pytestconfig)
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
 
 
 @dataclass(slots=True)
@@ -198,23 +185,23 @@ class _DatabasePair:
 
 
 @pytest.fixture
-def database_pair(postgres_url: str) -> Iterator[_DatabasePair]:
+def database_pair(external_deployment_postgres_url: str) -> Iterator[_DatabasePair]:
     databases = _DatabasePair(
-        postgres_url=postgres_url,
+        postgres_url=external_deployment_postgres_url,
         session_database=_identifier("external_session"),
         landscape_database=_identifier("external_landscape"),
         runtime_role=_identifier("external_runtime"),
         runtime_password=f"external-runtime-{uuid.uuid4().hex}",
     )
     assert databases.session_database != databases.landscape_database
-    with _psycopg_connect(postgres_url) as admin:
+    with _psycopg_connect(external_deployment_postgres_url) as admin:
         for database in (databases.session_database, databases.landscape_database):
             admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
 
     try:
         yield databases
     finally:
-        with _psycopg_connect(postgres_url) as admin:
+        with _psycopg_connect(external_deployment_postgres_url) as admin:
             for database in (databases.session_database, databases.landscape_database):
                 admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
             if databases.role_created:

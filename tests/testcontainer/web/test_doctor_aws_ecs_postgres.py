@@ -24,7 +24,6 @@ from elspeth.web.schema_probe import SchemaState, probe_landscape_schema, probe_
 from elspeth.web.sessions.engine import create_session_engine
 
 pytestmark = pytest.mark.testcontainer
-pytest_plugins = ("tests.testcontainer.web.test_external_deployment_postgres",)
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 _PROCESS_TIMEOUT_SECONDS = 120.0
@@ -48,20 +47,20 @@ class _DatabasePair:
 
 
 @pytest.fixture
-def database_pair(postgres_url: str) -> Iterator[_DatabasePair]:
+def database_pair(external_deployment_postgres_url: str) -> Iterator[_DatabasePair]:
     session_database = _identifier("doctor_session")
     landscape_database = _identifier("doctor_landscape")
     assert session_database != landscape_database
 
-    admin = create_engine(postgres_url)
+    admin = create_engine(external_deployment_postgres_url)
     with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         connection.exec_driver_sql(f'CREATE DATABASE "{session_database}"')
         connection.exec_driver_sql(f'CREATE DATABASE "{landscape_database}"')
 
     try:
         yield _DatabasePair(
-            session_url=_render_url(postgres_url, database=session_database),
-            landscape_url=_render_url(postgres_url, database=landscape_database),
+            session_url=_render_url(external_deployment_postgres_url, database=session_database),
+            landscape_url=_render_url(external_deployment_postgres_url, database=landscape_database),
         )
     finally:
         with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
