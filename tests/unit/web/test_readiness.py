@@ -532,6 +532,7 @@ def _settings_stub(tmp_path: Path, **overrides: object) -> Any:
     blob_dir.mkdir(exist_ok=True)
     values: dict[str, object] = {
         "deployment_target": "default",
+        "deployment_state_mode": "auto",
         "auth_provider": "local",
         "session_db_url": None,
         "landscape_url": None,
@@ -551,14 +552,25 @@ def _settings_stub(tmp_path: Path, **overrides: object) -> Any:
 
 
 class TestReadinessDatabaseChecks:
-    def test_aws_session_uses_raw_url_isolated_factory_and_same_connection(
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
+    def test_external_session_uses_raw_url_isolated_factory_and_same_connection(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
     ) -> None:
         raw_url = "postgresql+psycopg://runtime@db.internal/session"
-        settings = _settings_stub(tmp_path, deployment_target="aws-ecs", session_db_url=raw_url)
-        settings.get_session_db_url = lambda: pytest.fail("fallback getter must not run in AWS mode")
+        settings = _settings_stub(
+            tmp_path,
+            deployment_target=deployment_target,
+            deployment_state_mode="external-postgresql",
+            session_db_url=raw_url,
+            landscape_url="postgresql+psycopg://runtime@db.internal/landscape",
+        )
+        settings.get_session_db_url = lambda: pytest.fail("fallback getter must not supply external session URL")
         live_engine = _FakeEngine()
         owned = _FakeEngine()
         captured: dict[str, object] = {}
@@ -575,7 +587,7 @@ class TestReadinessDatabaseChecks:
             lambda conn: probe_connections.append(conn) or SchemaState.CURRENT,
         )
 
-        checks = _check_session_database(settings, live_engine)
+        checks = _check_session_database(settings, live_engine, "external-postgresql")
 
         assert captured == {
             "url": raw_url,
@@ -596,14 +608,25 @@ class TestReadinessDatabaseChecks:
             ReadinessCheck("session_schema", True, "schema state: CURRENT"),
         )
 
-    def test_aws_landscape_uses_raw_url_and_landscape_factory(
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
+    def test_external_landscape_uses_raw_url_and_landscape_factory(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
     ) -> None:
         raw_url = "postgresql+psycopg://runtime@db.internal/landscape"
-        settings = _settings_stub(tmp_path, deployment_target="aws-ecs", landscape_url=raw_url)
-        settings.get_landscape_url = lambda: pytest.fail("fallback getter must not run in AWS mode")
+        settings = _settings_stub(
+            tmp_path,
+            deployment_target=deployment_target,
+            deployment_state_mode="external-postgresql",
+            session_db_url="postgresql+psycopg://runtime@db.internal/session",
+            landscape_url=raw_url,
+        )
+        settings.get_landscape_url = lambda: pytest.fail("fallback getter must not supply external Landscape URL")
         owned = _FakeEngine()
         captured: dict[str, object] = {}
 
@@ -614,7 +637,7 @@ class TestReadinessDatabaseChecks:
         monkeypatch.setattr(readiness, "create_engine", factory)
         monkeypatch.setattr(readiness, "probe_landscape_schema", lambda conn: SchemaState.CURRENT)
 
-        checks = _check_landscape_database(settings)
+        checks = _check_landscape_database(settings, "external-postgresql")
 
         assert captured["url"] == raw_url
         assert captured["kwargs"] == {
@@ -674,12 +697,14 @@ class TestReadinessDatabaseChecks:
         settings = _settings_stub(
             tmp_path,
             deployment_target="aws-ecs",
+            deployment_state_mode="external-postgresql",
+            session_db_url="postgresql+psycopg://runtime@db.invalid/session",
             landscape_url="postgresql+psycopg://runtime@db.invalid/landscape",
         )
         owned = _FakeEngine(connection=_FakeConnection(failure=failure))
         monkeypatch.setattr(readiness, "create_engine", lambda *_a, **_kw: owned)
         with pytest.raises(type(failure)):
-            _check_landscape_database(settings)
+            _check_landscape_database(settings, "external-postgresql")
         assert owned.disposed is True
 
     @pytest.mark.asyncio
@@ -691,6 +716,7 @@ class TestReadinessDatabaseChecks:
         settings = _settings_stub(
             tmp_path,
             deployment_target="aws-ecs",
+            deployment_state_mode="external-postgresql",
             session_db_url="postgresql+psycopg://runtime@db.invalid/session",
             landscape_url="postgresql+psycopg://runtime@db.invalid/landscape",
         )
@@ -740,6 +766,22 @@ class TestReadinessFilesystemChecks:
         payload.mkdir(mode=0o700)
         payload.chmod(payload.stat().st_mode | stat.S_IWGRP)
         assert _check_payload_store(settings)[0].detail == "payload_store group/world-writable directory is not allowed"
+
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
+    def test_external_payload_uses_raw_explicit_path(self, tmp_path: Path, deployment_target: str) -> None:
+        settings = _settings_stub(
+            tmp_path,
+            deployment_target=deployment_target,
+            deployment_state_mode="external-postgresql",
+            session_db_url="postgresql+psycopg://runtime@db/session",
+            landscape_url="postgresql+psycopg://runtime@db/landscape",
+        )
+        settings.get_payload_store_path = lambda: pytest.fail("fallback getter must not supply external payload path")
+
+        assert _check_payload_store(settings, "external-postgresql") == (ReadinessCheck("payload_store", True, "directory is writable"),)
 
     def test_blob_rejects_symlink(self, tmp_path: Path) -> None:
         settings = _settings_stub(tmp_path)

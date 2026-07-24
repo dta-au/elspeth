@@ -16,32 +16,55 @@ from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.web.auth import audit as audit_module
 from elspeth.web.auth.audit import AuthAuditRecorder
-from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS
+
+_STATE_POLICY_MATRIX = [
+    ("default", "sqlite-single", True),
+    ("docker-compose", "sqlite-single", True),
+    ("linux-systemd", "sqlite-single", True),
+    ("default", "external-postgresql", False),
+    ("docker-compose", "external-postgresql", False),
+    ("linux-systemd", "external-postgresql", False),
+    ("aws-ecs", "external-postgresql", False),
+    ("azure-container-apps", "external-postgresql", False),
+    ("kubernetes", "external-postgresql", False),
+]
 
 
-def _settings(deployment_target: str) -> Any:
+def _settings(deployment_target: str, state_mode: str) -> Any:
+    external = state_mode == "external-postgresql"
+    landscape_url = "postgresql+psycopg://runtime@db/landscape" if external else "sqlite:///auth-audit.db"
+    session_url = "postgresql+psycopg://runtime@db/session" if external else "sqlite:///sessions.db"
     return SimpleNamespace(
         deployment_target=deployment_target,
+        deployment_state_mode=state_mode,
+        landscape_url=landscape_url,
+        session_db_url=session_url,
         landscape_passphrase=None,
-        get_landscape_url=lambda: "sqlite:///auth-audit.db",
+        get_landscape_url=lambda: landscape_url,
+        get_session_db_url=lambda: session_url,
     )
 
 
-def test_from_settings_disables_create_tables_for_aws_ecs() -> None:
-    recorder = AuthAuditRecorder.from_settings(_settings(DEPLOYMENT_TARGET_AWS_ECS))
+@pytest.mark.parametrize(("deployment_target", "state_mode", "expected"), _STATE_POLICY_MATRIX)
+def test_from_settings_schema_policy_follows_resolved_state_mode(
+    deployment_target: str,
+    state_mode: str,
+    expected: bool,
+) -> None:
+    recorder = AuthAuditRecorder.from_settings(_settings(deployment_target, state_mode))
 
-    assert recorder.create_tables is False
+    assert recorder.create_tables is expected
 
 
-def test_from_settings_keeps_create_tables_for_default() -> None:
-    recorder = AuthAuditRecorder.from_settings(_settings("default"))
+def test_from_settings_external_mode_retains_raw_explicit_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings("kubernetes", "external-postgresql")
+    raw_url = settings.landscape_url
+    settings.get_landscape_url = lambda: pytest.fail("fallback getter must not supply external Landscape URL")
+    monkeypatch.setattr(audit_module, "resolve_deployment_state_mode", lambda _settings: "external-postgresql", raising=False)
 
-    assert recorder.create_tables is True
+    recorder = AuthAuditRecorder.from_settings(settings)
 
-
-def test_from_settings_rejects_unknown_deployment_target() -> None:
-    with pytest.raises(ValueError, match="unsupported deployment_target"):
-        AuthAuditRecorder.from_settings(_settings("future-target"))
+    assert recorder.landscape_url == raw_url
 
 
 def test_direct_construction_requires_create_tables_policy() -> None:

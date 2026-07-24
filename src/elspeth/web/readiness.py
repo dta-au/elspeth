@@ -18,7 +18,7 @@ import structlog
 from sqlalchemy import Engine, create_engine, text
 
 from elspeth.web.config import WebSettings
-from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS
+from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.paths import managed_blob_directory
 from elspeth.web.schema_probe import (
     SchemaState,
@@ -172,8 +172,13 @@ def _is_in_memory_sqlite(engine: Engine) -> bool:
     return database == ":memory:" or str(engine.url) in {"sqlite:///:memory:", "sqlite://"}
 
 
-def _check_session_database(settings: WebSettings, session_engine: Engine) -> _ProbeResult:
-    if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
+def _check_session_database(
+    settings: WebSettings,
+    session_engine: Engine,
+    deployment_state_mode: Literal["sqlite-single", "external-postgresql"] | None = None,
+) -> _ProbeResult:
+    state_mode = deployment_state_mode or resolve_deployment_state_mode(settings)
+    if state_mode == "external-postgresql":
         assert settings.session_db_url is not None
         return _owned_database_check(settings.session_db_url, kind="session")
     if _is_in_memory_sqlite(session_engine):
@@ -187,8 +192,12 @@ def _check_session_database(settings: WebSettings, session_engine: Engine) -> _P
     return _owned_database_check(settings.get_session_db_url(), kind="session")
 
 
-def _check_landscape_database(settings: WebSettings) -> _ProbeResult:
-    if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
+def _check_landscape_database(
+    settings: WebSettings,
+    deployment_state_mode: Literal["sqlite-single", "external-postgresql"] | None = None,
+) -> _ProbeResult:
+    state_mode = deployment_state_mode or resolve_deployment_state_mode(settings)
+    if state_mode == "external-postgresql":
         assert settings.landscape_url is not None
         url = settings.landscape_url
     else:
@@ -254,8 +263,12 @@ def _check_data_dir(settings: WebSettings) -> _ProbeResult:
     return _validate_directory("data_dir", Path(settings.data_dir))
 
 
-def _check_payload_store(settings: WebSettings) -> _ProbeResult:
-    if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
+def _check_payload_store(
+    settings: WebSettings,
+    deployment_state_mode: Literal["sqlite-single", "external-postgresql"] | None = None,
+) -> _ProbeResult:
+    state_mode = deployment_state_mode or resolve_deployment_state_mode(settings)
+    if state_mode == "external-postgresql":
         assert settings.payload_store_path is not None
         path = Path(settings.payload_store_path)
     else:
@@ -313,17 +326,42 @@ async def readiness_report(
     settings: WebSettings,
     session_engine: Engine,
     runner: ReadinessProbeRunner,
+    deployment_state_mode: Literal["sqlite-single", "external-postgresql"] | None = None,
 ) -> ReadinessReport:
+    state_mode = deployment_state_mode or resolve_deployment_state_mode(settings)
     tasks: list[asyncio.Task[_ProbeResult]] = []
     try:
         async with asyncio.timeout(5.0):
             tasks = [
                 asyncio.create_task(
-                    runner.run("session", ("session_db", "session_schema"), _check_session_database, settings, session_engine)
+                    runner.run(
+                        "session",
+                        ("session_db", "session_schema"),
+                        _check_session_database,
+                        settings,
+                        session_engine,
+                        state_mode,
+                    )
                 ),
-                asyncio.create_task(runner.run("landscape", ("landscape_db", "landscape_schema"), _check_landscape_database, settings)),
+                asyncio.create_task(
+                    runner.run(
+                        "landscape",
+                        ("landscape_db", "landscape_schema"),
+                        _check_landscape_database,
+                        settings,
+                        state_mode,
+                    )
+                ),
                 asyncio.create_task(runner.run("data_dir", ("data_dir",), _check_data_dir, settings)),
-                asyncio.create_task(runner.run("payload_store", ("payload_store",), _check_payload_store, settings)),
+                asyncio.create_task(
+                    runner.run(
+                        "payload_store",
+                        ("payload_store",),
+                        _check_payload_store,
+                        settings,
+                        state_mode,
+                    )
+                ),
                 asyncio.create_task(runner.run("blob_dir", ("blob_dir",), _check_blob_dir, settings)),
             ]
             groups = await asyncio.gather(*tasks)

@@ -44,6 +44,8 @@ from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartup
 from elspeth.web.composer.boot_probe import ComposerBootConfigError
 from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_from_env
 from elspeth.web.dependencies import get_settings
+from elspeth.web.deployment_contract import DeploymentConfigurationError
+from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
 from elspeth.web.readiness import READINESS_CHECK_NAMES, ReadinessCache, ReadinessCheck, ReadinessProbeRunner, ReadinessReport
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX,
@@ -72,27 +74,35 @@ def _settings(tmp_path: Path, **overrides) -> WebSettings:
 
 
 def _aws_settings(tmp_path: Path, **overrides: object) -> WebSettings:
+    return _external_settings(tmp_path, "aws-ecs", **overrides)
+
+
+def _external_settings(tmp_path: Path, deployment_target: str, **overrides: object) -> WebSettings:
     data_dir = tmp_path / "data"
     payload_dir = tmp_path / "payload"
     for directory in (data_dir, data_dir / "blobs", payload_dir):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
     values: dict[str, object] = {
-        "deployment_target": "aws-ecs",
-        "operator_telemetry": "aws-otlp",
-        "operator_telemetry_environment": "test",
-        "operator_telemetry_release": "git-test",
-        "operator_telemetry_ecs_cluster": "elspeth-test",
-        "operator_telemetry_ecs_service": "elspeth-web",
-        "operator_telemetry_task_definition_family": "elspeth-web-task",
-        "operator_telemetry_task_definition_revision": "1",
-        "host": "0.0.0.0",
+        "deployment_target": deployment_target,
+        "deployment_state_mode": "external-postgresql",
+        "host": "0.0.0.0" if deployment_target in {"docker-compose", "aws-ecs", "azure-container-apps", "kubernetes"} else "127.0.0.1",
         "payload_store_path": payload_dir,
         "session_db_url": "postgresql+psycopg://runtime@db/session",
         "landscape_url": "postgresql+psycopg://runtime@db/landscape",
         "secret_key": "s" * 40,
         "shareable_link_signing_key": SecretBytes(bytes(range(32))),
     }
+    if deployment_target == "aws-ecs":
+        values.update(
+            operator_telemetry="aws-otlp",
+            operator_telemetry_environment="test",
+            operator_telemetry_release="git-test",
+            operator_telemetry_ecs_cluster="elspeth-test",
+            operator_telemetry_ecs_service="elspeth-web",
+            operator_telemetry_task_definition_family="elspeth-web-task",
+            operator_telemetry_task_definition_revision="1",
+        )
     values.update(overrides)
     return _settings(data_dir, **values)
 
@@ -1538,21 +1548,44 @@ class TestLifespanShutdown:
         assert fake_operator_telemetry.shutdown_calls == 1
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("deployment_target", "expected_create_tables"), [("default", True), ("aws-ecs", False)])
+    @pytest.mark.parametrize(
+        ("deployment_target", "state_mode", "expected_create_tables"),
+        [
+            ("default", "sqlite-single", True),
+            ("docker-compose", "sqlite-single", True),
+            ("linux-systemd", "sqlite-single", True),
+            ("default", "external-postgresql", False),
+            ("docker-compose", "external-postgresql", False),
+            ("linux-systemd", "external-postgresql", False),
+            ("aws-ecs", "external-postgresql", False),
+            ("azure-container-apps", "external-postgresql", False),
+            ("kubernetes", "external-postgresql", False),
+        ],
+    )
     async def test_lifespan_forwards_orphan_reconciliation_schema_creation_policy(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         deployment_target: str,
+        state_mode: str,
         expected_create_tables: bool,
     ) -> None:
         base_dir = tmp_path / deployment_target / "base"
         app = create_app(_settings(base_dir, composer_boot_probe_enabled=False))
-        if deployment_target == "aws-ecs":
-            app.state.settings = _aws_settings(
+        if state_mode == "external-postgresql":
+            app.state.settings = _external_settings(
                 tmp_path / deployment_target / "runtime",
+                deployment_target,
                 composer_boot_probe_enabled=False,
             )
+        else:
+            app.state.settings = _settings(
+                tmp_path / deployment_target / "runtime",
+                deployment_target=deployment_target,
+                deployment_state_mode=state_mode,
+                composer_boot_probe_enabled=False,
+            )
+        app.state.deployment_state_mode = state_mode
 
         one_shot_calls: list[bool] = []
         periodic_calls: list[bool] = []
@@ -2608,6 +2641,219 @@ class TestSecretsExceptionHandlers:
         _prop()
 
 
+class TestDeploymentStateModeStartup:
+    """Application startup policy is selected by resolved state mode."""
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            pytest.param(
+                lambda root: _settings(
+                    root,
+                    deployment_target="aws-ecs",
+                    deployment_state_mode="sqlite-single",
+                    session_db_url="sqlite:///sessions.db",
+                    landscape_url="sqlite:///landscape.db",
+                ),
+                id="aws-rejects-sqlite",
+            ),
+            pytest.param(
+                lambda root: _settings(
+                    root,
+                    deployment_target="default",
+                    deployment_state_mode="external-postgresql",
+                    session_db_url="sqlite:///sessions.db",
+                    landscape_url="sqlite:///landscape.db",
+                ),
+                id="external-mode-rejects-sqlite-urls",
+            ),
+        ],
+    )
+    def test_invalid_mode_combination_precedes_all_startup_effects(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        settings: Callable[[Path], WebSettings],
+    ) -> None:
+        runtime = settings(tmp_path / "must-not-exist")
+        side_effects: list[str] = []
+
+        monkeypatch.setattr(
+            app_module,
+            "bootstrap_operator_telemetry",
+            lambda *_args: side_effects.append("telemetry") or pytest.fail("telemetry bootstrapped before state resolution"),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "create_session_engine",
+            lambda *_args, **_kwargs: side_effects.append("engine") or pytest.fail("database URL opened before state resolution"),
+        )
+        monkeypatch.setattr(
+            app_module.AuthAuditRecorder,
+            "from_settings",
+            lambda *_args: side_effects.append("auth") or pytest.fail("auth audit constructed before state resolution"),
+        )
+        monkeypatch.setattr(
+            Path,
+            "mkdir",
+            lambda *_args, **_kwargs: side_effects.append("mkdir") or pytest.fail("directory created before state resolution"),
+        )
+
+        with pytest.raises(DeploymentConfigurationError):
+            create_app(runtime)
+
+        assert side_effects == []
+        assert runtime.data_dir.exists() is False
+
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
+    def test_external_mode_uses_raw_urls_validate_only_and_one_session_engine(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
+    ) -> None:
+        settings = _external_settings(tmp_path / deployment_target, deployment_target)
+        engine = create_engine("sqlite:///:memory:")
+        engine_calls: list[tuple[str, dict[str, object]]] = []
+        schema_calls: list[tuple[WebSettings, Engine]] = []
+        mkdir_calls: list[Path] = []
+        original_mkdir = Path.mkdir
+
+        def build_engine(url: str, **kwargs: object) -> Engine:
+            engine_calls.append((url, kwargs))
+            return engine
+
+        def validate(passed_settings: WebSettings, passed_engine: Engine) -> None:
+            schema_calls.append((passed_settings, passed_engine))
+
+        def mkdir(path: Path, *args: object, **kwargs: object) -> None:
+            mkdir_calls.append(path)
+            original_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(app_module, "create_session_engine", build_engine)
+        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", validate, raising=False)
+        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", validate)
+        monkeypatch.setattr(app_module, "initialize_session_schema", lambda *_args: pytest.fail("external startup ran session DDL"))
+        monkeypatch.setattr(app_module, "open_landscape_db", lambda *_args: pytest.fail("external startup ran Landscape DDL"))
+        monkeypatch.setattr(Path, "mkdir", mkdir)
+
+        app = create_app(settings)
+
+        assert app.state.deployment_state_mode == "external-postgresql"
+        assert engine_calls == [
+            (
+                settings.session_db_url,
+                {"connect_args": {"connect_timeout": 10}, "pool_size": 5, "max_overflow": 5, "pool_pre_ping": True},
+            )
+        ]
+        assert schema_calls == [(settings, engine)]
+        assert settings.data_dir not in mkdir_calls
+        assert settings.data_dir / "runs" not in mkdir_calls
+        app.state._session_engine_finalizer()
+
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "azure-container-apps", "kubernetes"],
+    )
+    @pytest.mark.parametrize("state", ["MISSING", "STALE"])
+    def test_external_noncurrent_schema_fails_without_ddl_and_disposes_session_engine(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
+        state: str,
+    ) -> None:
+        settings = _external_settings(tmp_path / deployment_target, deployment_target)
+        engine = create_engine("sqlite:///:memory:")
+        original_dispose = engine.dispose
+        dispose_calls = 0
+
+        def dispose(*args: object, **kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            original_dispose(*args, **kwargs)
+
+        def reject(*_args: object, **_kwargs: object) -> None:
+            raise ExternalStateSchemaNotReadyError(
+                f"External-state session_schema is {state.lower()}; Run 'elspeth doctor deployment' for full diagnostics."
+            )
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", reject, raising=False)
+        monkeypatch.setattr(app_module, "initialize_session_schema", lambda *_args: pytest.fail("external startup ran session DDL"))
+        monkeypatch.setattr(app_module, "open_landscape_db", lambda *_args: pytest.fail("external startup ran Landscape DDL"))
+
+        with pytest.raises(ExternalStateSchemaNotReadyError, match="doctor deployment"):
+            create_app(settings)
+
+        assert dispose_calls == 1
+
+    @pytest.mark.parametrize("failure", [RuntimeError("late failure"), KeyboardInterrupt()])
+    def test_later_create_app_base_exception_invokes_same_one_shot_finalizer(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: BaseException,
+    ) -> None:
+        settings = _external_settings(tmp_path, "linux-systemd")
+        engine = create_engine("sqlite:///:memory:")
+        original_dispose = engine.dispose
+        dispose_calls = 0
+
+        def dispose(*args: object, **kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            original_dispose(*args, **kwargs)
+
+        def fail_catalog() -> object:
+            raise failure
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", lambda *_args, **_kwargs: None, raising=False)
+        monkeypatch.setattr(app_module, "create_catalog_service", fail_catalog)
+
+        with pytest.raises(type(failure)):
+            create_app(settings)
+
+        assert dispose_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_successful_external_lifespan_finalizes_engine_exactly_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        settings = _external_settings(tmp_path, "azure-container-apps", composer_boot_probe_enabled=False)
+        engine = create_engine("sqlite:///:memory:")
+        original_dispose = engine.dispose
+        dispose_calls = 0
+
+        def dispose(*args: object, **kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            original_dispose(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", lambda *_args, **_kwargs: None, raising=False)
+        app = create_app(settings)
+
+        with (
+            patch("elspeth.web.app.ExecutionServiceImpl", return_value=_RecordingExecutionService()),
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+        ):
+            async with lifespan(app):
+                pass
+
+        app.state._session_engine_finalizer()
+        assert dispose_calls == 1
+
+
 class TestAwsEcsValidateOnlyStartup:
     """AWS startup must validate completely before persistent mutation."""
 
@@ -2806,16 +3052,16 @@ class TestAwsEcsValidateOnlyStartup:
 
         assert (settings.data_dir / "auth.db").exists() is False
 
-    def test_session_engine_construction_failure_is_static_redacted_and_unchained(self, tmp_path: Path) -> None:
+    def test_unsupported_session_driver_fails_contract_before_engine_with_static_diagnostic(self, tmp_path: Path) -> None:
         sentinel_driver = "sentinel_driver_raw_sqlalchemy_text"
         session_url = f"postgresql+{sentinel_driver}://runtime@db/session"
         settings = _aws_settings(tmp_path, session_db_url=session_url)
 
-        with capture_logs() as logs, pytest.raises(AwsEcsSchemaNotReadyError) as exc_info:
+        with capture_logs() as logs, pytest.raises(AwsEcsStartupContractError) as exc_info:
             create_app(settings)
 
         rendered = repr(exc_info.value)
-        assert "session_schema" in str(exc_info.value)
+        assert "session_db_url" in str(exc_info.value)
         assert "Run 'elspeth doctor aws-ecs' for full diagnostics." in str(exc_info.value)
         assert exc_info.value.__cause__ is None
         assert sentinel_driver not in rendered

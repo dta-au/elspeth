@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import jwt as pyjwt
 import structlog
@@ -19,7 +19,7 @@ from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityErro
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable
-from elspeth.web.landscape_access import landscape_create_tables_allowed
+from elspeth.web.deployment_contract import resolve_deployment_state_mode
 
 if TYPE_CHECKING:
     from elspeth.web.config import WebSettings
@@ -186,11 +186,21 @@ class AuthAuditRecorder:
     create_tables: bool
 
     @classmethod
-    def from_settings(cls, settings: WebSettings) -> AuthAuditRecorder:
+    def from_settings(
+        cls,
+        settings: WebSettings,
+        deployment_state_mode: Literal["sqlite-single", "external-postgresql"] | None = None,
+    ) -> AuthAuditRecorder:
+        state_mode = deployment_state_mode or resolve_deployment_state_mode(settings)
+        if state_mode == "external-postgresql":
+            landscape_url = settings.landscape_url
+            assert landscape_url is not None
+        else:
+            landscape_url = settings.get_landscape_url()
         return cls(
-            landscape_url=settings.get_landscape_url(),
+            landscape_url=landscape_url,
             landscape_passphrase=settings.landscape_passphrase,
-            create_tables=landscape_create_tables_allowed(settings),
+            create_tables=state_mode == "sqlite-single",
         )
 
     @contextmanager

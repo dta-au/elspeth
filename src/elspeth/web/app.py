@@ -11,7 +11,7 @@ import re
 import sys
 import time
 import weakref
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -59,7 +59,6 @@ from elspeth.web.auth.urls import (
     validate_oidc_issuer,
 )
 from elspeth.web.aws_ecs_startup import (
-    _CONNECT_TIMEOUT_SECONDS,
     AwsEcsSchemaNotReadyError,
     enforce_aws_ecs_contract,
     require_runtime_directories_mounted,
@@ -75,12 +74,23 @@ from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS
+from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS, resolve_deployment_state_mode
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.routes import create_execution_router
 from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
+from elspeth.web.external_state_startup import (
+    _CONNECT_TIMEOUT_SECONDS,
+    ExternalStateSchemaNotReadyError,
+    enforce_external_state_contract,
+)
+from elspeth.web.external_state_startup import (
+    require_runtime_directories_mounted as require_external_runtime_directories_mounted,
+)
+from elspeth.web.external_state_startup import (
+    validate_only_schema_or_raise as validate_external_schema_or_raise,
+)
 from elspeth.web.landscape_access import open_landscape_db
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.middleware.request_id import RequestIdMiddleware
@@ -357,7 +367,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Single-process server: every non-terminal run is orphaned after restart.
     # No age filter — cancel ALL pending/running runs immediately.
     settings: WebSettings = app.state.settings
-    create_landscape_tables = settings.deployment_target != DEPLOYMENT_TARGET_AWS_ECS
+    state_mode: str = app.state.deployment_state_mode
+    create_landscape_tables = state_mode == "sqlite-single"
+    if state_mode == "external-postgresql":
+        landscape_url = settings.landscape_url
+        assert landscape_url is not None
+    else:
+        landscape_url = settings.get_landscape_url()
     session_service = app.state.session_service
     cancelled_runs: list[RunRecord] = []
     try:
@@ -366,7 +382,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         await _reconcile_pending_landscape_runs(
             session_service,
-            settings.get_landscape_url(),
+            landscape_url,
             create_tables=create_landscape_tables,
         )
     except (SQLAlchemyError, OSError, SchemaCompatibilityError) as cleanup_exc:
@@ -473,7 +489,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #     different retention semantics)
     #   * the ``ShareTokenSigner`` primitive (HMAC over WebSettings'
     #     required ``shareable_link_signing_key``)
-    payload_store = FilesystemPayloadStore(settings.get_payload_store_path())
+    if state_mode == "external-postgresql":
+        payload_store_path = settings.payload_store_path
+        assert payload_store_path is not None
+    else:
+        payload_store_path = settings.get_payload_store_path()
+    payload_store = FilesystemPayloadStore(payload_store_path)
     app.state.payload_store = payload_store
     # ``shareable_link_signing_key`` is a ``SecretBytes`` (DC-2 FIX-L —
     # masks repr to prevent plaintext leakage in tracebacks/logs).
@@ -614,7 +635,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.sessions_telemetry,
             interval_seconds=settings.orphan_run_check_interval_seconds,
             max_age_seconds=settings.orphan_run_max_age_seconds,
-            landscape_url=settings.get_landscape_url(),
+            landscape_url=landscape_url,
             create_tables=create_landscape_tables,
         )
     )
@@ -641,7 +662,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from elspeth.web.async_workers import shutdown_async_workers
 
         await shutdown_async_workers()
-        app.state.session_engine.dispose()
+        app.state._session_engine_finalizer()
 
 
 class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
@@ -762,6 +783,27 @@ def _frontend_build_identity(dist_dir: Path) -> str | None:
 
 
 def create_app(settings: WebSettings | None = None) -> FastAPI:
+    """Create the application and synchronously clean up failed engine ownership."""
+    session_engine_finalizer: weakref.finalize[..., FastAPI] | None = None
+
+    def register_session_engine_finalizer(finalizer: weakref.finalize[..., FastAPI]) -> None:
+        nonlocal session_engine_finalizer
+        if session_engine_finalizer is not None:
+            raise RuntimeError("session engine finalizer registered more than once")
+        session_engine_finalizer = finalizer
+
+    try:
+        return _create_app(settings, register_session_engine_finalizer)
+    except BaseException:
+        if session_engine_finalizer is not None:
+            session_engine_finalizer()
+        raise
+
+
+def _create_app(
+    settings: WebSettings | None,
+    register_session_engine_finalizer: Callable[[weakref.finalize[..., FastAPI]], None],
+) -> FastAPI:
     """Create and configure the FastAPI application.
 
     Args:
@@ -774,11 +816,16 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     if settings is None:
         settings = settings_from_env()
 
-    # Reject an incomplete AWS deployment policy before installing the
-    # process-global provider. A failed first create_app() must not strand a
-    # later corrected AWS boot on a Prometheus-only provider.
+    resolved_state_mode = resolve_deployment_state_mode(settings)
+    external_state = resolved_state_mode == "external-postgresql"
+
+    # Reject incomplete deployment policy before installing the process-global
+    # provider. A failed first create_app() must not strand a later corrected
+    # boot on a provider selected from invalid settings.
     if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
         enforce_aws_ecs_contract(settings)
+    if external_state:
+        enforce_external_state_contract(settings)
 
     operator_runtime = bootstrap_operator_telemetry(settings)
     operator_meter = metrics.get_meter(__name__)
@@ -795,6 +842,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 
     app = FastAPI(title="ELSPETH Web", version="0.1.0", lifespan=lifespan)
     app.state.operator_telemetry = operator_runtime
+    app.state.deployment_state_mode = resolved_state_mode
 
     @app.exception_handler(AuditIntegrityError)
     async def _audit_integrity_error_handler(_request: Request, exc: AuditIntegrityError) -> JSONResponse:
@@ -939,27 +987,39 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
 
     app.state.settings = settings
 
-    aws_session_engine: Engine | None = None
-    if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-        require_runtime_directories_mounted(settings)
+    external_session_engine: Engine | None = None
+    if external_state:
+        if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
+            require_runtime_directories_mounted(settings)
+        else:
+            require_external_runtime_directories_mounted(settings)
         raw_session_url = settings.session_db_url
         assert raw_session_url is not None
         try:
-            aws_session_engine = create_session_engine(
+            external_session_engine = create_session_engine(
                 raw_session_url,
                 connect_args={"connect_timeout": _CONNECT_TIMEOUT_SECONDS},
                 **postgres_engine_kwargs(raw_session_url),
             )
         except (SQLAlchemyError, ImportError):
-            raise AwsEcsSchemaNotReadyError(
-                "AWS ECS session_schema engine could not be constructed. Run 'elspeth doctor aws-ecs' for full diagnostics."
+            if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
+                raise AwsEcsSchemaNotReadyError(
+                    "AWS ECS session_schema engine could not be constructed. Run 'elspeth doctor aws-ecs' for full diagnostics."
+                ) from None
+            raise ExternalStateSchemaNotReadyError(
+                "External-state session_schema engine could not be constructed. Run 'elspeth doctor deployment' for full diagnostics."
             ) from None
+        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, external_session_engine)
+        register_session_engine_finalizer(session_engine_finalizer)
+        app.state._session_engine_finalizer = session_engine_finalizer
         try:
-            validate_only_schema_or_raise(settings, aws_session_engine)
+            if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
+                validate_only_schema_or_raise(settings, external_session_engine)
+            else:
+                validate_external_schema_or_raise(settings, external_session_engine)
         except BaseException:
-            aws_session_engine.dispose()
+            session_engine_finalizer()
             raise
-        weakref.finalize(app, _dispose_session_engine, aws_session_engine)
     else:
         # Ensure data directory and subdirectories exist before any DB access.
         # get_landscape_url() defaults to data_dir/runs/audit.db — SQLite does
@@ -971,7 +1031,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         # stale pre-1.0 store would otherwise survive startup and fail only
         # after traffic arrived. Open once now to initialize a fresh store or
         # reject an old schema before auth/session state can be mutated.
-        with open_landscape_db(settings):
+        with open_landscape_db(settings, resolved_state_mode):
             pass
 
     # --- Catalog ---
@@ -1030,7 +1090,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
     else:
         raise RuntimeError(f"Unsupported auth provider: {settings.auth_provider}")
     app.state.auth_provider = auth_provider
-    app.state.auth_audit_recorder = AuthAuditRecorder.from_settings(settings)
+    app.state.auth_audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
     app.state.oidc_authorization_endpoint = settings.oidc_authorization_endpoint
     app.state.oidc_token_endpoint = settings.oidc_token_endpoint
 
@@ -1043,16 +1103,18 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
         )
 
     # --- Session database setup ---
-    if aws_session_engine is not None:
-        session_engine = aws_session_engine
+    if external_session_engine is not None:
+        session_engine = external_session_engine
     else:
         session_db_url = settings.get_session_db_url()
         session_engine = create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
+        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, session_engine)
+        register_session_engine_finalizer(session_engine_finalizer)
+        app.state._session_engine_finalizer = session_engine_finalizer
         initialize_session_schema(session_engine)
         session_db_path = session_engine.url.database
         if session_engine.dialect.name == "sqlite" and session_db_path not in (None, ":memory:"):
             session_engine.dispose()
-        weakref.finalize(app, _dispose_session_engine, session_engine)
 
     # Build the sessions-telemetry container ONCE per process and share it
     # across every consumer (SessionServiceImpl, ExecutionServiceImpl, and
@@ -1366,6 +1428,7 @@ def create_app(settings: WebSettings | None = None) -> FastAPI:
                 request.app.state.settings,
                 request.app.state.session_engine,
                 request.app.state.readiness_probe_runner,
+                request.app.state.deployment_state_mode,
             )
 
         try:
