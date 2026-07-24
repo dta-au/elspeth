@@ -17,7 +17,6 @@ from typing import Any
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL, make_url
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
 from elspeth.cli import app
@@ -25,6 +24,7 @@ from elspeth.web.schema_probe import SchemaState, probe_landscape_schema, probe_
 from elspeth.web.sessions.engine import create_session_engine
 
 pytestmark = pytest.mark.testcontainer
+pytest_plugins = ("tests.testcontainer.web.test_external_deployment_postgres",)
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 _PROCESS_TIMEOUT_SECONDS = 120.0
@@ -39,12 +39,6 @@ def _identifier(prefix: str) -> str:
 
 def _render_url(base_url: str | URL, *, database: str) -> str:
     return make_url(base_url).set(database=database).render_as_string(hide_password=False)
-
-
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
 
 
 @dataclass(frozen=True, slots=True)

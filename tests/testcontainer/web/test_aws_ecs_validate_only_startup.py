@@ -16,7 +16,6 @@ from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ProgrammingError
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 
 from elspeth.web.app import create_app
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
@@ -31,6 +30,7 @@ from elspeth.web.schema_probe import (
 from elspeth.web.sessions.engine import create_session_engine
 
 pytestmark = pytest.mark.testcontainer
+pytest_plugins = ("tests.testcontainer.web.test_external_deployment_postgres",)
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 
@@ -61,12 +61,6 @@ def _psycopg_connect(url: str) -> psycopg.Connection[Any]:
         password=parsed.password,
         autocommit=True,
     )
-
-
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
 
 
 @dataclass
