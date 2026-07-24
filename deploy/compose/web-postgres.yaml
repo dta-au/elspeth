@@ -1,6 +1,7 @@
 # Production web overlay for the PostgreSQL Compose bundle.
 
 x-web-environment: &web-environment
+  ELSPETH_WEB__HOST: 0.0.0.0
   ELSPETH_WEB__DEPLOYMENT_TARGET: docker-compose
   ELSPETH_WEB__DEPLOYMENT_STATE_MODE: external-postgresql
   ELSPETH_WEB__SESSION_DB_URL: postgresql+psycopg://elspeth:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}@postgres:5432/elspeth_sessions

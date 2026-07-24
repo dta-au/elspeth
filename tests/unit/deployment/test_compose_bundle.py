@@ -224,6 +224,15 @@ def test_web_service_uses_distinct_external_postgresql_state_and_one_persistent_
     assert "elspeth_state" in document["volumes"]
 
 
+def test_web_and_initializer_share_the_container_serving_bind_address() -> None:
+    static = _load(WEB_COMPOSE)
+    rendered = _rendered_bundle()
+
+    for document in (static, rendered):
+        assert _environment(_service(document, "web"))["ELSPETH_WEB__HOST"] == "0.0.0.0"
+        assert _environment(_service(document, "web-init"))["ELSPETH_WEB__HOST"] == "0.0.0.0"
+
+
 def test_web_readiness_probe_uses_only_python_standard_library() -> None:
     web = _service(_load(WEB_COMPOSE), "web")
     probe = " ".join(web["healthcheck"]["test"])
