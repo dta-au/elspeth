@@ -1,0 +1,315 @@
+"""ECS task-definition policy admission bound to protected inventory."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from pathlib import Path, PurePosixPath
+from typing import cast
+
+from elspeth.core.secrets import is_secret_field
+from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
+
+from .contracts import FORBIDDEN_AWS_OVERRIDE_ENV, AcceptanceCheckError, plugin_policy_binding_sha256, scenario_resource_namespace
+from .manifest_schema import _read_control_manifest
+from .scenario_inventory import _TASK_DEFINITION_COMPOSER_MODEL_ENV, PLUGIN_POLICY_ASSIGNMENT_NAMES, _load_bound_scenario_inventory
+
+_TASK_DEFINITION_PLAINTEXT_SECRET_ENV = frozenset(
+    {
+        "DATABASE_URL",
+        "ELSPETH_DATABASE_URL",
+        "ELSPETH_WEB__SESSION_DB_URL",
+        "ELSPETH_WEB__LANDSCAPE_URL",
+    }
+)
+_TASK_DEFINITION_REQUIRED_SECRET_BINDINGS = (
+    ("ELSPETH_WEB__SECRET_KEY", "database-runtime", "secret_key"),
+    ("ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY", "database-runtime", "shareable_link_signing_key"),
+    ("ELSPETH_WEB__SESSION_DB_URL", "database-runtime", "session_url"),
+    ("ELSPETH_WEB__LANDSCAPE_URL", "database-runtime", "landscape_url"),
+)
+_TASK_DEFINITION_OPENROUTER_SECRET_BINDING = (
+    "OPENROUTER_API_KEY",
+    "openrouter-composer",
+    "openrouter_api_key",
+)
+_TASK_DEFINITION_AWS_OVERRIDE_ENV = FORBIDDEN_AWS_OVERRIDE_ENV | {"AWS_DEFAULT_REGION"}
+_SECRET_VALUE_FROM_PATTERN = re.compile(
+    r"arn:(aws(?:-us-gov|-cn)?):secretsmanager:([a-z0-9-]+):([0-9]{12}):"
+    r"secret:([A-Za-z0-9/_+=.@-]{1,512})(?::([^:\x00-\x1f\x7f]{0,256}):([^:\x00-\x1f\x7f]{0,256}):([^:\x00-\x1f\x7f]{0,256}))?\Z"
+)
+_SECRET_ARN_SUFFIX_PATTERN = re.compile(r"(.+)-[A-Za-z0-9]{6}\Z")
+
+
+def _plaintext_task_definition_secret(name: str) -> bool:
+    return name in _TASK_DEFINITION_PLAINTEXT_SECRET_ENV or is_secret_field(name)
+
+
+def _secrets_manager_inventory_binding(
+    value_from: object,
+    *,
+    partition: str,
+    region: str,
+    account_id: str,
+) -> tuple[str, str | None, str | None, str | None] | None:
+    if type(value_from) is not str or len(value_from) > 2048:
+        return None
+    match = _SECRET_VALUE_FROM_PATTERN.fullmatch(value_from)
+    if match is None or match.group(1) != partition or match.group(2) != region or match.group(3) != account_id:
+        return None
+    suffixed_name = match.group(4)
+    name_match = _SECRET_ARN_SUFFIX_PATTERN.fullmatch(suffixed_name)
+    if name_match is None:
+        return None
+    return name_match.group(1), match.group(5), match.group(6), match.group(7)
+
+
+def validate_task_definition_policy_binding(
+    payload: object,
+    *,
+    manifest_path: Path,
+    scenario_id: str,
+    container_name: str,
+    expected_user: str | None = None,
+    expected_image_role: str = "candidate",
+) -> str:
+    """Bind a returned ECS task definition's policy environment to protected inventory."""
+
+    if (
+        scenario_id not in {"A", "B"}
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,255}", container_name) is None
+        or expected_image_role not in {"candidate", "rollback-baseline"}
+    ):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    manifest = _read_control_manifest(manifest_path)
+    inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
+    values = inventory["values"]
+    orphan = inventory["orphan_sweep"]
+    if not isinstance(values, dict) or not isinstance(orphan, dict):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    task = payload.get("taskDefinition") if isinstance(payload, Mapping) else None
+    if not isinstance(task, Mapping) or task.get("status") != "ACTIVE":
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    task_definition_arn = task.get("taskDefinitionArn")
+    task_definition_match = (
+        re.fullmatch(
+            r"arn:(aws(?:-us-gov|-cn)?):ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[A-Za-z0-9_-]+:[1-9][0-9]*",
+            task_definition_arn,
+        )
+        if type(task_definition_arn) is str
+        else None
+    )
+    if type(task_definition_arn) is not str or task_definition_match is None:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    containers = task.get("containerDefinitions")
+    if not isinstance(containers, list) or len(containers) > 100:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    matches = [container for container in containers if isinstance(container, Mapping) and container.get("name") == container_name]
+    if len(matches) != 1:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    container = matches[0]
+    if container.get("essential") is not True:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    ecr = manifest["ecr"]
+    if not isinstance(ecr, Mapping):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    registry = ecr["registry"]
+    repository = ecr["repository"]
+    digest = ecr["candidate_digest"] if expected_image_role == "candidate" else ecr["baseline_digest"]
+    if type(registry) is not str or type(repository) is not str or type(digest) is not str:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    if container.get("image") != f"{registry}/{repository}@{digest}":
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    aws = manifest["aws"]
+    role_names = orphan.get("iam_role_names")
+    if not isinstance(aws, Mapping) or not isinstance(role_names, list):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    account_id = aws.get("account_id")
+    namespace = scenario_resource_namespace(cast(str, manifest["acceptance_run_id"]), scenario_id)
+    expected_roles = {
+        "taskRoleArn": f"{namespace}-task-role",
+        "executionRoleArn": f"{namespace}-execution-role",
+    }
+    role_arns = tuple(task.get(field) for field in expected_roles)
+    if role_arns[0] == role_arns[1]:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    for field, expected_name in expected_roles.items():
+        role_arn = task.get(field)
+        if type(role_arn) is not str:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        match = re.fullmatch(
+            r"arn:aws(?:-us-gov|-cn)?:iam::([0-9]{12}):role/([A-Za-z0-9+=,.@_-]{1,64})",
+            role_arn,
+        )
+        if match is None or match.group(1) != account_id or match.group(2) != expected_name or expected_name not in role_names:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+    if expected_user is not None and (
+        expected_user != "1000:1000"
+        or container.get("user") != expected_user
+        or container.get("entryPoint") != ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
+    ):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    environment = container.get("environment")
+    secrets = container.get("secrets", [])
+    if not isinstance(environment, list) or not isinstance(secrets, list) or len(environment) > 1_000 or len(secrets) > 1_000:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+
+    observed: dict[str, str] = {}
+    for entry in environment:
+        if not isinstance(entry, Mapping) or set(entry) != {"name", "value"}:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        name = entry["name"]
+        value = entry["value"]
+        if type(name) is not str or type(value) is not str or name in observed:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        observed[name] = value
+    if any(name in _TASK_DEFINITION_AWS_OVERRIDE_ENV or _plaintext_task_definition_secret(name) for name in observed):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    if any(observed.get(name) != values.get(name) for name in _TASK_DEFINITION_COMPOSER_MODEL_ENV):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    composer_providers = {
+        infer_provider_from_model_name(observed[name]) or infer_provider_from_unprefixed_model_name(observed[name])
+        for name in _TASK_DEFINITION_COMPOSER_MODEL_ENV
+    }
+    if None in composer_providers or not composer_providers <= {"bedrock", "openrouter"}:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    requires_openrouter = "openrouter" in composer_providers
+    secret_names: set[str] = set()
+    approved_secret_ids = set(cast(list[str], orphan["secret_ids"]))
+    required_secret_bindings = {
+        name: (f"{namespace}-{secret_suffix}", json_key, "", "")
+        for name, secret_suffix, json_key in _TASK_DEFINITION_REQUIRED_SECRET_BINDINGS
+    }
+    if requires_openrouter:
+        name, secret_suffix, json_key = _TASK_DEFINITION_OPENROUTER_SECRET_BINDING
+        required_secret_bindings[name] = (f"{namespace}-{secret_suffix}", json_key, "", "")
+    aws_region = aws.get("region")
+    assert task_definition_match is not None
+    partition = task_definition_match.group(1)
+    for entry in secrets:
+        if not isinstance(entry, Mapping) or set(entry) != {"name", "valueFrom"}:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        name = entry["name"]
+        inventory_binding = _secrets_manager_inventory_binding(
+            entry["valueFrom"],
+            partition=partition,
+            region=cast(str, aws_region),
+            account_id=cast(str, account_id),
+        )
+        if (
+            type(name) is not str
+            or name in secret_names
+            or name in observed
+            or name in _TASK_DEFINITION_AWS_OVERRIDE_ENV
+            or inventory_binding is None
+            or inventory_binding[0] not in approved_secret_ids
+            or (name in required_secret_bindings and inventory_binding != required_secret_bindings[name])
+        ):
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        secret_names.add(name)
+    if not required_secret_bindings.keys() <= secret_names:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    if not requires_openrouter and "OPENROUTER_API_KEY" in secret_names:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+
+    protected_names = (
+        *_TASK_DEFINITION_COMPOSER_MODEL_ENV,
+        *PLUGIN_POLICY_ASSIGNMENT_NAMES,
+        "ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256",
+        "ELSPETH_BEDROCK_LIVE_TEST_MODEL",
+        "AWS_REGION",
+    )
+    acceptance_run_id = cast(str, manifest["acceptance_run_id"])
+    expected_runtime = {
+        "ELSPETH_WEB__DATA_DIR": cast(str, values["ELSPETH_WEB__DATA_DIR"]),
+        "ELSPETH_WEB__PAYLOAD_STORE_PATH": cast(str, values["ELSPETH_WEB__PAYLOAD_STORE_PATH"]),
+        "ELSPETH_ACCEPTANCE_RUN_ID": acceptance_run_id,
+        "ELSPETH_ACCEPTANCE_CANDIDATE_SHA": cast(str, manifest["candidate_sha"]),
+        "ELSPETH_ACCEPTANCE_SCENARIO_ID": scenario_id,
+        "ELSPETH_ACCEPTANCE_S3_BUCKET": cast(str, values["ELSPETH_TEST_S3_BUCKET"]),
+        "ELSPETH_ACCEPTANCE_S3_PREFIX": f"{scenario_resource_namespace(acceptance_run_id, scenario_id)}/{acceptance_run_id}",
+    }
+    if secret_names.intersection((*protected_names, *expected_runtime)):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    if any(observed.get(name) != values.get(name) for name in protected_names):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    if any(observed.get(name) != value for name, value in expected_runtime.items()):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    data_dir_value = observed.get("ELSPETH_WEB__DATA_DIR")
+    payload_root_value = observed.get("ELSPETH_WEB__PAYLOAD_STORE_PATH")
+    try:
+        data_dir = PurePosixPath(cast(str, data_dir_value))
+        payload_root = PurePosixPath(cast(str, payload_root_value))
+    except (TypeError, ValueError):
+        raise AcceptanceCheckError("task_definition_policy_binding") from None
+    if (
+        type(data_dir_value) is not str
+        or type(payload_root_value) is not str
+        or not data_dir.is_absolute()
+        or not payload_root.is_absolute()
+        or data_dir == PurePosixPath("/")
+        or payload_root == data_dir
+        or data_dir not in payload_root.parents
+        or payload_root == data_dir / "blobs"
+    ):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+
+    file_system_ids = orphan.get("efs_file_system_ids")
+    access_point_ids = orphan.get("efs_access_point_ids")
+    if (
+        not isinstance(file_system_ids, list)
+        or not isinstance(access_point_ids, list)
+        or len(file_system_ids) != 1
+        or len(access_point_ids) != 1
+        or type(file_system_ids[0]) is not str
+        or type(access_point_ids[0]) is not str
+    ):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    volumes = task.get("volumes")
+    mount_points = container.get("mountPoints")
+    if not isinstance(volumes, list) or not isinstance(mount_points, list):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    volume_names: set[str] = set()
+    matching_volumes: list[str] = []
+    efs_volume_names: set[str] = set()
+    for volume in volumes:
+        if not isinstance(volume, Mapping) or type(volume.get("name")) is not str:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        volume_name = cast(str, volume["name"])
+        if volume_name in volume_names:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        volume_names.add(volume_name)
+        efs = volume.get("efsVolumeConfiguration")
+        if not isinstance(efs, Mapping):
+            continue
+        efs_volume_names.add(volume_name)
+        authorization = efs.get("authorizationConfig")
+        if (
+            efs.get("fileSystemId") == file_system_ids[0]
+            and efs.get("transitEncryption") == "ENABLED"
+            and (efs.get("rootDirectory") is None or efs.get("rootDirectory") == "/")
+            and isinstance(authorization, Mapping)
+            and authorization.get("accessPointId") == access_point_ids[0]
+            and authorization.get("iam") == "ENABLED"
+        ):
+            matching_volumes.append(volume_name)
+    if len(matching_volumes) != 1 or efs_volume_names != {matching_volumes[0]}:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    bound_mounts = [
+        mount
+        for mount in mount_points
+        if isinstance(mount, Mapping) and (mount.get("sourceVolume") == matching_volumes[0] or mount.get("containerPath") == data_dir_value)
+    ]
+    if len(bound_mounts) != 1 or not (
+        bound_mounts[0].get("sourceVolume") == matching_volumes[0]
+        and bound_mounts[0].get("containerPath") == data_dir_value
+        and bound_mounts[0].get("readOnly") is False
+    ):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    try:
+        observed_binding = plugin_policy_binding_sha256(observed)
+    except AcceptanceCheckError:
+        raise AcceptanceCheckError("task_definition_policy_binding") from None
+    if observed_binding != observed["ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256"]:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    return task_definition_arn

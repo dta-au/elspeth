@@ -23,11 +23,8 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Literal, cast
-
-from elspeth.core.secrets import is_secret_field
-from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
 
 from ._aws_ecs_acceptance.bedrock import (
     _suppress_process_output,
@@ -67,9 +64,7 @@ from ._aws_ecs_acceptance.contracts import (
     _EMERGENCY_CLEANUP_SECONDS,
     _EVIDENCE_KINDS,
     _GIT_SHA_PATTERN,
-    _SCENARIO_VALUE_FIELDS,
     _SHA256_PATTERN,
-    FORBIDDEN_AWS_OVERRIDE_ENV,
     MAX_CONTROL_DOCUMENT_BYTES,
     MAX_EXEC_STREAM_BYTES,
     MAX_JSON_RESPONSE_BYTES,
@@ -82,7 +77,6 @@ from ._aws_ecs_acceptance.contracts import (
     _sha256,
     _task_definition_family,
     _utc_timestamp,
-    plugin_policy_binding_sha256,
     scenario_resource_namespace,
 )
 from ._aws_ecs_acceptance.contracts import (
@@ -90,6 +84,9 @@ from ._aws_ecs_acceptance.contracts import (
 )
 from ._aws_ecs_acceptance.contracts import (
     EVIDENCE_KINDS as EVIDENCE_KINDS,
+)
+from ._aws_ecs_acceptance.contracts import (
+    FORBIDDEN_AWS_OVERRIDE_ENV as FORBIDDEN_AWS_OVERRIDE_ENV,
 )
 from ._aws_ecs_acceptance.contracts import (
     MAX_BLOB_RESPONSE_BYTES as MAX_BLOB_RESPONSE_BYTES,
@@ -121,18 +118,33 @@ from ._aws_ecs_acceptance.contracts import (
 from ._aws_ecs_acceptance.contracts import (
     normalize_acceptance_origin as normalize_acceptance_origin,
 )
+from ._aws_ecs_acceptance.contracts import (
+    plugin_policy_binding_sha256 as plugin_policy_binding_sha256,
+)
 from ._aws_ecs_acceptance.http_client import AcceptanceHttpClient as AcceptanceHttpClient
+from ._aws_ecs_acceptance.manifest import (
+    control_manifest_bind_retained_evidence as control_manifest_bind_retained_evidence,
+)
+from ._aws_ecs_acceptance.manifest import (
+    control_manifest_bind_scenario as control_manifest_bind_scenario,
+)
+from ._aws_ecs_acceptance.manifest import (
+    control_manifest_checkpoint_operator_evidence as control_manifest_checkpoint_operator_evidence,
+)
+from ._aws_ecs_acceptance.manifest import control_manifest_get as control_manifest_get
+from ._aws_ecs_acceptance.manifest import control_manifest_init as control_manifest_init
 from ._aws_ecs_acceptance.manifest_schema import (
-    _CLEANUP_SURFACES,
     _INFRASTRUCTURE_APPROVAL_SCOPES,
     _load_retained_evidence,
     _read_control_manifest,
     _require_mutable_control_manifest,
     _validate_control_manifest,
-    _validate_retained_evidence_receipt,
 )
 from ._aws_ecs_acceptance.manifest_schema import (
     CLEANUP_SURFACES as CLEANUP_SURFACES,
+)
+from ._aws_ecs_acceptance.manifest_schema import (
+    _validate_retained_evidence_receipt as _validate_retained_evidence_receipt,
 )
 from ._aws_ecs_acceptance.operator_telemetry import (
     AcceptancePolicy as AcceptancePolicy,
@@ -189,7 +201,6 @@ from ._aws_ecs_acceptance.receipt_contracts import (
     _TERRAFORM_RECEIPT_KINDS,
     _expected_schema_facts,
     _validate_bounded_receipt_document,
-    _validate_exec_receipt_schema,
     _validate_stored_receipt,
     encode_exec_receipt,
     extract_exec_receipt,
@@ -197,24 +208,30 @@ from ._aws_ecs_acceptance.receipt_contracts import (
 )
 from ._aws_ecs_acceptance.s3 import verify_s3 as verify_s3
 from ._aws_ecs_acceptance.scenario_inventory import (
-    _ORPHAN_INVENTORY_FIELDS,
     _ORPHAN_MAX_ITEMS,
-    _PROVIDER_GENERATED_ORPHAN_FIELDS,
-    _RESOLVED_SCENARIO_FIELDS,
-    _TASK_DEFINITION_COMPOSER_MODEL_ENV,
     _control_path,
     _load_bound_scenario_inventory,
-    _load_preapply_scenario_inventory,
-    _scenario_inventory_hash,
-    _validate_scenario_inventory,
-    _validate_scenario_inventory_isolation,
-    _validate_tf_binding_receipt,
 )
 from ._aws_ecs_acceptance.scenario_inventory import (
     PLUGIN_POLICY_ASSIGNMENT_NAMES as PLUGIN_POLICY_ASSIGNMENT_NAMES,
 )
 from ._aws_ecs_acceptance.scenario_inventory import (
     SCENARIO_ASSIGNMENT_NAMES as SCENARIO_ASSIGNMENT_NAMES,
+)
+from ._aws_ecs_acceptance.scenario_inventory import (
+    _load_preapply_scenario_inventory as _load_preapply_scenario_inventory,
+)
+from ._aws_ecs_acceptance.scenario_inventory import (
+    _scenario_inventory_hash as _scenario_inventory_hash,
+)
+from ._aws_ecs_acceptance.scenario_inventory import (
+    _validate_scenario_inventory as _validate_scenario_inventory,
+)
+from ._aws_ecs_acceptance.scenario_inventory import (
+    _validate_scenario_inventory_isolation as _validate_scenario_inventory_isolation,
+)
+from ._aws_ecs_acceptance.scenario_inventory import (
+    _validate_tf_binding_receipt as _validate_tf_binding_receipt,
 )
 from ._aws_ecs_acceptance.secure_documents import (
     _read_protected_document,
@@ -237,32 +254,10 @@ from ._aws_ecs_acceptance.state import (
 from ._aws_ecs_acceptance.state import (
     write_acceptance_state as write_acceptance_state,
 )
+from ._aws_ecs_acceptance.task_definition import (
+    validate_task_definition_policy_binding as validate_task_definition_policy_binding,
+)
 
-_TASK_DEFINITION_PLAINTEXT_SECRET_ENV = frozenset(
-    {
-        "DATABASE_URL",
-        "ELSPETH_DATABASE_URL",
-        "ELSPETH_WEB__SESSION_DB_URL",
-        "ELSPETH_WEB__LANDSCAPE_URL",
-    }
-)
-_TASK_DEFINITION_REQUIRED_SECRET_BINDINGS = (
-    ("ELSPETH_WEB__SECRET_KEY", "database-runtime", "secret_key"),
-    ("ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY", "database-runtime", "shareable_link_signing_key"),
-    ("ELSPETH_WEB__SESSION_DB_URL", "database-runtime", "session_url"),
-    ("ELSPETH_WEB__LANDSCAPE_URL", "database-runtime", "landscape_url"),
-)
-_TASK_DEFINITION_OPENROUTER_SECRET_BINDING = (
-    "OPENROUTER_API_KEY",
-    "openrouter-composer",
-    "openrouter_api_key",
-)
-_TASK_DEFINITION_AWS_OVERRIDE_ENV = FORBIDDEN_AWS_OVERRIDE_ENV | {"AWS_DEFAULT_REGION"}
-_SECRET_VALUE_FROM_PATTERN = re.compile(
-    r"arn:(aws(?:-us-gov|-cn)?):secretsmanager:([a-z0-9-]+):([0-9]{12}):"
-    r"secret:([A-Za-z0-9/_+=.@-]{1,512})(?::([^:\x00-\x1f\x7f]{0,256}):([^:\x00-\x1f\x7f]{0,256}):([^:\x00-\x1f\x7f]{0,256}))?\Z"
-)
-_SECRET_ARN_SUFFIX_PATTERN = re.compile(r"(.+)-[A-Za-z0-9]{6}\Z")
 _GATE_LEDGER_FIELDS = frozenset(
     {
         "schema",
@@ -316,406 +311,6 @@ _ORPHAN_SURFACES = (
     "ecr",
 )
 _ORPHAN_MAX_PAGES = 100
-
-
-@_serialized_control_manifest_write
-def control_manifest_bind_retained_evidence(
-    path: Path,
-    *,
-    receipt_path: str,
-    require_complete: bool = False,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Bind an immutable monotonic checkpoint of retained metric/trace identities."""
-
-    manifest = _read_control_manifest(path)
-    _require_mutable_control_manifest(manifest)
-    current = now()
-    if current >= _control_timestamp(manifest["teardown_deadline_utc"]):
-        raise AcceptanceCheckError("control_manifest_expired")
-    protected_path = _control_path(receipt_path)
-    receipt, receipt_sha256 = _validate_retained_evidence_receipt(
-        _read_protected_document(Path(protected_path), check="retained_evidence_file"),
-        manifest=manifest,
-    )
-    if require_complete:
-        scenarios = receipt["scenarios"]
-        assert isinstance(scenarios, dict)
-        if any(
-            not cast(dict[str, object], scenarios[scenario_id])["cloudwatch_retained_metrics"]
-            or not cast(dict[str, object], scenarios[scenario_id])["xray_retained_trace_ids"]
-            for scenario_id in ("A", "B")
-        ):
-            raise AcceptanceCheckError("retained_evidence_incomplete")
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, dict)
-    if evidence["retained_evidence_path"] is not None:
-        if evidence["retained_evidence_path"] == protected_path and evidence["retained_evidence_sha256"] == receipt_sha256:
-            return manifest
-        previous = _load_retained_evidence(manifest)
-        if _control_timestamp(cast(str, receipt["captured_at"])) < _control_timestamp(cast(str, previous["captured_at"])):
-            raise AcceptanceCheckError("retained_evidence_conflict")
-        previous_scenarios = previous["scenarios"]
-        next_scenarios = receipt["scenarios"]
-        assert isinstance(previous_scenarios, dict) and isinstance(next_scenarios, dict)
-        grew = False
-        for scenario_id in ("A", "B"):
-            previous_scenario = previous_scenarios[scenario_id]
-            next_scenario = next_scenarios[scenario_id]
-            assert isinstance(previous_scenario, dict) and isinstance(next_scenario, dict)
-            previous_metrics = {
-                json.dumps(item, sort_keys=True, separators=(",", ":"))
-                for item in cast(list[dict[str, object]], previous_scenario["cloudwatch_retained_metrics"])
-            }
-            next_metrics = {
-                json.dumps(item, sort_keys=True, separators=(",", ":"))
-                for item in cast(list[dict[str, object]], next_scenario["cloudwatch_retained_metrics"])
-            }
-            previous_traces = set(cast(list[str], previous_scenario["xray_retained_trace_ids"]))
-            next_traces = set(cast(list[str], next_scenario["xray_retained_trace_ids"]))
-            if not previous_metrics <= next_metrics or not previous_traces <= next_traces:
-                raise AcceptanceCheckError("retained_evidence_conflict")
-            grew = grew or previous_metrics != next_metrics or previous_traces != next_traces
-        if not grew:
-            raise AcceptanceCheckError("retained_evidence_conflict")
-    evidence["retained_evidence_path"] = protected_path
-    evidence["retained_evidence_sha256"] = receipt_sha256
-    manifest["updated_at"] = _utc_timestamp(current)
-    _validate_control_manifest(manifest)
-    _write_protected_document(
-        path,
-        manifest,
-        create=False,
-        exists_check="control_manifest_exists",
-        write_check="control_manifest_file",
-    )
-    return manifest
-
-
-def control_manifest_checkpoint_operator_evidence(
-    path: Path,
-    *,
-    exec_receipt_path: str,
-    checkpoint_path: str,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Create and bind the next immutable checkpoint from one positive operator receipt."""
-
-    manifest = _read_control_manifest(path)
-    _require_mutable_control_manifest(manifest)
-    exec_receipt = _validate_exec_receipt_schema(
-        _read_protected_document(Path(_control_path(exec_receipt_path)), check="operator_exec_receipt_file")
-    )
-    scenario_id = exec_receipt["scenario_id"]
-    details = exec_receipt["details"]
-    if (
-        exec_receipt["check"] != "verify-operator-telemetry"
-        or exec_receipt["candidate_sha"] != manifest["candidate_sha"]
-        or scenario_id not in {"A", "B"}
-        or not isinstance(details, dict)
-        or details["phase"] != "positive"
-    ):
-        raise AcceptanceCheckError("retained_evidence_binding")
-    metric_query = details["retained_metric_query"]
-    trace_id = details["retained_trace_id"]
-    assert isinstance(metric_query, dict) and isinstance(trace_id, str)
-    protected_checkpoint = Path(_control_path(checkpoint_path))
-    current = now()
-
-    if protected_checkpoint.exists():
-        existing, _existing_sha256 = _validate_retained_evidence_receipt(
-            _read_protected_document(protected_checkpoint, check="retained_evidence_file"),
-            manifest=manifest,
-        )
-        existing_scenarios = existing["scenarios"]
-        assert isinstance(existing_scenarios, dict)
-        existing_scenario = existing_scenarios[scenario_id]
-        assert isinstance(existing_scenario, dict)
-        if (
-            metric_query not in existing_scenario["cloudwatch_retained_metrics"]
-            or trace_id not in existing_scenario["xray_retained_trace_ids"]
-        ):
-            raise AcceptanceCheckError("retained_evidence_conflict")
-    else:
-        evidence = manifest["evidence"]
-        assert isinstance(evidence, dict)
-        if evidence["retained_evidence_path"] is None:
-            scenarios: dict[str, object] = {
-                scenario: {
-                    "cloudwatch_retained_metrics": [],
-                    "xray_retained_trace_ids": [],
-                    "expected_retained_metric_series": 0,
-                    "expected_retained_trace_ids": 0,
-                }
-                for scenario in ("A", "B")
-            }
-        else:
-            previous = _load_retained_evidence(manifest)
-            scenarios = json.loads(json.dumps(previous["scenarios"]))
-        scenario = scenarios[scenario_id]
-        assert isinstance(scenario, dict)
-        metrics = cast(list[dict[str, object]], scenario["cloudwatch_retained_metrics"])
-        traces = cast(list[str], scenario["xray_retained_trace_ids"])
-        if metric_query in metrics or trace_id in traces:
-            raise AcceptanceCheckError("retained_evidence_conflict")
-        metrics.append(metric_query)
-        traces.append(trace_id)
-        scenario["expected_retained_metric_series"] = len(metrics)
-        scenario["expected_retained_trace_ids"] = len(traces)
-        checkpoint = {
-            "schema": "elspeth.aws-ecs-retained-evidence.v1",
-            "acceptance_run_id": manifest["acceptance_run_id"],
-            "candidate_sha": manifest["candidate_sha"],
-            "scenarios": scenarios,
-            "captured_at": _utc_timestamp(current),
-        }
-        _validate_retained_evidence_receipt(checkpoint, manifest=manifest)
-        _write_protected_document(
-            protected_checkpoint,
-            checkpoint,
-            create=True,
-            exists_check="retained_evidence_exists",
-            write_check="retained_evidence_file",
-            parent_check="retained_evidence_parent",
-        )
-    return control_manifest_bind_retained_evidence(
-        path,
-        receipt_path=str(protected_checkpoint),
-        now=lambda: current,
-    )
-
-
-def control_manifest_init(
-    path: Path,
-    *,
-    acceptance_run_id: str,
-    candidate_sha: str,
-    aws_account_id: str,
-    aws_region: str,
-    scenario_a_inventory: str,
-    scenario_b_inventory: str,
-    scenario_a_tf_binding: str,
-    scenario_b_tf_binding: str,
-    evidence_destination_sha256: str,
-    gate_ledger: str,
-    teardown_deadline_utc: str,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Create one fresh, closed, interruption-safe Plan 12 control manifest."""
-
-    scenario_a_document = _validate_scenario_inventory(
-        _read_protected_document(Path(scenario_a_inventory), check="scenario_inventory_file"),
-        scenario_id="A",
-        acceptance_run_id=acceptance_run_id,
-        candidate_sha=candidate_sha,
-        aws_account_id=aws_account_id,
-        aws_region=aws_region,
-        tf_binding_sha256=scenario_a_tf_binding,
-        expected_phase="preapply",
-    )
-    scenario_b_document = _validate_scenario_inventory(
-        _read_protected_document(Path(scenario_b_inventory), check="scenario_inventory_file"),
-        scenario_id="B",
-        acceptance_run_id=acceptance_run_id,
-        candidate_sha=candidate_sha,
-        aws_account_id=aws_account_id,
-        aws_region=aws_region,
-        tf_binding_sha256=scenario_b_tf_binding,
-        expected_phase="preapply",
-    )
-    _validate_scenario_inventory_isolation(scenario_a_document, scenario_b_document)
-    scenario_a_values = scenario_a_document["values"]
-    scenario_b_values = scenario_b_document["values"]
-    assert isinstance(scenario_a_values, dict) and isinstance(scenario_b_values, dict)
-    scenario_a_binding_path = scenario_a_values["SCENARIO_TF_BINDING_FILE"]
-    scenario_b_binding_path = scenario_b_values["SCENARIO_TF_BINDING_FILE"]
-    assert isinstance(scenario_a_binding_path, str) and isinstance(scenario_b_binding_path, str)
-    _, scenario_a_state_identity = _validate_tf_binding_receipt(
-        Path(scenario_a_binding_path),
-        scenario_id="A",
-        acceptance_run_id=acceptance_run_id,
-        aws_account_id=aws_account_id,
-        aws_region=aws_region,
-        expected_sha256=scenario_a_tf_binding,
-    )
-    _, scenario_b_state_identity = _validate_tf_binding_receipt(
-        Path(scenario_b_binding_path),
-        scenario_id="B",
-        acceptance_run_id=acceptance_run_id,
-        aws_account_id=aws_account_id,
-        aws_region=aws_region,
-        expected_sha256=scenario_b_tf_binding,
-    )
-    if scenario_a_state_identity == scenario_b_state_identity:
-        raise AcceptanceCheckError("tf_binding_binding")
-    timestamp = _utc_timestamp(now())
-    manifest: dict[str, object] = {
-        "schema": "elspeth.aws-ecs-control-manifest.v5",
-        "acceptance_run_id": acceptance_run_id,
-        "candidate_sha": candidate_sha,
-        "aws": {"account_id": aws_account_id, "region": aws_region},
-        "scenarios": {
-            "A": {
-                "preapply_inventory_path": scenario_a_inventory,
-                "preapply_inventory_sha256": _scenario_inventory_hash(scenario_a_document),
-                "inventory_path": scenario_a_inventory,
-                "inventory_sha256": _scenario_inventory_hash(scenario_a_document),
-                "inventory_phase": "preapply",
-                "tf_binding_sha256": scenario_a_tf_binding,
-                "tf_binding_path": scenario_a_binding_path,
-                "tf_state_identity_sha256": scenario_a_state_identity,
-                "terraform_plan_receipt": None,
-                "terraform_applied": False,
-                "terraform_noop_receipt": None,
-            },
-            "B": {
-                "preapply_inventory_path": scenario_b_inventory,
-                "preapply_inventory_sha256": _scenario_inventory_hash(scenario_b_document),
-                "inventory_path": scenario_b_inventory,
-                "inventory_sha256": _scenario_inventory_hash(scenario_b_document),
-                "inventory_phase": "preapply",
-                "tf_binding_sha256": scenario_b_tf_binding,
-                "tf_binding_path": scenario_b_binding_path,
-                "tf_state_identity_sha256": scenario_b_state_identity,
-                "terraform_plan_receipt": None,
-                "terraform_applied": False,
-                "terraform_noop_receipt": None,
-            },
-        },
-        "gate_ledger_path": gate_ledger,
-        "teardown_deadline_utc": teardown_deadline_utc,
-        "emergency_cleanup_deadline_utc": None,
-        "cleanup_required": False,
-        "cleanup_states": dict.fromkeys(_CLEANUP_SURFACES, "pending"),
-        "ecr": {
-            "registry": None,
-            "repository": None,
-            "baseline_tag": None,
-            "candidate_tag": None,
-            "baseline_digest": None,
-            "candidate_digest": None,
-        },
-        "evidence": {
-            "acceptance_state_path": None,
-            "oidc_evidence_dir": None,
-            "destination_sha256": evidence_destination_sha256,
-            "export_receipt_path": None,
-            "export_receipt_sha256": None,
-            "final_export_receipt_path": None,
-            "final_export_receipt_sha256": None,
-            "retained_evidence_path": None,
-            "retained_evidence_sha256": None,
-            "receipts": [],
-            "approvals": [],
-        },
-        "verdict_failures": [],
-        "cleanup_escalations": [],
-        "deadline_failure_recorded": False,
-        "final_evidence": None,
-        "created_at": timestamp,
-        "updated_at": timestamp,
-    }
-    _validate_control_manifest(manifest)
-    if _control_timestamp(teardown_deadline_utc) <= now():
-        raise AcceptanceCheckError("control_manifest_expired")
-    _write_protected_document(
-        path,
-        manifest,
-        create=True,
-        exists_check="control_manifest_exists",
-        write_check="control_manifest_write",
-    )
-    return manifest
-
-
-@_serialized_control_manifest_write
-def control_manifest_bind_scenario(
-    path: Path,
-    *,
-    scenario_id: str,
-    inventory_path: str,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
-) -> dict[str, object]:
-    """Atomically replace a pre-apply inventory with its immutable resolved inventory."""
-
-    if scenario_id not in {"A", "B"}:
-        raise AcceptanceCheckError("scenario_inventory_binding")
-    manifest = _read_control_manifest(path)
-    _require_mutable_control_manifest(manifest)
-    scenarios = manifest["scenarios"]
-    aws = manifest["aws"]
-    assert isinstance(scenarios, dict) and isinstance(aws, dict)
-    scenario = scenarios[scenario_id]
-    assert isinstance(scenario, dict)
-    resolved_path = _control_path(inventory_path)
-    inventory = _validate_scenario_inventory(
-        _read_protected_document(Path(resolved_path), check="scenario_inventory_file"),
-        scenario_id=scenario_id,
-        acceptance_run_id=cast(str, manifest["acceptance_run_id"]),
-        candidate_sha=cast(str, manifest["candidate_sha"]),
-        aws_account_id=cast(str, aws["account_id"]),
-        aws_region=cast(str, aws["region"]),
-        tf_binding_sha256=cast(str, scenario["tf_binding_sha256"]),
-        expected_phase="resolved",
-    )
-    inventory_sha256 = _scenario_inventory_hash(inventory)
-    if scenario["inventory_phase"] == "resolved":
-        if scenario["inventory_path"] == resolved_path and scenario["inventory_sha256"] == inventory_sha256:
-            return manifest
-        raise AcceptanceCheckError("scenario_inventory_conflict")
-    if scenario["inventory_phase"] != "preapply" or scenario["inventory_path"] == resolved_path:
-        raise AcceptanceCheckError("scenario_inventory_conflict")
-    if now() >= _control_timestamp(manifest["teardown_deadline_utc"]):
-        raise AcceptanceCheckError("control_manifest_expired")
-    if (
-        scenario["terraform_plan_receipt"] is None
-        or scenario["terraform_applied"] is not True
-        or scenario["terraform_noop_receipt"] is None
-    ):
-        raise AcceptanceCheckError("scenario_inventory_unresolved")
-    preapply = _load_preapply_scenario_inventory(manifest, scenario_id)
-    preapply_values = preapply["values"]
-    preapply_orphan = preapply["orphan_sweep"]
-    values = inventory["values"]
-    orphan = inventory["orphan_sweep"]
-    assert isinstance(values, dict) and isinstance(orphan, dict)
-    assert isinstance(preapply_values, dict) and isinstance(preapply_orphan, dict)
-    if any(values[field] != preapply_values[field] for field in _SCENARIO_VALUE_FIELDS - _RESOLVED_SCENARIO_FIELDS):
-        raise AcceptanceCheckError("scenario_inventory_conflict")
-    if any(orphan[field] != preapply_orphan[field] for field in _ORPHAN_INVENTORY_FIELDS - _PROVIDER_GENERATED_ORPHAN_FIELDS):
-        raise AcceptanceCheckError("scenario_inventory_conflict")
-    if values["SCENARIO_TF_BINDING_FILE"] != scenario["tf_binding_path"]:
-        raise AcceptanceCheckError("tf_binding_binding")
-    _, state_identity = _validate_tf_binding_receipt(
-        Path(cast(str, scenario["tf_binding_path"])),
-        scenario_id=scenario_id,
-        acceptance_run_id=cast(str, manifest["acceptance_run_id"]),
-        aws_account_id=cast(str, aws["account_id"]),
-        aws_region=cast(str, aws["region"]),
-        expected_sha256=cast(str, scenario["tf_binding_sha256"]),
-    )
-    if state_identity != scenario["tf_state_identity_sha256"]:
-        raise AcceptanceCheckError("tf_binding_binding")
-    other_id = "B" if scenario_id == "A" else "A"
-    other_scenario = scenarios[other_id]
-    assert isinstance(other_scenario, dict)
-    other_inventory = _load_bound_scenario_inventory(manifest, other_id)
-    _validate_scenario_inventory_isolation(
-        inventory if scenario_id == "A" else other_inventory, other_inventory if scenario_id == "A" else inventory
-    )
-    scenario["inventory_path"] = resolved_path
-    scenario["inventory_sha256"] = inventory_sha256
-    scenario["inventory_phase"] = "resolved"
-    manifest["updated_at"] = _utc_timestamp(now())
-    _validate_control_manifest(manifest)
-    _write_protected_document(
-        path,
-        manifest,
-        create=False,
-        exists_check="control_manifest_exists",
-        write_check="control_manifest_file",
-    )
-    return manifest
 
 
 def control_manifest_validate(
@@ -1379,25 +974,6 @@ def control_manifest_update(
     return manifest
 
 
-def control_manifest_get(path: Path, field: str) -> str:
-    value: object = _read_control_manifest(path)
-    if not field or len(field) > 256:
-        raise AcceptanceCheckError("control_manifest_field")
-    for segment in field.split("."):
-        if not isinstance(value, Mapping) or segment not in value:
-            raise AcceptanceCheckError("control_manifest_field")
-        value = value[segment]
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
-    if isinstance(value, (str, int)):
-        return str(value)
-    raise AcceptanceCheckError("control_manifest_field")
-
-
 def control_manifest_load_cleanup(
     path: Path,
     *,
@@ -1508,280 +1084,6 @@ def scenario_load(
         **{name: values[name] for name in SCENARIO_ASSIGNMENT_NAMES[2:]},
     }
     return "\n".join(f"{name}={shlex.quote(str(assignments[name]))}" for name in SCENARIO_ASSIGNMENT_NAMES) + "\n"
-
-
-def _plaintext_task_definition_secret(name: str) -> bool:
-    return name in _TASK_DEFINITION_PLAINTEXT_SECRET_ENV or is_secret_field(name)
-
-
-def _secrets_manager_inventory_binding(
-    value_from: object,
-    *,
-    partition: str,
-    region: str,
-    account_id: str,
-) -> tuple[str, str | None, str | None, str | None] | None:
-    if type(value_from) is not str or len(value_from) > 2048:
-        return None
-    match = _SECRET_VALUE_FROM_PATTERN.fullmatch(value_from)
-    if match is None or match.group(1) != partition or match.group(2) != region or match.group(3) != account_id:
-        return None
-    suffixed_name = match.group(4)
-    name_match = _SECRET_ARN_SUFFIX_PATTERN.fullmatch(suffixed_name)
-    if name_match is None:
-        return None
-    return name_match.group(1), match.group(5), match.group(6), match.group(7)
-
-
-def validate_task_definition_policy_binding(
-    payload: object,
-    *,
-    manifest_path: Path,
-    scenario_id: str,
-    container_name: str,
-    expected_user: str | None = None,
-    expected_image_role: str = "candidate",
-) -> str:
-    """Bind a returned ECS task definition's policy environment to protected inventory."""
-
-    if (
-        scenario_id not in {"A", "B"}
-        or re.fullmatch(r"[A-Za-z0-9_-]{1,255}", container_name) is None
-        or expected_image_role not in {"candidate", "rollback-baseline"}
-    ):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    manifest = _read_control_manifest(manifest_path)
-    inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-    values = inventory["values"]
-    orphan = inventory["orphan_sweep"]
-    if not isinstance(values, dict) or not isinstance(orphan, dict):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    task = payload.get("taskDefinition") if isinstance(payload, Mapping) else None
-    if not isinstance(task, Mapping) or task.get("status") != "ACTIVE":
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    task_definition_arn = task.get("taskDefinitionArn")
-    task_definition_match = (
-        re.fullmatch(
-            r"arn:(aws(?:-us-gov|-cn)?):ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[A-Za-z0-9_-]+:[1-9][0-9]*",
-            task_definition_arn,
-        )
-        if type(task_definition_arn) is str
-        else None
-    )
-    if type(task_definition_arn) is not str or task_definition_match is None:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    containers = task.get("containerDefinitions")
-    if not isinstance(containers, list) or len(containers) > 100:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    matches = [container for container in containers if isinstance(container, Mapping) and container.get("name") == container_name]
-    if len(matches) != 1:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    container = matches[0]
-    if container.get("essential") is not True:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    ecr = manifest["ecr"]
-    if not isinstance(ecr, Mapping):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    registry = ecr["registry"]
-    repository = ecr["repository"]
-    digest = ecr["candidate_digest"] if expected_image_role == "candidate" else ecr["baseline_digest"]
-    if type(registry) is not str or type(repository) is not str or type(digest) is not str:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    if container.get("image") != f"{registry}/{repository}@{digest}":
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    aws = manifest["aws"]
-    role_names = orphan.get("iam_role_names")
-    if not isinstance(aws, Mapping) or not isinstance(role_names, list):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    account_id = aws.get("account_id")
-    namespace = scenario_resource_namespace(cast(str, manifest["acceptance_run_id"]), scenario_id)
-    expected_roles = {
-        "taskRoleArn": f"{namespace}-task-role",
-        "executionRoleArn": f"{namespace}-execution-role",
-    }
-    role_arns = tuple(task.get(field) for field in expected_roles)
-    if role_arns[0] == role_arns[1]:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    for field, expected_name in expected_roles.items():
-        role_arn = task.get(field)
-        if type(role_arn) is not str:
-            raise AcceptanceCheckError("task_definition_policy_binding")
-        match = re.fullmatch(
-            r"arn:aws(?:-us-gov|-cn)?:iam::([0-9]{12}):role/([A-Za-z0-9+=,.@_-]{1,64})",
-            role_arn,
-        )
-        if match is None or match.group(1) != account_id or match.group(2) != expected_name or expected_name not in role_names:
-            raise AcceptanceCheckError("task_definition_policy_binding")
-    if expected_user is not None and (
-        expected_user != "1000:1000"
-        or container.get("user") != expected_user
-        or container.get("entryPoint") != ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
-    ):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    environment = container.get("environment")
-    secrets = container.get("secrets", [])
-    if not isinstance(environment, list) or not isinstance(secrets, list) or len(environment) > 1_000 or len(secrets) > 1_000:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-
-    observed: dict[str, str] = {}
-    for entry in environment:
-        if not isinstance(entry, Mapping) or set(entry) != {"name", "value"}:
-            raise AcceptanceCheckError("task_definition_policy_binding")
-        name = entry["name"]
-        value = entry["value"]
-        if type(name) is not str or type(value) is not str or name in observed:
-            raise AcceptanceCheckError("task_definition_policy_binding")
-        observed[name] = value
-    if any(name in _TASK_DEFINITION_AWS_OVERRIDE_ENV or _plaintext_task_definition_secret(name) for name in observed):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    if any(observed.get(name) != values.get(name) for name in _TASK_DEFINITION_COMPOSER_MODEL_ENV):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    composer_providers = {
-        infer_provider_from_model_name(observed[name]) or infer_provider_from_unprefixed_model_name(observed[name])
-        for name in _TASK_DEFINITION_COMPOSER_MODEL_ENV
-    }
-    if None in composer_providers:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    requires_openrouter = "openrouter" in composer_providers
-    secret_names: set[str] = set()
-    approved_secret_ids = set(cast(list[str], orphan["secret_ids"]))
-    required_secret_bindings = {
-        name: (f"{namespace}-{secret_suffix}", json_key, "", "")
-        for name, secret_suffix, json_key in _TASK_DEFINITION_REQUIRED_SECRET_BINDINGS
-    }
-    if requires_openrouter:
-        name, secret_suffix, json_key = _TASK_DEFINITION_OPENROUTER_SECRET_BINDING
-        required_secret_bindings[name] = (f"{namespace}-{secret_suffix}", json_key, "", "")
-    aws_region = aws.get("region")
-    assert task_definition_match is not None
-    partition = task_definition_match.group(1)
-    for entry in secrets:
-        if not isinstance(entry, Mapping) or set(entry) != {"name", "valueFrom"}:
-            raise AcceptanceCheckError("task_definition_policy_binding")
-        name = entry["name"]
-        inventory_binding = _secrets_manager_inventory_binding(
-            entry["valueFrom"],
-            partition=partition,
-            region=cast(str, aws_region),
-            account_id=cast(str, account_id),
-        )
-        if (
-            type(name) is not str
-            or name in secret_names
-            or name in observed
-            or name in _TASK_DEFINITION_AWS_OVERRIDE_ENV
-            or inventory_binding is None
-            or inventory_binding[0] not in approved_secret_ids
-            or (name in required_secret_bindings and inventory_binding != required_secret_bindings[name])
-        ):
-            raise AcceptanceCheckError("task_definition_policy_binding")
-        secret_names.add(name)
-    if not required_secret_bindings.keys() <= secret_names:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    if not requires_openrouter and "OPENROUTER_API_KEY" in secret_names:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-
-    protected_names = (
-        *_TASK_DEFINITION_COMPOSER_MODEL_ENV,
-        *PLUGIN_POLICY_ASSIGNMENT_NAMES,
-        "ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256",
-        "ELSPETH_BEDROCK_LIVE_TEST_MODEL",
-        "AWS_REGION",
-    )
-    acceptance_run_id = cast(str, manifest["acceptance_run_id"])
-    expected_runtime = {
-        "ELSPETH_WEB__DATA_DIR": cast(str, values["ELSPETH_WEB__DATA_DIR"]),
-        "ELSPETH_WEB__PAYLOAD_STORE_PATH": cast(str, values["ELSPETH_WEB__PAYLOAD_STORE_PATH"]),
-        "ELSPETH_ACCEPTANCE_RUN_ID": acceptance_run_id,
-        "ELSPETH_ACCEPTANCE_CANDIDATE_SHA": cast(str, manifest["candidate_sha"]),
-        "ELSPETH_ACCEPTANCE_SCENARIO_ID": scenario_id,
-        "ELSPETH_ACCEPTANCE_S3_BUCKET": cast(str, values["ELSPETH_TEST_S3_BUCKET"]),
-        "ELSPETH_ACCEPTANCE_S3_PREFIX": f"{scenario_resource_namespace(acceptance_run_id, scenario_id)}/{acceptance_run_id}",
-    }
-    if secret_names.intersection((*protected_names, *expected_runtime)):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    if any(observed.get(name) != values.get(name) for name in protected_names):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    if any(observed.get(name) != value for name, value in expected_runtime.items()):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    data_dir_value = observed.get("ELSPETH_WEB__DATA_DIR")
-    payload_root_value = observed.get("ELSPETH_WEB__PAYLOAD_STORE_PATH")
-    try:
-        data_dir = PurePosixPath(cast(str, data_dir_value))
-        payload_root = PurePosixPath(cast(str, payload_root_value))
-    except (TypeError, ValueError):
-        raise AcceptanceCheckError("task_definition_policy_binding") from None
-    if (
-        type(data_dir_value) is not str
-        or type(payload_root_value) is not str
-        or not data_dir.is_absolute()
-        or not payload_root.is_absolute()
-        or data_dir == PurePosixPath("/")
-        or payload_root == data_dir
-        or data_dir not in payload_root.parents
-        or payload_root == data_dir / "blobs"
-    ):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-
-    file_system_ids = orphan.get("efs_file_system_ids")
-    access_point_ids = orphan.get("efs_access_point_ids")
-    if (
-        not isinstance(file_system_ids, list)
-        or not isinstance(access_point_ids, list)
-        or len(file_system_ids) != 1
-        or len(access_point_ids) != 1
-        or type(file_system_ids[0]) is not str
-        or type(access_point_ids[0]) is not str
-    ):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    volumes = task.get("volumes")
-    mount_points = container.get("mountPoints")
-    if not isinstance(volumes, list) or not isinstance(mount_points, list):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    volume_names: set[str] = set()
-    matching_volumes: list[str] = []
-    efs_volume_names: set[str] = set()
-    for volume in volumes:
-        if not isinstance(volume, Mapping) or type(volume.get("name")) is not str:
-            raise AcceptanceCheckError("task_definition_policy_binding")
-        volume_name = cast(str, volume["name"])
-        if volume_name in volume_names:
-            raise AcceptanceCheckError("task_definition_policy_binding")
-        volume_names.add(volume_name)
-        efs = volume.get("efsVolumeConfiguration")
-        if not isinstance(efs, Mapping):
-            continue
-        efs_volume_names.add(volume_name)
-        authorization = efs.get("authorizationConfig")
-        if (
-            efs.get("fileSystemId") == file_system_ids[0]
-            and efs.get("transitEncryption") == "ENABLED"
-            and (efs.get("rootDirectory") is None or efs.get("rootDirectory") == "/")
-            and isinstance(authorization, Mapping)
-            and authorization.get("accessPointId") == access_point_ids[0]
-            and authorization.get("iam") == "ENABLED"
-        ):
-            matching_volumes.append(volume_name)
-    if len(matching_volumes) != 1 or efs_volume_names != {matching_volumes[0]}:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    bound_mounts = [
-        mount
-        for mount in mount_points
-        if isinstance(mount, Mapping) and (mount.get("sourceVolume") == matching_volumes[0] or mount.get("containerPath") == data_dir_value)
-    ]
-    if len(bound_mounts) != 1 or not (
-        bound_mounts[0].get("sourceVolume") == matching_volumes[0]
-        and bound_mounts[0].get("containerPath") == data_dir_value
-        and bound_mounts[0].get("readOnly") is False
-    ):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    try:
-        observed_binding = plugin_policy_binding_sha256(observed)
-    except AcceptanceCheckError:
-        raise AcceptanceCheckError("task_definition_policy_binding") from None
-    if observed_binding != observed["ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256"]:
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    return task_definition_arn
 
 
 @dataclass(frozen=True)
