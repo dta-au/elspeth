@@ -847,6 +847,16 @@ Elspeth can run from a published Docker image. Replace `v0.7.2` with the tag
 published for the release you are deploying; use the exact tag for an older
 release line when deploying an earlier version.
 
+The image contains PostgreSQL clients, not a PostgreSQL server. It supports
+both `postgresql+psycopg://` (psycopg v3) and
+`postgresql+psycopg2://` (psycopg2). The shipped Compose bundle is the only
+maintained bundle that provisions PostgreSQL; AWS and the maintained Azure
+Ubuntu VM path use external PostgreSQL in production. Run one web process and
+preserve payload persistence separately from database persistence. See the
+[deployment platform matrix](docs/reference/deployment-platforms.md) for the
+maintained Compose, AWS ECS, and native Linux paths plus the explicit Azure VM
+and Kubernetes boundaries.
+
 ```bash
 IMAGE_TAG=v0.7.2
 
@@ -930,6 +940,7 @@ See [Architecture Documentation](ARCHITECTURE.md) for C4 diagrams and detailed d
 | [docs/guides/](docs/guides/) | All | Tutorials, MCP analysis guide, data trust model |
 | [docs/release/](docs/release/) | Evaluators | Executive summary, Composer guide, platform architecture, guarantees, assessment mapping, release evidence, and archive policy |
 | [docs/reference/](docs/reference/) | Developers | Configuration reference |
+| [docs/reference/deployment-platforms.md](docs/reference/deployment-platforms.md) | Operators | Maintained deployment paths, database ownership, persistence, and deferred platform boundaries |
 | [docs/runbooks/](docs/runbooks/) | Operators | Deployment and operations |
 
 ---

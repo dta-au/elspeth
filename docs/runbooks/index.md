@@ -15,7 +15,8 @@ Operational procedures for ELSPETH pipeline management.
 | [Database Maintenance](database-maintenance.md) | Audit DB growing large, need cleanup |
 | [Incident Response](incident-response.md) | Production issue needs investigation |
 | [Backup and Recovery](backup-and-recovery.md) | Backup audit trail, restore from backup |
-| [Ansible Ubuntu Deployment](ansible-ubuntu-deployment.md) | Automate Ubuntu 24.04/22.04 VM, Azure Front Door, and Azure container deployments |
+| [Deployment Platforms](../reference/deployment-platforms.md) | Choose a maintained Compose, AWS ECS, native Linux, or Azure Ubuntu VM path; Kubernetes is BYO and Azure Container Apps is deferred |
+| [Native Linux and Azure Ubuntu VM Deployment](ansible-ubuntu-deployment.md) | Install one systemd-managed web process on Ubuntu; Azure may use one VM behind Front Door |
 | [AWS ECS Deployment](aws-ecs-deployment.md) | Deploying ELSPETH web to AWS ECS Fargate with Aurora PostgreSQL |
 | [AWS ECS Bedrock Opus and Sonnet](aws-ecs-bedrock-opus-sonnet.md) | Configure and validate operator-approved Bedrock Opus and Sonnet profiles on ECS |
 | [Audit Tier-1 Violation](audit-tier1-violation.md) | Compose-loop audit counters or audit-grade transcript logging fail |

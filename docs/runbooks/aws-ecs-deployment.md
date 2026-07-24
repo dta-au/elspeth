@@ -36,16 +36,27 @@ application and collector have deliberately separate evidence roles:
   never proves an audit write, and loss of the collector never rolls back a
   committed Landscape record.
 
-`ELSPETH_WEB__DEPLOYMENT_TARGET=aws-ecs` requires PostgreSQL
-`session_db_url` and `landscape_url` values. Both bare `postgresql://...`
-(SQLAlchemy's default `psycopg2` driver) and explicit
-`postgresql+psycopg://...` (psycopg v3) are supported. Production images that
-include the `postgres` extra contain both drivers. The deployment also requires
+`ELSPETH_WEB__DEPLOYMENT_TARGET=aws-ecs` requires external PostgreSQL
+`session_db_url` and `landscape_url` values. The image contains PostgreSQL
+clients, not a PostgreSQL server. Both `postgresql+psycopg2://...` (psycopg2)
+and `postgresql+psycopg://...` (psycopg v3) are supported; bare
+`postgresql://...` also selects psycopg2. Production images that include the
+`postgres` extra contain both drivers. The deployment also requires
 a pre-provisioned writable `data_dir`, an explicit
 writable `payload_store_path`, and non-placeholder
 `ELSPETH_WEB__SECRET_KEY` and
 `ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY` secrets. Web startup validates this
 contract but never creates, migrates, drops, or repairs either schema.
+
+Run one web process in the one ECS task. Payload persistence on EFS is
+separate from database persistence in Aurora/PostgreSQL; back up and restore
+both. Every replacement retains the zero-overlap service settings
+`minimumHealthyPercent=0`, `maximumPercent=100`, and `desiredCount=1` and uses
+an immutable image digest.
+
+Use `elspeth doctor deployment --init-schema` as the provider-neutral schema
+bootstrap. This runbook retains the AWS-compatible task command
+`elspeth doctor aws-ecs --init-schema`.
 
 AWS credentials are provided by ECS task roles and AWS Secrets Manager
 injection — never baked into the image or passed on the command line. ECS

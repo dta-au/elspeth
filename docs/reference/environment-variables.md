@@ -9,6 +9,7 @@ Reference for ELSPETH environment variables and `.env` configuration.
 - [Automatic .env Loading](#automatic-env-loading)
 - [Required Variables](#required-variables)
 - [Optional Variables](#optional-variables)
+- [Web Deployment Variables](#web-deployment-variables)
 - [LLM Provider Variables](#llm-provider-variables)
 - [Azure Service Variables](#azure-service-variables)
 - [Telemetry Variables](#telemetry-variables)
@@ -120,6 +121,28 @@ Used by the `llm` transform (provider: openrouter).
 Used by `llm` (provider: azure) transforms.
 
 **Endpoint format:** `https://your-resource.openai.azure.com`
+
+## Web Deployment Variables
+
+These variables define the web process's deployment and persistence contract.
+See the [deployment platform matrix](deployment-platforms.md) before selecting
+a target.
+
+| Variable | Allowed values / purpose |
+| --- | --- |
+| `ELSPETH_WEB__DEPLOYMENT_TARGET` | `default`, `docker-compose`, `linux-systemd`, `aws-ecs`, `azure-container-apps`, or `kubernetes`. The `azure-container-apps` value is reserved; no supported Container Apps bundle ships in this release. |
+| `ELSPETH_WEB__DEPLOYMENT_STATE_MODE` | `auto`, `sqlite-single`, or `external-postgresql`. Production cloud targets require `external-postgresql`; native Linux can use `sqlite-single` on one host. |
+| `ELSPETH_WEB__SESSION_DB_URL` | Session database URL. External mode requires PostgreSQL. |
+| `ELSPETH_WEB__LANDSCAPE_URL` | Landscape database URL. Keep it distinct from the session database. |
+| `ELSPETH_WEB__DATA_DIR` | Persistent application data directory. |
+| `ELSPETH_WEB__PAYLOAD_STORE_PATH` | Persistent payload directory. Payload persistence is separate from database persistence. |
+| `WEB_CONCURRENCY` | Web worker count. Set exactly `1` for every supported deployment. |
+
+The image includes both PostgreSQL clients, not the PostgreSQL server. Use
+`postgresql+psycopg://` for psycopg v3 or `postgresql+psycopg2://` for
+psycopg2. Initialize new external databases once with
+`elspeth doctor deployment --init-schema`; ordinary web startup validates but
+does not create schemas.
 
 ---
 
@@ -362,7 +385,7 @@ For docker-compose:
 ```yaml
 services:
   elspeth:
-    image: ghcr.io/johnm-dta/elspeth:latest
+    image: ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set an immutable sha-* or v* tag}
     environment:
       - ELSPETH_FINGERPRINT_KEY=${ELSPETH_FINGERPRINT_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}

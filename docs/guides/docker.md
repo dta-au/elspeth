@@ -70,6 +70,12 @@ docker run --rm \
 
 Pass secrets and configuration via environment variables. See the [Environment Variables Reference](../reference/environment-variables.md) for the complete list.
 
+The image contains PostgreSQL clients, not a PostgreSQL server. It supports
+`postgresql+psycopg://` with psycopg v3 and
+`postgresql+psycopg2://` with psycopg2. Compose is the only shipped bundle
+that provisions PostgreSQL; AWS, an Azure Ubuntu VM, or BYO Kubernetes
+manifests must connect ELSPETH to an operator-provided external service.
+
 ```bash
 docker run --rm \
   -e DATABASE_URL="sqlite:////app/data/audit.db" \
@@ -91,10 +97,9 @@ docker run --rm \
 | `OPENROUTER_API_KEY` | LLM provider API key |
 | `DATABASE_URL` | Audit database (default: SQLite) |
 
-For PostgreSQL, ELSPETH supports both SQLAlchemy URL forms:
-`postgresql://...` uses the bundled `psycopg2` driver, while
-`postgresql+psycopg://...` selects bundled psycopg v3 explicitly. Images built
-with the `postgres` extra contain both. The official generic image is built
+For PostgreSQL, ELSPETH also accepts bare `postgresql://...`, which uses the
+bundled psycopg2 driver. Images built with the `postgres` extra contain both
+PostgreSQL clients. The official generic image is built
 with `INSTALL_EXTRAS=all`; verify an artifact's selected profile before
 promotion with:
 
@@ -205,39 +210,56 @@ docker compose run --rm elspeth health --verbose
 docker compose run -it --rm elspeth explain --run latest --row 42 --database /app/data/audit.db
 ```
 
-### Production docker-compose
+### Production Docker Compose
 
-```yaml
-# docker-compose.prod.yaml
-services:
-  elspeth:
-    image: ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set IMAGE_TAG to sha-<commit> or v*}
-    environment:
-      - DATABASE_URL=postgresql://<user>:<password>@db:5432/elspeth  # secret-scan: allow-this-line
-      - OPENROUTER_API_KEY
-      - ELSPETH_FINGERPRINT_KEY
-      - ELSPETH_SIGNING_KEY
-    volumes:
-      - ./config:/app/config:ro
-      - ./input:/app/input:ro
-      - ./output:/app/output
-      - elspeth_data:/app/data
-    depends_on:
-      - db
+Run the shipped bundle from the repository root. It starts one web process,
+PostgreSQL 16, distinct session and Landscape databases, schema initialization,
+and separate PostgreSQL and ELSPETH state volumes.
 
-  db:
-    image: postgres:15
-    environment:
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=pass
-      - POSTGRES_DB=elspeth
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+1. Create the repository-root `.env`:
 
-volumes:
-  elspeth_state:
-  postgres_data:
-```
+   ```bash
+   cp deploy/compose/.env.example .env
+   chmod 600 .env
+   ```
+
+2. Generate the database password:
+
+   ```bash
+   openssl rand -hex 24
+   ```
+
+   Put the result in `.env` as `POSTGRES_PASSWORD`. It must remain a
+   48-character lowercase hexadecimal value. The bundle uses this same
+   URL-unreserved value for the PostgreSQL role and connection URLs; do not
+   paste an arbitrary unencoded password into a database URL. Complete the
+   other required secrets and set `IMAGE_TAG` to an immutable `sha-*` or `v*`
+   release tag.
+
+3. Start the exact three-file bundle:
+
+   ```bash
+   docker compose --env-file .env \
+     -f docker-compose.yaml \
+     -f deploy/compose/postgres.yaml \
+     -f deploy/compose/web-postgres.yaml up -d
+   ```
+
+4. Verify the one-shot schema gate and readiness:
+
+   ```bash
+   docker compose --env-file .env \
+     -f docker-compose.yaml \
+     -f deploy/compose/postgres.yaml \
+     -f deploy/compose/web-postgres.yaml run --rm web-init \
+     doctor deployment --init-schema
+   curl -fsS http://127.0.0.1:8451/api/ready
+   ```
+
+The `postgres_data` volume is database persistence. The `elspeth_state`
+volume holds payload persistence and local data. Back up and restore them as
+separate stores. Do not scale `web` beyond one replica or run more than one
+web process.
 
 ---
 
@@ -272,15 +294,12 @@ docker run --rm ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} health --json
 }
 ```
 
-### Kubernetes Liveness Probe
+### Kubernetes
 
-```yaml
-livenessProbe:
-  exec:
-    command: ["elspeth", "health", "--json"]
-  initialDelaySeconds: 5
-  periodSeconds: 30
-```
+This release does not ship Kubernetes manifests. BYO manifests must use one
+web process in one replica, `strategy: Recreate`, external PostgreSQL, and
+persistent payload storage. See the
+[deployment platform contract](../reference/deployment-platforms.md#kubernetes).
 
 ---
 
@@ -410,30 +429,9 @@ docker run --rm \
   ...
 ```
 
-### Health check fails in Kubernetes
-
-**Symptom:** Pod keeps restarting due to failed liveness probe.
-
-**Cause:** Health check requires database connection that's not ready.
-
-**Fix:** Increase `initialDelaySeconds` or use readiness probe:
-```yaml
-readinessProbe:
-  exec:
-    command: ["elspeth", "health", "--json"]
-  initialDelaySeconds: 10
-  periodSeconds: 5
-livenessProbe:
-  exec:
-    command: ["elspeth", "health", "--json"]
-  initialDelaySeconds: 30
-  periodSeconds: 30
-```
-
----
-
 ## See Also
 
+- [Deployment Platforms](../reference/deployment-platforms.md) - Maintained and BYO support boundaries
 - [AWS ECS Deployment Runbook](../runbooks/aws-ecs-deployment.md) - Production ECS/Fargate deployment contract
 - [Your First Pipeline](your-first-pipeline.md) - Getting started guide
 - [Configuration Reference](../reference/configuration.md) - Complete config options

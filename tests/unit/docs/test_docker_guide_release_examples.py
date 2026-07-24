@@ -9,6 +9,10 @@ DOCKER_GUIDE = REPO_ROOT / "docs" / "guides" / "docker.md"
 BASE_COMPOSE = REPO_ROOT / "docker-compose.yaml"
 STALE_IMAGE_TAG = "elspeth:v0.1.0"
 SHIPPED_COMPOSE_IMAGE = "${REGISTRY:-ghcr.io/johnm-dta}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}"
+THREE_FILE_COMPOSE_COMMAND = """docker compose --env-file .env \\
+  -f docker-compose.yaml \\
+  -f deploy/compose/postgres.yaml \\
+  -f deploy/compose/web-postgres.yaml up -d"""
 
 
 def test_docker_guide_uses_release_tag_variable_for_image_examples() -> None:
@@ -33,3 +37,27 @@ def test_shipped_compose_base_requires_an_immutable_release_image() -> None:
 
     assert SHIPPED_COMPOSE_IMAGE in text
     assert "${IMAGE_TAG:-latest}" not in text
+
+
+def test_docker_guide_uses_the_shipped_three_file_postgresql_bundle() -> None:
+    text = DOCKER_GUIDE.read_text(encoding="utf-8")
+
+    assert " ".join(THREE_FILE_COMPOSE_COMMAND.split()) in " ".join(text.split())
+    assert "cp deploy/compose/.env.example .env" in text
+    assert "openssl rand -hex 24" in text
+    assert "48-character lowercase hexadecimal" in text
+    assert "doctor deployment --init-schema" in text
+
+
+def test_docker_guide_explains_the_container_database_boundary() -> None:
+    text = DOCKER_GUIDE.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+
+    assert "PostgreSQL clients" in text
+    assert "PostgreSQL clients, not a PostgreSQL server" in normalized
+    assert "postgresql+psycopg://" in text
+    assert "postgresql+psycopg2://" in text
+    assert "Compose is the only shipped bundle that provisions PostgreSQL" in normalized
+    assert "one web process" in text
+    assert "payload persistence" in text.lower()
+    assert "database persistence" in text.lower()
