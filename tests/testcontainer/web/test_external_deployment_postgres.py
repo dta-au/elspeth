@@ -421,7 +421,7 @@ def test_doctor_rejects_same_database_without_leaking_credentials(
     by_name = {item["name"]: item for item in report}
     assert by_name["separate_db_targets"]["ok"] is False
     _assert_redacted(result.stdout + result.stderr, database_pair)
-    owner = create_engine(database_pair.session_owner_url)
+    owner = create_session_engine(database_pair.session_owner_url)
     try:
         assert inspect(owner).get_table_names() == []
     finally:
