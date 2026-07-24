@@ -200,7 +200,7 @@ Every multi-command gate must fail fast with `set -Eeuo pipefail`, separate exec
 - Recapture parser, dispatch, public-symbol, test-collection, and coverage baselines from `BASE_SHA`.
 - Run the current controller/runbook/architecture lane.
 - Run the deterministic scenario probe.
-- Run repository Ruff, formatting, mypy, and all source-sensitive static gates.
+- Run repository Ruff, formatting, mypy, and all locally owned source-sensitive static gates that do not depend on out-of-band release metadata.
 - Confirm `uv.lock` is unchanged.
 
 ### Per extraction commit
@@ -216,7 +216,7 @@ Every multi-command gate must fail fast with `set -Eeuo pipefail`, separate exec
 - Run the canonical Python 3.12 compatibility lane.
 - Run the canonical Python 3.13 coverage lane and require repository and controller/package non-regression.
 - Run the five focused PostgreSQL testcontainer files and the complete testcontainer suite once.
-- Run every source-sensitive custom CI gate.
+- Run every locally owned source-sensitive custom gate that does not depend on out-of-band release metadata.
 - Build and install the wheel using publishable `webui,llm,aws,postgres` extras.
 - Build and smoke the local container because the refactor changes packaged executable code.
 - In both wheel and container smokes:
