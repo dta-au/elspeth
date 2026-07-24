@@ -13,6 +13,8 @@ from types import SimpleNamespace
 import pytest
 
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._aws_ecs_acceptance import bedrock
 from tests.unit.web.aws_ecs_acceptance.test_receipt_contracts import _plugin_policy_receipt
@@ -564,7 +566,7 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
     from tests.unit.plugins.transforms.aws.test_guardrails_client import CONTENT_FILTERS, response
 
     database_url = f"sqlite:///{tmp_path / 'landscape.db'}"
-    with acceptance.LandscapeDB.from_url(database_url, create_tables=True):
+    with LandscapeDB.from_url(database_url, create_tables=True):
         pass
     settings = SimpleNamespace(
         landscape_passphrase=None,
@@ -651,8 +653,8 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
     assert len(manager.events) == 4
     assert manager.flushed is True
     assert manager.closed is True
-    with acceptance.LandscapeDB.from_url(database_url, create_tables=False) as database:
-        repositories = acceptance.RecorderFactory.writable(database)
+    with LandscapeDB.from_url(database_url, create_tables=False) as database:
+        repositories = RecorderFactory.writable(database)
         runs = repositories.run_lifecycle.list_runs()
         assert len(runs) == 1
         assert runs[0].status.value == "completed"

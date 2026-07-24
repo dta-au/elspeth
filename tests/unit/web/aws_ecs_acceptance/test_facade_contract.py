@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from elspeth.web import aws_ecs_acceptance as acceptance
+from elspeth.web._aws_ecs_acceptance import operator_telemetry
 
 EXPECTED_COMMANDS = {
     "approval-require-current",
@@ -137,6 +138,25 @@ EXPECTED_PUBLIC_EXPORTS = {
     "verify_payloads",
     "verify_s3",
     "write_acceptance_state",
+    "xray_trace_id",
+}
+
+OPERATOR_TELEMETRY_OWNER_EXPORTS = {
+    "AWSOperatorMetricEmitter",
+    "AWSOperatorTelemetryQueries",
+    "AcceptancePolicy",
+    "AuditSentinel",
+    "ExistingLandscapeLifecycleAudit",
+    "OperatorTelemetryEvidence",
+    "OperatorTelemetryOutageEvidence",
+    "PublicApiLifecycleAudit",
+    "TelemetryQueries",
+    "TelemetrySentinelEmitter",
+    "operator_metric_dimensions",
+    "verify_connection_budget_live",
+    "verify_operator_telemetry",
+    "verify_operator_telemetry_live",
+    "verify_operator_telemetry_outage",
     "xray_trace_id",
 }
 
@@ -505,6 +525,11 @@ def test_all_selected_base_public_exports_remain_importable() -> None:
     assert len(EXPECTED_PUBLIC_EXPORTS) == 91
     missing = {name for name in EXPECTED_PUBLIC_EXPORTS if not hasattr(acceptance, name)}
     assert not missing
+
+
+def test_operator_telemetry_exports_are_facade_reexports_by_identity() -> None:
+    for name in OPERATOR_TELEMETRY_OWNER_EXPORTS:
+        assert getattr(acceptance, name) is getattr(operator_telemetry, name)
 
 
 def test_public_export_literal_matches_selected_base_module_definitions() -> None:
