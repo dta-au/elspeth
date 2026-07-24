@@ -56,6 +56,7 @@ from elspeth.core.landscape.schema import run_attributions_table, runs_table
 from elspeth.telemetry.manager import TelemetryManager
 from elspeth.web.blobs.protocol import BlobFinalizationResult, BlobRecord, BlobServiceProtocol
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.execution.errors import PipelineValidationError
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import FrozenRunSettings
@@ -1730,6 +1731,10 @@ sinks:
         output_path = tmp_path / "out.jsonl"
         run_id = str(uuid4())
         mock_settings.deployment_target = "aws-ecs"
+        mock_settings.deployment_state_mode = "external-postgresql"
+        mock_settings.get_session_db_url = MagicMock(return_value="postgresql+psycopg://db.invalid/elspeth_sessions")
+        mock_settings.landscape_url = "postgresql+psycopg2://db.invalid/elspeth_landscape"
+        assert resolve_deployment_state_mode(mock_settings) == "external-postgresql"
         mock_settings.operator_telemetry_service_name = "elspeth-web-test"
         mock_settings.operator_telemetry_environment = "test"
         mock_settings.operator_telemetry_release = "git-test"
@@ -1738,9 +1743,9 @@ sinks:
         mock_settings.operator_telemetry_task_definition_family = "elspeth-web-task"
         mock_settings.operator_telemetry_task_definition_revision = "1"
         mock_settings.operator_pipeline_telemetry_granularity = "lifecycle"
-        mock_settings.landscape_url = f"sqlite:///{tmp_path / 'audit.db'}"
+        test_landscape_url = f"sqlite:///{tmp_path / 'audit.db'}"
         mock_settings.payload_store_path = tmp_path / "payloads"
-        initialized_db = LandscapeDB.from_url(mock_settings.landscape_url)
+        initialized_db = LandscapeDB.from_url(test_landscape_url)
         initialized_db.close()
         pipeline_yaml = f"""
 sources:
@@ -1781,10 +1786,16 @@ telemetry:
         # transport delivery itself is covered by test_operator_telemetry.py.
         telemetry_manager = create_autospec(TelemetryManager, instance=True)
         telemetry_manager.health_metrics = {"events_dropped": 3, "queue_drops": 1}
+
+        def _open_test_landscape_db(settings: _WebSettingsStub) -> LandscapeDB:
+            assert settings is mock_settings
+            assert resolve_deployment_state_mode(settings) == "external-postgresql"
+            return LandscapeDB.from_url(test_landscape_url, create_tables=False)
+
         with (
             patch(
                 "elspeth.web.execution.service.open_landscape_db",
-                return_value=LandscapeDB.from_url(mock_settings.landscape_url, create_tables=False),
+                side_effect=_open_test_landscape_db,
             ),
             patch("elspeth.telemetry.create_telemetry_manager", return_value=telemetry_manager),
             patch("elspeth.web.operator_telemetry.record_operator_pipeline_queue_drops") as record_queue_drops,
@@ -1794,7 +1805,7 @@ telemetry:
         telemetry_manager.close.assert_called_once_with()
         record_queue_drops.assert_called_once_with(1)
 
-        db = LandscapeDB.from_url(mock_settings.landscape_url, create_tables=False)
+        db = LandscapeDB.from_url(test_landscape_url, create_tables=False)
         try:
             with db.read_only_connection() as conn:
                 row = conn.execute(select(runs_table.c.settings_json, runs_table.c.config_hash).where(runs_table.c.run_id == run_id)).one()
