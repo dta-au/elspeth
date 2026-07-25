@@ -126,6 +126,7 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
+    web_aws_s3_source_policy_error,
     web_llm_base_url_policy_error,
     web_llm_retry_budget_policy_error,
     web_llm_tracing_policy_error,
@@ -1778,15 +1779,21 @@ def validate_pipeline(
     )
 
     for source_name, source in state.sources.items():
+        source_policy_error = web_aws_s3_source_policy_error(source.plugin)
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
-        if endpoint_policy_error is None:
+        policy_error = source_policy_error or endpoint_policy_error
+        if policy_error is None:
             continue
         source_component = "source" if source_name == "source" else f"source:{source_name}"
         checks.append(
             ValidationCheck(
                 name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
                 passed=False,
-                detail=f"Source '{source_name}' sets aws_s3 endpoint_url in a web-authored pipeline",
+                detail=(
+                    f"Source '{source_name}' uses aws_s3 in a web-authored pipeline"
+                    if source_policy_error is not None
+                    else f"Source '{source_name}' sets aws_s3 endpoint_url in a web-authored pipeline"
+                ),
                 affected_nodes=(source_component,),
                 outcome_code=None,
             )
@@ -1799,14 +1806,26 @@ def validate_pipeline(
                 ValidationError(
                     component_id=source_component,
                     component_type="source",
-                    message=endpoint_policy_error,
-                    suggestion="Remove endpoint_url and use operator-controlled AWS configuration.",
-                    error_code="aws_s3_endpoint_url_not_allowed",
+                    message=policy_error,
+                    suggestion=(
+                        "Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads."
+                        if source_policy_error is not None
+                        else "Remove endpoint_url and use operator-controlled AWS configuration."
+                    ),
+                    error_code=(
+                        "aws_s3_source_not_allowed"
+                        if source_policy_error is not None
+                        else "aws_s3_endpoint_url_not_allowed"
+                    ),
                 )
             ],
             readiness=_blocked_readiness(
                 code=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-                detail=f"source {source_component} sets aws_s3 endpoint_url in a web-authored pipeline",
+                detail=(
+                    f"source {source_component} uses aws_s3 in a web-authored pipeline"
+                    if source_policy_error is not None
+                    else f"source {source_component} sets aws_s3 endpoint_url in a web-authored pipeline"
+                ),
                 component_id=source_component,
                 component_type="source",
             ),

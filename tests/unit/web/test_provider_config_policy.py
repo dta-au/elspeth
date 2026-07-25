@@ -10,10 +10,25 @@ import pytest
 
 from elspeth.web.provider_config_policy import (
     AWS_S3_ENDPOINT_URL_POLICY_ERROR,
+    AWS_S3_SOURCE_POLICY_ERROR,
     LLM_TRACING_POLICY_ERROR,
     web_aws_s3_endpoint_url_policy_error,
+    web_aws_s3_source_policy_error,
     web_llm_tracing_policy_error,
 )
+
+
+class TestWebAwsS3SourcePolicy:
+    @pytest.mark.parametrize("plugin", ["csv", None, "json"])
+    def test_allows_non_aws_s3_sources(self, plugin: str | None) -> None:
+        assert web_aws_s3_source_policy_error(plugin) is None
+
+    def test_rejects_aws_s3_source_without_echoing_bucket_or_key(self) -> None:
+        error = web_aws_s3_source_policy_error("aws_s3")
+
+        assert error == AWS_S3_SOURCE_POLICY_ERROR
+        assert "prod-confidential-bucket" not in error
+        assert "payroll/ssn.csv" not in error
 
 
 class TestWebAwsS3EndpointUrlPolicy:

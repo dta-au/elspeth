@@ -60,7 +60,7 @@ from elspeth.web.plugin_policy.models import (
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
-from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
+from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR, AWS_S3_SOURCE_POLICY_ERROR
 
 
 def _make_source(options: dict[str, Any] | None = None, plugin: str = "csv") -> SourceSpec:
@@ -1246,17 +1246,43 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_load.assert_not_called()
         mock_instantiate.assert_not_called()
 
-    @pytest.mark.parametrize("component", ["source", "sink"])
     @pytest.mark.parametrize("endpoint_options", [{}, {"endpoint_url": None}])
-    def test_aws_s3_omitted_or_null_endpoint_url_passes_policy(
+    def test_aws_s3_source_is_blocked_even_without_endpoint_url(
         self,
-        component: str,
         endpoint_options: dict[str, object],
     ) -> None:
-        source_plugin = "aws_s3" if component == "source" else "csv"
-        source_options = endpoint_options if component == "source" else {}
-        output_plugin = "aws_s3" if component == "sink" else "csv"
-        output_options = endpoint_options if component == "sink" else {}
+        state = _make_state(
+            source_plugin="aws_s3",
+            source_options=endpoint_options,
+            outputs=(_make_output(name="results"),),
+        )
+        settings = _make_settings()
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        with (
+            patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load,
+            patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
+        ):
+            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
+
+        assert result.is_valid is False
+        assert _check(result, "aws_s3_endpoint_url_policy").passed is False
+        assert result.errors[0].message == AWS_S3_SOURCE_POLICY_ERROR
+        assert result.errors[0].error_code == "aws_s3_source_not_allowed"
+        assert result.errors[0].component_id == "source"
+        mock_load.assert_not_called()
+        mock_instantiate.assert_not_called()
+
+    @pytest.mark.parametrize("endpoint_options", [{}, {"endpoint_url": None}])
+    def test_aws_s3_sink_omitted_or_null_endpoint_url_passes_policy(
+        self,
+        endpoint_options: dict[str, object],
+    ) -> None:
+        source_plugin = "csv"
+        source_options = {}
+        output_plugin = "aws_s3"
+        output_options = endpoint_options
         state = _make_state(
             source_plugin=source_plugin,
             source_options=source_options,
