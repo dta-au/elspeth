@@ -99,7 +99,11 @@ inventory. `scenario-load` exports these exact names and the computed
 The same protected scenario inventory supplies
 `ELSPETH_BEDROCK_LIVE_TEST_MODEL`; it must exactly equal the private model in
 the selected tutorial profile, and `AWS_REGION` must equal that profile's
-private region.
+private region. It also supplies the non-provider-generated
+`CLOUDWATCH_AGENT_IMAGE`, `CLOUDWATCH_AGENT_CONFIG_JSON_SHA256`, and
+`CLOUDWATCH_AGENT_OTEL_YAML_SHA256` values. The image is one exact digest-only
+reference, and both lowercase configuration digests are identical in the
+immutable preapply and resolved inventories.
 
 Values use the JSON/opaque-alias contract in
 [`configuration.md`](../reference/configuration.md). Never retain their raw
@@ -592,7 +596,7 @@ and destroy use, and again when an approved apply is recorded; verification
 performed before expiry cannot authorize later use after expiry.
 
 Each protected scenario inventory uses
-`elspeth.aws-ecs-scenario-inventory.v6` and binds the run ID, candidate SHA,
+`elspeth.aws-ecs-scenario-inventory.v7` and binds the run ID, candidate SHA,
 account, region, scenario ID, Terraform binding, and the closed `values`
 assignment set, including the protected binding-receipt path. The initial
 immutable `preapply` document leaves provider-generated identities empty; a
@@ -704,7 +708,8 @@ load_scenario() {
     ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES \
     ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES \
     ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256 \
-    ELSPETH_BEDROCK_LIVE_TEST_MODEL \
+    ELSPETH_BEDROCK_LIVE_TEST_MODEL CLOUDWATCH_AGENT_IMAGE \
+    CLOUDWATCH_AGENT_CONFIG_JSON_SHA256 CLOUDWATCH_AGENT_OTEL_YAML_SHA256 \
     ALB_BASE_URL ALB_ARN CANDIDATE_TASK_DEFINITION DOCTOR_TASK_DEFINITION \
     DOCTOR_CONTAINER_NAME DOCTOR_NETWORK_CONFIGURATION \
     PAYLOAD_VERIFIER_TASK_DEFINITION LOCAL_AUTH_VERIFIER_TASK_DEFINITION \
@@ -960,7 +965,8 @@ chmod 600 "$BOOTSTRAP_PLAN"
 BOOTSTRAP_PLAN_SHA=$(sha256sum "$BOOTSTRAP_PLAN" | awk '{print $1}')
 terraform_capture -chdir="$BOOTSTRAP_TF_DIR" show -json "$BOOTSTRAP_PLAN" \
   | uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-      sanitize-evidence --kind terraform-plan >"$BOOTSTRAP_PLAN_RECEIPT"
+      sanitize-evidence --kind terraform-plan \
+      --plan-sha256 "$BOOTSTRAP_PLAN_SHA" >"$BOOTSTRAP_PLAN_RECEIPT"
 BOOTSTRAP_PLAN_RECEIPT_HASH=$(persist_sanitized_receipt bootstrap terraform-plan \
   "$BOOTSTRAP_PLAN_SHA" "$BOOTSTRAP_PLAN_RECEIPT")
 request_signed_tf_approval bootstrap terraform-plan "$BOOTSTRAP_PLAN_RECEIPT_HASH" \
@@ -1193,7 +1199,7 @@ render_resolved_inventory() (
   jq -e --arg run "$ACCEPTANCE_RUN_ID" --arg candidate "$CANDIDATE_SHA" \
     --arg account "$AWS_ACCOUNT_ID" --arg region "$AWS_REGION" --arg scenario "$scenario_id" '
       type == "object"
-      and .schema == "elspeth.aws-ecs-scenario-inventory.v6"
+      and .schema == "elspeth.aws-ecs-scenario-inventory.v7"
       and .phase == "resolved"
       and .acceptance_run_id == $run
       and .candidate_sha == $candidate
@@ -1231,11 +1237,11 @@ plan_and_apply_scenario() {
     -var="candidate_image=$CANDIDATE_IMAGE" \
     -var="rollback_baseline_image=$ROLLBACK_BASELINE_IMAGE" -out="$plan" >/dev/null
   chmod 600 "$plan"
+  plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
   terraform_capture -chdir="$directory" show -json "$plan" | \
     uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-      sanitize-evidence --kind terraform-plan >"$receipt"
+      sanitize-evidence --kind terraform-plan --plan-sha256 "$plan_sha" >"$receipt"
   chmod 600 "$receipt"
-  plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
   receipt_hash="$(persist_sanitized_receipt "$scenario_id" terraform-plan "$plan_sha" "$receipt")"
   request_signed_tf_approval "$scenario_id" terraform-plan "$receipt_hash" \
     "$receipt" "$TERRAFORM_PLAN_APPROVAL_FILE"
@@ -1257,11 +1263,11 @@ plan_and_apply_scenario() {
     -var="candidate_image=$CANDIDATE_IMAGE" \
     -var="rollback_baseline_image=$ROLLBACK_BASELINE_IMAGE" -out="$plan" >/dev/null
   chmod 600 "$plan"
+  noop_sha="$(sha256sum "$plan" | awk '{print $1}')"
   terraform_capture -chdir="$directory" show -json "$plan" | \
     uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-      sanitize-evidence --kind terraform-plan >"$receipt"
+      sanitize-evidence --kind terraform-plan --plan-sha256 "$noop_sha" >"$receipt"
   chmod 600 "$receipt"
-  noop_sha="$(sha256sum "$plan" | awk '{print $1}')"
   receipt_hash="$(persist_sanitized_receipt "$scenario_id" terraform-noop "$noop_sha" "$receipt")"
   render_resolved_inventory "$scenario_id" "$directory" "$resolved_inventory"
   checkpoint_terraform_noop_and_bind "$scenario_id" "$noop_sha" \
@@ -1516,8 +1522,8 @@ session epoch 36, Landscape epoch 29 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
-any later deployment action. The 0.7.0 image understands Landscape epoch 23,
-not epoch 29. Pre-1.0 candidates do not migrate predecessor schemas: the old
+any later deployment action. The 0.7.1 image understands session epoch 35,
+not epoch 36. Pre-1.0 candidates do not migrate predecessor schemas: the old
 deployment is stopped and uninstalled, required evidence is archived/exported,
 and the databases are recreated before the candidate is installed. The previous
 image cannot reopen the recreated current database, so Scenario B rollback is
@@ -2017,7 +2023,8 @@ permissions or the single-process local-auth contract.
 Store these two files in the deployment repository under a versioned
 `telemetry/elspeth.cloudwatch-agent.v1/` directory. Compute both digests with
 `sha256sum "$AGENT_CONFIG_JSON" "$AGENT_OTEL_YAML"`, record them in the
-reviewed task-definition manifest, and render each non-secret file as
+protected scenario inventory as `CLOUDWATCH_AGENT_CONFIG_JSON_SHA256` and
+`CLOUDWATCH_AGENT_OTEL_YAML_SHA256`, and render each non-secret file as
 single-line base64 plus its lowercase SHA-256 into the sidecar environment.
 Base64 is transport encoding, not a credential or secrecy mechanism. The
 sidecar entrypoint decodes both files into its task-local writable directory,
@@ -2098,19 +2105,20 @@ into an unreviewed retention surface.
 
 ## Task-definition shape
 
-Resolve an approved CloudWatch Agent repository and its 64-lowercase-hex
-digest into `CLOUDWATCH_AGENT_IMAGE_SHA256`. The rendered image reference must
-contain the digest and no tag. The approved ECS runtime variant must include
+Record the approved digest-only CloudWatch Agent reference in the protected
+scenario inventory as `CLOUDWATCH_AGENT_IMAGE`. The rendered image reference
+must equal it byte-for-byte and contain no tag. The approved ECS runtime variant must include
 the AWS control script plus `/bin/sh`, `base64`, `sha256sum`, `grep`, and
 `sleep`; those are part of the reviewed image contract and are exercised by
-the entrypoint below:
+the entrypoint below. The web container must override the image's diagnostic
+default with the exact service command `web --host 0.0.0.0 --port 8451`:
 
 ```json
 {
   "containerDefinitions": [
     {
       "name": "cloudwatch-agent",
-      "image": "${CLOUDWATCH_AGENT_IMAGE_REPOSITORY}@sha256:${CLOUDWATCH_AGENT_IMAGE_SHA256}",
+      "image": "${CLOUDWATCH_AGENT_IMAGE}",
       "essential": false,
       "memoryReservation": 192,
       "entryPoint": ["/bin/sh", "-ceu"],
@@ -2131,6 +2139,7 @@ the entrypoint below:
     },
     {
       "name": "elspeth-web",
+      "command": ["web", "--host", "0.0.0.0", "--port", "8451"],
       "dependsOn": [{"containerName": "cloudwatch-agent", "condition": "HEALTHY"}],
       "environment": [
         {"name": "ELSPETH_WEB__PLUGIN_ALLOWLIST", "value": "${ELSPETH_WEB__PLUGIN_ALLOWLIST}"},
@@ -2801,7 +2810,7 @@ checkpoint_operator_retained_evidence() {
 }
 
 run_connection_budget_check() {
-  local task_arn="$1" stream envelope_file details_file command
+  local task_arn="$1" stream envelope_file command
   [[ "$ACCEPTANCE_START_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
   [[ "$ACCEPTANCE_CONNECTION_BUDGET" =~ ^[1-9][0-9]{0,8}$ ]]
   [[ "$ACCEPTANCE_CONNECTION_SAFETY_MARGIN" =~ ^[0-9]{1,9}$ ]]
@@ -2813,17 +2822,15 @@ run_connection_budget_check() {
     --cluster "$ECS_CLUSTER" --task "$task_arn" --container "$WEB_CONTAINER_NAME" \
     --interactive --command "$command")
   envelope_file=$(mktemp -p /tmp elspeth-connection-envelope.XXXXXX)
-  details_file=$(mktemp -p /tmp elspeth-connection-budget.XXXXXX)
-  chmod 600 "$envelope_file" "$details_file"
+  chmod 600 "$envelope_file"
   printf '%s' "$stream" | uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
     extract-exec-receipt --check verify-connection-budget \
     --candidate-sha "$CANDIDATE_SHA" --task-arn "$task_arn" \
     --scenario-id "$ACTIVE_SCENARIO_ID" >"$envelope_file"
   unset stream
-  jq -e '.details' "$envelope_file" >"$details_file"
   persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" connection-budget \
-    "$DB_CLUSTER_IDENTIFIER" "$details_file" >/dev/null
-  rm -f -- "$envelope_file" "$details_file"
+    "$task_arn" "$envelope_file" >/dev/null
+  rm -f -- "$envelope_file"
 }
 
 run_candidate_role_check "$CANDIDATE_TASK_ARN" verify-s3
@@ -3125,11 +3132,12 @@ destroy_scenario() {
       -var="candidate_image=$CANDIDATE_IMAGE" \
       -var="rollback_baseline_image=$ROLLBACK_BASELINE_IMAGE" -out="$plan" >/dev/null
     chmod 600 "$plan"
+    plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
     terraform_capture -chdir="$directory" show -json "$plan" | \
       uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-        sanitize-evidence --kind terraform-destroy-plan >"$receipt"
+        sanitize-evidence --kind terraform-destroy-plan \
+        --plan-sha256 "$plan_sha" >"$receipt"
     chmod 600 "$receipt"
-    plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
     receipt_hash="$(persist_sanitized_receipt "$scenario_id" terraform-destroy-plan "$plan_sha" "$receipt")"
     request_signed_tf_approval "$scenario_id" terraform-destroy-plan "$receipt_hash" \
       "$receipt" "$approval_file"
@@ -3199,11 +3207,12 @@ destroy_shared_bootstrap() {
           -var="backend_state_bucket=$BACKEND_STATE_BUCKET" \
           -var="ecr_repository=$ECR_REPOSITORY" -out="$plan" >/dev/null
         chmod 600 "$plan"
+        plan_sha=$(sha256sum "$plan" | awk '{print $1}')
         terraform_capture -chdir="$BOOTSTRAP_TF_DIR" show -json "$plan" | \
           uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-            sanitize-evidence --kind terraform-destroy-plan >"$receipt"
+            sanitize-evidence --kind terraform-destroy-plan \
+            --plan-sha256 "$plan_sha" >"$receipt"
         chmod 600 "$receipt"
-        plan_sha=$(sha256sum "$plan" | awk '{print $1}')
         receipt_hash=$(persist_sanitized_receipt bootstrap terraform-destroy-plan "$plan_sha" "$receipt")
         request_signed_tf_approval bootstrap terraform-destroy-plan "$receipt_hash" \
           "$receipt" "${BOOTSTRAP_DESTROY_APPROVAL_FILE:?set bootstrap destroy approval file}"

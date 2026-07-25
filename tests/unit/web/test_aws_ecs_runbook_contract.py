@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml
 
+from elspeth.web._aws_ecs_acceptance import task_definition
 from elspeth.web.aws_ecs_acceptance import SCENARIO_ASSIGNMENT_NAMES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -47,9 +48,10 @@ def test_runbook_preserves_task_local_nonessential_healthy_sidecar() -> None:
     app = containers["elspeth-web"]
 
     assert sidecar["essential"] is False
-    assert re.search(r"@sha256:\$\{CLOUDWATCH_AGENT_IMAGE_SHA256\}$", sidecar["image"])
+    assert sidecar["image"] == "${CLOUDWATCH_AGENT_IMAGE}"
     assert "portMappings" not in sidecar
     assert app["dependsOn"] == [{"containerName": "cloudwatch-agent", "condition": "HEALTHY"}]
+    assert app["command"] == ["web", "--host", "0.0.0.0", "--port", "8451"]
     environment = {entry["name"]: entry["value"] for entry in app["environment"]}
     assert environment == {
         "ELSPETH_WEB__PLUGIN_ALLOWLIST": "${ELSPETH_WEB__PLUGIN_ALLOWLIST}",
@@ -119,6 +121,7 @@ def test_runbook_preserves_versioned_config_sidecar_startup() -> None:
     sidecar = next(container for container in task["containerDefinitions"] if container["name"] == "cloudwatch-agent")
 
     assert sidecar["entryPoint"] == ["/bin/sh", "-ceu"]
+    assert sidecar["command"] == [task_definition._CLOUDWATCH_AGENT_COMMAND]
     environment = {entry["name"]: entry["value"] for entry in sidecar["environment"]}
     assert environment == {
         "ELSPETH_CW_AGENT_CONFIG_JSON_B64": "${CLOUDWATCH_AGENT_CONFIG_JSON_B64}",
@@ -153,6 +156,7 @@ def test_runbook_preserves_supported_agent_health_mode() -> None:
         "CMD-SHELL",
         '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q \'"status": "running"\'',
     ]
+    assert sidecar["healthCheck"] == task_definition._CLOUDWATCH_AGENT_HEALTH_CHECK
     assert "-m ecs" not in json.dumps(sidecar)
 
 
@@ -183,7 +187,12 @@ def test_runbook_preserves_versioned_hashed_bounded_agent_config() -> None:
         "resource_to_telemetry_conversion": {"enabled": True},
     }
     assert otel["exporters"]["awsxray/elspeth"] == {"indexed_attributes": ["run_id", "status"]}
-    assert "OPERATOR_METRICS_LOG_GROUP" in SCENARIO_ASSIGNMENT_NAMES
+    assert {
+        "OPERATOR_METRICS_LOG_GROUP",
+        "CLOUDWATCH_AGENT_IMAGE",
+        "CLOUDWATCH_AGENT_CONFIG_JSON_SHA256",
+        "CLOUDWATCH_AGENT_OTEL_YAML_SHA256",
+    } <= set(SCENARIO_ASSIGNMENT_NAMES)
     assert otel["service"]["pipelines"] == {
         "metrics/elspeth": {
             "receivers": ["otlp/elspeth"],
@@ -870,6 +879,21 @@ def test_runbook_starts_connection_observation_on_a_future_minute_boundary() -> 
     assert "OBSERVATION_ALIGNMENT_SECONDS=$((60 - 10#$(date -u +%S)))" in observe
     assert observe.index('sleep "$OBSERVATION_ALIGNMENT_SECONDS"') < observe.index("ACCEPTANCE_START_UTC=$(date -u +%Y-%m-%dT%H:%M:00Z)")
     assert "ACCEPTANCE_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" not in observe
+
+
+def test_runbook_binds_terraform_receipts_to_plan_bytes_and_retains_connection_envelope() -> None:
+    text = _text()
+    assert text.count("sanitize-evidence --kind terraform-plan") == 3
+    assert text.count("sanitize-evidence --kind terraform-destroy-plan") == 2
+    assert text.count("--plan-sha256") == 5
+
+    connection = text[
+        text.index("run_connection_budget_check()") : text.index("run_candidate_role_check", text.index("run_connection_budget_check()"))
+    ]
+    assert "jq -e '.details'" not in connection
+    assert 'persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" connection-budget' in connection
+    assert '"$task_arn" "$envelope_file"' in connection
+    assert "details_file" not in connection
 
 
 def test_runbook_validates_task_definitions_and_compatibility_before_baseline_mutation() -> None:

@@ -1,0 +1,361 @@
+"""Shared contracts and pure helpers for AWS ECS acceptance."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from urllib.parse import urlsplit
+
+_MAX_IDENTITY_CHARS = 128
+_EVIDENCE_KINDS = (
+    "web-log",
+    "doctor-log",
+    "deployment-event",
+    "task-definition",
+    "terraform-plan",
+    "terraform-destroy-plan",
+)
+EVIDENCE_KINDS = _EVIDENCE_KINDS
+CONNECT_TIMEOUT_SECONDS = 5.0
+READ_TIMEOUT_SECONDS = 15.0
+WRITE_TIMEOUT_SECONDS = 10.0
+POOL_TIMEOUT_SECONDS = 5.0
+MAX_JSON_RESPONSE_BYTES = 1024 * 1024
+MAX_BLOB_RESPONSE_BYTES = 8 * 1024 * 1024
+RUN_POLL_DEADLINE_SECONDS = 5 * 60
+RUN_POLL_INTERVAL_SECONDS = 1.0
+MAX_STATE_FILE_BYTES = 64 * 1024
+MAX_EXEC_RECEIPT_CHARS = 16 * 1024
+MAX_EXEC_STREAM_BYTES = 2 * 1024 * 1024
+MAX_CONTROL_DOCUMENT_BYTES = 256 * 1024
+_EMERGENCY_CLEANUP_SECONDS = 3 * 60 * 60
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_GIT_SHA_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_SCENARIO_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_TERMINAL_RUN_STATUSES = frozenset({"completed", "completed_with_failures", "failed", "empty", "cancelled"})
+FORBIDDEN_AWS_OVERRIDE_ENV = frozenset(
+    {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_CREDENTIAL_EXPIRATION",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CREDENTIAL_FILE",
+        "BOTO_CONFIG",
+        "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_S3",
+        "AWS_ENDPOINT_URL_BEDROCK",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+        "AWS_ENDPOINT_URL_CLOUDWATCH",
+        "AWS_ENDPOINT_URL_XRAY",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    }
+)
+SCENARIO_ASSIGNMENT_NAMES = (
+    "ACTIVE_SCENARIO_ID",
+    "ACCEPTANCE_RUN_ID",
+    "DEPLOYMENT_MODE",
+    "TARGET_PLATFORM",
+    "AWS_REGION",
+    "ECS_CLUSTER",
+    "ECS_SERVICE",
+    "WEB_CONTAINER_NAME",
+    "ELSPETH_WEB__DATA_DIR",
+    "ELSPETH_WEB__PAYLOAD_STORE_PATH",
+    "ELSPETH_WEB__COMPOSER_MODEL",
+    "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL",
+    "ELSPETH_WEB__PLUGIN_ALLOWLIST",
+    "ELSPETH_WEB__PLUGIN_PREFERENCES",
+    "ELSPETH_WEB__PLUGIN_CONTROL_MODES",
+    "ELSPETH_WEB__LLM_PROFILES",
+    "ELSPETH_WEB__TUTORIAL_LLM_PROFILE",
+    "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES",
+    "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES",
+    "ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256",
+    "ELSPETH_BEDROCK_LIVE_TEST_MODEL",
+    "CLOUDWATCH_AGENT_IMAGE",
+    "CLOUDWATCH_AGENT_CONFIG_JSON_SHA256",
+    "CLOUDWATCH_AGENT_OTEL_YAML_SHA256",
+    "TARGET_GROUP_ARN",
+    "ALB_BASE_URL",
+    "ALB_ARN",
+    "CANDIDATE_TASK_DEFINITION",
+    "DOCTOR_TASK_DEFINITION",
+    "DOCTOR_CONTAINER_NAME",
+    "DOCTOR_NETWORK_CONFIGURATION",
+    "PAYLOAD_VERIFIER_TASK_DEFINITION",
+    "LOCAL_AUTH_VERIFIER_TASK_DEFINITION",
+    "ROLLBACK_DOCTOR_TASK_DEFINITION",
+    "WEB_LOG_GROUP",
+    "WEB_LOG_STREAM_PREFIX",
+    "DOCTOR_LOG_GROUP",
+    "DOCTOR_LOG_STREAM_PREFIX",
+    "OPERATOR_METRICS_LOG_GROUP",
+    "ECS_DEPLOYMENT_EVENT_RULE",
+    "ECS_DEPLOYMENT_EVENT_TARGET_ID",
+    "ECS_DEPLOYMENT_EVENT_LOG_GROUP",
+    "PREVIOUS_TASK_DEFINITION",
+    "FIRST_DEPLOY_LISTENER_RULE_ARN",
+    "FIRST_DEPLOY_FORWARD_ACTIONS",
+    "FIRST_DEPLOY_DISABLED_ACTIONS",
+    "COGNITO_USER_POOL_ID",
+    "DB_CLUSTER_IDENTIFIER",
+    "ELSPETH_TEST_S3_BUCKET",
+    "OIDC_EXPECTED_ISSUER",
+    "OIDC_EXPECTED_AUDIENCE",
+    "OIDC_EXPECTED_AUTHORIZATION_ORIGIN",
+    "OIDC_EXPECTED_AUDIENCE_CLAIM",
+    "SCENARIO_TF_DIR",
+    "SCENARIO_TF_VARS",
+    "SCENARIO_TF_BINDING_SHA",
+    "SCENARIO_TF_BINDING_FILE",
+)
+_SCENARIO_VALUE_FIELDS = frozenset(SCENARIO_ASSIGNMENT_NAMES[2:])
+PLUGIN_POLICY_ASSIGNMENT_NAMES = (
+    "ELSPETH_WEB__PLUGIN_ALLOWLIST",
+    "ELSPETH_WEB__PLUGIN_PREFERENCES",
+    "ELSPETH_WEB__PLUGIN_CONTROL_MODES",
+    "ELSPETH_WEB__LLM_PROFILES",
+    "ELSPETH_WEB__TUTORIAL_LLM_PROFILE",
+    "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES",
+    "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES",
+)
+_TASK_DEFINITION_FAMILY_PATTERN = re.compile(
+    r"arn:(?:aws|aws-us-gov|aws-cn):ecs:[a-z0-9-]+:[0-9]{12}:task-definition/([A-Za-z0-9_-]{1,255}):[1-9][0-9]*\Z"
+)
+
+
+class AcceptanceInputError(RuntimeError):
+    """Static failure raised before an acceptance request is sent."""
+
+
+class AcceptanceHttpError(RuntimeError):
+    """Static HTTP failure that never includes a response or exception body."""
+
+
+class AcceptanceStateError(RuntimeError):
+    """Static protected-state failure that never includes file content."""
+
+
+class AcceptanceCheckError(RuntimeError):
+    """A static named acceptance check failure safe for operator output."""
+
+    def __init__(self, check: str) -> None:
+        super().__init__(f"acceptance check failed: {check}")
+        self.check = check
+
+
+class OperatorTelemetryAcceptanceError(RuntimeError):
+    """Static acceptance failure safe for an operator receipt."""
+
+
+def normalize_acceptance_origin(raw: str) -> str:
+    """Validate and return one exact canonical acceptance origin."""
+
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise AcceptanceInputError("acceptance base origin is invalid") from None
+    if (
+        not raw
+        or parsed.scheme not in {"http", "https"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise AcceptanceInputError("acceptance base origin is invalid")
+    try:
+        hostname.encode("ascii")
+    except UnicodeEncodeError:
+        raise AcceptanceInputError("acceptance base origin is invalid") from None
+    if parsed.scheme == "http" and hostname not in _LOOPBACK_HOSTS:
+        raise AcceptanceInputError("acceptance base origin requires HTTPS except for exact loopback hosts")
+    if port is not None and not 1 <= port <= 65535:
+        raise AcceptanceInputError("acceptance base origin is invalid")
+
+    default_port = 443 if parsed.scheme == "https" else 80
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    canonical = f"{parsed.scheme}://{rendered_host}"
+    if port is not None and port != default_port:
+        canonical = f"{canonical}:{port}"
+    if raw != canonical:
+        raise AcceptanceInputError("acceptance base origin must be an exact normalized origin")
+    return canonical
+
+
+def _canonical_uuid(value: str, *, label: str) -> str:
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        raise AcceptanceInputError(f"acceptance {label} is invalid") from None
+    if str(parsed) != value:
+        raise AcceptanceInputError(f"acceptance {label} is invalid")
+    return value
+
+
+def _mapping(value: object, *, check: str) -> Mapping[str, object]:
+    if not isinstance(value, dict):
+        raise AcceptanceCheckError(check)
+    return value
+
+
+def _string_field(value: Mapping[str, object], field: str, *, check: str) -> str:
+    candidate = value.get(field)
+    if type(candidate) is not str or not candidate:
+        raise AcceptanceCheckError(check)
+    return candidate
+
+
+def _uuid_field(value: Mapping[str, object], field: str, *, check: str) -> str:
+    candidate = _string_field(value, field, check=check)
+    try:
+        return _canonical_uuid(candidate, label="response identity")
+    except AcceptanceInputError:
+        raise AcceptanceCheckError(check) from None
+
+
+def _sha256_field(value: Mapping[str, object], field: str, *, check: str) -> str:
+    candidate = _string_field(value, field, check=check)
+    if _SHA256_PATTERN.fullmatch(candidate) is None:
+        raise AcceptanceCheckError(check)
+    return candidate
+
+
+def _sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def scenario_resource_namespace(acceptance_run_id: str, scenario_id: str) -> str:
+    """Return the stable AWS-name-safe namespace for one acceptance scenario."""
+
+    try:
+        canonical_run_id = _canonical_uuid(acceptance_run_id, label="acceptance run ID")
+    except AcceptanceInputError:
+        raise AcceptanceCheckError("scenario_inventory_binding") from None
+    if scenario_id not in {"A", "B"}:
+        raise AcceptanceCheckError("scenario_inventory_binding")
+    digest = _sha256(f"{canonical_run_id}\0{scenario_id}".encode())[:20]
+    return f"{scenario_id.lower()}-{digest}"
+
+
+def plugin_policy_binding_sha256(values: Mapping[str, str]) -> str:
+    """Hash the exact protected seven-setting web policy assignment."""
+
+    projection: dict[str, str] = {}
+    for name in PLUGIN_POLICY_ASSIGNMENT_NAMES:
+        value = values.get(name)
+        if type(value) is not str or not value or len(value) > 16 * 1024:
+            raise AcceptanceCheckError("plugin_policy_binding")
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise AcceptanceCheckError("plugin_policy_binding")
+        projection[name] = value
+    encoded = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _sha256(encoded)
+
+
+def _utc_timestamp(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise AcceptanceCheckError("timestamp")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc_z_timestamp(value: str) -> datetime:
+    """Parse one strict UTC timestamp ending in ``Z``."""
+
+    if type(value) is not str or not value.endswith("Z"):
+        raise ValueError("timestamp must be a UTC Z timestamp")
+    try:
+        parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+    except ValueError:
+        raise ValueError("timestamp must be a UTC Z timestamp") from None
+    if parsed.tzinfo != UTC:
+        raise ValueError("timestamp must be a UTC Z timestamp")
+    return parsed
+
+
+def _control_timestamp(value: object) -> datetime:
+    if type(value) is not str:
+        raise AcceptanceCheckError("control_manifest_schema")
+    try:
+        return _parse_utc_z_timestamp(value)
+    except ValueError:
+        raise AcceptanceCheckError("control_manifest_schema") from None
+
+
+def _bounded_identity(field: str, value: str) -> str:
+    if (
+        not value.strip()
+        or value != value.strip()
+        or len(value) > _MAX_IDENTITY_CHARS
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise ValueError(f"{field} must be a non-blank bounded string without control characters")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class SanitizedResourceIdentity:
+    """Closed non-content identity persisted in acceptance evidence."""
+
+    service_name: str
+    service_version: str
+    deployment_environment: str
+    cloud_provider: str
+
+    def __post_init__(self) -> None:
+        for field in ("service_name", "service_version", "deployment_environment", "cloud_provider"):
+            _bounded_identity(field, getattr(self, field))
+        if self.cloud_provider != "aws":
+            raise ValueError("cloud_provider must be aws")
+
+
+def _resolve_aws_region(env: Mapping[str, str], *, check: str) -> str:
+    primary_region = env.get("AWS_REGION")
+    default_region = env.get("AWS_DEFAULT_REGION")
+    if primary_region is not None and not primary_region:
+        raise AcceptanceCheckError(check)
+    if default_region is not None and not default_region:
+        raise AcceptanceCheckError(check)
+    if primary_region is not None and default_region is not None and primary_region != default_region:
+        raise AcceptanceCheckError(check)
+    region = primary_region or default_region
+    if region is None or len(region) > 64 or re.fullmatch(r"[A-Za-z0-9-]+", region) is None:
+        raise AcceptanceCheckError(check)
+    return region
+
+
+def _parse_task_definition_family(task_definition_arn: object) -> str | None:
+    """Return the ECS task-definition family, or no match for invalid input."""
+
+    if type(task_definition_arn) is not str:
+        return None
+    match = _TASK_DEFINITION_FAMILY_PATTERN.fullmatch(task_definition_arn)
+    return None if match is None else match.group(1)
+
+
+def _task_definition_family(task_definition_arn: object) -> str:
+    family = _parse_task_definition_family(task_definition_arn)
+    if family is None:
+        raise AcceptanceCheckError("orphan_sweep_api")
+    return family

@@ -190,6 +190,21 @@ class TestListSinks:
 class TestGetSchema:
     """get_schema() returns full JSON schema for a plugin's config."""
 
+    def test_plugin_description_is_dedented_for_cross_python_stability(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        monkeypatch.setattr(
+            LLMTransform,
+            "__doc__",
+            "Summary.\n\n        Detail line.\n        Final line.",
+        )
+        manager = PluginManager()
+        manager.register_builtin_plugins()
+
+        info = CatalogServiceImpl(manager).get_schema("transform", "llm")
+
+        assert info.description == "Summary.\n\nDetail line.\nFinal line."
+
     def test_csv_source_schema(self, catalog: CatalogServiceImpl) -> None:
         info = catalog.get_schema("source", "csv")
         assert isinstance(info, PluginSchemaInfo)

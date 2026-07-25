@@ -188,13 +188,13 @@ def test_real_web_tree_has_only_the_reviewed_direct_call_map() -> None:
 
     assert offenders == ()
     assert direct_map == (
+        ("src/elspeth/web/_aws_ecs_acceptance/bedrock.py", "from_url"),
+        ("src/elspeth/web/_aws_ecs_acceptance/capture.py", "from_url"),
+        ("src/elspeth/web/_aws_ecs_acceptance/operator_telemetry.py", "from_url"),
+        ("src/elspeth/web/_aws_ecs_acceptance/operator_telemetry.py", "from_url"),
+        ("src/elspeth/web/_aws_ecs_acceptance/operator_telemetry.py", "from_url"),
         ("src/elspeth/web/app.py", "from_url"),
         ("src/elspeth/web/auth/audit.py", "from_url"),
-        ("src/elspeth/web/aws_ecs_acceptance.py", "from_url"),
-        ("src/elspeth/web/aws_ecs_acceptance.py", "from_url"),
-        ("src/elspeth/web/aws_ecs_acceptance.py", "from_url"),
-        ("src/elspeth/web/aws_ecs_acceptance.py", "from_url"),
-        ("src/elspeth/web/aws_ecs_acceptance.py", "from_url"),
         ("src/elspeth/web/execution/accounting.py", "from_url"),
         ("src/elspeth/web/execution/diagnostics.py", "from_url"),
         ("src/elspeth/web/execution/discard_summary.py", "from_url"),
