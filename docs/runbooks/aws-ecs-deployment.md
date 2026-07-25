@@ -82,7 +82,11 @@ inventory. `scenario-load` exports these exact names and the computed
 The same protected scenario inventory supplies
 `ELSPETH_BEDROCK_LIVE_TEST_MODEL`; it must exactly equal the private model in
 the selected tutorial profile, and `AWS_REGION` must equal that profile's
-private region.
+private region. It also supplies the non-provider-generated
+`CLOUDWATCH_AGENT_IMAGE`, `CLOUDWATCH_AGENT_CONFIG_JSON_SHA256`, and
+`CLOUDWATCH_AGENT_OTEL_YAML_SHA256` values. The image is one exact digest-only
+reference, and both lowercase configuration digests are identical in the
+immutable preapply and resolved inventories.
 
 Values use the JSON/opaque-alias contract in
 [`configuration.md`](../reference/configuration.md). Never retain their raw
@@ -575,7 +579,7 @@ and destroy use, and again when an approved apply is recorded; verification
 performed before expiry cannot authorize later use after expiry.
 
 Each protected scenario inventory uses
-`elspeth.aws-ecs-scenario-inventory.v6` and binds the run ID, candidate SHA,
+`elspeth.aws-ecs-scenario-inventory.v7` and binds the run ID, candidate SHA,
 account, region, scenario ID, Terraform binding, and the closed `values`
 assignment set, including the protected binding-receipt path. The initial
 immutable `preapply` document leaves provider-generated identities empty; a
@@ -687,7 +691,8 @@ load_scenario() {
     ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES \
     ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES \
     ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256 \
-    ELSPETH_BEDROCK_LIVE_TEST_MODEL \
+    ELSPETH_BEDROCK_LIVE_TEST_MODEL CLOUDWATCH_AGENT_IMAGE \
+    CLOUDWATCH_AGENT_CONFIG_JSON_SHA256 CLOUDWATCH_AGENT_OTEL_YAML_SHA256 \
     ALB_BASE_URL ALB_ARN CANDIDATE_TASK_DEFINITION DOCTOR_TASK_DEFINITION \
     DOCTOR_CONTAINER_NAME DOCTOR_NETWORK_CONFIGURATION \
     PAYLOAD_VERIFIER_TASK_DEFINITION LOCAL_AUTH_VERIFIER_TASK_DEFINITION \
@@ -1177,7 +1182,7 @@ render_resolved_inventory() (
   jq -e --arg run "$ACCEPTANCE_RUN_ID" --arg candidate "$CANDIDATE_SHA" \
     --arg account "$AWS_ACCOUNT_ID" --arg region "$AWS_REGION" --arg scenario "$scenario_id" '
       type == "object"
-      and .schema == "elspeth.aws-ecs-scenario-inventory.v6"
+      and .schema == "elspeth.aws-ecs-scenario-inventory.v7"
       and .phase == "resolved"
       and .acceptance_run_id == $run
       and .candidate_sha == $candidate
@@ -2001,7 +2006,8 @@ permissions or the single-process local-auth contract.
 Store these two files in the deployment repository under a versioned
 `telemetry/elspeth.cloudwatch-agent.v1/` directory. Compute both digests with
 `sha256sum "$AGENT_CONFIG_JSON" "$AGENT_OTEL_YAML"`, record them in the
-reviewed task-definition manifest, and render each non-secret file as
+protected scenario inventory as `CLOUDWATCH_AGENT_CONFIG_JSON_SHA256` and
+`CLOUDWATCH_AGENT_OTEL_YAML_SHA256`, and render each non-secret file as
 single-line base64 plus its lowercase SHA-256 into the sidecar environment.
 Base64 is transport encoding, not a credential or secrecy mechanism. The
 sidecar entrypoint decodes both files into its task-local writable directory,
@@ -2082,9 +2088,9 @@ into an unreviewed retention surface.
 
 ## Task-definition shape
 
-Resolve an approved CloudWatch Agent repository and its 64-lowercase-hex
-digest into `CLOUDWATCH_AGENT_IMAGE_SHA256`. The rendered image reference must
-contain the digest and no tag. The approved ECS runtime variant must include
+Record the approved digest-only CloudWatch Agent reference in the protected
+scenario inventory as `CLOUDWATCH_AGENT_IMAGE`. The rendered image reference
+must equal it byte-for-byte and contain no tag. The approved ECS runtime variant must include
 the AWS control script plus `/bin/sh`, `base64`, `sha256sum`, `grep`, and
 `sleep`; those are part of the reviewed image contract and are exercised by
 the entrypoint below:
@@ -2094,7 +2100,7 @@ the entrypoint below:
   "containerDefinitions": [
     {
       "name": "cloudwatch-agent",
-      "image": "${CLOUDWATCH_AGENT_IMAGE_REPOSITORY}@sha256:${CLOUDWATCH_AGENT_IMAGE_SHA256}",
+      "image": "${CLOUDWATCH_AGENT_IMAGE}",
       "essential": false,
       "memoryReservation": 192,
       "entryPoint": ["/bin/sh", "-ceu"],

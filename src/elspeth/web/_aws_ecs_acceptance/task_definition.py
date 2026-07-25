@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import json
 import re
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import cast
+
+import yaml
 
 from elspeth.core.secrets import is_secret_field
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
@@ -39,6 +45,40 @@ _SECRET_VALUE_FROM_PATTERN = re.compile(
     r"secret:([A-Za-z0-9/_+=.@-]{1,512})(?::([^:\x00-\x1f\x7f]{0,256}):([^:\x00-\x1f\x7f]{0,256}):([^:\x00-\x1f\x7f]{0,256}))?\Z"
 )
 _SECRET_ARN_SUFFIX_PATTERN = re.compile(r"(.+)-[A-Za-z0-9]{6}\Z")
+_CLOUDWATCH_AGENT_CONFIG_MAX_BYTES = 16 * 1024
+_CLOUDWATCH_AGENT_CONFIG_MAX_BASE64_CHARS = 4 * ((_CLOUDWATCH_AGENT_CONFIG_MAX_BYTES + 2) // 3)
+_CLOUDWATCH_AGENT_COMMAND = (
+    "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; CTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl; "
+    'mkdir -p "$CONFIG_DIR"; printf \'%s\' "$ELSPETH_CW_AGENT_CONFIG_JSON_B64" | base64 -d > '
+    "\"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' "
+    '"$ELSPETH_CW_AGENT_OTEL_YAML_B64" | base64 -d > '
+    "\"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' "
+    '"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" | '
+    "sha256sum -c -; printf '%s\\n' "
+    '"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml" | '
+    'sha256sum -c -; "$CTL" -a fetch-config -m auto -c '
+    '"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" -s; "$CTL" -a append-config -m auto -c '
+    '"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml" -s; while "$CTL" -a status -m auto '
+    '| grep -q \'"status": "running"\'; do sleep 30; done; exit 1'
+)
+_CLOUDWATCH_AGENT_HEALTH_CHECK = {
+    "command": [
+        "CMD-SHELL",
+        '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q \'"status": "running"\'',
+    ],
+    "interval": 10,
+    "timeout": 5,
+    "retries": 6,
+    "startPeriod": 30,
+}
+_CLOUDWATCH_AGENT_ENV_NAMES = frozenset(
+    {
+        "ELSPETH_CW_AGENT_CONFIG_JSON_B64",
+        "ELSPETH_CW_AGENT_CONFIG_JSON_SHA256",
+        "ELSPETH_CW_AGENT_OTEL_YAML_B64",
+        "ELSPETH_CW_AGENT_OTEL_YAML_SHA256",
+    }
+)
 
 
 def _plaintext_task_definition_secret(name: str) -> bool:
@@ -62,6 +102,106 @@ def _secrets_manager_inventory_binding(
     if name_match is None:
         return None
     return name_match.group(1), match.group(5), match.group(6), match.group(7)
+
+
+def _decode_cloudwatch_agent_config(value: object) -> bytes:
+    if type(value) is not str or not value or len(value) > _CLOUDWATCH_AGENT_CONFIG_MAX_BASE64_CHARS:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        raise AcceptanceCheckError("task_definition_policy_binding") from None
+    if not decoded or len(decoded) > _CLOUDWATCH_AGENT_CONFIG_MAX_BYTES or base64.b64encode(decoded).decode("ascii") != value:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    return decoded
+
+
+def _cloudwatch_json_object(content: bytes) -> Mapping[str, object]:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    try:
+        document = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        raise AcceptanceCheckError("task_definition_policy_binding") from None
+    if not isinstance(document, Mapping):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    return document
+
+
+def _cloudwatch_yaml_object(content: bytes) -> Mapping[str, object]:
+    try:
+        document = yaml.safe_load(content.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError, RecursionError, OverflowError):
+        raise AcceptanceCheckError("task_definition_policy_binding") from None
+    if not isinstance(document, Mapping):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    return document
+
+
+def _validate_cloudwatch_agent_sidecar(
+    sidecar: Mapping[str, object],
+    main_container: Mapping[str, object],
+    values: Mapping[str, object],
+) -> None:
+    if (
+        sidecar.get("name") != "cloudwatch-agent"
+        or sidecar.get("image") != values.get("CLOUDWATCH_AGENT_IMAGE")
+        or sidecar.get("essential") is not False
+        or type(sidecar.get("memoryReservation")) is not int
+        or sidecar.get("memoryReservation") != 192
+        or sidecar.get("entryPoint") != ["/bin/sh", "-ceu"]
+        or sidecar.get("command") != [_CLOUDWATCH_AGENT_COMMAND]
+        or sidecar.get("healthCheck") != _CLOUDWATCH_AGENT_HEALTH_CHECK
+        or sidecar.get("secrets", []) != []
+        or sidecar.get("mountPoints", []) != []
+        or sidecar.get("portMappings", []) != []
+        or sidecar.get("environmentFiles", []) != []
+        or main_container.get("dependsOn") != [{"containerName": "cloudwatch-agent", "condition": "HEALTHY"}]
+    ):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+
+    environment = sidecar.get("environment")
+    if not isinstance(environment, list) or len(environment) != len(_CLOUDWATCH_AGENT_ENV_NAMES):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    observed: dict[str, str] = {}
+    for entry in environment:
+        if not isinstance(entry, Mapping) or set(entry) != {"name", "value"}:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        name = entry["name"]
+        value = entry["value"]
+        if type(name) is not str or type(value) is not str or name in observed:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+        observed[name] = value
+    if (
+        set(observed) != _CLOUDWATCH_AGENT_ENV_NAMES
+        or set(observed).intersection(_TASK_DEFINITION_AWS_OVERRIDE_ENV)
+        or any(_plaintext_task_definition_secret(name) for name in observed)
+    ):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+
+    config_json = _decode_cloudwatch_agent_config(observed["ELSPETH_CW_AGENT_CONFIG_JSON_B64"])
+    otel_yaml = _decode_cloudwatch_agent_config(observed["ELSPETH_CW_AGENT_OTEL_YAML_B64"])
+    _cloudwatch_json_object(config_json)
+    _cloudwatch_yaml_object(otel_yaml)
+    expected_json_sha256 = values.get("CLOUDWATCH_AGENT_CONFIG_JSON_SHA256")
+    expected_otel_sha256 = values.get("CLOUDWATCH_AGENT_OTEL_YAML_SHA256")
+    if (
+        observed["ELSPETH_CW_AGENT_CONFIG_JSON_SHA256"] != expected_json_sha256
+        or observed["ELSPETH_CW_AGENT_OTEL_YAML_SHA256"] != expected_otel_sha256
+        or hashlib.sha256(config_json).hexdigest() != expected_json_sha256
+        or hashlib.sha256(otel_yaml).hexdigest() != expected_otel_sha256
+    ):
+        raise AcceptanceCheckError("task_definition_policy_binding")
 
 
 def validate_task_definition_policy_binding(
@@ -117,6 +257,9 @@ def validate_task_definition_policy_binding(
     container = matches[0]
     if container.get("essential") is not True:
         raise AcceptanceCheckError("task_definition_policy_binding")
+    sidecars = [candidate for candidate in containers if isinstance(candidate, Mapping) and candidate.get("name") == "cloudwatch-agent"]
+    if sidecars:
+        _validate_cloudwatch_agent_sidecar(sidecars[0], container, values)
     ecr = manifest["ecr"]
     if not isinstance(ecr, Mapping):
         raise AcceptanceCheckError("task_definition_policy_binding")

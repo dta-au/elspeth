@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml
 
+from elspeth.web._aws_ecs_acceptance import task_definition
 from elspeth.web.aws_ecs_acceptance import SCENARIO_ASSIGNMENT_NAMES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -47,7 +48,7 @@ def test_runbook_preserves_task_local_nonessential_healthy_sidecar() -> None:
     app = containers["elspeth-web"]
 
     assert sidecar["essential"] is False
-    assert re.search(r"@sha256:\$\{CLOUDWATCH_AGENT_IMAGE_SHA256\}$", sidecar["image"])
+    assert sidecar["image"] == "${CLOUDWATCH_AGENT_IMAGE}"
     assert "portMappings" not in sidecar
     assert app["dependsOn"] == [{"containerName": "cloudwatch-agent", "condition": "HEALTHY"}]
     environment = {entry["name"]: entry["value"] for entry in app["environment"]}
@@ -119,6 +120,7 @@ def test_runbook_preserves_versioned_config_sidecar_startup() -> None:
     sidecar = next(container for container in task["containerDefinitions"] if container["name"] == "cloudwatch-agent")
 
     assert sidecar["entryPoint"] == ["/bin/sh", "-ceu"]
+    assert sidecar["command"] == [task_definition._CLOUDWATCH_AGENT_COMMAND]
     environment = {entry["name"]: entry["value"] for entry in sidecar["environment"]}
     assert environment == {
         "ELSPETH_CW_AGENT_CONFIG_JSON_B64": "${CLOUDWATCH_AGENT_CONFIG_JSON_B64}",
@@ -153,6 +155,7 @@ def test_runbook_preserves_supported_agent_health_mode() -> None:
         "CMD-SHELL",
         '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q \'"status": "running"\'',
     ]
+    assert sidecar["healthCheck"] == task_definition._CLOUDWATCH_AGENT_HEALTH_CHECK
     assert "-m ecs" not in json.dumps(sidecar)
 
 
@@ -183,7 +186,12 @@ def test_runbook_preserves_versioned_hashed_bounded_agent_config() -> None:
         "resource_to_telemetry_conversion": {"enabled": True},
     }
     assert otel["exporters"]["awsxray/elspeth"] == {"indexed_attributes": ["run_id", "status"]}
-    assert "OPERATOR_METRICS_LOG_GROUP" in SCENARIO_ASSIGNMENT_NAMES
+    assert {
+        "OPERATOR_METRICS_LOG_GROUP",
+        "CLOUDWATCH_AGENT_IMAGE",
+        "CLOUDWATCH_AGENT_CONFIG_JSON_SHA256",
+        "CLOUDWATCH_AGENT_OTEL_YAML_SHA256",
+    } <= set(SCENARIO_ASSIGNMENT_NAMES)
     assert otel["service"]["pipelines"] == {
         "metrics/elspeth": {
             "receivers": ["otlp/elspeth"],

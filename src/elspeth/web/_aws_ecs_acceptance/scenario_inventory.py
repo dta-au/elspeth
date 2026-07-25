@@ -33,6 +33,10 @@ _TASK_DEFINITION_COMPOSER_MODEL_ENV = (
     "ELSPETH_WEB__COMPOSER_MODEL",
     "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL",
 )
+_DIGEST_PINNED_CONTAINER_IMAGE_PATTERN = re.compile(
+    r"[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?"
+    r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+@sha256:[0-9a-f]{64}\Z"
+)
 
 _ORPHAN_INVENTORY_FIELDS = frozenset(
     {
@@ -631,7 +635,8 @@ def _validate_resolved_scenario_values(
             or authorization_origin.path not in {"", "/"}
             or authorization_origin.query
             or authorization_origin.fragment
-            or namespace not in authorization_origin.hostname
+            or authorization_origin.hostname != f"{namespace}.auth.{aws_region}.amazoncognito.com"
+            or values["OIDC_EXPECTED_AUTHORIZATION_ORIGIN"] != f"https://{namespace}.auth.{aws_region}.amazoncognito.com"
         ):
             raise AcceptanceCheckError("scenario_inventory_schema")
         if re.fullmatch(r"[A-Za-z0-9_-]{8,128}", cast(str, values["OIDC_EXPECTED_AUDIENCE"])) is None:
@@ -662,7 +667,7 @@ def _validate_scenario_inventory(
     }:
         raise AcceptanceCheckError("scenario_inventory_schema")
     if (
-        payload["schema"] != "elspeth.aws-ecs-scenario-inventory.v6"
+        payload["schema"] != "elspeth.aws-ecs-scenario-inventory.v7"
         or payload["scenario_id"] != scenario_id
         or payload["phase"] != expected_phase
         or payload["acceptance_run_id"] != acceptance_run_id
@@ -691,6 +696,13 @@ def _validate_scenario_inventory(
         raise AcceptanceCheckError("scenario_inventory_schema") from None
     if values["ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256"] != policy_binding:
         raise AcceptanceCheckError("scenario_inventory_binding")
+    if (
+        len(cast(str, values["CLOUDWATCH_AGENT_IMAGE"])) > 2048
+        or _DIGEST_PINNED_CONTAINER_IMAGE_PATTERN.fullmatch(cast(str, values["CLOUDWATCH_AGENT_IMAGE"])) is None
+        or _SHA256_PATTERN.fullmatch(cast(str, values["CLOUDWATCH_AGENT_CONFIG_JSON_SHA256"])) is None
+        or _SHA256_PATTERN.fullmatch(cast(str, values["CLOUDWATCH_AGENT_OTEL_YAML_SHA256"])) is None
+    ):
+        raise AcceptanceCheckError("scenario_inventory_schema")
     live_model = values["ELSPETH_BEDROCK_LIVE_TEST_MODEL"]
     if not live_model.startswith("bedrock/") or any(character.isspace() for character in live_model):
         raise AcceptanceCheckError("scenario_inventory_schema")

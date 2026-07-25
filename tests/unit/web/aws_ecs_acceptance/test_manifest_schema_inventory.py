@@ -17,6 +17,51 @@ from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._aws_ecs_acceptance import contracts, manifest_schema, scenario_inventory
 from tests.unit.web.aws_ecs_acceptance.test_bedrock_guardrails import _guardrail_env
 
+CLOUDWATCH_AGENT_CONFIG_JSON = b"""{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "usage_data": false
+  }
+}
+"""
+CLOUDWATCH_AGENT_OTEL_YAML = b"""receivers:
+  otlp/elspeth:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+processors:
+  memory_limiter/elspeth:
+    check_interval: 5s
+    limit_mib: 128
+    spike_limit_mib: 32
+  batch/elspeth:
+    send_batch_size: 512
+    send_batch_max_size: 1024
+    timeout: 5s
+exporters:
+  awsemf/elspeth:
+    namespace: ELSPETH/Operator
+    log_group_name: ${OPERATOR_METRICS_LOG_GROUP}
+    log_stream_name: telemetry
+    dimension_rollup_option: NoDimensionRollup
+    retain_initial_value_of_delta_metric: true
+    resource_to_telemetry_conversion:
+      enabled: true
+  awsxray/elspeth:
+    indexed_attributes: [run_id, status]
+service:
+  pipelines:
+    metrics/elspeth:
+      receivers: [otlp/elspeth]
+      processors: [memory_limiter/elspeth, batch/elspeth]
+      exporters: [awsemf/elspeth]
+    traces/elspeth:
+      receivers: [otlp/elspeth]
+      processors: [memory_limiter/elspeth, batch/elspeth]
+      exporters: [awsxray/elspeth]
+"""
+CLOUDWATCH_AGENT_IMAGE = "public.ecr.aws/cloudwatch-agent/cloudwatch-agent@sha256:" + "a" * 64
+
 
 def test_manifest_schema_and_scenario_inventory_modules_exist() -> None:
     assert importlib.util.find_spec("elspeth.web._aws_ecs_acceptance.manifest_schema") is not None
@@ -104,6 +149,9 @@ def _scenario_inventory(
             "ELSPETH_WEB__COMPOSER_MODEL": "openrouter/openai/gpt-5.4",
             "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL": "openrouter/anthropic/claude-opus-4.6",
             "ELSPETH_BEDROCK_LIVE_TEST_MODEL": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            "CLOUDWATCH_AGENT_IMAGE": CLOUDWATCH_AGENT_IMAGE,
+            "CLOUDWATCH_AGENT_CONFIG_JSON_SHA256": hashlib.sha256(CLOUDWATCH_AGENT_CONFIG_JSON).hexdigest(),
+            "CLOUDWATCH_AGENT_OTEL_YAML_SHA256": hashlib.sha256(CLOUDWATCH_AGENT_OTEL_YAML).hexdigest(),
             "TARGET_GROUP_ARN": f"arn:aws:elasticloadbalancing:{region}:{account}:targetgroup/{namespace}-target/0123456789abcdef",
             "ALB_BASE_URL": f"https://{namespace}.example.invalid",
             "ALB_ARN": f"arn:aws:elasticloadbalancing:{region}:{account}:loadbalancer/app/{namespace}-alb/0123456789abcdef",
@@ -202,7 +250,7 @@ def _scenario_inventory(
         for profile in guardrail_profiles
     ]
     return {
-        "schema": "elspeth.aws-ecs-scenario-inventory.v6",
+        "schema": "elspeth.aws-ecs-scenario-inventory.v7",
         "acceptance_run_id": run_id,
         "candidate_sha": "c" * 40,
         "aws_account_id": account,
@@ -636,6 +684,18 @@ def test_control_manifest_rejects_shared_terraform_state_and_foreign_scenario_re
             "https://elspeth-acceptance-example-b.auth.ap-southeast-2.amazoncognito.com:not-a-port",
             id="malformed-port",
         ),
+        pytest.param(
+            "https://elspeth-acceptance-example-b.attacker.invalid",
+            id="attacker-suffix",
+        ),
+        pytest.param(
+            "https://elspeth-acceptance-example-b.auth.ap-southeast-2.amazoncognito.com:443",
+            id="explicit-default-port",
+        ),
+        pytest.param(
+            "https://elspeth-acceptance-example-b.auth.ap-southeast-2.amazoncognito.com/",
+            id="trailing-slash",
+        ),
     ],
 )
 def test_scenario_inventory_rejects_nonstandard_oidc_authorization_origin(
@@ -656,6 +716,44 @@ def test_scenario_inventory_rejects_nonstandard_oidc_authorization_origin(
         _init_control_manifest(
             tmp_path / "unsafe-oidc-authorization-origin.json",
             inventory_mutator=mutate_authorization_origin,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("CLOUDWATCH_AGENT_IMAGE", "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest", id="tagged-image"),
+        pytest.param("CLOUDWATCH_AGENT_CONFIG_JSON_SHA256", "A" * 64, id="uppercase-json-digest"),
+        pytest.param("CLOUDWATCH_AGENT_OTEL_YAML_SHA256", "", id="missing-otel-digest"),
+    ],
+)
+def test_scenario_inventory_rejects_unbound_cloudwatch_sidecar_identity(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    def mutate_sidecar_identity(inventory: dict[str, object], _scenario: str) -> None:
+        values = inventory["values"]
+        assert isinstance(values, dict)
+        values[field] = value
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_schema"):
+        _init_control_manifest(
+            tmp_path / "unbound-cloudwatch-sidecar.json",
+            inventory_mutator=mutate_sidecar_identity,
+        )
+
+
+def test_scenario_inventory_requires_cloudwatch_sidecar_identity_to_match_preapply(tmp_path: Path) -> None:
+    def drift_sidecar_identity(inventory: dict[str, object], _scenario: str) -> None:
+        values = inventory["values"]
+        assert isinstance(values, dict)
+        values["CLOUDWATCH_AGENT_IMAGE"] = "public.ecr.aws/cloudwatch-agent/cloudwatch-agent@sha256:" + "b" * 64
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_conflict"):
+        _init_control_manifest(
+            tmp_path / "drifted-cloudwatch-sidecar.json",
+            inventory_mutator=drift_sidecar_identity,
         )
 
 
