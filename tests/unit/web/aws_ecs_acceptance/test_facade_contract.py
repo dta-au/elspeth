@@ -616,7 +616,7 @@ def test_parser_surface_is_the_exact_reviewed_contract() -> None:
 
 def test_all_selected_base_public_exports_remain_importable() -> None:
     assert len(EXPECTED_PUBLIC_EXPORTS) == 91
-    missing = {name for name in EXPECTED_PUBLIC_EXPORTS if not hasattr(acceptance, name)}
+    missing = EXPECTED_PUBLIC_EXPORTS.difference(vars(acceptance))
     assert not missing
 
 
