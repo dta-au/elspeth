@@ -1,8 +1,8 @@
 // E2E spec: guided-mode wizard source/output walk against the live local
 // backend. The local Playwright backend intentionally has no LLM provider, so
-// this stops at the transform step before any provider-dependent guided chat.
-// Wire-stage behavior is covered by tutorial.spec.ts with a deterministic
-// guided protocol fixture.
+// this stops after output review, immediately before "Finish outputs" invokes
+// the provider-dependent guided planner. Later-stage behavior is covered by
+// tutorial.spec.ts with a deterministic guided protocol fixture.
 
 import { expect, test, type Page } from "@playwright/test";
 
@@ -113,7 +113,7 @@ async function isolateAuditReadinessSideRail(
 
 test.describe("composer-guided — source/output live walk", () => {
   test(
-    "guided demo: CSV source → JSONL output → transform chat step",
+    "guided demo: CSV source → reviewed JSONL output",
     async ({ page }) => {
       // ── Out-of-band setup ──────────────────────────────────────────────────
       // Create session + upload CSV blob via REST before navigating the SPA.
@@ -195,23 +195,15 @@ test.describe("composer-guided — source/output live walk", () => {
         await expect(
           page.getByRole("button", { name: "Finish outputs", exact: true }),
         ).toBeEnabled();
-        await page.getByRole("button", { name: "Finish outputs", exact: true }).click();
 
-        // ── Step 3 proposal review: no provider revision call yet ─────────
-        await expect(
-          page.getByRole("heading", {
-            name: "Review the transform stages that turn source data into the output.",
-          }),
-        ).toBeVisible();
-        const proposal = page.getByRole("article", {
-          name: "Review pipeline proposal",
-        });
-        await expect(proposal).toBeVisible();
-        await expect(
-          proposal.getByRole("button", { name: "Review wiring", exact: true }),
-        ).toBeEnabled();
-        await expect(proposal.getByText("source-1 · csv", { exact: true })).toBeVisible();
-        await expect(proposal.getByText("output-1 · json", { exact: true })).toBeVisible();
+        // "Finish outputs" is the planner handoff and therefore requires an
+        // available provider. Verify the complete live source/output walk at
+        // that boundary; tutorial.spec.ts owns the deterministic later stages.
+        const outputReview = page.getByRole("region", { name: "Review outputs" });
+        await expect(outputReview).toBeVisible();
+        await expect(outputReview.getByText("output", { exact: true })).toBeVisible();
+        await expect(outputReview.getByText("json", { exact: true })).toBeVisible();
+        await expect(outputReview.getByText("reviewed", { exact: true })).toBeVisible();
         await expect(page.getByRole("textbox", { name: "Message input" })).toBeEnabled();
         await expect(
           page.getByRole("button", { name: "Exit to freeform", exact: true }),
