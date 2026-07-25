@@ -443,6 +443,51 @@ def test_gate_ledger_records_idempotent_closed_checks_and_finalizes_checksum(tmp
         )
 
 
+def test_bound_cleanup_terminal_replays_after_external_ledger_finalize(tmp_path: Path) -> None:
+    gate_ledger = importlib.import_module("elspeth.web._aws_ecs_acceptance.gate_ledger")
+    path = tmp_path / "ledger.json"
+    _gate_ledger_init(path)
+    _fill_gate_ledger_prefix(path)
+    _fill_cleanup_gate_prefix(path)
+    expected_prefix_sha256 = acceptance._gate_ledger_records_hash(json.loads(path.read_text()))
+    recorded = gate_ledger._gate_ledger_record_cleanup_bound(
+        path,
+        check_id=acceptance._TERMINAL_GATE_CHECK_ID,
+        exit_status=0,
+        receipt_hash="e" * 64,
+        candidate_sha="c" * 40,
+        expected_prefix_records_sha256=expected_prefix_sha256,
+        now=lambda: datetime(2026, 7, 14, 1, 2, tzinfo=UTC),
+    )
+    finalized = acceptance.gate_ledger_finalize(
+        path,
+        candidate_sha="c" * 40,
+        now=lambda: datetime(2026, 7, 14, 1, 3, tzinfo=UTC),
+    )
+
+    replayed = gate_ledger._gate_ledger_record_cleanup_bound(
+        path,
+        check_id=acceptance._TERMINAL_GATE_CHECK_ID,
+        exit_status=0,
+        receipt_hash="e" * 64,
+        candidate_sha="c" * 40,
+        expected_prefix_records_sha256=expected_prefix_sha256,
+        now=lambda: datetime(2026, 7, 14, 1, 4, tzinfo=UTC),
+    )
+
+    assert recorded["finalized"] is None
+    assert replayed == finalized
+    with pytest.raises(acceptance.AcceptanceCheckError, match="gate_ledger_conflict"):
+        gate_ledger._gate_ledger_record_cleanup_bound(
+            path,
+            check_id=acceptance._TERMINAL_GATE_CHECK_ID,
+            exit_status=0,
+            receipt_hash="f" * 64,
+            candidate_sha="c" * 40,
+            expected_prefix_records_sha256=expected_prefix_sha256,
+        )
+
+
 def test_gate_ledger_rejects_conflicting_resume_and_invalid_or_secret_shaped_fields(tmp_path: Path) -> None:
     path = tmp_path / "ledger.json"
     _gate_ledger_init(path)

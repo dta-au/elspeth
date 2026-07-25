@@ -417,6 +417,14 @@ def test_cleanup_evidence_finalize_is_two_phase_refuses_pending_and_clears_only_
         acceptance.cleanup_evidence_finalize(
             manifest_path,
             ledger_path=ledger_path,
+            phase="prepare",
+            clear_cleanup_required=False,
+            now=lambda: datetime(2026, 7, 14, 1, 7, 50, tzinfo=UTC),
+        )
+    with pytest.raises(acceptance.AcceptanceCheckError, match="cleanup_finalize_receipt"):
+        acceptance.cleanup_evidence_finalize(
+            manifest_path,
+            ledger_path=ledger_path,
             phase="commit",
             clear_cleanup_required=True,
             now=lambda: datetime(2026, 7, 14, 1, 8, tzinfo=UTC),
@@ -504,6 +512,11 @@ def test_cleanup_evidence_finalize_recovers_after_terminal_row_precedes_manifest
         phase="prepare",
         clear_cleanup_required=False,
         now=lambda: datetime(2026, 7, 14, 1, 6, tzinfo=UTC),
+    )
+    acceptance.gate_ledger_finalize(
+        ledger_path,
+        candidate_sha="c" * 40,
+        now=lambda: datetime(2026, 7, 14, 1, 6, 30, tzinfo=UTC),
     )
     recovered = acceptance.cleanup_evidence_finalize(
         manifest_path,

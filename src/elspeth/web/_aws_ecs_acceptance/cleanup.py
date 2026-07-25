@@ -59,6 +59,27 @@ def _ensure_final_cleanup_receipt(
     )
 
 
+def _validate_committed_cleanup_replay(
+    manifest_path: Path,
+    manifest: Mapping[str, object],
+    ledger: Mapping[str, object],
+    *,
+    receipts_sha256: str,
+) -> bool:
+    final_evidence = manifest["final_evidence"]
+    if not (isinstance(final_evidence, dict) and final_evidence["phase"] == "committed" and manifest["cleanup_required"] is False):
+        return False
+    ledger_sha256 = _gate_ledger_records_hash(ledger)
+    if (
+        final_evidence["ledger_sha256"] != ledger_sha256
+        or final_evidence["receipts_sha256"] != receipts_sha256
+        or type(final_evidence["committed_at"]) is not str
+    ):
+        raise AcceptanceCheckError("cleanup_finalize_conflict")
+    _verify_final_cleanup_receipt(manifest_path, manifest)
+    return True
+
+
 @_serialized_control_manifest_write
 def cleanup_evidence_finalize(
     manifest_path: Path,
@@ -117,7 +138,16 @@ def cleanup_evidence_finalize(
         ).encode("utf-8")
     )
     if phase == "prepare":
-        if clear_cleanup_required or ledger["finalized"] is not None:
+        if clear_cleanup_required:
+            raise AcceptanceCheckError("cleanup_finalize_phase")
+        if _validate_committed_cleanup_replay(
+            manifest_path,
+            manifest,
+            ledger,
+            receipts_sha256=receipts_sha256,
+        ):
+            return manifest
+        if ledger["finalized"] is not None:
             raise AcceptanceCheckError("cleanup_finalize_phase")
         existing = manifest["final_evidence"]
         prepared = {
@@ -131,8 +161,6 @@ def cleanup_evidence_finalize(
             "ledger_sha256": None,
         }
         if isinstance(existing, dict):
-            if existing["phase"] == "committed":
-                return manifest
             comparable = {**prepared, "prepared_at": existing["prepared_at"]}
             if existing != comparable:
                 raise AcceptanceCheckError("cleanup_finalize_conflict")
@@ -161,15 +189,12 @@ def cleanup_evidence_finalize(
     if phase != "commit" or not clear_cleanup_required:
         raise AcceptanceCheckError("cleanup_finalize_phase")
     final_evidence = manifest["final_evidence"]
-    if isinstance(final_evidence, dict) and final_evidence["phase"] == "committed" and manifest["cleanup_required"] is False:
-        ledger_sha256 = _gate_ledger_records_hash(ledger)
-        if (
-            final_evidence["ledger_sha256"] != ledger_sha256
-            or final_evidence["receipts_sha256"] != receipts_sha256
-            or type(final_evidence["committed_at"]) is not str
-        ):
-            raise AcceptanceCheckError("cleanup_finalize_conflict")
-        _verify_final_cleanup_receipt(manifest_path, manifest)
+    if _validate_committed_cleanup_replay(
+        manifest_path,
+        manifest,
+        ledger,
+        receipts_sha256=receipts_sha256,
+    ):
         return manifest
     if manifest["cleanup_required"] is not True or not isinstance(final_evidence, dict):
         raise AcceptanceCheckError("cleanup_finalize_pending")
