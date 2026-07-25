@@ -118,6 +118,8 @@ _EVIDENCE_KINDS = (
 EVIDENCE_KINDS = _EVIDENCE_KINDS
 CONNECT_TIMEOUT_SECONDS = 5.0
 READ_TIMEOUT_SECONDS = 15.0
+_CONTAINER_RUNTIME_UID = 1654
+_CONTAINER_RUNTIME_GID = 1654
 WRITE_TIMEOUT_SECONDS = 10.0
 POOL_TIMEOUT_SECONDS = 5.0
 MAX_JSON_RESPONSE_BYTES = 1024 * 1024
@@ -1966,8 +1968,14 @@ def verify_local_auth() -> dict[str, object]:
     }
 
 
+def _storage_metadata(path: Path) -> os.stat_result:
+    """Return ownership metadata for a provisioned runtime directory."""
+
+    return path.lstat()
+
+
 def provision_storage() -> dict[str, object]:
-    """Create and prove the three required EFS-backed directories as UID/GID 1000."""
+    """Create and prove the required EFS-backed directories as the image user."""
 
     try:
         settings = settings_from_env()
@@ -1979,7 +1987,7 @@ def provision_storage() -> dict[str, object]:
         raise
     except Exception:
         raise AcceptanceCheckError("storage_settings") from None
-    if os.geteuid() != 1000 or os.getegid() != 1000:
+    if os.geteuid() != _CONTAINER_RUNTIME_UID or os.getegid() != _CONTAINER_RUNTIME_GID:
         raise AcceptanceCheckError("storage_identity")
     if not isinstance(data_dir, Path) or not isinstance(payload_root, Path):
         raise AcceptanceCheckError("storage_settings")
@@ -2019,8 +2027,8 @@ def provision_storage() -> dict[str, object]:
     for path in roots:
         probe: Path | None = None
         try:
-            metadata = path.lstat()
-            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 1000 or metadata.st_gid != 1000:
+            metadata = _storage_metadata(path)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != _CONTAINER_RUNTIME_UID or metadata.st_gid != _CONTAINER_RUNTIME_GID:
                 raise AcceptanceCheckError("storage_ownership")
             probe = path / f".elspeth-probe-{uuid.uuid4().hex}"
             descriptor = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
@@ -2048,8 +2056,8 @@ def provision_storage() -> dict[str, object]:
     return {
         "check": "provision-storage",
         "ok": True,
-        "uid": 1000,
-        "gid": 1000,
+        "uid": _CONTAINER_RUNTIME_UID,
+        "gid": _CONTAINER_RUNTIME_GID,
         "directories": 3,
         "write_read_fsync_delete_probes": 3,
     }
@@ -6744,7 +6752,7 @@ def validate_task_definition_policy_binding(
         if match is None or match.group(1) != account_id or match.group(2) != expected_name or expected_name not in role_names:
             raise AcceptanceCheckError("task_definition_policy_binding")
     if expected_user is not None and (
-        expected_user != "1000:1000"
+        expected_user != "1654:1654"
         or container.get("user") != expected_user
         or container.get("entryPoint") != ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
     ):
@@ -9649,7 +9657,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_definition_policy.add_argument("--file", required=True)
     task_definition_policy.add_argument("--scenario-id", required=True, choices=("A", "B"))
     task_definition_policy.add_argument("--container-name", required=True)
-    task_definition_policy.add_argument("--expected-user", choices=("1000:1000",))
+    task_definition_policy.add_argument("--expected-user", choices=("1654:1654",))
     task_definition_policy.add_argument("--expected-image-role", choices=("candidate", "rollback-baseline"), default="candidate")
 
     compatibility_record = commands.add_parser("compatibility-record-validate")

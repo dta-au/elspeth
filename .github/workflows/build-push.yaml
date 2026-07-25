@@ -372,6 +372,10 @@ jobs:
             [[ -n "$image" ]] || continue
             docker pull "$image"
             test "$(docker inspect --format '{{ index .Config.Labels "io.elspeth.install-extras" }}' "$image")" = "all"
+            test "$(docker run --rm --entrypoint id "$image" -u)" = "1654"
+            test "$(docker run --rm --entrypoint id "$image" -g)" = "1654"
+            docker run --rm --entrypoint /bin/sh "$image" -c \
+              'test -d /app/data/blobs && test -d /app/data/outputs'
             docker run --rm --interactive --entrypoint python "$image" - <<'PY'
           import psycopg
           import psycopg2

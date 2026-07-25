@@ -33,7 +33,7 @@ acceptance/deployment controller described by its runbook.
 - Run one web process or replica (`WEB_CONCURRENCY=1`). Stop the old process
   before starting its replacement.
 - Create persistent `data`, `data/blobs`, and `payloads` paths writable by UID
-  and GID 1000. Payload persistence is separate from database persistence.
+  and GID 1654. Payload persistence is separate from database persistence.
 - For an external database, configure distinct session and Landscape URLs with
   `ELSPETH_WEB__DEPLOYMENT_STATE_MODE=external-postgresql`.
 - Initialize empty external schemas once with
@@ -88,7 +88,7 @@ conditions:
 - one replica and one process;
 - `strategy: Recreate` (stop-before-start);
 - external PostgreSQL for session and Landscape state; and
-- persistent payload storage writable by UID/GID 1000.
+- persistent payload storage writable by UID/GID 1654.
 
 ELSPETH does not ship or claim a PVC bundle in this release. The operator owns
 storage-class behavior, backups, database availability, rollout verification,

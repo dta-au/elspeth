@@ -136,6 +136,12 @@ a target.
 | `ELSPETH_WEB__LANDSCAPE_URL` | Landscape database URL. Keep it distinct from the session database. |
 | `ELSPETH_WEB__DATA_DIR` | Persistent application data directory. |
 | `ELSPETH_WEB__PAYLOAD_STORE_PATH` | Persistent payload directory. Payload persistence is separate from database persistence. |
+| `ELSPETH_WEB__SECRET_KEY` | Required session-token signing secret. Generate at least 32 random bytes and keep the value stable across restarts. |
+| `ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY` | Required base64-encoded shareable-link signing key. Generate with `openssl rand -base64 32` and keep the value stable across restarts. |
+| `ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS` | Required positive maximum for Composer build/revision turns. The standalone Docker example uses `15`. |
+| `ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS` | Required positive maximum for Composer discovery turns. The standalone Docker example uses `10`. |
+| `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` | Required positive Composer timeout in seconds. The standalone Docker example uses `180.0`. |
+| `ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE` | Required positive per-user Composer request limit. The standalone Docker example uses `60`. |
 | `WEB_CONCURRENCY` | Web worker count. Set exactly `1` for every supported deployment. |
 
 The image includes both PostgreSQL clients, not the PostgreSQL server. Use

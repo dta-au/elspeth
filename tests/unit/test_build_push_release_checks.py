@@ -152,6 +152,27 @@ def test_release_dockerfile_builds_frontend_dist_before_python_install() -> None
     assert dockerfile.index("npm run build") < dockerfile.index('uv sync --frozen "$@" --no-editable --active')
 
 
+def test_release_dockerfile_prepares_the_standalone_web_runtime_contract() -> None:
+    """The published image must carry a clash-resistant identity and web roots."""
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "groupadd --gid 1654 elspeth" in dockerfile
+    assert "useradd --uid 1654 --gid elspeth" in dockerfile
+    assert "/app/data/blobs" in dockerfile
+    assert "/app/data/outputs" in dockerfile
+    assert dockerfile.index("/app/data/blobs") < dockerfile.index("USER elspeth")
+
+
+def test_registry_smoke_checks_runtime_identity_and_web_directories() -> None:
+    """Each independently published registry image must prove the same runtime contract."""
+    workflow = BUILD_PUSH_WORKFLOW.read_text(encoding="utf-8")
+
+    assert 'test "$(docker run --rm --entrypoint id "$image" -u)" = "1654"' in workflow
+    assert 'test "$(docker run --rm --entrypoint id "$image" -g)" = "1654"' in workflow
+    assert "test -d /app/data/blobs" in workflow
+    assert "test -d /app/data/outputs" in workflow
+
+
 def test_release_build_context_excludes_host_node_modules() -> None:
     """Host-installed frontend dependencies must not enter the Docker context."""
     raw_lines = DOCKERIGNORE.read_text(encoding="utf-8").splitlines()

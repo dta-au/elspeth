@@ -11,7 +11,7 @@
 #   docker run elspeth --help                                                # Show available commands
 #   docker run elspeth --version                                             # Show version
 #   docker run elspeth run --settings /app/config/pipeline.yaml              # Run batch pipeline
-#   docker run -p 8451:8451 -e ELSPETH_WEB__SECRET_KEY=<key> elspeth web     # Start web server
+#   docker run -p 8451:8451 <required-web-env> elspeth web --host 0.0.0.0   # Start web server
 
 # One canonical build selection is threaded through every stage. The runtime
 # label makes the selected extras inspectable on the final artifact; official
@@ -103,10 +103,12 @@ LABEL org.opencontainers.image.description="Auditable Sense/Decide/Act Pipelines
 LABEL org.opencontainers.image.source="https://github.com/johnm-dta/elspeth"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL io.elspeth.install-extras="$INSTALL_EXTRAS"
+LABEL io.elspeth.runtime-uid="1654"
+LABEL io.elspeth.runtime-gid="1654"
 
-# Create non-root user for security
-RUN groupadd --gid 1000 elspeth && \
-    useradd --uid 1000 --gid elspeth --shell /bin/bash --create-home elspeth
+# Use one documented, clash-resistant non-root identity across all published images.
+RUN groupadd --gid 1654 elspeth && \
+    useradd --uid 1654 --gid elspeth --shell /bin/bash --create-home elspeth
 
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
@@ -122,7 +124,15 @@ WORKDIR /app
 # Create standard mount point directories
 # These will typically be mounted from host
 # /app/state is for the default audit.db location (sqlite:///./state/audit.db)
-RUN mkdir -p /app/config /app/input /app/ops /app/output /app/state /app/secrets && \
+RUN mkdir -p \
+        /app/config \
+        /app/data/blobs \
+        /app/data/outputs \
+        /app/input \
+        /app/ops \
+        /app/output \
+        /app/secrets \
+        /app/state && \
     chown -R elspeth:elspeth /app
 
 # Switch to non-root user

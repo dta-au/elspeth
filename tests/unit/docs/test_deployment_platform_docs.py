@@ -80,8 +80,11 @@ def test_support_matrix_states_the_shared_runtime_contract() -> None:
         "Payload persistence is separate from database persistence",
         "doctor deployment --init-schema",
         "doctor aws-ecs --init-schema",
+        "UID/GID 1654",
     ):
         assert phrase in text
+
+    assert "UID/GID 1000" not in text
 
     assert "Every other production topology supplies its own external PostgreSQL service" not in text
     assert "AWS ECS, Azure production, and Kubernetes BYO deployments require operator-provided external PostgreSQL" in text

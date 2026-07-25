@@ -904,7 +904,20 @@ def test_verify_local_auth_fails_closed_without_creating_or_echoing_database_pat
         assert not auth_db.exists()
 
 
+def _assume_published_image_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model the published image identity without requiring host UID 1654."""
+
+    monkeypatch.setattr(acceptance.os, "geteuid", lambda: 1654)
+    monkeypatch.setattr(acceptance.os, "getegid", lambda: 1654)
+    monkeypatch.setattr(
+        acceptance,
+        "_storage_metadata",
+        lambda path: SimpleNamespace(st_mode=path.lstat().st_mode, st_uid=1654, st_gid=1654),
+    )
+
+
 def test_provision_storage_creates_and_probes_required_non_root_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _assume_published_image_identity(monkeypatch)
     data_dir = tmp_path / "data"
     data_dir.mkdir(mode=0o700)
     payload_root = data_dir / "payloads"
@@ -923,8 +936,8 @@ def test_provision_storage_creates_and_probes_required_non_root_directories(tmp_
     assert receipt == {
         "check": "provision-storage",
         "ok": True,
-        "uid": 1000,
-        "gid": 1000,
+        "uid": 1654,
+        "gid": 1654,
         "directories": 3,
         "write_read_fsync_delete_probes": 3,
     }
@@ -935,6 +948,7 @@ def test_provision_storage_creates_and_probes_required_non_root_directories(tmp_
 
 @pytest.mark.parametrize("payload_kind", ["data", "blobs"])
 def test_provision_storage_rejects_duplicate_required_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload_kind: str) -> None:
+    _assume_published_image_identity(monkeypatch)
     data_dir = tmp_path / "data"
     data_dir.mkdir(mode=0o700)
     payload_root = data_dir if payload_kind == "data" else data_dir / "blobs"
@@ -953,6 +967,7 @@ def test_provision_storage_rejects_duplicate_required_roots(tmp_path: Path, monk
 
 
 def test_provision_storage_rejects_outside_payload_root_without_creating_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _assume_published_image_identity(monkeypatch)
     data_dir = tmp_path / "data"
     data_dir.mkdir(mode=0o700)
     payload_root = tmp_path / "outside" / "payloads"
@@ -4109,7 +4124,7 @@ def test_task_definition_policy_binding_compares_returned_environment_to_protect
 def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entrypoint(tmp_path: Path) -> None:
     manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
     container = payload["taskDefinition"]["containerDefinitions"][0]
-    container["user"] = "1000:1000"
+    container["user"] = "1654:1654"
     container["entryPoint"] = ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
 
     acceptance.validate_task_definition_policy_binding(
@@ -4117,7 +4132,7 @@ def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entry
         manifest_path=manifest_path,
         scenario_id="A",
         container_name=container_name,
-        expected_user="1000:1000",
+        expected_user="1654:1654",
     )
     task_definition = payload["taskDefinition"]
     original_task_role = task_definition["taskRoleArn"]
@@ -4130,7 +4145,7 @@ def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entry
             manifest_path=manifest_path,
             scenario_id="A",
             container_name=container_name,
-            expected_user="1000:1000",
+            expected_user="1654:1654",
         )
     task_definition["taskRoleArn"] = original_task_role
     task_definition["executionRoleArn"] = original_execution_role
@@ -4141,7 +4156,7 @@ def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entry
             manifest_path=manifest_path,
             scenario_id="A",
             container_name=container_name,
-            expected_user="1000:1000",
+            expected_user="1654:1654",
         )
     task_definition["taskRoleArn"] = original_task_role
     task_definition["volumes"].append(
@@ -4161,7 +4176,7 @@ def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entry
             manifest_path=manifest_path,
             scenario_id="A",
             container_name=container_name,
-            expected_user="1000:1000",
+            expected_user="1654:1654",
         )
     task_definition["volumes"].pop()
     container["mountPoints"].pop()
@@ -4172,7 +4187,7 @@ def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entry
             manifest_path=manifest_path,
             scenario_id="A",
             container_name=container_name,
-            expected_user="1000:1000",
+            expected_user="1654:1654",
         )
     task_definition["volumes"].pop()
     container["user"] = "0"
@@ -4182,9 +4197,9 @@ def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entry
             manifest_path=manifest_path,
             scenario_id="A",
             container_name=container_name,
-            expected_user="1000:1000",
+            expected_user="1654:1654",
         )
-    container["user"] = "1000:1000"
+    container["user"] = "1654:1654"
     payload["taskDefinition"]["volumes"][0]["efsVolumeConfiguration"]["fileSystemId"] = "fs-ffffffffffffffffa"  # type: ignore[index]
     with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
         acceptance.validate_task_definition_policy_binding(
@@ -4192,7 +4207,7 @@ def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entry
             manifest_path=manifest_path,
             scenario_id="A",
             container_name=container_name,
-            expected_user="1000:1000",
+            expected_user="1654:1654",
         )
 
 

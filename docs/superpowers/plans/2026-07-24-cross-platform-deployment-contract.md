@@ -619,7 +619,7 @@ URLs, so the supported Compose path deliberately restricts it to URL-unreserved
 characters instead of accepting an ambiguously encoded free-form password.
 
 `state-init` uses the same ELSPETH image with an entrypoint override, runs as
-the image's UID/GID 1000, and idempotently runs
+the image's UID/GID 1654, and idempotently runs
 `install -d -m 0700 /app/state/data /app/state/data/blobs
 /app/state/payloads` so reused volumes are repaired to the required mode. It
 exits before `web-init`; it does not run alongside the web process.
@@ -754,7 +754,7 @@ the storage name is `elspeth-nfs`, the subpath is `elspeth`, and Key Vault URLs 
 origin. It contains no credential value.
 
 Cross-check the application container's inherited identity against
-`Dockerfile`: the runtime stage must still declare UID/GID 1000 and
+`Dockerfile`: the runtime stage must still declare UID/GID 1654 and
 `USER elspeth`. Do not invent `runAsUser`, Kubernetes-style
 `securityContext`, or a non-root init container that cannot write a
 root-owned NFS share.
@@ -770,11 +770,11 @@ uv run --frozen pytest -q tests/unit/deployment/test_azure_container_apps_bundle
 The module assumes the custom-VNet Container Apps environment, managed
 identity, Key Vault secrets, and NFS Azure Files environment storage already
 exist. It also requires an operator-prepared `elspeth` subdirectory containing
-`data/blobs` and `payloads`, all owned by UID/GID 1000 and mode `0700`.
+`data/blobs` and `payloads`, all owned by UID/GID 1654 and mode `0700`.
 The Azure runbook prepares these paths from a trusted NFS administration host
 before creating a revision and verifies them with
 `stat -c '%u:%g:%a %n'`; the expected output for each path starts
-`1000:1000:700`. The app revision is not granted privilege to repair storage.
+`1654:1654:700`. The app revision is not granted privilege to repair storage.
 
 The module must not create a database or embed a connection string. Accept
 Key Vault secret URLs as parameters, define Container Apps
@@ -885,11 +885,11 @@ uv run --frozen pytest -q tests/unit/deployment/test_kubernetes_bundle.py
 
 - [ ] **Step 3: Implement the Kustomize base**
 
-Use pod `fsGroup: 1000` only to make the empty volume root writable. The init
-container runs as UID/GID 1000, creates child directories with mode `0700`,
+Use pod `fsGroup: 1654` only to make the empty volume root writable. The init
+container runs as UID/GID 1654, creates child directories with mode `0700`,
 and the application uses only those restrictive child paths. The support
 contract requires a storage class that honors `fsGroup`; otherwise the
-operator must pre-provision a PVC path writable by UID/GID 1000. Document this
+operator must pre-provision a PVC path writable by UID/GID 1654. Document this
 precondition and let the init container fail rather than weakening directory
 permissions.
 
@@ -1087,7 +1087,7 @@ current `webui,azure,llm` omission.
 Assert the Compose guide uses `openssl rand -hex 24` for the shared
 `POSTGRES_PASSWORD`/connection-URL value and does not suggest embedding an
 arbitrary unencoded password in a URL. Assert the Kubernetes guide says the
-storage class must honor pod `fsGroup: 1000`, or the operator must
+storage class must honor pod `fsGroup: 1654`, or the operator must
 pre-provision a UID/GID-1000-writable persistent path.
 
 Assert the Azure runbook no longer configures

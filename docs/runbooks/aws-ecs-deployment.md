@@ -1525,7 +1525,7 @@ forbidden after recreation. Unknown or unapproved compatibility is NO-GO;
 expiry or identity drift is also NO-GO.
 
 Before either schema initializer runs, create and prove the required EFS
-children with the candidate image's explicit `1000:1000` one-shot definition.
+children with the candidate image's explicit `1654:1654` one-shot definition.
 The command creates only the configured payload directory and `data_dir/blobs`
 under the already-mounted `data_dir`, then performs create/read/fsync/delete
 probes in all three directories. It emits no paths:
@@ -1587,8 +1587,8 @@ resolve_bound_task_definition() {
 validate_scenario_task_definitions() {
   resolve_bound_task_definition CANDIDATE_TASK_DEFINITION "$WEB_CONTAINER_NAME"
   resolve_bound_task_definition DOCTOR_TASK_DEFINITION "$DOCTOR_CONTAINER_NAME"
-  resolve_bound_task_definition PAYLOAD_VERIFIER_TASK_DEFINITION "$WEB_CONTAINER_NAME" 1000:1000
-  resolve_bound_task_definition LOCAL_AUTH_VERIFIER_TASK_DEFINITION "$WEB_CONTAINER_NAME" 1000:1000
+  resolve_bound_task_definition PAYLOAD_VERIFIER_TASK_DEFINITION "$WEB_CONTAINER_NAME" 1654:1654
+  resolve_bound_task_definition LOCAL_AUTH_VERIFIER_TASK_DEFINITION "$WEB_CONTAINER_NAME" 1654:1654
   if test "$DEPLOYMENT_MODE" = upgrade; then
     resolve_bound_task_definition ROLLBACK_DOCTOR_TASK_DEFINITION "$DOCTOR_CONTAINER_NAME"
     resolve_bound_task_definition PREVIOUS_TASK_DEFINITION "$WEB_CONTAINER_NAME"
@@ -1952,7 +1952,7 @@ one of those digests as the generic GHCR/ACR release image.
 
 Before doctor, run `provision_scenario_storage` above. It provisions
 `data_dir`, explicit `payload_store_path`, and the derived blob directory on
-the intended EFS access point and proves them as the non-root `1000:1000`
+the intended EFS access point and proves them as the non-root `1654:1654`
 user. Mounting only the parent is insufficient: doctor deliberately never
 calls `mkdir`, including with `--init-schema`, because an overlay child would
 mask a displaced EFS mount. Record the filesystem/access-point identity and
@@ -2727,14 +2727,14 @@ one:
    protected state without mutating the session. Require the six-row
    `GET /api/system/status` contract and the typed HTTP 409
    `tutorial_required_control_coverage` recheck as part of this command.
-5. Start the explicit `1000:1000` one-shot payload verifier with the candidate
+5. Start the explicit `1654:1654` one-shot payload verifier with the candidate
    digest and the same PostgreSQL/EFS settings; do not use root-running ECS
    Exec for this proof.
 6. From every contributing healthy candidate task, use ECS Exec for the S3,
    Bedrock, Guardrail, and operator-telemetry checks and locally extract the
    one sanitized receipt sentinel.
 7. Drain traffic to fixed 503, scale the service to zero, then start the
-   explicit `1000:1000` local-auth verifier against the same EFS mount.
+   explicit `1654:1654` local-auth verifier against the same EFS mount.
 
 ```bash
 case "$ACTIVE_SCENARIO_ID" in
@@ -2902,7 +2902,7 @@ exact `target_llm` and the prompt-shield/content-safety entries in
 `run_web_plugin_policy` row was read back unchanged; a Guardrail API success
 without this policy proof is NO-GO.
 
-Both one-shot definitions set task-level `user: "1000:1000"`, override the
+Both one-shot definitions set task-level `user: "1654:1654"`, override the
 image entrypoint exactly once with
 `{"entryPoint": ["python", "-m", "elspeth.web.aws_ecs_acceptance"]}`,
 use the candidate digest, and reuse the exact

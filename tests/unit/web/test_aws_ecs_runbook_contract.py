@@ -777,7 +777,7 @@ def test_runbook_pins_replacement_then_persistence_role_and_drained_local_auth_o
     positions = [sequence.index(marker) for marker in ordered]
     assert positions == sorted(positions)
     assert sequence.index("require_compatibility_record_current") < sequence.index("PRE_REPLACEMENT_TASK_ARN")
-    assert 'task-level `user: "1000:1000"`' in text
+    assert 'task-level `user: "1654:1654"`' in text
     assert "root-running ECS Exec" in text
 
     phase = text[text.index("### 5. Perform candidate-aware acceptance") : text.index("### 6. Observe")]

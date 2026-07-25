@@ -245,7 +245,7 @@ extracted from the current Ubuntu/Azure specification. It declares:
 - explicit `azure-container-apps` and `external-postgresql` settings;
 - an NFS Azure Files mount for payload/data persistence;
 - a required operator-prepared NFS subdirectory whose data, blob, and payload
-  paths are owned by UID/GID 1000 with restrictive permissions; and
+  paths are owned by UID/GID 1654 with restrictive permissions; and
 - liveness and readiness probes matching the web service.
 
 The Azure runbook remains responsible for resource provisioning, managed

@@ -35,7 +35,7 @@ services:
         /app/state/data
         /app/state/data/blobs
         /app/state/payloads
-    user: "1000:1000"
+    user: "1654:1654"
     volumes:
       - elspeth_state:/app/state
     restart: "no"

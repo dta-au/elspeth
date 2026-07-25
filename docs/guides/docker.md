@@ -5,6 +5,7 @@ This guide covers running ELSPETH in Docker containers for development and produ
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Standalone Web Server](#standalone-web-server)
 - [Volume Mounts](#volume-mounts)
 - [Environment Variables](#environment-variables)
 - [Common Commands](#common-commands)
@@ -37,6 +38,55 @@ docker run ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} plugins list
 
 Replace `v0.7.2` with the exact release or immutable `sha-<commit>` tag that
 matches the deployment you are operating.
+
+---
+
+## Standalone Web Server
+
+The published image runs as UID/GID 1654. A bind mount hides the directories
+created in the image, so prepare the web data roots on the host and make them
+writable by that identity:
+
+```bash
+mkdir -p ./data/blobs ./data/outputs
+sudo chown -R 1654:1654 ./data
+sudo chmod 0700 ./data ./data/blobs ./data/outputs
+```
+
+Generate fresh signing keys in the shell, then pass all required web settings
+into the container. The values below for the four Composer limits match the
+project's browser-test configuration:
+
+```bash
+export ELSPETH_WEB_SECRET_KEY="$(openssl rand -hex 32)"
+export ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY="$(openssl rand -base64 32)"
+
+docker run --rm --name elspeth-web \
+  -p 8451:8451 \
+  -e ELSPETH_WEB__DATA_DIR=/app/data \
+  -e ELSPETH_WEB__SECRET_KEY="${ELSPETH_WEB_SECRET_KEY}" \
+  -e ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="${ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY}" \
+  -e ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15 \
+  -e ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10 \
+  -e ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0 \
+  -e ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60 \
+  -v "$(pwd)/data:/app/data" \
+  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  web --host 0.0.0.0 --port 8451
+```
+
+The explicit `0.0.0.0` bind is required for Docker's published port to reach
+the process; the native CLI keeps its safer `127.0.0.1` default. From another
+terminal, check readiness with:
+
+```bash
+curl -fsS http://127.0.0.1:8451/api/ready
+```
+
+For persistent deployments, store both generated keys in a secret manager and
+reuse them across restarts. Rotating `ELSPETH_WEB__SECRET_KEY` invalidates
+sessions; rotating `ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY` invalidates
+existing shareable links. Never bake either key into an image or commit it.
 
 ---
 
@@ -409,7 +459,10 @@ For general ELSPETH troubleshooting (API errors, configuration issues, etc.), se
 ### Common Docker Errors
 
 - **"File not found"** - See [File Not Found Errors](troubleshooting.md#file-not-found-errors) (verify volume mounts and container paths)
-- **"Permission denied"** - See [Permission Denied on Output](troubleshooting.md#permission-denied-on-output) (create output dir with `mkdir -p ./output && chmod 777 ./output`)
+- **"Permission denied"** - The published image runs as UID/GID 1654. Create
+  the bind-mounted directory and assign it to that identity, for example
+  `mkdir -p ./output && sudo chown 1654:1654 ./output && chmod 0700 ./output`.
+  Do not make deployment data world-writable.
 
 ### Database connection refused
 

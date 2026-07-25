@@ -71,3 +71,35 @@ def test_docker_guide_explains_the_container_database_boundary() -> None:
     assert "AWS ECS, Azure production, and BYO Kubernetes deployments require external PostgreSQL" in normalized
     assert "Azure VM SQLite is supported only for explicitly non-production use on one persistent host" in normalized
     assert "Native Linux may use SQLite on one persistent host" in normalized
+
+
+def test_docker_guide_has_a_runnable_standalone_web_container() -> None:
+    text = DOCKER_GUIDE.read_text(encoding="utf-8")
+    section = text[text.index("## Standalone Web Server") : text.index("\n---", text.index("## Standalone Web Server"))]
+
+    assert "openssl rand -hex 32" in section
+    assert "openssl rand -base64 32" in section
+    assert "mkdir -p ./data/blobs ./data/outputs" in section
+    assert "1654:1654" in section
+    assert "-p 8451:8451" in section
+    assert "web --host 0.0.0.0 --port 8451" in section
+    assert "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15" in section
+    assert "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10" in section
+    assert "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0" in section
+    assert "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60" in section
+    for variable in (
+        "ELSPETH_WEB__SECRET_KEY",
+        "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY",
+        "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS",
+        "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS",
+        "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS",
+        "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE",
+    ):
+        assert variable in section
+
+
+def test_docker_guide_documents_the_published_runtime_identity() -> None:
+    text = " ".join(DOCKER_GUIDE.read_text(encoding="utf-8").split())
+
+    assert "UID/GID 1654" in text
+    assert "UID/GID 1000" not in text

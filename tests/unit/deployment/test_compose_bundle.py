@@ -196,7 +196,7 @@ def test_state_initializer_repairs_all_private_state_directories_then_exits() ->
     command = state_init["command"]
 
     assert state_init["image"] == ELSPETH_IMAGE
-    assert state_init["user"] == "1000:1000"
+    assert state_init["user"] == "1654:1654"
     assert state_init["entrypoint"] == ["/bin/sh", "-c"]
     assert isinstance(command, list)
     assert len(command) == 1, "/bin/sh -c must receive the complete install expression as one argument"

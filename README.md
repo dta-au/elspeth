@@ -250,8 +250,14 @@ npm install
 npm run build
 cd ../../../../
 
-# 3) Set a non-default JWT signing key
-export ELSPETH_WEB__SECRET_KEY="local-dev-secret-key"
+# 3) Create the required local roots and set all required web settings
+mkdir -p data/blobs data/outputs
+export ELSPETH_WEB__SECRET_KEY="$(openssl rand -hex 32)"
+export ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="$(openssl rand -base64 32)"
+export ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15
+export ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10
+export ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0
+export ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60
 
 # 4) Create a local demo login user (development only)
 elspeth composer users add demo \
@@ -273,7 +279,13 @@ Vite proxies `/api` and `/ws` to the backend on port 8451.
 
 ```bash
 # Terminal 1
-export ELSPETH_WEB__SECRET_KEY="local-dev-secret-key"
+mkdir -p data/blobs data/outputs
+export ELSPETH_WEB__SECRET_KEY="$(openssl rand -hex 32)"
+export ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="$(openssl rand -base64 32)"
+export ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15
+export ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10
+export ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0
+export ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60
 elspeth web --host 127.0.0.1 --port 8451
 
 # Terminal 2
