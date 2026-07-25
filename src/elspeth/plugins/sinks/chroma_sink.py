@@ -51,6 +51,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
     ChromaConnectionConfig,
+    _validate_chroma_http_target,
 )
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -271,6 +272,7 @@ class ChromaSink(BaseSink):
                 raise FrameworkBugError(
                     "ChromaSinkConfig.host is None in 'client' mode — ChromaConnectionConfig validation should have rejected this"
                 )
+            _validate_chroma_http_target(self._config.host, self._config.port, ssl=self._config.ssl)
             self._client = chromadb.HttpClient(
                 host=self._config.host,
                 port=self._config.port,

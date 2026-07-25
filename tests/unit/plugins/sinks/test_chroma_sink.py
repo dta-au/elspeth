@@ -182,6 +182,35 @@ class TestChromaSinkOnStart:
             with pytest.raises(RuntimeError, match="Connection refused"):
                 sink.on_start(ctx)
 
+    def test_client_on_start_revalidates_ssrf_target_after_preflight_construction(self) -> None:
+        from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+
+        config = {
+            "collection": "test-collection",
+            "mode": "client",
+            "host": "169.254.169.254",
+            "port": 8000,
+            "ssl": True,
+            "field_mapping": {
+                "document_field": "text",
+                "id_field": "doc_id",
+                "metadata_fields": [],
+            },
+            "schema": {
+                "mode": "fixed",
+                "fields": ["doc_id: str", "text: str"],
+            },
+        }
+        with plugin_preflight_mode(True):
+            sink = inject_write_failure(ChromaSink(config))
+        ctx = _make_lifecycle_ctx()
+
+        with patch("elspeth.plugins.sinks.chroma_sink.chromadb") as mock_chromadb:
+            with pytest.raises(ValueError, match=r"(?i)ssrf"):
+                sink.on_start(ctx)
+
+            mock_chromadb.HttpClient.assert_not_called()
+
 
 class TestChromaSinkFlush:
     def test_flush_is_noop(self) -> None:
