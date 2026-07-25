@@ -4,9 +4,6 @@
 // Wire-stage behavior is covered by tutorial.spec.ts with a deterministic
 // guided protocol fixture.
 
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-
 import { expect, test, type Page } from "@playwright/test";
 
 import {
@@ -24,19 +21,9 @@ const BLOB_FILENAME = "playwright-orders.csv";
 // satisfy the classify recipe's classifier-keyword required-field predicate.
 const SAMPLE_CSV = "id,name,category\n1,widget,a\n";
 
-// Frontend root: playwright.config.ts passes an absolute .e2e-data path
-// anchored to the frontend directory, and the backend stores uploaded blobs
-// relative to that data_dir.
-const FRONTEND_ROOT = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "../..",
-);
-const E2E_DATA_DIR = process.env.PLAYWRIGHT_E2E_DATA_DIR
-  ? resolve(process.env.PLAYWRIGHT_E2E_DATA_DIR)
-  : resolve(FRONTEND_ROOT, ".e2e-data");
-
-// Sink output path — must be under data_dir/outputs/ (paths.py:44).
-const SINK_OUTPUT_PATH = resolve(E2E_DATA_DIR, "outputs", "playwright-guided-output.jsonl");
+// Sink paths are deployment-relative and resolve inside the managed outputs
+// directory; absolute host paths are deliberately rejected.
+const SINK_OUTPUT_PATH = "playwright-guided-output.jsonl";
 
 async function isolateAuditReadinessSideRail(
   page: Page,
@@ -169,6 +156,17 @@ test.describe("composer-guided — source/output live walk", () => {
         ).toBeEnabled();
         await page.getByRole("button", { name: "Continue", exact: true }).click();
 
+        // Uploaded tabular sources are inspected before they are committed.
+        // Confirm the observed columns so the wizard can advance to output.
+        await expect(
+          page.getByRole("button", { name: "Looks right", exact: true }),
+        ).toBeVisible();
+        await page.getByRole("button", { name: "Looks right", exact: true }).click();
+        await expect(
+          page.getByRole("button", { name: "Finish sources", exact: true }),
+        ).toBeEnabled();
+        await page.getByRole("button", { name: "Finish sources", exact: true }).click();
+
         // ── Step 2 sink: SINGLE_SELECT — pick "json" ───────────────────────
         await expect(
           page.getByRole("button", { name: "JSON", exact: true }),
@@ -194,22 +192,29 @@ test.describe("composer-guided — source/output live walk", () => {
         // review can continue without adding a custom field.
         await expect(page.getByText("category")).toBeVisible();
         await page.getByRole("button", { name: "Continue", exact: true }).click();
+        await expect(
+          page.getByRole("button", { name: "Finish outputs", exact: true }),
+        ).toBeEnabled();
+        await page.getByRole("button", { name: "Finish outputs", exact: true }).click();
 
-        // ── Step 3 transform chat: no provider call yet, controls visible ──
+        // ── Step 3 proposal review: no provider revision call yet ─────────
         await expect(
           page.getByRole("heading", {
-            name: "Review the transform chain that turns source data into the output.",
+            name: "Review the transform stages that turn source data into the output.",
           }),
         ).toBeVisible();
+        const proposal = page.getByRole("article", {
+          name: "Review pipeline proposal",
+        });
+        await expect(proposal).toBeVisible();
+        await expect(
+          proposal.getByRole("button", { name: "Review wiring", exact: true }),
+        ).toBeEnabled();
+        await expect(proposal.getByText("source-1 · csv", { exact: true })).toBeVisible();
+        await expect(proposal.getByText("output-1 · json", { exact: true })).toBeVisible();
         await expect(page.getByRole("textbox", { name: "Message input" })).toBeEnabled();
         await expect(
           page.getByRole("button", { name: "Exit to freeform", exact: true }),
-        ).toBeVisible();
-        await expect(
-          page.getByText("This pipeline will read your CSV and write a JSON file."),
-        ).toBeVisible();
-        await expect(
-          page.getByText("Required fields: id, name, category"),
         ).toBeVisible();
         await expect(
           page.getByText(/Source commit failed|Chat panel encountered an error/i),

@@ -27,24 +27,30 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
 
 const tutorialSession = {
-  id: "session-tutorial",
+  id: "11111111-1111-4111-8111-111111111111",
   title: "New session",
   created_at: "2026-05-19T12:00:00Z",
   updated_at: "2026-05-19T12:00:00Z",
 };
 
 const graduationSession = {
-  id: "session-graduation",
+  id: "22222222-2222-4222-8222-222222222222",
   title: "New session",
   created_at: "2026-05-19T12:10:00Z",
   updated_at: "2026-05-19T12:10:00Z",
 };
 
+const SOURCE_ID = "00000000-0000-4000-8000-000000000010";
+const SCRAPE_ID = "00000000-0000-4000-8000-000000000020";
+const RATE_ID = "00000000-0000-4000-8000-000000000030";
+const OUTPUT_ID = "00000000-0000-4000-8000-000000000040";
+
 // Composition state the guided respond/state endpoints return. The canonical
 // tutorial pipeline is web_scrape → llm (rate) → jsonl, the shape that triggers
 // the prompt-injection shield advisory at the wire stage.
 const compositionState = {
-  id: "state-1",
+  id: "00000000-0000-4000-8000-000000000001",
+  session_id: tutorialSession.id,
   version: 1,
   sources: {
     source: {
@@ -52,6 +58,8 @@ const compositionState = {
       options: {
         rows: [{ url: "dta.gov.au" }, { url: "data.gov.au" }],
       },
+      on_success: "scrape",
+      on_validation_failure: "discard",
     },
   },
   nodes: [
@@ -75,8 +83,23 @@ const compositionState = {
     },
   ],
   edges: [],
-  outputs: [{ name: "ratings", plugin: "jsonl", options: {} }],
+  outputs: [
+    {
+      name: "ratings",
+      plugin: "jsonl",
+      options: {},
+      on_write_failure: "discard",
+    },
+  ],
   metadata: { name: null, description: null },
+  is_valid: true,
+  validation_errors: [],
+  validation_warnings: [],
+  validation_suggestions: [],
+  derived_from_state_id: null,
+  created_at: "2026-05-19T12:00:00Z",
+  composer_meta: null,
+  plugin_policy_findings: [],
 };
 
 interface GuidedFixtureState {
@@ -102,10 +125,15 @@ function guidedSession(step: string): Record<string, unknown> {
   };
 }
 
-function singleSelectTurn(question: string, options: Array<[string, string]>): Record<string, unknown> {
+function singleSelectTurn(
+  question: string,
+  options: Array<[string, string]>,
+  stepIndex = 0,
+): Record<string, unknown> {
   return {
     type: "single_select",
-    step_index: 0,
+    step_index: stepIndex,
+    turn_token: (stepIndex === 0 ? "a" : "b").repeat(64),
     payload: {
       question,
       options: options.map(([id, label]) => ({ id, label, hint: null })),
@@ -125,65 +153,106 @@ function singleSelectTurn(question: string, options: Array<[string, string]>): R
 const wireTurn: Record<string, unknown> = {
   type: "confirm_wiring",
   step_index: 3,
+  turn_token: "c".repeat(64),
   payload: {
-    topology: {
-      sources: {
-        source: {
-          id: "source",
-          plugin: "inline_blob",
-          on_success: "scrape",
-          on_validation_failure: "discard",
+    proposal_id: "00000000-0000-4000-8000-000000000002",
+    draft_hash: "d".repeat(64),
+    sources: [
+      {
+        stable_id: SOURCE_ID,
+        label: "Source",
+        plugin: "inline_blob",
+        on_validation_failure: "discard",
+        guaranteed_fields: ["url"],
+        row_cardinality: {
+          input: "none",
+          output: "zero_or_many",
+          expected_output_count: null,
         },
       },
-      nodes: [
-        {
-          id: "scrape",
-          node_type: "transform",
-          plugin: "web_scrape",
-          input: "scrape",
-          on_success: "rate",
-          on_error: "discard",
-          routes: null,
-          fork_to: null,
-          branches: null,
-        },
-        {
-          id: "rate",
-          node_type: "transform",
-          plugin: "llm_rate",
-          input: "rate",
-          on_success: "ratings",
-          on_error: "discard",
-          routes: null,
-          fork_to: null,
-          branches: null,
-        },
-      ],
-      outputs: [
-        {
-          id: "output:ratings",
-          sink_name: "ratings",
-          plugin: "jsonl",
-          on_write_failure: "discard",
-        },
-      ],
-    },
-    edge_contracts: [
+    ],
+    nodes: [
       {
-        from: "source",
-        to: "scrape",
-        producer_guarantees: ["url"],
-        consumer_requires: ["url"],
-        missing_fields: [],
-        satisfied: true,
+        stable_id: SCRAPE_ID,
+        label: "Fetch step",
+        node_type: "transform",
+        plugin: "web_scrape",
+        behavior: { kind: "transform" },
+        required_fields: ["url"],
+        guaranteed_fields: ["url", "html"],
+        row_cardinality: {
+          input: "one",
+          output: "one",
+          expected_output_count: null,
+        },
+        structured_output_fields: [],
       },
       {
-        from: "scrape",
-        to: "rate",
-        producer_guarantees: ["url", "html"],
-        consumer_requires: ["html"],
-        missing_fields: [],
-        satisfied: true,
+        stable_id: RATE_ID,
+        label: "Llm Rate step",
+        node_type: "transform",
+        plugin: "llm_rate",
+        behavior: { kind: "transform" },
+        required_fields: ["html"],
+        guaranteed_fields: ["url", "score", "rationale"],
+        row_cardinality: {
+          input: "one",
+          output: "one",
+          expected_output_count: null,
+        },
+        structured_output_fields: [],
+      },
+    ],
+    outputs: [
+      {
+        stable_id: OUTPUT_ID,
+        label: "Ratings output",
+        plugin: "jsonl",
+        on_write_failure: "discard",
+        required_fields: ["score", "rationale"],
+        business_schema: {
+          mode: "observed",
+          fields: [],
+          guaranteed_fields: [],
+          required_fields: ["score", "rationale"],
+        },
+      },
+    ],
+    connections: [
+      {
+        stable_id: "00000000-0000-4000-8000-000000000050",
+        from_endpoint: { kind: "source", stable_id: SOURCE_ID },
+        to_endpoint: { kind: "node", stable_id: SCRAPE_ID },
+        flow: { kind: "source_success", branch: null },
+        schema_contract: {
+          from: "source",
+          to: "scrape",
+          producer_guarantees: ["url"],
+          consumer_requires: ["url"],
+          missing_fields: [],
+          satisfied: true,
+        },
+      },
+      {
+        stable_id: "00000000-0000-4000-8000-000000000051",
+        from_endpoint: { kind: "node", stable_id: SCRAPE_ID },
+        to_endpoint: { kind: "node", stable_id: RATE_ID },
+        flow: { kind: "node_success", branch: null },
+        schema_contract: {
+          from: "scrape",
+          to: "rate",
+          producer_guarantees: ["url", "html"],
+          consumer_requires: ["html"],
+          missing_fields: [],
+          satisfied: true,
+        },
+      },
+      {
+        stable_id: "00000000-0000-4000-8000-000000000052",
+        from_endpoint: { kind: "node", stable_id: RATE_ID },
+        to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
+        flow: { kind: "node_success", branch: null },
+        schema_contract: null,
       },
     ],
     semantic_contracts: [],
@@ -197,6 +266,8 @@ const wireTurn: Record<string, unknown> = {
           "LLM node 'rate' consumes externally-fetched content from a web_scrape upstream without an authorized prompt-injection shield between them. Continuing without it is allowed.",
       },
     ],
+    blockers: [],
+    can_confirm: true,
   },
 };
 
@@ -330,7 +401,7 @@ async function installTutorialRoutes(
             ["csv", "csv"],
           ]),
           terminal: null,
-          composition_state: null,
+          composition_state: compositionState,
         },
       });
       return;
@@ -364,7 +435,7 @@ async function installTutorialRoutes(
             ["csv", "csv"],
           ]),
           terminal: null,
-          composition_state: null,
+          composition_state: compositionState,
         },
       });
       return;
@@ -383,7 +454,7 @@ async function installTutorialRoutes(
         next = singleSelectTurn("What format should the output be in?", [
           ["jsonl", "jsonl"],
           ["json", "json"],
-        ]);
+        ], 1);
       } else {
         next = wireTurn;
         session = guidedSession("step_4_wire");
@@ -420,7 +491,7 @@ async function installTutorialRoutes(
         next = singleSelectTurn("What format should the output be in?", [
           ["jsonl", "jsonl"],
           ["json", "json"],
-        ]);
+        ], 1);
         session = guidedSession("step_2_sink");
       } else if (n === 2) {
         // after sink pick → wire turn
@@ -657,13 +728,21 @@ test.describe("first-run tutorial (staged guided flow)", () => {
     // ── Step 4 wire stage: topology + edge-contract overlay (M1 from/to) ─────
     await expect(page.getByRole("heading", { name: "Review wiring" })).toBeVisible();
     await expect(
-      page.getByRole("listitem", { name: "Source to Fetch step" }),
+      page.getByRole("listitem", { name: /Source to Fetch step \(Fetch\)/ }),
     ).toBeVisible();
     await expect(
-      page.getByRole("listitem", { name: "Fetch step to Llm Rate step" }),
+      page.getByRole("listitem", {
+        name: /Fetch step \(Fetch\) to Llm Rate step \(Llm Rate\)/,
+      }),
     ).toBeVisible();
-    await expect(page.getByText(/Source\s+→\s+Fetch step\s+—\s+connected/)).toBeVisible();
-    await expect(page.getByText(/Fetch step\s+→\s+Llm Rate step\s+—\s+connected/)).toBeVisible();
+    await expect(
+      page.getByRole("listitem", { name: /Source to Fetch step \(Fetch\).*connected/ }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("listitem", {
+        name: /Fetch step \(Fetch\) to Llm Rate step \(Llm Rate\).*connected/,
+      }),
+    ).toBeVisible();
     // M1 guard: post-M1 naming, never from_id/to_id.
     await expect(
       page.getByRole("listitem", { name: /from_id|to_id/ }),
