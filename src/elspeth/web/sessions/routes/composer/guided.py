@@ -2196,7 +2196,7 @@ async def post_guided_respond(
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
 ) -> GuidedRespondResponse:
     """Settle one schema-8 guided response as a fenced atomic cohort."""
-    await _verify_session_ownership(session_id, user, request)
+    owned_session = await _verify_session_ownership(session_id, user, request)
     if body.proposal_id is not None:
         try:
             parsed_proposal = UUID(body.proposal_id)
@@ -2470,7 +2470,7 @@ async def post_guided_respond(
                 body,
                 plugin=held_sink_plugin,
                 data_dir=str(request.app.state.settings.data_dir),
-                session_id=str(session_id),
+                session_id=str(owned_session.id),
             )
         try:
             projected_state, _planned_response, _next_turn, _prepared_next = _schema8_answer_and_project_next(

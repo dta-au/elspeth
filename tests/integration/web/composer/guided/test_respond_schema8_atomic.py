@@ -921,6 +921,32 @@ def test_respond_handler_has_no_legacy_or_unfenced_mutation_calls() -> None:
     assert {"renew_guided_operation", "settle_guided_state_operation"} <= attributes
 
 
+def test_respond_sink_preflight_uses_owned_session_record_for_path_namespace() -> None:
+    """Filesystem scope must come from the ownership-verified record, not route input."""
+    tree = ast.parse(inspect.getsource(guided_route.post_guided_respond))
+    ownership_assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Await)
+        and isinstance(node.value.value, ast.Call)
+        and isinstance(node.value.value.func, ast.Name)
+        and node.value.value.func.id == "_verify_session_ownership"
+    ]
+
+    assert len(ownership_assignments) == 1
+    assert [ast.unparse(target) for target in ownership_assignments[0].targets] == ["owned_session"]
+
+    sink_preflight_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_schema8_require_runnable_sink_form"
+    ]
+    assert len(sink_preflight_calls) == 1
+    session_keyword = next(keyword for keyword in sink_preflight_calls[0].keywords if keyword.arg == "session_id")
+    assert ast.unparse(session_keyword.value) == "str(owned_session.id)"
+
+
 def test_respond_settlement_shares_chat_lock_and_never_polls_under_it() -> None:
     from elspeth.web.sessions.routes.composer import guided_chat_atomic
 
