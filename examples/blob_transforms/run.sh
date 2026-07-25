@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 EXAMPLE_DIR="$PROJECT_ROOT/examples/blob_transforms"
 
-PYTHON_BIN="${PYTHON_BIN:-$PROJECT_ROOT/.venv/bin/python}"
-ELSPETH_BIN="${ELSPETH_BIN:-$PROJECT_ROOT/.venv/bin/elspeth}"
+PYTHON_BIN="${ELSPETH_BLOB_TRANSFORMS_PYTHON_BIN:-$PROJECT_ROOT/.venv/bin/python}"
+ELSPETH_BIN="${ELSPETH_BLOB_TRANSFORMS_CLI_BIN:-$PROJECT_ROOT/.venv/bin/elspeth}"
 
 cd "$PROJECT_ROOT"
 
