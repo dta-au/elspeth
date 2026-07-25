@@ -96,8 +96,14 @@ def build_layered_prompt(
     )
 
 
-# Plan 1 roster (file-predicate pairs). Full routing table is Plan 2.
-_EVERY_FILE = ("solution-architect", "security-architect")
+# Universal roster from the panel design. Language- and UX-specific lenses remain
+# optional and are added only when their persona files exist.
+_EVERY_FILE = (
+    "solution-architect",
+    "systems-thinker",
+    "quality-engineer",
+    "security-architect",
+)
 
 
 def load_persona(lens: str, *, lenses_dir: Path = LENSES_DIR) -> str:
