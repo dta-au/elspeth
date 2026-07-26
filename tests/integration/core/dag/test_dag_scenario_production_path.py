@@ -39,9 +39,6 @@ RECOVERY_CASES = [
     if case.workflow == "recovery"
 ]
 BUILD_CASES = [
-    pytest.param("multiple-independent-sources", "independent-roots", id="multiple-independent-sources:independent-roots"),
-    pytest.param("multi-source-queue-fan-in", "queued-fan-in", id="multi-source-queue-fan-in:queued-fan-in"),
-    pytest.param("conditional-routing", "two-way-gate", id="conditional-routing:two-way-gate"),
     pytest.param("fork-coalesce-policies", "require-all-nested", id="fork-coalesce-policies:require-all-nested"),
 ]
 
@@ -52,26 +49,9 @@ B1_RUNTIME_CASES = (
     ("conditional-routing", "two-way-gate"),
 )
 
-B1_RUNTIME_ORACLE_FIXTURES = {
-    ("multiple-independent-sources", "independent-roots"): "multiple-independent-sources/runtime-expected.json",
-    ("multi-source-queue-fan-in", "queued-fan-in"): "multi-source-queue-fan-in/runtime-expected.json",
-    ("conditional-routing", "two-way-gate"): "conditional-routing/runtime-expected.json",
-}
-
 
 def _declared_case(scenario_id: str, case_id: str) -> tuple[ScenarioSpec, HarnessCaseSpec]:
     return next((scenario, case) for scenario, case in iter_harness_cases(MANIFEST) if (scenario.id, case.id) == (scenario_id, case_id))
-
-
-def _proposed_b1_runtime_case(scenario_id: str, case_id: str) -> tuple[ScenarioSpec, HarnessCaseSpec]:
-    scenario, declared_case = _declared_case(scenario_id, case_id)
-    oracle_fixture = B1_RUNTIME_ORACLE_FIXTURES.get((scenario_id, case_id))
-    if oracle_fixture is None:
-        return scenario, declared_case
-    values = declared_case.model_dump(mode="json")
-    values["workflow"] = "run"
-    values["expected"] = json.loads(resolve_fixture_path(oracle_fixture).read_text(encoding="utf-8"))
-    return scenario, HarnessCaseSpec.model_validate(values)
 
 
 @pytest.mark.parametrize(("scenario_id", "case_id"), B1_RUNTIME_CASES)
@@ -79,7 +59,7 @@ def test_b1_runtime_table_declares_exact_run_oracle(
     scenario_id: str,
     case_id: str,
 ) -> None:
-    _scenario, case = _proposed_b1_runtime_case(scenario_id, case_id)
+    _scenario, case = _declared_case(scenario_id, case_id)
 
     assert case.workflow == "run"
     assert isinstance(case.expected, RunExpectation)
@@ -92,7 +72,7 @@ def test_b1_runtime_table_executes_exact_production_oracle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario, case = _proposed_b1_runtime_case(scenario_id, case_id)
+    scenario, case = _declared_case(scenario_id, case_id)
     install_corpus_plugin_manager(monkeypatch)
 
     evidence = run_scenario_case(scenario, case, tmp_path)
@@ -104,7 +84,7 @@ def test_b1_multiple_independent_sources_preserves_exact_source_identity_and_ord
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario, case = _proposed_b1_runtime_case("multiple-independent-sources", "independent-roots")
+    scenario, case = _declared_case("multiple-independent-sources", "independent-roots")
     install_corpus_plugin_manager(monkeypatch)
 
     evidence = run_scenario_case(scenario, case, tmp_path)
@@ -135,7 +115,7 @@ def test_b1_multi_source_queue_fan_in_proves_queue_traversal_and_canonical_order
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario, case = _proposed_b1_runtime_case("multi-source-queue-fan-in", "queued-fan-in")
+    scenario, case = _declared_case("multi-source-queue-fan-in", "queued-fan-in")
     install_corpus_plugin_manager(monkeypatch)
 
     evidence = run_scenario_case(scenario, case, tmp_path)
@@ -174,7 +154,7 @@ def test_b1_conditional_routing_proves_exact_artifacts_routes_and_dispositions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario, case = _proposed_b1_runtime_case("conditional-routing", "two-way-gate")
+    scenario, case = _declared_case("conditional-routing", "two-way-gate")
     install_corpus_plugin_manager(monkeypatch)
 
     evidence = run_scenario_case(scenario, case, tmp_path)

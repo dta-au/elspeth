@@ -277,18 +277,18 @@ evidence:
   - id: harness-multiple-independent-sources-independent-roots
     kind: harness
     locator: multiple-independent-sources:independent-roots
-    claim: Two independently named source roots build through the production config and graph path into one shared sink.
-    stages: [config, build]
+    claim: The independent-roots corpus case executes two independently named source roots through the production runtime and exact durable and portable audit paths.
+    stages: [config, build, runtime, audit]
   - id: harness-multi-source-queue-fan-in-queued-fan-in
     kind: harness
     locator: multi-source-queue-fan-in:queued-fan-in
-    claim: Two source roots build through an explicit scheduling queue and downstream transform into one sink.
-    stages: [config, build]
+    claim: The queued-fan-in corpus case executes two source roots through an explicit scheduling queue and downstream transform with exact runtime and audit evidence.
+    stages: [config, build, runtime, audit]
   - id: harness-conditional-routing-two-way-gate
     kind: harness
     locator: conditional-routing:two-way-gate
-    claim: A two-way conditional gate builds through the production config and graph path with exact route edges.
-    stages: [config, build]
+    claim: The two-way-gate corpus case executes exact accepted and rejected artifacts, route labels, dispositions, and durable and portable audit evidence.
+    stages: [config, build, runtime, audit]
   - id: harness-fork-coalesce-policies-require-all-nested
     kind: harness
     locator: fork-coalesce-policies:require-all-nested
@@ -412,17 +412,11 @@ scenarios:
         status: pass
         evidence: [core-builder-schema-plural-sources-03, composer-runtime-agreement]
       runtime:
-        status: partial
+        status: pass
         evidence: [harness-linear-happy-path]
-        reason: Existing runtime evidence does not execute every required production disposition for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes exact production runtime result and disposition assertions.
       audit:
-        status: partial
+        status: pass
         evidence: [harness-linear-happy-path]
-        reason: Existing audit evidence does not prove every required durable record and portable export for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes exact durable audit-state and exported-record assertions.
       recovery: &recovery_partial
         status: partial
         evidence: [focused-crash-restart-09]
@@ -458,7 +452,7 @@ scenarios:
     title: Multiple independent sources
     cases:
       - id: independent-roots
-        workflow: build
+        workflow: run
         fixture: multiple-independent-sources/independent-roots.yaml
         input_fixtures:
           orders: multiple-independent-sources/orders.csv
@@ -466,12 +460,611 @@ scenarios:
         output_artifacts:
           output: output.jsonl
         expected:
-          node_count: 3
-          edge_count: 2
-          node_type_counts:
-            - {node_type: sink, count: 1}
-            - {node_type: source, count: 2}
-          edge_labels: [on_success, on_success]
+          {
+            "kind": "exact",
+            "status": "completed",
+            "sink_outputs": [
+              {
+                "sink_name": "output",
+                "rows": [
+                  "{\"id\":1,\"value\":10}",
+                  "{\"id\":2,\"value\":20}",
+                  "{\"id\":3,\"value\":30}",
+                  "{\"id\":101,\"value\":-5}",
+                  "{\"id\":102,\"value\":-10}",
+                  "{\"id\":103,\"value\":-15}"
+                ]
+              }
+            ],
+            "rows_processed": 6,
+            "rows_succeeded": 6,
+            "rows_failed": 0,
+            "projection": {
+              "rows": [
+                {
+                  "key": "orders:0",
+                  "source_name": "orders",
+                  "source_row_index": 0,
+                  "ingest_sequence": 0,
+                  "source_data_hash": "19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2"
+                },
+                {
+                  "key": "orders:1",
+                  "source_name": "orders",
+                  "source_row_index": 1,
+                  "ingest_sequence": 1,
+                  "source_data_hash": "ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d"
+                },
+                {
+                  "key": "orders:2",
+                  "source_name": "orders",
+                  "source_row_index": 2,
+                  "ingest_sequence": 2,
+                  "source_data_hash": "d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9"
+                },
+                {
+                  "key": "refunds:0",
+                  "source_name": "refunds",
+                  "source_row_index": 0,
+                  "ingest_sequence": 3,
+                  "source_data_hash": "804d9ca070c77a3af1dd0dac3d6fd6a2f664c563275ae090ba958e3725944256"
+                },
+                {
+                  "key": "refunds:1",
+                  "source_name": "refunds",
+                  "source_row_index": 1,
+                  "ingest_sequence": 4,
+                  "source_data_hash": "67b60e8bb29435c1ba474ce8707630b6bc49770f88a13c3060d307d8b219c784"
+                },
+                {
+                  "key": "refunds:2",
+                  "source_name": "refunds",
+                  "source_row_index": 2,
+                  "ingest_sequence": 5,
+                  "source_data_hash": "f0df28eb4c45da93c8c9c0124c72449bbf5627ca1166126dac2103c6f3067d9a"
+                }
+              ],
+              "tokens": [
+                {
+                  "key": "orders:0#0",
+                  "row_key": "orders:0",
+                  "parents": []
+                },
+                {
+                  "key": "orders:1#0",
+                  "row_key": "orders:1",
+                  "parents": []
+                },
+                {
+                  "key": "orders:2#0",
+                  "row_key": "orders:2",
+                  "parents": []
+                },
+                {
+                  "key": "refunds:0#0",
+                  "row_key": "refunds:0",
+                  "parents": []
+                },
+                {
+                  "key": "refunds:1#0",
+                  "row_key": "refunds:1",
+                  "parents": []
+                },
+                {
+                  "key": "refunds:2#0",
+                  "row_key": "refunds:2",
+                  "parents": []
+                }
+              ],
+              "node_states": [
+                {
+                  "key": "orders:0#0|sink:output@468d2923fe79|1|0",
+                  "token_key": "orders:0#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 1,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:0#0|source:orders@26129b303751|0|0",
+                  "token_key": "orders:0#0",
+                  "node_key": "source:orders@26129b303751",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:1#0|sink:output@468d2923fe79|1|0",
+                  "token_key": "orders:1#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 1,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:1#0|source:orders@26129b303751|0|0",
+                  "token_key": "orders:1#0",
+                  "node_key": "source:orders@26129b303751",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:2#0|sink:output@468d2923fe79|1|0",
+                  "token_key": "orders:2#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 1,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:2#0|source:orders@26129b303751|0|0",
+                  "token_key": "orders:2#0",
+                  "node_key": "source:orders@26129b303751",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:0#0|sink:output@468d2923fe79|1|0",
+                  "token_key": "refunds:0#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 1,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:0#0|source:refunds@c9c63796fdee|0|0",
+                  "token_key": "refunds:0#0",
+                  "node_key": "source:refunds@c9c63796fdee",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:1#0|sink:output@468d2923fe79|1|0",
+                  "token_key": "refunds:1#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 1,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:1#0|source:refunds@c9c63796fdee|0|0",
+                  "token_key": "refunds:1#0",
+                  "node_key": "source:refunds@c9c63796fdee",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:2#0|sink:output@468d2923fe79|1|0",
+                  "token_key": "refunds:2#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 1,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:2#0|source:refunds@c9c63796fdee|0|0",
+                  "token_key": "refunds:2#0",
+                  "node_key": "source:refunds@c9c63796fdee",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                }
+              ],
+              "routes": [],
+              "terminal_dispositions": [
+                {
+                  "key": "orders:0#0",
+                  "token_key": "orders:0#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "orders:1#0",
+                  "token_key": "orders:1#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "orders:2#0",
+                  "token_key": "orders:2#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "refunds:0#0",
+                  "token_key": "refunds:0#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "refunds:1#0",
+                  "token_key": "refunds:1#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "refunds:2#0",
+                  "token_key": "refunds:2#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                }
+              ],
+              "scheduler_work": [
+                {
+                  "key": "orders:0#0|scheduler:unbound|0",
+                  "token_key": "orders:0#0",
+                  "node_key": "scheduler:unbound",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "orders:1#0|scheduler:unbound|0",
+                  "token_key": "orders:1#0",
+                  "node_key": "scheduler:unbound",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "orders:2#0|scheduler:unbound|0",
+                  "token_key": "orders:2#0",
+                  "node_key": "scheduler:unbound",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "refunds:0#0|scheduler:unbound|0",
+                  "token_key": "refunds:0#0",
+                  "node_key": "scheduler:unbound",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "refunds:1#0|scheduler:unbound|0",
+                  "token_key": "refunds:1#0",
+                  "node_key": "scheduler:unbound",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "refunds:2#0|scheduler:unbound|0",
+                  "token_key": "refunds:2#0",
+                  "node_key": "scheduler:unbound",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                }
+              ],
+              "audit_records": [
+                {
+                  "key": "artifact|sink:output@468d2923fe79|primary|0|file",
+                  "record_type": "artifact",
+                  "material": "{\"artifact_type\":\"file\",\"content_hash\":\"46d9b93349eab5a2aabbea9ed368627fc0e391f646a9a35b135c95a2bb279ca2\",\"idempotency_witness\":\"sink:output@468d2923fe79|primary|0\",\"path_or_uri\":\"$CORPUS_RUNTIME_PATH\",\"producer_kind\":\"sink_effect\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"size_bytes\":146}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:output@468d2923fe79|sink_write|0|0",
+                  "record_type": "call",
+                  "material": "{\"call_index\":0,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:output@468d2923fe79|sink_write|0|1",
+                  "record_type": "call",
+                  "material": "{\"call_index\":1,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:output@468d2923fe79|sink_write|0|2",
+                  "record_type": "call",
+                  "material": "{\"call_index\":2,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "edge|source:orders@26129b303751|on_success|move|sink:output@468d2923fe79",
+                  "record_type": "edge",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"on_success\"}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "source:orders@26129b303751"
+                  ]
+                },
+                {
+                  "key": "edge|source:refunds@c9c63796fdee|on_success|move|sink:output@468d2923fe79",
+                  "record_type": "edge",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"on_success\"}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "source:refunds@c9c63796fdee"
+                  ]
+                },
+                {
+                  "key": "manifest|manifest",
+                  "record_type": "manifest",
+                  "material": "{\"chunk_count\":1,\"derivation_version\":\"audit-export-derivation-v1\",\"export_format\":\"json\",\"hash_algorithm\":\"sha256\",\"record_chain_algorithm\":\"sha256_concat_record_sha256_v1\",\"record_count\":78,\"schema\":\"elspeth.audit-export-manifest.v2\",\"signature_algorithm\":\"unsigned\",\"signature_key_id\":\"UNSIGNED\",\"source_status\":\"completed\"}",
+                  "references": [
+                    "run|run"
+                  ]
+                },
+                {
+                  "key": "node|sink:output@468d2923fe79",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"format\":\"jsonl\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"mode\":\"observed\"}},\"determinism\":\"io_write\",\"node_type\":\"sink\",\"plugin_name\":\"json\",\"plugin_version\":\"1.0.0\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:c7e72d6839c80dea\"}",
+                  "references": []
+                },
+                {
+                  "key": "node|source:orders@26129b303751",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"on_validation_failure\":\"discard\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"fields\":[\"id: int\",\"value: int\"],\"mode\":\"fixed\"},\"source_name\":\"orders\"},\"determinism\":\"io_read\",\"node_type\":\"source\",\"plugin_name\":\"csv\",\"plugin_version\":\"1.0.0\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:da40c7c68226f54a\"}",
+                  "references": []
+                },
+                {
+                  "key": "node|source:refunds@c9c63796fdee",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"on_validation_failure\":\"discard\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"fields\":[\"id: int\",\"value: int\"],\"mode\":\"fixed\"},\"source_name\":\"refunds\"},\"determinism\":\"io_read\",\"node_type\":\"source\",\"plugin_name\":\"csv\",\"plugin_version\":\"1.0.0\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:da40c7c68226f54a\"}",
+                  "references": []
+                },
+                {
+                  "key": "operation|sink:output@468d2923fe79|sink_write|0",
+                  "record_type": "operation",
+                  "material": "{\"error_message\":null,\"input_data_hash\":null,\"input_data_ref\":null,\"operation_type\":\"sink_write\",\"output_data_hash\":\"$SINK_EFFECT_RESULT\",\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "operation|source:orders@26129b303751|source_load|0",
+                  "record_type": "operation",
+                  "material": "{\"error_message\":null,\"input_data_hash\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"input_data_ref\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"operation_type\":\"source_load\",\"output_data_hash\":null,\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "references": [
+                    "source:orders@26129b303751"
+                  ]
+                },
+                {
+                  "key": "operation|source:refunds@c9c63796fdee|source_load|0",
+                  "record_type": "operation",
+                  "material": "{\"error_message\":null,\"input_data_hash\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"input_data_ref\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"operation_type\":\"source_load\",\"output_data_hash\":null,\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "references": [
+                    "source:refunds@c9c63796fdee"
+                  ]
+                },
+                {
+                  "key": "run|run",
+                  "record_type": "run",
+                  "material": "{\"canonical_version\":\"sha256-rfc8785-v1\",\"reproducibility_grade\":\"replay_reproducible\",\"semantic_settings_sha256\":\"d52e4376126d380992934bb7c18b68bd822ece4492f0f1dcc4b532de54565e70\",\"status\":\"completed\"}",
+                  "references": []
+                },
+                {
+                  "key": "sink_effect_attempt|sink:output@468d2923fe79|primary|0|0",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"inspect\",\"attempt_index\":0,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:output@468d2923fe79|sink_write|0|0\",\"generation\":1,\"member_ordinal\":null,\"request_witness\":\"sink:output@468d2923fe79|sink_write|0|0\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|primary|0",
+                    "sink:output@468d2923fe79|sink_write|0|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:output@468d2923fe79|primary|0|1",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"reconcile\",\"attempt_index\":1,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:output@468d2923fe79|sink_write|0|1\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:output@468d2923fe79|sink_write|0|1\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|primary|0",
+                    "sink:output@468d2923fe79|sink_write|0|1"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:output@468d2923fe79|primary|0|2",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"commit\",\"attempt_index\":2,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:output@468d2923fe79|sink_write|0|2\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:output@468d2923fe79|sink_write|0|2\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|primary|0",
+                    "sink:output@468d2923fe79|sink_write|0|2"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|0",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":0,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":0,\"payload_hash\":\"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "orders:0",
+                    "orders:0#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|1",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":1,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":1,\"payload_hash\":\"ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "orders:1",
+                    "orders:1#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|2",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":2,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":2,\"payload_hash\":\"d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "orders:2",
+                    "orders:2#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|3",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":3,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":3,\"payload_hash\":\"804d9ca070c77a3af1dd0dac3d6fd6a2f664c563275ae090ba958e3725944256\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "refunds:0",
+                    "refunds:0#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|4",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":4,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":4,\"payload_hash\":\"67b60e8bb29435c1ba474ce8707630b6bc49770f88a13c3060d307d8b219c784\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "refunds:1",
+                    "refunds:1#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|5",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":5,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":5,\"payload_hash\":\"f0df28eb4c45da93c8c9c0124c72449bbf5627ca1166126dac2103c6f3067d9a\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "refunds:2",
+                    "refunds:2#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_stream|sink:output@468d2923fe79|primary",
+                  "record_type": "sink_effect_stream",
+                  "material": "{\"head_descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"next_sequence\":1,\"requested_target\":\"$CORPUS_RUNTIME_PATH\",\"role\":\"primary\"}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect|sink:output@468d2923fe79|primary|0",
+                  "record_type": "sink_effect",
+                  "material": "{\"descriptor_mode\":\"precomputed\",\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0|file\",\"generation\":2,\"group_payload_hash\":\"751f9d1c3069ba3a212b1ded0daa27444bc70bb9fe9e652841460971bf001fc0\",\"input_kind\":\"pipeline_members\",\"inspection_mode\":\"inspected\",\"member_payload_hashes\":[\"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2\",\"ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d\",\"d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9\",\"804d9ca070c77a3af1dd0dac3d6fd6a2f664c563275ae090ba958e3725944256\",\"67b60e8bb29435c1ba474ce8707630b6bc49770f88a13c3060d307d8b219c784\",\"f0df28eb4c45da93c8c9c0124c72449bbf5627ca1166126dac2103c6f3067d9a\"],\"plan_present\":true,\"precondition_witness\":\"sink:output@468d2923fe79|primary\",\"protocol_version\":\"sink-effect-v1\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"reconcile_kind\":null,\"role\":\"primary\",\"state\":\"finalized\",\"stream_sequence\":0}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary",
+                    "sink:output@468d2923fe79|primary|0|0",
+                    "sink:output@468d2923fe79|primary|0|file"
+                  ]
+                }
+              ]
+            },
+            "audit_record_counts": [
+              {
+                "record_type": "artifact",
+                "count": 1
+              },
+              {
+                "record_type": "call",
+                "count": 3
+              },
+              {
+                "record_type": "edge",
+                "count": 2
+              },
+              {
+                "record_type": "manifest",
+                "count": 1
+              },
+              {
+                "record_type": "node",
+                "count": 3
+              },
+              {
+                "record_type": "node_state",
+                "count": 12
+              },
+              {
+                "record_type": "operation",
+                "count": 3
+              },
+              {
+                "record_type": "row",
+                "count": 6
+              },
+              {
+                "record_type": "run",
+                "count": 1
+              },
+              {
+                "record_type": "scheduler_event",
+                "count": 24
+              },
+              {
+                "record_type": "sink_effect",
+                "count": 1
+              },
+              {
+                "record_type": "sink_effect_attempt",
+                "count": 3
+              },
+              {
+                "record_type": "sink_effect_member",
+                "count": 6
+              },
+              {
+                "record_type": "sink_effect_stream",
+                "count": 1
+              },
+              {
+                "record_type": "token",
+                "count": 6
+              },
+              {
+                "record_type": "token_outcome",
+                "count": 6
+              }
+            ],
+            "source_operation_count": 2
+          }
     dimensions:
       config:
         status: pass
@@ -490,17 +1083,12 @@ scenarios:
           - core-builder-schema-plural-sources-11
           - harness-multiple-independent-sources-independent-roots
       contracts: *contracts_pass
-      runtime: &runtime_partial
-        status: partial
-        reason: Existing runtime evidence does not execute every required production disposition for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes exact production runtime result and disposition assertions.
+      runtime:
+        status: pass
+        evidence: [harness-multiple-independent-sources-independent-roots]
       audit:
-        status: partial
-        evidence: [core-builder-schema-plural-sources-07]
-        reason: Existing audit evidence does not prove every required durable record and portable export for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes exact durable audit-state and exported-record assertions.
+        status: pass
+        evidence: [core-builder-schema-plural-sources-07, harness-multiple-independent-sources-independent-roots]
       recovery: *recovery_partial
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
@@ -526,7 +1114,7 @@ scenarios:
     title: Multi-source queue fan-in
     cases:
       - id: queued-fan-in
-        workflow: build
+        workflow: run
         fixture: multi-source-queue-fan-in/queued-fan-in.yaml
         input_fixtures:
           orders: multi-source-queue-fan-in/orders.csv
@@ -534,14 +1122,689 @@ scenarios:
         output_artifacts:
           output: output.jsonl
         expected:
-          node_count: 5
-          edge_count: 4
-          node_type_counts:
-            - {node_type: queue, count: 1}
-            - {node_type: sink, count: 1}
-            - {node_type: source, count: 2}
-            - {node_type: transform, count: 1}
-          edge_labels: [continue, continue, continue, on_success]
+          {
+            "kind": "exact",
+            "status": "completed",
+            "sink_outputs": [
+              {
+                "sink_name": "output",
+                "rows": [
+                  "{\"id\":1,\"value\":10}",
+                  "{\"id\":2,\"value\":20}",
+                  "{\"id\":3,\"value\":30}",
+                  "{\"id\":101,\"value\":-5}",
+                  "{\"id\":102,\"value\":-10}",
+                  "{\"id\":103,\"value\":-15}"
+                ]
+              }
+            ],
+            "rows_processed": 6,
+            "rows_succeeded": 6,
+            "rows_failed": 0,
+            "projection": {
+              "rows": [
+                {
+                  "key": "orders:0",
+                  "source_name": "orders",
+                  "source_row_index": 0,
+                  "ingest_sequence": 0,
+                  "source_data_hash": "19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2"
+                },
+                {
+                  "key": "orders:1",
+                  "source_name": "orders",
+                  "source_row_index": 1,
+                  "ingest_sequence": 1,
+                  "source_data_hash": "ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d"
+                },
+                {
+                  "key": "orders:2",
+                  "source_name": "orders",
+                  "source_row_index": 2,
+                  "ingest_sequence": 2,
+                  "source_data_hash": "d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9"
+                },
+                {
+                  "key": "refunds:0",
+                  "source_name": "refunds",
+                  "source_row_index": 0,
+                  "ingest_sequence": 3,
+                  "source_data_hash": "804d9ca070c77a3af1dd0dac3d6fd6a2f664c563275ae090ba958e3725944256"
+                },
+                {
+                  "key": "refunds:1",
+                  "source_name": "refunds",
+                  "source_row_index": 1,
+                  "ingest_sequence": 4,
+                  "source_data_hash": "67b60e8bb29435c1ba474ce8707630b6bc49770f88a13c3060d307d8b219c784"
+                },
+                {
+                  "key": "refunds:2",
+                  "source_name": "refunds",
+                  "source_row_index": 2,
+                  "ingest_sequence": 5,
+                  "source_data_hash": "f0df28eb4c45da93c8c9c0124c72449bbf5627ca1166126dac2103c6f3067d9a"
+                }
+              ],
+              "tokens": [
+                {
+                  "key": "orders:0#0",
+                  "row_key": "orders:0",
+                  "parents": []
+                },
+                {
+                  "key": "orders:1#0",
+                  "row_key": "orders:1",
+                  "parents": []
+                },
+                {
+                  "key": "orders:2#0",
+                  "row_key": "orders:2",
+                  "parents": []
+                },
+                {
+                  "key": "refunds:0#0",
+                  "row_key": "refunds:0",
+                  "parents": []
+                },
+                {
+                  "key": "refunds:1#0",
+                  "row_key": "refunds:1",
+                  "parents": []
+                },
+                {
+                  "key": "refunds:2#0",
+                  "row_key": "refunds:2",
+                  "parents": []
+                }
+              ],
+              "node_states": [
+                {
+                  "key": "orders:0#0|sink:output@468d2923fe79|3|0",
+                  "token_key": "orders:0#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 3,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:0#0|source:orders@26129b303751|0|0",
+                  "token_key": "orders:0#0",
+                  "node_key": "source:orders@26129b303751",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:0#0|transform:normalize_rows@e7eff0f8b3dc|2|0",
+                  "token_key": "orders:0#0",
+                  "node_key": "transform:normalize_rows@e7eff0f8b3dc",
+                  "step_index": 2,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:1#0|sink:output@468d2923fe79|3|0",
+                  "token_key": "orders:1#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 3,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:1#0|source:orders@26129b303751|0|0",
+                  "token_key": "orders:1#0",
+                  "node_key": "source:orders@26129b303751",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:1#0|transform:normalize_rows@e7eff0f8b3dc|2|0",
+                  "token_key": "orders:1#0",
+                  "node_key": "transform:normalize_rows@e7eff0f8b3dc",
+                  "step_index": 2,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:2#0|sink:output@468d2923fe79|3|0",
+                  "token_key": "orders:2#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 3,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:2#0|source:orders@26129b303751|0|0",
+                  "token_key": "orders:2#0",
+                  "node_key": "source:orders@26129b303751",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "orders:2#0|transform:normalize_rows@e7eff0f8b3dc|2|0",
+                  "token_key": "orders:2#0",
+                  "node_key": "transform:normalize_rows@e7eff0f8b3dc",
+                  "step_index": 2,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:0#0|sink:output@468d2923fe79|3|0",
+                  "token_key": "refunds:0#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 3,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:0#0|source:refunds@c9c63796fdee|0|0",
+                  "token_key": "refunds:0#0",
+                  "node_key": "source:refunds@c9c63796fdee",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:0#0|transform:normalize_rows@e7eff0f8b3dc|2|0",
+                  "token_key": "refunds:0#0",
+                  "node_key": "transform:normalize_rows@e7eff0f8b3dc",
+                  "step_index": 2,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:1#0|sink:output@468d2923fe79|3|0",
+                  "token_key": "refunds:1#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 3,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:1#0|source:refunds@c9c63796fdee|0|0",
+                  "token_key": "refunds:1#0",
+                  "node_key": "source:refunds@c9c63796fdee",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:1#0|transform:normalize_rows@e7eff0f8b3dc|2|0",
+                  "token_key": "refunds:1#0",
+                  "node_key": "transform:normalize_rows@e7eff0f8b3dc",
+                  "step_index": 2,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:2#0|sink:output@468d2923fe79|3|0",
+                  "token_key": "refunds:2#0",
+                  "node_key": "sink:output@468d2923fe79",
+                  "step_index": 3,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:2#0|source:refunds@c9c63796fdee|0|0",
+                  "token_key": "refunds:2#0",
+                  "node_key": "source:refunds@c9c63796fdee",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "refunds:2#0|transform:normalize_rows@e7eff0f8b3dc|2|0",
+                  "token_key": "refunds:2#0",
+                  "node_key": "transform:normalize_rows@e7eff0f8b3dc",
+                  "step_index": 2,
+                  "attempt": 0,
+                  "status": "completed"
+                }
+              ],
+              "routes": [],
+              "terminal_dispositions": [
+                {
+                  "key": "orders:0#0",
+                  "token_key": "orders:0#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "orders:1#0",
+                  "token_key": "orders:1#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "orders:2#0",
+                  "token_key": "orders:2#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "refunds:0#0",
+                  "token_key": "refunds:0#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "refunds:1#0",
+                  "token_key": "refunds:1#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                },
+                {
+                  "key": "refunds:2#0",
+                  "token_key": "refunds:2#0",
+                  "outcome": "success",
+                  "path": "default_flow",
+                  "sink_name": "output"
+                }
+              ],
+              "scheduler_work": [
+                {
+                  "key": "orders:0#0|queue:inbound@b1f5c3a45de5|0",
+                  "token_key": "orders:0#0",
+                  "node_key": "queue:inbound@b1f5c3a45de5",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "orders:1#0|queue:inbound@b1f5c3a45de5|0",
+                  "token_key": "orders:1#0",
+                  "node_key": "queue:inbound@b1f5c3a45de5",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "orders:2#0|queue:inbound@b1f5c3a45de5|0",
+                  "token_key": "orders:2#0",
+                  "node_key": "queue:inbound@b1f5c3a45de5",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "refunds:0#0|queue:inbound@b1f5c3a45de5|0",
+                  "token_key": "refunds:0#0",
+                  "node_key": "queue:inbound@b1f5c3a45de5",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "refunds:1#0|queue:inbound@b1f5c3a45de5|0",
+                  "token_key": "refunds:1#0",
+                  "node_key": "queue:inbound@b1f5c3a45de5",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "refunds:2#0|queue:inbound@b1f5c3a45de5|0",
+                  "token_key": "refunds:2#0",
+                  "node_key": "queue:inbound@b1f5c3a45de5",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                }
+              ],
+              "audit_records": [
+                {
+                  "key": "artifact|sink:output@468d2923fe79|primary|0|file",
+                  "record_type": "artifact",
+                  "material": "{\"artifact_type\":\"file\",\"content_hash\":\"46d9b93349eab5a2aabbea9ed368627fc0e391f646a9a35b135c95a2bb279ca2\",\"idempotency_witness\":\"sink:output@468d2923fe79|primary|0\",\"path_or_uri\":\"$CORPUS_RUNTIME_PATH\",\"producer_kind\":\"sink_effect\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"size_bytes\":146}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:output@468d2923fe79|sink_write|0|0",
+                  "record_type": "call",
+                  "material": "{\"call_index\":0,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:output@468d2923fe79|sink_write|0|1",
+                  "record_type": "call",
+                  "material": "{\"call_index\":1,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:output@468d2923fe79|sink_write|0|2",
+                  "record_type": "call",
+                  "material": "{\"call_index\":2,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "edge|queue:inbound@b1f5c3a45de5|continue|move|transform:normalize_rows@e7eff0f8b3dc",
+                  "record_type": "edge",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"continue\"}",
+                  "references": [
+                    "queue:inbound@b1f5c3a45de5",
+                    "transform:normalize_rows@e7eff0f8b3dc"
+                  ]
+                },
+                {
+                  "key": "edge|source:orders@26129b303751|continue|move|queue:inbound@b1f5c3a45de5",
+                  "record_type": "edge",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"continue\"}",
+                  "references": [
+                    "queue:inbound@b1f5c3a45de5",
+                    "source:orders@26129b303751"
+                  ]
+                },
+                {
+                  "key": "edge|source:refunds@c9c63796fdee|continue|move|queue:inbound@b1f5c3a45de5",
+                  "record_type": "edge",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"continue\"}",
+                  "references": [
+                    "queue:inbound@b1f5c3a45de5",
+                    "source:refunds@c9c63796fdee"
+                  ]
+                },
+                {
+                  "key": "edge|transform:normalize_rows@e7eff0f8b3dc|on_success|move|sink:output@468d2923fe79",
+                  "record_type": "edge",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"on_success\"}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "transform:normalize_rows@e7eff0f8b3dc"
+                  ]
+                },
+                {
+                  "key": "manifest|manifest",
+                  "record_type": "manifest",
+                  "material": "{\"chunk_count\":1,\"derivation_version\":\"audit-export-derivation-v1\",\"export_format\":\"json\",\"hash_algorithm\":\"sha256\",\"record_chain_algorithm\":\"sha256_concat_record_sha256_v1\",\"record_count\":88,\"schema\":\"elspeth.audit-export-manifest.v2\",\"signature_algorithm\":\"unsigned\",\"signature_key_id\":\"UNSIGNED\",\"source_status\":\"completed\"}",
+                  "references": [
+                    "run|run"
+                  ]
+                },
+                {
+                  "key": "node|queue:inbound@b1f5c3a45de5",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"description\":\"deterministic multi-source fan-in\",\"name\":\"inbound\"},\"determinism\":\"deterministic\",\"node_type\":\"queue\",\"plugin_name\":\"queue:inbound\",\"plugin_version\":\"engine:0.7.2\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":null}",
+                  "references": []
+                },
+                {
+                  "key": "node|sink:output@468d2923fe79",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"format\":\"jsonl\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"mode\":\"observed\"}},\"determinism\":\"io_write\",\"node_type\":\"sink\",\"plugin_name\":\"json\",\"plugin_version\":\"1.0.0\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:c7e72d6839c80dea\"}",
+                  "references": []
+                },
+                {
+                  "key": "node|source:orders@26129b303751",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"on_validation_failure\":\"discard\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"fields\":[\"id: int\",\"value: int\"],\"mode\":\"fixed\"},\"source_name\":\"orders\"},\"determinism\":\"io_read\",\"node_type\":\"source\",\"plugin_name\":\"csv\",\"plugin_version\":\"1.0.0\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:da40c7c68226f54a\"}",
+                  "references": []
+                },
+                {
+                  "key": "node|source:refunds@c9c63796fdee",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"on_validation_failure\":\"discard\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"fields\":[\"id: int\",\"value: int\"],\"mode\":\"fixed\"},\"source_name\":\"refunds\"},\"determinism\":\"io_read\",\"node_type\":\"source\",\"plugin_name\":\"csv\",\"plugin_version\":\"1.0.0\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:da40c7c68226f54a\"}",
+                  "references": []
+                },
+                {
+                  "key": "node|transform:normalize_rows@e7eff0f8b3dc",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"schema\":{\"mode\":\"observed\"}},\"determinism\":\"deterministic\",\"node_type\":\"transform\",\"plugin_name\":\"passthrough\",\"plugin_version\":\"1.0.0\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:994456034738fd4d\"}",
+                  "references": []
+                },
+                {
+                  "key": "operation|sink:output@468d2923fe79|sink_write|0",
+                  "record_type": "operation",
+                  "material": "{\"error_message\":null,\"input_data_hash\":null,\"input_data_ref\":null,\"operation_type\":\"sink_write\",\"output_data_hash\":\"$SINK_EFFECT_RESULT\",\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "operation|source:orders@26129b303751|source_load|0",
+                  "record_type": "operation",
+                  "material": "{\"error_message\":null,\"input_data_hash\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"input_data_ref\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"operation_type\":\"source_load\",\"output_data_hash\":null,\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "references": [
+                    "source:orders@26129b303751"
+                  ]
+                },
+                {
+                  "key": "operation|source:refunds@c9c63796fdee|source_load|0",
+                  "record_type": "operation",
+                  "material": "{\"error_message\":null,\"input_data_hash\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"input_data_ref\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"operation_type\":\"source_load\",\"output_data_hash\":null,\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "references": [
+                    "source:refunds@c9c63796fdee"
+                  ]
+                },
+                {
+                  "key": "run|run",
+                  "record_type": "run",
+                  "material": "{\"canonical_version\":\"sha256-rfc8785-v1\",\"reproducibility_grade\":\"replay_reproducible\",\"semantic_settings_sha256\":\"c5b70ac2931164d070826ff570f5291d870db64e92203e471d8b52d239360559\",\"status\":\"completed\"}",
+                  "references": []
+                },
+                {
+                  "key": "sink_effect_attempt|sink:output@468d2923fe79|primary|0|0",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"inspect\",\"attempt_index\":0,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:output@468d2923fe79|sink_write|0|0\",\"generation\":1,\"member_ordinal\":null,\"request_witness\":\"sink:output@468d2923fe79|sink_write|0|0\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|primary|0",
+                    "sink:output@468d2923fe79|sink_write|0|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:output@468d2923fe79|primary|0|1",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"reconcile\",\"attempt_index\":1,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:output@468d2923fe79|sink_write|0|1\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:output@468d2923fe79|sink_write|0|1\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|primary|0",
+                    "sink:output@468d2923fe79|sink_write|0|1"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:output@468d2923fe79|primary|0|2",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"commit\",\"attempt_index\":2,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:output@468d2923fe79|sink_write|0|2\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:output@468d2923fe79|sink_write|0|2\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:output@468d2923fe79|primary|0",
+                    "sink:output@468d2923fe79|sink_write|0|2"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|0",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":0,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":0,\"payload_hash\":\"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "orders:0",
+                    "orders:0#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|1",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":1,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":1,\"payload_hash\":\"ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "orders:1",
+                    "orders:1#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|2",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":2,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":2,\"payload_hash\":\"d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "orders:2",
+                    "orders:2#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|3",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":3,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":3,\"payload_hash\":\"804d9ca070c77a3af1dd0dac3d6fd6a2f664c563275ae090ba958e3725944256\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "refunds:0",
+                    "refunds:0#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|4",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":4,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":4,\"payload_hash\":\"67b60e8bb29435c1ba474ce8707630b6bc49770f88a13c3060d307d8b219c784\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "refunds:1",
+                    "refunds:1#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:output@468d2923fe79|primary|0|5",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":5,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":5,\"payload_hash\":\"f0df28eb4c45da93c8c9c0124c72449bbf5627ca1166126dac2103c6f3067d9a\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "refunds:2",
+                    "refunds:2#0",
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_stream|sink:output@468d2923fe79|primary",
+                  "record_type": "sink_effect_stream",
+                  "material": "{\"head_descriptor_witness\":\"sink:output@468d2923fe79|primary|0\",\"next_sequence\":1,\"requested_target\":\"$CORPUS_RUNTIME_PATH\",\"role\":\"primary\"}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect|sink:output@468d2923fe79|primary|0",
+                  "record_type": "sink_effect",
+                  "material": "{\"descriptor_mode\":\"precomputed\",\"descriptor_witness\":\"sink:output@468d2923fe79|primary|0|file\",\"generation\":2,\"group_payload_hash\":\"751f9d1c3069ba3a212b1ded0daa27444bc70bb9fe9e652841460971bf001fc0\",\"input_kind\":\"pipeline_members\",\"inspection_mode\":\"inspected\",\"member_payload_hashes\":[\"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2\",\"ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d\",\"d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9\",\"804d9ca070c77a3af1dd0dac3d6fd6a2f664c563275ae090ba958e3725944256\",\"67b60e8bb29435c1ba474ce8707630b6bc49770f88a13c3060d307d8b219c784\",\"f0df28eb4c45da93c8c9c0124c72449bbf5627ca1166126dac2103c6f3067d9a\"],\"plan_present\":true,\"precondition_witness\":\"sink:output@468d2923fe79|primary\",\"protocol_version\":\"sink-effect-v1\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"reconcile_kind\":null,\"role\":\"primary\",\"state\":\"finalized\",\"stream_sequence\":0}",
+                  "references": [
+                    "sink:output@468d2923fe79",
+                    "sink:output@468d2923fe79|primary",
+                    "sink:output@468d2923fe79|primary|0|0",
+                    "sink:output@468d2923fe79|primary|0|file"
+                  ]
+                }
+              ]
+            },
+            "audit_record_counts": [
+              {
+                "record_type": "artifact",
+                "count": 1
+              },
+              {
+                "record_type": "call",
+                "count": 3
+              },
+              {
+                "record_type": "edge",
+                "count": 4
+              },
+              {
+                "record_type": "manifest",
+                "count": 1
+              },
+              {
+                "record_type": "node",
+                "count": 5
+              },
+              {
+                "record_type": "node_state",
+                "count": 18
+              },
+              {
+                "record_type": "operation",
+                "count": 3
+              },
+              {
+                "record_type": "row",
+                "count": 6
+              },
+              {
+                "record_type": "run",
+                "count": 1
+              },
+              {
+                "record_type": "scheduler_event",
+                "count": 24
+              },
+              {
+                "record_type": "sink_effect",
+                "count": 1
+              },
+              {
+                "record_type": "sink_effect_attempt",
+                "count": 3
+              },
+              {
+                "record_type": "sink_effect_member",
+                "count": 6
+              },
+              {
+                "record_type": "sink_effect_stream",
+                "count": 1
+              },
+              {
+                "record_type": "token",
+                "count": 6
+              },
+              {
+                "record_type": "token_outcome",
+                "count": 6
+              }
+            ],
+            "source_operation_count": 2
+          }
     dimensions:
       config:
         status: pass
@@ -563,12 +1826,12 @@ scenarios:
           - core-builder-schema-plural-sources-03
           - core-builder-schema-plural-sources-12
           - composer-runtime-agreement-08
-      runtime: *runtime_partial
-      audit: &audit_partial
-        status: partial
-        reason: Existing audit evidence does not prove every required durable record and portable export for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes exact durable audit-state and exported-record assertions.
+      runtime:
+        status: pass
+        evidence: [harness-multi-source-queue-fan-in-queued-fan-in]
+      audit:
+        status: pass
+        evidence: [harness-multi-source-queue-fan-in-queued-fan-in]
       recovery: &recovery_unknown
         status: unknown
         reason: No complete database-reopen recovery case exists for this scenario.
@@ -585,7 +1848,7 @@ scenarios:
     title: Conditional routing, including missing and error destinations
     cases:
       - id: two-way-gate
-        workflow: build
+        workflow: run
         fixture: conditional-routing/two-way-gate.yaml
         input_fixtures:
           primary: conditional-routing/input.csv
@@ -593,13 +1856,591 @@ scenarios:
           accepted: accepted.jsonl
           rejected: rejected.jsonl
         expected:
-          node_count: 4
-          edge_count: 3
-          node_type_counts:
-            - {node_type: gate, count: 1}
-            - {node_type: sink, count: 2}
-            - {node_type: source, count: 1}
-          edge_labels: [continue, "false", "true"]
+          {
+            "kind": "exact",
+            "status": "completed",
+            "sink_outputs": [
+              {
+                "sink_name": "accepted",
+                "rows": [
+                  "{\"id\":2,\"value\":20}",
+                  "{\"id\":3,\"value\":30}"
+                ]
+              },
+              {
+                "sink_name": "rejected",
+                "rows": [
+                  "{\"id\":1,\"value\":10}"
+                ]
+              }
+            ],
+            "rows_processed": 3,
+            "rows_succeeded": 3,
+            "rows_failed": 0,
+            "projection": {
+              "rows": [
+                {
+                  "key": "primary:0",
+                  "source_name": "primary",
+                  "source_row_index": 0,
+                  "ingest_sequence": 0,
+                  "source_data_hash": "19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2"
+                },
+                {
+                  "key": "primary:1",
+                  "source_name": "primary",
+                  "source_row_index": 1,
+                  "ingest_sequence": 1,
+                  "source_data_hash": "ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d"
+                },
+                {
+                  "key": "primary:2",
+                  "source_name": "primary",
+                  "source_row_index": 2,
+                  "ingest_sequence": 2,
+                  "source_data_hash": "d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9"
+                }
+              ],
+              "tokens": [
+                {
+                  "key": "primary:0#0",
+                  "row_key": "primary:0",
+                  "parents": []
+                },
+                {
+                  "key": "primary:1#0",
+                  "row_key": "primary:1",
+                  "parents": []
+                },
+                {
+                  "key": "primary:2#0",
+                  "row_key": "primary:2",
+                  "parents": []
+                }
+              ],
+              "node_states": [
+                {
+                  "key": "primary:0#0|gate:route_by_value@bc6ab09a6f6f|1|0",
+                  "token_key": "primary:0#0",
+                  "node_key": "gate:route_by_value@bc6ab09a6f6f",
+                  "step_index": 1,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "primary:0#0|sink:rejected@468d2923fe79|2|0",
+                  "token_key": "primary:0#0",
+                  "node_key": "sink:rejected@468d2923fe79",
+                  "step_index": 2,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "primary:0#0|source:primary@5a21cc0bf019|0|0",
+                  "token_key": "primary:0#0",
+                  "node_key": "source:primary@5a21cc0bf019",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "primary:1#0|gate:route_by_value@bc6ab09a6f6f|1|0",
+                  "token_key": "primary:1#0",
+                  "node_key": "gate:route_by_value@bc6ab09a6f6f",
+                  "step_index": 1,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "primary:1#0|sink:accepted@468d2923fe79|2|0",
+                  "token_key": "primary:1#0",
+                  "node_key": "sink:accepted@468d2923fe79",
+                  "step_index": 2,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "primary:1#0|source:primary@5a21cc0bf019|0|0",
+                  "token_key": "primary:1#0",
+                  "node_key": "source:primary@5a21cc0bf019",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "primary:2#0|gate:route_by_value@bc6ab09a6f6f|1|0",
+                  "token_key": "primary:2#0",
+                  "node_key": "gate:route_by_value@bc6ab09a6f6f",
+                  "step_index": 1,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "primary:2#0|sink:accepted@468d2923fe79|2|0",
+                  "token_key": "primary:2#0",
+                  "node_key": "sink:accepted@468d2923fe79",
+                  "step_index": 2,
+                  "attempt": 0,
+                  "status": "completed"
+                },
+                {
+                  "key": "primary:2#0|source:primary@5a21cc0bf019|0|0",
+                  "token_key": "primary:2#0",
+                  "node_key": "source:primary@5a21cc0bf019",
+                  "step_index": 0,
+                  "attempt": 0,
+                  "status": "completed"
+                }
+              ],
+              "routes": [
+                {
+                  "key": "primary:0#0|gate:route_by_value@bc6ab09a6f6f|0|sink:rejected@468d2923fe79",
+                  "token_key": "primary:0#0",
+                  "from_node_key": "gate:route_by_value@bc6ab09a6f6f",
+                  "to_node_key": "sink:rejected@468d2923fe79",
+                  "label": "false",
+                  "mode": "move",
+                  "ordinal": 0
+                },
+                {
+                  "key": "primary:1#0|gate:route_by_value@bc6ab09a6f6f|0|sink:accepted@468d2923fe79",
+                  "token_key": "primary:1#0",
+                  "from_node_key": "gate:route_by_value@bc6ab09a6f6f",
+                  "to_node_key": "sink:accepted@468d2923fe79",
+                  "label": "true",
+                  "mode": "move",
+                  "ordinal": 0
+                },
+                {
+                  "key": "primary:2#0|gate:route_by_value@bc6ab09a6f6f|0|sink:accepted@468d2923fe79",
+                  "token_key": "primary:2#0",
+                  "from_node_key": "gate:route_by_value@bc6ab09a6f6f",
+                  "to_node_key": "sink:accepted@468d2923fe79",
+                  "label": "true",
+                  "mode": "move",
+                  "ordinal": 0
+                }
+              ],
+              "terminal_dispositions": [
+                {
+                  "key": "primary:0#0",
+                  "token_key": "primary:0#0",
+                  "outcome": "success",
+                  "path": "gate_routed",
+                  "sink_name": "rejected"
+                },
+                {
+                  "key": "primary:1#0",
+                  "token_key": "primary:1#0",
+                  "outcome": "success",
+                  "path": "gate_routed",
+                  "sink_name": "accepted"
+                },
+                {
+                  "key": "primary:2#0",
+                  "token_key": "primary:2#0",
+                  "outcome": "success",
+                  "path": "gate_routed",
+                  "sink_name": "accepted"
+                }
+              ],
+              "scheduler_work": [
+                {
+                  "key": "primary:0#0|gate:route_by_value@bc6ab09a6f6f|0",
+                  "token_key": "primary:0#0",
+                  "node_key": "gate:route_by_value@bc6ab09a6f6f",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "primary:1#0|gate:route_by_value@bc6ab09a6f6f|0",
+                  "token_key": "primary:1#0",
+                  "node_key": "gate:route_by_value@bc6ab09a6f6f",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                },
+                {
+                  "key": "primary:2#0|gate:route_by_value@bc6ab09a6f6f|0",
+                  "token_key": "primary:2#0",
+                  "node_key": "gate:route_by_value@bc6ab09a6f6f",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ],
+                  "final_status": "terminal"
+                }
+              ],
+              "audit_records": [
+                {
+                  "key": "artifact|sink:accepted@468d2923fe79|primary|0|file",
+                  "record_type": "artifact",
+                  "material": "{\"artifact_type\":\"file\",\"content_hash\":\"cd5ddabd29324ba65e9347ba4b2454d2a92349e02fd9f386dc9eac9840c0fde9\",\"idempotency_witness\":\"sink:accepted@468d2923fe79|primary|0\",\"path_or_uri\":\"$CORPUS_RUNTIME_PATH\",\"producer_kind\":\"sink_effect\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"size_bytes\":46}",
+                  "references": [
+                    "sink:accepted@468d2923fe79",
+                    "sink:accepted@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "artifact|sink:rejected@468d2923fe79|primary|0|file",
+                  "record_type": "artifact",
+                  "material": "{\"artifact_type\":\"file\",\"content_hash\":\"15283e82066ae9202eb33fb674b48268117efebf84be8957a13cdf26640f2d1d\",\"idempotency_witness\":\"sink:rejected@468d2923fe79|primary|0\",\"path_or_uri\":\"$CORPUS_RUNTIME_PATH\",\"producer_kind\":\"sink_effect\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"size_bytes\":23}",
+                  "references": [
+                    "sink:rejected@468d2923fe79",
+                    "sink:rejected@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:accepted@468d2923fe79|sink_write|0|0",
+                  "record_type": "call",
+                  "material": "{\"call_index\":0,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:accepted@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:accepted@468d2923fe79|sink_write|0|1",
+                  "record_type": "call",
+                  "material": "{\"call_index\":1,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:accepted@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:accepted@468d2923fe79|sink_write|0|2",
+                  "record_type": "call",
+                  "material": "{\"call_index\":2,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:accepted@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:rejected@468d2923fe79|sink_write|0|0",
+                  "record_type": "call",
+                  "material": "{\"call_index\":0,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:rejected@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:rejected@468d2923fe79|sink_write|0|1",
+                  "record_type": "call",
+                  "material": "{\"call_index\":1,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:rejected@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:rejected@468d2923fe79|sink_write|0|2",
+                  "record_type": "call",
+                  "material": "{\"call_index\":2,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "references": [
+                    "sink:rejected@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "edge|gate:route_by_value@bc6ab09a6f6f|false|move|sink:rejected@468d2923fe79",
+                  "record_type": "edge",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"false\"}",
+                  "references": [
+                    "gate:route_by_value@bc6ab09a6f6f",
+                    "sink:rejected@468d2923fe79"
+                  ]
+                },
+                {
+                  "key": "edge|gate:route_by_value@bc6ab09a6f6f|true|move|sink:accepted@468d2923fe79",
+                  "record_type": "edge",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"true\"}",
+                  "references": [
+                    "gate:route_by_value@bc6ab09a6f6f",
+                    "sink:accepted@468d2923fe79"
+                  ]
+                },
+                {
+                  "key": "edge|source:primary@5a21cc0bf019|continue|move|gate:route_by_value@bc6ab09a6f6f",
+                  "record_type": "edge",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"continue\"}",
+                  "references": [
+                    "gate:route_by_value@bc6ab09a6f6f",
+                    "source:primary@5a21cc0bf019"
+                  ]
+                },
+                {
+                  "key": "manifest|manifest",
+                  "record_type": "manifest",
+                  "material": "{\"chunk_count\":1,\"derivation_version\":\"audit-export-derivation-v1\",\"export_format\":\"json\",\"hash_algorithm\":\"sha256\",\"record_chain_algorithm\":\"sha256_concat_record_sha256_v1\",\"record_count\":65,\"schema\":\"elspeth.audit-export-manifest.v2\",\"signature_algorithm\":\"unsigned\",\"signature_key_id\":\"UNSIGNED\",\"source_status\":\"completed\"}",
+                  "references": [
+                    "run|run"
+                  ]
+                },
+                {
+                  "key": "node|gate:route_by_value@bc6ab09a6f6f",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"condition\":\"row['value'] >= 20\",\"routes\":{\"false\":\"rejected\",\"true\":\"accepted\"}},\"determinism\":\"deterministic\",\"node_type\":\"gate\",\"plugin_name\":\"config_gate:route_by_value\",\"plugin_version\":\"engine:0.7.2\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":null}",
+                  "references": []
+                },
+                {
+                  "key": "node|sink:accepted@468d2923fe79",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"format\":\"jsonl\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"mode\":\"observed\"}},\"determinism\":\"io_write\",\"node_type\":\"sink\",\"plugin_name\":\"json\",\"plugin_version\":\"1.0.0\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:c7e72d6839c80dea\"}",
+                  "references": []
+                },
+                {
+                  "key": "node|sink:rejected@468d2923fe79",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"format\":\"jsonl\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"mode\":\"observed\"}},\"determinism\":\"io_write\",\"node_type\":\"sink\",\"plugin_name\":\"json\",\"plugin_version\":\"1.0.0\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:c7e72d6839c80dea\"}",
+                  "references": []
+                },
+                {
+                  "key": "node|source:primary@5a21cc0bf019",
+                  "record_type": "node",
+                  "material": "{\"config\":{\"on_validation_failure\":\"discard\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"fields\":[\"id: int\",\"value: int\"],\"mode\":\"fixed\"},\"source_name\":\"primary\"},\"determinism\":\"io_read\",\"node_type\":\"source\",\"plugin_name\":\"csv\",\"plugin_version\":\"1.0.0\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:da40c7c68226f54a\"}",
+                  "references": []
+                },
+                {
+                  "key": "operation|sink:accepted@468d2923fe79|sink_write|0",
+                  "record_type": "operation",
+                  "material": "{\"error_message\":null,\"input_data_hash\":null,\"input_data_ref\":null,\"operation_type\":\"sink_write\",\"output_data_hash\":\"$SINK_EFFECT_RESULT\",\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "references": [
+                    "sink:accepted@468d2923fe79",
+                    "sink:accepted@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "operation|sink:rejected@468d2923fe79|sink_write|0",
+                  "record_type": "operation",
+                  "material": "{\"error_message\":null,\"input_data_hash\":null,\"input_data_ref\":null,\"operation_type\":\"sink_write\",\"output_data_hash\":\"$SINK_EFFECT_RESULT\",\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "references": [
+                    "sink:rejected@468d2923fe79",
+                    "sink:rejected@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "operation|source:primary@5a21cc0bf019|source_load|0",
+                  "record_type": "operation",
+                  "material": "{\"error_message\":null,\"input_data_hash\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"input_data_ref\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"operation_type\":\"source_load\",\"output_data_hash\":null,\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "references": [
+                    "source:primary@5a21cc0bf019"
+                  ]
+                },
+                {
+                  "key": "run|run",
+                  "record_type": "run",
+                  "material": "{\"canonical_version\":\"sha256-rfc8785-v1\",\"reproducibility_grade\":\"replay_reproducible\",\"semantic_settings_sha256\":\"b48a7a4d877d2d31d4424e1610ba271d7778d91a5de04b23bf22ef927d75c847\",\"status\":\"completed\"}",
+                  "references": []
+                },
+                {
+                  "key": "sink_effect_attempt|sink:accepted@468d2923fe79|primary|0|0",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"inspect\",\"attempt_index\":0,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:accepted@468d2923fe79|sink_write|0|0\",\"generation\":1,\"member_ordinal\":null,\"request_witness\":\"sink:accepted@468d2923fe79|sink_write|0|0\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:accepted@468d2923fe79|primary|0",
+                    "sink:accepted@468d2923fe79|sink_write|0|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:accepted@468d2923fe79|primary|0|1",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"reconcile\",\"attempt_index\":1,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:accepted@468d2923fe79|sink_write|0|1\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:accepted@468d2923fe79|sink_write|0|1\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:accepted@468d2923fe79|primary|0",
+                    "sink:accepted@468d2923fe79|sink_write|0|1"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:accepted@468d2923fe79|primary|0|2",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"commit\",\"attempt_index\":2,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:accepted@468d2923fe79|sink_write|0|2\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:accepted@468d2923fe79|sink_write|0|2\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:accepted@468d2923fe79|primary|0",
+                    "sink:accepted@468d2923fe79|sink_write|0|2"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:rejected@468d2923fe79|primary|0|0",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"inspect\",\"attempt_index\":0,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:rejected@468d2923fe79|sink_write|0|0\",\"generation\":1,\"member_ordinal\":null,\"request_witness\":\"sink:rejected@468d2923fe79|sink_write|0|0\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:rejected@468d2923fe79|primary|0",
+                    "sink:rejected@468d2923fe79|sink_write|0|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:rejected@468d2923fe79|primary|0|1",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"reconcile\",\"attempt_index\":1,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:rejected@468d2923fe79|sink_write|0|1\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:rejected@468d2923fe79|sink_write|0|1\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:rejected@468d2923fe79|primary|0",
+                    "sink:rejected@468d2923fe79|sink_write|0|1"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:rejected@468d2923fe79|primary|0|2",
+                  "record_type": "sink_effect_attempt",
+                  "material": "{\"action\":\"commit\",\"attempt_index\":2,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:rejected@468d2923fe79|sink_write|0|2\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:rejected@468d2923fe79|sink_write|0|2\",\"state\":\"returned\"}",
+                  "references": [
+                    "sink:rejected@468d2923fe79|primary|0",
+                    "sink:rejected@468d2923fe79|sink_write|0|2"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:accepted@468d2923fe79|primary|0|0",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:accepted@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":1,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":0,\"payload_hash\":\"ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "primary:1",
+                    "primary:1#0",
+                    "sink:accepted@468d2923fe79",
+                    "sink:accepted@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:accepted@468d2923fe79|primary|0|1",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:accepted@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":2,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":1,\"payload_hash\":\"d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "primary:2",
+                    "primary:2#0",
+                    "sink:accepted@468d2923fe79",
+                    "sink:accepted@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:rejected@468d2923fe79|primary|0|0",
+                  "record_type": "sink_effect_member",
+                  "material": "{\"descriptor_witness\":\"sink:rejected@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":0,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":0,\"payload_hash\":\"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "references": [
+                    "primary:0",
+                    "primary:0#0",
+                    "sink:rejected@468d2923fe79",
+                    "sink:rejected@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_stream|sink:accepted@468d2923fe79|primary",
+                  "record_type": "sink_effect_stream",
+                  "material": "{\"head_descriptor_witness\":\"sink:accepted@468d2923fe79|primary|0\",\"next_sequence\":1,\"requested_target\":\"$CORPUS_RUNTIME_PATH\",\"role\":\"primary\"}",
+                  "references": [
+                    "sink:accepted@468d2923fe79",
+                    "sink:accepted@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_stream|sink:rejected@468d2923fe79|primary",
+                  "record_type": "sink_effect_stream",
+                  "material": "{\"head_descriptor_witness\":\"sink:rejected@468d2923fe79|primary|0\",\"next_sequence\":1,\"requested_target\":\"$CORPUS_RUNTIME_PATH\",\"role\":\"primary\"}",
+                  "references": [
+                    "sink:rejected@468d2923fe79",
+                    "sink:rejected@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect|sink:accepted@468d2923fe79|primary|0",
+                  "record_type": "sink_effect",
+                  "material": "{\"descriptor_mode\":\"precomputed\",\"descriptor_witness\":\"sink:accepted@468d2923fe79|primary|0|file\",\"generation\":2,\"group_payload_hash\":\"c0925c7088613db0cfc39108f84b253d72b026ff7e56f1aa632dd652d4a9e8f9\",\"input_kind\":\"pipeline_members\",\"inspection_mode\":\"inspected\",\"member_payload_hashes\":[\"ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d\",\"d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9\"],\"plan_present\":true,\"precondition_witness\":\"sink:accepted@468d2923fe79|primary\",\"protocol_version\":\"sink-effect-v1\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"reconcile_kind\":null,\"role\":\"primary\",\"state\":\"finalized\",\"stream_sequence\":0}",
+                  "references": [
+                    "sink:accepted@468d2923fe79",
+                    "sink:accepted@468d2923fe79|primary",
+                    "sink:accepted@468d2923fe79|primary|0|0",
+                    "sink:accepted@468d2923fe79|primary|0|file"
+                  ]
+                },
+                {
+                  "key": "sink_effect|sink:rejected@468d2923fe79|primary|0",
+                  "record_type": "sink_effect",
+                  "material": "{\"descriptor_mode\":\"precomputed\",\"descriptor_witness\":\"sink:rejected@468d2923fe79|primary|0|file\",\"generation\":2,\"group_payload_hash\":\"4fc38f93ea1e35a5df92369288cb1a75a8f56d6cc439f962675c8532e7eaac93\",\"input_kind\":\"pipeline_members\",\"inspection_mode\":\"inspected\",\"member_payload_hashes\":[\"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2\"],\"plan_present\":true,\"precondition_witness\":\"sink:rejected@468d2923fe79|primary\",\"protocol_version\":\"sink-effect-v1\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"reconcile_kind\":null,\"role\":\"primary\",\"state\":\"finalized\",\"stream_sequence\":0}",
+                  "references": [
+                    "sink:rejected@468d2923fe79",
+                    "sink:rejected@468d2923fe79|primary",
+                    "sink:rejected@468d2923fe79|primary|0|0",
+                    "sink:rejected@468d2923fe79|primary|0|file"
+                  ]
+                }
+              ]
+            },
+            "audit_record_counts": [
+              {
+                "record_type": "artifact",
+                "count": 2
+              },
+              {
+                "record_type": "call",
+                "count": 6
+              },
+              {
+                "record_type": "edge",
+                "count": 3
+              },
+              {
+                "record_type": "manifest",
+                "count": 1
+              },
+              {
+                "record_type": "node",
+                "count": 4
+              },
+              {
+                "record_type": "node_state",
+                "count": 9
+              },
+              {
+                "record_type": "operation",
+                "count": 3
+              },
+              {
+                "record_type": "routing_event",
+                "count": 3
+              },
+              {
+                "record_type": "row",
+                "count": 3
+              },
+              {
+                "record_type": "run",
+                "count": 1
+              },
+              {
+                "record_type": "scheduler_event",
+                "count": 12
+              },
+              {
+                "record_type": "sink_effect",
+                "count": 2
+              },
+              {
+                "record_type": "sink_effect_attempt",
+                "count": 6
+              },
+              {
+                "record_type": "sink_effect_member",
+                "count": 3
+              },
+              {
+                "record_type": "sink_effect_stream",
+                "count": 2
+              },
+              {
+                "record_type": "token",
+                "count": 3
+              },
+              {
+                "record_type": "token_outcome",
+                "count": 3
+              }
+            ],
+            "source_operation_count": 1
+          }
     dimensions:
       config:
         status: pass
@@ -610,8 +2451,12 @@ scenarios:
       contracts:
         status: pass
         evidence: [core-builder-schema-plural-sources-03, composer-runtime-agreement-07]
-      runtime: *runtime_partial
-      audit: *audit_partial
+      runtime:
+        status: pass
+        evidence: [harness-conditional-routing-two-way-gate]
+      audit:
+        status: pass
+        evidence: [harness-conditional-routing-two-way-gate]
       recovery: *recovery_unknown
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
@@ -631,8 +2476,16 @@ scenarios:
       contracts:
         status: pass
         evidence: [core-builder-schema-plural-sources-03, composer-runtime-agreement-03]
-      runtime: *runtime_partial
-      audit: *audit_partial
+      runtime: &runtime_partial
+        status: partial
+        reason: Existing runtime evidence does not execute every required production disposition for this scenario.
+        owner_issue: elspeth-ef29ef6ba4
+        exit_gate: The scenario corpus case passes exact production runtime result and disposition assertions.
+      audit: &audit_partial
+        status: partial
+        reason: Existing audit evidence does not prove every required durable record and portable export for this scenario.
+        owner_issue: elspeth-ef29ef6ba4
+        exit_gate: The scenario corpus case passes exact durable audit-state and exported-record assertions.
       recovery: *recovery_unknown
       concurrency: *concurrency_unknown
       freeform: *freeform_pass

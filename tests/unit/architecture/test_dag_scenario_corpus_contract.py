@@ -102,13 +102,13 @@ EXPECTED_SCENARIO_VALUES = (
 )
 
 EXPECTED_STATUS_MATRIX = {
-    "linear": ("pass", "pass", "pass", "partial", "partial", "partial", "unknown", "pass", "partial", "partial", "partial"),
+    "linear": ("pass", "pass", "pass", "pass", "pass", "partial", "unknown", "pass", "partial", "partial", "partial"),
     "multiple-independent-sources": (
         "pass",
         "pass",
         "pass",
-        "partial",
-        "partial",
+        "pass",
+        "pass",
         "partial",
         "unknown",
         "pass",
@@ -120,8 +120,8 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
-        "partial",
+        "pass",
+        "pass",
         "unknown",
         "unknown",
         "pass",
@@ -133,8 +133,8 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
-        "partial",
+        "pass",
+        "pass",
         "unknown",
         "unknown",
         "pass",
@@ -363,8 +363,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "409034bb798cd578ce8e4cd741b1d77fc6858a042dc5f1f917f50b3272355d70"
-EXPECTED_CASE_REGISTRY_SHA256 = "f27758e8a8f29879e01e288b531d5b1f373215c9e0065a6589a53c6a6eecd28a"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "eb1c5191fb7cbec13ca245694de09872c15353207c6aa4cd6460b1f640df3ead"
+EXPECTED_CASE_REGISTRY_SHA256 = "218629569166379ee55a67331626835f02c00ee1c29017eee2f5927d8b938f58"
 EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
@@ -388,17 +388,17 @@ EXPECTED_HARNESS_EVIDENCE = (
     (
         "harness-multiple-independent-sources-independent-roots",
         "multiple-independent-sources:independent-roots",
-        ("config", "build"),
+        ("config", "build", "runtime", "audit"),
     ),
     (
         "harness-multi-source-queue-fan-in-queued-fan-in",
         "multi-source-queue-fan-in:queued-fan-in",
-        ("config", "build"),
+        ("config", "build", "runtime", "audit"),
     ),
     (
         "harness-conditional-routing-two-way-gate",
         "conditional-routing:two-way-gate",
-        ("config", "build"),
+        ("config", "build", "runtime", "audit"),
     ),
     (
         "harness-fork-coalesce-policies-require-all-nested",
@@ -1665,9 +1665,10 @@ def _register_linear_case(raw: dict[str, object], case: dict[str, object]) -> No
     scenario = _raw_scenarios(raw)[0]
     scenario["cases"] = [case]
     evidence_id = _add_harness_evidence(raw, f"linear:{case['id']}")
-    runtime_cell = deepcopy(_raw_dimensions(scenario)["runtime"])
-    runtime_cell["evidence"] = [*cast(list[str], runtime_cell.get("evidence", [])), evidence_id]
-    _raw_dimensions(scenario)["runtime"] = runtime_cell
+    for dimension in ("runtime", "audit"):
+        cell = deepcopy(_raw_dimensions(scenario)[dimension])
+        cell["evidence"] = [*cast(list[str], cell.get("evidence", [])), evidence_id]
+        _raw_dimensions(scenario)[dimension] = cell
 
 
 def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> None:
@@ -1749,14 +1750,20 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         "harness-multiple-independent-sources-independent-roots": (
             ("multiple-independent-sources", "config"),
             ("multiple-independent-sources", "build"),
+            ("multiple-independent-sources", "runtime"),
+            ("multiple-independent-sources", "audit"),
         ),
         "harness-multi-source-queue-fan-in-queued-fan-in": (
             ("multi-source-queue-fan-in", "config"),
             ("multi-source-queue-fan-in", "build"),
+            ("multi-source-queue-fan-in", "runtime"),
+            ("multi-source-queue-fan-in", "audit"),
         ),
         "harness-conditional-routing-two-way-gate": (
             ("conditional-routing", "config"),
             ("conditional-routing", "build"),
+            ("conditional-routing", "runtime"),
+            ("conditional-routing", "audit"),
         ),
         "harness-fork-coalesce-policies-require-all-nested": (
             ("fork-coalesce-policies", "config"),
@@ -2306,16 +2313,16 @@ def test_manifest_rejects_pass_lifecycle_cell_without_matching_executable_stage(
         load_manifest(write_manifest(tmp_path, raw))
 
 
-def test_manifest_rejects_harness_stages_beyond_registered_build_workflow(tmp_path: Path) -> None:
+def test_manifest_rejects_incomplete_harness_stages_for_registered_run_workflow(tmp_path: Path) -> None:
     raw = valid_manifest_dict()
-    build_evidence = next(
+    run_evidence = next(
         evidence for evidence in _raw_evidence(raw) if evidence["id"] == "harness-multiple-independent-sources-independent-roots"
     )
-    build_evidence["stages"] = ["config", "build", "runtime"]
+    run_evidence["stages"] = ["config", "build", "runtime"]
 
     with pytest.raises(
         ValueError,
-        match=r"harness evidence.*independent-roots.*build workflow.*exact stages.*config.*build",
+        match=r"harness evidence.*independent-roots.*run workflow.*exact stages.*config.*build.*runtime.*audit",
     ):
         load_manifest(write_manifest(tmp_path, raw))
 
@@ -2323,20 +2330,22 @@ def test_manifest_rejects_harness_stages_beyond_registered_build_workflow(tmp_pa
 def test_manifest_rejects_harness_attached_beyond_its_workflow_even_with_other_executable_evidence(tmp_path: Path) -> None:
     raw = valid_manifest_dict()
     independent_sources = next(scenario for scenario in _raw_scenarios(raw) if scenario["id"] == "multiple-independent-sources")
-    _raw_dimensions(independent_sources)["runtime"]["evidence"] = [
+    recovery_cell = deepcopy(_raw_dimensions(independent_sources)["recovery"])
+    recovery_cell["evidence"] = [
+        *cast(list[str], recovery_cell.get("evidence", [])),
         "harness-multiple-independent-sources-independent-roots",
-        "runtime-disposition-drains",
     ]
+    _raw_dimensions(independent_sources)["recovery"] = recovery_cell
 
     with pytest.raises(
         ValueError,
-        match=r"harness evidence.*independent-roots.*multiple-independent-sources\.runtime.*stage 'runtime'",
+        match=r"harness evidence.*independent-roots.*multiple-independent-sources\.recovery.*stage 'recovery'",
     ):
         load_manifest(write_manifest(tmp_path, raw))
 
 
 @pytest.mark.parametrize("dimension", ["concurrency", "guided", "scale"])
-def test_manifest_rejects_build_harness_attached_to_non_lifecycle_dimension(tmp_path: Path, dimension: str) -> None:
+def test_manifest_rejects_run_harness_attached_to_non_lifecycle_dimension(tmp_path: Path, dimension: str) -> None:
     raw = valid_manifest_dict()
     independent_sources = next(scenario for scenario in _raw_scenarios(raw) if scenario["id"] == "multiple-independent-sources")
     cell = deepcopy(_raw_dimensions(independent_sources)[dimension])
@@ -2345,7 +2354,7 @@ def test_manifest_rejects_build_harness_attached_to_non_lifecycle_dimension(tmp_
 
     with pytest.raises(
         ValueError,
-        match=rf"harness evidence.*independent-roots.*multiple-independent-sources\.{dimension}.*build workflow.*validated lifecycle",
+        match=rf"harness evidence.*independent-roots.*multiple-independent-sources\.{dimension}.*run workflow.*validated lifecycle",
     ):
         load_manifest(write_manifest(tmp_path, raw))
 
@@ -2386,6 +2395,8 @@ def test_manifest_rejects_unknown_harness_locator(tmp_path: Path) -> None:
 def test_manifest_rejects_case_without_matching_harness_locator(tmp_path: Path) -> None:
     raw = valid_manifest_dict()
     _remove_harness_evidence(raw, "linear:happy-path")
+    for dimension in ("runtime", "audit"):
+        _raw_dimensions(_raw_scenarios(raw)[0])[dimension]["evidence"] = ["runtime-disposition-drains"]
     _raw_scenarios(raw)[0]["cases"] = [_case_dict()]
     with pytest.raises(ValueError, match=r"harness case.*linear:happy-path.*matching evidence locator"):
         load_manifest(write_manifest(tmp_path, raw))
