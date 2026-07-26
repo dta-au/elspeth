@@ -47,6 +47,7 @@ ValidationCheckName = Literal[
     "llm_base_url_policy",
     "llm_tracing_policy",
     "aws_s3_endpoint_url_policy",
+    "aws_s3_source_policy",
     "settings_load",
     "plugin_instantiation",
     "value_source_compliance",
@@ -76,6 +77,7 @@ CHECK_LLM_RETRY_BUDGET_POLICY: Final[ValidationCheckName] = "llm_retry_budget_po
 CHECK_LLM_BASE_URL_POLICY: Final[ValidationCheckName] = "llm_base_url_policy"
 CHECK_LLM_TRACING_POLICY: Final[ValidationCheckName] = "llm_tracing_policy"
 CHECK_AWS_S3_ENDPOINT_URL_POLICY: Final[ValidationCheckName] = "aws_s3_endpoint_url_policy"
+CHECK_AWS_S3_SOURCE_POLICY: Final[ValidationCheckName] = "aws_s3_source_policy"
 CHECK_SETTINGS: Final[ValidationCheckName] = "settings_load"
 RUNTIME_CHECK_PLUGIN_INSTANTIATION: Final[ValidationCheckName] = "plugin_instantiation"
 CHECK_VALUE_SOURCE_COMPLIANCE: Final[ValidationCheckName] = "value_source_compliance"
@@ -104,6 +106,7 @@ VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     CHECK_LLM_BASE_URL_POLICY,
     CHECK_LLM_TRACING_POLICY,
     CHECK_AWS_S3_ENDPOINT_URL_POLICY,
+    CHECK_AWS_S3_SOURCE_POLICY,
     CHECK_SETTINGS,
     RUNTIME_CHECK_PLUGIN_INSTANTIATION,
     CHECK_VALUE_SOURCE_COMPLIANCE,

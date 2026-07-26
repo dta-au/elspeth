@@ -81,6 +81,7 @@ from elspeth.web.execution.preflight import (
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
     CHECK_AWS_S3_ENDPOINT_URL_POLICY,
+    CHECK_AWS_S3_SOURCE_POLICY,
     CHECK_BATCH_TRANSFORM_OPTIONS,
     CHECK_BLOB_INLINE_REFS,
     CHECK_IDENTITY_NODE_ADVISORY,
@@ -126,6 +127,7 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
+    web_aws_s3_source_policy_error,
     web_llm_base_url_policy_error,
     web_llm_retry_budget_policy_error,
     web_llm_tracing_policy_error,
@@ -150,6 +152,7 @@ _CHECK_LLM_RETRY_BUDGET_POLICY = CHECK_LLM_RETRY_BUDGET_POLICY
 _CHECK_LLM_BASE_URL_POLICY = CHECK_LLM_BASE_URL_POLICY
 _CHECK_LLM_TRACING_POLICY = CHECK_LLM_TRACING_POLICY
 _CHECK_AWS_S3_ENDPOINT_URL_POLICY = CHECK_AWS_S3_ENDPOINT_URL_POLICY
+_CHECK_AWS_S3_SOURCE_POLICY = CHECK_AWS_S3_SOURCE_POLICY
 _CHECK_SETTINGS = CHECK_SETTINGS
 _CHECK_PLUGINS = RUNTIME_CHECK_PLUGIN_INSTANTIATION
 _CHECK_VALUE_SOURCE_COMPLIANCE = CHECK_VALUE_SOURCE_COMPLIANCE
@@ -1854,6 +1857,57 @@ def validate_pipeline(
             name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
             passed=True,
             detail="No web-authored aws_s3 endpoint_url override",
+            affected_nodes=(),
+            outcome_code=None,
+        )
+    )
+
+    if plugin_snapshot.principal_scope != "local:trained-operator":
+        for source_name, source in state.sources.items():
+            source_policy_error = web_aws_s3_source_policy_error(source.plugin)
+            if source_policy_error is None:
+                continue
+            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            checks.append(
+                ValidationCheck(
+                    name=_CHECK_AWS_S3_SOURCE_POLICY,
+                    passed=False,
+                    detail=f"Source '{source_name}' uses aws_s3 in a web-authored pipeline",
+                    affected_nodes=(source_component,),
+                    outcome_code=None,
+                )
+            )
+            _append_skipped_checks(checks, _CHECK_AWS_S3_SOURCE_POLICY)
+            return ValidationResult(
+                is_valid=False,
+                checks=checks,
+                errors=[
+                    ValidationError(
+                        component_id=source_component,
+                        component_type="source",
+                        message=source_policy_error,
+                        suggestion=("Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads."),
+                        error_code="aws_s3_source_not_allowed",
+                    )
+                ],
+                readiness=_blocked_readiness(
+                    code=_CHECK_AWS_S3_SOURCE_POLICY,
+                    detail=f"source {source_component} uses aws_s3 in a web-authored pipeline",
+                    component_id=source_component,
+                    component_type="source",
+                ),
+                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            )
+
+    checks.append(
+        ValidationCheck(
+            name=_CHECK_AWS_S3_SOURCE_POLICY,
+            passed=True,
+            detail=(
+                "Web-authored pipeline does not use an aws_s3 source"
+                if plugin_snapshot.principal_scope != "local:trained-operator"
+                else "Local trained-operator validation is exempt from the web aws_s3 source policy"
+            ),
             affected_nodes=(),
             outcome_code=None,
         )

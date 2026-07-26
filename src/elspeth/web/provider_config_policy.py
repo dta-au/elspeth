@@ -40,6 +40,11 @@ LLM_RETRY_BUDGET_POLICY_ERROR: Final[str] = (
     "The LLM transform default is one hour, which can monopolize the web execution worker. "
     "Set max_capacity_retry_seconds to a small positive value or use pool_size > 1 for pooled retry handling."
 )
+AWS_S3_SOURCE_POLICY_ERROR: Final[str] = (
+    "Web-authored aws_s3 sources are disabled because they read with the server AWS "
+    "credential chain while bucket and key are author-controlled. Use an operator-controlled "
+    "connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads."
+)
 AWS_S3_ENDPOINT_URL_POLICY_ERROR: Final[str] = (
     "Web-authored aws_s3 source and sink options may not set endpoint_url. "
     "Custom storage endpoints can redirect server-side requests to an author-chosen "
@@ -49,6 +54,24 @@ AWS_S3_ENDPOINT_URL_POLICY_ERROR: Final[str] = (
 _FALSE_LITERALS: Final[frozenset[str]] = frozenset({"", "0", "false", "f", "no", "n", "off"})
 _TRUE_LITERALS: Final[frozenset[str]] = frozenset({"1", "true", "t", "yes", "y", "on"})
 _INT_ADAPTER: Final[TypeAdapter[int]] = TypeAdapter(int)
+
+
+@trust_boundary(
+    tier=3,
+    source="web-authored aws_s3 source plugin (untrusted author-supplied selection)",
+    source_param="plugin",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "non-aws_s3 source plugins are ignored; every aws_s3 source returns the static "
+        "policy error because S3 reads would use server credentials with author-chosen keys; never raises"
+    ),
+    non_raising=True,
+)
+def web_aws_s3_source_policy_error(plugin: str | None) -> str | None:
+    """Reject web-authored AWS S3 sources that would read with server AWS credentials."""
+    if plugin != "aws_s3":
+        return None
+    return AWS_S3_SOURCE_POLICY_ERROR
 
 
 @trust_boundary(
