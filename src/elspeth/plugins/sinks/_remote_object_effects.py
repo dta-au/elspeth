@@ -629,8 +629,6 @@ def reconcile_remote_observation(
         return SinkEffectReconcileResult.applied(
             plan.expected_descriptor,
             evidence={"effect_id": plan.effect_id, "provider": evidence.provider, "reconciled": "exact_metadata"},
-            accepted_ordinals=evidence.accepted_ordinals,
-            diverted_ordinals=evidence.diverted_ordinals,
         )
     if not observation.exists and evidence.precondition == "if_none_match":
         return SinkEffectReconcileResult.not_applied(
