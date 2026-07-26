@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
+import re
+from collections import Counter, defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
+from types import MappingProxyType
 from typing import Any, cast
 
+import yaml
 from sqlalchemy import select
 
 from elspeth.contracts import RunStatus
@@ -45,6 +49,15 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     RuntimeEvidence,
     ScenarioRunEvidence,
     ScenarioSpec,
+    SinkOutputProjection,
+    StableNodeStateProjection,
+    StableRouteProjection,
+    StableRowProjection,
+    StableRunProjection,
+    StableSchedulerWorkProjection,
+    StableTerminalDisposition,
+    StableTokenProjection,
+    normalize_template_name,
 )
 
 
@@ -54,8 +67,17 @@ class RenderedScenario:
     settings_yaml: str
     settings_sha256: str
     fixture_sha256: str
-    output_path: Path
+    input_paths: Mapping[str, Path]
+    output_paths: Mapping[str, Path]
     fault_marker: Path
+
+    @property
+    def output_path(self) -> Path:
+        """Return the sole declared artifact for legacy single-output callers."""
+
+        if len(self.output_paths) != 1:
+            raise ValueError(f"scenario declares multiple output artifacts: {tuple(self.output_paths)!r}")
+        return next(iter(self.output_paths.values()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,45 +89,114 @@ class BuiltScenario:
     graph_evidence: GraphEvidence
 
 
+def _require_exact_template_bindings(
+    fixture_template: str,
+    *,
+    section: str,
+    declared_names: tuple[str, ...],
+    token_prefix: str,
+) -> None:
+    raw = yaml.safe_load(fixture_template)
+    if not isinstance(raw, dict) or not isinstance(raw.get(section), dict):
+        raise ValueError(f"DAG scenario fixture must declare a {section} mapping")
+    configured = cast(dict[object, object], raw[section])
+    configured_names = tuple(str(name) for name in configured)
+    subject = "source" if section == "sources" else "sink"
+    if configured_names != declared_names:
+        raise ValueError(
+            f"DAG scenario declared {subject} names must exactly match fixture {section}: "
+            f"declared={declared_names!r}, configured={configured_names!r}"
+        )
+    for name in declared_names:
+        entry = configured.get(name)
+        options = entry.get("options") if isinstance(entry, dict) else None
+        configured_path = options.get("path") if isinstance(options, dict) else None
+        expected_token = f"${{{token_prefix}_{normalize_template_name(name)}}}"
+        if configured_path != expected_token:
+            raise ValueError(
+                f"DAG scenario trusted {token_prefix} token must configure declared {subject} {name!r}: "
+                f"expected {expected_token!r}, got {configured_path!r}"
+            )
+
+
+def compute_fixture_sha256(case: HarnessCaseSpec) -> str:
+    """Hash canonical YAML and every sorted source binding with names and bytes."""
+
+    digest = hashlib.sha256(resolve_fixture_path(case.fixture).read_bytes())
+    for source_name, relative_path in case.input_fixtures.items():
+        fixture_bytes = resolve_fixture_path(relative_path).read_bytes()
+        for component in (source_name.encode(), relative_path.encode(), fixture_bytes):
+            digest.update(b"\0")
+            digest.update(len(component).to_bytes(8, "big"))
+            digest.update(component)
+    return digest.hexdigest()
+
+
 def render_settings(case: HarnessCaseSpec, tmp_path: Path) -> RenderedScenario:
     """Resolve and load one trusted corpus fixture without environment expansion."""
 
     fixture_path = resolve_fixture_path(case.fixture)
     fixture_bytes = fixture_path.read_bytes()
     fixture_template = fixture_bytes.decode("utf-8")
-    if "${input_csv}" not in fixture_template:
-        raise ValueError(f"DAG scenario fixture must reference ${{input_csv}}: {fixture_path}")
-
-    input_path = resolve_fixture_path(case.input_fixture)
-    output_path = tmp_path / "output.jsonl"
-    fault_marker = tmp_path / "fault-triggered.marker"
-    rendered = Template(fixture_template).substitute(
-        input_csv=json.dumps(str(input_path)),
-        output_jsonl=json.dumps(str(output_path)),
-        fault_marker=json.dumps(str(fault_marker)),
+    _require_exact_template_bindings(
+        fixture_template,
+        section="sources",
+        declared_names=tuple(case.input_fixtures),
+        token_prefix="input",
     )
+    _require_exact_template_bindings(
+        fixture_template,
+        section="sinks",
+        declared_names=tuple(case.output_artifacts),
+        token_prefix="output",
+    )
+
+    input_paths = {name: resolve_fixture_path(path) for name, path in case.input_fixtures.items()}
+    output_paths = {name: tmp_path / filename for name, filename in case.output_artifacts.items()}
+    fault_marker = tmp_path / "fault-triggered.marker"
+    substitutions = {
+        **{f"input_{normalize_template_name(name)}": json.dumps(str(path)) for name, path in input_paths.items()},
+        **{f"output_{normalize_template_name(name)}": json.dumps(str(path)) for name, path in output_paths.items()},
+        "fault_marker": json.dumps(str(fault_marker)),
+    }
+    rendered = Template(fixture_template).substitute(substitutions)
     if "${" in rendered:
         raise ValueError(f"Unresolved DAG scenario template variable in {fixture_path}")
     settings = load_settings_from_yaml_string(rendered)
     source_paths = {
         source_name: Path(source.options["path"]).resolve() for source_name, source in settings.sources.items() if "path" in source.options
     }
-    if not source_paths:
-        raise ValueError(f"DAG scenario fixture must configure a source path for declared input fixture: {fixture_path}")
-    mismatched_sources = {name: path for name, path in source_paths.items() if path != input_path}
-    if mismatched_sources:
+    if tuple(source_paths) != tuple(input_paths):
         raise ValueError(
-            "DAG scenario source path must match declared input fixture "
-            f"{input_path}: {', '.join(f'{name}={path}' for name, path in mismatched_sources.items())}"
+            "DAG scenario source names must exactly match declared input_fixtures: "
+            f"declared={tuple(input_paths)!r}, configured={tuple(source_paths)!r}"
+        )
+    if source_paths != input_paths:
+        raise ValueError(
+            "DAG scenario source path bindings must exactly match declared input_fixtures: "
+            f"declared={input_paths!r}, configured={source_paths!r}"
         )
 
-    input_bytes = input_path.read_bytes()
+    sink_paths = {sink_name: Path(sink.options["path"]).resolve() for sink_name, sink in settings.sinks.items() if "path" in sink.options}
+    resolved_output_paths = {name: path.resolve() for name, path in output_paths.items()}
+    if tuple(sink_paths) != tuple(resolved_output_paths):
+        raise ValueError(
+            "DAG scenario sink names must exactly match declared output_artifacts: "
+            f"declared={tuple(resolved_output_paths)!r}, configured={tuple(sink_paths)!r}"
+        )
+    if sink_paths != resolved_output_paths:
+        raise ValueError(
+            "DAG scenario sink path bindings must exactly match declared output_artifacts: "
+            f"declared={resolved_output_paths!r}, configured={sink_paths!r}"
+        )
+
     return RenderedScenario(
         settings=settings,
         settings_yaml=rendered,
         settings_sha256=hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
-        fixture_sha256=hashlib.sha256(fixture_bytes + b"\0" + input_bytes).hexdigest(),
-        output_path=output_path,
+        fixture_sha256=compute_fixture_sha256(case),
+        input_paths=MappingProxyType(input_paths),
+        output_paths=MappingProxyType(output_paths),
         fault_marker=fault_marker,
     )
 
@@ -174,7 +265,295 @@ def build_scenario(
     return BuiltScenario(rendered, bundle, graph, config, graph_evidence)
 
 
-def _audit_evidence(records: list[dict[str, Any]]) -> AuditEvidence:
+def _stable_node_key(record: Mapping[str, Any]) -> str:
+    node_type = str(record["node_type"])
+    prefix = "config_gate" if node_type == "gate" else node_type
+    node_id = str(record["node_id"])
+    match = re.fullmatch(rf"{re.escape(prefix)}_(.+)_[0-9a-f]{{12}}(?:_[0-9]+)?", node_id)
+    if match is None:
+        raise AssertionError(f"DAG corpus cannot derive stable identity for {node_type} node {node_id!r}")
+    return f"{node_type}:{match.group(1)}"
+
+
+def _stable_projection(records: list[dict[str, Any]]) -> StableRunProjection:
+    """Normalize one public durable/export view without retaining run-local IDs."""
+
+    node_records = [record for record in records if record.get("record_type") == "node"]
+    node_keys = {str(record["node_id"]): _stable_node_key(record) for record in node_records}
+    edge_records = [record for record in records if record.get("record_type") == "edge"]
+    edges = {str(record["edge_id"]): record for record in edge_records}
+
+    rows_by_id: dict[str, str] = {}
+    rows: list[StableRowProjection] = []
+    for record in (record for record in records if record.get("record_type") == "row"):
+        source_key = node_keys[str(record["source_node_id"])]
+        source_name = source_key.split(":", 1)[1]
+        source_row_index = int(record["source_row_index"])
+        key = f"{source_name}:{source_row_index}"
+        rows_by_id[str(record["row_id"])] = key
+        rows.append(
+            StableRowProjection(
+                key=key,
+                source_name=source_name,
+                source_row_index=source_row_index,
+                ingest_sequence=int(record["ingest_sequence"]),
+                source_data_hash=str(record["source_data_hash"]),
+            )
+        )
+
+    token_records_by_row: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in (record for record in records if record.get("record_type") == "token"):
+        token_records_by_row[str(record["row_id"])].append(record)
+    token_keys: dict[str, str] = {}
+    for row_id, token_records in token_records_by_row.items():
+        token_records.sort(
+            key=lambda record: (
+                str(record.get("branch_name") or ""),
+                int(record.get("step_in_pipeline") or 0),
+            )
+        )
+        signatures = [
+            (
+                record.get("branch_name"),
+                record.get("step_in_pipeline"),
+            )
+            for record in token_records
+        ]
+        if len(signatures) != len(set(signatures)):
+            raise AssertionError(f"DAG corpus tokens lack a stable ordering for row {rows_by_id[row_id]!r}")
+        for ordinal, record in enumerate(token_records):
+            token_keys[str(record["token_id"])] = f"{rows_by_id[row_id]}#{ordinal}"
+
+    parents_by_token: defaultdict[str, list[tuple[int, str]]] = defaultdict(list)
+    for record in (record for record in records if record.get("record_type") == "token_parent"):
+        parents_by_token[str(record["token_id"])].append((int(record["ordinal"]), str(record["parent_token_id"])))
+    tokens = tuple(
+        StableTokenProjection(
+            key=stable_key,
+            row_key=rows_by_id[str(record["row_id"])],
+            parents=tuple(token_keys[parent_id] for _ordinal, parent_id in sorted(parents_by_token[str(record["token_id"])])),
+        )
+        for record in (record for record in records if record.get("record_type") == "token")
+        for stable_key in (token_keys[str(record["token_id"])],)
+    )
+
+    state_records = [record for record in records if record.get("record_type") == "node_state"]
+    state_keys = {str(record["state_id"]): record for record in state_records}
+    node_states = tuple(
+        StableNodeStateProjection(
+            key=(
+                f"{token_keys[str(record['token_id'])]}|{node_keys[str(record['node_id'])]}|"
+                f"{int(record['step_index'])}|{int(record['attempt'])}"
+            ),
+            token_key=token_keys[str(record["token_id"])],
+            node_key=node_keys[str(record["node_id"])],
+            step_index=int(record["step_index"]),
+            attempt=int(record["attempt"]),
+            status=str(record["status"]),
+        )
+        for record in state_records
+    )
+
+    routes: list[StableRouteProjection] = []
+    for record in (record for record in records if record.get("record_type") == "routing_event"):
+        state = state_keys[str(record["state_id"])]
+        edge_id = record.get("edge_id")
+        if edge_id is None:
+            raise AssertionError("DAG corpus exact route projection requires a durable edge_id")
+        edge = edges[str(edge_id)]
+        token_key = token_keys[str(state["token_id"])]
+        from_node_key = node_keys[str(state["node_id"])]
+        to_node_key = node_keys[str(edge["to_node_id"])]
+        ordinal = int(record["ordinal"])
+        routes.append(
+            StableRouteProjection(
+                key=f"{token_key}|{from_node_key}|{ordinal}|{to_node_key}",
+                token_key=token_key,
+                from_node_key=from_node_key,
+                to_node_key=to_node_key,
+                label=str(edge["label"]),
+                mode=str(record["mode"]),
+                ordinal=ordinal,
+            )
+        )
+
+    completed_outcomes: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in (record for record in records if record.get("record_type") == "token_outcome"):
+        if bool(record["completed"]):
+            completed_outcomes[str(record["token_id"])].append(record)
+    terminal_dispositions: list[StableTerminalDisposition] = []
+    for token_id, token_key in token_keys.items():
+        outcomes = completed_outcomes[token_id]
+        if len(outcomes) != 1:
+            raise AssertionError(f"DAG corpus exact projection requires one terminal disposition for {token_key!r}")
+        outcome = outcomes[0]
+        terminal_dispositions.append(
+            StableTerminalDisposition(
+                key=token_key,
+                token_key=token_key,
+                outcome=str(outcome["outcome"]),
+                path=str(outcome["path"]),
+                sink_name=cast(str | None, outcome.get("sink_name")),
+            )
+        )
+
+    scheduler_events: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in (record for record in records if record.get("record_type") == "scheduler_event"):
+        scheduler_events[str(record["work_item_id"])].append(record)
+    work_by_token_node: defaultdict[tuple[str, str], list[tuple[str, list[dict[str, Any]]]]] = defaultdict(list)
+    for work_item_id, work_events in scheduler_events.items():
+        first = work_events[0]
+        token_key = token_keys[str(first["token_id"])]
+        raw_node_id = first.get("node_id")
+        node_key = node_keys[str(raw_node_id)] if raw_node_id is not None else "scheduler:unbound"
+        work_by_token_node[(token_key, node_key)].append((work_item_id, work_events))
+    scheduler_work: list[StableSchedulerWorkProjection] = []
+    for (token_key, node_key), items in work_by_token_node.items():
+        if len(items) != 1:
+            raise AssertionError(f"DAG corpus scheduler work lacks a stable ordering for {token_key!r} at {node_key!r}")
+        _work_item_id, unordered_events = items[0]
+        ordered_events: list[dict[str, Any]] = []
+        remaining = list(unordered_events)
+        current_status: object = None
+        while remaining:
+            candidates = [event for event in remaining if event.get("from_status") == current_status]
+            if len(candidates) != 1:
+                raise AssertionError(f"DAG corpus scheduler events do not form one stable transition chain for {token_key!r}")
+            event = candidates[0]
+            ordered_events.append(event)
+            remaining.remove(event)
+            current_status = event["to_status"]
+        scheduler_work.append(
+            StableSchedulerWorkProjection(
+                key=f"{token_key}|{node_key}|0",
+                token_key=token_key,
+                node_key=node_key,
+                transitions=tuple(f"{event['event_type']}:{event['to_status']}" for event in ordered_events),
+                final_status=str(ordered_events[-1]["to_status"]),
+            )
+        )
+
+    return StableRunProjection(
+        rows=tuple(sorted(rows, key=lambda row: row.key)),
+        tokens=tuple(sorted(tokens, key=lambda token: token.key)),
+        node_states=tuple(sorted(node_states, key=lambda state: state.key)),
+        routes=tuple(sorted(routes, key=lambda route: route.key)),
+        terminal_dispositions=tuple(sorted(terminal_dispositions, key=lambda disposition: disposition.key)),
+        scheduler_work=tuple(sorted(scheduler_work, key=lambda work: work.key)),
+    )
+
+
+def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: FilesystemPayloadStore) -> list[dict[str, Any]]:
+    repositories = RecorderFactory.read_only(db, payload_store=payload_store)
+    records: list[dict[str, Any]] = []
+    for node in repositories.data_flow.get_nodes(run_id):
+        records.append({"record_type": "node", "node_id": node.node_id, "node_type": node.node_type.value})
+    for edge in repositories.data_flow.get_edges(run_id):
+        records.append(
+            {
+                "record_type": "edge",
+                "edge_id": edge.edge_id,
+                "from_node_id": edge.from_node_id,
+                "to_node_id": edge.to_node_id,
+                "label": edge.label,
+            }
+        )
+    for row in repositories.query.get_rows(run_id):
+        records.append(
+            {
+                "record_type": "row",
+                "row_id": row.row_id,
+                "source_node_id": row.source_node_id,
+                "source_row_index": row.source_row_index,
+                "ingest_sequence": row.ingest_sequence,
+                "source_data_hash": row.source_data_hash,
+            }
+        )
+    tokens = repositories.query.get_all_tokens_for_run(run_id)
+    for token in tokens:
+        records.append(
+            {
+                "record_type": "token",
+                "token_id": token.token_id,
+                "row_id": token.row_id,
+                "step_in_pipeline": token.step_in_pipeline,
+                "branch_name": token.branch_name,
+                "fork_group_id": token.fork_group_id,
+                "join_group_id": token.join_group_id,
+                "expand_group_id": token.expand_group_id,
+            }
+        )
+    for parent in repositories.query.get_all_token_parents_for_run(run_id):
+        records.append(
+            {
+                "record_type": "token_parent",
+                "token_id": parent.token_id,
+                "parent_token_id": parent.parent_token_id,
+                "ordinal": parent.ordinal,
+            }
+        )
+    for state in repositories.query.get_all_node_states_for_run(run_id):
+        records.append(
+            {
+                "record_type": "node_state",
+                "state_id": state.state_id,
+                "token_id": state.token_id,
+                "node_id": state.node_id,
+                "step_index": state.step_index,
+                "attempt": state.attempt,
+                "status": state.status.value,
+            }
+        )
+    for route_event in repositories.query.get_all_routing_events_for_run(run_id):
+        records.append(
+            {
+                "record_type": "routing_event",
+                "state_id": route_event.state_id,
+                "edge_id": route_event.edge_id,
+                "ordinal": route_event.ordinal,
+                "mode": route_event.mode.value,
+            }
+        )
+    for outcome in repositories.query.get_all_token_outcomes_for_run(run_id):
+        records.append(
+            {
+                "record_type": "token_outcome",
+                "token_id": outcome.token_id,
+                "outcome": outcome.outcome.value if outcome.outcome is not None else None,
+                "path": outcome.path.value,
+                "completed": outcome.completed,
+                "sink_name": outcome.sink_name,
+            }
+        )
+    for scheduler_event in repositories.query.get_scheduler_events(run_id=run_id):
+        records.append(
+            {
+                "record_type": "scheduler_event",
+                "work_item_id": scheduler_event.work_item_id,
+                "token_id": scheduler_event.token_id,
+                "node_id": scheduler_event.node_id,
+                "event_type": scheduler_event.event_type.value,
+                "from_status": scheduler_event.from_status.value if scheduler_event.from_status is not None else None,
+                "to_status": scheduler_event.to_status.value,
+            }
+        )
+    return records
+
+
+def _sink_outputs(rendered: RenderedScenario) -> tuple[SinkOutputProjection, ...]:
+    outputs: list[SinkOutputProjection] = []
+    for sink_name, output_path in rendered.output_paths.items():
+        if not output_path.is_file():
+            raise AssertionError(f"DAG corpus sink {sink_name!r} did not produce {output_path.name!r}")
+        rows = tuple(
+            json.dumps(json.loads(line), sort_keys=True, separators=(",", ":"))
+            for line in output_path.read_text(encoding="utf-8").splitlines()
+        )
+        outputs.append(SinkOutputProjection(sink_name=sink_name, rows=rows))
+    return tuple(outputs)
+
+
+def _audit_evidence(records: list[dict[str, Any]], *, portable_projection: StableRunProjection | None = None) -> AuditEvidence:
     counts = Counter(str(record["record_type"]) for record in records)
     return AuditEvidence(
         attempted=True,
@@ -183,6 +562,7 @@ def _audit_evidence(records: list[dict[str, Any]]) -> AuditEvidence:
         source_operation_count=sum(
             1 for record in records if record.get("record_type") == "operation" and record.get("operation_type") == "source_load"
         ),
+        portable_projection=portable_projection,
     )
 
 
@@ -192,16 +572,22 @@ def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> 
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     try:
         catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
         result = Orchestrator(db).run(
             built.config,
             graph=built.graph,
             settings=built.rendered.settings,
-            payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
+            payload_store=payload_store,
             openrouter_catalog_sha256=catalog_sha256,
             openrouter_catalog_source=catalog_source,
         )
-        output_rows = [json.loads(line) for line in rendered.output_path.read_text(encoding="utf-8").splitlines()]
-        audit = _audit_evidence(list(LandscapeExporter(db).export_run(result.run_id)))
+        sink_outputs = _sink_outputs(rendered)
+        durable_projection = _stable_projection(_public_durable_records(db, run_id=result.run_id, payload_store=payload_store))
+        records = list(LandscapeExporter(db).export_run(result.run_id))
+        portable_projection = _stable_projection(records)
+        if durable_projection != portable_projection:
+            raise AssertionError("DAG corpus public durable query and portable export projections differ")
+        audit = _audit_evidence(records, portable_projection=portable_projection)
         result_data = result.to_dict()
         return ScenarioRunEvidence(
             schema_version=1,
@@ -217,7 +603,9 @@ def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> 
                 rows_processed=result_data["rows_processed"],
                 rows_succeeded=result_data["rows_succeeded"],
                 rows_failed=result_data["rows_failed"],
-                output_rows=len(output_rows),
+                output_rows=sum(len(output.rows) for output in sink_outputs),
+                sink_outputs=sink_outputs,
+                durable_projection=durable_projection,
             ),
             audit=audit,
             recovery=RecoveryEvidence(

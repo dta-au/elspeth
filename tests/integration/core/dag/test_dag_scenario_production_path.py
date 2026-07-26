@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import node_states_table
@@ -16,7 +16,7 @@ from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
 from tests.fixtures.dag_scenario_corpus import harness as corpus_harness
 from tests.fixtures.dag_scenario_corpus import loader as corpus_loader
-from tests.fixtures.dag_scenario_corpus.harness import build_scenario, render_settings, run_scenario_case
+from tests.fixtures.dag_scenario_corpus.harness import build_scenario, compute_fixture_sha256, render_settings, run_scenario_case
 from tests.fixtures.dag_scenario_corpus.loader import iter_harness_cases, load_manifest, resolve_fixture_path
 from tests.fixtures.dag_scenario_corpus.plugins import install_corpus_plugin_manager
 from tests.fixtures.dag_scenario_corpus.schema import (
@@ -25,6 +25,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     RunExpectation,
     ScenarioRunEvidence,
     ScenarioSpec,
+    SummaryRunExpectation,
 )
 
 MANIFEST = load_manifest()
@@ -54,9 +55,7 @@ def _assert_declared_run_evidence(
     evidence: ScenarioRunEvidence,
 ) -> None:
     assert isinstance(case.expected, RunExpectation)
-    fixture_path = resolve_fixture_path(case.fixture)
-    input_path = resolve_fixture_path(case.input_fixture)
-    expected_fixture_hash = hashlib.sha256(fixture_path.read_bytes() + b"\0" + input_path.read_bytes()).hexdigest()
+    expected_fixture_hash = compute_fixture_sha256(case)
 
     assert evidence.schema_version == 1
     assert (evidence.scenario_id, evidence.case_id) == (scenario.id, case.id)
@@ -79,14 +78,21 @@ def _assert_declared_run_evidence(
 
     assert evidence.runtime.attempted is True
     assert evidence.runtime.status == case.expected.status
-    assert evidence.runtime.output_rows == case.expected.output_rows
+    assert evidence.runtime.output_rows == sum(len(output.rows) for output in case.expected.sink_outputs)
+    assert evidence.runtime.rows_processed == case.expected.rows_processed
+    assert evidence.runtime.rows_succeeded == case.expected.rows_succeeded
+    assert evidence.runtime.rows_failed == case.expected.rows_failed
+    assert evidence.runtime.sink_outputs == case.expected.sink_outputs
+    assert evidence.runtime.durable_projection == case.expected.projection
 
     assert evidence.audit.attempted is True
     assert evidence.audit.total_records > 0
     assert evidence.audit.total_records == sum(record.count for record in evidence.audit.record_counts)
     record_types = tuple(record.record_type for record in evidence.audit.record_counts)
     assert record_types == tuple(sorted(record_types))
-    assert set(case.expected.required_audit_record_types) <= set(record_types)
+    assert evidence.audit.record_counts == case.expected.audit_record_counts
+    assert evidence.audit.source_operation_count == case.expected.source_operation_count
+    assert evidence.audit.portable_projection == case.expected.projection
 
     assert evidence.recovery.model_dump() == {
         "attempted": False,
@@ -104,10 +110,8 @@ def _assert_declared_recovery_evidence(
     case: HarnessCaseSpec,
     evidence: ScenarioRunEvidence,
 ) -> None:
-    assert isinstance(case.expected, RunExpectation)
-    fixture_path = resolve_fixture_path(case.fixture)
-    input_path = resolve_fixture_path(case.input_fixture)
-    expected_fixture_hash = hashlib.sha256(fixture_path.read_bytes() + b"\0" + input_path.read_bytes()).hexdigest()
+    assert isinstance(case.expected, SummaryRunExpectation)
+    expected_fixture_hash = compute_fixture_sha256(case)
 
     assert evidence.schema_version == 1
     assert (evidence.scenario_id, evidence.case_id) == (scenario.id, case.id)
@@ -151,9 +155,7 @@ def _assert_declared_build_evidence(
     case: HarnessCaseSpec,
     evidence: ScenarioRunEvidence,
 ) -> None:
-    fixture_path = resolve_fixture_path(case.fixture)
-    input_path = resolve_fixture_path(case.input_fixture)
-    expected_fixture_hash = hashlib.sha256(fixture_path.read_bytes() + b"\0" + input_path.read_bytes()).hexdigest()
+    expected_fixture_hash = compute_fixture_sha256(case)
     expected = case.expected
     assert isinstance(expected, BuildExpectation)
 
@@ -250,10 +252,11 @@ def test_render_settings_quotes_yaml_significant_paths(
 ) -> None:
     _scenario, case = _declared_case("linear", "happy-path")
     original_fixture = resolve_fixture_path(case.fixture)
-    original_input = resolve_fixture_path(case.input_fixture)
+    input_fixture = case.input_fixtures["primary"]
+    original_input = resolve_fixture_path(input_fixture)
     fixture_root = tmp_path / "fixture root : # corpus"
     copied_fixture = fixture_root / case.fixture
-    copied_input = fixture_root / case.input_fixture
+    copied_input = fixture_root / input_fixture
     copied_fixture.parent.mkdir(parents=True)
     copied_fixture.write_bytes(original_fixture.read_bytes())
     copied_input.write_bytes(original_input.read_bytes())
@@ -272,25 +275,239 @@ def test_render_settings_quotes_yaml_significant_paths(
     assert built.graph_evidence.accepted is True
 
 
+def _write_plural_binding_fixture(
+    fixture_root: Path,
+    *,
+    source_paths: tuple[str, str] = ("${input_orders}", "${input_refunds}"),
+    sink_paths: tuple[str, str] = ("${output_accepted}", "${output_rejected}"),
+    suffix: str = "",
+) -> HarnessCaseSpec:
+    scenario_root = fixture_root / "binding"
+    scenario_root.mkdir(parents=True)
+    (scenario_root / "orders.csv").write_text("id,value\n1,10\n", encoding="utf-8")
+    (scenario_root / "refunds.csv").write_text("id,value\n2,-5\n", encoding="utf-8")
+    (scenario_root / "binding.yaml").write_text(
+        f"""sources:
+  orders:
+    plugin: csv
+    on_success: accepted
+    options:
+      path: {source_paths[0]}
+      on_validation_failure: discard
+      schema: {{mode: fixed, fields: [\"id: int\", \"value: int\"]}}
+  refunds:
+    plugin: csv
+    on_success: rejected
+    options:
+      path: {source_paths[1]}
+      on_validation_failure: discard
+      schema: {{mode: fixed, fields: [\"id: int\", \"value: int\"]}}
+sinks:
+  accepted:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {sink_paths[0]}
+      format: jsonl
+      schema: {{mode: observed}}
+  rejected:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {sink_paths[1]}
+      format: jsonl
+      schema: {{mode: observed}}
+{suffix}""",
+        encoding="utf-8",
+    )
+    return HarnessCaseSpec.model_validate(
+        {
+            "id": "binding",
+            "workflow": "build",
+            "fixture": "binding/binding.yaml",
+            "input_fixtures": {
+                "orders": "binding/orders.csv",
+                "refunds": "binding/refunds.csv",
+            },
+            "output_artifacts": {
+                "accepted": "accepted.jsonl",
+                "rejected": "rejected.jsonl",
+            },
+            "expected": {
+                "node_count": 4,
+                "edge_count": 2,
+                "node_type_counts": (
+                    {"node_type": "sink", "count": 2},
+                    {"node_type": "source", "count": 2},
+                ),
+                "edge_labels": ("on_success", "on_success"),
+            },
+        }
+    )
+
+
+def test_plural_input_artifact_binding_renders_exact_source_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "fixture root : # corpus"
+    case = _write_plural_binding_fixture(fixture_root)
+    monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
+    runtime_root = tmp_path / "runtime root : # artifacts"
+    runtime_root.mkdir()
+
+    rendered = render_settings(case, runtime_root)
+
+    assert {name: source.options["path"] for name, source in rendered.settings.sources.items()} == {
+        "orders": str(fixture_root / "binding/orders.csv"),
+        "refunds": str(fixture_root / "binding/refunds.csv"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("source_paths", "input_fixtures", "message"),
+    [
+        (("${input_orders}", "${input_refunds}"), {"orders": "binding/orders.csv"}, "source names must exactly match"),
+        (
+            ("${input_orders}", "${input_refunds}"),
+            {
+                "decoy": "binding/decoy.csv",
+                "orders": "binding/orders.csv",
+                "refunds": "binding/refunds.csv",
+            },
+            "source names must exactly match",
+        ),
+        (
+            ("${input_refunds}", "${input_orders}"),
+            {"orders": "binding/orders.csv", "refunds": "binding/refunds.csv"},
+            "trusted input token must configure declared source",
+        ),
+    ],
+    ids=("missing-source", "extra-source", "swapped-bindings"),
+)
+def test_plural_input_artifact_binding_rejects_source_map_drift(
+    source_paths: tuple[str, str],
+    input_fixtures: dict[str, str],
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "fixtures"
+    case = _write_plural_binding_fixture(fixture_root, source_paths=source_paths)
+    case = HarnessCaseSpec.model_validate({**case.model_dump(mode="json"), "input_fixtures": input_fixtures})
+    monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
+
+    with pytest.raises(ValueError, match=message):
+        render_settings(case, tmp_path / "runtime")
+
+
+def test_plural_input_artifact_binding_rejects_comment_only_decoy_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "fixtures"
+    case = _write_plural_binding_fixture(
+        fixture_root,
+        source_paths=(json.dumps(str(fixture_root / "binding/decoy.csv")), "${input_refunds}"),
+        suffix="# declared input: ${input_orders}\n",
+    )
+    (fixture_root / "binding/decoy.csv").write_text("id,value\n99,999\n", encoding="utf-8")
+    monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
+
+    with pytest.raises(ValueError, match="trusted input token must configure declared source"):
+        render_settings(case, tmp_path / "runtime")
+
+
+def test_plural_input_artifact_binding_rejects_normalized_token_collision() -> None:
+    values = _declared_case("multiple-independent-sources", "independent-roots")[1].model_dump(mode="json")
+    values["input_fixtures"] = {
+        "orders-v1": "multiple-independent-sources/orders.csv",
+        "orders_v1": "multiple-independent-sources/refunds.csv",
+    }
+    values["output_artifacts"] = {"output": "output.jsonl"}
+
+    with pytest.raises(ValidationError, match="normalized template token collision"):
+        HarnessCaseSpec.model_validate(values)
+
+
+def test_per_sink_artifact_binding_renders_exact_sink_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "fixtures"
+    case = _write_plural_binding_fixture(fixture_root)
+    monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
+
+    rendered = render_settings(case, tmp_path / "runtime")
+
+    assert rendered.output_paths == {
+        "accepted": tmp_path / "runtime/accepted.jsonl",
+        "rejected": tmp_path / "runtime/rejected.jsonl",
+    }
+
+
+@pytest.mark.parametrize(
+    ("sink_paths", "output_artifacts", "message"),
+    [
+        (("${output_accepted}", "${output_rejected}"), {"accepted": "accepted.jsonl"}, "sink names must exactly match"),
+        (
+            ("${output_accepted}", "${output_rejected}"),
+            {"accepted": "accepted.jsonl", "decoy": "decoy.jsonl", "rejected": "rejected.jsonl"},
+            "sink names must exactly match",
+        ),
+        (
+            ("${output_rejected}", "${output_accepted}"),
+            {"accepted": "accepted.jsonl", "rejected": "rejected.jsonl"},
+            "trusted output token must configure declared sink",
+        ),
+    ],
+    ids=("missing-sink", "extra-sink", "swapped-bindings"),
+)
+def test_per_sink_artifact_binding_rejects_sink_map_drift(
+    sink_paths: tuple[str, str],
+    output_artifacts: dict[str, str],
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "fixtures"
+    case = _write_plural_binding_fixture(fixture_root, sink_paths=sink_paths)
+    case = HarnessCaseSpec.model_validate({**case.model_dump(mode="json"), "output_artifacts": output_artifacts})
+    monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
+
+    with pytest.raises(ValueError, match=message):
+        render_settings(case, tmp_path / "runtime")
+
+
+def test_per_sink_artifact_binding_rejects_input_output_token_collision() -> None:
+    values = _declared_case("linear", "happy-path")[1].model_dump(mode="json")
+    values["input_fixtures"] = {"shared": "linear/input.csv"}
+    values["output_artifacts"] = {"shared": "output.jsonl"}
+
+    with pytest.raises(ValidationError, match="input/output template token collision"):
+        HarnessCaseSpec.model_validate(values)
+
+
 def test_render_settings_rejects_fixture_without_declared_input_reference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _scenario, case = _declared_case("linear", "happy-path")
     original_fixture = resolve_fixture_path(case.fixture)
-    original_input = resolve_fixture_path(case.input_fixture)
+    input_fixture = case.input_fixtures["primary"]
+    original_input = resolve_fixture_path(input_fixture)
     fixture_root = tmp_path / "fixtures"
     copied_fixture = fixture_root / case.fixture
-    copied_input = fixture_root / case.input_fixture
+    copied_input = fixture_root / input_fixture
     copied_fixture.parent.mkdir(parents=True)
     copied_fixture.write_text(
-        original_fixture.read_text(encoding="utf-8").replace("${input_csv}", json.dumps(str(copied_input))),
+        original_fixture.read_text(encoding="utf-8").replace("${input_primary}", json.dumps(str(copied_input))),
         encoding="utf-8",
     )
     copied_input.write_bytes(original_input.read_bytes())
     monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
 
-    with pytest.raises(ValueError, match=r"must reference \$\{input_csv\}"):
+    with pytest.raises(ValueError, match="trusted input token must configure declared source"):
         render_settings(case, tmp_path / "runtime")
 
 
@@ -300,22 +517,23 @@ def test_render_settings_rejects_input_reference_outside_source_path(
 ) -> None:
     _scenario, case = _declared_case("linear", "happy-path")
     original_fixture = resolve_fixture_path(case.fixture)
-    original_input = resolve_fixture_path(case.input_fixture)
+    input_fixture = case.input_fixtures["primary"]
+    original_input = resolve_fixture_path(input_fixture)
     fixture_root = tmp_path / "fixtures"
     copied_fixture = fixture_root / case.fixture
-    copied_input = fixture_root / case.input_fixture
+    copied_input = fixture_root / input_fixture
     decoy_input = copied_fixture.parent / "decoy.csv"
     copied_fixture.parent.mkdir(parents=True)
     copied_fixture.write_text(
-        original_fixture.read_text(encoding="utf-8").replace("${input_csv}", json.dumps(str(decoy_input)))
-        + "\n# declared input: ${input_csv}\n",
+        original_fixture.read_text(encoding="utf-8").replace("${input_primary}", json.dumps(str(decoy_input)))
+        + "\n# declared input: ${input_primary}\n",
         encoding="utf-8",
     )
     copied_input.write_bytes(original_input.read_bytes())
     decoy_input.write_text("id,value\n99,999\n", encoding="utf-8")
     monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
 
-    with pytest.raises(ValueError, match="source path must match declared input fixture"):
+    with pytest.raises(ValueError, match="trusted input token must configure declared source"):
         render_settings(case, tmp_path / "runtime")
 
 
@@ -367,11 +585,11 @@ def test_linear_happy_path_has_exact_production_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario, case = _declared_case("linear", "happy-path")
-    assert (scenario.id, case.id, case.fixture, case.input_fixture) == (
+    assert (scenario.id, case.id, case.fixture, dict(case.input_fixtures)) == (
         "linear",
         "happy-path",
         "linear/happy-path.yaml",
-        "linear/input.csv",
+        {"primary": "linear/input.csv"},
     )
 
     install_corpus_plugin_manager(monkeypatch)
@@ -399,6 +617,27 @@ def test_linear_happy_path_has_exact_production_evidence(
     assert audit_counts["edge"] == 3
     assert audit_counts["row"] == 3
     assert evidence.audit.source_operation_count == 1
+
+
+def test_exact_runtime_projection_linear_matches_declared_durable_and_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    assert isinstance(case.expected, RunExpectation)
+    assert case.expected.kind == "exact"
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    assert evidence.runtime.kind == "exact"
+    assert evidence.audit.kind == "exact"
+    assert evidence.runtime.sink_outputs == case.expected.sink_outputs
+    assert evidence.runtime.durable_projection == case.expected.projection
+    assert evidence.audit.portable_projection == case.expected.projection
+    assert evidence.runtime.durable_projection == evidence.audit.portable_projection
+    assert evidence.audit.record_counts == case.expected.audit_record_counts
+    assert evidence.audit.source_operation_count == case.expected.source_operation_count
 
 
 @pytest.mark.parametrize(("scenario", "case"), RECOVERY_CASES)

@@ -3,7 +3,7 @@ sources:
     plugin: csv
     on_success: fork_input
     options:
-      path: ${input_csv}
+      path: ${input_primary}
       on_validation_failure: discard
       schema: {mode: fixed, fields: ["id: int", "value: int"]}
 gates:
@@ -23,6 +23,6 @@ sinks:
     plugin: json
     on_write_failure: discard
     options:
-      path: ${output_jsonl}
+      path: ${output_output}
       format: jsonl
       schema: {mode: observed}

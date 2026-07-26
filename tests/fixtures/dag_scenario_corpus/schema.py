@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, cast
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    StrictBool,
+    StringConstraints,
+    field_serializer,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 NonEmpty = Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1)]
 IssueId = Annotated[str, StringConstraints(strict=True, pattern=r"^elspeth-[0-9a-f]{10}$")]
@@ -111,10 +124,188 @@ class EvidenceCell(ClosedModel):
         return self
 
 
-class RunExpectation(ClosedModel):
+class SummaryRunExpectation(ClosedModel):
+    kind: Literal["summary"]
     status: Literal["completed", "completed_with_failures", "empty"]
     output_rows: Count
     required_audit_record_types: tuple[NonEmpty, ...]
+
+
+class AuditRecordCount(ClosedModel):
+    record_type: NonEmpty
+    count: Count
+
+
+class SinkOutputProjection(ClosedModel):
+    sink_name: NonEmpty
+    rows: tuple[NonEmpty, ...]
+
+    @field_validator("rows")
+    @classmethod
+    def _require_canonical_json_rows(cls, rows: tuple[str, ...]) -> tuple[str, ...]:
+        import json
+
+        for row in rows:
+            try:
+                parsed = json.loads(row)
+            except json.JSONDecodeError as exc:
+                raise ValueError("sink output rows must be valid JSON") from exc
+            canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+            if canonical != row:
+                raise ValueError("sink output rows must use canonical JSON")
+        return rows
+
+
+class StableRowProjection(ClosedModel):
+    key: NonEmpty
+    source_name: NonEmpty
+    source_row_index: Count
+    ingest_sequence: Count
+    source_data_hash: Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
+
+
+class StableTokenProjection(ClosedModel):
+    key: NonEmpty
+    row_key: NonEmpty
+    parents: tuple[NonEmpty, ...]
+
+    @field_validator("parents")
+    @classmethod
+    def _require_sorted_parents(cls, parents: tuple[str, ...]) -> tuple[str, ...]:
+        if parents != tuple(sorted(set(parents))):
+            raise ValueError("token parents must be unique and sorted")
+        return parents
+
+
+class StableNodeStateProjection(ClosedModel):
+    key: NonEmpty
+    token_key: NonEmpty
+    node_key: NonEmpty
+    step_index: Count
+    attempt: Count
+    status: Literal["open", "pending", "completed", "failed"]
+
+
+class StableRouteProjection(ClosedModel):
+    key: NonEmpty
+    token_key: NonEmpty
+    from_node_key: NonEmpty
+    to_node_key: NonEmpty
+    label: NonEmpty
+    mode: Literal["move", "copy", "divert"]
+    ordinal: Count
+
+
+class StableTerminalDisposition(ClosedModel):
+    key: NonEmpty
+    token_key: NonEmpty
+    outcome: Literal["success", "failure", "transient"]
+    path: Literal[
+        "default_flow",
+        "gate_routed",
+        "gate_discarded",
+        "on_error_routed",
+        "filter_dropped",
+        "coalesced",
+        "unrouted",
+        "quarantined_at_source",
+        "sink_fallback_to_failsink",
+        "sink_discarded",
+        "fork_parent",
+        "expand_parent",
+        "batch_consumed",
+    ]
+    sink_name: NonEmpty | None
+
+
+class StableSchedulerWorkProjection(ClosedModel):
+    key: NonEmpty
+    token_key: NonEmpty
+    node_key: NonEmpty
+    transitions: tuple[NonEmpty, ...]
+    final_status: Literal["ready", "leased", "blocked", "pending_sink", "terminal", "failed"]
+
+
+StableKeyedProjection = (
+    StableRowProjection
+    | StableTokenProjection
+    | StableNodeStateProjection
+    | StableRouteProjection
+    | StableTerminalDisposition
+    | StableSchedulerWorkProjection
+)
+
+
+def _require_unique_sorted_keys(label: str, values: tuple[StableKeyedProjection, ...]) -> None:
+    keys = tuple(value.key for value in values)
+    if keys != tuple(sorted(keys)) or len(set(keys)) != len(keys):
+        raise ValueError(f"{label} must contain unique sorted keys")
+
+
+class StableRunProjection(ClosedModel):
+    rows: tuple[StableRowProjection, ...]
+    tokens: tuple[StableTokenProjection, ...]
+    node_states: tuple[StableNodeStateProjection, ...]
+    routes: tuple[StableRouteProjection, ...]
+    terminal_dispositions: tuple[StableTerminalDisposition, ...]
+    scheduler_work: tuple[StableSchedulerWorkProjection, ...]
+
+    @model_validator(mode="after")
+    def _validate_projection(self) -> Self:
+        for label, values in (
+            ("rows", self.rows),
+            ("tokens", self.tokens),
+            ("node states", self.node_states),
+            ("routes", self.routes),
+            ("terminal dispositions", self.terminal_dispositions),
+            ("scheduler work", self.scheduler_work),
+        ):
+            _require_unique_sorted_keys(label, values)
+
+        row_keys = {row.key for row in self.rows}
+        token_keys = {token.key for token in self.tokens}
+        if any(token.row_key not in row_keys for token in self.tokens):
+            raise ValueError("every token must reference a projected row")
+        if any(parent not in token_keys or parent == token.key for token in self.tokens for parent in token.parents):
+            raise ValueError("token parents must reference distinct projected tokens")
+        if any(state.token_key not in token_keys for state in self.node_states):
+            raise ValueError("every node state must reference a projected token")
+        if any(route.token_key not in token_keys for route in self.routes):
+            raise ValueError("every route must reference a projected token")
+        if {disposition.token_key for disposition in self.terminal_dispositions} != token_keys:
+            raise ValueError("terminal dispositions must exactly cover tokens")
+        if any(work.token_key not in token_keys for work in self.scheduler_work):
+            raise ValueError("every scheduler work item must reference a projected token")
+        return self
+
+
+class RunExpectation(ClosedModel):
+    kind: Literal["exact"]
+    status: Literal["completed", "completed_with_failures", "empty"]
+    sink_outputs: tuple[SinkOutputProjection, ...]
+    rows_processed: Count
+    rows_succeeded: Count
+    rows_failed: Count
+    projection: StableRunProjection
+    audit_record_counts: tuple[AuditRecordCount, ...]
+    source_operation_count: Count
+
+    @model_validator(mode="after")
+    def _validate_exact_counts(self) -> Self:
+        sink_names = tuple(output.sink_name for output in self.sink_outputs)
+        if sink_names != tuple(sorted(sink_names)) or len(set(sink_names)) != len(sink_names):
+            raise ValueError("sink_outputs must contain unique sorted sink names")
+        record_types = tuple(record.record_type for record in self.audit_record_counts)
+        if record_types != tuple(sorted(record_types)) or len(set(record_types)) != len(record_types):
+            raise ValueError("audit_record_counts must contain unique sorted record types")
+        if self.rows_processed != len(self.projection.rows):
+            raise ValueError("rows_processed must equal projected row count")
+        if self.rows_succeeded + self.rows_failed != self.rows_processed:
+            raise ValueError("rows_succeeded plus rows_failed must equal rows_processed")
+        return self
+
+
+DeclaredRunExpectation = Annotated[RunExpectation | SummaryRunExpectation, Field(discriminator="kind")]
 
 
 class GraphNodeTypeCount(ClosedModel):
@@ -161,20 +352,75 @@ class BuildExpectation(ClosedModel):
         return self
 
 
+def normalize_template_name(name: str) -> str:
+    """Return the deterministic token component for one declared node name."""
+
+    normalized = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    if not normalized:
+        raise ValueError(f"node name {name!r} has no usable normalized template token")
+    return normalized
+
+
 class HarnessCaseSpec(ClosedModel):
     id: NonEmpty
     workflow: Workflow
     fixture: NonEmpty
-    input_fixture: NonEmpty
-    expected: RunExpectation | BuildExpectation
+    input_fixtures: Mapping[NonEmpty, NonEmpty]
+    output_artifacts: Mapping[NonEmpty, NonEmpty]
+    expected: DeclaredRunExpectation | BuildExpectation
+
+    @field_validator("input_fixtures")
+    @classmethod
+    def _freeze_input_fixtures(cls, fixtures: Mapping[str, str]) -> Mapping[str, str]:
+        items = tuple(fixtures.items())
+        if not items:
+            raise ValueError("input_fixtures must not be empty")
+        if items != tuple(sorted(items)):
+            raise ValueError("input_fixtures must be sorted by source name")
+        if len({path for _name, path in items}) != len(items):
+            raise ValueError("input_fixtures must use distinct fixture paths")
+        return MappingProxyType(dict(items))
+
+    @field_serializer("input_fixtures")
+    def _serialize_input_fixtures(self, fixtures: Mapping[str, str]) -> dict[str, str]:
+        return dict(fixtures)
+
+    @field_validator("output_artifacts")
+    @classmethod
+    def _freeze_output_artifacts(cls, artifacts: Mapping[str, str]) -> Mapping[str, str]:
+        items = tuple(artifacts.items())
+        if not items:
+            raise ValueError("output_artifacts must not be empty")
+        if items != tuple(sorted(items)):
+            raise ValueError("output_artifacts must be sorted by sink name")
+        if len({filename for _name, filename in items}) != len(items):
+            raise ValueError("output_artifacts must use unique filenames")
+        for _sink_name, filename in items:
+            path = Path(filename)
+            if path.is_absolute() or len(path.parts) != 1 or path.name != filename or filename in (".", ".."):
+                raise ValueError(f"output artifact must be a safe relative leaf filename: {filename!r}")
+        return MappingProxyType(dict(items))
+
+    @field_serializer("output_artifacts")
+    def _serialize_output_artifacts(self, artifacts: Mapping[str, str]) -> dict[str, str]:
+        return dict(artifacts)
 
     @model_validator(mode="after")
     def _validate_workflow_expectation(self) -> Self:
         if self.workflow == "build":
             if not isinstance(self.expected, BuildExpectation):
                 raise ValueError("build workflow requires BuildExpectation")
-        elif not isinstance(self.expected, RunExpectation):
-            raise ValueError(f"{self.workflow} workflow requires RunExpectation")
+        elif not isinstance(self.expected, (RunExpectation, SummaryRunExpectation)):
+            raise ValueError(f"{self.workflow} workflow requires a run expectation")
+
+        input_tokens = {normalize_template_name(name) for name in self.input_fixtures}
+        if len(input_tokens) != len(self.input_fixtures):
+            raise ValueError("normalized template token collision between input source names")
+        output_tokens = {normalize_template_name(name) for name in self.output_artifacts}
+        if len(output_tokens) != len(self.output_artifacts):
+            raise ValueError("normalized template token collision between output sink names")
+        if input_tokens & output_tokens:
+            raise ValueError("input/output template token collision between source and sink names")
         return self
 
 
@@ -249,6 +495,7 @@ class GraphEvidence(ClosedModel):
 
 
 class RuntimeEvidence(ClosedModel):
+    kind: Literal["unattempted", "summary", "exact"] = "summary"
     attempted: StrictBool
     run_id: NonEmpty | None = None
     status: NonEmpty | None = None
@@ -256,9 +503,23 @@ class RuntimeEvidence(ClosedModel):
     rows_succeeded: Count = 0
     rows_failed: Count = 0
     output_rows: Count = 0
+    sink_outputs: tuple[SinkOutputProjection, ...] = ()
+    durable_projection: StableRunProjection | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _supply_discriminator(cls, data: object) -> object:
+        if isinstance(data, dict) and "kind" not in data:
+            data = dict(data)
+            data["kind"] = "exact" if data.get("durable_projection") is not None else "summary" if data.get("attempted") else "unattempted"
+        return data
 
     @model_validator(mode="after")
     def _validate_runtime_shape(self) -> Self:
+        if self.kind == "unattempted" and self.attempted:
+            raise ValueError("unattempted runtime kind requires attempted=false")
+        if self.kind != "unattempted" and not self.attempted:
+            raise ValueError("attempted runtime kind requires attempted=true")
         if self.attempted:
             if self.run_id is None or self.status is None:
                 raise ValueError("attempted runtime requires run_id and status")
@@ -268,25 +529,80 @@ class RuntimeEvidence(ClosedModel):
             or any(count != 0 for count in (self.rows_processed, self.rows_succeeded, self.rows_failed, self.output_rows))
         ):
             raise ValueError("unattempted runtime forbids run identity, status, and non-zero counters")
+        if (self.durable_projection is None) != (not self.sink_outputs):
+            raise ValueError("runtime sink outputs and durable projection must be declared together")
+        if self.kind == "exact" and self.durable_projection is None:
+            raise ValueError("exact runtime kind requires exact projection evidence")
+        if self.kind != "exact" and self.durable_projection is not None:
+            raise ValueError("non-exact runtime kind forbids exact projection evidence")
+        if self.kind == "exact":
+            assert self.durable_projection is not None
+            sink_names = tuple(output.sink_name for output in self.sink_outputs)
+            if sink_names != tuple(sorted(sink_names)) or len(set(sink_names)) != len(sink_names):
+                raise ValueError("runtime sink outputs must contain unique sorted sink names")
+            if self.rows_processed != len(self.durable_projection.rows):
+                raise ValueError("runtime rows_processed must equal projected row count")
+            if self.rows_succeeded + self.rows_failed != self.rows_processed:
+                raise ValueError("runtime success and failure counts must equal rows_processed")
+            if self.output_rows != sum(len(output.rows) for output in self.sink_outputs):
+                raise ValueError("runtime output_rows must equal exact sink output row count")
+        if not self.attempted and (self.sink_outputs or self.durable_projection is not None):
+            raise ValueError("unattempted runtime forbids exact projection evidence")
         return self
 
-
-class AuditRecordCount(ClosedModel):
-    record_type: NonEmpty
-    count: Count
+    @model_serializer(mode="wrap")
+    def _serialize_runtime(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = cast(dict[str, object], handler(self))
+        if self.kind != "exact":
+            for field in ("kind", "sink_outputs", "durable_projection"):
+                data.pop(field)
+        return data
 
 
 class AuditEvidence(ClosedModel):
+    kind: Literal["unattempted", "summary", "exact"] = "summary"
     attempted: StrictBool
     total_records: Count
     record_counts: tuple[AuditRecordCount, ...]
     source_operation_count: Count
+    portable_projection: StableRunProjection | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _supply_discriminator(cls, data: object) -> object:
+        if isinstance(data, dict) and "kind" not in data:
+            data = dict(data)
+            data["kind"] = "exact" if data.get("portable_projection") is not None else "summary" if data.get("attempted") else "unattempted"
+        return data
 
     @model_validator(mode="after")
     def _validate_audit_shape(self) -> Self:
+        if self.kind == "unattempted" and self.attempted:
+            raise ValueError("unattempted audit kind requires attempted=false")
+        if self.kind != "unattempted" and not self.attempted:
+            raise ValueError("attempted audit kind requires attempted=true")
         if not self.attempted and (self.total_records != 0 or self.record_counts or self.source_operation_count != 0):
             raise ValueError("unattempted audit forbids non-zero or non-empty records")
+        record_types = tuple(record.record_type for record in self.record_counts)
+        if record_types != tuple(sorted(record_types)) or len(set(record_types)) != len(record_types):
+            raise ValueError("audit record counts must contain unique sorted record types")
+        if self.total_records != sum(record.count for record in self.record_counts):
+            raise ValueError("audit total_records must equal the sum of record counts")
+        if not self.attempted and self.portable_projection is not None:
+            raise ValueError("unattempted audit forbids exact projection evidence")
+        if self.kind == "exact" and self.portable_projection is None:
+            raise ValueError("exact audit kind requires exact projection evidence")
+        if self.kind != "exact" and self.portable_projection is not None:
+            raise ValueError("non-exact audit kind forbids exact projection evidence")
         return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_audit(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = cast(dict[str, object], handler(self))
+        if self.kind != "exact":
+            for field in ("kind", "portable_projection"):
+                data.pop(field)
+        return data
 
 
 class RecoveryEvidence(ClosedModel):
@@ -326,3 +642,14 @@ class ScenarioRunEvidence(ClosedModel):
     audit: AuditEvidence
     recovery: RecoveryEvidence
     completed_stages: tuple[Stage, ...]
+
+    @model_validator(mode="after")
+    def _validate_exact_views(self) -> Self:
+        if self.runtime.kind == "exact":
+            if self.audit.kind != "exact":
+                raise ValueError("exact runtime requires exact audit evidence")
+            if self.runtime.durable_projection != self.audit.portable_projection:
+                raise ValueError("exact durable and portable projections must match")
+        elif self.audit.kind == "exact":
+            raise ValueError("exact audit evidence requires exact runtime evidence")
+        return self

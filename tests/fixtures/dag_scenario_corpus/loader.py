@@ -328,8 +328,16 @@ def _validate_document_locator(locator: str) -> None:
 
 def _validate_case_paths(manifest: ScenarioManifest) -> None:
     for scenario, case in iter_harness_cases(manifest):
-        for field_name, relative_path in (("fixture", case.fixture), ("input_fixture", case.input_fixture)):
+        try:
+            resolve_fixture_path(case.fixture)
+        except ValueError as exc:
+            raise ValueError(f"DAG scenario case {scenario.id}:{case.id} has invalid fixture: {exc}") from exc
+
+        resolved_inputs: list[Path] = []
+        for source_name, relative_path in case.input_fixtures.items():
             try:
-                resolve_fixture_path(relative_path)
+                resolved_inputs.append(resolve_fixture_path(relative_path))
             except ValueError as exc:
-                raise ValueError(f"DAG scenario case {scenario.id}:{case.id} has invalid {field_name}: {exc}") from exc
+                raise ValueError(f"DAG scenario case {scenario.id}:{case.id} has invalid input_fixtures[{source_name!r}]: {exc}") from exc
+        if len(set(resolved_inputs)) != len(resolved_inputs):
+            raise ValueError(f"DAG scenario case {scenario.id}:{case.id} input_fixtures resolve to duplicated paths")
