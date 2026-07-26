@@ -602,7 +602,7 @@ class TestProgressBroadcasterCallbackBacklogBound:
         assert isinstance(counter, _FakeCounter)
         amount, attrs, _context = counter.calls[0]
         assert amount == queue.maxsize
-        assert attrs == {"reason": "terminal_drain", "run_id": "run-1"}
+        assert attrs == {"reason": "terminal_drain"}
 
     def test_queue_full_drop_emits_telemetry_instead_of_logging(self) -> None:
         mock_loop = MagicMock(spec=asyncio.AbstractEventLoop)
@@ -619,7 +619,7 @@ class TestProgressBroadcasterCallbackBacklogBound:
         assert isinstance(counter, _FakeCounter)
         amount, attrs, _context = counter.calls[0]
         assert amount == 1
-        assert attrs == {"reason": "queue_full", "run_id": "run-1"}
+        assert attrs == {"reason": "queue_full"}
 
 
 class TestProgressBroadcasterCleanup:

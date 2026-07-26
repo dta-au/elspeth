@@ -284,7 +284,7 @@ class ProgressBroadcaster:
                 queue.get_nowait()
                 drained += 1
             if drained > 0:
-                ProgressBroadcaster._record_queue_pressure(telemetry=telemetry, run_id=run_id, reason="terminal_drain", count=drained)
+                ProgressBroadcaster._record_queue_pressure(telemetry=telemetry, reason="terminal_drain", count=drained)
             queue.put_nowait(event)  # Queue is now empty — this cannot fail
             return
 
@@ -295,14 +295,13 @@ class ProgressBroadcaster:
         # backpressure policy for a slow client — record it as a best-effort
         # drop so the loss is observable rather than silent.
         queue.get_nowait()
-        ProgressBroadcaster._record_queue_pressure(telemetry=telemetry, run_id=run_id, reason="queue_full", count=1)
+        ProgressBroadcaster._record_queue_pressure(telemetry=telemetry, reason="queue_full", count=1)
         queue.put_nowait(event)
 
     @staticmethod
     def _record_queue_pressure(
         *,
         telemetry: _SessionsTelemetry | None,
-        run_id: str,
         reason: str,
         count: int,
     ) -> None:
@@ -310,7 +309,7 @@ class ProgressBroadcaster:
             return
         telemetry.progress_broadcast_dropped_total.add(
             count,
-            attributes={"reason": reason, "run_id": run_id},
+            attributes={"reason": reason},
         )
 
     def cleanup_run(self, run_id: str) -> None:

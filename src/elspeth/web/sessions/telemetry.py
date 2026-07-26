@@ -298,7 +298,7 @@ def build_sessions_telemetry(*, meter: _Meter | None = None) -> _SessionsTelemet
         progress_broadcast_dropped_total=meter.create_counter(
             "execution.progress.broadcast_dropped_total",
             description=(
-                "Execution progress WebSocket broadcasts dropped or drained under client backpressure. Attributes: reason, run_id when available."
+                "Execution progress WebSocket broadcasts dropped or drained under client backpressure. Attributes: reason."
             ),
         ),
         orphaned_runs_cancelled_total=meter.create_counter(
