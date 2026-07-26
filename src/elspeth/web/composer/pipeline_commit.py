@@ -323,7 +323,8 @@ async def prepare_pipeline_proposal_commit(
         composer_provider=authority.row.composer_provider,
         composer_skill_hash=authority.row.composer_skill_hash,
         tool_arguments_hash=authority.row.tool_arguments_hash,
-        reviewed_source_authority=resolve_reviewed_source_authority(
+        reviewed_source_authority=await bounded(
+            resolve_reviewed_source_authority,
             engine=config.session_engine,
             session_id=str(authority.row.session_id),
             user_id=config.user_id,

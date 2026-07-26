@@ -1312,6 +1312,204 @@ async def test_prepare_pipeline_commit_runs_blocking_policy_validation_off_event
 
 
 @pytest.mark.asyncio
+async def test_prepare_pipeline_commit_bounds_reviewed_source_db_without_blocking_event_loop(
+    service: SessionServiceImpl,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority as original_resolver
+
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
+        session_id,
+        "reviewed.csv",
+        b"value\nreviewed\n",
+        "text/csv",
+    )
+    source_options = {
+        "schema": {"fields": ["value: str"], "mode": "flexible"},
+        "path": f"blob:{blob.id}",
+        "delimiter": ",",
+        "encoding": "utf-8",
+    }
+    output_options = {
+        "schema": {"mode": "observed"},
+        "path": "outputs/reviewed.json",
+        "collision_policy": "auto_increment",
+        "mode": "write",
+    }
+    source_stable_id = str(uuid4())
+    reviewed_facts = {
+        "source_order": [source_stable_id],
+        "reviewed_sources": {
+            source_stable_id: {
+                "name": "source",
+                "plugin": "csv",
+                "options": source_options,
+                "observed_columns": ["value"],
+                "sample_rows": [],
+                "on_validation_failure": "discard",
+            }
+        },
+        "output_order": [],
+        "reviewed_outputs": {},
+    }
+    pipeline: dict[str, object] = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": source_options,
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "rows",
+                "plugin": "json",
+                "options": output_options,
+                "on_write_failure": "discard",
+            }
+        ],
+    }
+    plan = PipelinePlanResult(
+        proposal=PipelineProposal.create(
+            pipeline=pipeline,
+            base=AbsentBase(),
+            reviewed_facts=reviewed_facts,
+            surface=PlannerSurface.GUIDED_STAGED,
+            repair_count=0,
+            skill_hash=stable_hash("guided skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+        tool_call_id="reviewed-source-terminal-call",
+        custody_result="not_required",
+        model_identifier="planner-model",
+        model_version="planner-model-v1",
+        provider="test",
+    )
+    row = await service.create_pipeline_composition_proposal(
+        session_id=session_id,
+        plan=plan,
+        summary="Use the reviewed source.",
+        rationale="Requested by the operator.",
+        affects=("source",),
+        arguments_redacted_json=_redacted_pipeline(pipeline),
+        actor="composer-web:user:alice",
+        composer_model_identifier="planner-model",
+        composer_model_version="planner-model-v1",
+        composer_provider="provider",
+    )
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts=reviewed_facts,
+    )
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+
+    import elspeth.web.composer.pipeline_commit as commit_module
+
+    loop = asyncio.get_running_loop()
+    event_loop_thread_id = threading.get_ident()
+    database_entered = asyncio.Event()
+    heartbeat_seen = asyncio.Event()
+    resolver_finished = asyncio.Event()
+    resolver_started = threading.Event()
+    release_database = threading.Event()
+    outer_watchdog_expired = threading.Event()
+    database_thread_ids: list[int] = []
+    original_connect = service._engine.connect
+    outer_failure_watchdog_seconds = 5.0
+
+    def delayed_connect():
+        database_thread_ids.append(threading.get_ident())
+        loop.call_soon_threadsafe(database_entered.set)
+        if not release_database.wait(timeout=outer_failure_watchdog_seconds):
+            outer_watchdog_expired.set()
+            raise AssertionError("outer test watchdog expired before the delayed database connection was released")
+        return original_connect()
+
+    def tracked_resolver(*args, **kwargs):
+        resolver_started.set()
+        try:
+            return original_resolver(*args, **kwargs)
+        finally:
+            loop.call_soon_threadsafe(resolver_finished.set)
+
+    async def heartbeat() -> None:
+        await database_entered.wait()
+        heartbeat_seen.set()
+
+    monkeypatch.setattr(service._engine, "connect", delayed_connect)
+    monkeypatch.setattr(commit_module, "resolve_reviewed_source_authority", tracked_resolver)
+    heartbeat_task = asyncio.create_task(heartbeat())
+    prepare_task = asyncio.create_task(
+        prepare_pipeline_proposal_commit(
+            authority=authority,
+            reviewed_facts=reviewed_facts,
+            current_state=CompositionState(
+                source=None,
+                nodes=(),
+                edges=(),
+                outputs=(),
+                metadata=PipelineMetadata(),
+                version=1,
+            ),
+            current_state_id=None,
+            policy_catalog=policy,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=service._engine,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=0.2,
+            ),
+            recorder=BufferingRecorder(),
+            actor="user:alice",
+            settlement_surface="guided",
+        )
+    )
+    try:
+        await asyncio.wait_for(database_entered.wait(), timeout=outer_failure_watchdog_seconds)
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=outer_failure_watchdog_seconds)
+        await asyncio.wait_for(heartbeat_task, timeout=outer_failure_watchdog_seconds)
+        assert not release_database.is_set()
+        with pytest.raises(PipelineCommitError, match="timed out") as exc_info:
+            await asyncio.wait_for(
+                asyncio.shield(prepare_task),
+                timeout=outer_failure_watchdog_seconds,
+            )
+        assert exc_info.value.code == "TIMEOUT"
+        assert not release_database.is_set()
+    finally:
+        release_database.set()
+        try:
+            if resolver_started.is_set():
+                await asyncio.wait_for(resolver_finished.wait(), timeout=outer_failure_watchdog_seconds)
+        finally:
+            for task in (heartbeat_task, prepare_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(heartbeat_task, prepare_task, return_exceptions=True)
+
+    assert resolver_finished.is_set()
+    assert not outer_watchdog_expired.is_set()
+    assert len(database_thread_ids) == 1
+    assert database_thread_ids[0] != event_loop_thread_id
+
+
+@pytest.mark.asyncio
 async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
     service: SessionServiceImpl,
     tmp_path,
