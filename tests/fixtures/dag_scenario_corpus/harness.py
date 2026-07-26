@@ -37,23 +37,31 @@ from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter, RecorderFactory
 from elspeth.core.landscape.execution.sink_effect_reservation import SinkEffectReservation
-from elspeth.core.landscape.export_read_model import open_export_read_transaction
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     artifacts_table,
     batch_members_table,
     batches_table,
+    calls_table,
+    edges_table,
     node_states_table,
+    nodes_table,
+    operations_table,
+    routing_events_table,
     rows_table,
+    runs_table,
     scheduler_events_table,
     sink_effect_attempts_table,
     sink_effect_members_table,
+    sink_effect_streams_table,
     sink_effects_table,
     token_outcomes_table,
     token_parents_table,
     token_work_items_table,
     tokens_table,
+    transform_errors_table,
+    validation_errors_table,
 )
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.clock import MockClock
@@ -1697,18 +1705,241 @@ def _validate_durable_sink_effect_material(records: list[dict[str, Any]]) -> Non
         )
 
 
-def _validate_portable_material_matches_durable(durable_records: list[dict[str, Any]], portable_records: list[dict[str, Any]]) -> None:
-    field_groups = (
+_DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        "run",
+        ("run_id",),
+        ("status", "canonical_version", "config_hash", "settings", "reproducibility_grade"),
+    ),
+    (
+        "node",
+        ("node_id",),
         (
-            "sink_effect",
-            ("effect_id",),
-            ("artifact_id", "expected_descriptor_hash", "result_descriptor_hash", "precondition_hash"),
+            "plugin_name",
+            "node_type",
+            "plugin_version",
+            "source_file_hash",
+            "determinism",
+            "config_hash",
+            "config",
+            "schema_hash",
+            "schema_mode",
+            "schema_fields",
+            "sequence_in_pipeline",
         ),
-        ("sink_effect_member", ("effect_id", "ordinal"), ("descriptor_hash", "member_effect_id")),
-        ("sink_effect_attempt", ("effect_id", "attempt_index"), ("request_hash", "evidence_hash")),
-        ("call", ("call_id",), ("request_hash", "response_hash")),
-    )
-    for record_type, key_fields, fields in field_groups:
+    ),
+    ("edge", ("edge_id",), ("from_node_id", "to_node_id", "label", "default_mode")),
+    (
+        "operation",
+        ("operation_id",),
+        (
+            "node_id",
+            "operation_type",
+            "sink_effect_id",
+            "status",
+            "error_message",
+            "input_data_ref",
+            "input_data_hash",
+            "output_data_ref",
+            "output_data_hash",
+        ),
+    ),
+    (
+        "call",
+        ("call_id",),
+        (
+            "state_id",
+            "operation_id",
+            "call_index",
+            "call_type",
+            "status",
+            "request_hash",
+            "response_hash",
+            "resolved_prompt_template_hash",
+            "request_ref",
+            "response_ref",
+            "error_json",
+        ),
+    ),
+    (
+        "artifact",
+        ("artifact_id",),
+        (
+            "sink_node_id",
+            "producer_kind",
+            "produced_by_state_id",
+            "sink_effect_id",
+            "artifact_type",
+            "path_or_uri",
+            "content_hash",
+            "size_bytes",
+            "idempotency_key",
+            "publication_performed",
+            "publication_evidence_kind",
+        ),
+    ),
+    (
+        "sink_effect_stream",
+        ("stream_id",),
+        (
+            "sink_node_id",
+            "role",
+            "requested_target_hash",
+            "next_sequence",
+            "tail_effect_id",
+            "head_effect_id",
+            "head_descriptor_hash",
+        ),
+    ),
+    (
+        "sink_effect",
+        ("effect_id",),
+        (
+            "sink_node_id",
+            "role",
+            "state",
+            "protocol_version",
+            "input_kind",
+            "config_hash",
+            "membership_or_manifest_hash",
+            "group_payload_hash",
+            "artifact_id",
+            "artifact_idempotency_key",
+            "inspection_mode",
+            "inspection_attempt_id",
+            "plan_hash",
+            "descriptor_mode",
+            "expected_descriptor_hash",
+            "precondition_hash",
+            "lease_owner",
+            "generation",
+            "reconcile_kind",
+            "reconcile_evidence_hash",
+            "result_descriptor_hash",
+            "publication_performed",
+            "publication_evidence_kind",
+            "primary_effect_id",
+            "stream_id",
+            "stream_sequence",
+            "predecessor_effect_id",
+        ),
+    ),
+    (
+        "sink_effect_member",
+        ("effect_id", "ordinal"),
+        (
+            "sink_node_id",
+            "role",
+            "token_id",
+            "row_id",
+            "ingest_sequence",
+            "lineage_hash",
+            "payload_hash",
+            "primary_effect_id",
+            "prepared_disposition",
+            "reason_hash",
+            "member_effect_id",
+            "member_state",
+            "descriptor_hash",
+            "evidence_hash",
+        ),
+    ),
+    (
+        "sink_effect_attempt",
+        ("effect_id", "attempt_index"),
+        (
+            "attempt_id",
+            "member_ordinal",
+            "generation",
+            "action",
+            "call_kind",
+            "request_hash",
+            "state",
+            "evidence_hash",
+        ),
+    ),
+    (
+        "row",
+        ("row_id",),
+        ("source_node_id", "source_row_index", "ingest_sequence", "source_data_hash"),
+    ),
+    (
+        "token",
+        ("token_id",),
+        ("row_id", "step_in_pipeline", "branch_name", "fork_group_id", "join_group_id", "expand_group_id"),
+    ),
+    ("token_parent", ("token_id", "parent_token_id"), ("ordinal",)),
+    (
+        "node_state",
+        ("state_id",),
+        ("token_id", "node_id", "step_index", "attempt", "status", "context_after_json", "error_json"),
+    ),
+    ("routing_event", ("event_id",), ("state_id", "edge_id", "ordinal", "mode")),
+    (
+        "token_outcome",
+        ("outcome_id",),
+        (
+            "token_id",
+            "outcome",
+            "path",
+            "completed",
+            "sink_name",
+            "batch_id",
+            "expand_group_id",
+            "expected_branches_json",
+            "error_hash",
+        ),
+    ),
+    (
+        "scheduler_event",
+        ("event_id",),
+        (
+            "work_item_id",
+            "token_id",
+            "node_id",
+            "event_type",
+            "from_status",
+            "to_status",
+            "from_attempt",
+            "to_attempt",
+            "from_lease_owner",
+            "to_lease_owner",
+        ),
+    ),
+    (
+        "batch",
+        ("batch_id",),
+        ("aggregation_node_id", "attempt", "status", "trigger_type", "trigger_reason"),
+    ),
+    ("batch_member", ("batch_id", "token_id"), ("ordinal",)),
+    (
+        "validation_error",
+        ("error_id",),
+        (
+            "node_id",
+            "row_id",
+            "row_hash",
+            "row_data_json",
+            "error",
+            "schema_mode",
+            "destination",
+            "violation_type",
+            "original_field_name",
+            "normalized_field_name",
+            "expected_type",
+            "actual_type",
+        ),
+    ),
+    (
+        "transform_error",
+        ("error_id",),
+        ("token_id", "transform_id", "row_hash", "row_data_json", "error_details_json", "destination"),
+    ),
+)
+
+
+def _validate_portable_material_matches_durable(durable_records: list[dict[str, Any]], portable_records: list[dict[str, Any]]) -> None:
+    for record_type, key_fields, fields in _DURABLE_EXPORT_PARITY_SCHEMA:
         durable = _record_index(durable_records, record_type=record_type, key_fields=key_fields, source="durable")
         portable = _record_index(portable_records, record_type=record_type, key_fields=key_fields, source="portable")
         if durable.keys() != portable.keys():
@@ -1716,6 +1947,10 @@ def _validate_portable_material_matches_durable(durable_records: list[dict[str, 
         for key, durable_record in durable.items():
             portable_record = portable[key]
             for field in fields:
+                if field not in durable_record:
+                    raise AssertionError(f"DAG corpus durable {record_type} integrity: selected field {field!r} is missing")
+                if field not in portable_record:
+                    raise AssertionError(f"DAG corpus portable {record_type} integrity: selected field {field!r} is missing")
                 _require_material_equal(
                     source="portable",
                     record_type=record_type,
@@ -1779,36 +2014,495 @@ def _validate_portable_manifest(records: list[dict[str, Any]]) -> None:
 
 
 def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: FilesystemPayloadStore) -> list[dict[str, Any]]:
-    repositories = RecorderFactory.read_only(db, payload_store=payload_store)
-    with open_export_read_transaction(db.engine) as read_model:
-        unsigned_records = list(LandscapeExporter(db, read_model=read_model).iter_unsigned_run_records(run_id))
-        effect_plan_json = {effect.effect_id: effect.plan_json for effect in read_model.get_sink_effects_for_run(run_id)}
-        attempt_evidence_json = {
-            attempt.attempt_id: attempt.evidence_json for attempt in read_model.get_sink_effect_attempts_for_run(run_id)
-        }
-    audit_types = {
-        "artifact",
-        "batch",
-        "batch_member",
-        "call",
-        "edge",
-        "node",
-        "operation",
-        "run",
-        "sink_effect",
-        "sink_effect_attempt",
-        "sink_effect_member",
-        "sink_effect_stream",
-        "transform_error",
-        "validation_error",
-    }
-    records = [dict(record) for record in unsigned_records if record["record_type"] in audit_types]
-    for record in records:
-        if record["record_type"] == "sink_effect":
-            record["_plan_json"] = effect_plan_json[str(record["effect_id"])]
-        elif record["record_type"] == "sink_effect_attempt":
-            record["_evidence_json"] = attempt_evidence_json[str(record["attempt_id"])]
-    run = next(record for record in records if record["record_type"] == "run")
+    """Project claimed export material directly from persisted table rows.
+
+    This is deliberately independent of ``LandscapeExporter`` and its
+    ``_iter_records`` serializer.  The field lists below are the maintained
+    durable/export parity contract; raw error rows and volatile timestamps are
+    intentionally normalized out before comparison.
+    """
+
+    _ = payload_store
+
+    def decode_json(raw: object, *, label: str) -> object:
+        if not isinstance(raw, str):
+            raise AssertionError(f"DAG corpus durable {label} must be JSON text")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"DAG corpus durable {label} must be valid JSON") from exc
+
+    def fetch(
+        table: Any,
+        fields: tuple[str, ...],
+        *order_by: Any,
+    ) -> list[Mapping[str, Any]]:
+        query = select(*(table.c[field] for field in fields)).where(table.c.run_id == run_id)
+        if order_by:
+            query = query.order_by(*order_by)
+        return list(connection.execute(query).mappings())
+
+    def project(record_type: str, row: Mapping[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+        return {"record_type": record_type, **{field: row[field] for field in fields}}
+
+    records: list[dict[str, Any]] = []
+    with db.connection() as connection:
+        run_fields = ("run_id", "status", "canonical_version", "config_hash", "settings_json", "reproducibility_grade")
+        run_rows = fetch(runs_table, run_fields)
+        if len(run_rows) != 1:
+            raise AssertionError(f"DAG corpus durable run integrity: expected one run, got {len(run_rows)}")
+        run_row = run_rows[0]
+        records.append(
+            {
+                "record_type": "run",
+                "run_id": run_row["run_id"],
+                "status": run_row["status"],
+                "canonical_version": run_row["canonical_version"],
+                "config_hash": run_row["config_hash"],
+                "settings": decode_json(run_row["settings_json"], label="run.settings_json"),
+                "reproducibility_grade": run_row["reproducibility_grade"],
+            }
+        )
+
+        node_fields = (
+            "run_id",
+            "node_id",
+            "plugin_name",
+            "node_type",
+            "plugin_version",
+            "source_file_hash",
+            "determinism",
+            "config_hash",
+            "config_json",
+            "schema_hash",
+            "schema_mode",
+            "schema_fields_json",
+            "sequence_in_pipeline",
+        )
+        for row in fetch(
+            nodes_table,
+            node_fields,
+            nodes_table.c.sequence_in_pipeline.nullslast(),
+            nodes_table.c.registered_at,
+            nodes_table.c.node_id,
+        ):
+            records.append(
+                {
+                    "record_type": "node",
+                    "run_id": row["run_id"],
+                    "node_id": row["node_id"],
+                    "plugin_name": row["plugin_name"],
+                    "node_type": row["node_type"],
+                    "plugin_version": row["plugin_version"],
+                    "source_file_hash": row["source_file_hash"],
+                    "determinism": row["determinism"],
+                    "config_hash": row["config_hash"],
+                    "config": decode_json(row["config_json"], label=f"node {row['node_id']}.config_json"),
+                    "schema_hash": row["schema_hash"],
+                    "schema_mode": row["schema_mode"],
+                    "schema_fields": (
+                        None
+                        if row["schema_fields_json"] is None
+                        else decode_json(row["schema_fields_json"], label=f"node {row['node_id']}.schema_fields_json")
+                    ),
+                    "sequence_in_pipeline": row["sequence_in_pipeline"],
+                }
+            )
+
+        edge_fields = ("run_id", "edge_id", "from_node_id", "to_node_id", "label", "default_mode")
+        records.extend(
+            project("edge", row, edge_fields) for row in fetch(edges_table, edge_fields, edges_table.c.created_at, edges_table.c.edge_id)
+        )
+
+        operation_fields = (
+            "run_id",
+            "operation_id",
+            "node_id",
+            "operation_type",
+            "sink_effect_id",
+            "status",
+            "error_message",
+            "input_data_ref",
+            "input_data_hash",
+            "output_data_ref",
+            "output_data_hash",
+        )
+        records.extend(
+            project("operation", row, operation_fields)
+            for row in fetch(
+                operations_table,
+                operation_fields,
+                operations_table.c.started_at,
+                operations_table.c.operation_id,
+            )
+        )
+
+        call_fields = (
+            "call_id",
+            "state_id",
+            "operation_id",
+            "call_index",
+            "call_type",
+            "status",
+            "request_hash",
+            "response_hash",
+            "resolved_prompt_template_hash",
+            "request_ref",
+            "response_ref",
+            "error_json",
+        )
+        call_scope = calls_table.c.operation_id.in_(
+            select(operations_table.c.operation_id).where(operations_table.c.run_id == run_id)
+        ) | calls_table.c.state_id.in_(select(node_states_table.c.state_id).where(node_states_table.c.run_id == run_id))
+        call_rows = connection.execute(
+            select(*(calls_table.c[field] for field in call_fields))
+            .where(call_scope)
+            .order_by(calls_table.c.operation_id, calls_table.c.state_id, calls_table.c.call_index)
+        ).mappings()
+        records.extend({"record_type": "call", "run_id": run_id, **dict(row)} for row in call_rows)
+
+        stream_fields = (
+            "run_id",
+            "stream_id",
+            "sink_node_id",
+            "role",
+            "requested_target_hash",
+            "next_sequence",
+            "tail_effect_id",
+            "head_effect_id",
+            "head_descriptor_hash",
+        )
+        records.extend(
+            project("sink_effect_stream", row, stream_fields)
+            for row in fetch(sink_effect_streams_table, stream_fields, sink_effect_streams_table.c.stream_id)
+        )
+
+        effect_fields = (
+            "run_id",
+            "effect_id",
+            "sink_node_id",
+            "role",
+            "state",
+            "protocol_version",
+            "input_kind",
+            "config_hash",
+            "membership_or_manifest_hash",
+            "group_payload_hash",
+            "artifact_id",
+            "artifact_idempotency_key",
+            "inspection_mode",
+            "inspection_attempt_id",
+            "plan_hash",
+            "descriptor_mode",
+            "expected_descriptor_hash",
+            "precondition_hash",
+            "lease_owner",
+            "generation",
+            "reconcile_kind",
+            "reconcile_evidence_hash",
+            "result_descriptor_hash",
+            "publication_performed",
+            "publication_evidence_kind",
+            "primary_effect_id",
+            "stream_id",
+            "stream_sequence",
+            "predecessor_effect_id",
+            "plan_json",
+        )
+        for row in fetch(
+            sink_effects_table,
+            effect_fields,
+            sink_effects_table.c.stream_id,
+            sink_effects_table.c.stream_sequence,
+            sink_effects_table.c.effect_id,
+        ):
+            record = project("sink_effect", row, effect_fields[:-1])
+            record["_plan_json"] = row["plan_json"]
+            records.append(record)
+
+        member_fields = (
+            "run_id",
+            "effect_id",
+            "ordinal",
+            "sink_node_id",
+            "role",
+            "token_id",
+            "row_id",
+            "ingest_sequence",
+            "lineage_hash",
+            "payload_hash",
+            "primary_effect_id",
+            "prepared_disposition",
+            "reason_hash",
+            "member_effect_id",
+            "member_state",
+            "descriptor_hash",
+            "evidence_hash",
+        )
+        records.extend(
+            project("sink_effect_member", row, member_fields)
+            for row in fetch(
+                sink_effect_members_table,
+                member_fields,
+                sink_effect_members_table.c.effect_id,
+                sink_effect_members_table.c.ordinal,
+            )
+        )
+
+        attempt_fields = (
+            "attempt_id",
+            "effect_id",
+            "member_ordinal",
+            "generation",
+            "action",
+            "call_kind",
+            "request_hash",
+            "state",
+            "evidence_hash",
+            "evidence_json",
+        )
+        attempt_rows = connection.execute(
+            select(*(sink_effect_attempts_table.c[field] for field in attempt_fields))
+            .where(
+                sink_effect_attempts_table.c.effect_id.in_(
+                    select(sink_effects_table.c.effect_id).where(sink_effects_table.c.run_id == run_id)
+                )
+            )
+            .order_by(
+                sink_effect_attempts_table.c.effect_id,
+                sink_effect_attempts_table.c.started_at,
+                sink_effect_attempts_table.c.attempt_id,
+            )
+        ).mappings()
+        attempt_index_by_effect: defaultdict[str, int] = defaultdict(int)
+        for row in attempt_rows:
+            effect_id = str(row["effect_id"])
+            attempt_index = attempt_index_by_effect[effect_id]
+            attempt_index_by_effect[effect_id] += 1
+            record = {
+                "record_type": "sink_effect_attempt",
+                "run_id": run_id,
+                **{field: row[field] for field in attempt_fields[:-1]},
+                "attempt_index": attempt_index,
+                "_evidence_json": row["evidence_json"],
+            }
+            records.append(record)
+
+        artifact_fields = (
+            "run_id",
+            "artifact_id",
+            "sink_node_id",
+            "produced_by_state_id",
+            "sink_effect_id",
+            "artifact_type",
+            "path_or_uri",
+            "content_hash",
+            "size_bytes",
+            "idempotency_key",
+            "publication_performed",
+            "publication_evidence_kind",
+        )
+        for row in fetch(
+            artifacts_table,
+            artifact_fields,
+            artifacts_table.c.created_at,
+            artifacts_table.c.artifact_id,
+        ):
+            producer_kind = "node_state" if row["produced_by_state_id"] is not None else "sink_effect"
+            records.append({"record_type": "artifact", **dict(row), "producer_kind": producer_kind})
+
+        row_fields = ("run_id", "row_id", "source_node_id", "source_row_index", "ingest_sequence", "source_data_hash")
+        records.extend(
+            project("row", row, row_fields) for row in fetch(rows_table, row_fields, rows_table.c.ingest_sequence, rows_table.c.row_id)
+        )
+
+        token_fields = (
+            "run_id",
+            "token_id",
+            "row_id",
+            "step_in_pipeline",
+            "branch_name",
+            "fork_group_id",
+            "join_group_id",
+            "expand_group_id",
+        )
+        records.extend(
+            project("token", row, token_fields)
+            for row in fetch(tokens_table, token_fields, tokens_table.c.row_id, tokens_table.c.created_at, tokens_table.c.token_id)
+        )
+
+        parent_fields = ("run_id", "token_id", "parent_token_id", "ordinal")
+        records.extend(
+            project("token_parent", row, parent_fields)
+            for row in fetch(
+                token_parents_table,
+                parent_fields,
+                token_parents_table.c.token_id,
+                token_parents_table.c.ordinal,
+                token_parents_table.c.parent_token_id,
+            )
+        )
+
+        state_fields = (
+            "run_id",
+            "state_id",
+            "token_id",
+            "node_id",
+            "step_index",
+            "attempt",
+            "status",
+            "context_after_json",
+            "error_json",
+        )
+        records.extend(
+            project("node_state", row, state_fields)
+            for row in fetch(
+                node_states_table,
+                state_fields,
+                node_states_table.c.token_id,
+                node_states_table.c.step_index,
+                node_states_table.c.attempt,
+                node_states_table.c.state_id,
+            )
+        )
+
+        route_fields = ("run_id", "event_id", "state_id", "edge_id", "ordinal", "mode")
+        records.extend(
+            project("routing_event", row, route_fields)
+            for row in fetch(
+                routing_events_table,
+                route_fields,
+                routing_events_table.c.state_id,
+                routing_events_table.c.ordinal,
+                routing_events_table.c.event_id,
+            )
+        )
+
+        outcome_fields = (
+            "run_id",
+            "outcome_id",
+            "token_id",
+            "outcome",
+            "path",
+            "completed",
+            "sink_name",
+            "batch_id",
+            "expand_group_id",
+            "expected_branches_json",
+            "error_hash",
+        )
+        for row in fetch(
+            token_outcomes_table,
+            outcome_fields,
+            token_outcomes_table.c.token_id,
+            token_outcomes_table.c.recorded_at,
+            token_outcomes_table.c.outcome_id,
+        ):
+            record = project("token_outcome", row, outcome_fields)
+            record["completed"] = bool(record["completed"])
+            records.append(record)
+
+        scheduler_fields = (
+            "run_id",
+            "event_id",
+            "work_item_id",
+            "token_id",
+            "node_id",
+            "event_type",
+            "from_status",
+            "to_status",
+            "from_attempt",
+            "to_attempt",
+            "from_lease_owner",
+            "to_lease_owner",
+        )
+        records.extend(
+            project("scheduler_event", row, scheduler_fields)
+            for row in fetch(
+                scheduler_events_table,
+                scheduler_fields,
+                scheduler_events_table.c.token_id,
+                scheduler_events_table.c.recorded_at,
+                scheduler_events_table.c.event_id,
+            )
+        )
+
+        batch_fields = (
+            "run_id",
+            "batch_id",
+            "aggregation_node_id",
+            "attempt",
+            "status",
+            "trigger_type",
+            "trigger_reason",
+        )
+        records.extend(
+            project("batch", row, batch_fields)
+            for row in fetch(batches_table, batch_fields, batches_table.c.created_at, batches_table.c.batch_id)
+        )
+
+        batch_member_fields = ("run_id", "batch_id", "token_id", "ordinal")
+        records.extend(
+            project("batch_member", row, batch_member_fields)
+            for row in fetch(
+                batch_members_table,
+                batch_member_fields,
+                batch_members_table.c.batch_id,
+                batch_members_table.c.ordinal,
+                batch_members_table.c.token_id,
+            )
+        )
+
+        validation_fields = (
+            "run_id",
+            "error_id",
+            "node_id",
+            "row_id",
+            "row_hash",
+            "error",
+            "schema_mode",
+            "destination",
+            "violation_type",
+            "original_field_name",
+            "normalized_field_name",
+            "expected_type",
+            "actual_type",
+        )
+        records.extend(
+            {
+                **project("validation_error", row, validation_fields),
+                "row_data_json": None,
+            }
+            for row in fetch(
+                validation_errors_table,
+                validation_fields,
+                validation_errors_table.c.created_at,
+                validation_errors_table.c.error_id,
+            )
+        )
+
+        transform_fields = (
+            "run_id",
+            "error_id",
+            "token_id",
+            "transform_id",
+            "row_hash",
+            "error_details_json",
+            "destination",
+        )
+        records.extend(
+            {
+                **project("transform_error", row, transform_fields),
+                "row_data_json": None,
+            }
+            for row in fetch(
+                transform_errors_table,
+                transform_fields,
+                transform_errors_table.c.created_at,
+                transform_errors_table.c.error_id,
+            )
+        )
+
     records.append(
         {
             "record_type": "manifest",
@@ -1817,102 +2511,13 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
             "export_format": "json",
             "hash_algorithm": "sha256",
             "record_chain_algorithm": "sha256_concat_record_sha256_v1",
-            "record_count": len(unsigned_records),
+            "record_count": len(records),
             "schema": "elspeth.audit-export-manifest.v2",
             "signature_algorithm": "unsigned",
             "signature_key_id": "UNSIGNED",
-            "source_status": run["status"],
+            "source_status": run_row["status"],
         }
     )
-    for row in repositories.query.get_rows(run_id):
-        records.append(
-            {
-                "record_type": "row",
-                "row_id": row.row_id,
-                "source_node_id": row.source_node_id,
-                "source_row_index": row.source_row_index,
-                "ingest_sequence": row.ingest_sequence,
-                "source_data_hash": row.source_data_hash,
-            }
-        )
-    tokens = repositories.query.get_all_tokens_for_run(run_id)
-    for token in tokens:
-        records.append(
-            {
-                "record_type": "token",
-                "token_id": token.token_id,
-                "row_id": token.row_id,
-                "step_in_pipeline": token.step_in_pipeline,
-                "branch_name": token.branch_name,
-                "fork_group_id": token.fork_group_id,
-                "join_group_id": token.join_group_id,
-                "expand_group_id": token.expand_group_id,
-            }
-        )
-    for parent in repositories.query.get_all_token_parents_for_run(run_id):
-        records.append(
-            {
-                "record_type": "token_parent",
-                "token_id": parent.token_id,
-                "parent_token_id": parent.parent_token_id,
-                "ordinal": parent.ordinal,
-            }
-        )
-    for state in repositories.query.get_all_node_states_for_run(run_id):
-        records.append(
-            {
-                "record_type": "node_state",
-                "state_id": state.state_id,
-                "token_id": state.token_id,
-                "node_id": state.node_id,
-                "step_index": state.step_index,
-                "attempt": state.attempt,
-                "status": state.status.value,
-                "context_after_json": getattr(state, "context_after_json", None),
-                "error_json": getattr(state, "error_json", None),
-            }
-        )
-    for route_event in repositories.query.get_all_routing_events_for_run(run_id):
-        records.append(
-            {
-                "record_type": "routing_event",
-                "state_id": route_event.state_id,
-                "edge_id": route_event.edge_id,
-                "ordinal": route_event.ordinal,
-                "mode": route_event.mode.value,
-            }
-        )
-    for outcome in repositories.query.get_all_token_outcomes_for_run(run_id):
-        records.append(
-            {
-                "record_type": "token_outcome",
-                "token_id": outcome.token_id,
-                "outcome": outcome.outcome.value if outcome.outcome is not None else None,
-                "path": outcome.path.value,
-                "completed": outcome.completed,
-                "sink_name": outcome.sink_name,
-                "batch_id": outcome.batch_id,
-                "expand_group_id": outcome.expand_group_id,
-                "expected_branches_json": outcome.expected_branches_json,
-                "error_hash": outcome.error_hash,
-            }
-        )
-    for scheduler_event in repositories.query.get_scheduler_events(run_id=run_id):
-        records.append(
-            {
-                "record_type": "scheduler_event",
-                "work_item_id": scheduler_event.work_item_id,
-                "token_id": scheduler_event.token_id,
-                "node_id": scheduler_event.node_id,
-                "event_type": scheduler_event.event_type.value,
-                "from_status": scheduler_event.from_status.value if scheduler_event.from_status is not None else None,
-                "to_status": scheduler_event.to_status.value,
-                "from_attempt": scheduler_event.from_attempt,
-                "to_attempt": scheduler_event.to_attempt,
-                "from_lease_owner": scheduler_event.from_lease_owner,
-                "to_lease_owner": scheduler_event.to_lease_owner,
-            }
-        )
     return records
 
 

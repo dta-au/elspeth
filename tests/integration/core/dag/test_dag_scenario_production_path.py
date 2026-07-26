@@ -2161,6 +2161,38 @@ def test_exact_runtime_projection_linear_matches_declared_durable_and_export(
     assert evidence.audit.source_operation_count == case.expected.source_operation_count
 
 
+def test_recovery_durable_oracle_rejects_shared_serializer_record_family_omission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("retry-quarantine-discard-routed-errors", "source-quarantine-routed")
+    install_corpus_plugin_manager(monkeypatch)
+    evidence = run_scenario_case(scenario, case, tmp_path)
+    run_id = evidence.runtime.run_id
+    assert run_id is not None
+
+    original_iter_records = LandscapeExporter._iter_records
+
+    def omit_validation_errors(self: LandscapeExporter, target_run_id: str) -> Any:
+        yield from (record for record in original_iter_records(self, target_run_id) if record["record_type"] != "validation_error")
+
+    monkeypatch.setattr(LandscapeExporter, "_iter_records", omit_validation_errors)
+    reopened_store = FilesystemPayloadStore(tmp_path / "payloads")
+    reopened_db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}", create_tables=False)
+    try:
+        with pytest.raises(
+            AssertionError,
+            match=r"portable validation_error integrity: record identities differ from durable data",
+        ):
+            corpus_harness._exact_recovery_views(
+                reopened_db,
+                run_id=run_id,
+                payload_store=reopened_store,
+            )
+    finally:
+        reopened_db.close()
+
+
 def test_b3_recovery_cases_are_registered_as_closed_recovery_workflows() -> None:
     observed = tuple(
         (scenario.id, case.id, case.recovery_kind)
