@@ -965,6 +965,95 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         assert "allow_private" in result.errors[0].message
         mock_yaml_gen.generate_yaml.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("field", "value", "expected_fragment"),
+        [
+            ("timeout", 86400, "blob_fetch.http.timeout=86400"),
+            ("timeout", 86400.0, "blob_fetch.http.timeout=86400"),
+            ("timeout", "86400", "blob_fetch.http.timeout=86400"),
+            ("max_body_bytes", 1024 * 1024 * 1024 * 1024, "blob_fetch.http.max_body_bytes"),
+            ("max_body_bytes", float(1024 * 1024 * 1024 * 1024), "blob_fetch.http.max_body_bytes"),
+            ("max_body_bytes", str(1024 * 1024 * 1024 * 1024), "blob_fetch.http.max_body_bytes"),
+        ],
+    )
+    def test_blob_fetch_large_resource_limits_rejected_before_yaml_generation(
+        self,
+        field: str,
+        value: object,
+        expected_fragment: str,
+    ) -> None:
+        options = self._blob_fetch_options()
+        http = cast(dict[str, object], options["http"])
+        http[field] = value
+        state = _make_state(
+            nodes=(
+                _make_node(
+                    plugin="blob_fetch",
+                    options=options,
+                ),
+            ),
+            outputs=(_make_output(name="results"),),
+        )
+        settings = _make_settings()
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+            mock_load.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
+
+        assert result.is_valid is False
+        assert _check(result, "web_scrape_network_policy").passed is True
+        assert _check(result, "web_fetch_resource_policy").passed is False
+        assert {error.error_code for error in result.errors} == {"web_fetch_resource_limit_exceeded"}
+        assert expected_fragment in result.errors[0].message
+        assert result.readiness.blockers[0].code == "web_fetch_resource_policy"
+        mock_yaml_gen.generate_yaml.assert_not_called()
+
+    def test_blob_fetch_default_resource_limits_allowed_to_reach_yaml_generation(self) -> None:
+        state = _make_state(
+            nodes=(
+                _make_node(
+                    plugin="blob_fetch",
+                    options=self._blob_fetch_options(),
+                ),
+            ),
+            outputs=(_make_output(name="results"),),
+        )
+        settings = _make_settings()
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+            mock_load.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
+
+        assert result.is_valid is False
+        assert _check(result, "web_scrape_network_policy").passed is True
+        assert _check(result, "web_fetch_resource_policy").passed is True
+        mock_yaml_gen.generate_yaml.assert_called_once()
+
+    def test_trained_operator_blob_fetch_is_exempt_from_web_resource_limits(self) -> None:
+        options = self._blob_fetch_options()
+        http = cast(dict[str, object], options["http"])
+        http["timeout"] = "86400"
+        http["max_body_bytes"] = str(1024 * 1024 * 1024 * 1024)
+        state = _make_state(
+            nodes=(_make_node(plugin="blob_fetch", options=options),),
+            outputs=(_make_output(name="results"),),
+        )
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+            mock_load.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_trained_operator(state, _make_settings(), mock_yaml_gen)
+
+        assert _check(result, "web_scrape_network_policy").passed is True
+        assert _check(result, "web_fetch_resource_policy").passed is True
+        assert all(error.error_code != "web_fetch_resource_limit_exceeded" for error in result.errors)
+        mock_load.assert_called_once()
+
     def test_web_scrape_explicit_cidr_allowlist_rejected_before_yaml_generation(self) -> None:
         state = _make_state(
             nodes=(
@@ -4238,6 +4327,7 @@ sinks:
         # after blob_inline_refs (their declared #8/#9 home), not before web_scrape.
         assert emitted.index("managed_identity_policy") > emitted.index("blob_inline_refs")
         assert emitted.index("llm_retry_budget_policy") > emitted.index("managed_identity_policy")
+        assert emitted.index("web_fetch_resource_policy") == emitted.index("web_scrape_network_policy") + 1
         assert emitted.index("llm_tracing_policy") == emitted.index("llm_base_url_policy") + 1
         assert emitted.index("aws_s3_endpoint_url_policy") == emitted.index("llm_tracing_policy") + 1
         assert emitted.index("aws_s3_source_policy") == emitted.index("aws_s3_endpoint_url_policy") + 1

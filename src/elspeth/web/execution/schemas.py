@@ -37,6 +37,7 @@ ValidationCheckName = Literal[
     "required_control_coverage",
     "path_allowlist",
     "web_scrape_network_policy",
+    "web_fetch_resource_policy",
     "secret_refs",
     "semantic_contracts",
     "batch_transform_options",
@@ -67,6 +68,7 @@ CHECK_REQUIRED_CONTROL_AVAILABILITY: Final[ValidationCheckName] = "required_cont
 CHECK_REQUIRED_CONTROL_COVERAGE: Final[ValidationCheckName] = "required_control_coverage"
 CHECK_PATH_ALLOWLIST: Final[ValidationCheckName] = "path_allowlist"
 CHECK_WEB_SCRAPE_NETWORK_POLICY: Final[ValidationCheckName] = "web_scrape_network_policy"
+CHECK_WEB_FETCH_RESOURCE_POLICY: Final[ValidationCheckName] = "web_fetch_resource_policy"
 CHECK_SECRET_REFS: Final[ValidationCheckName] = "secret_refs"
 CHECK_SEMANTIC_CONTRACTS: Final[ValidationCheckName] = "semantic_contracts"
 CHECK_BATCH_TRANSFORM_OPTIONS: Final[ValidationCheckName] = "batch_transform_options"
@@ -96,6 +98,7 @@ VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     CHECK_REQUIRED_CONTROL_COVERAGE,
     CHECK_PATH_ALLOWLIST,
     CHECK_WEB_SCRAPE_NETWORK_POLICY,
+    CHECK_WEB_FETCH_RESOURCE_POLICY,
     CHECK_SECRET_REFS,
     CHECK_SEMANTIC_CONTRACTS,
     CHECK_BATCH_TRANSFORM_OPTIONS,
