@@ -16,6 +16,7 @@ import time
 from collections.abc import Callable, Mapping
 from threading import Event, Lock
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -43,9 +44,31 @@ logger = structlog.get_logger(__name__)
 _CAPACITY_RETRY_INITIAL_DELAY_SECONDS = 0.05
 _CAPACITY_RETRY_MAX_DELAY_SECONDS = 1.0
 _AZURE_HTTP_TIMEOUT_SECONDS = 30.0
+_AZURE_CONTENT_SAFETY_ENDPOINT_SUFFIXES = (
+    ".cognitiveservices.azure.com",
+    ".api.cognitive.microsoft.com",
+)
 
 
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
+
+
+def _validate_azure_content_safety_endpoint(v: str) -> str:
+    """Return a credential-safe Azure Content Safety endpoint URL.
+
+    Azure safety transforms send the configured API key as an
+    ``Ocp-Apim-Subscription-Key`` header.  Constrain user-provided endpoints to
+    Azure AI Services hosts so a server-scoped Content Safety key cannot be
+    exfiltrated to arbitrary HTTPS infrastructure.
+    """
+    stripped = validate_credential_safe_https_url(v, field_name="endpoint")
+    hostname = urlparse(stripped).hostname
+    if hostname is None:
+        raise ValueError("endpoint must include a hostname")
+    normalized = hostname.casefold().rstrip(".")
+    if not any(normalized.endswith(suffix) for suffix in _AZURE_CONTENT_SAFETY_ENDPOINT_SUFFIXES):
+        raise ValueError("endpoint must be an Azure Content Safety endpoint")
+    return stripped
 
 
 class BaseAzureSafetyConfig(TransformDataConfig):
@@ -66,7 +89,7 @@ class BaseAzureSafetyConfig(TransformDataConfig):
     @field_validator("endpoint")
     @classmethod
     def _validate_endpoint_url(cls, v: str) -> str:
-        return validate_credential_safe_https_url(v, field_name="endpoint")
+        return _validate_azure_content_safety_endpoint(v)
 
     @field_validator("api_key")
     @classmethod

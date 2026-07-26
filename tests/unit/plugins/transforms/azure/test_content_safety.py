@@ -2006,13 +2006,21 @@ class TestEndpointURLValidation:
         from elspeth.plugins.transforms.azure.content_safety import AzureContentSafetyConfig
 
         with pytest.raises(PluginConfigError, match=r"(?i)credentials"):
-            AzureContentSafetyConfig.from_dict(self._make_config_dict("https://user:pass@test.azure.com"))
+            AzureContentSafetyConfig.from_dict(self._make_config_dict("https://user:pass@test.cognitiveservices.azure.com"))
+
+    def test_non_azure_https_endpoint_rejected(self) -> None:
+        from elspeth.plugins.transforms.azure.content_safety import AzureContentSafetyConfig
+
+        with pytest.raises(PluginConfigError, match=r"(?i)azure content safety"):
+            AzureContentSafetyConfig.from_dict(self._make_config_dict("https://attacker.example"))
 
     def test_endpoint_with_path_accepted(self) -> None:
         from elspeth.plugins.transforms.azure.content_safety import AzureContentSafetyConfig
 
-        cfg = AzureContentSafetyConfig.from_dict(self._make_config_dict("https://test.azure.com/safety/v1"))
-        assert cfg.endpoint == "https://test.azure.com/safety/v1"
+        cfg = AzureContentSafetyConfig.from_dict(
+            self._make_config_dict("https://test.cognitiveservices.azure.com/safety/v1")
+        )
+        assert cfg.endpoint == "https://test.cognitiveservices.azure.com/safety/v1"
 
 
 class TestDuplicateCategoryDetection:
