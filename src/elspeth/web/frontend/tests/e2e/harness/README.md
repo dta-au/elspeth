@@ -24,14 +24,14 @@ re-run, diagnostics) live in `../helpers/tutorial-harness.ts`.
 
 The staging config (`playwright.staging.config.ts`) is single-worker,
 `fullyParallel:false`, `retries:0`, so runs are **sequential** (one shared
-`dta_user` account) and **all** runs execute even if some fail. Invoke from the
+configured staging account) and **all** runs execute even if some fail. Invoke from the
 frontend dir:
 
 ```bash
 cd src/elspeth/web/frontend
 HARNESS_BATCH_ID=batch-2026-06-06 HARNESS_BATCH_SIZE=10 \
 STAGING_BASE_URL=https://elspeth.foundryside.dev \
-STAGING_USERNAME=dta_user STAGING_PASSWORD=dta_pass \
+STAGING_USERNAME="${STAGING_USERNAME:?set from secret manager}" STAGING_PASSWORD="${STAGING_PASSWORD:?set from secret manager}" \
 PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
 npx playwright test --config=playwright.staging.config.ts tutorial-reliability.staging.spec.ts
 ```
@@ -40,6 +40,11 @@ npx playwright test --config=playwright.staging.config.ts tutorial-reliability.s
 |---------|---------|---------|
 | `HARNESS_BATCH_ID` | `skeleton` | Names the batch; results land under `tests/e2e/.harness-results/<batch_id>/` (gitignored) and the report lands at `notes/tutorial-reliability/<batch_id>.md`. |
 | `HARNESS_BATCH_SIZE` | `1` | How many independent tutorial runs the battery enumerates. |
+
+Load `STAGING_USERNAME` and `STAGING_PASSWORD` from the approved secret
+manager before running the command; never commit concrete staging credentials.
+Rotate any staging credential that has previously appeared in repository
+history.
 
 The four `STAGING_*` / `PLAYWRIGHT_BACKEND_BASE_URL` vars are required by
 `playwright.staging.config.ts` and the global-setup auth step.

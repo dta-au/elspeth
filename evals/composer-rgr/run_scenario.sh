@@ -8,8 +8,8 @@
 #
 # Usage:
 #   ELSPETH_EVAL_BASE_URL=https://elspeth.foundryside.dev \
-#   ELSPETH_EVAL_USER=dta_user \
-#   ELSPETH_EVAL_PASS=dta_pass \
+#   ELSPETH_EVAL_USER=REDACTED_LOAD_FROM_SECRET_MANAGER \
+#   ELSPETH_EVAL_PASS=REDACTED_LOAD_FROM_SECRET_MANAGER \
 #   ./run_scenario.sh [run_label]
 #
 # Selecting a scenario:

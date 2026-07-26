@@ -14,7 +14,7 @@
 //
 // Invocation:
 //   STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//   STAGING_USERNAME=dta_user STAGING_PASSWORD=dta_pass \
+//   STAGING_USERNAME="${STAGING_USERNAME:?set from secret manager}" STAGING_PASSWORD="${STAGING_PASSWORD:?set from secret manager}" \
 //   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
 //   npx playwright test --config=playwright.staging.config.ts composer-preferences
 
@@ -43,7 +43,7 @@ export default defineConfig({
   testIgnore: ["**/setup/**", "**/page-objects/**", "**/helpers/**", "**/*.test.ts"],
   // Sequential, single-worker for staging — we are talking to a shared
   // service and don't want parallel test runs colliding on the same
-  // dta_user account's preferences row.
+  // configured staging account's preferences row.
   fullyParallel: false,
   workers: 1,
   retries: 0,

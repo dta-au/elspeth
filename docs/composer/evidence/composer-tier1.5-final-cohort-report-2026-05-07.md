@@ -213,7 +213,7 @@ I initially hypothesised that the parallel-cohort REDs were a concurrency artefa
 ```bash
 # Re-fire the three demo-shape sequential cohorts (6 runs each):
 export ELSPETH_EVAL_BASE_URL=https://elspeth.foundryside.dev
-export ELSPETH_EVAL_USER=dta_user ELSPETH_EVAL_PASS=dta_pass
+export ELSPETH_EVAL_USER=REDACTED_LOAD_FROM_SECRET_MANAGER ELSPETH_EVAL_PASS=REDACTED_LOAD_FROM_SECRET_MANAGER
 cd /home/john/elspeth/.worktrees/composer-tier1.5-hardening/evals/composer-rgr
 
 # url-download (re-baseline)

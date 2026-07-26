@@ -163,7 +163,7 @@ The example `deep_routing` covers a real-world pattern — multi-rule routing fo
 # 1. Auth + create session
 TOKEN=$(curl -sS -X POST https://elspeth.foundryside.dev/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"dta_user","password":"dta_pass"}' \
+  -d '{"username":"REDACTED_LOAD_FROM_SECRET_MANAGER","password":"REDACTED_LOAD_FROM_SECRET_MANAGER"}' \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
 
 SID=$(curl -sS -X POST https://elspeth.foundryside.dev/api/sessions \

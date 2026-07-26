@@ -50,7 +50,7 @@ The user explicitly authorised building one ("you can create a new harness if yo
 
 `evals/composer-rgr/run_scenario.sh`:
 
-1. `POST /api/auth/login` with `dta_user` / `dta_pass`, capture JWT
+1. `POST /api/auth/login` with credentials loaded from the approved secret manager, capture JWT
 2. `POST /api/sessions` to create a fresh session
 3. `POST /api/sessions/{sid}/messages` with the scenario's `opening_prompt` (the exact failing user prompt from the captured session)
 4. `GET /api/sessions/{sid}/messages` to capture the full thread

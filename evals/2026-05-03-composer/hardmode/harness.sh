@@ -24,6 +24,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SID_FILE=""
 JWT_FILE=""
+: "${ELSPETH_EVAL_BASE_URL:=https://elspeth.foundryside.dev}"
+: "${ELSPETH_EVAL_USER:?set ELSPETH_EVAL_USER from the approved secret manager}"
+: "${ELSPETH_EVAL_PASS:?set ELSPETH_EVAL_PASS from the approved secret manager}"
 
 scenario_id="${1:-}"
 if [[ -z "$scenario_id" ]]; then echo "usage: $0 <scenario_id>"; exit 1; fi
@@ -37,16 +40,16 @@ mkdir -p $out
 cp "$scen" $out/scenario.json
 
 # --- step 1: login fresh ---
-curl -fsS -X POST https://elspeth.foundryside.dev/api/auth/login \
+curl -fsS -X POST "$ELSPETH_EVAL_BASE_URL/api/auth/login" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"dta_user","password":"dta_pass"}' \
+  -d "$(jq -n --arg username "$ELSPETH_EVAL_USER" --arg password "$ELSPETH_EVAL_PASS" '{username:$username,password:$password}')" \
   | jq -r '.access_token' > $out/jwt.txt
 J=$(cat $out/jwt.txt)
 [[ -n "$J" ]] || { echo "login failed"; exit 2; }
 
 # --- step 2: create session ---
 title=$(jq -r '.task_summary' $out/scenario.json)
-curl -fsS -X POST https://elspeth.foundryside.dev/api/sessions \
+curl -fsS -X POST "$ELSPETH_EVAL_BASE_URL/api/sessions" \
   -H "Authorization: Bearer $J" -H 'Content-Type: application/json' \
   -d "$(jq -n --arg t "hardmode/$scenario_id $title" '{title:$t}')" \
   -o $out/session.json
@@ -61,7 +64,7 @@ if [[ -n "$csv_filename" ]]; then
     --rawfile body <(jq -r '.csv_content' $out/scenario.json) \
     '{filename:$fn, mime_type:"text/csv", content:$body}' \
     > $out/blob.req.json
-  curl -fsS -X POST "https://elspeth.foundryside.dev/api/sessions/$sid/blobs/inline" \
+  curl -fsS -X POST "$ELSPETH_EVAL_BASE_URL/api/sessions/$sid/blobs/inline" \
     -H "Authorization: Bearer $J" -H 'Content-Type: application/json' \
     --data @$out/blob.req.json -o $out/blob.json
 fi
