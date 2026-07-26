@@ -1231,6 +1231,7 @@ class TestResumeFinalizesAsFailed:
         run_id = "run-empty-journal"
         _insert_failed_run(db, run_id)
         mock_factory = MagicMock(spec=RecorderFactory)
+        mock_factory.scheduler.count_active_work.return_value = 0
         mock_factory.data_flow.sweep_deferred_invariants_or_crash = MagicMock(spec=object)
         mock_factory.run_lifecycle.finalize_run = MagicMock(spec=object)
         # ADR-030 §A.3 (slice 4): resume() always starts a RunHeartbeatThread.
@@ -1386,6 +1387,7 @@ class TestResumeFinalizesAsFailed:
         run_id = "run-structural-counter-resume"
         _insert_failed_run(db, run_id)
         mock_factory = MagicMock(spec=RecorderFactory)
+        mock_factory.scheduler.count_active_work.return_value = 0
         mock_factory.data_flow.sweep_deferred_invariants_or_crash = MagicMock(spec=DataFlowRepository.sweep_deferred_invariants_or_crash)
         mock_factory.run_lifecycle.finalize_run = MagicMock(spec=RunLifecycleRepository.finalize_run)
         # F2 (resume-fork-reemit): rows_processed is now sourced from a dedicated

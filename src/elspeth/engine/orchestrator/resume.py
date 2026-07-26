@@ -1020,7 +1020,13 @@ class ResumeCoordinator:
             # WITHOUT constructing the recovery processor. The no-work arm
             # therefore requires both restored barrier work and the complete
             # scheduler journal to be quiescent.
-            has_active_scheduler_work = factory.scheduler.count_active_work(run_id=run_id) > 0
+            # Only consult the journal when the other two work sources are
+            # empty. Once rows or restored barriers are present the processing
+            # path is already mandatory, so an additional database query cannot
+            # change the branch decision.
+            has_active_scheduler_work = (
+                not unprocessed_rows and not state.has_restored_barrier_work and factory.scheduler.count_active_work(run_id=run_id) > 0
+            )
             if not unprocessed_rows and not state.has_restored_barrier_work and not has_active_scheduler_work:
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
 
