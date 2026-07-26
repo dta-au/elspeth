@@ -177,6 +177,33 @@ class TestExecutionError:
         assert "opaque-token" not in error.traceback
         assert "opaque-token" not in str(error.to_dict())
 
+    def test_execution_error_traceback_scrubs_secret_split_by_fake_frame(self) -> None:
+        """Attacker-controlled frame-like message lines cannot evade scrubbing."""
+        from elspeth.contracts import ExecutionError
+
+        traceback = (
+            'Traceback (most recent call last):\n'
+            '  File "worker.py", line 10, in run\n'
+            'RuntimeError: Authorization:\n'
+            'File "Bearer opaque-token"\n'
+        )
+
+        error = ExecutionError(
+            exception="boom",
+            exception_type="RuntimeError",
+            traceback=traceback,
+        )
+
+        assert error.traceback == (
+            'Traceback (most recent call last):\n'
+            '  File "worker.py", line 10, in run\n'
+            '<redacted-secret>\n'
+            '<redacted-secret>\n'
+        )
+        assert "Authorization" not in error.traceback
+        assert "opaque-token" not in error.traceback
+        assert "opaque-token" not in str(error.to_dict())
+
     def test_execution_error_traceback_scrubs_secret_continuation_after_redacted_message_line(self) -> None:
         """Continuation lines after a redacted exception message tail are redacted."""
         from elspeth.contracts import ExecutionError

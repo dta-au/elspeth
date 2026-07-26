@@ -61,16 +61,18 @@ def _scrub_traceback_for_audit(traceback_text: str) -> str:
             if scrub_text_for_audit(tail_text) != tail_text:
                 redacted_indexes.update(range(tail_start, run_stop))
 
-    for run_start, run_stop in nonstructural_runs:
-        for start in range(run_start, run_stop):
-            window_stop = min(run_stop, start + _TRACEBACK_SECRET_WINDOW_SIZE)
-            for stop in range(start + 2, window_stop + 1):
-                window_indexes = range(start, stop)
-                if any(index in redacted_indexes for index in window_indexes):
-                    continue
-                window_text = _join_line_parts(line_parts[start:stop])
-                if scrub_text_for_audit(window_text) != window_text:
-                    redacted_indexes.update(window_indexes)
+    # Scan bounded windows across every line boundary. Exception text is
+    # attacker-controlled and may itself look like traceback structure, so a
+    # structural classification must not create a secret-scrubbing boundary.
+    for window_size in range(2, _TRACEBACK_SECRET_WINDOW_SIZE + 1):
+        for start in range(len(line_parts) - window_size + 1):
+            stop = start + window_size
+            window_indexes = range(start, stop)
+            if any(index in redacted_indexes for index in window_indexes):
+                continue
+            window_text = _join_line_parts(line_parts[start:stop])
+            if scrub_text_for_audit(window_text) != window_text:
+                redacted_indexes.update(window_indexes)
 
     return "".join(
         f"{scrubbed_content_by_index[index] if index not in redacted_indexes else _REDACTED_SECRET}{line_ending}"
