@@ -81,6 +81,8 @@ def validate_pipeline_for_web_principal(
     state: CompositionState,
     settings: Any,
     yaml_generator: YamlGenerator,
+    *,
+    principal_scope: str = "local:test-user",
     **kwargs: Any,
 ) -> Any:
     """Exercise validation with a web principal and the unrestricted test catalog."""
@@ -88,7 +90,7 @@ def validate_pipeline_for_web_principal(
     unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     snapshot = PluginAvailabilitySnapshot.create(
         policy_hash="test-web-policy",
-        principal_scope="local:test-user",
+        principal_scope=principal_scope,
         available=unrestricted.available,
         unavailable=(),
         selected=unrestricted.selected,
@@ -939,6 +941,32 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         assert "allow_private" in result.errors[0].message
         mock_yaml_gen.generate_yaml.assert_not_called()
 
+    def test_web_user_named_trained_operator_is_not_exempt_from_network_policy(self) -> None:
+        state = _make_state(
+            nodes=(
+                _make_node(
+                    plugin="web_scrape",
+                    options=self._web_scrape_options("allow_private"),
+                ),
+            ),
+            outputs=(_make_output(name="results"),),
+        )
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+            mock_load.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_web_principal(
+                state,
+                _make_settings(),
+                mock_yaml_gen,
+                principal_scope="local:trained-operator",
+            )
+
+        assert _check(result, "web_scrape_network_policy").passed is False
+        assert result.errors[0].error_code == "web_scrape_private_network_not_allowed"
+        mock_yaml_gen.generate_yaml.assert_not_called()
+
     @pytest.mark.parametrize("plugin", ["web_scrape", "blob_fetch"])
     def test_trained_operator_private_network_allowlist_is_exempt_from_web_policy(self, plugin: str) -> None:
         options = self._web_scrape_options("allow_private") if plugin == "web_scrape" else self._blob_fetch_options("allow_private")
@@ -1486,7 +1514,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         endpoint_options: dict[str, object],
     ) -> None:
         source_plugin = "csv"
-        source_options = {}
+        source_options: dict[str, object] = {}
         output_plugin = "aws_s3"
         output_options = endpoint_options
         state = _make_state(

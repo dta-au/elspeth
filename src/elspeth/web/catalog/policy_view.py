@@ -34,7 +34,7 @@ class PolicyCatalogView:
         snapshot: PluginAvailabilitySnapshot,
     ) -> PolicyCatalogView:
         """Return the explicit full-catalog projection for the local MCP."""
-        if snapshot.principal_scope != "local:trained-operator":
+        if not snapshot.is_trained_operator:
             raise ValueError("trained_operator_snapshot_required")
         view = cls.__new__(cls)
         view._full = full

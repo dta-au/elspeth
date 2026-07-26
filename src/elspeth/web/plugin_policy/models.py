@@ -51,6 +51,11 @@ class PluginUnavailableReason(StrEnum):
     PROFILE_UNAVAILABLE = "profile_unavailable"
 
 
+class PluginSnapshotAuthority(StrEnum):
+    RESTRICTED = "restricted"
+    TRAINED_OPERATOR = "trained_operator"
+
+
 @dataclass(frozen=True, slots=True, order=True)
 class PluginAvailability:
     plugin_id: PluginId
@@ -115,7 +120,13 @@ class PluginAvailabilitySnapshot:
     selected_profile_aliases: tuple[tuple[PluginId, str | None], ...]
     control_modes: tuple[tuple[PluginCapability, ControlMode], ...]
     binding_generation_fingerprint: str
+    authority: PluginSnapshotAuthority
     snapshot_hash: str
+
+    @property
+    def is_trained_operator(self) -> bool:
+        """Return whether this snapshot carries explicit local-MCP authority."""
+        return self.authority is PluginSnapshotAuthority.TRAINED_OPERATOR
 
     @classmethod
     def for_trained_operator(cls, full_catalog: CatalogService) -> PluginAvailabilitySnapshot:
@@ -145,6 +156,7 @@ class PluginAvailabilitySnapshot:
             usable_profile_aliases=(),
             selected_profile_aliases=(),
             binding_generation_fingerprint=_canonical_hash({"binding_generation": "trained-operator"}),
+            authority=PluginSnapshotAuthority.TRAINED_OPERATOR,
         )
 
     @classmethod
@@ -160,6 +172,7 @@ class PluginAvailabilitySnapshot:
         selected_profile_aliases: tuple[tuple[PluginId, str | None], ...],
         binding_generation_fingerprint: str,
         control_modes: tuple[tuple[PluginCapability, ControlMode], ...] = (),
+        authority: PluginSnapshotAuthority = PluginSnapshotAuthority.RESTRICTED,
     ) -> PluginAvailabilitySnapshot:
         canonical = {
             "policy_hash": policy_hash,
@@ -171,6 +184,7 @@ class PluginAvailabilitySnapshot:
             "selected_profile_aliases": [(str(plugin_id), alias) for plugin_id, alias in selected_profile_aliases],
             "control_modes": [(capability.value, mode.value) for capability, mode in control_modes],
             "binding_generation_fingerprint": binding_generation_fingerprint,
+            "authority": authority.value,
         }
         return cls(
             policy_hash=policy_hash,
@@ -182,5 +196,6 @@ class PluginAvailabilitySnapshot:
             selected_profile_aliases=selected_profile_aliases,
             control_modes=control_modes,
             binding_generation_fingerprint=binding_generation_fingerprint,
+            authority=authority,
             snapshot_hash=_canonical_hash(canonical),
         )

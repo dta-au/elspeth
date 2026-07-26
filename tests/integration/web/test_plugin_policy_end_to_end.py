@@ -52,6 +52,7 @@ from elspeth.web.plugin_policy.models import (
     PluginAvailability,
     PluginAvailabilitySnapshot,
     PluginId,
+    PluginSnapshotAuthority,
     PluginUnavailableReason,
     WebPluginPolicy,
 )
@@ -602,6 +603,89 @@ def test_policy_matrix_cases_are_five_distinct_authorization_and_availability_co
     }
 
     assert len(contracts) == 5
+
+
+def test_trained_operator_user_id_stays_restricted_through_request_factory_and_catalog() -> None:
+    case = next(case for case in _CASES if case.name == "core_only")
+    policy = _policy(case)
+    profiles = _profiles(policy)
+    catalog = _MatrixCatalog()
+    engine: sa.engine.Engine = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(engine)
+    user_store = UserSecretStore(engine=engine, master_key="trained-operator-user-test-key")
+    server_store = ServerSecretStore(())
+    secret_service = WebSecretService(user_store=user_store, server_store=server_store)
+    factory = RequestPluginSnapshotFactory(
+        policy=policy,
+        catalog=catalog,
+        profiles=profiles,
+        auth_provider="local",
+        secret_service=secret_service,
+        server_store=server_store,
+        user_store=user_store,
+        generation_key=b"trained-operator-user-generation-key",
+    )
+    user = UserIdentity(user_id="trained-operator", username="trained-operator")
+    snapshot = factory(user)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            catalog_service=catalog,
+            plugin_snapshot_factory=factory,
+            operator_profile_registry=profiles,
+            web_plugin_policy=policy,
+        )
+    )
+    request = Request({"type": "http", "method": "GET", "path": "/api/catalog", "headers": [], "app": app})
+    transforms_response = Response()
+    transforms = asyncio.run(catalog_routes.list_transforms(request, transforms_response, user))
+    schema = asyncio.run(catalog_routes.get_schema("transforms", "llm", request, Response(), user))
+    policy_response = asyncio.run(catalog_routes.get_policy(request, Response(), user))
+
+    state = CompositionState(
+        source=None,
+        nodes=(
+            NodeSpec(
+                id="llm_profile_probe",
+                node_type="transform",
+                plugin="llm",
+                input="rows",
+                on_success="labelled",
+                on_error="discard",
+                options={
+                    "profile": "tutorial",
+                    "prompt_template": "{{ row }}",
+                    "schema": {"mode": "observed", "fields": None},
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    validation = validate_plugin_policy(state, snapshot=snapshot, profile_registry=profiles, catalog=catalog)
+    executable_options = validation.executable_state.nodes[0].options
+
+    assert snapshot.principal_scope == "local:trained-operator"
+    assert snapshot.authority is PluginSnapshotAuthority.RESTRICTED
+    assert transforms_response.headers["X-ELSPETH-Plugin-Snapshot"] == snapshot.snapshot_hash
+    assert {item.name for item in transforms} == {"field_mapper", "llm", "web_scrape"}
+    assert frozenset(map(PluginId.parse, policy_response.available_plugin_ids)) == _CORE_IDS
+    assert "transform:azure_prompt_shield" not in policy_response.available_plugin_ids
+    assert '"tutorial"' in schema.model_dump_json()
+    assert '"api_key"' not in schema.model_dump_json()
+    assert validation.findings == ()
+    assert "profile" not in executable_options
+    assert executable_options["provider"] == "bedrock"
+    with pytest.raises(ValueError, match="trained_operator_snapshot_required"):
+        PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    engine.dispose()
 
 
 def test_every_web_tool_context_constructor_supplies_policy_context() -> None:

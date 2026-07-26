@@ -99,7 +99,7 @@ def validate_plugin_policy(
         )
 
     executable_state = state
-    if not findings and snapshot.principal_scope != "local:trained-operator":
+    if not findings and not snapshot.is_trained_operator:
         executable_state, profile_findings = _lower_profiled_components(
             state,
             snapshot=snapshot,
@@ -362,7 +362,7 @@ def validate_authored_composition_state(
     catalog: CatalogService,
 ) -> ProfileAwareValidationResult:
     """Validate authored state once through the principal's policy boundary."""
-    if snapshot.principal_scope == "local:trained-operator":
+    if snapshot.is_trained_operator:
         return ProfileAwareValidationResult(
             authored_state=state,
             executable_state=state,

@@ -124,7 +124,7 @@ from elspeth.web.interpretation_state import (
     materialize_state_for_authoring,
     materialize_state_for_execution,
 )
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
 from elspeth.web.provider_config_policy import (
@@ -1138,7 +1138,7 @@ def validate_pipeline(
 
     web_fetch_network_errors: list[ValidationError] = []
     for node in state.nodes:
-        if plugin_snapshot.principal_scope == "local:trained-operator" or node.plugin not in _WEB_FETCH_TRANSFORMS:
+        if plugin_snapshot.is_trained_operator or node.plugin not in _WEB_FETCH_TRANSFORMS:
             continue
         http_options = node.options["http"] if "http" in node.options else None
         if not isinstance(http_options, Mapping):
@@ -1202,7 +1202,7 @@ def validate_pipeline(
             passed=True,
             detail=(
                 "No web fetch transform private-network allowlists found"
-                if plugin_snapshot.principal_scope != "local:trained-operator"
+                if not plugin_snapshot.is_trained_operator
                 else "Local trained-operator validation is exempt from the web fetch private-network policy"
             ),
             affected_nodes=(),
@@ -1211,7 +1211,7 @@ def validate_pipeline(
     )
 
     web_fetch_resource_errors: list[ValidationError] = []
-    if plugin_snapshot.principal_scope != "local:trained-operator":
+    if not plugin_snapshot.is_trained_operator:
         for node in state.nodes:
             if node.plugin != "blob_fetch":
                 continue
@@ -1285,7 +1285,7 @@ def validate_pipeline(
             passed=True,
             detail=(
                 "No blob_fetch resource limits exceed the web execution policy"
-                if plugin_snapshot.principal_scope != "local:trained-operator"
+                if not plugin_snapshot.is_trained_operator
                 else "Local trained-operator validation is exempt from the web blob_fetch resource policy"
             ),
             affected_nodes=(),
@@ -1877,9 +1877,7 @@ def validate_pipeline(
 
     for source_name, source in state.sources.items():
         endpoint_policy_error = (
-            None
-            if plugin_snapshot.principal_scope == "local:trained-operator"
-            else web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
+            None if plugin_snapshot.is_trained_operator else web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
         )
         if endpoint_policy_error is None:
             continue
@@ -1917,9 +1915,7 @@ def validate_pipeline(
 
     for output in state.outputs:
         endpoint_policy_error = (
-            None
-            if plugin_snapshot.principal_scope == "local:trained-operator"
-            else web_aws_s3_endpoint_url_policy_error(output.plugin, output.options)
+            None if plugin_snapshot.is_trained_operator else web_aws_s3_endpoint_url_policy_error(output.plugin, output.options)
         )
         if endpoint_policy_error is None:
             continue
@@ -1960,7 +1956,7 @@ def validate_pipeline(
             passed=True,
             detail=(
                 "No web-authored aws_s3 endpoint_url override"
-                if plugin_snapshot.principal_scope != "local:trained-operator"
+                if not plugin_snapshot.is_trained_operator
                 else "Local trained-operator validation is exempt from the web aws_s3 endpoint_url policy"
             ),
             affected_nodes=(),
@@ -1968,7 +1964,7 @@ def validate_pipeline(
         )
     )
 
-    if plugin_snapshot.principal_scope != "local:trained-operator":
+    if not plugin_snapshot.is_trained_operator:
         for source_name, source in state.sources.items():
             source_policy_error = web_aws_s3_source_policy_error(source.plugin)
             if source_policy_error is None:
@@ -2011,7 +2007,7 @@ def validate_pipeline(
             passed=True,
             detail=(
                 "Web-authored pipeline does not use an aws_s3 source"
-                if plugin_snapshot.principal_scope != "local:trained-operator"
+                if not plugin_snapshot.is_trained_operator
                 else "Local trained-operator validation is exempt from the web aws_s3 source policy"
             ),
             affected_nodes=(),
@@ -2569,7 +2565,7 @@ def _trained_operator_validation_context(
     catalog = kwargs.pop("catalog") if "catalog" in kwargs else catalog_factory()
     if plugin_snapshot is None:
         return catalog, PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    if plugin_snapshot.principal_scope == "local:trained-operator":
+    if plugin_snapshot.is_trained_operator:
         return catalog, plugin_snapshot
     return catalog, PluginAvailabilitySnapshot.create(
         policy_hash=plugin_snapshot.policy_hash,
@@ -2581,4 +2577,5 @@ def _trained_operator_validation_context(
         selected_profile_aliases=plugin_snapshot.selected_profile_aliases,
         control_modes=plugin_snapshot.control_modes,
         binding_generation_fingerprint=plugin_snapshot.binding_generation_fingerprint,
+        authority=PluginSnapshotAuthority.TRAINED_OPERATOR,
     )
