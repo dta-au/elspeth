@@ -1013,12 +1013,15 @@ class ResumeCoordinator:
             # from ``unprocessed_rows`` because they are RESTORED at processor
             # construction — so a fully-buffered crashed run (all remaining
             # work sitting at barriers) legitimately has zero unprocessed
-            # rows. Early-completing here would finalize the run and delete
-            # checkpoints WITHOUT ever constructing the
-            # BarrierJournalRestoreContext, silently dropping the buffered
-            # batch. The no-work arm therefore also requires the journal to
-            # carry no restored barrier work.
-            if not unprocessed_rows and not state.has_restored_barrier_work:
+            # rows. PENDING_SINK rows are also absent when every leaf already
+            # has a terminal outcome, but the processor must still reclaim
+            # them and reconcile the durable sink effect. Early-completing in
+            # either case would finalize the run and delete checkpoints
+            # WITHOUT constructing the recovery processor. The no-work arm
+            # therefore requires both restored barrier work and the complete
+            # scheduler journal to be quiescent.
+            has_active_scheduler_work = factory.scheduler.count_active_work(run_id=run_id) > 0
+            if not unprocessed_rows and not state.has_restored_barrier_work and not has_active_scheduler_work:
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
 
                 # All rows were processed - complete the run.

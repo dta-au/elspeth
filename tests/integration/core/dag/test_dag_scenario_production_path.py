@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.dag import GraphValidationError
@@ -1021,6 +1022,178 @@ def test_b2_partial_terminal_failure_executes_exact_production_oracle(
     assert all(work.final_status == "terminal" for work in projection.scheduler_work)
     assert not (tmp_path / "failing.jsonl").exists()
     assert evidence.audit.portable_projection == projection
+
+
+def test_b2_terminal_leaf_resume_reconciles_finalized_pending_sink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Public resume must drain sink debt even when every leaf is terminal."""
+    _scenario, case = _declared_case(*B2_PARTIAL_TERMINAL_FAILURE_CASE)
+    install_corpus_plugin_manager(monkeypatch)
+    db_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    payload_root = tmp_path / "payloads"
+
+    initial_rendered = render_settings(case, tmp_path)
+    initial_built = build_scenario(initial_rendered)
+    survivor_sink_id = str(initial_built.graph.get_sink_id_map()["survivor"])
+    checkpoint_config = corpus_harness.RuntimeCheckpointConfig.from_settings(initial_rendered.settings.checkpoint)
+    initial_store = FilesystemPayloadStore(payload_root)
+    initial_db = LandscapeDB(db_url)
+    initial_checkpoints = corpus_harness.CheckpointManager(initial_db)
+    injected: list[corpus_harness.SinkEffectExecutionSeam] = []
+
+    def fail_after_survivor_finalize(
+        coordinator: corpus_harness.SinkEffectCoordinator,
+        seam: corpus_harness.SinkEffectExecutionSeam,
+    ) -> None:
+        if seam is not corpus_harness.SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE or injected:
+            return
+        active_runs = coordinator._factory.run_lifecycle.list_runs()
+        survivor_finalized = any(
+            effect.sink_node_id == survivor_sink_id
+            for run in active_runs
+            for effect in coordinator._factory.execution.sink_effects.get_effects_for_run(run.run_id)
+        )
+        if survivor_finalized:
+            injected.append(seam)
+            raise corpus_harness.SinkEffectInjectedFault(seam)
+
+    try:
+        catalog_sha256, catalog_source = corpus_harness.read_openrouter_catalog_snapshot_id()
+        with monkeypatch.context() as fault_patch:
+            fault_patch.setattr(corpus_harness.SinkEffectCoordinator, "_fault", fail_after_survivor_finalize)
+            with pytest.raises(
+                corpus_harness.SinkEffectInjectedFault,
+                match=corpus_harness.SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE.value,
+            ):
+                Orchestrator(
+                    initial_db,
+                    checkpoint_manager=initial_checkpoints,
+                    checkpoint_config=checkpoint_config,
+                ).run(
+                    initial_built.config,
+                    graph=initial_built.graph,
+                    settings=initial_rendered.settings,
+                    payload_store=initial_store,
+                    openrouter_catalog_sha256=catalog_sha256,
+                    openrouter_catalog_source=catalog_source,
+                )
+
+        assert injected == [corpus_harness.SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE]
+        repositories = corpus_harness.RecorderFactory(initial_db, payload_store=initial_store)
+        runs = repositories.run_lifecycle.list_runs()
+        assert len(runs) == 1
+        run_id = runs[0].run_id
+        checkpoint = initial_checkpoints.get_latest_checkpoint(run_id)
+        assert checkpoint is not None
+
+        with initial_db.connection() as conn:
+            outcomes = tuple(
+                conn.execute(
+                    select(corpus_harness.token_outcomes_table).where(
+                        corpus_harness.token_outcomes_table.c.run_id == run_id,
+                    )
+                ).mappings()
+            )
+            work_rows = tuple(
+                conn.execute(
+                    select(corpus_harness.token_work_items_table).where(
+                        corpus_harness.token_work_items_table.c.run_id == run_id,
+                    )
+                ).mappings()
+            )
+        assert outcomes
+        assert all(outcome["completed"] for outcome in outcomes)
+        assert sum(work["status"] == "pending_sink" for work in work_rows) == 3
+
+        effects_before = tuple(
+            sorted(
+                effect.effect_id
+                for effect in repositories.execution.sink_effects.get_effects_for_run(run_id)
+                if effect.sink_node_id == survivor_sink_id
+            )
+        )
+        artifacts_before = tuple(
+            sorted(
+                artifact.artifact_id
+                for artifact in repositories.execution.get_artifacts(run_id)
+                if artifact.sink_node_id == survivor_sink_id
+            )
+        )
+        survivor_output_before = initial_rendered.output_paths["survivor"].read_bytes()
+        assert len(effects_before) == len(artifacts_before) == 1
+    finally:
+        initial_db.close()
+
+    reopened_store = FilesystemPayloadStore(payload_root)
+    reopened_db = LandscapeDB.from_url(db_url, create_tables=False)
+    try:
+        reopened_rendered = render_settings(case, tmp_path)
+        reopened_built = build_scenario(
+            reopened_rendered,
+            purpose=corpus_harness.SinkEffectExecutionPurpose.RESUME,
+        )
+        reopened_checkpoints = corpus_harness.CheckpointManager(reopened_db)
+        recovery = corpus_harness.RecoveryManager(reopened_db, reopened_checkpoints)
+        resume_point = recovery.get_resume_point(run_id, reopened_built.graph)
+        assert resume_point is not None
+
+        result = Orchestrator(
+            reopened_db,
+            checkpoint_manager=reopened_checkpoints,
+            checkpoint_config=checkpoint_config,
+        ).resume(
+            resume_point,
+            reopened_built.config,
+            reopened_built.graph,
+            payload_store=reopened_store,
+            settings=reopened_rendered.settings,
+        )
+
+        assert result.to_dict()["status"] == "completed_with_failures"
+        final_repositories = corpus_harness.RecorderFactory(reopened_db, payload_store=reopened_store)
+        effects_after = tuple(
+            sorted(
+                effect.effect_id
+                for effect in final_repositories.execution.sink_effects.get_effects_for_run(run_id)
+                if effect.sink_node_id == survivor_sink_id
+            )
+        )
+        artifacts_after = tuple(
+            sorted(
+                artifact.artifact_id
+                for artifact in final_repositories.execution.get_artifacts(run_id)
+                if artifact.sink_node_id == survivor_sink_id
+            )
+        )
+        assert effects_after == effects_before
+        assert artifacts_after == artifacts_before
+        survivor_effects = tuple(
+            effect
+            for effect in final_repositories.execution.sink_effects.get_effects_for_run(run_id)
+            if effect.sink_node_id == survivor_sink_id
+        )
+        assert sum(effect.publication_performed is True for effect in survivor_effects) == 1
+        assert reopened_rendered.output_paths["survivor"].read_bytes() == survivor_output_before
+        with reopened_db.connection() as conn:
+            final_work_statuses = tuple(
+                conn.execute(
+                    select(corpus_harness.token_work_items_table.c.status).where(
+                        corpus_harness.token_work_items_table.c.run_id == run_id,
+                    )
+                ).scalars()
+            )
+        assert set(final_work_statuses) == {"terminal"}
+        assert reopened_checkpoints.get_latest_checkpoint(run_id) is None
+        durable_projection, final_audit = corpus_harness._exact_recovery_views(
+            reopened_db,
+            run_id=run_id,
+            payload_store=reopened_store,
+        )
+        assert final_audit.portable_projection == durable_projection
+    finally:
+        reopened_db.close()
 
 
 def _copy_conditional_routing_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[HarnessCaseSpec, Path]:
