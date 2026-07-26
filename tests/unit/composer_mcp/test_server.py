@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
 
-from elspeth.composer_mcp.server import _build_tool_defs, _dispatch_tool
+from elspeth.composer_mcp.server import _build_tool_defs, _dispatch_tool, create_server
+from elspeth.composer_mcp.session import SessionCheckout, SessionManager
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer.state import (
@@ -160,6 +163,38 @@ def _mock_catalog() -> CatalogService:
     return catalog
 
 
+def _call_handler(handlers: dict[object, object], name: str, arguments: dict[str, object]) -> object:
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    request = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name=name, arguments=arguments),
+    )
+    return handlers[CallToolRequest](request)  # type: ignore[index,operator]
+
+
+def _session_authority(scratch_dir: Path) -> tuple[SessionManager, list[SessionCheckout | None]]:
+    return SessionManager(scratch_dir), [None]
+
+
+def _dispatch_session_once(
+    tool_name: str,
+    arguments: dict[str, Any],
+    state: CompositionState,
+    scratch_dir: Path,
+) -> dict[str, Any]:
+    session_manager, session_checkout_ref = _session_authority(scratch_dir)
+    return _dispatch_tool(
+        tool_name,
+        arguments,
+        state,
+        _mock_catalog(),
+        scratch_dir,
+        session_manager=session_manager,
+        session_checkout_ref=session_checkout_ref,
+    )
+
+
 class TestBuildToolDefs:
     """Tests for _build_tool_defs() tool registration."""
 
@@ -215,6 +250,178 @@ class TestBuildToolDefs:
 
 
 class TestDispatchTool:
+    @pytest.mark.asyncio
+    async def test_live_session_manager_token_authorizes_save_after_mutation(self, scratch_dir: Path) -> None:
+        recorder = MagicMock()
+        server = create_server(_mock_catalog(), scratch_dir, recorder=recorder)
+        created = await _call_handler(server.request_handlers, "new_session", {"name": "CAS"})  # type: ignore[misc]
+        created_payload = json.loads(created.root.content[0].text)
+        session_id = created_payload["data"]["session_id"]
+        assert "token" not in created_payload["data"]
+
+        mutated = await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "source_out",
+                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            },
+        )
+        assert json.loads(mutated.root.content[0].text)["success"] is True
+
+        saved = await _call_handler(server.request_handlers, "save_session", {"session_id": session_id})  # type: ignore[misc]
+        saved_payload = json.loads(saved.root.content[0].text)
+        assert saved_payload["success"] is True
+        assert "token" not in saved_payload["data"]
+
+        mutated_again = await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "next_source_out",
+                "options": {"path": "/data/blobs/next.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            },
+        )
+        assert json.loads(mutated_again.root.content[0].text)["success"] is True
+
+        saved_again = await _call_handler(server.request_handlers, "save_session", {"session_id": session_id})  # type: ignore[misc]
+        saved_again_payload = json.loads(saved_again.root.content[0].text)
+        assert saved_again_payload["success"] is True
+        assert "token" not in saved_again_payload["data"]
+
+        for call in recorder.record.call_args_list:
+            invocation = call.args[0]
+            if invocation.result_canonical is not None:
+                assert "token" not in json.loads(invocation.result_canonical).get("data", {})
+
+        durable = SessionManager(scratch_dir).load(session_id)
+        assert durable.metadata.name == "CAS"
+        assert durable.sources["source"].plugin == "csv"
+        assert durable.sources["source"].on_success == "next_source_out"
+        assert durable.version == 3
+
+    @pytest.mark.asyncio
+    async def test_live_save_to_non_active_session_conflicts_and_preserves_sessions(self, scratch_dir: Path) -> None:
+        server = create_server(_mock_catalog(), scratch_dir)
+        created_a = await _call_handler(server.request_handlers, "new_session", {"name": "A"})  # type: ignore[misc]
+        session_a = json.loads(created_a.root.content[0].text)["data"]["session_id"]
+        created_b = await _call_handler(server.request_handlers, "new_session", {"name": "B"})  # type: ignore[misc]
+        session_b = json.loads(created_b.root.content[0].text)["data"]["session_id"]
+        path_a = scratch_dir / f"{session_a}.json"
+        path_b = scratch_dir / f"{session_b}.json"
+        original_a = path_a.read_bytes()
+        original_b = path_b.read_bytes()
+
+        await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "source_out",
+                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            },
+        )
+
+        rejected = await _call_handler(server.request_handlers, "save_session", {"session_id": session_a})  # type: ignore[misc]
+
+        assert rejected.root.isError is True
+        assert path_a.read_bytes() == original_a
+        assert path_b.read_bytes() == original_b
+
+    @pytest.mark.asyncio
+    async def test_delete_clears_active_checkout_authority(self, scratch_dir: Path) -> None:
+        server = create_server(_mock_catalog(), scratch_dir)
+        created = await _call_handler(server.request_handlers, "new_session", {"name": "deleted"})  # type: ignore[misc]
+        created_payload = json.loads(created.root.content[0].text)
+        session_id = created_payload["data"]["session_id"]
+        original = CompositionState.from_dict(created_payload["state"])
+
+        deleted = await _call_handler(server.request_handlers, "delete_session", {"session_id": session_id})  # type: ignore[misc]
+        assert json.loads(deleted.root.content[0].text)["success"] is True
+
+        # Recreate the same durable bytes externally. A retained pre-delete
+        # checkout token would now compare equal and incorrectly regain write
+        # authority; the live server must have cleared it after the tombstone.
+        path = SessionManager(scratch_dir).save(session_id, original)
+        recreated = path.read_bytes()
+
+        await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "source_out",
+                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            },
+        )
+        rejected = await _call_handler(server.request_handlers, "save_session", {"session_id": session_id})  # type: ignore[misc]
+
+        assert rejected.root.isError is True
+        assert path.read_bytes() == recreated
+
+    @pytest.mark.asyncio
+    async def test_delete_clears_active_authority_when_tombstone_recording_raises(
+        self,
+        scratch_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.composer_mcp.audit import JsonlEventRecorder, events_sidecar_path
+        from elspeth.contracts.composer_audit import ComposerToolInvocation
+
+        original_record = JsonlEventRecorder.record
+        delete_attempts = 0
+
+        def record_then_fail_delete(
+            recorder: JsonlEventRecorder,
+            invocation: ComposerToolInvocation,
+        ) -> None:
+            nonlocal delete_attempts
+            original_record(recorder, invocation)
+            if invocation.tool_name == "delete_session":
+                delete_attempts += 1
+                raise RuntimeError("delete tombstone recorder failure")
+
+        monkeypatch.setattr(JsonlEventRecorder, "record", record_then_fail_delete)
+        server = create_server(_mock_catalog(), scratch_dir)
+        created = await _call_handler(server.request_handlers, "new_session", {"name": "deleted"})  # type: ignore[misc]
+        created_payload = json.loads(created.root.content[0].text)
+        session_id = created_payload["data"]["session_id"]
+        path = scratch_dir / f"{session_id}.json"
+        original_bytes = path.read_bytes()
+        sidecar = events_sidecar_path(scratch_dir, session_id)
+
+        delete_error = await _call_handler(server.request_handlers, "delete_session", {"session_id": session_id})  # type: ignore[misc]
+
+        assert delete_error.root.isError is True
+        assert delete_attempts == 1
+        assert not path.exists()
+        tombstone_audit = sidecar.read_bytes()
+
+        # Recreate the deleted session with byte-identical durable state. The
+        # failed audit must not retain either its scope or its old CAS evidence.
+        path.write_bytes(original_bytes)
+        await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "source_out",
+                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            },
+        )
+        save_error = await _call_handler(server.request_handlers, "save_session", {"session_id": session_id})  # type: ignore[misc]
+
+        assert save_error.root.isError is True
+        assert path.read_bytes() == original_bytes
+        assert sidecar.read_bytes() == tombstone_audit
+
     def test_dispatch_constructs_explicit_trained_operator_policy(self, scratch_dir: Path) -> None:
         from elspeth.web.catalog.policy_view import PolicyCatalogView
         from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -380,17 +587,21 @@ class TestDispatchTool:
         assert "collision_policy" in result["error"]
 
     def test_new_session_returns_session_id(self, scratch_dir: Path) -> None:
+        session_manager, session_checkout_ref = _session_authority(scratch_dir)
         result = _dispatch_tool(
             "new_session",
             {},
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
         assert result["success"] is True
         assert "session_id" in result["data"]
 
     def test_save_and_load_round_trip(self, scratch_dir: Path) -> None:
+        session_manager, session_checkout_ref = _session_authority(scratch_dir)
         # Create a session first
         new_result = _dispatch_tool(
             "new_session",
@@ -398,6 +609,8 @@ class TestDispatchTool:
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
         session_id = new_result["data"]["session_id"]
 
@@ -424,6 +637,8 @@ class TestDispatchTool:
             modified_state,
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
         assert save_result["success"] is True
 
@@ -434,6 +649,8 @@ class TestDispatchTool:
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
         assert load_result["success"] is True
         assert load_result["state"]["sources"]["source"]["plugin"] == "csv"
@@ -441,6 +658,7 @@ class TestDispatchTool:
     def test_delete_missing_session_before_scratch_exists_returns_not_found(self, tmp_path: Path) -> None:
         scratch_dir = tmp_path / "scratch"
         session_id = "0" * 12
+        session_manager, session_checkout_ref = _session_authority(scratch_dir)
 
         result = _dispatch_tool(
             "delete_session",
@@ -448,6 +666,8 @@ class TestDispatchTool:
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
 
         assert result["success"] is False
@@ -455,11 +675,10 @@ class TestDispatchTool:
         assert result["state"] == _empty_state().to_dict()
 
     def test_generate_yaml_returns_string_for_valid_state(self, scratch_dir: Path) -> None:
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             _valid_state_with_no_edge_contracts(),
-            _mock_catalog(),
             scratch_dir,
         )
         assert result["success"] is True
@@ -515,7 +734,7 @@ class TestDispatchTool:
             version=1,
         )
 
-        result = _dispatch_tool("generate_yaml", {}, state, _mock_catalog(), scratch_dir)
+        result = _dispatch_session_once("generate_yaml", {}, state, scratch_dir)
 
         assert result["success"] is True
         assert yaml.safe_load(result["data"])["transforms"][0]["options"]["profile"] == "operator-owned-alias"
@@ -553,11 +772,10 @@ class TestDispatchTool:
             version=1,
         )
 
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             state,
-            _mock_catalog(),
             scratch_dir,
         )
 
@@ -591,11 +809,10 @@ class TestDispatchTool:
             version=1,
         )
 
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             state,
-            _mock_catalog(),
             scratch_dir,
         )
 
@@ -603,11 +820,10 @@ class TestDispatchTool:
         assert "collision_policy" in result["error"]
 
     def test_generate_yaml_rejects_invalid_contract_state(self, scratch_dir: Path) -> None:
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             _invalid_contract_state(),
-            _mock_catalog(),
             scratch_dir,
         )
 
@@ -627,11 +843,10 @@ class TestDispatchTool:
         ]
 
     def test_generate_yaml_allows_valid_state_with_no_edge_contracts(self, scratch_dir: Path) -> None:
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             _valid_state_with_no_edge_contracts(),
-            _mock_catalog(),
             scratch_dir,
         )
 
@@ -639,11 +854,10 @@ class TestDispatchTool:
         assert isinstance(result["data"], str)
 
     def test_generate_yaml_allows_connection_valid_state_without_ui_edges(self, scratch_dir: Path) -> None:
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             _connection_valid_field_mapper_state_without_edges(),
-            _mock_catalog(),
             scratch_dir,
         )
 

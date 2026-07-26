@@ -27,7 +27,14 @@ from mcp.types import CallToolResult, TextContent, Tool
 from pydantic import BaseModel
 
 from elspeth.composer_mcp.audit import JsonlEventRecorder
-from elspeth.composer_mcp.session import InvalidSessionIdError, SessionManager, SessionNotFoundError, _validate_session_id
+from elspeth.composer_mcp.session import (
+    InvalidSessionIdError,
+    SessionCheckout,
+    SessionCheckoutMismatchError,
+    SessionManager,
+    SessionNotFoundError,
+    _validate_session_id,
+)
 from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
@@ -337,6 +344,8 @@ def _dispatch_tool(
     scratch_dir: Path,
     baseline: CompositionState | None = None,
     runtime_preflight: RuntimePreflight | None = None,
+    session_manager: SessionManager | None = None,
+    session_checkout_ref: list[SessionCheckout | None] | None = None,
 ) -> dict[str, Any]:
     """Dispatch a tool call and return a result dict.
 
@@ -347,7 +356,9 @@ def _dispatch_tool(
     CompositionState), and may include ``data``.
     """
     if tool_name in _SESSION_TOOL_NAMES:
-        return _dispatch_session_tool(tool_name, arguments, state, scratch_dir)
+        if session_manager is None or session_checkout_ref is None:
+            raise RuntimeError("session dispatch requires server-owned persistence authority")
+        return _dispatch_session_tool(tool_name, arguments, state, session_manager, session_checkout_ref)
 
     if tool_name in _COMPOSER_TOOL_NAMES:
         control_error = _tool_file_sink_collision_control_error(tool_name, arguments, state)
@@ -480,11 +491,10 @@ def _dispatch_session_tool(
     tool_name: str,
     arguments: dict[str, Any],
     state: CompositionState,
-    scratch_dir: Path,
+    manager: SessionManager,
+    active_checkout_ref: list[SessionCheckout | None],
 ) -> dict[str, Any]:
     """Handle session management tools."""
-    manager = SessionManager(scratch_dir)
-
     if tool_name == "new_session":
         # Tier-3 MCP args. ``name`` is optional (required: []); its schema
         # documents the default "Untitled Pipeline", so absence is a declared
@@ -492,7 +502,12 @@ def _dispatch_session_tool(
         # the value must match the advertised string schema exactly.
         name = _new_session_name_argument(arguments)
         session_id, new_state = manager.new_session(name=name)
-        manager.save(session_id, new_state)
+        saved = manager.save_if_current(session_id, new_state, expected_token=None)
+        active_checkout_ref[0] = SessionCheckout(
+            session_id=session_id,
+            state=new_state,
+            token=saved.token,
+        )
         return {
             "success": True,
             "data": {"session_id": session_id, "name": name},
@@ -501,7 +516,22 @@ def _dispatch_session_tool(
 
     if tool_name == "save_session":
         session_id = _session_id_argument(arguments)
-        manager.save(session_id, state)
+        active_checkout = active_checkout_ref[0]
+        if active_checkout is None or active_checkout.session_id != session_id:
+            raise SessionCheckoutMismatchError(
+                requested_session_id=session_id,
+                active_session_id=active_checkout.session_id if active_checkout is not None else None,
+            )
+        saved = manager.save_if_current(
+            session_id,
+            state,
+            expected_token=active_checkout.token,
+        )
+        active_checkout_ref[0] = SessionCheckout(
+            session_id=session_id,
+            state=state,
+            token=saved.token,
+        )
         return {
             "success": True,
             "data": {"session_id": session_id},
@@ -511,17 +541,18 @@ def _dispatch_session_tool(
     if tool_name == "load_session":
         session_id = _session_id_argument(arguments)
         try:
-            loaded = manager.load(session_id)
+            checkout = manager.checkout(session_id)
         except SessionNotFoundError:
             return {
                 "success": False,
                 "error": f"Session not found: {session_id}",
                 "state": state.to_dict(),
             }
+        active_checkout_ref[0] = checkout
         return {
             "success": True,
             "data": {"session_id": session_id},
-            "state": loaded.to_dict(),
+            "state": checkout.state.to_dict(),
         }
 
     if tool_name == "list_sessions":
@@ -607,6 +638,7 @@ def create_server(
         Configured MCP Server ready for stdio transport.
     """
     server = Server("elspeth-composer")
+    session_manager = SessionManager(scratch_dir)
     coordinator = runtime_preflight_coordinator or RuntimePreflightCoordinator()
     session_id_ref: list[str | None] = [None]
     audit_recorder: ComposerToolRecorder = (
@@ -637,6 +669,8 @@ def create_server(
     state_ref: list[CompositionState] = [initial_state]
     # B5: Baseline for diff_pipeline — captured at session create/load.
     baseline_ref: list[CompositionState] = [initial_state]
+    # Exact durable evidence for the state snapshot from the active session.
+    session_checkout_ref: list[SessionCheckout | None] = [None]
 
     tool_defs = _build_tool_defs()
 
@@ -770,6 +804,8 @@ def create_server(
                     scratch_dir,
                     baseline=baseline_ref[0],
                     runtime_preflight=runtime_preflight_callback,
+                    session_manager=session_manager,
+                    session_checkout_ref=session_checkout_ref,
                 )
             except ToolArgumentError as exc:
                 return _argument_error_result(exc)
@@ -804,7 +840,9 @@ def create_server(
                     # so subsequent calls use the unsaved scope unless a
                     # new/load_session resolves a fresh id.
                     if name == "delete_session" and result_dict["success"]:
-                        clear_session_after_audit = True
+                        deleted_sid: str = result_dict["data"]["session_id"]
+                        active_checkout = session_checkout_ref[0]
+                        clear_session_after_audit = active_checkout is not None and active_checkout.session_id == deleted_sid
                     # B4: Redact storage paths from the response sent to the agent.
                     result_dict["state"] = redact_source_storage_path(result_dict["state"])
                 response_text = json.dumps(result_dict, indent=2)
@@ -876,9 +914,12 @@ def create_server(
                 latency_ms=latency_ms,
                 actor="composer-mcp:cli",
             )
-            audit_recorder.record(invocation)
-            if clear_session_after_audit:
-                session_id_ref[0] = None
+            try:
+                audit_recorder.record(invocation)
+            finally:
+                if clear_session_after_audit:
+                    session_id_ref[0] = None
+                    session_checkout_ref[0] = None
 
     return server
 

@@ -9,6 +9,7 @@ Layer: L3 (application). Imports from L3 (web.composer.state).
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -18,6 +19,7 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -70,11 +72,12 @@ class CorruptSessionFileError(ValueError):
 
 
 class StaleSessionVersionError(ValueError):
-    """Raised when a save would overwrite a newer on-disk session version."""
+    """Raised when a save is not based on the current durable session."""
 
     def __init__(self, session_id: str, *, incoming_version: int, on_disk_version: int) -> None:
         super().__init__(
-            f"Refusing stale save for {session_id}: incoming version {incoming_version} is older than on-disk version {on_disk_version}."
+            f"Refusing stale save for {session_id}: incoming version {incoming_version} "
+            f"does not match the current base at on-disk version {on_disk_version}."
         )
         self.session_id = session_id
         self.incoming_version = incoming_version
@@ -106,6 +109,45 @@ def _session_lock(session_id: str) -> threading.Lock:
         if session_id not in _SESSION_LOCKS:
             _SESSION_LOCKS[session_id] = threading.Lock()
         return _SESSION_LOCKS[session_id]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionToken:
+    """Opaque compare-and-swap evidence bound to one session's exact bytes."""
+
+    _session_id: str = field(repr=False)
+    _digest: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCheckout:
+    """A validated state snapshot paired with its immutable durable evidence."""
+
+    session_id: str
+    state: CompositionState
+    token: SessionToken
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSaveResult:
+    """Result of a successful create, idempotent save, or CAS replacement."""
+
+    path: Path
+    token: SessionToken
+
+
+class SessionCheckoutMismatchError(ValueError):
+    """Raised when a save targets a session other than the active checkout."""
+
+    def __init__(self, requested_session_id: str, active_session_id: str | None) -> None:
+        super().__init__(f"Session {requested_session_id} is not the active checkout")
+        self.requested_session_id = requested_session_id
+        self.active_session_id = active_session_id
+
+
+def _session_token(session_id: str, raw: bytes) -> SessionToken:
+    """Return opaque CAS evidence for exact durable bytes of one session."""
+    return SessionToken(session_id, hashlib.sha256(raw).hexdigest())
 
 
 class SessionNotFoundError(Exception):
@@ -140,32 +182,79 @@ class SessionManager:
         return session_id, state
 
     def save(self, session_id: str, state: CompositionState) -> Path:
-        """Persist session state to disk. Creates scratch dir if needed."""
-        self._dir.mkdir(parents=True, exist_ok=True)
+        """Create or idempotently re-save without overwrite authority.
+
+        Compatibility callers that need to update an existing session must
+        first call ``checkout()`` and supply its token to ``save_if_current``.
+        A tokenless divergent overwrite always fails closed.
+        """
+        return self.save_if_current(session_id, state, expected_token=None).path
+
+    def save_if_current(
+        self,
+        session_id: str,
+        state: CompositionState,
+        *,
+        expected_token: SessionToken | None,
+    ) -> SessionSaveResult:
+        """Persist state only when explicit checkout evidence is still current."""
         path = self._session_path(session_id)
+        self._dir.mkdir(parents=True, exist_ok=True)
         data = state.to_dict()
-        serialized = json.dumps(data, indent=2, sort_keys=True)
+        serialized = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
         with self._locked_session(session_id):
             if path.exists():
-                on_disk = self._read_session_state(path, session_id)
+                on_disk, raw = self._read_session_snapshot(path, session_id)
+                current_token = _session_token(session_id, raw)
+
+                # Idempotency is byte-exact: an already-durable request is a
+                # successful no-op even when checkout evidence is stale or
+                # absent. Return current evidence without replacing the file.
+                if raw == serialized:
+                    return SessionSaveResult(path=path, token=current_token)
+
+                if expected_token is None or expected_token._session_id != session_id or expected_token._digest != current_token._digest:
+                    raise StaleSessionVersionError(
+                        session_id,
+                        incoming_version=state.version,
+                        on_disk_version=on_disk.version,
+                    )
                 if state.version < on_disk.version:
                     raise StaleSessionVersionError(
                         session_id,
                         incoming_version=state.version,
                         on_disk_version=on_disk.version,
                     )
+            elif expected_token is not None:
+                # A manager that previously loaded/saved this session cannot
+                # silently resurrect it after another actor deleted the file.
+                raise StaleSessionVersionError(
+                    session_id,
+                    incoming_version=state.version,
+                    on_disk_version=0,
+                )
             self._atomic_write(path, serialized)
-        return path
+            return SessionSaveResult(path=path, token=_session_token(session_id, serialized))
 
-    def load(self, session_id: str) -> CompositionState:
-        """Load session state from disk."""
+    def checkout(self, session_id: str) -> SessionCheckout:
+        """Load validated state together with its exact durable CAS evidence."""
         path = self._session_path(session_id)
         if not path.exists():
             raise SessionNotFoundError(session_id)
         try:
-            return self._read_session_state(path, session_id)
+            with self._locked_session(session_id):
+                state, raw = self._read_session_snapshot(path, session_id)
+                return SessionCheckout(
+                    session_id=session_id,
+                    state=state,
+                    token=_session_token(session_id, raw),
+                )
         except FileNotFoundError as exc:
             raise SessionNotFoundError(session_id) from exc
+
+    def load(self, session_id: str) -> CompositionState:
+        """Load session state without retaining overwrite authority."""
+        return self.checkout(session_id).state
 
     def delete(self, session_id: str) -> None:
         """Delete a saved session while preserving its audit events sidecar.
@@ -242,34 +331,45 @@ class SessionManager:
 
     def _read_session_state(self, path: Path, session_id: str) -> CompositionState:
         """Parse one canonical session file into a validated state snapshot."""
+        state, _raw = self._read_session_snapshot(path, session_id)
+        return state
+
+    def _read_session_snapshot(self, path: Path, session_id: str) -> tuple[CompositionState, bytes]:
+        """Read validated state and the exact bytes used as its CAS identity."""
         try:
-            raw = path.read_text(encoding="utf-8")
+            raw = path.read_bytes()
         except FileNotFoundError:
             raise
         except OSError as exc:
             raise CorruptSessionFileError(session_id, f"could not read file: {exc}") from exc
         try:
-            data = json.loads(raw)
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CorruptSessionFileError(session_id, "invalid UTF-8") from exc
+        if decoded.startswith("\ufeff"):
+            raise CorruptSessionFileError(session_id, "UTF-8 BOM is not permitted")
+        try:
+            data = json.loads(decoded)
         except json.JSONDecodeError as exc:
             raise CorruptSessionFileError(session_id, f"invalid JSON: {exc.msg}") from exc
         if type(data) is not dict:
             raise CorruptSessionFileError(session_id, "top-level JSON value must be an object")
         try:
-            return CompositionState.from_dict(data)
+            state = CompositionState.from_dict(data)
         except (KeyError, TypeError, ValueError) as exc:
             raise CorruptSessionFileError(session_id, f"invalid session payload: {exc}") from exc
+        return state, raw
 
-    def _atomic_write(self, path: Path, serialized: str) -> None:
+    def _atomic_write(self, path: Path, serialized: bytes) -> None:
         """Write to a sibling tempfile and replace the canonical file atomically."""
         tmp_fd, tmp_name = tempfile.mkstemp(
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",
-            text=True,
         )
         tmp_path = Path(tmp_name)
         try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_file:
+            with os.fdopen(tmp_fd, "wb") as tmp_file:
                 tmp_file.write(serialized)
                 tmp_file.flush()
                 os.fsync(tmp_file.fileno())

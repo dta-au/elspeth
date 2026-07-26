@@ -3,17 +3,46 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from elspeth.composer_mcp.session import (
+    CorruptSessionFileError,
     InvalidSessionIdError,
     SessionManager,
     SessionNotFoundError,
+    SessionToken,
+    StaleSessionVersionError,
+    fcntl_module,
 )
 from elspeth.web.composer.state import NodeSpec, SourceSpec
+
+
+def _race_session_save(
+    scratch_dir: str,
+    session_id: str,
+    candidate_name: str,
+    ready: object,
+    results: object,
+) -> None:
+    """Load a base, rendezvous with the peer, then attempt one CAS save."""
+    try:
+        manager = SessionManager(Path(scratch_dir))
+        checkout = manager.checkout(session_id)
+        candidate = checkout.state.with_metadata({"name": candidate_name})
+        ready.wait(timeout=15)  # type: ignore[attr-defined]
+        manager.save_if_current(session_id, candidate, expected_token=checkout.token)
+    except StaleSessionVersionError:
+        results.put(("conflict", candidate_name))  # type: ignore[attr-defined]
+    except Exception as exc:
+        results.put(("error", f"{type(exc).__name__}: {exc}"))  # type: ignore[attr-defined]
+    else:
+        results.put(("saved", candidate_name))  # type: ignore[attr-defined]
 
 
 class TestSessionManager:
@@ -150,15 +179,284 @@ class TestSessionManager:
     def test_save_rejects_stale_version_and_preserves_newer_state(self, manager: SessionManager) -> None:
         sid, original = manager.new_session(name="original")
         manager.save(sid, original)
+        checkout = manager.checkout(sid)
         newer = original.with_metadata({"name": "newer"})
-        manager.save(sid, newer)
+        saved = manager.save_if_current(sid, newer, expected_token=checkout.token)
 
         with pytest.raises(ValueError, match="stale"):
-            manager.save(sid, original)
+            manager.save_if_current(sid, original, expected_token=saved.token)
 
         loaded = manager.load(sid)
         assert loaded.metadata.name == "newer"
         assert loaded.version == newer.version
+
+    def test_divergent_saves_from_same_base_allow_exactly_one_winner(
+        self,
+        scratch_dir: Path,
+    ) -> None:
+        creator = SessionManager(scratch_dir)
+        sid, original = creator.new_session(name="original")
+        creator.save(sid, original)
+
+        first_manager = SessionManager(scratch_dir)
+        second_manager = SessionManager(scratch_dir)
+        first_checkout = first_manager.checkout(sid)
+        second_checkout = second_manager.checkout(sid)
+        first_candidate = first_checkout.state.with_metadata({"name": "first"})
+        second_candidate = second_checkout.state.with_metadata({"name": "second"})
+        ready = threading.Barrier(2)
+
+        def save_candidate(manager: SessionManager, candidate_name: str, expected_token: SessionToken) -> tuple[str, str]:
+            candidate = first_candidate if candidate_name == "first" else second_candidate
+            ready.wait(timeout=15)
+            try:
+                manager.save_if_current(sid, candidate, expected_token=expected_token)
+            except StaleSessionVersionError:
+                return "conflict", candidate_name
+            return "saved", candidate_name
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = [
+                future.result(timeout=15)
+                for future in (
+                    executor.submit(save_candidate, first_manager, "first", first_checkout.token),
+                    executor.submit(save_candidate, second_manager, "second", second_checkout.token),
+                )
+            ]
+
+        assert sorted(status for status, _name in outcomes) == ["conflict", "saved"]
+        winner = next(name for status, name in outcomes if status == "saved")
+        reloaded = SessionManager(scratch_dir).load(sid)
+        assert reloaded.metadata.name == winner
+        assert reloaded.version == original.version + 1
+
+    def test_same_manager_divergent_branch_preserves_first_winner(
+        self,
+        scratch_dir: Path,
+    ) -> None:
+        manager = SessionManager(scratch_dir)
+        sid, original = manager.new_session(name="original")
+        manager.save(sid, original)
+        checkout = manager.checkout(sid)
+        winner = checkout.state.with_metadata({"name": "winner"})
+        stale_branch = checkout.state.with_metadata({"name": "stale-branch"})
+
+        manager.save_if_current(sid, winner, expected_token=checkout.token)
+        with pytest.raises(StaleSessionVersionError):
+            manager.save_if_current(sid, stale_branch, expected_token=checkout.token)
+
+        assert SessionManager(scratch_dir).load(sid) == winner
+
+    @pytest.mark.skipif(fcntl_module is None, reason="cross-process session CAS requires fcntl.flock")
+    def test_divergent_saves_from_same_base_allow_one_cross_process_winner(
+        self,
+        scratch_dir: Path,
+    ) -> None:
+        creator = SessionManager(scratch_dir)
+        sid, original = creator.new_session(name="original")
+        path = creator.save(sid, original)
+
+        context = multiprocessing.get_context("spawn")
+        ready = context.Barrier(3)
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_race_session_save,
+                args=(str(scratch_dir), sid, candidate_name, ready, results),
+            )
+            for candidate_name in ("first-process", "second-process")
+        ]
+
+        try:
+            for process in processes:
+                process.start()
+            ready.wait(timeout=15)
+            for process in processes:
+                process.join(timeout=15)
+
+            assert all(not process.is_alive() for process in processes)
+            assert [process.exitcode for process in processes] == [0, 0]
+            outcomes = [results.get(timeout=5) for _process in processes]
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=5)
+            results.close()
+            results.join_thread()
+
+        assert sorted(status for status, _name in outcomes) == ["conflict", "saved"]
+        winner = next(name for status, name in outcomes if status == "saved")
+        reloaded = SessionManager(scratch_dir).load(sid)
+        assert reloaded.metadata.name == winner
+        assert reloaded.version == original.version + 1
+        assert path.read_bytes() == json.dumps(reloaded.to_dict(), indent=2, sort_keys=True).encode("utf-8")
+
+    def test_identical_stale_resave_is_noop_and_refreshes_cas_token(
+        self,
+        scratch_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        creator = SessionManager(scratch_dir)
+        sid, original = creator.new_session(name="original")
+        creator.save(sid, original)
+
+        first_manager = SessionManager(scratch_dir)
+        second_manager = SessionManager(scratch_dir)
+        first_checkout = first_manager.checkout(sid)
+        second_checkout = second_manager.checkout(sid)
+        first_candidate = first_checkout.state.with_metadata({"name": "identical"})
+        second_candidate = second_checkout.state.with_metadata({"name": "identical"})
+        first_manager.save_if_current(sid, first_candidate, expected_token=first_checkout.token)
+
+        atomic_writes: list[bytes] = []
+        original_atomic_write = second_manager._atomic_write
+
+        def recording_atomic_write(path: Path, serialized: bytes) -> None:
+            atomic_writes.append(serialized)
+            original_atomic_write(path, serialized)
+
+        monkeypatch.setattr(second_manager, "_atomic_write", recording_atomic_write)
+
+        idempotent = second_manager.save_if_current(sid, second_candidate, expected_token=second_checkout.token)
+        assert atomic_writes == []
+
+        next_candidate = second_candidate.with_metadata({"name": "after-idempotent"})
+        second_manager.save_if_current(sid, next_candidate, expected_token=idempotent.token)
+        assert len(atomic_writes) == 1
+        assert SessionManager(scratch_dir).load(sid) == next_candidate
+
+    def test_missing_token_identical_resave_is_noop_and_refreshes_cas_token(
+        self,
+        scratch_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        creator = SessionManager(scratch_dir)
+        sid, original = creator.new_session(name="original")
+        creator.save(sid, original)
+
+        untracked_manager = SessionManager(scratch_dir)
+        atomic_writes: list[bytes] = []
+        original_atomic_write = untracked_manager._atomic_write
+
+        def recording_atomic_write(path: Path, serialized: bytes) -> None:
+            atomic_writes.append(serialized)
+            original_atomic_write(path, serialized)
+
+        monkeypatch.setattr(untracked_manager, "_atomic_write", recording_atomic_write)
+
+        idempotent = untracked_manager.save_if_current(sid, original, expected_token=None)
+        assert atomic_writes == []
+
+        candidate = original.with_metadata({"name": "after-idempotent"})
+        untracked_manager.save_if_current(sid, candidate, expected_token=idempotent.token)
+        assert len(atomic_writes) == 1
+        assert SessionManager(scratch_dir).load(sid) == candidate
+
+    def test_save_without_base_token_rejects_divergent_existing_session(
+        self,
+        scratch_dir: Path,
+    ) -> None:
+        creator = SessionManager(scratch_dir)
+        sid, original = creator.new_session(name="original")
+        creator.save(sid, original)
+
+        untracked_manager = SessionManager(scratch_dir)
+        divergent = original.with_metadata({"name": "untracked"})
+
+        with pytest.raises(StaleSessionVersionError):
+            untracked_manager.save(sid, divergent)
+
+        assert SessionManager(scratch_dir).load(sid) == original
+
+    def test_failed_replace_does_not_refresh_token_and_retry_can_succeed(
+        self,
+        scratch_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        creator = SessionManager(scratch_dir)
+        sid, original = creator.new_session(name="before")
+        creator.save(sid, original)
+
+        manager = SessionManager(scratch_dir)
+        checkout = manager.checkout(sid)
+        candidate = checkout.state.with_metadata({"name": "after"})
+
+        with monkeypatch.context() as replace_failure:
+
+            def fail_replace(_self: Path, _target: Path) -> None:
+                raise OSError("replace failed")
+
+            replace_failure.setattr(Path, "replace", fail_replace)
+            with pytest.raises(OSError, match="replace failed"):
+                manager.save_if_current(sid, candidate, expected_token=checkout.token)
+
+        manager.save_if_current(sid, candidate, expected_token=checkout.token)
+        assert SessionManager(scratch_dir).load(sid) == candidate
+
+    def test_corrupt_file_save_failure_preserves_bytes_and_previous_token(
+        self,
+        scratch_dir: Path,
+    ) -> None:
+        creator = SessionManager(scratch_dir)
+        sid, original = creator.new_session(name="before")
+        path = creator.save(sid, original)
+
+        manager = SessionManager(scratch_dir)
+        checkout = manager.checkout(sid)
+        candidate = checkout.state.with_metadata({"name": "after"})
+        original_bytes = path.read_bytes()
+        corrupt_bytes = b"{not valid JSON"
+        path.write_bytes(corrupt_bytes)
+
+        with pytest.raises(CorruptSessionFileError):
+            manager.save_if_current(sid, candidate, expected_token=checkout.token)
+        assert path.read_bytes() == corrupt_bytes
+
+        path.write_bytes(original_bytes)
+        manager.save_if_current(sid, candidate, expected_token=checkout.token)
+        assert SessionManager(scratch_dir).load(sid) == candidate
+
+    @pytest.mark.parametrize("encoding", ["utf-16", "utf-32", "utf-8-sig"])
+    def test_non_strict_utf8_session_is_corrupt_and_preserves_checkout(
+        self,
+        scratch_dir: Path,
+        encoding: str,
+    ) -> None:
+        creator = SessionManager(scratch_dir)
+        sid, original = creator.new_session(name="before")
+        path = creator.save(sid, original)
+
+        manager = SessionManager(scratch_dir)
+        checkout = manager.checkout(sid)
+        candidate = checkout.state.with_metadata({"name": "after"})
+        original_bytes = path.read_bytes()
+        non_utf8_bytes = json.dumps(original.to_dict(), sort_keys=True).encode(encoding)
+        path.write_bytes(non_utf8_bytes)
+
+        with pytest.raises(CorruptSessionFileError):
+            manager.save_if_current(sid, candidate, expected_token=checkout.token)
+        assert path.read_bytes() == non_utf8_bytes
+
+        path.write_bytes(original_bytes)
+        manager.save_if_current(sid, candidate, expected_token=checkout.token)
+        assert SessionManager(scratch_dir).load(sid) == candidate
+
+    def test_delete_invalidates_checkout_but_tokenless_create_can_recreate(
+        self,
+        scratch_dir: Path,
+    ) -> None:
+        manager = SessionManager(scratch_dir)
+        sid, state = manager.new_session(name="recreated")
+        manager.save(sid, state)
+        checkout = manager.checkout(sid)
+
+        manager.delete(sid)
+        with pytest.raises(StaleSessionVersionError):
+            manager.save_if_current(sid, state, expected_token=checkout.token)
+        manager.save(sid, state)
+
+        assert SessionManager(scratch_dir).load(sid) == state
 
     def test_save_pre_replace_failure_preserves_prior_file(
         self,
@@ -167,6 +465,7 @@ class TestSessionManager:
     ) -> None:
         sid, original = manager.new_session(name="before")
         manager.save(sid, original)
+        checkout = manager.checkout(sid)
         updated = original.with_metadata({"name": "after"})
 
         def fail_replace(_self: Path, _target: Path) -> None:
@@ -175,7 +474,7 @@ class TestSessionManager:
         monkeypatch.setattr(Path, "replace", fail_replace)
 
         with pytest.raises(OSError, match="replace failed"):
-            manager.save(sid, updated)
+            manager.save_if_current(sid, updated, expected_token=checkout.token)
 
         loaded = manager.load(sid)
         assert loaded.metadata.name == "before"
