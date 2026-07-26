@@ -119,13 +119,13 @@ _MATRIX_CASES_BY_NAME = {raw["name"]: raw for raw in _MATRIX_CONTRACT["cases"]}
 
 _CONTROL_OPTIONS: dict[str, dict[str, object]] = {
     "azure_prompt_shield": {
-        "endpoint": "https://example.com",
+        "endpoint": "https://matrix.cognitiveservices.azure.com",
         "api_key": {"secret_ref": "AZURE_CONTENT_SAFETY_KEY"},
         "fields": ["text"],
         "schema": {"mode": "observed", "fields": None},
     },
     "azure_content_safety": {
-        "endpoint": "https://example.com",
+        "endpoint": "https://matrix.cognitiveservices.azure.com",
         "api_key": {"secret_ref": "AZURE_CONTENT_SAFETY_KEY"},
         "fields": ["text"],
         "thresholds": {"hate": 2, "violence": 2, "sexual": 2, "self_harm": 2},

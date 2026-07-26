@@ -200,9 +200,9 @@ class TestChromaSearchProvider:
             scheme="http",
             bare_hostname="localhost",
         )
-        fake_collection = MagicMock()
+        fake_collection = MagicMock(spec_set=["metadata"])
         fake_collection.metadata = {"hnsw:space": "cosine"}
-        fake_client = MagicMock()
+        fake_client = MagicMock(spec_set=["get_collection"])
         fake_client.get_collection.return_value = fake_collection
 
         with (
