@@ -19,6 +19,58 @@ _TOP_LEVEL_BLOB_TOOLS = frozenset(
     }
 )
 _BLOB_REFERENCE_TOOLS = _TOP_LEVEL_BLOB_TOOLS | {"set_pipeline"}
+_PIPELINE_BLOB_PATH_KEYS = ("path", "file")
+
+
+def _pipeline_blob_reference_ids(arguments: Mapping[str, Any]) -> tuple[str, ...]:
+    """Extract blob custody from legacy and guided pipeline source shapes."""
+    references: list[str] = []
+    source = arguments["source"] if "source" in arguments else None
+    if source is not None:
+        if type(source) is not dict:
+            raise ValueError("set_pipeline source must be a mapping when present")
+        value = source["blob_id"] if "blob_id" in source else None
+        if value is not None:
+            if type(value) is not str or not value:
+                raise ValueError("set_pipeline source.blob_id must be a non-empty string when present")
+            references.append(value)
+
+    sources = arguments["sources"] if "sources" in arguments else None
+    if sources is None:
+        return tuple(references)
+    if type(sources) is not dict:
+        raise ValueError("set_pipeline sources must be a mapping when present")
+    for source_name, guided_source in sources.items():
+        if type(source_name) is not str or not source_name or type(guided_source) is not dict:
+            raise ValueError("set_pipeline sources must contain non-empty string names and source mappings")
+        options = guided_source["options"] if "options" in guided_source else None
+        if options is None:
+            continue
+        if type(options) is not dict:
+            raise ValueError(f"set_pipeline sources[{source_name!r}].options must be a mapping when present")
+        source_references: set[str] = set()
+        if "blob_ref" in options:
+            blob_ref = options["blob_ref"]
+            if type(blob_ref) is not str or not blob_ref:
+                raise ValueError(
+                    f"set_pipeline sources[{source_name!r}].options.blob_ref must be a non-empty string when present"
+                )
+            source_references.add(blob_ref)
+        for key in _PIPELINE_BLOB_PATH_KEYS:
+            value = options[key] if key in options else None
+            if type(value) is str and value.startswith("blob:"):
+                blob_id = value.removeprefix("blob:")
+                if not blob_id:
+                    raise ValueError(
+                        f"set_pipeline sources[{source_name!r}].options.{key} blob sentinel must contain a blob id"
+                    )
+                source_references.add(blob_id)
+        if len(source_references) > 1:
+            raise ValueError(f"set_pipeline sources[{source_name!r}] blob custody fields disagree")
+        for blob_id in source_references:
+            if blob_id not in references:
+                references.append(blob_id)
+    return tuple(references)
 
 
 def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) -> tuple[str, ...]:
@@ -31,13 +83,7 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
         return ()
 
     if tool_name == "set_pipeline":
-        source = arguments["source"] if "source" in arguments else None
-        if source is None:
-            return ()
-        if type(source) is not dict:
-            raise ValueError("set_pipeline source must be a mapping when present")
-        value = source["blob_id"] if "blob_id" in source else None
-        field_name = "source.blob_id"
+        return _pipeline_blob_reference_ids(arguments)
     else:
         value = arguments["blob_id"] if "blob_id" in arguments else None
         field_name = "blob_id"
