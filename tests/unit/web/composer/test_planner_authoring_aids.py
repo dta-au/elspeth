@@ -13,8 +13,11 @@ planners an invalid shape.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -53,7 +56,7 @@ def _trained_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
 
 
 def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every cache operation is serialized across planner worker threads."""
+    """Lookup, eviction, and insertion are locked while cold builds remain off-lock."""
 
     class LockCheckedMemo(dict[str, dict[str, Any]]):
         def _assert_locked(self) -> None:
@@ -71,9 +74,23 @@ def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -
             self._assert_locked()
             super().__setitem__(key, value)
 
-    memo = LockCheckedMemo()
+        def __iter__(self) -> Iterator[str]:
+            self._assert_locked()
+            return super().__iter__()
+
+        def pop(self, key: str, default: Any = None) -> Any:
+            self._assert_locked()
+            return super().pop(key, default)
+
+    memo = LockCheckedMemo({"old-snapshot": {"key": "old-value"}})
     monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO", memo)
-    monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", lambda catalog: {"key": "value"})
+    monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO_MAX", 1)
+
+    def build(_catalog: object) -> dict[str, str]:
+        assert not planner_authoring_aids._AIDS_MEMO_LOCK.locked()
+        return {"key": "value"}
+
+    monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
     catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="snapshot"))
 
     first = planner_authoring_aids.build_planner_authoring_aids(catalog)
@@ -81,6 +98,33 @@ def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -
 
     assert first == second == {"key": "value"}
     assert first is not second
+    assert dict(memo) == {"snapshot": {"key": "value"}}
+
+
+@pytest.mark.parametrize("snapshot_hashes", [["same"] * 4, ["one", "two", "three", "four"]])
+def test_authoring_aids_concurrent_cold_builds_are_bounded_and_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_hashes: list[str],
+) -> None:
+    """Concurrent misses cannot corrupt eviction or share mutable return values."""
+    barrier = Barrier(len(snapshot_hashes))
+    monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO", {})
+    monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO_MAX", 2)
+
+    def build(catalog: Any) -> dict[str, str]:
+        assert not planner_authoring_aids._AIDS_MEMO_LOCK.locked()
+        barrier.wait(timeout=5)
+        return {"purpose": catalog.snapshot.snapshot_hash}
+
+    monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
+    catalogs = [SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash=value)) for value in snapshot_hashes]
+
+    with ThreadPoolExecutor(max_workers=len(catalogs)) as executor:
+        results = list(executor.map(planner_authoring_aids.build_planner_authoring_aids, catalogs))
+
+    assert [result["purpose"] for result in results] == snapshot_hashes
+    assert len(planner_authoring_aids._AIDS_MEMO) <= 2
+    assert len({id(result) for result in results}) == len(results)
 
 
 def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
