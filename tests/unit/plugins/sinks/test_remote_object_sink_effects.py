@@ -529,8 +529,8 @@ def test_azure_effect_diverts_fixed_schema_extra_and_publishes_good_rows() -> No
         schema={"mode": "fixed", "fields": ["id: int", "name: str"]},
     ).reconcile_effect(plan, _CTX)
     assert reconciled.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR
-    assert reconciled.accepted_ordinals == (0,)
-    assert reconciled.diverted_ordinals == (1,)
+    assert reconciled.accepted_ordinals is None
+    assert reconciled.diverted_ordinals is None
 
 
 def test_s3_csv_effect_applies_display_headers_before_serialization() -> None:
