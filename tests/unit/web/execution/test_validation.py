@@ -2680,7 +2680,7 @@ class TestValidatePipelineSuccess:
         result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
         assert result.is_valid is True
-        assert len(result.checks) == 22
+        assert len(result.checks) == 24
         assert all(c.passed for c in result.checks)
         # B11 fix: path_allowlist check is always recorded
         assert _check(result, "path_allowlist").passed is True
@@ -2689,6 +2689,8 @@ class TestValidatePipelineSuccess:
         assert _check(result, "llm_base_url_policy").passed is True
         assert _check(result, "llm_tracing_policy").passed is True
         assert _check(result, "aws_s3_endpoint_url_policy").passed is True
+        assert _check(result, "aws_s3_source_policy").passed is True
+        assert _check(result, "web_fetch_resource_policy").passed is True
         assert _check(result, "secret_refs").passed is True
         assert _check(result, "blob_inline_refs").passed is True
         assert _check(result, "semantic_contracts").passed is True
