@@ -18,6 +18,7 @@ from elspeth.web.coordination.contracts import (
     SessionOperationKind,
     StartPermitState,
 )
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 
 __all__ = [
     "PROTOCOL_BUMP_NOT_REQUIRED_CHANGES",
@@ -35,5 +36,6 @@ __all__ = [
     "SessionOperationFence",
     "SessionOperationFenceLost",
     "SessionOperationKind",
+    "SessionOperationLease",
     "StartPermitState",
 ]
