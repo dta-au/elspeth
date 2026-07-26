@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from threading import Event
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Engine, MetaData, Table, column, delete, insert, literal, select, table, update
+from sqlalchemy import Connection, Engine, MetaData, Table, column, delete, insert, literal, select, table, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
 from elspeth.web.coordination.contracts import (
@@ -657,3 +658,106 @@ def test_postgres_fenced_update_rejects_every_ownership_assignment(
         == before
     )
     assert refused is True
+
+
+class _ObservedDatabaseClockRepository(PostgresSessionOperationRepository):
+    """Expose when a deciding operation samples PostgreSQL time."""
+
+    def __init__(self, engine: Engine, *, clock_sampled: Event) -> None:
+        super().__init__(engine)
+        self._clock_sampled = clock_sampled
+
+    def _database_now(self, conn: Connection) -> datetime:
+        value = super()._database_now(conn)
+        self._clock_sampled.set()
+        return value
+
+
+@pytest.mark.parametrize("operation", ("mutate", "renew", "release", "archive_delete"))
+def test_postgres_waiter_cannot_act_after_expiry(
+    postgres_engine: Engine,
+    operation: str,
+) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    kind = SessionOperationKind.ARCHIVE if operation == "archive_delete" else SessionOperationKind.COMPOSE
+    fence = repository.acquire(
+        session_id=created.id,
+        operation_kind=kind,
+        owner_instance_id=f"waiter-{uuid4()}",
+        lease_seconds=2,
+    )
+    with postgres_engine.connect() as conn:
+        before_fence = dict(
+            conn.execute(select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(created.id)))
+            .one()
+            ._mapping
+        )
+        before_title = conn.execute(select(sessions_table.c.title).where(sessions_table.c.id == str(created.id))).scalar_one()
+
+    clock_sampled = Event()
+    callback_called = Event()
+    contender = _ObservedDatabaseClockRepository(postgres_engine, clock_sampled=clock_sampled)
+
+    def act() -> None:
+        if operation == "mutate":
+
+            def mutation(transaction) -> None:
+                callback_called.set()
+                transaction.execute(update(sessions_table).values(title="written-after-expiry"))
+
+            contender.mutate(fence, mutation)
+        elif operation == "renew":
+            contender.renew(fence, lease_seconds=30)
+        elif operation == "release":
+            contender.release(fence)
+        else:
+            contender.archive_delete(fence)
+
+    blocker = postgres_engine.connect()
+    blocker_transaction = blocker.begin()
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        blocker.execute(
+            select(session_operation_fences_table.c.session_id)
+            .where(session_operation_fences_table.c.session_id == str(created.id))
+            .with_for_update()
+        ).one()
+        outcome = pool.submit(act)
+        # On the broken ordering the time read happens before the waiter
+        # blocks on its UPDATE.  On the fixed ordering it remains behind
+        # this row lock and samples time only after the lock is released.
+        clock_sampled.wait(timeout=0.5)
+        blocker.exec_driver_sql(
+            "SELECT pg_sleep(GREATEST(EXTRACT(EPOCH FROM "
+            "(SELECT lease_expires_at FROM session_operation_fences WHERE session_id = %s) "
+            "- clock_timestamp()), 0) + 0.1)",
+            (str(created.id),),
+        )
+        expired_before_unblock = blocker.exec_driver_sql(
+            "SELECT clock_timestamp() >= lease_expires_at FROM session_operation_fences WHERE session_id = %s",
+            (str(created.id),),
+        ).scalar_one()
+        blocker_transaction.commit()
+
+        assert expired_before_unblock
+        with pytest.raises(SessionOperationFenceLost) as exc_info:
+            outcome.result(timeout=5)
+        assert exc_info.value.reason is FenceLossReason.LEASE_EXPIRED
+    finally:
+        if blocker_transaction.is_active:
+            blocker_transaction.rollback()
+        blocker.close()
+        pool.shutdown(wait=True)
+
+    assert callback_called.is_set() is False
+    with postgres_engine.connect() as conn:
+        assert conn.execute(select(sessions_table.c.title).where(sessions_table.c.id == str(created.id))).scalar_one() == before_title
+        assert (
+            dict(
+                conn.execute(select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(created.id)))
+                .one()
+                ._mapping
+            )
+            == before_fence
+        )

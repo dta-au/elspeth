@@ -473,6 +473,16 @@ class _SessionOperationAuthorityRepository:
         if result.rowcount != 1:
             self._raise_fence_lost(conn, fence, database_now=database_now)
 
+    def _lock_fence_and_read_database_time(
+        self,
+        conn: Connection,
+        fence: SessionOperationFence,
+    ) -> datetime:
+        """Serialize on the fence row before binding its lease decision time."""
+        if self._select_fence(conn, session_id=fence.session_id) is None:
+            raise SessionOperationFenceLost(FenceLossReason.MISSING)
+        return self._database_now(conn)
+
     def renew(
         self,
         fence: SessionOperationFence,
@@ -481,7 +491,7 @@ class _SessionOperationAuthorityRepository:
     ) -> SessionOperationFence:
         _validate_lease_seconds(lease_seconds)
         with self._locked_transaction(fence.session_id) as conn:
-            database_now = self._database_now(conn)
+            database_now = self._lock_fence_and_read_database_time(conn, fence)
             result = conn.execute(
                 update(session_operation_fences_table)
                 .where(and_(*self._exact_active_predicates(fence, database_now)))
@@ -508,7 +518,7 @@ class _SessionOperationAuthorityRepository:
         if not callable(mutation):
             raise TypeError("mutation must be callable")
         with self._locked_transaction(fence.session_id) as conn:
-            database_now = self._database_now(conn)
+            database_now = self._lock_fence_and_read_database_time(conn, fence)
             self._compare_and_swap_on_connection(conn, fence, database_now=database_now)
             transaction = _RepositoryMutationTransaction(conn, session_id=fence.session_id)
             try:
@@ -518,7 +528,7 @@ class _SessionOperationAuthorityRepository:
 
     def release(self, fence: SessionOperationFence) -> None:
         with self._locked_transaction(fence.session_id) as conn:
-            database_now = self._database_now(conn)
+            database_now = self._lock_fence_and_read_database_time(conn, fence)
             result = conn.execute(
                 update(session_operation_fences_table)
                 .where(and_(*self._exact_active_predicates(fence, database_now)))
@@ -530,7 +540,7 @@ class _SessionOperationAuthorityRepository:
     def archive_delete(self, fence: SessionOperationFence) -> None:
         """Delete a parent only while its exact current archive fence is live."""
         with self._locked_transaction(fence.session_id) as conn:
-            database_now = self._database_now(conn)
+            database_now = self._lock_fence_and_read_database_time(conn, fence)
             self._compare_and_swap_on_connection(
                 conn,
                 fence,
