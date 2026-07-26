@@ -54,6 +54,24 @@ scratch/
 # so junk under the corpus stays ignored.
 !/evals/composer-parity/
 !/evals/composer-parity/**
+# Preserve the repository-wide credential safeguards after the broad corpus
+# exception above (the last matching gitignore rule wins).
+/evals/composer-parity/**/jwt.txt
+/evals/composer-parity/**/jwt-*.txt
+/evals/composer-parity/**/jwt_*.txt
+/evals/composer-parity/**/*.api_key
+/evals/composer-parity/**/*.access_token
+/evals/composer-parity/**/*.bearer_token
+/evals/composer-parity/**/login.json
+/evals/composer-parity/**/login_*.json
+/evals/composer-parity/**/*.pem
+/evals/composer-parity/**/*.p12
+/evals/composer-parity/**/*.pfx
+/evals/composer-parity/**/.env
+/evals/composer-parity/**/.env.*
+!/evals/composer-parity/**/.env.example
+!/evals/composer-parity/**/.env.template
+!/evals/composer-parity/**/.env.sample
 
 # Generated bug analysis docs (can be regenerated)
 docs/bugs/generated/
