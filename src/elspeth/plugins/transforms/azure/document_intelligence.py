@@ -84,6 +84,24 @@ _KNOWN_FEATURES: frozenset[str] = frozenset(
 
 _MODEL_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._~-]{1,63}$")
 _PAGES_PATTERN = re.compile(r"^(\d+(-\d+)?)(,\s*(\d+(-\d+)?))*$")
+_AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES: tuple[str, ...] = (
+    ".cognitiveservices.azure.com",
+    ".cognitiveservices.azure.us",
+    ".cognitiveservices.azure.cn",
+)
+
+
+def _validate_azure_document_intelligence_endpoint(value: str) -> str:
+    """Validate that a credential-bearing endpoint targets Azure Document Intelligence."""
+    from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+
+    endpoint = validate_credential_safe_https_url(value, field_name="endpoint")
+    parsed = urlparse(endpoint)
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    if not any(hostname.endswith(suffix) and hostname.removesuffix(suffix) for suffix in _AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES):
+        allowed = ", ".join(f"*{suffix}" for suffix in _AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES)
+        raise ValueError(f"endpoint must be an Azure Document Intelligence resource endpoint ({allowed})")
+    return endpoint
 
 
 class ExtractFields(BaseModel):
@@ -109,7 +127,7 @@ class ExtractFields(BaseModel):
 class AzureDocumentIntelligenceConfig(TransformDataConfig):
     """Configuration for the azure_document_intelligence transform."""
 
-    endpoint: str = Field(..., description="Azure Document Intelligence endpoint URL (HTTPS).")
+    endpoint: str = Field(..., description="Azure Document Intelligence resource endpoint URL (HTTPS, Azure host only).")
     api_key: str = Field(..., repr=False, description="Document Intelligence API key (Ocp-Apim-Subscription-Key).")
     api_version: str = Field("2024-11-30", description="REST api-version (GA 2024-11-30 only in v1).")
     model_id: str = Field(..., description="Prebuilt or custom model id, e.g. prebuilt-layout, prebuilt-invoice.")
@@ -155,9 +173,7 @@ class AzureDocumentIntelligenceConfig(TransformDataConfig):
     @field_validator("endpoint")
     @classmethod
     def _validate_endpoint(cls, v: str) -> str:
-        from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
-
-        return validate_credential_safe_https_url(v, field_name="endpoint")
+        return _validate_azure_document_intelligence_endpoint(v)
 
     @field_validator("api_key")
     @classmethod

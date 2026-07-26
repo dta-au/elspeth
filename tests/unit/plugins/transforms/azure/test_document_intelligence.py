@@ -58,6 +58,15 @@ def test_rejects_http_endpoint() -> None:
         _cfg(endpoint="http://di.cognitiveservices.azure.com")
 
 
+def test_rejects_non_azure_document_intelligence_endpoint() -> None:
+    with pytest.raises(PluginConfigError):
+        _cfg(endpoint="https://attacker.example")
+
+
+def test_accepts_sovereign_azure_document_intelligence_endpoint() -> None:
+    assert _cfg(endpoint="https://di.cognitiveservices.azure.us").endpoint == "https://di.cognitiveservices.azure.us"
+
+
 def test_rejects_empty_api_key() -> None:
     with pytest.raises(PluginConfigError):
         _cfg(api_key="   ")
