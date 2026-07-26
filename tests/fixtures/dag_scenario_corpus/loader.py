@@ -22,6 +22,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     ScenarioManifest,
     ScenarioSpec,
     Stage,
+    Workflow,
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -37,6 +38,11 @@ _LIFECYCLE_STAGE_BY_DIMENSION: dict[Dimension, Stage] = {
     "runtime": "runtime",
     "audit": "audit",
     "recovery": "recovery",
+}
+_EXACT_HARNESS_STAGES_BY_WORKFLOW: dict[Workflow, tuple[Stage, ...]] = {
+    "build": ("config", "build"),
+    "run": ("config", "build", "runtime", "audit"),
+    "recovery": ("config", "build", "runtime", "audit", "recovery"),
 }
 
 
@@ -161,16 +167,16 @@ def _validate_evidence_references(manifest: ScenarioManifest) -> None:
     for reference in manifest.evidence:
         _validate_evidence_locator(reference)
 
-    registered_case_locators: list[str] = []
+    registered_cases_by_locator: dict[str, HarnessCaseSpec] = {}
     for scenario in manifest.scenarios:
         case_ids = tuple(case.id for case in scenario.cases)
         duplicate_case_ids = tuple(identifier for identifier, count in Counter(case_ids).items() if count > 1)
         if duplicate_case_ids:
             duplicate_locators = ", ".join(f"{scenario.id}:{identifier}" for identifier in duplicate_case_ids)
             raise ValueError(f"DAG scenario manifest contains duplicate case id(s): {duplicate_locators}")
-        registered_case_locators.extend(f"{scenario.id}:{case.id}" for case in scenario.cases)
+        registered_cases_by_locator.update((f"{scenario.id}:{case.id}", case) for case in scenario.cases)
 
-    registered_cases = set(registered_case_locators)
+    registered_cases = set(registered_cases_by_locator)
     harness_locators = {reference.locator for reference in manifest.evidence if reference.kind == "harness"}
     unknown_harness_locators = sorted(harness_locators - registered_cases)
     if unknown_harness_locators:
@@ -178,6 +184,16 @@ def _validate_evidence_references(manifest: ScenarioManifest) -> None:
     missing_harness_locators = sorted(registered_cases - harness_locators)
     if missing_harness_locators:
         raise ValueError("DAG scenario harness case(s) " + ", ".join(missing_harness_locators) + " lack a matching evidence locator")
+    for reference in manifest.evidence:
+        if reference.kind != "harness":
+            continue
+        case = registered_cases_by_locator[reference.locator]
+        exact_stages = _EXACT_HARNESS_STAGES_BY_WORKFLOW[case.workflow]
+        if reference.stages != exact_stages:
+            raise ValueError(
+                f"DAG scenario harness evidence {reference.id!r} at {reference.locator!r} for {case.workflow} workflow "
+                f"must declare exact stages {exact_stages!r}; got {reference.stages!r}"
+            )
 
     referenced_evidence_ids: set[str] = set()
     for scenario in manifest.scenarios:
@@ -186,13 +202,22 @@ def _validate_evidence_references(manifest: ScenarioManifest) -> None:
             unknown_ids = tuple(evidence_id for evidence_id in cell.evidence if evidence_id not in evidence_by_id)
             if unknown_ids:
                 raise ValueError(f"DAG scenario {scenario.id}.{dimension} references unknown evidence id(s): {', '.join(unknown_ids)}")
+            required_stage = _LIFECYCLE_STAGE_BY_DIMENSION.get(dimension)
+            if required_stage is not None:
+                for evidence_id in cell.evidence:
+                    reference = evidence_by_id[evidence_id]
+                    if reference.kind == "harness" and required_stage not in reference.stages:
+                        raise ValueError(
+                            f"DAG scenario harness evidence {reference.id!r} at {reference.locator!r} is attached to "
+                            f"{scenario.id}.{dimension}, but its validated stages {reference.stages!r} omit required "
+                            f"stage {required_stage!r}"
+                        )
             if cell.status == "pass":
                 executable_evidence = tuple(
                     evidence_by_id[evidence_id] for evidence_id in cell.evidence if evidence_by_id[evidence_id].executable
                 )
                 if not executable_evidence:
                     raise ValueError(f"DAG scenario pass cell {scenario.id}.{dimension} references only document/decision evidence")
-                required_stage = _LIFECYCLE_STAGE_BY_DIMENSION.get(dimension)
                 if required_stage is not None and not any(required_stage in evidence.stages for evidence in executable_evidence):
                     raise ValueError(
                         f"DAG scenario pass lifecycle cell {scenario.id}.{dimension} lacks executable evidence declaring stage {required_stage!r}"

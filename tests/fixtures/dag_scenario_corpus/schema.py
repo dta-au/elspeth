@@ -129,11 +129,15 @@ def _validate_exact_graph_shape(
     node_type_counts: tuple[GraphNodeTypeCount, ...],
     edge_labels: tuple[str, ...],
 ) -> None:
+    if node_count <= 0 or edge_count <= 0:
+        raise ValueError("accepted graph shape requires positive node_count and edge_count")
     node_types = tuple(item.node_type for item in node_type_counts)
     if node_types != tuple(sorted(node_types)) or len(set(node_types)) != len(node_types):
         raise ValueError("node_type_counts must contain unique node types in sorted order")
     if sum(item.count for item in node_type_counts) != node_count:
         raise ValueError("node_type_counts must sum exactly to node_count")
+    if not {"source", "sink"}.issubset(node_types):
+        raise ValueError("accepted graph shape requires at least one source and one sink")
     if edge_labels != tuple(sorted(edge_labels)):
         raise ValueError("edge_labels must be sorted")
     if len(edge_labels) != edge_count:

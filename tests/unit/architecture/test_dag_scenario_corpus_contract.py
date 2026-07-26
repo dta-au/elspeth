@@ -853,6 +853,49 @@ def test_build_expectation_rejects_inexact_graph_shape(field: str, value: object
         BuildExpectation.model_validate(values)
 
 
+@pytest.mark.parametrize("model", ["build-expectation", "accepted-evidence"])
+def test_accepted_graph_contracts_reject_zero_shape(model: str) -> None:
+    values: dict[str, object] = {
+        "node_count": 0,
+        "edge_count": 0,
+        "node_type_counts": (),
+        "edge_labels": (),
+    }
+    if model == "accepted-evidence":
+        values.update(accepted=True, topology_hash="topology-sha")
+
+    contract = GraphEvidence if model == "accepted-evidence" else BuildExpectation
+    with pytest.raises(ValidationError, match="positive node_count and edge_count"):
+        contract.model_validate(values)
+
+
+@pytest.mark.parametrize("model", ["build-expectation", "accepted-evidence"])
+@pytest.mark.parametrize(
+    "node_type_counts",
+    [
+        ({"node_type": "sink", "count": 1},),
+        ({"node_type": "source", "count": 1},),
+    ],
+    ids=("missing-source", "missing-sink"),
+)
+def test_accepted_graph_contracts_require_source_and_sink(
+    model: str,
+    node_type_counts: tuple[dict[str, object], ...],
+) -> None:
+    values: dict[str, object] = {
+        "node_count": 1,
+        "edge_count": 1,
+        "node_type_counts": node_type_counts,
+        "edge_labels": ("on_success",),
+    }
+    if model == "accepted-evidence":
+        values.update(accepted=True, topology_hash="topology-sha")
+
+    contract = GraphEvidence if model == "accepted-evidence" else BuildExpectation
+    with pytest.raises(ValidationError, match="at least one source and one sink"):
+        contract.model_validate(values)
+
+
 @pytest.mark.parametrize(
     ("workflow", "expected", "expected_kind"),
     [
@@ -2087,6 +2130,35 @@ def test_manifest_rejects_pass_lifecycle_cell_without_matching_executable_stage(
             evidence["stages"] = ["runtime"]
 
     with pytest.raises(ValueError, match=r"pass lifecycle cell linear\.config.*executable evidence declaring stage 'config'"):
+        load_manifest(write_manifest(tmp_path, raw))
+
+
+def test_manifest_rejects_harness_stages_beyond_registered_build_workflow(tmp_path: Path) -> None:
+    raw = valid_manifest_dict()
+    build_evidence = next(
+        evidence for evidence in _raw_evidence(raw) if evidence["id"] == "harness-multiple-independent-sources-independent-roots"
+    )
+    build_evidence["stages"] = ["config", "build", "runtime"]
+
+    with pytest.raises(
+        ValueError,
+        match=r"harness evidence.*independent-roots.*build workflow.*exact stages.*config.*build",
+    ):
+        load_manifest(write_manifest(tmp_path, raw))
+
+
+def test_manifest_rejects_harness_attached_beyond_its_workflow_even_with_other_executable_evidence(tmp_path: Path) -> None:
+    raw = valid_manifest_dict()
+    independent_sources = next(scenario for scenario in _raw_scenarios(raw) if scenario["id"] == "multiple-independent-sources")
+    _raw_dimensions(independent_sources)["runtime"]["evidence"] = [
+        "harness-multiple-independent-sources-independent-roots",
+        "runtime-disposition-drains",
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=r"harness evidence.*independent-roots.*multiple-independent-sources\.runtime.*stage 'runtime'",
+    ):
         load_manifest(write_manifest(tmp_path, raw))
 
 
