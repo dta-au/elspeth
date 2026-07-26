@@ -254,41 +254,72 @@ pre-freeze sequence unless live state proves Task 21 or later has begun.
    combined source, capture the live platform tip. Require the recorded replay
    base to remain its ancestor, review any commits after the recorded
    `132bd53232ea6b3885250675c361d3c057b19ac5` snapshot, and replay through the
-   captured tip onto `COMBINED_SHA`:
+   captured tip onto the reviewed `COMBINED_SHA`. Replay the captured commit,
+   not a moving branch ref, then update the platform branch with a compare-and-
+   swap so a concurrent branch move fails closed:
 
    ```bash
+   (
+   set -euo pipefail
+
    platform_worktree=/home/john/elspeth/.worktrees/deferred-platform-completion
+   platform_branch=codex/deferred-platform-completion
    platform_replay_base=696b3d1414ed7a6789c8f25bf5cbdc5450385bdd
-   platform_integration_tip=$(git -C "$platform_worktree" \
-     rev-parse codex/deferred-platform-completion^{commit})
-   combined_sha=<full-reviewed-release-plus-wave-b-sha>
+   combined_sha=2b47c25428ed0e978443df953e0fd587860aeed8
    test -z "$(git -C "$platform_worktree" status --short)"
+   test "$(git -C "$platform_worktree" branch --show-current)" = \
+     "$platform_branch"
+   platform_integration_tip=$(git -C "$platform_worktree" rev-parse HEAD^{commit})
+   test "$(git -C "$platform_worktree" rev-parse \
+     "$platform_branch"^{commit})" = "$platform_integration_tip"
+   test "$(git -C /home/john/elspeth rev-parse \
+     "$combined_sha"^{commit})" = "$combined_sha"
+   git -C /home/john/elspeth merge-base --is-ancestor \
+     "$combined_sha" release/0.7.2
    git -C "$platform_worktree" merge-base --is-ancestor \
      "$platform_replay_base" "$platform_integration_tip"
+   test "$(git -C "$platform_worktree" merge-base \
+     "$combined_sha" "$platform_integration_tip")" = "$platform_replay_base"
+   test -z "$(git -C "$platform_worktree" rev-list --merges \
+     "$platform_replay_base..$platform_integration_tip")"
+   git -C "$platform_worktree" switch --detach "$platform_integration_tip"
    git -C "$platform_worktree" rebase --onto \
      "$combined_sha" "$platform_replay_base" \
-     codex/deferred-platform-completion
+     "$platform_integration_tip"
+   rebased_platform_tip=$(git -C "$platform_worktree" rev-parse HEAD^{commit})
+   git -C "$platform_worktree" update-ref \
+     "refs/heads/$platform_branch" "$rebased_platform_tip" \
+     "$platform_integration_tip"
+   git -C "$platform_worktree" switch "$platform_branch"
+   )
    ```
 
    Review each conflict, the recorded 13-commit range, and any explicitly
-   reviewed later platform commits. A textually clean rebase is not acceptance.
-4. **Rerun the affected platform authority suites.** Reverify Tasks 3 through
-   5 from the now-current deferred-platform plan, then continue the plan from
-   Task 6. Do not skip to provider or release work.
-5. **Invalidate pre-platform evidence.** Treat every B1-X, B2-X, B3-X, and
+   reviewed later platform commits. If the compare-and-swap fails, stop: the
+   platform branch moved after capture and the detached replay is not authority.
+   A textually clean rebase is not acceptance.
+4. **Invalidate pre-platform evidence immediately.** Treat every B1-X, B2-X,
+   B3-X, and
    B4-A recovery/runtime/audit proof as provisional at its recorded Wave B
    commit. Do not carry forward an evidence locator, fixture hash,
    compatibility/topology hash, acceptance hash, or cell status solely because
    the rebase applied cleanly.
-6. **Reaccept the corpus.** Regenerate topology and compatibility evidence,
-   rerun every registered recovery case and seam-specific verifier, rerun the
-   full corpus/static floor, and re-audit every promoted recovery/runtime/audit
-   cell against the rebased production behavior.
-7. **Implement B4-B only on the real distributed harness.** After the live
-   platform plan lands its independent-process PostgreSQL/registered-worker
-   matrix, execute scenario 15 with real Landscape claim epochs, lease expiry,
-   reclaim, stale-worker fencing, and late-completion refusal. Scenario 15
-   cannot promote another scenario's concurrency cell by analogy.
+5. **Resume platform implementation through its source-stable boundary.**
+   Reverify the affected authority suites from already-landed Tasks 3 through
+   5, then continue the live deferred-platform plan from Task 6 through Task
+   13. Do not begin Task 14's provider packaging while the corpus remains
+   invalidated.
+6. **Implement B4-B only on the real distributed harness.** Once platform Task
+   13's independent-process PostgreSQL/registered-worker matrix is green,
+   execute scenario 15 with real Landscape claim epochs, lease expiry, reclaim,
+   stale-worker fencing, and late-completion refusal. Scenario 15 cannot
+   promote another scenario's concurrency cell by analogy.
+7. **Reaccept the corpus before Task 14.** Regenerate topology and compatibility
+   evidence, rerun every registered recovery case and seam-specific verifier,
+   rerun the full corpus/static floor, and re-audit every promoted
+   recovery/runtime/audit cell against the post-Task-13 production behavior.
+   If Tasks 14 through 20 later touch a corpus-sensitive production seam,
+   invalidate and rerun the affected evidence again before Task 21.
 8. **Run candidate acceptance once on the combined tree.** Complete
    deferred-platform Tasks 21 through 27 only after source and evidence are
    stable. If Task 21 or later had already started, explicitly invalidate the

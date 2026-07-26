@@ -647,8 +647,22 @@ provisional.
 - [x] **Step 1: Recompute the exact live manifest ledger and list every
   remaining concurrency/distributed-authority cell.**
 
-- [ ] **Step 2: Record the combined release/Wave B SHA and all packet commits,
+- [x] **Step 2: Record the combined release/Wave B SHA and all packet commits,
   tests, reviews, and open blockers.**
+
+  Local `release/0.7.2` now contains the reviewed combined commit
+  `2b47c25428ed0e978443df953e0fd587860aeed8`, with release parent
+  `ad7f1e277e2ecab75e33bdda6d82c0342d418600` and Wave B parent
+  `ca65ecab32f77c8cbd2b33ce8685c381011078e0`. The immutable Wave B
+  implementation/evidence head is `210a92d544dbb10d5d0b438351f123e05da19f5d`;
+  the only later Wave B commit changes this plan and the handoff document.
+  Exact-current merge and quality reviews approved the integration. The
+  release checkout gate passed with 541 tests, 2 expected xfails owned by
+  `elspeth-3a6fa9141f`, and 3 warnings; Ruff, formatting, mypy, and diff checks
+  also passed. Deferred platform work remains paused at
+  `132bd53232ea6b3885250675c361d3c057b19ac5`. Independent recovery/export
+  parity remains open as `elspeth-168c26e22e`; distributed and scale evidence
+  remain incomplete as recorded in the final ledger.
 
 - [x] **Step 3: Give the paused platform branch an exact rebase instruction.**
 
