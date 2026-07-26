@@ -6640,6 +6640,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'validate_secret_ref'" in result.data["error"]
@@ -6657,6 +6658,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'validate_secret_ref'" in result.data["error"]
@@ -6675,6 +6677,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'wire_secret_ref'" in result.data["error"]
@@ -6692,6 +6695,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'wire_secret_ref'" in result.data["error"]
@@ -6714,6 +6718,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'wire_secret_ref'" in result.data["error"]

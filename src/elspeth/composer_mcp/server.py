@@ -50,6 +50,7 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     validate_composer_file_sink_collision_policy,
 )
+from elspeth.web.composer.tools._dispatch import _validate_tool_arguments
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -350,6 +351,8 @@ def _dispatch_tool(
         return _dispatch_session_tool(tool_name, arguments, state, scratch_dir)
 
     if tool_name in _COMPOSER_TOOL_NAMES:
+        argument_error = _validate_tool_arguments(tool_name, arguments, state, raise_on_error=True)
+        assert argument_error is None
         control_error = _tool_file_sink_collision_control_error(tool_name, arguments, state)
         if control_error is not None:
             return {
@@ -368,6 +371,9 @@ def _dispatch_tool(
             data_dir=None,
             baseline=baseline,
             runtime_preflight=runtime_preflight,
+            validate_arguments=True,
+            require_data_dir_for_paths=True,
+            raise_schema_argument_errors=True,
         )
         response = result.to_dict()
         response["state"] = result.updated_state.to_dict()
@@ -732,6 +738,13 @@ def create_server(
             if canonicalization_failed is not None:
                 # Pre-dispatch ARG_ERROR: malformed LLM arguments.
                 return _argument_error_result(ValueError(f"arguments not canonicalizable ({type(canonicalization_failed).__name__})"))
+
+            if name in _COMPOSER_TOOL_NAMES:
+                try:
+                    argument_error = _validate_tool_arguments(name, arguments, state_ref[0], raise_on_error=True)
+                    assert argument_error is None
+                except ToolArgumentError as exc:
+                    return _argument_error_result(exc)
 
             if name == "preview_pipeline" and runtime_preflight is not None:
                 try:

@@ -542,6 +542,8 @@ def execute_tool(
     composer_skill_hash: str | None = None,
     tool_arguments_hash: str | None = None,
     reviewed_source_authority: ReviewedSourceAuthority | None = None,
+    validate_arguments: bool = False,
+    require_data_dir_for_paths: bool = False,
     raise_schema_argument_errors: bool = False,
 ) -> ToolResult:
     """Execute a composition tool by name.
@@ -600,7 +602,13 @@ def execute_tool(
         composer_skill_hash: Hash of the composer skill markdown used for
             the request.
         tool_arguments_hash: Canonical audited arguments hash for this tool
-            call.
+            call. This is optional audit evidence only; its presence never
+            controls argument admission or path-policy enforcement.
+        validate_arguments: Enforce the declared closed JSON Schema before
+            handler dispatch. Public LLM/MCP entry points must enable this.
+        require_data_dir_for_paths: Fail closed when source-local paths are
+            supplied without a dispatcher data directory. Public LLM/MCP
+            entry points must enable this.
         raise_schema_argument_errors: When true, audited declaration-schema
             failures raise ``ToolArgumentError`` for compose-loop ARG_ERROR
             routing. Direct callers keep the historical failed-``ToolResult``
@@ -622,7 +630,7 @@ def execute_tool(
         return normalize_tool_result_validation(_failure_result(state, f"Unknown tool: {tool_name}"), catalog)
     current_validation = prior_validation or catalog.validate_composition_state(state).validation
 
-    if tool_arguments_hash is not None:
+    if validate_arguments or raise_schema_argument_errors:
         argument_error = _validate_tool_arguments(
             tool_name,
             arguments,
@@ -647,7 +655,7 @@ def execute_tool(
         catalog=catalog,
         plugin_snapshot=plugin_snapshot,
         data_dir=data_dir,
-        require_data_dir_for_paths=tool_arguments_hash is not None,
+        require_data_dir_for_paths=require_data_dir_for_paths,
         session_engine=session_engine,
         session_id=session_id,
         secret_service=secret_service,

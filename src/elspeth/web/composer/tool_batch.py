@@ -1463,6 +1463,8 @@ async def run_tool_batch(
                 composer_provider=_composer_provider,
                 composer_skill_hash=_composer_skill_hash,
                 tool_arguments_hash=_tool_arguments_hash,
+                validate_arguments=True,
+                require_data_dir_for_paths=True,
                 raise_schema_argument_errors=True,
             )
 
