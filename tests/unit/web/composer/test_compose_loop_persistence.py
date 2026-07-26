@@ -18,7 +18,7 @@ from sqlalchemy import select, text, update
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch as tool_batch_module
-from elspeth.web.composer.protocol import ComposerPluginCrashError
+from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_tool_call_response
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
@@ -334,6 +334,205 @@ async def test_tool_batch_rejects_duplicate_ids_before_durable_proposal_creation
         )
     assert type(caught) is AuditIntegrityError
     assert str(caught) == "Composer tool batch contains duplicate provider tool-call IDs"
+
+
+@pytest.mark.parametrize("proposal_count", [10, 11])
+@pytest.mark.asyncio
+async def test_explicit_approval_batch_preflights_proposal_cap_before_creation(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    proposal_count: int,
+) -> None:
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+        conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+
+    batch_progress_calls = 0
+    real_emit_progress = tool_batch_module.emit_progress
+
+    async def _record_batch_progress(*args: Any, **kwargs: Any) -> Any:
+        nonlocal batch_progress_calls
+        batch_progress_calls += 1
+        return await real_emit_progress(*args, **kwargs)
+
+    monkeypatch.setattr(tool_batch_module, "emit_progress", _record_batch_progress)
+    proposal_calls = 0
+    real_create_proposal = sessions_service.create_composition_proposal
+
+    async def _record_real_proposal(*args: Any, **kwargs: Any) -> Any:
+        nonlocal proposal_calls
+        proposal_calls += 1
+        return await real_create_proposal(*args, **kwargs)
+
+    monkeypatch.setattr(sessions_service, "create_composition_proposal", _record_real_proposal)
+    response = _tool_batch_response(
+        *((f"call_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(proposal_count))
+    )
+
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=response,
+    )
+
+    if proposal_count == 10:
+        assert caught is None
+        expected_proposals = 10
+    else:
+        assert type(caught) is ComposerServiceError
+        assert str(caught) == "Composer produced too many pending tool proposals in one turn (10 maximum)."
+        expected_proposals = 0
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        proposal_ids = conn.execute(
+            select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+        ).fetchall()
+        proposal_event_ids = conn.execute(
+            select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)
+        ).fetchall()
+    assert len(proposal_ids) == expected_proposals
+    assert len(proposal_event_ids) == expected_proposals
+    assert proposal_calls == expected_proposals
+    assert (batch_progress_calls > 0) is (proposal_count == 10)
+
+    if proposal_count == 11:
+        retry_caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=response,
+        )
+        assert type(retry_caught) is ComposerServiceError
+        assert str(retry_caught) == "Composer produced too many pending tool proposals in one turn (10 maximum)."
+        assert proposal_calls == 0
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+            assert (
+                conn.execute(
+                    select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+                ).fetchall()
+                == []
+            )
+            assert (
+                conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall()
+                == []
+            )
+
+
+@pytest.mark.asyncio
+async def test_proposal_attempt_cap_rejects_mixed_schema_and_semantic_invalid_calls_before_dispatch(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+        conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(
+            *((f"call_valid_attempt_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(9)),
+            ("call_schema_invalid_attempt", "set_metadata", {}),
+            (
+                "call_semantic_invalid_attempt",
+                "set_pipeline",
+                {
+                    "source": None,
+                    "nodes": [],
+                    "edges": [],
+                    "outputs": [],
+                    "metadata": {"name": "semantically incomplete"},
+                },
+            ),
+        ),
+    )
+
+    assert type(caught) is ComposerServiceError
+    assert str(caught) == "Composer produced too many pending tool proposals in one turn (10 maximum)."
+    assert handler_calls == []
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        assert (
+            conn.execute(
+                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+            ).fetchall()
+            == []
+        )
+        assert (
+            conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall() == []
+        )
+
+
+@pytest.mark.asyncio
+async def test_proposal_attempt_cap_excludes_discovery_and_immediate_create_blob(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+) -> None:
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+        conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(
+            ("call_discovery_boundary", "list_transforms", {}),
+            (
+                "call_create_blob_boundary",
+                "create_blob",
+                {
+                    "filename": "immediate.txt",
+                    "mime_type": "text/plain",
+                    "content": "immediate non-proposal content",
+                },
+            ),
+            *((f"call_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(10)),
+        ),
+    )
+
+    assert caught is None
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        assert set(
+            conn.execute(
+                select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+            ).scalars()
+        ) == {f"call_boundary_proposal_{index}" for index in range(10)}
+        assert (
+            len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall())
+            == 10
+        )
+
+
+@pytest.mark.asyncio
+async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutation(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+) -> None:
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+        conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(
+            *((f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(10)),
+            ("call_approval_required_blob_only", "delete_blob", {}),
+        ),
+    )
+
+    assert type(caught) is ComposerServiceError
+    assert str(caught) == "Composer produced too many pending tool proposals in one turn (10 maximum)."
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        assert (
+            conn.execute(
+                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+            ).fetchall()
+            == []
+        )
+        assert (
+            conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall() == []
+        )
 
 
 @pytest.mark.parametrize(

@@ -396,6 +396,25 @@ async def run_tool_batch(
 
     admitted_batch = _admit_tool_batch(call_model.assistant_tool_calls)
     assistant_tool_calls = admitted_batch.calls
+    if (
+        turn_sessions_service is not None
+        and turn_session_uuid is not None
+        and turn_preferences is not None
+        and turn_preferences.trust_mode == "explicit_approve"
+        and sum(
+            1
+            for tool_call in assistant_tool_calls
+            if is_mutation_tool(tool_call.function.name)
+            and (
+                not is_blob_store_only_mutation_tool(tool_call.function.name)
+                or is_approval_required_blob_store_only_mutation_tool(tool_call.function.name)
+            )
+        )
+        > _MAX_PENDING_PROPOSALS_PER_TURN
+    ):
+        raise ComposerServiceError(
+            f"Composer produced too many pending tool proposals in one turn ({_MAX_PENDING_PROPOSALS_PER_TURN} maximum)."
+        )
     await _preflight_session_tool_call_ids(
         admitted_batch,
         sessions_service=turn_sessions_service,
