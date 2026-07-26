@@ -65,6 +65,8 @@ from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 # the audit-primacy rule (a broken OTel exporter must not 500 a POST
 # whose audit row already wrote).
 from elspeth.web.composer.telemetry_phase8 import record_interpretation_opt_out
+from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PENDING_INTERPRETATION_AUTHORING_TEXT,
@@ -195,6 +197,7 @@ from elspeth.web.sessions.protocol import (
     RunRecord,
     SessionGuidedOperationInProgressError,
     SessionNotFoundError,
+    SessionOperationAuthority,
     SessionRecord,
     SessionRunEventType,
     SessionRunStatus,
@@ -3383,6 +3386,9 @@ class SessionServiceImpl:
         plugin_snapshot_factory: Callable[[str], PluginAvailabilitySnapshot] | None = None,
         operator_profile_registry: OperatorProfileRegistry | None = None,
         catalog: CatalogService | None = None,
+        session_operation_authority: SessionOperationAuthority | None = None,
+        owner_instance_id: str | None = None,
+        session_operation_lease_seconds: int = 30,
     ) -> None:
         if (plugin_snapshot_factory is None) != (operator_profile_registry is None):
             raise ValueError("plugin_snapshot_factory and operator_profile_registry must be configured together")
@@ -3395,6 +3401,25 @@ class SessionServiceImpl:
         self._plugin_snapshot_factory = plugin_snapshot_factory
         self._operator_profile_registry = operator_profile_registry
         self._catalog = catalog
+        if owner_instance_id is not None and (type(owner_instance_id) is not str or not owner_instance_id.strip()):
+            raise ValueError("owner_instance_id must be a nonblank exact string")
+        if type(session_operation_lease_seconds) is not int or not 1 <= session_operation_lease_seconds <= 3600:
+            raise ValueError("session_operation_lease_seconds must be an exact integer from 1 through 3600")
+        self._owner_instance_id = owner_instance_id or f"{engine.dialect.name}-{uuid.uuid4()}"
+        self._session_operation_lease_seconds = session_operation_lease_seconds
+        if session_operation_authority is None:
+            if engine.dialect.name == "sqlite":
+                session_operation_authority = SQLiteLocalSessionOperationAuthority(engine)
+            elif engine.dialect.name == "postgresql":
+                session_operation_authority = PostgresSessionOperationRepository(engine)
+            else:
+                raise NotImplementedError(f"session operation authority not implemented for dialect {engine.dialect.name}")
+        self._session_operation_authority = session_operation_authority
+
+    @property
+    def session_operation_authority(self) -> SessionOperationAuthority:
+        """Return the handle-free authority shared by session service callers."""
+        return self._session_operation_authority
 
     def _validate_patched_composition_state(
         self,
@@ -5276,35 +5301,17 @@ class SessionServiceImpl:
         title: str,
         auth_provider_type: AuthProviderType,
     ) -> SessionRecord:
-        """Create a new session and return its record."""
-        session_id = uuid.uuid4()
-        now = self._now()
-
-        def _sync() -> None:
-            with self._session_process_locked_begin(str(session_id)) as conn:
-                conn.execute(
-                    insert(sessions_table).values(
-                        id=str(session_id),
-                        user_id=user_id,
-                        auth_provider_type=auth_provider_type,
-                        title=title,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-
-        await self._run_sync(_sync)
-
-        return SessionRecord(
-            id=session_id,
-            user_id=user_id,
-            auth_provider_type=auth_provider_type,
-            title=title,
-            created_at=now,
-            updated_at=now,
-            archived_at=None,
-            forked_from_session_id=None,
-            forked_from_message_id=None,
+        """Create one session plus an already-closed epoch-1 fence."""
+        return cast(
+            "SessionRecord",
+            await self._run_sync(
+                self._session_operation_authority.create_session_with_initial_fence,
+                user_id=user_id,
+                title=title,
+                auth_provider_type=auth_provider_type,
+                owner_instance_id=self._owner_instance_id,
+                lease_seconds=self._session_operation_lease_seconds,
+            ),
         )
 
     def _row_to_session_record(self, row: Any) -> SessionRecord:

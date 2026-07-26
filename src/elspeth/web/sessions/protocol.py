@@ -2209,9 +2209,86 @@ class ToolCallIDMismatchError(RuntimeError):
         )
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class SessionOperationMutationResult:
+    """Detached result from one bounded statement in a fenced transaction."""
+
+    rowcount: int
+    rows: tuple[Mapping[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.rowcount) is not int:
+            raise TypeError("SessionOperationMutationResult.rowcount must be an exact integer")
+        freeze_fields(self, "rows")
+
+
+@runtime_checkable
+class SessionOperationMutationTransaction(Protocol):
+    """Bounded statement executor backed by one private authority transaction.
+
+    Implementations accept SQLAlchemy Select/Insert/Update/Delete statements
+    only, detach all returned rows, and expose no connection, commit, rollback,
+    raw-SQL, or transaction-control surface.
+    """
+
+    def execute(self, statement: object) -> SessionOperationMutationResult: ...
+
+
+@runtime_checkable
+class SessionOperationAuthority(Protocol):
+    """Persistent per-session operation authority without database-handle leakage.
+
+    Implementations own their transactions.  Callers receive only immutable
+    records/fences; a raw SQLAlchemy engine or connection is never part of the
+    public authority surface.
+    """
+
+    def create_session_with_initial_fence(
+        self,
+        *,
+        user_id: str,
+        title: str,
+        auth_provider_type: AuthProviderType,
+        owner_instance_id: str,
+        lease_seconds: int,
+    ) -> SessionRecord: ...
+
+    def acquire(
+        self,
+        *,
+        session_id: UUID,
+        operation_kind: SessionOperationKind,
+        owner_instance_id: str,
+        lease_seconds: int,
+    ) -> SessionOperationFence: ...
+
+    def renew(
+        self,
+        fence: SessionOperationFence,
+        *,
+        lease_seconds: int,
+    ) -> SessionOperationFence: ...
+
+    def compare_and_swap(self, fence: SessionOperationFence) -> None: ...
+
+    def mutate[T](
+        self,
+        fence: SessionOperationFence,
+        mutation: Callable[[SessionOperationMutationTransaction], T],
+    ) -> T: ...
+
+    def release(self, fence: SessionOperationFence) -> None: ...
+
+    def archive_delete(self, fence: SessionOperationFence) -> None: ...
+
+
 @runtime_checkable
 class SessionServiceProtocol(Protocol):
     """Protocol for session persistence operations."""
+
+    @property
+    def session_operation_authority(self) -> SessionOperationAuthority: ...
 
     async def create_session(
         self,
