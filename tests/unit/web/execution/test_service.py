@@ -951,6 +951,18 @@ class TestExecutionFlow:
                 "on_write_failure": "discard",
             }
         ]
+        unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+        snapshot = PluginAvailabilitySnapshot.create(
+            policy_hash="runtime-policy",
+            principal_scope="test:alice",
+            available=unrestricted.available,
+            unavailable=(),
+            selected=unrestricted.selected,
+            usable_profile_aliases=(),
+            selected_profile_aliases=(),
+            binding_generation_fingerprint="runtime-policy-generation",
+        )
+        service._plugin_snapshot_factory = lambda _user_id: snapshot
 
         with (
             patch("elspeth.web.execution.validation.validate_pipeline", side_effect=_real_validate_pipeline),
