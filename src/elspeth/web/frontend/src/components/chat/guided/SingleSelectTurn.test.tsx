@@ -85,6 +85,53 @@ describe("SingleSelectTurn — option click", () => {
     expect(body.chosen).toEqual(["llm_classify"]);
     expect(body.custom_inputs).toBeNull();
   });
+
+  it("does not restore an invalidated source choice when the same UUID reappears", async () => {
+    const user = userEvent.setup();
+    const first = {
+      id: "00000000-0000-4000-8000-000000000831",
+      filename: "first.csv",
+      sizeBytes: 16,
+    };
+    const second = {
+      id: "00000000-0000-4000-8000-000000000832",
+      filename: "second.csv",
+      sizeBytes: 16,
+    };
+    const { rerender } = render(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[first, second]}
+        sourceBlobChoiceRequired
+      />,
+    );
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Source file" }),
+      first.id,
+    );
+
+    rerender(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[second]}
+        sourceBlobChoiceRequired
+      />,
+    );
+    expect(screen.getByRole("combobox", { name: "Source file" })).toHaveValue("");
+
+    rerender(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[first, second]}
+        sourceBlobChoiceRequired
+      />,
+    );
+    expect(screen.getByRole("combobox", { name: "Source file" })).toHaveValue("");
+    expect(screen.getByRole("button", { name: "CSV File" })).toBeDisabled();
+  });
 });
 
 describe("SingleSelectTurn — allow_custom=false", () => {
@@ -159,6 +206,60 @@ describe("SingleSelectTurn — allow_custom=true", () => {
 
     const body = onSubmit.mock.calls[0][0];
     expect(body.custom_inputs).toEqual(["my custom source"]);
+    expect(body).not.toHaveProperty("source_blob_id");
+  });
+
+  it("limits a pending source upload to source-bound controls", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const sourceBlobCandidates = [
+      {
+        id: "00000000-0000-4000-8000-000000000831",
+        filename: "first.csv",
+        sizeBytes: 16,
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000832",
+        filename: "second.csv",
+        sizeBytes: 24,
+      },
+    ];
+    const { rerender } = render(
+      <SingleSelectTurn
+        payload={PAYLOAD_WITH_CUSTOM}
+        onSubmit={onSubmit}
+        sourceBlobCandidates={sourceBlobCandidates}
+      />,
+    );
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Source file" }),
+      sourceBlobCandidates[0].id,
+    );
+
+    rerender(
+      <SingleSelectTurn
+        payload={PAYLOAD_WITH_CUSTOM}
+        onSubmit={onSubmit}
+        sourceBlobCandidates={sourceBlobCandidates}
+        sourceUploadPending
+      />,
+    );
+
+    expect(
+      screen.getByRole("combobox", { name: "Source file" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "LLM Classifier" }),
+    ).toBeDisabled();
+    const customInput = screen.getByRole("textbox", { name: /custom/i });
+    expect(customInput).toBeEnabled();
+    await user.type(customInput, "my pending-upload custom source");
+    const submit = screen.getByRole("button", { name: /submit custom/i });
+    expect(submit).toBeEnabled();
+    await user.click(submit);
+
+    const body = onSubmit.mock.calls[0][0];
+    expect(body.custom_inputs).toEqual(["my pending-upload custom source"]);
     expect(body).not.toHaveProperty("source_blob_id");
   });
 });

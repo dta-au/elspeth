@@ -56,6 +56,21 @@ describe("blobStore", () => {
     vi.restoreAllMocks();
   });
 
+  it("publishes a monotonic activation epoch for exact session fences", () => {
+    const initialEpoch = useBlobStore.getState().activationEpoch;
+
+    useBlobStore.getState().activateSession("session-a");
+    expect(useBlobStore.getState().activeSessionId).toBe("session-a");
+    expect(useBlobStore.getState().activationEpoch).toBe(initialEpoch + 1);
+
+    useBlobStore.getState().activateSession("session-a");
+    expect(useBlobStore.getState().activationEpoch).toBe(initialEpoch + 1);
+
+    useBlobStore.getState().activateSession("session-b");
+    expect(useBlobStore.getState().activeSessionId).toBe("session-b");
+    expect(useBlobStore.getState().activationEpoch).toBe(initialEpoch + 2);
+  });
+
   describe("loadBlobs", () => {
     it("fetches blobs and sets them in state", async () => {
       const blobs = [makeBlob(), makeBlob({ id: "blob-2", filename: "other.json" })];
@@ -164,6 +179,32 @@ describe("blobStore", () => {
       expect(state.blobs[0]).toEqual(newBlob);
       expect(state.blobs[1]).toEqual(existing);
       expect(state.error).toBeNull();
+    });
+
+    it("deduplicates an upload UUID already returned by an overlapping list", async () => {
+      const listResult = deferred<BlobMetadata[]>();
+      const uploadResult = deferred<BlobMetadata>();
+      const uploadedBlob = makeBlob({
+        id: "blob-shared",
+        filename: "shared.csv",
+      });
+      const { listBlobs, uploadBlob } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockReturnValue(listResult.promise);
+      (uploadBlob as ReturnType<typeof vi.fn>).mockReturnValue(uploadResult.promise);
+
+      const load = useBlobStore.getState().loadBlobs("session-1");
+      const upload = useBlobStore
+        .getState()
+        .uploadBlob("session-1", new File(["content"], "shared.csv"));
+
+      listResult.resolve([uploadedBlob]);
+      await load;
+      expect(useBlobStore.getState().blobs).toEqual([uploadedBlob]);
+
+      uploadResult.resolve(uploadedBlob);
+      await upload;
+
+      expect(useBlobStore.getState().blobs).toEqual([uploadedBlob]);
     });
 
     it("preserves a completed upload when an older list request resolves last", async () => {
@@ -278,6 +319,44 @@ describe("blobStore", () => {
         useBlobStore.getState().uploadBlob("session-1", file),
       ).rejects.toEqual({ status: 415 });
 
+      expect(useBlobStore.getState().error).toBe(
+        "Unsupported file type. Please use CSV, JSON, JSONL, or plain text.",
+      );
+    });
+
+    it("does not publish an upload error rejected by the request owner fence", async () => {
+      const uploadError = { status: 413 };
+      const shouldPublishError = vi.fn().mockReturnValue(false);
+      const { uploadBlob } = await import("@/api/client");
+      (uploadBlob as ReturnType<typeof vi.fn>).mockRejectedValue(uploadError);
+
+      const file = new File(["x"], "stale.csv", { type: "text/csv" });
+      await expect(
+        useBlobStore.getState().uploadBlob("session-1", file, {
+          shouldPublishError,
+        }),
+      ).rejects.toEqual(uploadError);
+
+      expect(shouldPublishError).toHaveBeenCalledWith(uploadError);
+      expect(useBlobStore.getState().error).toBeNull();
+    });
+
+    it("publishes a mapped upload error accepted by the request owner fence", async () => {
+      const uploadError = { status: 415 };
+      const shouldPublishError = vi.fn().mockReturnValue(true);
+      const { uploadBlob } = await import("@/api/client");
+      (uploadBlob as ReturnType<typeof vi.fn>).mockRejectedValue(uploadError);
+
+      const file = new File(["x"], "current.exe", {
+        type: "application/octet-stream",
+      });
+      await expect(
+        useBlobStore.getState().uploadBlob("session-1", file, {
+          shouldPublishError,
+        }),
+      ).rejects.toEqual(uploadError);
+
+      expect(shouldPublishError).toHaveBeenCalledWith(uploadError);
       expect(useBlobStore.getState().error).toBe(
         "Unsupported file type. Please use CSV, JSON, JSONL, or plain text.",
       );

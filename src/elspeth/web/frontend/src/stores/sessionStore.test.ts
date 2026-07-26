@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { useSessionStore } from "./sessionStore";
+import { useBlobStore } from "./blobStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import type {
@@ -9,6 +10,7 @@ import type {
   ComposerProgressSnapshot,
   CompositionState,
   CompositionProposal,
+  BlobMetadata,
 } from "@/types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
@@ -60,6 +62,10 @@ vi.mock("@/api/client", () => ({
   // does not trip session-load tests; targeted assertions on the call live
   // in interpretationEventsStore.test.ts.
   listInterpretationEvents: vi.fn().mockResolvedValue([]),
+  listBlobs: vi.fn(),
+  uploadBlob: vi.fn(),
+  deleteBlob: vi.fn(),
+  downloadBlobContent: vi.fn(),
 }));
 
 // Mock the execution store dependency
@@ -362,6 +368,58 @@ describe("sessionStore", () => {
       expect(useSessionStore.getState().activeSessionId).toBe("new-1");
       expect(useSessionStore.getState().compositionStateLoaded).toBe(true);
       expect(useSessionStore.getState().compositionState).toBeNull();
+    });
+
+    it("createSession transfers blob ownership before the new session can upload", async () => {
+      const apiMod = await import("@/api/client");
+      const blobA = {
+        id: "blob-a",
+        session_id: "session-a",
+        filename: "a.csv",
+        mime_type: "text/csv",
+        size_bytes: 1,
+        content_hash: "a".repeat(64),
+        created_at: "2026-07-26T00:00:00Z",
+        created_by: "user",
+        source_description: null,
+        status: "ready",
+        creation_modality: "verbatim",
+        created_from_message_id: null,
+        creating_model_identifier: null,
+        creating_model_version: null,
+        creating_provider: null,
+        creating_composer_skill_hash: null,
+        creating_arguments_hash: null,
+      } satisfies BlobMetadata;
+      const blobB = {
+        ...blobA,
+        id: "blob-b",
+        session_id: "session-b",
+        filename: "b.csv",
+        content_hash: "b".repeat(64),
+      } satisfies BlobMetadata;
+      useBlobStore.getState().reset();
+      (apiMod.listBlobs as ReturnType<typeof vi.fn>).mockResolvedValue([blobA]);
+      await useBlobStore.getState().loadBlobs("session-a");
+      (apiMod.createSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "session-b",
+        title: "Session B",
+        created_at: "2026-07-26T00:00:00Z",
+        updated_at: "2026-07-26T00:00:00Z",
+      });
+
+      await useSessionStore.getState().createSession();
+
+      expect(useSessionStore.getState().activeSessionId).toBe("session-b");
+      expect(useBlobStore.getState().blobs).toEqual([]);
+
+      (apiMod.uploadBlob as ReturnType<typeof vi.fn>).mockResolvedValue(blobB);
+      const result = await useBlobStore
+        .getState()
+        .uploadBlob("session-b", new File(["b"], "b.csv"));
+
+      expect(result).toEqual(blobB);
+      expect(useBlobStore.getState().blobs).toEqual([blobB]);
     });
   });
 

@@ -3,13 +3,27 @@ import { create } from "zustand";
 import type { BlobMetadata } from "@/types/api";
 import * as api from "@/api/client";
 
+interface BlobUploadOptions {
+  /** Request-owner fence for publishing a mapped upload error. */
+  shouldPublishError?: (error: unknown) => boolean;
+}
+
 interface BlobState {
   blobs: BlobMetadata[];
   isLoading: boolean;
   error: string | null;
+  /** Session whose rows may be published into this store instance. */
+  activeSessionId: string | null;
+  /** Monotonic generation for session-bound async completion fences. */
+  activationEpoch: number;
 
+  activateSession: (sessionId: string | null) => void;
   loadBlobs: (sessionId: string) => Promise<void>;
-  uploadBlob: (sessionId: string, file: File) => Promise<BlobMetadata>;
+  uploadBlob: (
+    sessionId: string,
+    file: File,
+    options?: BlobUploadOptions,
+  ) => Promise<BlobMetadata>;
   deleteBlob: (sessionId: string, blobId: string) => Promise<void>;
   downloadBlob: (sessionId: string, blobId: string) => Promise<void>;
   clearBlobs: () => void;
@@ -20,11 +34,11 @@ const initialState = {
   blobs: [] as BlobMetadata[],
   isLoading: false,
   error: null as string | null,
+  activeSessionId: null as string | null,
+  activationEpoch: 0,
 };
 
 let blobLoadRequestSeq = 0;
-let blobOwnerSessionId: string | null = null;
-let blobOwnerEpoch = 0;
 
 interface BlobMutationOwnership {
   sessionId: string;
@@ -32,41 +46,26 @@ interface BlobMutationOwnership {
   ownsStore: boolean;
 }
 
-function beginBlobMutation(sessionId: string): BlobMutationOwnership {
-  if (blobOwnerSessionId === null) {
-    blobOwnerSessionId = sessionId;
-    blobOwnerEpoch++;
-  }
-  return {
-    sessionId,
-    ownerEpoch: blobOwnerEpoch,
-    ownsStore: blobOwnerSessionId === sessionId,
-  };
-}
-
-function mutationStillOwnsStore(ownership: BlobMutationOwnership): boolean {
-  return (
-    ownership.ownsStore &&
-    blobOwnerSessionId === ownership.sessionId &&
-    blobOwnerEpoch === ownership.ownerEpoch
-  );
-}
-
-export const useBlobStore = create<BlobState>((set) => ({
+export const useBlobStore = create<BlobState>((set, get) => ({
   ...initialState,
 
-  async loadBlobs(sessionId: string) {
-    const sessionChanged = blobOwnerSessionId !== sessionId;
-    if (sessionChanged) {
-      blobOwnerSessionId = sessionId;
-      blobOwnerEpoch++;
-    }
-    const requestSeq = ++blobLoadRequestSeq;
+  activateSession(sessionId: string | null) {
+    const state = get();
+    if (state.activeSessionId === sessionId) return;
+    blobLoadRequestSeq++;
     set({
-      ...(sessionChanged ? { blobs: [] } : {}),
-      isLoading: true,
+      blobs: [],
+      isLoading: false,
       error: null,
+      activeSessionId: sessionId,
+      activationEpoch: state.activationEpoch + 1,
     });
+  },
+
+  async loadBlobs(sessionId: string) {
+    get().activateSession(sessionId);
+    const requestSeq = ++blobLoadRequestSeq;
+    set({ isLoading: true, error: null });
     try {
       const blobs = await api.listBlobs(sessionId);
       if (requestSeq !== blobLoadRequestSeq) {
@@ -81,19 +80,39 @@ export const useBlobStore = create<BlobState>((set) => ({
     }
   },
 
-  async uploadBlob(sessionId: string, file: File) {
-    const ownership = beginBlobMutation(sessionId);
+  async uploadBlob(
+    sessionId: string,
+    file: File,
+    options?: BlobUploadOptions,
+  ) {
+    if (get().activeSessionId === null) {
+      set((state) => ({
+        activeSessionId: sessionId,
+        activationEpoch: state.activationEpoch + 1,
+      }));
+    }
+    const ownerState = get();
+    const ownership: BlobMutationOwnership = {
+      sessionId,
+      ownerEpoch: ownerState.activationEpoch,
+      ownsStore: ownerState.activeSessionId === sessionId,
+    };
     if (ownership.ownsStore) {
       set({ error: null });
     }
     try {
       const blob = await api.uploadBlob(sessionId, file);
-      if (!mutationStillOwnsStore(ownership)) {
+      const current = get();
+      if (
+        !ownership.ownsStore ||
+        current.activeSessionId !== ownership.sessionId ||
+        current.activationEpoch !== ownership.ownerEpoch
+      ) {
         return blob;
       }
       blobLoadRequestSeq++;
       set((state) => ({
-        blobs: [blob, ...state.blobs],
+        blobs: [blob, ...state.blobs.filter((item) => item.id !== blob.id)],
         isLoading: false,
       }));
       return blob;
@@ -104,7 +123,13 @@ export const useBlobStore = create<BlobState>((set) => ({
           : (err as { status?: number }).status === 415
             ? "Unsupported file type. Please use CSV, JSON, JSONL, or plain text."
             : "Upload failed. Please try again.";
-      if (mutationStillOwnsStore(ownership)) {
+      const current = get();
+      if (
+        (options?.shouldPublishError?.(err) ?? true) &&
+        ownership.ownsStore &&
+        current.activeSessionId === ownership.sessionId &&
+        current.activationEpoch === ownership.ownerEpoch
+      ) {
         set({ error: detail });
       }
       throw err;
@@ -112,10 +137,26 @@ export const useBlobStore = create<BlobState>((set) => ({
   },
 
   async deleteBlob(sessionId: string, blobId: string) {
-    const ownership = beginBlobMutation(sessionId);
+    if (get().activeSessionId === null) {
+      set((state) => ({
+        activeSessionId: sessionId,
+        activationEpoch: state.activationEpoch + 1,
+      }));
+    }
+    const ownerState = get();
+    const ownership: BlobMutationOwnership = {
+      sessionId,
+      ownerEpoch: ownerState.activationEpoch,
+      ownsStore: ownerState.activeSessionId === sessionId,
+    };
     try {
       await api.deleteBlob(sessionId, blobId);
-      if (!mutationStillOwnsStore(ownership)) {
+      const current = get();
+      if (
+        !ownership.ownsStore ||
+        current.activeSessionId !== ownership.sessionId ||
+        current.activationEpoch !== ownership.ownerEpoch
+      ) {
         return;
       }
       blobLoadRequestSeq++;
@@ -128,7 +169,12 @@ export const useBlobStore = create<BlobState>((set) => ({
         (err as { status?: number }).status === 409
           ? "Cannot delete — file is linked to an active run."
           : "Failed to delete file.";
-      if (mutationStillOwnsStore(ownership)) {
+      const current = get();
+      if (
+        ownership.ownsStore &&
+        current.activeSessionId === ownership.sessionId &&
+        current.activationEpoch === ownership.ownerEpoch
+      ) {
         set({ error: detail });
       }
     }
@@ -155,16 +201,21 @@ export const useBlobStore = create<BlobState>((set) => ({
   },
 
   clearBlobs() {
-    blobOwnerSessionId = null;
-    blobOwnerEpoch++;
     blobLoadRequestSeq++;
-    set({ blobs: [], isLoading: false, error: null });
+    set((state) => ({
+      blobs: [],
+      isLoading: false,
+      error: null,
+      activeSessionId: null,
+      activationEpoch: state.activationEpoch + 1,
+    }));
   },
 
   reset() {
-    blobOwnerSessionId = null;
-    blobOwnerEpoch++;
     blobLoadRequestSeq++;
-    set(initialState);
+    set((state) => ({
+      ...initialState,
+      activationEpoch: state.activationEpoch + 1,
+    }));
   },
 }));

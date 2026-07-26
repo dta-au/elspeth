@@ -28,6 +28,19 @@ interface ChatInputProps {
   onOpenSecrets?: () => void;
   /** Successful upload metadata, retained by guided mode for exact source binding. */
   onBlobUploaded?: (blob: BlobMetadata) => void;
+  /** Upload request lifecycle, used by guided mode to fence async completions. */
+  onBlobUploadStarted?: (requestId: string, sessionId: string) => void;
+  /** Return false to suppress stale candidate publication and filename insertion. */
+  onBlobUploadCompleted?: (
+    requestId: string,
+    sessionId: string,
+    blob: BlobMetadata,
+  ) => boolean;
+  /** Return false to suppress stale local and blob-store failure publication. */
+  onBlobUploadRejected?: (requestId: string, sessionId: string) => boolean;
+  onBlobUploadSettled?: (requestId: string, sessionId: string) => void;
+  /** Disables only the upload affordance; ordinary text remains independently gated. */
+  uploadDisabled?: boolean;
   /** Controlled mode: external value (use with onChange) */
   value?: string;
   /** Controlled mode: callback when value changes */
@@ -81,6 +94,11 @@ export function ChatInput({
   showBlobManager,
   onOpenSecrets,
   onBlobUploaded,
+  onBlobUploadStarted,
+  onBlobUploadCompleted,
+  onBlobUploadRejected,
+  onBlobUploadSettled,
+  uploadDisabled = false,
   value: controlledValue,
   onChange: controlledOnChange,
   maxLength,
@@ -222,11 +240,25 @@ export function ChatInput({
 
   async function handleFileSelect(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (!file || !activeSessionId) return;
+    if (!file || !activeSessionId || uploadDisabled) return;
 
+    const uploadRequestId = crypto.randomUUID();
+    const uploadSessionId = activeSessionId;
+    const input = e.target;
     setUploadStatus(null);
+    onBlobUploadStarted?.(uploadRequestId, uploadSessionId);
+    let rejectionAccepted: boolean | null = null;
     try {
-      const blob = await uploadBlob(activeSessionId, file);
+      const blob = await uploadBlob(uploadSessionId, file, {
+        shouldPublishError: () => {
+          rejectionAccepted =
+            onBlobUploadRejected?.(uploadRequestId, uploadSessionId) ?? true;
+          return rejectionAccepted;
+        },
+      });
+      const accepted =
+        onBlobUploadCompleted?.(uploadRequestId, uploadSessionId, blob) ?? true;
+      if (!accepted) return;
       onBlobUploaded?.(blob);
       // Use ref to get current text (user may have typed during async upload)
       const currentText = textRef.current;
@@ -240,11 +272,17 @@ export function ChatInput({
         setInternalText(newText);
       }
     } catch {
-      // Error is shown in the blob store / blob manager
-      setUploadStatus("Upload failed. Check the file manager for details.");
+      const accepted =
+        rejectionAccepted ??
+        onBlobUploadRejected?.(uploadRequestId, uploadSessionId) ??
+        true;
+      if (accepted) {
+        // The mapped detail is shown in the blob store / blob manager.
+        setUploadStatus("Upload failed. Check the file manager for details.");
+      }
     } finally {
+      onBlobUploadSettled?.(uploadRequestId, uploadSessionId);
       // Reset the file input so the same file can be re-selected
-      const input = e.target;
       input.value = "";
     }
   }
@@ -358,7 +396,7 @@ export function ChatInput({
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={!activeSessionId}
+              disabled={!activeSessionId || uploadDisabled}
               className="chat-input-icon-btn"
               title="Upload file"
               aria-label="Upload file"
@@ -369,7 +407,7 @@ export function ChatInput({
               ref={fileInputRef}
               type="file"
               onChange={handleFileSelect}
-              disabled={!activeSessionId}
+              disabled={!activeSessionId || uploadDisabled}
               style={{ display: "none" }}
               aria-hidden="true"
               tabIndex={-1}

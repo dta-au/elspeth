@@ -270,6 +270,10 @@ const GUIDED_RESPONSE_STALE_MESSAGE =
   "The active session changed before the guided response could be applied.";
 const GUIDED_RESPONSE_REFRESH_REQUIRED_MESSAGE =
   "The server accepted the response, but this view could not refresh. Refresh or re-enter the session before continuing.";
+const GUIDED_SOURCE_BLOB_LIFECYCLE_REJECTIONS = new Set([
+  "Selected source blob is no longer a ready upload for this session.",
+  "Selected source blob is not a ready upload for this session.",
+]);
 
 function isAbortError(err: unknown): boolean {
   // DOMException ('AbortError'/'TimeoutError') is not always an Error
@@ -1169,6 +1173,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearComposerProgressPollTimer();
     clearInflightMessagesPollTimer();
     advanceGuidedPublicationGeneration();
+    useBlobStore.getState().activateSession(session.id);
     set((state) => ({
       sessions: [session, ...state.sessions],
       activeSessionId: session.id,
@@ -1215,15 +1220,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   async archiveSession(id: string) {
     try {
       await api.archiveSession(id);
+      const wasActive = get().activeSessionId === id;
+      if (wasActive) {
+        clearComposerProgressPollTimer();
+        clearInflightMessagesPollTimer();
+        advanceGuidedPublicationGeneration();
+        useBlobStore.getState().activateSession(null);
+      }
       set((state) => {
         const sessions = state.sessions.filter((s) => s.id !== id);
         // If we archived the active session, clear selection
-        const wasActive = state.activeSessionId === id;
-        if (wasActive) {
-          clearComposerProgressPollTimer();
-          clearInflightMessagesPollTimer();
-          advanceGuidedPublicationGeneration();
-        }
         return {
           sessions,
           ...(wasActive
@@ -1291,6 +1297,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearOrphanedGuidedRetriesForSession(id);
     const selectionGeneration = advanceGuidedPublicationGeneration();
 
+    useBlobStore.getState().activateSession(id);
     set({
       activeSessionId: id,
       messages: [],
@@ -1392,6 +1399,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedPublicationIsCurrent(id, selectionGeneration)
       ) {
         advanceGuidedPublicationGeneration();
+        useBlobStore.getState().activateSession(null);
         set({
           activeSessionId: null,
           messages: [],
@@ -1426,6 +1434,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   resetForTutorialSession(sessionId: string) {
     advanceGuidedPublicationGeneration();
+    useBlobStore.getState().activateSession(sessionId);
     set({
       activeSessionId: sessionId,
       messages: [],
@@ -1449,7 +1458,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     if (get().activeSessionId !== sessionId) {
       return;
     }
+    clearComposerProgressPollTimer();
+    clearInflightMessagesPollTimer();
     advanceGuidedPublicationGeneration();
+    useBlobStore.getState().activateSession(null);
     set({
       activeSessionId: null,
       messages: [],
@@ -2149,6 +2161,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (!get().sessions.some((session) => session.id === result.session_id)) {
         throw new Error("Published fork result disappeared during hydration");
       }
+      if (get().activeSessionId !== activeSessionId) {
+        clearGuidedRetry(retry);
+        return;
+      }
+      useBlobStore.getState().activateSession(result.session_id);
       let activatedChild = false;
       set((state) => {
         if (state.activeSessionId !== activeSessionId) {
@@ -2624,6 +2641,33 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         };
       }
       const apiErr = err as ApiError;
+
+      // A source file can leave the ready lifecycle between the user's click
+      // and the authoritative guided response. Refresh the live blob rows so
+      // ChatPanel immediately invalidates that candidate, but preserve the
+      // backend rejection as the actionable error below. Match the two exact
+      // lifecycle details only: unrelated guided 400s must not churn files.
+      if (
+        apiErr.status === 400 &&
+        "source_blob_id" in body &&
+        typeof body.source_blob_id === "string" &&
+        apiErr.detail !== undefined &&
+        GUIDED_SOURCE_BLOB_LIFECYCLE_REJECTIONS.has(apiErr.detail)
+      ) {
+        try {
+          await useBlobStore.getState().loadBlobs(requestedSessionId);
+        } catch {
+          // Blob refresh is corrective projection only. Its failure must not
+          // replace or hide the original guided lifecycle rejection.
+        }
+        if (get().activeSessionId !== requestedSessionId) {
+          return {
+            status: "not_applied",
+            reason: "stale",
+            message: GUIDED_RESPONSE_STALE_MESSAGE,
+          };
+        }
+      }
 
       // C-3 self-heal: "turn_not_emitted" means the client's view of the
       // current turn was stale (guided.py's respond handler couldn't find an
@@ -3504,6 +3548,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearInflightMessagesPollTimer();
     clearAllGuidedRetries();
     advanceGuidedPublicationGeneration();
+    useBlobStore.getState().activateSession(null);
     // composeTimeoutReady resets to false via initialState; App.checkHealth
     // re-latches it on re-authentication. The module ceiling (composeTimeoutMs)
     // is a backend property that harmlessly persists — it is only read while

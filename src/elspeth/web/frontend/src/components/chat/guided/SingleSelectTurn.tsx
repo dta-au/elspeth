@@ -19,7 +19,7 @@
 // single_select and multi_select_with_custom. Schema-form and
 // pipeline-proposal turns establish their own structures.
 
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import type {
   GuidedRespondAction,
   GuidedSourceBlobCandidate,
@@ -62,6 +62,10 @@ interface SingleSelectTurnProps {
   onSubmit: (body: GuidedRespondAction) => void;
   /** Ready uploads associated with the exact owning Step-1 source turn. */
   sourceBlobCandidates?: readonly GuidedSourceBlobCandidate[];
+  /** This exact turn requires the user to make a fresh source-file choice. */
+  sourceBlobChoiceRequired?: boolean;
+  /** Gates only actions that can bind an in-flight source upload. */
+  sourceUploadPending?: boolean;
   disabled?: boolean;
   /**
    * Tutorial mode is passive — the per-stage prompt is built by pressing Send,
@@ -76,11 +80,24 @@ export function SingleSelectTurn({
   payload,
   onSubmit,
   sourceBlobCandidates = NO_SOURCE_BLOB_CANDIDATES,
+  sourceBlobChoiceRequired = false,
+  sourceUploadPending = false,
   disabled = false,
   isTutorial = false,
 }: SingleSelectTurnProps) {
   const [customText, setCustomText] = useState("");
   const [selectedSourceBlobId, setSelectedSourceBlobId] = useState("");
+
+  useEffect(() => {
+    if (
+      selectedSourceBlobId !== "" &&
+      !sourceBlobCandidates.some(
+        (candidate) => candidate.id === selectedSourceBlobId,
+      )
+    ) {
+      setSelectedSourceBlobId("");
+    }
+  }, [selectedSourceBlobId, sourceBlobCandidates]);
 
   // useId scopes DOM IDs per-instance so multiple SingleSelectTurns rendered
   // simultaneously (e.g. active turn + GuidedHistory replay in Task 7.9) don't
@@ -97,11 +114,14 @@ export function SingleSelectTurn({
   )
     ? selectedSourceBlobId
     : "";
+  const explicitSourceBlobChoiceRequired =
+    sourceBlobChoiceRequired || sourceBlobCandidates.length > 1;
   const sourceBlobId =
-    sourceBlobCandidates.length === 1
+    sourceBlobCandidates.length === 1 && !explicitSourceBlobChoiceRequired
       ? sourceBlobCandidates[0].id
       : validSelectedSourceBlobId || undefined;
-  const sourceFileChoiceRequired = sourceBlobCandidates.length > 1 && sourceBlobId === undefined;
+  const sourceFileChoiceRequired =
+    explicitSourceBlobChoiceRequired && sourceBlobId === undefined;
 
   function handleOptionClick(optionId: string) {
     onSubmit({
@@ -132,7 +152,8 @@ export function SingleSelectTurn({
 
   return (
     <div className="guided-turn guided-single-select">
-      {sourceBlobCandidates.length > 1 && (
+      {(sourceBlobCandidates.length > 1 ||
+        (sourceBlobChoiceRequired && sourceBlobCandidates.length > 0)) && (
         <div className="guided-source-file-choice">
           <label htmlFor={sourceFileSelectId} className="guided-custom-label">
             Source file
@@ -141,7 +162,7 @@ export function SingleSelectTurn({
             id={sourceFileSelectId}
             className="guided-custom-input"
             value={validSelectedSourceBlobId}
-            disabled={disabled}
+            disabled={disabled || sourceUploadPending}
             aria-describedby={sourceFileHintId}
             onChange={(event) => setSelectedSourceBlobId(event.target.value)}
           >
@@ -185,7 +206,9 @@ export function SingleSelectTurn({
                   className="guided-chip-btn"
                   onClick={() => handleOptionClick(option.id)}
                   aria-describedby={hintId}
-                  disabled={disabled || sourceFileChoiceRequired}
+                  disabled={
+                    disabled || sourceUploadPending || sourceFileChoiceRequired
+                  }
                 >
                   {option.label}
                 </button>

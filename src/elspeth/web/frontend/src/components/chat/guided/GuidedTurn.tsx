@@ -35,6 +35,10 @@ interface GuidedTurnProps {
   onSubmit: (body: GuidedRespondAction) => void;
   /** Ready uploads associated with this exact Step-1 single-select turn. */
   sourceBlobCandidates?: readonly GuidedSourceBlobCandidate[];
+  /** This exact turn requires the user to make a fresh source-file choice. */
+  sourceBlobChoiceRequired?: boolean;
+  /** Gates only Step-1 actions that can bind an in-flight source upload. */
+  sourceUploadPending?: boolean;
   disabled?: boolean;
   /** Tutorial mode — forwarded to leaf widgets that surface worked-example
    * teaching copy (e.g. SchemaFormTurn's on_validation_failure caveat). */
@@ -61,6 +65,8 @@ export function GuidedTurn({
   turn,
   onSubmit,
   sourceBlobCandidates,
+  sourceBlobChoiceRequired = false,
+  sourceUploadPending = false,
   disabled = false,
   isTutorial = false,
   wirePendingAcknowledgements,
@@ -94,6 +100,8 @@ export function GuidedTurn({
           payload={turn.payload}
           onSubmit={guardedSubmit}
           sourceBlobCandidates={sourceBlobCandidates}
+          sourceBlobChoiceRequired={sourceBlobChoiceRequired}
+          sourceUploadPending={sourceUploadPending}
           disabled={disabled}
           isTutorial={isTutorial}
         />

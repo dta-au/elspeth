@@ -21,6 +21,11 @@ const MockGuidedResponseReceiptError = vi.hoisted(() => class extends Error {
   }
 });
 
+const blobStoreMocks = vi.hoisted(() => ({
+  activateSession: vi.fn(),
+  loadBlobs: vi.fn(),
+}));
+
 // Mock the API client — store tests verify state logic, not HTTP calls.
 // Must include all exports used by sessionStore (not just guided ones).
 vi.mock("@/api/client", () => ({
@@ -65,7 +70,7 @@ vi.mock("./executionStore", () => ({
 // Without this, the real blobStore makes HTTP calls against jsdom.
 vi.mock("./blobStore", () => ({
   useBlobStore: {
-    getState: () => ({ loadBlobs: vi.fn() }),
+    getState: () => blobStoreMocks,
   },
 }));
 
@@ -3552,6 +3557,73 @@ describe("sessionStore — guided-mode fields and actions", () => {
   });
 
   describe("respondGuided rejection surfacing (elspeth-3b35abf148 variant 3)", () => {
+    it.each([
+      "Selected source blob is no longer a ready upload for this session.",
+      "Selected source blob is not a ready upload for this session.",
+    ])(
+      "refreshes source candidates while preserving lifecycle rejection: %s",
+      async (detail) => {
+        const { respondGuided } = await import("@/api/client");
+        (respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+          status: 400,
+          detail,
+        });
+        useSessionStore.setState({
+          activeSessionId: RETRY_SESSION_ID,
+          guidedSession: sampleGuidedSession,
+          guidedNextTurn: sampleNextTurn,
+        });
+
+        const outcome = await useSessionStore.getState().respondGuided({
+          chosen: ["csv"],
+          source_blob_id: "00000000-0000-4000-8000-000000000901",
+          edited_values: null,
+          custom_inputs: null,
+          proposal_id: null,
+          draft_hash: null,
+          edit_target: null,
+          control_signal: null,
+        });
+
+        expect(blobStoreMocks.loadBlobs).toHaveBeenCalledWith(RETRY_SESSION_ID);
+        expect(outcome).toEqual({
+          status: "not_applied",
+          reason: "rejected",
+          message: detail,
+        });
+        expect(useSessionStore.getState().error).toBe(detail);
+        expect(useSessionStore.getState().guidedResponsePending).toBe(false);
+      },
+    );
+
+    it("does not refresh blobs for an unrelated guided 400", async () => {
+      const detail = "A different guided validation failed.";
+      const { respondGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 400,
+        detail,
+      });
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      await useSessionStore.getState().respondGuided({
+        chosen: ["csv"],
+        source_blob_id: "00000000-0000-4000-8000-000000000901",
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      });
+
+      expect(blobStoreMocks.loadBlobs).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().error).toBe(detail);
+    });
+
     it("surfaces a structured wire_confirm_rejected 409 as error + errorDetails", async () => {
       const { getGuided, respondGuided } = await import("@/api/client");
       (respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({

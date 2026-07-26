@@ -8,8 +8,20 @@ import {
   OPEN_YAML_MODAL_EVENT,
 } from "@/lib/composer-events";
 import { resetStore } from "@/test/store-helpers";
+import * as apiClient from "@/api/client";
+import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useHashRouter } from "./useHashRouter";
+
+vi.mock("@/api/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/client")>();
+  return {
+    ...actual,
+    uploadBlob: vi.fn(),
+    fetchComposerProgress: vi.fn(),
+    fetchMessages: vi.fn(),
+  };
+});
 
 vi.mock("@/components/inspector/GraphView", () => ({
   GraphView: () => createElement("div", { "data-testid": "graph-view-stub" }),
@@ -28,9 +40,19 @@ function nonEmptyCompositionState() {
   };
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 describe("useHashRouter Phase 3B fragment migration", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    vi.mocked(apiClient.uploadBlob).mockReset();
     window.history.replaceState(null, "", window.location.pathname);
     useSessionStore.setState({
       sessions: [{ id: "sess-1", title: "Session 1" } as never],
@@ -187,6 +209,8 @@ describe("useHashRouter — Batch 2 fixes", () => {
 
   beforeEach(() => {
     resetStore(useSessionStore);
+    vi.mocked(apiClient.fetchComposerProgress).mockReset();
+    vi.mocked(apiClient.fetchMessages).mockReset();
     window.history.replaceState(null, "", window.location.pathname);
     localStorage.removeItem(TOAST_KEY);
     useSessionStore.setState({
@@ -449,6 +473,160 @@ describe("useHashRouter — Batch 2 fixes", () => {
 
     expect(window.location.hash).toBe("");
     expect(useSessionStore.getState().activeSessionId).toBeNull();
+  });
+
+  it("popstate to an empty hash stops both old-session pollers", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(apiClient.fetchComposerProgress).mockResolvedValue({
+        session_id: "sess-1",
+        request_id: "request-1",
+        phase: "using_tools",
+        headline: "Working",
+        evidence: [],
+        likely_next: null,
+        reason: null,
+        updated_at: "2026-07-26T10:00:00Z",
+      });
+      vi.mocked(apiClient.fetchMessages).mockResolvedValue([]);
+      useSessionStore.setState({
+        sessions: [{ id: "sess-1", title: "Session 1" } as never],
+        activeSessionId: "sess-1",
+        selectSession: vi.fn(),
+      } as never);
+      useSessionStore.getState().startComposerProgressPolling("sess-1");
+      useSessionStore.getState().startInflightMessagesPolling("sess-1");
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(apiClient.fetchComposerProgress).toHaveBeenCalledTimes(2);
+      expect(apiClient.fetchMessages).toHaveBeenCalledTimes(1);
+
+      window.history.replaceState(null, "", "#/sess-1");
+      renderHook(() => useHashRouter());
+      await act(async () => {
+        window.history.replaceState(null, "", window.location.pathname);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      const progressCallsAtUnbind = vi.mocked(apiClient.fetchComposerProgress)
+        .mock.calls.length;
+      const messageCallsAtUnbind = vi.mocked(apiClient.fetchMessages).mock.calls
+        .length;
+
+      await vi.advanceTimersByTimeAsync(4500);
+      expect(apiClient.fetchComposerProgress).toHaveBeenCalledTimes(
+        progressCallsAtUnbind,
+      );
+      expect(apiClient.fetchMessages).toHaveBeenCalledTimes(messageCallsAtUnbind);
+    } finally {
+      resetStore(useSessionStore);
+      vi.useRealTimers();
+    }
+  });
+
+  it("missing-session hydration stops both old-session pollers", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(apiClient.fetchComposerProgress).mockResolvedValue({
+        session_id: "missing-session",
+        request_id: "request-missing",
+        phase: "using_tools",
+        headline: "Working",
+        evidence: [],
+        likely_next: null,
+        reason: null,
+        updated_at: "2026-07-26T10:00:00Z",
+      });
+      vi.mocked(apiClient.fetchMessages).mockResolvedValue([]);
+      useSessionStore.setState({
+        sessions: [],
+        activeSessionId: "missing-session",
+        selectSession: vi.fn(),
+      } as never);
+      useSessionStore
+        .getState()
+        .startComposerProgressPolling("missing-session");
+      useSessionStore.getState().startInflightMessagesPolling("missing-session");
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(apiClient.fetchComposerProgress).toHaveBeenCalledTimes(2);
+      expect(apiClient.fetchMessages).toHaveBeenCalledTimes(1);
+
+      window.history.replaceState(null, "", "#/missing-session");
+      renderHook(() => useHashRouter());
+      await act(async () => {
+        useSessionStore.setState({
+          sessions: [{ id: "sess-1", title: "Session 1" } as never],
+        });
+      });
+      expect(useSessionStore.getState().activeSessionId).toBeNull();
+      const progressCallsAtUnbind = vi.mocked(apiClient.fetchComposerProgress)
+        .mock.calls.length;
+      const messageCallsAtUnbind = vi.mocked(apiClient.fetchMessages).mock.calls
+        .length;
+
+      await vi.advanceTimersByTimeAsync(4500);
+      expect(apiClient.fetchComposerProgress).toHaveBeenCalledTimes(
+        progressCallsAtUnbind,
+      );
+      expect(apiClient.fetchMessages).toHaveBeenCalledTimes(messageCallsAtUnbind);
+    } finally {
+      resetStore(useSessionStore);
+      vi.useRealTimers();
+    }
+  });
+
+  it("fences an A upload completion across router A-to-null-to-A navigation", async () => {
+    const upload = deferred<Awaited<ReturnType<typeof apiClient.uploadBlob>>>();
+    const uploaded = {
+      id: "00000000-0000-4000-8000-000000000911",
+      session_id: "sess-1",
+      filename: "stale.csv",
+      mime_type: "text/csv",
+      size_bytes: 12,
+      content_hash: "f".repeat(64),
+      created_at: "2026-07-26T09:00:00Z",
+      created_by: "user" as const,
+      source_description: null,
+      status: "ready" as const,
+      creation_modality: "verbatim" as const,
+      created_from_message_id: null,
+      creating_model_identifier: null,
+      creating_model_version: null,
+      creating_provider: null,
+      creating_composer_skill_hash: null,
+      creating_arguments_hash: null,
+    };
+    vi.mocked(apiClient.uploadBlob).mockReturnValueOnce(upload.promise);
+    useBlobStore.getState().activateSession("sess-1");
+    useSessionStore.setState({
+      sessions: [{ id: "sess-1", title: "Session 1" } as never],
+      activeSessionId: "sess-1",
+      selectSession: vi.fn((sessionId: string) => {
+        useBlobStore.getState().activateSession(sessionId);
+        useSessionStore.setState({ activeSessionId: sessionId });
+        return Promise.resolve();
+      }),
+    } as never);
+    window.history.replaceState(null, "", "#/sess-1");
+    renderHook(() => useHashRouter());
+    const pendingUpload = useBlobStore
+      .getState()
+      .uploadBlob("sess-1", new File(["stale"], "stale.csv"));
+
+    await act(async () => {
+      window.history.replaceState(null, "", window.location.pathname);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await act(async () => {
+      window.history.replaceState(null, "", "#/sess-1");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(useSessionStore.getState().activeSessionId).toBe("sess-1");
+
+    await act(async () => {
+      upload.resolve(uploaded);
+      await pendingUpload;
+    });
+
+    expect(useBlobStore.getState().blobs).toEqual([]);
   });
 
   // ── Two rapid hashchanges ────────────────────────────────────────────────
