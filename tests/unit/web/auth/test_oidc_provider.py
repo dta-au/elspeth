@@ -8,7 +8,9 @@ import time
 from unittest.mock import create_autospec, patch
 
 import httpx
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from structlog.testing import capture_logs
 
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity
@@ -49,6 +51,22 @@ def _valid_claims(overrides: dict[str, object] | None = None) -> dict[str, objec
     if overrides:
         claims.update(overrides)
     return claims
+
+
+def _jwks_with_kid(public_key: rsa.RSAPublicKey, kid: str) -> dict[str, object]:
+    """Build a one-key JWKS with an explicit rotation identifier."""
+    jwks = build_rsa_jwk(public_key)
+    keys = jwks["keys"]
+    assert isinstance(keys, list)
+    key = keys[0]
+    assert isinstance(key, dict)
+    key["kid"] = kid
+    return jwks
+
+
+def _token_with_kid(private_key: rsa.RSAPrivateKey, kid: str) -> str:
+    """Sign a valid token with an explicit rotation identifier."""
+    return jwt.encode(_valid_claims(), private_key, algorithm="RS256", headers={"kid": kid})
 
 
 @pytest.fixture
@@ -163,6 +181,218 @@ class TestOIDCDiscovery:
         with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client):
             identity = await provider.authenticate(token)
             assert identity.user_id == "user-123"
+
+
+class TestOIDCSigningKeyRotation:
+    """An unknown signing key triggers one shared, bounded refresh."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_unknown_kid_misses_share_one_refresh(self, rsa_keypair) -> None:
+        old_private_key, old_public_key = rsa_keypair
+        new_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        new_public_key = new_private_key.public_key()
+        old_jwks = _jwks_with_kid(old_public_key, "old-key")
+        rotated_jwks = _jwks_with_kid(new_public_key, "rotated-key")
+        old_token = _token_with_kid(old_private_key, "old-key")
+        rotated_token = _token_with_kid(new_private_key, "rotated-key")
+        provider = OIDCAuthProvider(issuer=ISSUER, audience=AUDIENCE)
+
+        active_jwks = old_jwks
+        refresh_started = asyncio.Event()
+        all_callers_missed = asyncio.Event()
+        release_refresh = asyncio.Event()
+        discovery_fetches = 0
+        jwks_fetches = 0
+
+        async def rotating_get(url, **kwargs):
+            nonlocal discovery_fetches, jwks_fetches
+            if ".well-known/openid-configuration" in url:
+                discovery_fetches += 1
+                if active_jwks is rotated_jwks:
+                    refresh_started.set()
+                    await release_refresh.wait()
+                return _http_response({"jwks_uri": f"{ISSUER}/keys", "issuer": ISSUER})
+            jwks_fetches += 1
+            return _http_response(active_jwks)
+
+        client = create_autospec(httpx.AsyncClient, instance=True)
+        client.get = rotating_get
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = False
+
+        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+            assert (await provider.authenticate(old_token)).user_id == "user-123"
+            discovery_fetches = 0
+            jwks_fetches = 0
+            active_jwks = rotated_jwks
+            decode_calls = 0
+            original_decode = provider._validator.decode_token
+
+            def counted_decode(token, jwks):
+                nonlocal decode_calls
+                decode_calls += 1
+                if decode_calls == 6:
+                    all_callers_missed.set()
+                return original_decode(token, jwks)
+
+            with patch.object(provider._validator, "decode_token", side_effect=counted_decode):
+                callers = [asyncio.create_task(provider.authenticate(rotated_token)) for _ in range(6)]
+                await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
+                await asyncio.wait_for(all_callers_missed.wait(), timeout=1.0)
+                release_refresh.set()
+                identities = await asyncio.gather(*callers)
+
+        assert [identity.user_id for identity in identities] == ["user-123"] * 6
+        assert discovery_fetches == 1
+        assert jwks_fetches == 1
+        assert decode_calls == 12
+
+    @pytest.mark.asyncio
+    async def test_cancelled_refresh_winner_allows_follower_to_replace_it(self, rsa_keypair) -> None:
+        old_private_key, old_public_key = rsa_keypair
+        new_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        old_jwks = _jwks_with_kid(old_public_key, "old-key")
+        rotated_jwks = _jwks_with_kid(new_private_key.public_key(), "rotated-key")
+        old_token = _token_with_kid(old_private_key, "old-key")
+        rotated_token = _token_with_kid(new_private_key, "rotated-key")
+        provider = OIDCAuthProvider(
+            issuer=ISSUER,
+            audience=AUDIENCE,
+            jwks_failure_retry_seconds=60,
+        )
+        active_jwks = old_jwks
+        cancelled_refresh_started = asyncio.Event()
+        never_complete_cancelled_refresh = asyncio.Event()
+        follower_missed_old_cache = asyncio.Event()
+        cancellation_armed = False
+        discovery_fetches = 0
+        jwks_fetches = 0
+
+        async def cancelling_get(url, **kwargs):
+            nonlocal discovery_fetches, jwks_fetches
+            if ".well-known/openid-configuration" in url:
+                discovery_fetches += 1
+                if cancellation_armed and discovery_fetches == 1:
+                    cancelled_refresh_started.set()
+                    await never_complete_cancelled_refresh.wait()
+                return _http_response({"jwks_uri": f"{ISSUER}/keys", "issuer": ISSUER})
+            jwks_fetches += 1
+            return _http_response(active_jwks)
+
+        client = create_autospec(httpx.AsyncClient, instance=True)
+        client.get = cancelling_get
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = False
+
+        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+            assert (await provider.authenticate(old_token)).user_id == "user-123"
+            discovery_fetches = 0
+            jwks_fetches = 0
+            active_jwks = rotated_jwks
+            cancellation_armed = True
+            decode_calls = 0
+            original_decode = provider._validator.decode_token
+
+            def counted_decode(token, jwks):
+                nonlocal decode_calls
+                decode_calls += 1
+                if decode_calls == 2:
+                    follower_missed_old_cache.set()
+                return original_decode(token, jwks)
+
+            with patch.object(provider._validator, "decode_token", side_effect=counted_decode):
+                winner = asyncio.create_task(provider.authenticate(rotated_token))
+                await asyncio.wait_for(cancelled_refresh_started.wait(), timeout=1.0)
+                follower = asyncio.create_task(provider.authenticate(rotated_token))
+                await asyncio.wait_for(follower_missed_old_cache.wait(), timeout=1.0)
+
+                winner.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await winner
+                identity = await asyncio.wait_for(follower, timeout=1.0)
+
+        assert identity.user_id == "user-123"
+        assert discovery_fetches == 2
+        assert jwks_fetches == 1
+        assert decode_calls == 3
+
+    @pytest.mark.asyncio
+    async def test_unknown_kid_retries_decode_once_then_fails_closed(self, rsa_keypair) -> None:
+        old_private_key, old_public_key = rsa_keypair
+        missing_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        old_jwks = _jwks_with_kid(old_public_key, "old-key")
+        old_token = _token_with_kid(old_private_key, "old-key")
+        missing_token = _token_with_kid(missing_private_key, "missing-key")
+        provider = OIDCAuthProvider(issuer=ISSUER, audience=AUDIENCE)
+        active_jwks = old_jwks
+        discovery_fetches = 0
+
+        async def unchanged_get(url, **kwargs):
+            nonlocal discovery_fetches
+            if ".well-known/openid-configuration" in url:
+                discovery_fetches += 1
+                return _http_response({"jwks_uri": f"{ISSUER}/keys", "issuer": ISSUER})
+            return _http_response(active_jwks)
+
+        client = create_autospec(httpx.AsyncClient, instance=True)
+        client.get = unchanged_get
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = False
+
+        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+            assert (await provider.authenticate(old_token)).user_id == "user-123"
+            discovery_fetches = 0
+            decode_calls = 0
+            original_decode = provider._validator.decode_token
+
+            def counted_decode(token, jwks):
+                nonlocal decode_calls
+                decode_calls += 1
+                return original_decode(token, jwks)
+
+            with patch.object(provider._validator, "decode_token", side_effect=counted_decode):
+                with pytest.raises(AuthenticationError, match="signing key"):
+                    await provider.authenticate(missing_token)
+                # Repeated invalid tokens must not turn successful-but-unchanged
+                # JWKS responses into an unbounded IdP request amplifier.
+                with pytest.raises(AuthenticationError, match="signing key"):
+                    await provider.authenticate(missing_token)
+
+        assert discovery_fetches == 1
+        assert decode_calls == 4
+
+    @pytest.mark.asyncio
+    async def test_get_user_info_refreshes_unknown_kid(self, rsa_keypair) -> None:
+        old_private_key, old_public_key = rsa_keypair
+        new_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        old_jwks = _jwks_with_kid(old_public_key, "old-key")
+        rotated_jwks = _jwks_with_kid(new_private_key.public_key(), "rotated-key")
+        old_token = _token_with_kid(old_private_key, "old-key")
+        rotated_token = _token_with_kid(new_private_key, "rotated-key")
+        provider = OIDCAuthProvider(issuer=ISSUER, audience=AUDIENCE)
+        active_jwks = old_jwks
+        discovery_fetches = 0
+
+        async def rotating_get(url, **kwargs):
+            nonlocal discovery_fetches
+            if ".well-known/openid-configuration" in url:
+                discovery_fetches += 1
+                return _http_response({"jwks_uri": f"{ISSUER}/keys", "issuer": ISSUER})
+            return _http_response(active_jwks)
+
+        client = create_autospec(httpx.AsyncClient, instance=True)
+        client.get = rotating_get
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = False
+
+        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+            assert (await provider.authenticate(old_token)).user_id == "user-123"
+            discovery_fetches = 0
+            active_jwks = rotated_jwks
+            profile = await provider.get_user_info(rotated_token)
+
+        assert profile.user_id == "user-123"
+        assert discovery_fetches == 1
 
 
 class TestOIDCTokenValidation:

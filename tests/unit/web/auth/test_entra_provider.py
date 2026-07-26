@@ -6,11 +6,13 @@ import time
 from dataclasses import dataclass
 from unittest.mock import patch
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from elspeth.web.auth.entra import EntraAuthProvider
 from elspeth.web.auth.models import AuthenticationError
-from tests.unit.web.auth.conftest import make_rs256_token
+from tests.unit.web.auth.conftest import build_rsa_jwk, make_rs256_token
 
 TENANT_ID = "00000000-aaaa-bbbb-cccc-111111111111"
 AUDIENCE = "my-entra-app-id"
@@ -30,7 +32,9 @@ class _DiscoveryResponse:
 
 class _DiscoveryAsyncClient:
     def __init__(self, jwks_response: dict[str, object]) -> None:
-        self._jwks_response = jwks_response
+        self.jwks_response = jwks_response
+        self.discovery_fetches = 0
+        self.jwks_fetches = 0
 
     async def __aenter__(self) -> _DiscoveryAsyncClient:
         return self
@@ -40,6 +44,7 @@ class _DiscoveryAsyncClient:
 
     async def get(self, url: str, **kwargs: object) -> _DiscoveryResponse:
         if ".well-known/openid-configuration" in url:
+            self.discovery_fetches += 1
             return _DiscoveryResponse(
                 {
                     "jwks_uri": f"{ISSUER}/discovery/v2.0/keys",
@@ -47,7 +52,8 @@ class _DiscoveryAsyncClient:
                 }
             )
         if "keys" in url:
-            return _DiscoveryResponse(self._jwks_response)
+            self.jwks_fetches += 1
+            return _DiscoveryResponse(self.jwks_response)
         raise AssertionError(f"Unexpected discovery URL: {url}")
 
 
@@ -66,6 +72,20 @@ def _valid_entra_claims(overrides: dict[str, object] | None = None) -> dict[str,
     if overrides:
         claims.update(overrides)
     return claims
+
+
+def _jwks_with_kid(public_key: rsa.RSAPublicKey, kid: str) -> dict[str, object]:
+    jwks = build_rsa_jwk(public_key)
+    keys = jwks["keys"]
+    assert isinstance(keys, list)
+    key = keys[0]
+    assert isinstance(key, dict)
+    key["kid"] = kid
+    return jwks
+
+
+def _token_with_kid(private_key: rsa.RSAPrivateKey, kid: str) -> str:
+    return jwt.encode(_valid_entra_claims(), private_key, algorithm="RS256", headers={"kid": kid})
 
 
 @pytest.fixture
@@ -187,6 +207,34 @@ class TestEntraTenantValidation:
         with mock_httpx_discovery:
             identity = await provider.authenticate(token)
         assert identity.username == "entra-user-456"
+
+
+class TestEntraSigningKeyRotation:
+    """Every Entra token-decode path refreshes a rotated signing key."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["authenticate", "get_user_info"])
+    async def test_unknown_kid_refreshes_shared_validator_cache(self, rsa_keypair, operation: str) -> None:
+        old_private_key, old_public_key = rsa_keypair
+        new_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        old_jwks = _jwks_with_kid(old_public_key, "old-key")
+        rotated_jwks = _jwks_with_kid(new_private_key.public_key(), "rotated-key")
+        old_token = _token_with_kid(old_private_key, "old-key")
+        rotated_token = _token_with_kid(new_private_key, "rotated-key")
+        provider = EntraAuthProvider(tenant_id=TENANT_ID, audience=AUDIENCE)
+        client = _DiscoveryAsyncClient(old_jwks)
+
+        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+            assert (await provider.authenticate(old_token)).user_id == "entra-user-456"
+            client.discovery_fetches = 0
+            client.jwks_fetches = 0
+            client.jwks_response = rotated_jwks
+
+            result = await getattr(provider, operation)(rotated_token)
+
+        assert result.user_id == "entra-user-456"
+        assert client.discovery_fetches == 1
+        assert client.jwks_fetches == 1
 
 
 class TestEntraGroupClaims:

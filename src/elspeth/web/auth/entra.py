@@ -99,8 +99,7 @@ class EntraAuthProvider:
         Performs standard OIDC validation (signature, expiry, issuer,
         audience) via JWKSTokenValidator, then checks the tenant claim.
         """
-        jwks = await self._validator.ensure_jwks()
-        payload = self._validator.decode_token(token, jwks)
+        payload = dict(await self._validator.decode_token_with_refresh(token))
 
         self._validate_tenant(payload)
 
@@ -118,8 +117,7 @@ class EntraAuthProvider:
 
     async def get_user_info(self, token: str) -> UserProfile:
         """Decode an Entra ID token and extract profile with group claims."""
-        jwks = await self._validator.ensure_jwks()
-        payload = self._validator.decode_token(token, jwks)
+        payload = dict(await self._validator.decode_token_with_refresh(token))
 
         self._validate_tenant(payload)
 

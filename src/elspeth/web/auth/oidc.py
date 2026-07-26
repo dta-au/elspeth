@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping
 from typing import Any, Literal, NoReturn, cast
 
 import httpx
@@ -22,6 +23,10 @@ from elspeth.web.auth.urls import validate_oidc_issuer
 from elspeth.web.validation import has_visible_content
 
 slog = structlog.get_logger()
+
+
+class _UnknownSigningKeyError(AuthenticationError):
+    """Internal signal that cached JWKS did not contain the token's kid."""
 
 
 @trust_boundary(
@@ -89,6 +94,9 @@ class JWKSTokenValidator:
         self._jwks: dict[str, Any] | None = None
         self._jwks_last_success_at: float | None = None
         self._jwks_refresh_failed = False
+        # Unknown token key IDs may force one refresh before the normal TTL,
+        # but cannot turn repeated invalid tokens into unbounded IdP traffic.
+        self._next_key_miss_refresh_at: float = 0.0
         # Separate "when should we try to refresh next" from "when did we
         # last succeed." A successful fetch sets this to now+ttl; a failure
         # that serves stale cache sets this to now+failure_retry so concurrent
@@ -230,7 +238,11 @@ class JWKSTokenValidator:
             return alg
         return None
 
-    async def ensure_jwks(self) -> dict[str, Any]:
+    async def ensure_jwks(
+        self,
+        *,
+        refresh_if_unchanged: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Fetch and cache JWKS keys from the OIDC discovery endpoint.
 
         Uses double-checked locking to prevent thundering herd at TTL
@@ -258,9 +270,18 @@ class JWKSTokenValidator:
         while ``self._jwks is None and now < self._next_refresh_at`` —
         means only the first request per retry window pays the network
         cost, and the rest fail fast with 503 until the horizon passes.
+
+        ``refresh_if_unchanged`` requests one forced refresh after a token
+        references an unknown signing key. These callers wait on the normal
+        refresh lock because the cached keys are known to be insufficient.
+        After acquiring the lock, a caller reuses any cache replacement made
+        by the winner instead of fetching again. Successful key-miss refreshes
+        also use the failure-retry interval as a short cooldown, preventing
+        repeated invalid key IDs from amplifying IdP traffic.
         """
         now = time.monotonic()
-        if self._jwks is not None and now < self._next_refresh_at:
+        force_refresh = refresh_if_unchanged is not None
+        if not force_refresh and self._jwks is not None and now < self._next_refresh_at:
             if self._cached_jwks_within_max_stale_age(now):
                 return self._jwks
             # A failure retry window remains load-bearing even after cached
@@ -278,7 +299,7 @@ class JWKSTokenValidator:
         # timestamp is the single source of truth for "are we in a
         # throttle window" — see the failure branches below for where
         # it is advanced on both network and shape failures.
-        if self._jwks is None and now < self._next_refresh_at:
+        if not force_refresh and self._jwks is None and now < self._next_refresh_at:
             raise AuthProviderUnavailable("JWKS unavailable (cold-start fetch failed, retry throttled)")
 
         # Lock-decoupled stale-serve: if another coroutine is already
@@ -289,7 +310,7 @@ class JWKSTokenValidator:
         # best-effort: if the lock is released between the check and our
         # acquire call, we fall through to the normal double-checked
         # locking path and the re-check inside the lock is authoritative.
-        if self._jwks is not None and self._jwks_lock.locked():
+        if not force_refresh and self._jwks is not None and self._jwks_lock.locked():
             if self._cached_jwks_within_max_stale_age(now):
                 return self._jwks
             self._raise_max_stale_age_exceeded()
@@ -297,7 +318,22 @@ class JWKSTokenValidator:
         async with self._jwks_lock:
             # Re-check inside lock (another coroutine may have refreshed)
             now = time.monotonic()
-            if self._jwks is not None and now < self._next_refresh_at:
+            if refresh_if_unchanged is not None:
+                current_jwks = self._jwks
+                if current_jwks is None:
+                    raise AuthProviderUnavailable("JWKS unavailable (cache cleared during refresh)")
+                if current_jwks is not refresh_if_unchanged:
+                    return current_jwks
+                # A failed key-miss refresh uses the existing retry horizon.
+                # Followers share the failed attempt and retry decode with the
+                # same stale cache rather than serially re-hitting the IdP.
+                if self._jwks_refresh_failed and now < self._next_refresh_at:
+                    if self._cached_jwks_within_max_stale_age(now):
+                        return current_jwks
+                    self._raise_max_stale_age_exceeded()
+                if now < self._next_key_miss_refresh_at and self._cached_jwks_within_max_stale_age(now):
+                    return current_jwks
+            elif self._jwks is not None and now < self._next_refresh_at:
                 if self._cached_jwks_within_max_stale_age(now):
                     return self._jwks
                 if self._jwks_refresh_failed:
@@ -308,7 +344,7 @@ class JWKSTokenValidator:
             # the fail-fast check here so lock-queued cold-start requests
             # don't re-hit the dead IdP when the first coroutine releases
             # the lock after raising.
-            if self._jwks is None and now < self._next_refresh_at:
+            if not force_refresh and self._jwks is None and now < self._next_refresh_at:
                 raise AuthProviderUnavailable("JWKS unavailable (cold-start fetch failed, retry throttled)")
 
             stale_jwks = self._jwks
@@ -330,6 +366,8 @@ class JWKSTokenValidator:
                     self._jwks_last_success_at = success_at
                     self._jwks_refresh_failed = False
                     self._next_refresh_at = success_at + self._jwks_cache_ttl_seconds
+                    if refresh_if_unchanged is not None:
+                        self._next_key_miss_refresh_at = success_at + self._jwks_failure_retry_seconds
             except AuthenticationError:
                 # Shape-validation failure — advance the refresh horizon
                 # by ``_jwks_failure_retry_seconds`` (the same throttle the
@@ -477,7 +515,7 @@ class JWKSTokenValidator:
                     matched_jwk = key
                     break
             if matched_jwk is None:
-                raise AuthenticationError("Invalid token: signing key check failed")
+                raise _UnknownSigningKeyError("Invalid token: signing key check failed")
             jwk_alg = self._get_jwk_algorithm(jwks, kid=kid)
             if jwk_alg is not None and jwk_alg != token_alg:
                 raise AuthenticationError("Invalid token: algorithm check failed")
@@ -512,6 +550,15 @@ class JWKSTokenValidator:
             raise AuthenticationError(f"Invalid token: {type(exc).__name__}") from exc
         return payload
 
+    async def decode_token_with_refresh(self, token: str) -> Mapping[str, Any]:
+        """Decode a token, refreshing JWKS once if its signing key is unknown."""
+        jwks = await self.ensure_jwks()
+        try:
+            return self.decode_token(token, jwks)
+        except _UnknownSigningKeyError:
+            refreshed_jwks = await self.ensure_jwks(refresh_if_unchanged=jwks)
+            return self.decode_token(token, refreshed_jwks)
+
 
 class OIDCAuthProvider:
     """Validates OIDC tokens via JWKS discovery."""
@@ -537,8 +584,7 @@ class OIDCAuthProvider:
 
     async def authenticate(self, token: str) -> UserIdentity:
         """Validate an OIDC token and return the authenticated identity."""
-        jwks = await self._validator.ensure_jwks()
-        payload = self._validator.decode_token(token, jwks)
+        payload = dict(await self._validator.decode_token_with_refresh(token))
 
         try:
             sub = payload["sub"]
@@ -572,8 +618,7 @@ class OIDCAuthProvider:
     )
     async def get_user_info(self, token: str) -> UserProfile:
         """Decode the OIDC token and extract profile claims."""
-        jwks = await self._validator.ensure_jwks()
-        payload = self._validator.decode_token(token, jwks)
+        payload = dict(await self._validator.decode_token_with_refresh(token))
 
         try:
             sub = payload["sub"]
