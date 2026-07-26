@@ -8,7 +8,6 @@ major line so a green local build cannot hide an older production toolchain.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +20,10 @@ NODE_ENGINE = ">=24 <25"
 NPM_ENGINE = ">=11 <12"
 PACKAGE_MANAGER = "npm@11.6.2"
 SETUP_NODE_REVISION = "820762786026740c76f36085b0efc47a31fe5020"
+IMAGE_NODE_VERSION = "24.18.0"
+IMAGE_NPM_VERSION = "11.6.2"
+IMAGE_NODE_BASE = "node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d"
+OLD_IMAGE_NODE_BASE = "node:24.13.0-bookworm-slim@sha256:4660b1ca8b28d6d1906fd644abe34b2ed81d15434d26d845ef0aced307cf4b6f"
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -73,12 +76,22 @@ def test_ci_and_release_image_build_with_node_24() -> None:
     assert {step["with"]["node-version"] for step in setup_steps} == {"24"}
 
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert re.search(
-        rf"^FROM node:{re.escape(NODE_VERSION)}-bookworm-slim@sha256:[0-9a-f]{{64}} AS frontend-builder$",
-        dockerfile,
-        flags=re.MULTILINE,
-    )
+    assert f"FROM {IMAGE_NODE_BASE} AS frontend-builder" in dockerfile
+    assert OLD_IMAGE_NODE_BASE not in dockerfile
     assert "FROM node:22" not in dockerfile
+
+
+def test_release_image_installs_and_verifies_exact_node_and_npm_versions() -> None:
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    npm_install = f"npm install --global npm@{IMAGE_NPM_VERSION}"
+    node_check = f'test "$(node --version)" = "v{IMAGE_NODE_VERSION}"'
+    npm_check = f'test "$(npm --version)" = "{IMAGE_NPM_VERSION}"'
+
+    assert npm_install in dockerfile
+    assert node_check in dockerfile
+    assert npm_check in dockerfile
+    assert dockerfile.index(npm_install) < dockerfile.index("RUN npm ci")
 
 
 def test_active_deployment_runbooks_require_node_24() -> None:

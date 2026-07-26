@@ -21,9 +21,15 @@ ARG INSTALL_EXTRAS="all"
 # =============================================================================
 # Stage 1: Frontend Builder
 # =============================================================================
-FROM node:24.13.0-bookworm-slim@sha256:4660b1ca8b28d6d1906fd644abe34b2ed81d15434d26d845ef0aced307cf4b6f AS frontend-builder
+FROM node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS frontend-builder
 
 WORKDIR /frontend
+
+# Keep the package manager as reproducible as the Node base on every target
+# architecture, and fail the build immediately if either runtime drifts.
+RUN npm install --global npm@11.6.2 && \
+    test "$(node --version)" = "v24.18.0" && \
+    test "$(npm --version)" = "11.6.2"
 
 # Install frontend dependencies from the lockfile first (layer caching)
 COPY src/elspeth/web/frontend/package.json src/elspeth/web/frontend/package-lock.json ./
@@ -68,7 +74,11 @@ RUN uv venv /opt/venv && \
 
 # Copy source code
 COPY src/ ./src/
-COPY README.md ./
+
+# Hatch requires the project readme while building metadata. Use fixed content
+# and an epoch timestamp so public README edits cannot alter release images.
+RUN printf '%s\n' '# ELSPETH package metadata' > README.md && \
+    touch --date=@0 README.md
 
 # Install the project from the lockfile (non-editable) with the same selected extras.
 RUN . /opt/venv/bin/activate && \
