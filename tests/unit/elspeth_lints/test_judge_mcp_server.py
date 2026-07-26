@@ -27,7 +27,7 @@ from elspeth_lints.core.allowlist import (
     JudgeVerdict,
     compute_judge_metadata_signature,
 )
-from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_AGENT, JudgeConfigurationError
+from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_CODEX_CLI, JudgeConfigurationError
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, read_bundle, write_bundle
 from elspeth_lints.mcp import server as judge_server
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
@@ -265,6 +265,9 @@ def test_stage_status_reads_bundle(tmp_path: Path) -> None:
     assert "sign-bundle" in payload["sign_bundle_command"]
     assert str(written) in payload["sign_bundle_command"]
     assert _JUDGE_METADATA_SIGNATURE_ENV_VAR in payload["sign_bundle_command"]
+    assert "--judge-transport codex-cli" in payload["sign_bundle_command"]
+    assert "--judge-tools readonly" in payload["sign_bundle_command"]
+    assert "--dry-run" in payload["sign_bundle_command"]
 
 
 def test_stage_status_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -451,8 +454,8 @@ def _fake_response(verdict: JudgeVerdict, rationale: str) -> SimpleNamespace:
     return SimpleNamespace(
         verdict=verdict,
         judge_rationale=rationale,
-        model_id="claude-agent-preview-model",
-        judge_transport=TRANSPORT_AGENT,
+        model_id="codex-preview-model",
+        judge_transport=TRANSPORT_CODEX_CLI,
     )
 
 
@@ -485,7 +488,7 @@ def test_stage_preview_fills_non_authoritative_verdicts(tmp_path: Path) -> None:
     # Read-only agent posture (defense-in-depth): the patched judge was reached
     # via the agent transport with exactly the read-only tool scope.
     assert mock_scope.called
-    assert mock_call.call_args.kwargs["transport"] == TRANSPORT_AGENT
+    assert mock_call.call_args.kwargs["transport"] == TRANSPORT_CODEX_CLI
     assert mock_call.call_args.kwargs["tool_scope"] is sentinel_scope
 
     bundle = read_bundle(staged_dir / f"{bundle_id}.json")
@@ -493,7 +496,7 @@ def test_stage_preview_fills_non_authoritative_verdicts(tmp_path: Path) -> None:
     assert previews and all(p is not None for p in previews)
     assert all(p.authoritative is False for p in previews)
     assert all(p.verdict == "ACCEPTED" for p in previews)
-    assert all(p.transport == TRANSPORT_AGENT for p in previews)
+    assert all(p.transport == TRANSPORT_CODEX_CLI for p in previews)
     # Bundle still serializes no signature.
     text = (staged_dir / f"{bundle_id}.json").read_text(encoding="utf-8")
     assert "judge_metadata_signature" not in text
@@ -536,24 +539,17 @@ def test_stage_preview_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest
     assert _JUDGE_METADATA_SIGNATURE_ENV_VAR in outcome.text
 
 
-def test_stage_preview_missing_judge_agent_extra_returns_actionable_hint(tmp_path: Path) -> None:
-    """Key ABSENT + ``[judge-agent]`` extra absent: ``call_judge`` raises the
-    SDK-install ``JudgeConfigurationError`` (judge.py wraps the import). The tool
-    must surface a clean, actionable error result -- not a crash -- and the
-    other key-free tools keep working.
-    """
+def test_stage_preview_missing_codex_cli_returns_actionable_hint(tmp_path: Path) -> None:
+    """Key absent + Codex CLI absent yields an actionable configuration error."""
     ctx, _staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
-    sdk_absent = JudgeConfigurationError(
-        "The claude-agent-sdk is required for --judge-transport agent. "
-        "Install with:\n\n    uv pip install -e 'elspeth-lints/[judge-agent]'\n"
-    )
+    codex_absent = JudgeConfigurationError("The Codex CLI is required for --judge-transport codex-cli.")
     with (
         patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()),
-        patch("elspeth_lints.core.judge.call_judge", side_effect=sdk_absent),
+        patch("elspeth_lints.core.judge.call_judge", side_effect=codex_absent),
     ):
         outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
     assert outcome.is_error is True
-    assert "judge-agent" in outcome.text  # actionable hint, not a raw traceback
+    assert "Codex CLI" in outcome.text
 
 
 def test_stage_preview_still_fails_closed_with_judge_agent_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

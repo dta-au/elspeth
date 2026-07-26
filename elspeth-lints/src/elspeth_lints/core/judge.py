@@ -28,13 +28,11 @@ Design constraints (from the prototype plan, all load-bearing):
   policy, silently coercing a malformed judge response into a
   default-shaped one would destroy the audit primitive's integrity.
 
-Transport: the judge calls Anthropic-family models via OpenRouter using
-the OpenAI-compatible chat-completions SDK. Project-wide standard. The
-OpenAI SDK is pointed at ``https://openrouter.ai/api/v1`` and uses the
-``OPENROUTER_API_KEY`` env var. Prompt caching uses Anthropic's
-``cache_control: {"type": "ephemeral"}`` markers, which OpenRouter
-forwards inline; cache-hit accounting comes back on
-``response.usage.prompt_tokens_details.cached_tokens``.
+Transports: the default calls Anthropic-family models via OpenRouter using the
+OpenAI-compatible chat-completions SDK. Local agent alternatives are explicit:
+the legacy Claude Agent SDK and an installed/authenticated Codex CLI. All three
+reduce their provider output to the same strict parsing/validation contract;
+the signed transport identity records which path produced a verdict.
 """
 
 from __future__ import annotations
@@ -43,6 +41,9 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
+import sys
+import tempfile
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,6 +64,7 @@ DEFAULT_JUDGE_MAX_TOKENS: int = 1024
 # registry below so the two can't drift.
 TRANSPORT_OPENROUTER: str = "openrouter"
 TRANSPORT_AGENT: str = "claude_agent_sdk"
+TRANSPORT_CODEX_CLI: str = "codex_cli"
 
 # Per-transport default model. CRITICAL: DEFAULT_JUDGE_MODEL is an OpenRouter
 # *routing slug* ("anthropic/claude-opus-4-7" — the vendor prefix is required
@@ -71,6 +73,7 @@ TRANSPORT_AGENT: str = "claude_agent_sdk"
 # will reject the slug. Each transport therefore has its own default; call_judge
 # resolves by transport when the caller passes no explicit model_id.
 DEFAULT_AGENT_JUDGE_MODEL: str = "claude-opus-4-7"  # confirm the SDK-accepted id post-install (Task 2)
+DEFAULT_CODEX_JUDGE_MODEL: str = "gpt-5.6-sol"
 
 # OpenRouter endpoint. The OpenAI SDK is pointed here rather than at
 # OpenAI's own endpoint so model identity (and therefore which family's
@@ -896,7 +899,7 @@ class JudgeResponse:
     the audit trail loses information if we coerce ``None`` to ``0``.
 
     ``judge_transport`` records which transport produced this verdict
-    (``"openrouter"`` or ``"claude_agent_sdk"``) and is bound into the
+    (``"openrouter"``, ``"claude_agent_sdk"``, or ``"codex_cli"``) and is bound into the
     HMAC-signed v2 allowlist payload (justify write + migrate + validator
     all sign it). "How the verdict was produced" is therefore verdict
     metadata bound to and tamper-evident with the verdict itself: a forged
@@ -1909,9 +1912,292 @@ def _is_agent_auth_error(exc: Exception) -> bool:
     return any(cls.__name__ in auth_names for cls in type(exc).__mro__)
 
 
+_CODEX_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "verdict": {"type": "string", "enum": ["ACCEPTED", "BLOCKED"]},
+        "rationale": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "should_use_decorator": {"type": ["string", "null"]},
+    },
+    "required": ["verdict", "rationale", "confidence", "should_use_decorator"],
+}
+
+# The Codex process must authenticate from its installed account state, not
+# from credentials held by the signing shell.  Keep this allowlist deliberately
+# small: the child needs executable discovery, its home/Codex home, locale, and
+# TLS trust roots.  Provider keys, HMAC keys, override tokens, cloud credentials,
+# proxy credentials, and arbitrary application env never cross the boundary.
+_CODEX_CHILD_ENV_NAMES: frozenset[str] = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TERM",
+        "TMPDIR",
+        "CODEX_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+)
+_CODEX_CLI_TIMEOUT_SECONDS: int = 600
+_CODEX_READONLY_MCP_TOOLS: tuple[str, ...] = ("read_file", "grep_files", "glob_files")
+
+
+def _codex_child_env() -> dict[str, str]:
+    """Return the minimal, signing-secret-free environment for ``codex exec``."""
+    child = {name: value for name, value in os.environ.items() if name in _CODEX_CHILD_ENV_NAMES or name.startswith("LC_")}
+    child["NO_COLOR"] = "1"
+    return child
+
+
+def _codex_prompt(request: JudgeRequest, *, tool_mode: bool) -> str:
+    """Render the shared judge policy + dynamic request for the Codex CLI."""
+    user_blocks = _build_user_message_blocks(request)
+    dynamic_text = "\n\n".join(block["text"] for block in user_blocks)
+    tool_addendum = (
+        _TOOL_MODE_ADDENDUM + "\nOn this Codex transport, Read/Grep/Glob are named "
+        "read_file/grep_files/glob_files on the elspeth_judge_tools MCP server.\n"
+        if tool_mode
+        else ""
+    )
+    return (
+        "Follow the ELSPETH judge policy below as the controlling task-specific "
+        "policy for this invocation. Do not propose a code fix. Your final "
+        "response must be only the JSON object required by the supplied output "
+        "schema.\n\n"
+        f"{_STATIC_POLICY_BLOCK}{tool_addendum}\n\n"
+        "JUDGE REQUEST\n\n"
+        f"{dynamic_text}"
+    )
+
+
+def _toml_string(value: str) -> str:
+    """Encode one string as a TOML basic string (JSON quoting is compatible)."""
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _codex_mcp_config_args(scope: AgentToolScope) -> list[str]:
+    """Build the sole MCP registration exposed to a tool-mode Codex judge."""
+    package_src = Path(__file__).resolve().parents[2]
+    server_args = [
+        "-m",
+        "elspeth_lints.mcp.codex_judge_tools",
+        "--cwd",
+        str(scope.cwd),
+        "--max-calls",
+        str(scope.max_turns),
+    ]
+    for root in scope.allowed_roots:
+        server_args.extend(["--allowed-root", str(root)])
+    pythonpath_table = "{ PYTHONPATH = " + _toml_string(str(package_src)) + " }"
+    enabled_tools = json.dumps(list(_CODEX_READONLY_MCP_TOOLS), ensure_ascii=True)
+    return [
+        "-c",
+        f"mcp_servers.elspeth_judge_tools.command={_toml_string(sys.executable)}",
+        "-c",
+        f"mcp_servers.elspeth_judge_tools.args={json.dumps(server_args, ensure_ascii=True)}",
+        "-c",
+        f"mcp_servers.elspeth_judge_tools.env={pythonpath_table}",
+        "-c",
+        f"mcp_servers.elspeth_judge_tools.enabled_tools={enabled_tools}",
+        "-c",
+        "mcp_servers.elspeth_judge_tools.required=true",
+        "-c",
+        'mcp_servers.elspeth_judge_tools.default_tools_approval_mode="approve"',
+    ]
+
+
+def _codex_failure_detail(stdout: str, stderr: str) -> str:
+    """Extract bounded diagnostic text without echoing the judge prompt."""
+    candidates: list[str] = []
+    for raw_line in stdout.splitlines():
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "error":
+            message = event.get("message")
+            if isinstance(message, str):
+                candidates.append(message)
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "error":
+            message = item.get("message")
+            if isinstance(message, str):
+                candidates.append(message)
+    if stderr.strip():
+        candidates.append(stderr.strip())
+    detail = " | ".join(candidates) or "no diagnostic text"
+    return detail[:1000]
+
+
+def _parse_codex_jsonl(stdout: str, *, requested_model: str) -> _TransportResult:
+    """Reduce ``codex exec --json`` events to the shared transport shape."""
+    final_text: str | None = None
+    usage: dict[str, Any] | None = None
+    for line_number, raw_line in enumerate(stdout.splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            raise JudgeContractError(f"Codex CLI emitted malformed JSONL at line {line_number}: {exc}") from exc
+        if not isinstance(event, dict):
+            raise JudgeContractError(f"Codex CLI JSONL event at line {line_number} must be an object; got {type(event).__name__}")
+        item = event.get("item")
+        if event.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise JudgeContractError("Codex CLI agent_message.text must be a string")
+            final_text = text
+        if event.get("type") == "turn.completed":
+            candidate = event.get("usage")
+            if not isinstance(candidate, dict):
+                raise JudgeContractError("Codex CLI turn.completed event is missing its usage object")
+            usage = candidate
+
+    if final_text is None or not final_text.strip():
+        raise JudgeContractError("Codex CLI produced no final agent_message text")
+    if usage is None:
+        raise JudgeContractError("Codex CLI produced no turn.completed usage event")
+
+    input_tokens = usage.get("input_tokens")
+    cached_tokens = usage.get("cached_input_tokens")
+    if not isinstance(input_tokens, int) or isinstance(input_tokens, bool):
+        raise JudgeContractError(f"Codex CLI usage.input_tokens must be int; got {type(input_tokens).__name__}")
+    if cached_tokens is not None and (not isinstance(cached_tokens, int) or isinstance(cached_tokens, bool)):
+        raise JudgeContractError(f"Codex CLI usage.cached_input_tokens must be int or None; got {type(cached_tokens).__name__}")
+    if cached_tokens is not None and cached_tokens > input_tokens:
+        raise JudgeContractError(f"Codex CLI cached_input_tokens ({cached_tokens}) exceeds input_tokens ({input_tokens})")
+    return _TransportResult(
+        raw_text=final_text,
+        served_model_id=requested_model,
+        prompt_tokens_total=input_tokens,
+        prompt_tokens_cached=cached_tokens,
+    )
+
+
+def _call_codex_cli(
+    request: JudgeRequest,
+    model_id: str,
+    max_tokens: int,
+    *,
+    tool_scope: AgentToolScope | None = None,
+) -> _TransportResult:
+    """Codex CLI transport with a sealed tool surface and stripped credentials.
+
+    ``codex exec`` authenticates through the operator's installed Codex account
+    state (``CODEX_HOME`` / ``HOME``), while the subprocess environment omits
+    every signing/provider/application secret.  User config, repo rules, shell,
+    web, apps, hooks, goals, memories, remote plugins, and subagents are
+    disabled.  Tool mode registers exactly one local MCP server whose three
+    read-only tools enforce ``AgentToolScope``; blinded mode registers no MCP.
+
+    Codex currently exposes no per-call completion-token cap, so ``max_tokens``
+    is accepted for the common transport contract but not forwarded.  The
+    output schema and shared parser still fail closed on truncation/malformed
+    output.
+    """
+    del max_tokens
+    prompt = _codex_prompt(request, tool_mode=tool_scope is not None)
+    base_config = [
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'web_search="disabled"',
+        "-c",
+        'model_reasoning_effort="high"',
+        "-c",
+        "features.shell_tool=false",
+        "-c",
+        "features.unified_exec=false",
+        "-c",
+        "features.shell_snapshot=false",
+        "-c",
+        "features.apps=false",
+        "-c",
+        "features.hooks=false",
+        "-c",
+        "features.goals=false",
+        "-c",
+        "features.memories=false",
+        "-c",
+        "features.multi_agent=false",
+        "-c",
+        "features.remote_plugin=false",
+        "-c",
+        "features.personality=false",
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="elspeth-judge-codex-") as temp_dir:
+        temp_root = Path(temp_dir)
+        schema_path = temp_root / "judge-response.schema.json"
+        schema_path.write_text(json.dumps(_CODEX_RESPONSE_SCHEMA, sort_keys=True), encoding="utf-8")
+        command = [
+            "codex",
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--model",
+            model_id,
+            "--json",
+            "--color",
+            "never",
+            "--output-schema",
+            str(schema_path),
+            "--cd",
+            str(temp_root),
+            *base_config,
+        ]
+        if tool_scope is not None:
+            command.extend(_codex_mcp_config_args(tool_scope))
+        command.append("-")
+        try:
+            completed = subprocess.run(
+                command,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=_CODEX_CLI_TIMEOUT_SECONDS,
+                env=_codex_child_env(),
+            )
+        except FileNotFoundError as exc:
+            raise JudgeConfigurationError(
+                "The Codex CLI is required for --judge-transport codex-cli but "
+                "`codex` was not found on PATH. Install Codex CLI, authenticate "
+                "it, and re-run."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise JudgeTransportError(f"Codex CLI judge exceeded the {_CODEX_CLI_TIMEOUT_SECONDS}s transport timeout") from exc
+        except OSError as exc:
+            raise JudgeConfigurationError(f"Could not start the Codex CLI judge: {exc}") from exc
+
+    if completed.returncode != 0:
+        detail = _codex_failure_detail(completed.stdout, completed.stderr)
+        auth_markers = ("auth", "login", "credential", "not logged", "unauthorized")
+        if any(marker in detail.lower() for marker in auth_markers):
+            raise JudgeConfigurationError(
+                f"The Codex CLI could not authenticate for --judge-transport codex-cli. Run `codex login`, then re-run. Detail: {detail}"
+            )
+        raise JudgeTransportError(f"Codex CLI judge exited {completed.returncode}. Detail: {detail}")
+    return _parse_codex_jsonl(completed.stdout, requested_model=model_id)
+
+
 _TRANSPORTS: dict[str, Callable[..., _TransportResult]] = {
     TRANSPORT_OPENROUTER: _call_openrouter,
     TRANSPORT_AGENT: _call_agent_sdk,
+    TRANSPORT_CODEX_CLI: _call_codex_cli,
 }
 # Derive the valid-transport set from the registry so the two can't drift: a
 # transport that validates but has no registry entry would KeyError on lookup.
@@ -1930,17 +2216,17 @@ def call_judge(
     """Send a judge request through the selected transport and return the verdict.
 
     ``transport`` selects the provider path (``TRANSPORT_OPENROUTER`` /
-    ``TRANSPORT_AGENT``). When ``model_id`` is omitted, the default is resolved
+    ``TRANSPORT_AGENT`` / ``TRANSPORT_CODEX_CLI``). When ``model_id`` is omitted, the default is resolved
     **by transport** — the OpenRouter slug and the Agent-SDK model id are
     different namespaces (see ``DEFAULT_AGENT_JUDGE_MODEL``). ``transport_impl``
     is a test seam: inject a fake to exercise the shared validation path without
-    a real provider call. Both transports funnel their extracted assistant text
+    a real provider call. All transports funnel their extracted assistant text
     through the identical ``_parse_judge_payload`` → validators path, so a
     verdict is validated the same way regardless of origin.
 
-    ``tool_scope`` (agent transport only) enables the read-only tool-augmented
-    investigation mode, confined to that filesystem scope. The OpenRouter
-    transport rejects a non-None ``tool_scope`` (it has no tool loop). When
+    ``tool_scope`` (local agent transports only) enables the read-only
+    tool-augmented investigation mode, confined to that filesystem scope. The
+    OpenRouter transport rejects a non-None ``tool_scope`` (it has no tool loop). When
     ``tool_scope`` is None every transport is called exactly as before — the
     blinded path is unchanged — which also keeps the ``transport_impl`` test
     seam backward-compatible (fakes are invoked with the old 3-arg signature).
@@ -1960,7 +2246,12 @@ def call_judge(
     if model_id is None:
         # Resolve the default by transport: the OpenRouter routing slug
         # ("anthropic/...") is invalid for the Agent SDK and vice versa.
-        model_id = DEFAULT_AGENT_JUDGE_MODEL if transport == TRANSPORT_AGENT else DEFAULT_JUDGE_MODEL
+        if transport == TRANSPORT_AGENT:
+            model_id = DEFAULT_AGENT_JUDGE_MODEL
+        elif transport == TRANSPORT_CODEX_CLI:
+            model_id = DEFAULT_CODEX_JUDGE_MODEL
+        else:
+            model_id = DEFAULT_JUDGE_MODEL
 
     impl = transport_impl if transport_impl is not None else _TRANSPORTS[transport]
     # Pass tool_scope only when set, so existing 3-arg fakes and call sites are

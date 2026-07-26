@@ -30,12 +30,20 @@ keys re-key) is an assertion the operator step re-derives from the live source
 tree before it writes anything. The bundle is a worklist and an audit record,
 not a grant.
 
-## Judging runs on the agentic harness with tool access (2026-07-09 policy)
+## Judging runs on the Codex CLI harness with tool access (updated 2026-07-27)
 
 All judging — including the **final signature verdict** — runs via the agentic
-harness (`--judge-transport agent`) with read-only tool access
+harness (`--judge-transport codex-cli`) with read-only tool access
 (`--judge-tools readonly`). The judge may Read/Grep/Glob within the source tree
-and allowlist dir (fail-closed PreToolUse containment guard) before ruling.
+and allowlist dir through a sealed, fail-closed MCP reader before ruling.
+
+The Codex subprocess authenticates from the installed CLI account state, not
+from a provider key passed by the signing shell. Its environment is reduced to
+executable/home/locale/TLS essentials: the HMAC key, override tokens, provider
+API keys, cloud credentials, and arbitrary application environment do not cross
+the process boundary. User config and repo rules are ignored; shell, web, apps,
+hooks, goals, memories, remote plugins, and subagents are disabled. The only
+tool-mode capability is the three-tool read-only MCP server.
 
 Why: the excerpt-blinded judge systematically misjudged boundary code it could
 not see — verdicts flipped on whether a function's `def` line happened to fall
@@ -54,8 +62,9 @@ What this does NOT change:
   moved from input blinding to output scrubbing: in readonly mode the judge's
   rationale passes through `scrub_secrets` (the same curated pattern set the
   excerpt goes through) before it is printed or persisted.
-- `--judge-tools readonly` still requires `--judge-transport agent`; the
-  OpenRouter path has no tool loop and is rejected.
+- `--judge-tools readonly` accepts `--judge-transport codex-cli` and the legacy
+  Claude Agent SDK spelling `agent`; the OpenRouter path has no tool loop and
+  is rejected. `codex-cli` is the normal signing transport.
 
 Blinded mode (`--judge-tools none`) remains available and byte-identical to the
 historical behavior; entries signed before 2026-07-09 were produced under it.
@@ -85,16 +94,16 @@ with the key.
 Registered in `.mcp.json` as `elspeth-judge`, launched as
 `python -m elspeth_lints.mcp --root src/elspeth --allowlist-dir
 config/cicd/enforce_tier_model --staged-dir .elspeth/staged-reviews` (with
-`PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra; `stage_preview`
-additionally needs `[judge-agent]`. All five tools fail closed when the HMAC key
-is present in the environment.
+`PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra and an installed
+and authenticated Codex CLI. All five tools fail closed when the HMAC key is
+present in the environment.
 
 | Tool | Key-free? | LLM? | What it does |
 | --- | --- | --- | --- |
 | `verify_signatures` | yes | no | Read-only, **always shape-only** signature diagnosis of the tier_model allowlist. The authoritative HMAC recompute is the operator CLI `diagnose`, not this tool. |
 | `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment`. Args: optional `bundle_id`, `staged_by`. |
 | `stage_status` | yes | no | Summarise a staged bundle (per-lane/kind counts, preview outcomes) and emit the paste-ready operator `sign-bundle` command. Arg: `bundle_id` (required). |
-| `stage_preview` | yes | yes (read-only agent judge) | Run the read-only agent judge over each `new_judgment` action and record a **non-authoritative** preview verdict (`authoritative=False`); surfaces BLOCKED reasons. Never signs. Arg: `bundle_id` (required). Needs `[judge-agent]`. |
+| `stage_preview` | yes | yes (read-only Codex CLI judge) | Run the sealed read-only Codex judge over each `new_judgment` action and record a **non-authoritative** preview verdict (`authoritative=False`); surfaces BLOCKED reasons. Never signs. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
 
 `stage_scan` feeds the rotation planner only non-judge-gated entries
@@ -105,14 +114,16 @@ entry routes to `drift_repair` only.
 ## Operator commands (key-bearing shell)
 
 Run these only in an operator-controlled shell that holds
-`ELSPETH_JUDGE_METADATA_HMAC_KEY` (and, for the LLM lanes, `OPENROUTER_API_KEY`).
-Both commands re-derive every binding from the live tree and abort on any
-staleness *before* the first write.
+`ELSPETH_JUDGE_METADATA_HMAC_KEY`. The Codex transport authenticates from the
+installed CLI account and does not need a provider API key in that shell. Both
+commands re-derive every binding from the live tree and abort on any staleness
+*before* the first write.
 
 ### `sign-bundle` — fire a staged review bundle
 
 ```
-elspeth-lints sign-bundle <bundle.json> --owner <operator-id> [options]
+elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
+  --judge-transport codex-cli --judge-tools readonly --dry-run
 ```
 
 This is the **only** place a judge signature is minted from a bundle. The verify
@@ -144,8 +155,8 @@ Flags:
 | `--dry-run` | off | Print verify + per-lane plan; no judge call, no writes. |
 | `--yes` | off | Skip the interactive confirm before the destructive write phase. |
 | `--format` | `text` | Per-entry justify output (`text`/`json`). |
-| `--judge-transport` | `openrouter` | Provider that produces the verdict. |
-| `--judge-tools` | — | Judge tool configuration (mirrors `justify`). |
+| `--judge-transport` | `openrouter` | Provider that produces the verdict (`codex-cli` is the required normal signing choice; `agent` is the legacy Claude SDK path). |
+| `--judge-tools` | `none` | Judge tool configuration; use `readonly` with `codex-cli` for signing. |
 
 Override-token environment (only when `--operator-override` is passed):
 `ELSPETH_JUDGE_OVERRIDE_TOKEN` + `ELSPETH_JUDGE_OVERRIDE_TOKEN_SHA256`.

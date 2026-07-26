@@ -174,6 +174,11 @@ def _sign_bundle_command(ctx: _ServerContext, bundle_path: Path) -> str:
         str(ctx.allowlist_dir),
         "--owner",
         '"$USER"',
+        "--judge-transport",
+        "codex-cli",
+        "--judge-tools",
+        "readonly",
+        "--dry-run",
     ]
     return _shell_join_keep_user(parts)
 
@@ -483,11 +488,11 @@ def _verdict_str(verdict: Any) -> str:
 
 
 def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
-    """Populate each ``new_judgment`` action with a NON-authoritative agent verdict.
+    """Populate each ``new_judgment`` action with a NON-authoritative Codex verdict.
 
     [O1] ordering: ``_assert_no_hmac_key_in_env()`` is the first line, BEFORE the
-    lazy judge import -- so a key-present call fails closed even when the
-    ``[judge-agent]`` extra is absent. ``ActionPreview.authoritative`` is
+    lazy judge import -- so a key-present call fails closed even when the Codex
+    CLI is absent. ``ActionPreview.authoritative`` is
     structurally ``False``; the bundle stays signature-free. BLOCKED previews are
     surfaced so the agent can fix code/rationale before the operator step.
     """
@@ -519,19 +524,11 @@ def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
             surrounding_code=_surrounding_code_for(ctx, action),
         )
         try:
-            response = judge_mod.call_judge(request, transport=judge_mod.TRANSPORT_AGENT, tool_scope=tool_scope)
+            response = judge_mod.call_judge(request, transport=judge_mod.TRANSPORT_CODEX_CLI, tool_scope=tool_scope)
         except (ModuleNotFoundError, judge_mod.JudgeConfigurationError) as exc:
-            # ``call_judge`` wraps the missing ``claude_agent_sdk`` import in a
-            # ``JudgeConfigurationError`` (judge.py:1465), so that -- not a bare
-            # ModuleNotFoundError -- is the real "extra absent" signal. Surface an
-            # actionable install hint rather than a raw traceback; the other four
-            # key-free tools keep working without the [judge-agent] extra.
-            message = str(exc)
-            if "claude_agent_sdk" in message or "claude-agent-sdk" in message:
-                raise ImportError(
-                    "stage_preview requires the [judge-agent] extra: uv pip install -e '.[judge-agent]' from elspeth-lints/"
-                ) from exc
-            raise
+            # Convert the optional external-runtime failure to the MCP server's
+            # clean ImportError outcome rather than a protocol traceback.
+            raise ImportError(f"stage_preview Codex judge unavailable: {exc}") from exc
         verdict = _verdict_str(response.verdict)
         preview = ActionPreview(
             verdict=verdict,
@@ -668,9 +665,9 @@ _TOOLS.update(
         ),
         "stage_preview": _ToolSpec(
             description=(
-                "Run the read-only agent judge over each new_judgment action and record a "
+                "Run the read-only Codex CLI judge over each new_judgment action and record a "
                 "NON-authoritative preview verdict (never signs; surfaces BLOCKED reasons). "
-                "Requires the [judge-agent] extra."
+                "Requires an installed + authenticated Codex CLI and the [mcp] extra."
             ),
             input_schema={
                 "type": "object",

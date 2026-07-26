@@ -39,11 +39,13 @@ from elspeth_lints.core.cli import (
 )
 from elspeth_lints.core.judge import (
     DEFAULT_AGENT_JUDGE_MODEL,
+    DEFAULT_CODEX_JUDGE_MODEL,
     DEFAULT_JUDGE_MODEL,
     JUDGE_EXCERPT_CONTEXT_LINES,
     JUDGE_POLICY_HASH,
     JUDGE_SURROUNDING_CODE_CHAR_LIMIT,
     TRANSPORT_AGENT,
+    TRANSPORT_CODEX_CLI,
     TRANSPORT_OPENROUTER,
     JudgeConfigurationError,
     JudgeContractError,
@@ -921,6 +923,31 @@ def test_justify_agent_transport_flag_selects_agent(tmp_path: Path) -> None:
     assert len(loaded.entries) == 1
     assert loaded.entries[0].judge_transport == "claude_agent_sdk"
     assert loaded.entries[0].judge_signature_version == 2
+
+
+def test_justify_codex_cli_transport_flag_selects_codex(tmp_path: Path) -> None:
+    """``--judge-transport codex-cli`` persists the explicit Codex identity."""
+    root, _target = _build_source_tree(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    captured: dict[str, str] = {}
+
+    argv = [
+        *_justify_argv(root, allowlist_dir, owner="test-codex-transport"),
+        "--judge-transport",
+        "codex-cli",
+        "--judge-tools",
+        "readonly",
+    ]
+    with _capture_call_judge_transport(
+        captured,
+        response_transport=TRANSPORT_CODEX_CLI,
+        model_id=DEFAULT_CODEX_JUDGE_MODEL,
+    ):
+        assert main(argv) == 0
+
+    assert captured["transport"] == TRANSPORT_CODEX_CLI
+    assert captured["transport"] == "codex_cli"
+    assert "judge_transport: codex_cli" in (allowlist_dir / "plugins.yaml").read_text(encoding="utf-8")
 
 
 def test_justify_default_transport_is_openrouter(tmp_path: Path) -> None:

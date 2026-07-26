@@ -30,6 +30,7 @@ from elspeth_lints.core.emitters.sarif import render_sarif
 from elspeth_lints.core.emitters.text import render_text
 from elspeth_lints.core.judge import (
     TRANSPORT_AGENT,
+    TRANSPORT_CODEX_CLI,
     TRANSPORT_OPENROUTER,
     AgentToolScope,
     build_readonly_tool_scope,
@@ -83,11 +84,18 @@ class _JudgeSignatureSigningFailure:
     exit_code: int
 
 
-# CLI spelling -> stored transport identity. The operator types the short
-# ``agent`` form; the persisted/threaded value is the canonical
-# ``claude_agent_sdk`` (TRANSPORT_AGENT). ``openrouter`` is the default so
-# unopted-in invocations keep the prior behaviour exactly.
-_CLI_TRANSPORT_CHOICES: dict[str, str] = {"openrouter": TRANSPORT_OPENROUTER, "agent": TRANSPORT_AGENT}
+# CLI spelling -> stored transport identity.  Keep ``agent`` as the legacy
+# Claude Agent SDK spelling and expose Codex explicitly rather than silently
+# rebinding old signed metadata to a different transport.
+_CLI_TRANSPORT_CHOICES: dict[str, str] = {
+    "openrouter": TRANSPORT_OPENROUTER,
+    "agent": TRANSPORT_AGENT,
+    "codex-cli": TRANSPORT_CODEX_CLI,
+}
+_READONLY_TOOL_TRANSPORTS: frozenset[str] = frozenset({TRANSPORT_AGENT, TRANSPORT_CODEX_CLI})
+_READONLY_TOOLS_TRANSPORT_ERROR = (
+    "--judge-tools readonly requires --judge-transport agent or codex-cli (the openrouter transport has no tool loop).\n"
+)
 
 
 def _add_judge_transport_arg(parser: argparse.ArgumentParser) -> None:
@@ -105,10 +113,11 @@ def _add_judge_transport_arg(parser: argparse.ArgumentParser) -> None:
         help=(
             "Which transport produces the verdict. 'openrouter' (default) uses "
             "the OpenAI-compatible SDK with temperature=0 (reproducible). 'agent' "
-            "uses the Claude Agent SDK (claude_code preset, no tools, cheaper via a "
-            "Claude subscription); it cannot pin temperature, so agent verdicts are "
-            "less reproducible (see reaudit). Requires the [judge-agent] extra and "
-            "Claude Code auth."
+            "uses the Claude Agent SDK and requires the [judge-agent] extra plus "
+            "Claude Code auth. 'codex-cli' uses the installed, authenticated Codex "
+            "CLI with a secret-stripped subprocess and sealed tool surface. Local "
+            "agent transports cannot pin temperature and are less reproducible "
+            "(see reaudit)."
         ),
     )
 
@@ -118,9 +127,9 @@ def _add_judge_tools_arg(parser: argparse.ArgumentParser) -> None:
 
     'none' (default) keeps the blinded judge — it sees only the excerpt.
     'readonly' lets the agent transport Read/Grep/Glob within the source tree +
-    allowlist dir (fail-closed PreToolUse guard) to resolve a would-be block for
-    lack of context. Requires ``--judge-transport agent`` (the OpenRouter path
-    has no tool loop). Since 2026-07-09 signing paths accept it too — the
+    allowlist dir (fail-closed transport guard) to resolve a would-be block for
+    lack of context. Requires ``--judge-transport agent`` or ``codex-cli`` (the
+    OpenRouter path has no tool loop). Since 2026-07-09 signing paths accept it too — the
     excerpt-blinded signing judge systematically misjudged boundary code it
     could not see, forcing bulk operator overrides. In readonly mode the
     judge's rationale is passed through ``scrub_secrets`` before it is printed
@@ -132,9 +141,9 @@ def _add_judge_tools_arg(parser: argparse.ArgumentParser) -> None:
         default="none",
         help=(
             "Read-only tool access for the judge. 'none' (default) is blinded "
-            "(excerpt only). 'readonly' lets the agent transport Read/Grep/Glob "
+            "(excerpt only). 'readonly' lets a local agent transport Read/Grep/Glob "
             "within src + allowlist dir to investigate; requires --judge-transport "
-            "agent. Less reproducible than blinded mode. Valid on signing paths "
+            "agent or codex-cli. Less reproducible than blinded mode. Valid on signing paths "
             "since 2026-07-09; readonly-mode judge rationales are secret-scrubbed "
             "before being persisted into signed allowlist entries."
         ),
@@ -1630,8 +1639,8 @@ def _run_justify(args: argparse.Namespace) -> int:
     transport: str = _CLI_TRANSPORT_CHOICES[args.judge_transport]
     tool_scope: AgentToolScope | None = None
     if args.judge_tools == "readonly":
-        if transport != TRANSPORT_AGENT:
-            sys.stderr.write("--judge-tools readonly requires --judge-transport agent (the openrouter transport has no tool loop).\n")
+        if transport not in _READONLY_TOOL_TRANSPORTS:
+            sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
             return 2
         tool_scope = build_readonly_tool_scope(root=root, allowlist_dir=allowlist_dir)
 
@@ -3087,8 +3096,8 @@ def _run_reaudit(args: argparse.Namespace) -> int:
     # source tree + allowlist dir via a fail-closed PreToolUse guard.
     tool_scope: AgentToolScope | None = None
     if args.judge_tools == "readonly":
-        if transport != TRANSPORT_AGENT:
-            sys.stderr.write("--judge-tools readonly requires --judge-transport agent (the openrouter transport has no tool loop).\n")
+        if transport not in _READONLY_TOOL_TRANSPORTS:
+            sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
             return 2
         tool_scope = build_readonly_tool_scope(root=args.root.resolve(), allowlist_dir=allowlist_dir)
 
@@ -3347,8 +3356,8 @@ def _run_sign_judge_signatures(args: argparse.Namespace) -> int:
     existing ``justify`` implementation. If a judge call fails, the stale row is
     restored so a rejected suppression does not erase the remaining backlog.
     """
-    if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] != TRANSPORT_AGENT:
-        sys.stderr.write("--judge-tools readonly requires --judge-transport agent (the openrouter transport has no tool loop).\n")
+    if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] not in _READONLY_TOOL_TRANSPORTS:
+        sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
         return 2
 
     from elspeth_lints.core.allowlist import _judge_metadata_hmac_key
@@ -3811,8 +3820,8 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
     place, restores/skips the blocked action, and returns non-zero with a
     per-action report.
     """
-    if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] != TRANSPORT_AGENT:
-        sys.stderr.write("--judge-tools readonly requires --judge-transport agent (the openrouter transport has no tool loop).\n")
+    if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] not in _READONLY_TOOL_TRANSPORTS:
+        sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
         return 2
 
     from elspeth_lints.core.allowlist import _judge_metadata_hmac_key
