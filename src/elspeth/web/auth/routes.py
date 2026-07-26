@@ -22,7 +22,7 @@ from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_PRINCIPAL_MA
 from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter, classify_authentication_failure
-from elspeth.web.auth.local import LocalAuthProvider, LocalAuthRegistrationConflict
+from elspeth.web.auth.local import LocalAuthProvider, LocalAuthRegistrationConflict, bcrypt_password_bytes
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity
 from elspeth.web.auth.protocol import AuthProvider, CredentialAuthProvider
@@ -53,6 +53,12 @@ class LoginRequest(BaseModel):
     username: str = Field(max_length=AUTH_AUDIT_PRINCIPAL_MAX_LENGTH)
     password: str
 
+    @field_validator("password")
+    @classmethod
+    def _password_must_fit_bcrypt(cls, v: str) -> str:
+        bcrypt_password_bytes(v)
+        return v
+
 
 class RegisterRequest(BaseModel):
     """Request body for POST /api/auth/register."""
@@ -61,6 +67,12 @@ class RegisterRequest(BaseModel):
     password: str
     display_name: str
     email: str | None = None
+
+    @field_validator("password")
+    @classmethod
+    def _password_must_fit_bcrypt(cls, v: str) -> str:
+        bcrypt_password_bytes(v)
+        return v
 
     @field_validator("username", "password", "display_name")
     @classmethod

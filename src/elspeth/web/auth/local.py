@@ -33,6 +33,7 @@ _EMAIL_VERIFICATION_TOKEN_BYTES = 32
 _EMAIL_VERIFICATION_TOKEN_TTL_SECONDS = 24 * 60 * 60
 _EMAIL_VERIFICATION_AUDIT_RETRY_SECONDS = 5 * 60
 _PENDING_REGISTRATION_RETENTION_SECONDS = 7 * 24 * 60 * 60
+MAX_BCRYPT_PASSWORD_BYTES = 72
 
 
 class LocalAuthRegistrationConflict(ValueError):
@@ -41,6 +42,14 @@ class LocalAuthRegistrationConflict(ValueError):
 
 class LocalAuthStorageSecurityError(RuntimeError):
     """The local credential store failed its owner-only file admission."""
+
+
+def bcrypt_password_bytes(password: str) -> bytes:
+    """Encode a password after enforcing bcrypt's UTF-8 byte limit."""
+    encoded_password = password.encode("utf-8")
+    if len(encoded_password) > MAX_BCRYPT_PASSWORD_BYTES:
+        raise ValueError(f"password must not exceed {MAX_BCRYPT_PASSWORD_BYTES} bytes")
+    return encoded_password
 
 
 def _required_visible_string_claim(payload: dict[str, object], claim_name: str) -> str:
@@ -308,7 +317,7 @@ class LocalAuthProvider:
         """
         if not display_name:
             raise ValueError("display_name must not be empty")
-        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        password_hash = bcrypt.hashpw(bcrypt_password_bytes(password), bcrypt.gensalt()).decode()
         with self._connect() as conn:
             try:
                 conn.execute(
@@ -342,7 +351,7 @@ class LocalAuthProvider:
         """
         if not display_name:
             raise ValueError("display_name must not be empty")
-        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        password_hash = bcrypt.hashpw(bcrypt_password_bytes(password), bcrypt.gensalt()).decode()
         with self._connect(immediate=True) as conn:
             try:
                 conn.execute(
@@ -487,7 +496,8 @@ class LocalAuthProvider:
         """
         if not display_name:
             raise ValueError("display_name must not be empty")
-        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        password_bytes = bcrypt_password_bytes(password)
+        password_hash = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode()
         now = int(time.time())
         with self._connect(immediate=True) as conn:
             self._reap_stale_pending_registrations(conn, now=now)
@@ -506,7 +516,7 @@ class LocalAuthProvider:
                     not email_verified
                     and existing_name == display_name
                     and existing_email == email
-                    and bcrypt.checkpw(password.encode(), existing_hash.encode())
+                    and bcrypt.checkpw(password_bytes, existing_hash.encode())
                 )
                 if not matches_pending_registration:
                     raise LocalAuthRegistrationConflict(f"User already exists: {user_id}")
@@ -657,6 +667,10 @@ class LocalAuthProvider:
         # credential enumeration.
         if not username or not password:
             raise AuthenticationError("Invalid credentials")
+        try:
+            password_bytes = bcrypt_password_bytes(password)
+        except ValueError as exc:
+            raise AuthenticationError("Invalid credentials") from exc
 
         with self._connect() as conn:
             row = conn.execute(
@@ -666,10 +680,10 @@ class LocalAuthProvider:
 
         if row is None:
             # Constant-time: hash against dummy to prevent timing oracle
-            bcrypt.checkpw(password.encode(), self._get_dummy_hash())
+            bcrypt.checkpw(password_bytes, self._get_dummy_hash())
             raise AuthenticationError("Invalid credentials")
 
-        if not bcrypt.checkpw(password.encode(), row[0].encode()):
+        if not bcrypt.checkpw(password_bytes, row[0].encode()):
             raise AuthenticationError("Invalid credentials")
 
         if not row[1]:

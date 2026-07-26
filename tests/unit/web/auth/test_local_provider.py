@@ -46,6 +46,22 @@ def _delete_user(provider: LocalAuthProvider, user_id: str) -> None:
 class TestCreateUser:
     """Tests for user creation."""
 
+    @pytest.mark.parametrize(
+        ("password", "is_valid"),
+        [
+            ("a" * 72, True),
+            ("a" * 73, False),
+            ("é" * 36, True),
+            ("é" * 36 + "a", False),
+        ],
+    )
+    def test_create_user_enforces_bcrypt_password_byte_limit(self, provider, password: str, is_valid: bool) -> None:
+        if is_valid:
+            provider.create_user("alice", password, display_name="Alice")
+        else:
+            with pytest.raises(ValueError, match="72 bytes"):
+                provider.create_user("alice", password, display_name="Alice")
+
     def test_create_user_succeeds(self, provider) -> None:
         provider.create_user("alice", "password123", display_name="Alice Smith")
         # No exception means success
@@ -413,6 +429,14 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
 class TestLogin:
     """Tests for username/password login."""
+
+    @pytest.mark.asyncio
+    async def test_login_rejects_password_that_collides_after_bcrypt_limit(self, provider) -> None:
+        password = "a" * 72
+        provider.create_user("alice", password, display_name="Alice")
+
+        with pytest.raises(AuthenticationError, match="Invalid credentials"):
+            await provider.login("alice", password + "b")
 
     @pytest.mark.asyncio
     async def test_login_returns_jwt_string(self, provider) -> None:

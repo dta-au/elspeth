@@ -21,7 +21,7 @@ from elspeth.web.auth import local as auth_local
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity, UserProfile
-from elspeth.web.auth.routes import RegisterRequest, create_auth_router
+from elspeth.web.auth.routes import LoginRequest, RegisterRequest, create_auth_router
 from elspeth.web.config import WebSettings
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 
@@ -1285,6 +1285,16 @@ class TestMeErrorPath:
 
 class TestRegisterRequestValidation:
     """Registration must reject invisible-only fields to stay aligned with UserIdentity."""
+
+    @pytest.mark.parametrize("request_type", [LoginRequest, RegisterRequest])
+    @pytest.mark.parametrize("password", ["a" * 73, "é" * 36 + "a"])
+    def test_rejects_password_over_bcrypt_byte_limit(self, request_type, password: str) -> None:
+        payload = {"username": "alice", "password": password}
+        if request_type is RegisterRequest:
+            payload["display_name"] = "Alice"
+
+        with pytest.raises(ValueError, match="72 bytes"):
+            request_type(**payload)
 
     def test_rejects_zero_width_space_username(self) -> None:
         with pytest.raises(ValueError, match="visible character"):
