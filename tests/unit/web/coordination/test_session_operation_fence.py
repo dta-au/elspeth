@@ -318,9 +318,19 @@ async def test_mutation_facade_exposes_no_handle_and_closes_after_callback(servi
     authority.mutate(fence, lambda transaction: captured.append(transaction))
 
     transaction = captured[0]
-    assert {name for name in dir(transaction) if not name.startswith("_")} == {"execute"}
+    assert {name for name in dir(transaction) if not name.startswith("_")} == {
+        "append_run_event",
+        "execute",
+        "insert_blob_inline_resolutions",
+        "insert_blob_run_link",
+        "list_blob_run_links",
+        "list_run_events_after",
+        "list_run_output_blobs",
+    }
     with pytest.raises(RuntimeError, match="closed"):
         transaction.execute(select(sessions_table.c.id))  # type: ignore[attr-defined]
+    with pytest.raises(RuntimeError, match="closed"):
+        transaction.list_run_events_after(run_id=uuid4(), after_sequence=0)  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

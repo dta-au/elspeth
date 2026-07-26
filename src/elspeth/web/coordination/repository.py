@@ -7,19 +7,32 @@ only immutable records/fences, never SQLAlchemy engines or connections.
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, final
+from typing import TYPE_CHECKING, Any, cast, final
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, Connection, Engine, Row, Table, and_, delete, insert, select, update
+from sqlalchemy import ColumnElement, Connection, Engine, Row, Table, and_, delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql import visitors
 from sqlalchemy.sql.dml import Delete, Insert, Update
 from sqlalchemy.sql.elements import BindParameter, ColumnClause, TextClause
 from sqlalchemy.sql.selectable import Select
 
+from elspeth.contracts.blobs import (
+    ALLOWED_MIME_TYPES,
+    BLOB_CREATORS,
+    BLOB_RUN_LINK_DIRECTIONS,
+    BLOB_STATUSES,
+    BlobRecord,
+    BlobRunLinkDirection,
+    BlobRunLinkRecord,
+)
+from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.coordination.contracts import (
     FenceLossReason,
     SessionOperationFence,
@@ -27,15 +40,23 @@ from elspeth.web.coordination.contracts import (
     SessionOperationKind,
 )
 from elspeth.web.sessions.models import (
+    blob_inline_resolutions_table,
+    blob_run_links_table,
+    blobs_table,
     metadata,
+    run_events_table,
+    runs_table,
     session_operation_fences_table,
     sessions_table,
     web_instances_table,
 )
 from elspeth.web.sessions.protocol import (
+    SESSION_RUN_EVENT_TYPE_VALUES,
+    RunEventRecord,
     SessionOperationMutationResult,
     SessionOperationMutationTransaction,
     SessionRecord,
+    SessionRunEventType,
 )
 
 if TYPE_CHECKING:
@@ -86,6 +107,13 @@ class SessionOperationConflictError(RuntimeError):
         super().__init__("session operation is already active")
 
 
+class SessionDerivedCustodyError(RuntimeError):
+    """A derived parent is absent from the exact fenced session."""
+
+    def __init__(self) -> None:
+        super().__init__("session-scoped derived record is unavailable")
+
+
 def _ensure_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
@@ -117,8 +145,7 @@ class _RepositoryMutationTransaction:
         self.__active = True
 
     def execute(self, statement: object) -> SessionOperationMutationResult:
-        if not self.__active:
-            raise RuntimeError("session operation mutation transaction is closed")
+        self._require_active()
         if not isinstance(statement, (Select, Insert, Update, Delete)):
             raise TypeError("fenced mutation accepts only Select, Insert, Update, or Delete statements")
         normalized = self._normalize_select(statement) if isinstance(statement, Select) else self._normalize_dml(statement)
@@ -127,6 +154,278 @@ class _RepositoryMutationTransaction:
         if result.returns_rows:
             rows = tuple({str(key): value for key, value in row._mapping.items()} for row in result.fetchall())
         return SessionOperationMutationResult(rowcount=result.rowcount, rows=rows)
+
+    def _require_active(self) -> None:
+        if not self.__active:
+            raise RuntimeError("session operation mutation transaction is closed")
+
+    @staticmethod
+    def _validate_uuid(value: UUID, *, field_name: str) -> None:
+        if type(value) is not UUID:
+            raise TypeError(f"{field_name} must be an exact UUID")
+
+    @staticmethod
+    def _validate_event_type(value: object) -> SessionRunEventType:
+        if type(value) is not str or value not in SESSION_RUN_EVENT_TYPE_VALUES:
+            raise ValueError(f"event_type must be one of {sorted(SESSION_RUN_EVENT_TYPE_VALUES)}")
+        return cast(SessionRunEventType, value)
+
+    @staticmethod
+    def _validate_link_direction(value: object) -> BlobRunLinkDirection:
+        if type(value) is not str or value not in BLOB_RUN_LINK_DIRECTIONS:
+            raise ValueError(f"direction must be one of {sorted(BLOB_RUN_LINK_DIRECTIONS)}")
+        return cast(BlobRunLinkDirection, value)
+
+    @staticmethod
+    def _validate_resolutions(value: object) -> Sequence[ResolvedBlobContent]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            raise TypeError("resolutions must be a sequence")
+        return cast(Sequence[ResolvedBlobContent], value)
+
+    def _require_run(self, run_id: UUID) -> Row[Any]:
+        self._validate_uuid(run_id, field_name="run_id")
+        row = self.__connection.execute(
+            select(runs_table)
+            .where(
+                runs_table.c.id == str(run_id),
+                runs_table.c.session_id == self.__session_id,
+            )
+            .with_for_update()
+        ).one_or_none()
+        if row is None:
+            raise SessionDerivedCustodyError
+        return row
+
+    def _require_blob(self, blob_id: UUID) -> Row[Any]:
+        self._validate_uuid(blob_id, field_name="blob_id")
+        row = self.__connection.execute(
+            select(blobs_table)
+            .where(
+                blobs_table.c.id == str(blob_id),
+                blobs_table.c.session_id == self.__session_id,
+            )
+            .with_for_update()
+        ).one_or_none()
+        if row is None:
+            raise SessionDerivedCustodyError
+        return row
+
+    @staticmethod
+    def _event_record(row: Row[Any]) -> RunEventRecord:
+        if row.event_type not in SESSION_RUN_EVENT_TYPE_VALUES:
+            raise AuditIntegrityError(
+                f"Tier 1: run_events.event_type is {row.event_type!r}, expected one of {sorted(SESSION_RUN_EVENT_TYPE_VALUES)}"
+            )
+        if not isinstance(row.data, Mapping):
+            raise AuditIntegrityError("Tier 1: run_events.data is not a JSON object")
+        return RunEventRecord(
+            id=UUID(row.id),
+            run_id=UUID(row.run_id),
+            sequence=int(row.sequence),
+            timestamp=_ensure_utc(row.timestamp),
+            event_type=cast(SessionRunEventType, row.event_type),
+            data=cast(Mapping[str, Any], row.data),
+        )
+
+    @staticmethod
+    def _blob_record(row: Row[Any]) -> BlobRecord:
+        if row.status not in BLOB_STATUSES:
+            raise AuditIntegrityError(f"Tier 1: blobs.status is {row.status!r}, expected one of {sorted(BLOB_STATUSES)}")
+        if row.created_by not in BLOB_CREATORS:
+            raise AuditIntegrityError(f"Tier 1: blobs.created_by is {row.created_by!r}, expected one of {sorted(BLOB_CREATORS)}")
+        if row.mime_type not in ALLOWED_MIME_TYPES:
+            raise AuditIntegrityError(f"Tier 1: blobs.mime_type is {row.mime_type!r}, not in the allowed MIME set")
+        if row.creation_modality not in {modality.value for modality in CreationModality}:
+            raise AuditIntegrityError(
+                "Tier 1: blobs.creation_modality is "
+                f"{row.creation_modality!r}, expected one of {sorted(modality.value for modality in CreationModality)}"
+            )
+        return BlobRecord(
+            id=UUID(row.id),
+            session_id=UUID(row.session_id),
+            filename=row.filename,
+            mime_type=row.mime_type,
+            size_bytes=row.size_bytes,
+            content_hash=row.content_hash,
+            storage_path=row.storage_path,
+            created_at=_ensure_utc(row.created_at),
+            created_by=row.created_by,
+            source_description=row.source_description,
+            status=row.status,
+            creation_modality=CreationModality(row.creation_modality),
+            created_from_message_id=row.created_from_message_id,
+            creating_model_identifier=row.creating_model_identifier,
+            creating_model_version=row.creating_model_version,
+            creating_provider=row.creating_provider,
+            creating_composer_skill_hash=row.creating_composer_skill_hash,
+            creating_arguments_hash=row.creating_arguments_hash,
+        )
+
+    def append_run_event(
+        self,
+        *,
+        run_id: UUID,
+        timestamp: datetime,
+        event_type: SessionRunEventType,
+        data: Mapping[str, Any],
+    ) -> RunEventRecord:
+        self._require_active()
+        self._require_run(run_id)
+        if not isinstance(timestamp, datetime):
+            raise TypeError("timestamp must be a datetime")
+        event_type = self._validate_event_type(event_type)
+        payload = deep_thaw(data)
+        if type(payload) is not dict:
+            raise TypeError("data must thaw to an exact dictionary")
+        run_id_text = str(run_id)
+        sequence = (
+            int(
+                self.__connection.execute(
+                    select(func.coalesce(func.max(run_events_table.c.sequence), 0)).where(run_events_table.c.run_id == run_id_text)
+                ).scalar_one()
+            )
+            + 1
+        )
+        event_id = uuid4()
+        self.__connection.execute(
+            insert(run_events_table).values(
+                id=str(event_id),
+                run_id=run_id_text,
+                sequence=sequence,
+                timestamp=timestamp,
+                event_type=event_type,
+                data=payload,
+            )
+        )
+        return RunEventRecord(
+            id=event_id,
+            run_id=run_id,
+            sequence=sequence,
+            timestamp=timestamp,
+            event_type=event_type,
+            data=cast(Mapping[str, Any], payload),
+        )
+
+    def list_run_events_after(
+        self,
+        *,
+        run_id: UUID,
+        after_sequence: int,
+    ) -> tuple[RunEventRecord, ...]:
+        self._require_active()
+        self._require_run(run_id)
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("after_sequence must be a non-negative exact integer")
+        rows = self.__connection.execute(
+            select(run_events_table)
+            .where(
+                run_events_table.c.run_id == str(run_id),
+                run_events_table.c.sequence > after_sequence,
+            )
+            .order_by(run_events_table.c.sequence)
+        ).all()
+        return tuple(self._event_record(row) for row in rows)
+
+    def insert_blob_run_link(
+        self,
+        *,
+        blob_id: UUID,
+        run_id: UUID,
+        direction: BlobRunLinkDirection,
+    ) -> bool:
+        self._require_active()
+        self._require_run(run_id)
+        self._require_blob(blob_id)
+        direction = self._validate_link_direction(direction)
+        predicate = and_(
+            blob_run_links_table.c.blob_id == str(blob_id),
+            blob_run_links_table.c.run_id == str(run_id),
+            blob_run_links_table.c.direction == direction,
+        )
+        if self.__connection.execute(select(blob_run_links_table.c.blob_id).where(predicate)).one_or_none() is not None:
+            return False
+        self.__connection.execute(insert(blob_run_links_table).values(blob_id=str(blob_id), run_id=str(run_id), direction=direction))
+        return True
+
+    def list_blob_run_links(self, *, blob_id: UUID) -> tuple[BlobRunLinkRecord, ...]:
+        self._require_active()
+        self._require_blob(blob_id)
+        rows = self.__connection.execute(
+            select(blob_run_links_table)
+            .where(blob_run_links_table.c.blob_id == str(blob_id))
+            .order_by(blob_run_links_table.c.run_id, blob_run_links_table.c.direction)
+        ).all()
+        records: list[BlobRunLinkRecord] = []
+        for row in rows:
+            self._require_run(UUID(row.run_id))
+            if row.direction not in BLOB_RUN_LINK_DIRECTIONS:
+                raise AuditIntegrityError(
+                    f"Tier 1: blob_run_links.direction is {row.direction!r}, expected one of {sorted(BLOB_RUN_LINK_DIRECTIONS)}"
+                )
+            records.append(
+                BlobRunLinkRecord(
+                    blob_id=UUID(row.blob_id),
+                    run_id=UUID(row.run_id),
+                    direction=cast(BlobRunLinkDirection, row.direction),
+                )
+            )
+        return tuple(records)
+
+    def list_run_output_blobs(self, *, run_id: UUID) -> tuple[BlobRecord, ...]:
+        self._require_active()
+        self._require_run(run_id)
+        blob_ids = self.__connection.execute(
+            select(blob_run_links_table.c.blob_id)
+            .where(
+                blob_run_links_table.c.run_id == str(run_id),
+                blob_run_links_table.c.direction == "output",
+            )
+            .order_by(blob_run_links_table.c.blob_id)
+        ).scalars()
+        return tuple(self._blob_record(self._require_blob(UUID(blob_id))) for blob_id in blob_ids)
+
+    def insert_blob_inline_resolutions(
+        self,
+        *,
+        run_id: UUID,
+        attempt: int,
+        resolutions: Sequence[ResolvedBlobContent],
+        resolved_at: datetime,
+    ) -> None:
+        self._require_active()
+        self._require_run(run_id)
+        if type(attempt) is not int or attempt < 1:
+            raise ValueError("attempt must be a positive exact integer")
+        resolutions = self._validate_resolutions(resolutions)
+        if not isinstance(resolved_at, datetime):
+            raise TypeError("resolved_at must be a datetime")
+        rows: list[dict[str, Any]] = []
+        for resolution in resolutions:
+            if type(resolution) is not ResolvedBlobContent:
+                raise TypeError("resolutions must contain exact ResolvedBlobContent values")
+            blob = self._require_blob(resolution.blob_id)
+            if (
+                blob.status != "ready"
+                or blob.content_hash != resolution.content_hash
+                or blob.size_bytes != resolution.byte_length
+                or blob.mime_type != resolution.mime_type
+            ):
+                raise SessionDerivedCustodyError
+            rows.append(
+                {
+                    "run_id": str(run_id),
+                    "attempt": attempt,
+                    "field_path": resolution.field_path,
+                    "blob_id": str(resolution.blob_id),
+                    "content_hash": resolution.content_hash,
+                    "byte_length": resolution.byte_length,
+                    "mime_type": resolution.mime_type,
+                    "encoding": resolution.encoding,
+                    "resolved_at": resolved_at,
+                }
+            )
+        if rows:
+            self.__connection.execute(insert(blob_inline_resolutions_table), rows)
 
     @staticmethod
     def _target_identity(target: object) -> tuple[str | None, str]:

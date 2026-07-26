@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, final, get_
 from uuid import UUID
 
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.blobs import BlobForkPlanEntry
+from elspeth.contracts.blobs import BlobForkPlanEntry, BlobRecord, BlobRunLinkDirection, BlobRunLinkRecord
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import (
@@ -2235,6 +2235,43 @@ class SessionOperationMutationTransaction(Protocol):
     """
 
     def execute(self, statement: object) -> SessionOperationMutationResult: ...
+
+    def append_run_event(
+        self,
+        *,
+        run_id: UUID,
+        timestamp: datetime,
+        event_type: SessionRunEventType,
+        data: Mapping[str, Any],
+    ) -> RunEventRecord: ...
+
+    def list_run_events_after(
+        self,
+        *,
+        run_id: UUID,
+        after_sequence: int,
+    ) -> tuple[RunEventRecord, ...]: ...
+
+    def insert_blob_run_link(
+        self,
+        *,
+        blob_id: UUID,
+        run_id: UUID,
+        direction: BlobRunLinkDirection,
+    ) -> bool: ...
+
+    def list_blob_run_links(self, *, blob_id: UUID) -> tuple[BlobRunLinkRecord, ...]: ...
+
+    def list_run_output_blobs(self, *, run_id: UUID) -> tuple[BlobRecord, ...]: ...
+
+    def insert_blob_inline_resolutions(
+        self,
+        *,
+        run_id: UUID,
+        attempt: int,
+        resolutions: Sequence[ResolvedBlobContent],
+        resolved_at: datetime,
+    ) -> None: ...
 
 
 @runtime_checkable
