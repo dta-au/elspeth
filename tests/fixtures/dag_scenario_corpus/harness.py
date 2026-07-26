@@ -35,14 +35,17 @@ from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidat
 from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter, RecorderFactory
+from elspeth.core.landscape.execution.sink_effect_reservation import SinkEffectReservation
 from elspeth.core.landscape.export_read_model import open_export_read_transaction
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
+from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     artifacts_table,
     batch_members_table,
     batches_table,
     node_states_table,
     rows_table,
+    scheduler_events_table,
     sink_effect_attempts_table,
     sink_effect_members_table,
     sink_effects_table,
@@ -52,6 +55,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.engine.clock import MockClock
 from elspeth.engine.executors.sink_effects import (
     SinkEffectCoordinator,
     SinkEffectExecutionSeam,
@@ -81,6 +85,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     HarnessCaseSpec,
     OutputArtifactExpectation,
     ParallelSinkFinalizationRecoveryEvidence,
+    PendingSinkRedriveRecoveryEvidence,
     PortableExportUnavailableByPolicy,
     RecoveryEvidence,
     RunExpectation,
@@ -1246,7 +1251,13 @@ def _ordered_scheduler_events(
 
     complete_chains: list[tuple[int, ...]] = []
 
-    def search(current_status: object, remaining: tuple[int, ...], prefix: tuple[int, ...]) -> None:
+    def search(
+        current_status: object,
+        current_attempt: object,
+        current_lease_owner: object,
+        remaining: tuple[int, ...],
+        prefix: tuple[int, ...],
+    ) -> None:
         if len(complete_chains) > 1:
             return
         if not remaining:
@@ -1254,15 +1265,21 @@ def _ordered_scheduler_events(
             return
         for index in remaining:
             event = events[index]
-            if event.get("from_status") != current_status:
+            if (
+                event.get("from_status") != current_status
+                or event.get("from_attempt") != current_attempt
+                or event.get("from_lease_owner") != current_lease_owner
+            ):
                 continue
             search(
                 event.get("to_status"),
+                event.get("to_attempt"),
+                event.get("to_lease_owner"),
                 tuple(candidate for candidate in remaining if candidate != index),
                 (*prefix, index),
             )
 
-    search(None, tuple(range(len(events))), ())
+    search(None, None, None, tuple(range(len(events))), ())
     if len(complete_chains) != 1:
         raise AssertionError(f"DAG corpus scheduler events do not form exactly one complete transition chain for {work_key!r}")
     return tuple(events[index] for index in complete_chains[0])
@@ -1664,6 +1681,10 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
                 "event_type": scheduler_event.event_type.value,
                 "from_status": scheduler_event.from_status.value if scheduler_event.from_status is not None else None,
                 "to_status": scheduler_event.to_status.value,
+                "from_attempt": scheduler_event.from_attempt,
+                "to_attempt": scheduler_event.to_attempt,
+                "from_lease_owner": scheduler_event.from_lease_owner,
+                "to_lease_owner": scheduler_event.to_lease_owner,
             }
         )
     return records
@@ -2695,6 +2716,469 @@ def _sink_effect_snapshot(
     return effects, attempts, members, artifacts
 
 
+def _single_pending_sink_work_snapshot(
+    db: LandscapeDB,
+    *,
+    run_id: str,
+    require_live_payload: bool = True,
+) -> dict[str, Any]:
+    """Read and validate the sole scheduler identity for the one-row redrive case."""
+
+    with db.connection() as conn:
+        rows = tuple(conn.execute(select(token_work_items_table).where(token_work_items_table.c.run_id == run_id)).mappings())
+    if len(rows) != 1:
+        raise AssertionError(f"pending-sink recovery requires exactly one scheduler work row, got {len(rows)}")
+    snapshot = dict(rows[0])
+    payload = snapshot["row_payload_json"]
+    if not isinstance(payload, str) or payload == "":
+        raise AssertionError("pending-sink recovery work does not carry a non-empty durable row payload")
+    if require_live_payload:
+        restored = TokenSchedulerRepository.deserialize_row_payload(payload)
+        if restored.to_dict() != {"id": 1, "value": 10}:
+            raise AssertionError(f"pending-sink recovery restored unexpected row payload: {restored.to_dict()!r}")
+    snapshot["row_payload_hash"] = hashlib.sha256(payload.encode()).hexdigest()
+    return snapshot
+
+
+def _pending_sink_redrive_recovery_case(
+    scenario: ScenarioSpec,
+    case: HarnessCaseSpec,
+    tmp_path: Path,
+) -> ScenarioRunEvidence:
+    """Exercise TS-04 then TS-06 through three fresh production lifetimes."""
+
+    db_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    payload_root = tmp_path / "payloads"
+    clock = MockClock(start=1_750_000_000.0)
+    initial_rendered = render_settings(case, tmp_path)
+    initial_built = build_scenario(initial_rendered)
+    initial_store = FilesystemPayloadStore(payload_root)
+    initial_db = LandscapeDB(db_url)
+    initial_checkpoint_manager = CheckpointManager(initial_db)
+    checkpoint_config = RuntimeCheckpointConfig.from_settings(initial_rendered.settings.checkpoint)
+    record_run_source = RunLifecycleRepository.record_run_source
+    setup_faults: list[str] = []
+
+    def stop_after_source_exhausted(repository: RunLifecycleRepository, **kwargs: Any) -> None:
+        record_run_source(repository, **kwargs)
+        lifecycle = kwargs["lifecycle_state"]
+        if getattr(lifecycle, "value", lifecycle) == "exhausted" and not setup_faults:
+            setup_faults.append("after_source_exhausted_before_sink_flush")
+            raise RuntimeError("injected DAG corpus pending-sink setup crash")
+
+    try:
+        catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
+        try:
+            with patch.object(RunLifecycleRepository, "record_run_source", new=stop_after_source_exhausted):
+                Orchestrator(
+                    initial_db,
+                    checkpoint_manager=initial_checkpoint_manager,
+                    checkpoint_config=checkpoint_config,
+                    clock=clock,
+                ).run(
+                    initial_built.config,
+                    graph=initial_built.graph,
+                    settings=initial_rendered.settings,
+                    payload_store=initial_store,
+                    openrouter_catalog_sha256=catalog_sha256,
+                    openrouter_catalog_source=catalog_source,
+                )
+        except RuntimeError as exc:
+            if str(exc) != "injected DAG corpus pending-sink setup crash":
+                raise
+        else:
+            raise AssertionError("pending-sink recovery setup did not stop before sink flush")
+        if setup_faults != ["after_source_exhausted_before_sink_flush"]:
+            raise AssertionError(f"pending-sink recovery setup reached unexpected seams: {setup_faults!r}")
+
+        initial_repositories = RecorderFactory.read_only(initial_db, payload_store=initial_store)
+        runs = initial_repositories.run_lifecycle.list_runs()
+        if len(runs) != 1 or runs[0].status is not RunStatus.FAILED:
+            raise AssertionError(f"pending-sink recovery expected one failed setup run, got {runs!r}")
+        run_id = runs[0].run_id
+        source_records = initial_repositories.run_lifecycle.get_run_source_lifecycle_records(run_id)
+        if not source_records or any(record.lifecycle_state != "exhausted" for record in source_records.values()):
+            raise AssertionError(f"pending-sink recovery source was not exhausted before setup stop: {source_records!r}")
+        checkpoint = initial_checkpoint_manager.get_latest_checkpoint(run_id)
+        if checkpoint is None or checkpoint.upstream_topology_hash != initial_built.graph_evidence.topology_hash:
+            raise AssertionError("pending-sink recovery setup did not retain its exact topology checkpoint")
+        checkpoint_id = checkpoint.checkpoint_id
+        checkpoint_sequence = checkpoint.sequence_number
+        checkpoint_topology_hash = checkpoint.upstream_topology_hash
+        pending_before_claim = _single_pending_sink_work_snapshot(initial_db, run_id=run_id)
+        if (
+            pending_before_claim["status"],
+            pending_before_claim["pending_sink_name"],
+            pending_before_claim["pending_outcome"],
+            pending_before_claim["pending_path"],
+            pending_before_claim["pending_error_hash"],
+            pending_before_claim["pending_error_message"],
+            pending_before_claim["attempt"],
+            pending_before_claim["lease_expires_at"],
+        ) != ("pending_sink", "output", "success", "default_flow", None, None, 1, None):
+            raise AssertionError(f"pending-sink recovery setup retained the wrong complete bundle: {pending_before_claim!r}")
+        initial_effects = RecorderFactory(initial_db, payload_store=initial_store).execution.sink_effects.get_effects_for_run(run_id)
+        initial_artifacts = initial_repositories.execution.get_artifacts(run_id)
+        if initial_effects or initial_artifacts or initial_rendered.output_path.exists():
+            raise AssertionError("pending-sink recovery setup crossed the sink-effect reservation boundary")
+    finally:
+        initial_db.close()
+
+    del initial_repositories, initial_store, runs, source_records, checkpoint
+    del initial_built, initial_rendered
+
+    first_resume_db = LandscapeDB.from_url(db_url, create_tables=False)
+    try:
+        first_resume_store = FilesystemPayloadStore(payload_root)
+        first_resume_checkpoint_manager = CheckpointManager(first_resume_db)
+        first_resume_rendered = render_settings(case, tmp_path)
+        first_resume_built = build_scenario(first_resume_rendered, purpose=SinkEffectExecutionPurpose.RESUME)
+        if first_resume_built.graph_evidence.topology_hash != checkpoint_topology_hash:
+            raise AssertionError("pending-sink first fresh graph changed topology")
+        first_recovery = RecoveryManager(first_resume_db, first_resume_checkpoint_manager)
+        first_check = first_recovery.can_resume(run_id, first_resume_built.graph)
+        first_point = first_recovery.get_resume_point(run_id, first_resume_built.graph)
+        if not first_check.can_resume or first_point is None or first_point.checkpoint.checkpoint_id != checkpoint_id:
+            raise AssertionError(f"pending-sink first public resume was unavailable: {first_check.reason}")
+
+        original_reserve = SinkEffectReservation.reserve
+        reservation_faults: list[str] = []
+
+        def stop_before_reservation(reservation: SinkEffectReservation, request: Any) -> Any:
+            if not reservation_faults:
+                reservation_faults.append("before_sink_effect_reservation")
+                raise RuntimeError("injected DAG corpus crash before sink-effect reservation")
+            return original_reserve(reservation, request)
+
+        try:
+            with patch.object(SinkEffectReservation, "reserve", new=stop_before_reservation):
+                Orchestrator(
+                    first_resume_db,
+                    checkpoint_manager=first_resume_checkpoint_manager,
+                    checkpoint_config=checkpoint_config,
+                    clock=clock,
+                ).resume(
+                    first_point,
+                    first_resume_built.config,
+                    first_resume_built.graph,
+                    payload_store=first_resume_store,
+                    settings=first_resume_rendered.settings,
+                )
+        except RuntimeError as exc:
+            if str(exc) != "injected DAG corpus crash before sink-effect reservation":
+                raise
+        else:
+            raise AssertionError("pending-sink first resume did not reach the reservation fault")
+        if reservation_faults != ["before_sink_effect_reservation"]:
+            raise AssertionError(f"pending-sink recovery reached unexpected reservation seams: {reservation_faults!r}")
+
+        leased_before_recovery = _single_pending_sink_work_snapshot(first_resume_db, run_id=run_id)
+        if leased_before_recovery["status"] != "leased" or leased_before_recovery["lease_owner"] in (None, ""):
+            raise AssertionError(f"pending-sink first resume did not retain a claimed sink-redrive lease: {leased_before_recovery!r}")
+        if leased_before_recovery["lease_expires_at"] is None:
+            raise AssertionError("pending-sink first resume did not retain a bounded sink-redrive lease")
+        claim_preserved_fields = (
+            "work_item_id",
+            "token_id",
+            "row_id",
+            "row_payload_hash",
+            "pending_sink_name",
+            "pending_outcome",
+            "pending_path",
+            "pending_error_hash",
+            "pending_error_message",
+            "attempt",
+        )
+        if any(pending_before_claim[field] != leased_before_recovery[field] for field in claim_preserved_fields):
+            raise AssertionError("pending-sink TS-04 claim changed the complete durable bundle or scheduler identity")
+        first_factory = RecorderFactory(first_resume_db, payload_store=first_resume_store)
+        effects_before = first_factory.execution.sink_effects.get_effects_for_run(run_id)
+        artifacts_before = first_factory.execution.get_artifacts(run_id)
+        if effects_before or artifacts_before or first_resume_rendered.output_path.exists():
+            raise AssertionError("pending-sink reservation fault wrote an effect, artifact, or publication")
+        if first_resume_checkpoint_manager.get_latest_checkpoint(run_id) is None:
+            raise AssertionError("pending-sink reservation fault removed the resumable checkpoint")
+    finally:
+        first_resume_db.close()
+
+    del first_resume_store, first_resume_built, first_resume_rendered, first_recovery, first_check, first_point, first_factory
+
+    clock.advance(360.0)
+    final_db = LandscapeDB.from_url(db_url, create_tables=False)
+    try:
+        final_store = FilesystemPayloadStore(payload_root)
+        final_checkpoint_manager = CheckpointManager(final_db)
+        final_rendered = render_settings(case, tmp_path)
+        final_built = build_scenario(final_rendered, purpose=SinkEffectExecutionPurpose.RESUME)
+        if final_built.graph_evidence.topology_hash != checkpoint_topology_hash:
+            raise AssertionError("pending-sink final fresh graph changed topology")
+        final_recovery = RecoveryManager(final_db, final_checkpoint_manager)
+        final_check = final_recovery.can_resume(run_id, final_built.graph)
+        final_point = final_recovery.get_resume_point(run_id, final_built.graph)
+        if not final_check.can_resume or final_point is None or final_point.checkpoint.checkpoint_id != checkpoint_id:
+            raise AssertionError(f"pending-sink final public resume was unavailable: {final_check.reason}")
+
+        original_claim_pending_sink = TokenSchedulerRepository.claim_pending_sink
+        recovered_before_reclaim: list[dict[str, Any]] = []
+
+        def capture_recovered_bundle(repository: TokenSchedulerRepository, **kwargs: Any) -> Any:
+            if not recovered_before_reclaim:
+                candidate = _single_pending_sink_work_snapshot(final_db, run_id=run_id)
+                if candidate["status"] == "pending_sink":
+                    recovered_before_reclaim.append(candidate)
+            return original_claim_pending_sink(repository, **kwargs)
+
+        with patch.object(TokenSchedulerRepository, "claim_pending_sink", new=capture_recovered_bundle):
+            result = Orchestrator(
+                final_db,
+                checkpoint_manager=final_checkpoint_manager,
+                checkpoint_config=checkpoint_config,
+                clock=clock,
+            ).resume(
+                final_point,
+                final_built.config,
+                final_built.graph,
+                payload_store=final_store,
+                settings=final_rendered.settings,
+            )
+        if len(recovered_before_reclaim) != 1:
+            raise AssertionError(f"pending-sink final resume did not expose one ownerless recovered bundle: {recovered_before_reclaim!r}")
+        recovered_bundle = recovered_before_reclaim[0]
+        preserved_fields = (
+            "work_item_id",
+            "token_id",
+            "row_id",
+            "row_payload_hash",
+            "pending_sink_name",
+            "pending_outcome",
+            "pending_path",
+            "pending_error_hash",
+            "pending_error_message",
+            "attempt",
+        )
+        if any(leased_before_recovery[field] != recovered_bundle[field] for field in preserved_fields):
+            raise AssertionError("pending-sink expiry recovery changed the durable bundle or scheduler identity")
+        if recovered_bundle["lease_owner"] is not None or recovered_bundle["lease_expires_at"] is not None:
+            raise AssertionError("pending-sink expiry recovery did not clear the former lease before reclaim")
+
+        result_data = result.to_dict()
+        if result.run_id != run_id or (
+            result_data["status"],
+            result_data["rows_processed"],
+            result_data["rows_succeeded"],
+            result_data["rows_failed"],
+        ) != ("completed", 1, 1, 0):
+            raise AssertionError(f"pending-sink recovery returned the wrong final result: {result_data!r}")
+        sink_outputs = _sink_outputs(final_rendered)
+        expected_sink_outputs = (SinkOutputProjection(sink_name="output", rows=('{"id":1,"value":10}',)),)
+        if sink_outputs != expected_sink_outputs:
+            raise AssertionError(f"pending-sink recovery emitted unexpected output: {sink_outputs!r}")
+
+        final_factory = RecorderFactory(final_db, payload_store=final_store)
+        effects_after = final_factory.execution.sink_effects.get_effects_for_run(run_id)
+        members_after = final_factory.execution.sink_effects.get_members_for_run(run_id)
+        attempts_after = final_factory.execution.sink_effects.get_attempts_for_run(run_id)
+        artifacts_after = final_factory.execution.get_artifacts(run_id)
+        if (
+            len(effects_after),
+            len(members_after),
+            len(attempts_after),
+            len(artifacts_after),
+            sum(effect.publication_performed is True for effect in effects_after),
+        ) != (1, 1, 3, 1, 1):
+            raise AssertionError("pending-sink recovery did not produce exactly one effect/member/artifact/publication and three attempts")
+        effect = effects_after[0]
+        artifact = artifacts_after[0]
+        if artifact.sink_effect_id != effect.effect_id or artifact.artifact_id != effect.artifact_id:
+            raise AssertionError("pending-sink recovery artifact is not linked to the sole finalized effect")
+        if members_after[0].token_id != str(leased_before_recovery["token_id"]):
+            raise AssertionError("pending-sink recovery effect member changed token identity")
+
+        with final_db.connection() as conn:
+            recovery_events = tuple(
+                conn.execute(
+                    select(scheduler_events_table)
+                    .where(scheduler_events_table.c.run_id == run_id)
+                    .where(scheduler_events_table.c.event_type == "recover_expired_lease")
+                ).mappings()
+            )
+            claim_events = tuple(
+                conn.execute(
+                    select(scheduler_events_table)
+                    .where(scheduler_events_table.c.run_id == run_id)
+                    .where(scheduler_events_table.c.event_type == "claim_pending_sink")
+                    .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                ).mappings()
+            )
+        if len(recovery_events) != 1:
+            raise AssertionError(f"pending-sink recovery requires one RECOVER_EXPIRED_LEASE event, got {recovery_events!r}")
+        recovery_event = recovery_events[0]
+        if (
+            recovery_event["work_item_id"],
+            recovery_event["token_id"],
+            recovery_event["from_status"],
+            recovery_event["to_status"],
+            recovery_event["from_attempt"],
+            recovery_event["to_attempt"],
+            recovery_event["from_lease_owner"],
+            recovery_event["to_lease_owner"],
+        ) != (
+            leased_before_recovery["work_item_id"],
+            leased_before_recovery["token_id"],
+            "leased",
+            "pending_sink",
+            1,
+            1,
+            leased_before_recovery["lease_owner"],
+            None,
+        ):
+            raise AssertionError(f"pending-sink recovery event changed subtype identity: {dict(recovery_event)!r}")
+        if len(claim_events) != 2:
+            raise AssertionError(f"pending-sink recovery did not claim the same exact bundle twice: {claim_events!r}")
+        first_claim, fresh_claim = claim_events
+        if any(
+            event["work_item_id"] != leased_before_recovery["work_item_id"]
+            or event["token_id"] != leased_before_recovery["token_id"]
+            or event["from_status"] != "pending_sink"
+            or event["to_status"] != "leased"
+            or event["from_attempt"] != 1
+            or event["to_attempt"] != 1
+            for event in claim_events
+        ):
+            raise AssertionError(f"pending-sink recovery claim events changed the exact bundle subtype: {claim_events!r}")
+        fresh_owner = fresh_claim["to_lease_owner"]
+        if (
+            first_claim["to_lease_owner"] != leased_before_recovery["lease_owner"]
+            or fresh_claim["from_lease_owner"] is not None
+            or not isinstance(fresh_owner, str)
+            or fresh_owner == ""
+            or fresh_owner == leased_before_recovery["lease_owner"]
+        ):
+            raise AssertionError(f"pending-sink recovery did not clear and reclaim under a fresh lease owner: {claim_events!r}")
+
+        if (
+            members_after[0].effect_id != effect.effect_id
+            or tuple(attempt.effect_id for attempt in attempts_after) != (effect.effect_id,) * 3
+            or artifact.sink_effect_id != effect.effect_id
+        ):
+            raise AssertionError("pending-sink recovery effect, member, attempts, and artifact split identity")
+
+        _assert_all_tokens_and_work_terminal(final_db, run_id=run_id, payload_store=final_store)
+        final_work = _single_pending_sink_work_snapshot(final_db, run_id=run_id, require_live_payload=False)
+        if final_work["work_item_id"] != leased_before_recovery["work_item_id"] or final_work["status"] != "terminal":
+            raise AssertionError("pending-sink recovery did not terminalize the original work identity")
+        final_outcome = RecorderFactory.read_only(final_db, payload_store=final_store).data_flow.get_token_outcome(
+            str(leased_before_recovery["token_id"])
+        )
+        if final_outcome is None or final_outcome.outcome is None or final_outcome.outcome.value != "success":
+            raise AssertionError(f"pending-sink recovery did not retain the terminal success outcome: {final_outcome!r}")
+        durable_projection, audit = _exact_recovery_views(final_db, run_id=run_id, payload_store=final_store)
+        if audit.source_operation_count != 1:
+            raise AssertionError(f"pending-sink recovery replayed its source: source_load count={audit.source_operation_count}")
+        if final_checkpoint_manager.get_latest_checkpoint(run_id) is not None:
+            raise AssertionError("pending-sink recovery retained its checkpoint after successful resume")
+
+        attempt_ids = tuple(sorted(attempt.attempt_id for attempt in attempts_after))
+        return ScenarioRunEvidence(
+            schema_version=2,
+            scenario_id=scenario.id,
+            case_id=case.id,
+            fixture_sha256=final_rendered.fixture_sha256,
+            config=ConfigEvidence(loaded=True, settings_sha256=final_rendered.settings_sha256),
+            graph=final_built.graph_evidence,
+            runtime=RuntimeEvidence(
+                attempted=True,
+                run_id=result.run_id,
+                status=str(result_data["status"]),
+                rows_processed=result_data["rows_processed"],
+                rows_succeeded=result_data["rows_succeeded"],
+                rows_failed=result_data["rows_failed"],
+                output_rows=sum(len(output.rows) for output in sink_outputs),
+                sink_outputs=sink_outputs,
+                durable_projection=durable_projection,
+            ),
+            audit=audit,
+            recovery=RecoveryEvidence(
+                attempted=True,
+                database_reopened=True,
+                checkpoint_id=checkpoint_id,
+                checkpoint_sequence=checkpoint_sequence,
+                can_resume=True,
+                source_replayed=False,
+                checkpoint_removed=True,
+                pending_sink_redrive=PendingSinkRedriveRecoveryEvidence(
+                    fault_seam="before_sink_effect_reservation",
+                    fault_count=1,
+                    source_exhausted_before=True,
+                    work_item_id_before=str(pending_before_claim["work_item_id"]),
+                    work_item_id_claimed=str(leased_before_recovery["work_item_id"]),
+                    work_item_id_after=str(recovered_bundle["work_item_id"]),
+                    token_id_before=str(pending_before_claim["token_id"]),
+                    token_id_claimed=str(leased_before_recovery["token_id"]),
+                    token_id_after=str(recovered_bundle["token_id"]),
+                    row_id_before=str(pending_before_claim["row_id"]),
+                    row_id_claimed=str(leased_before_recovery["row_id"]),
+                    row_id_after=str(recovered_bundle["row_id"]),
+                    row_payload_hash_before=str(pending_before_claim["row_payload_hash"]),
+                    row_payload_hash_claimed=str(leased_before_recovery["row_payload_hash"]),
+                    row_payload_hash_after=str(recovered_bundle["row_payload_hash"]),
+                    pending_sink_name_before=str(pending_before_claim["pending_sink_name"]),
+                    pending_sink_name_claimed=str(leased_before_recovery["pending_sink_name"]),
+                    pending_sink_name_after=str(recovered_bundle["pending_sink_name"]),
+                    pending_outcome_before="success",
+                    pending_outcome_claimed="success",
+                    pending_outcome_after="success",
+                    pending_path_before="default_flow",
+                    pending_path_claimed="default_flow",
+                    pending_path_after="default_flow",
+                    pending_error_hash_before=None,
+                    pending_error_hash_claimed=None,
+                    pending_error_hash_after=None,
+                    pending_error_message_before=None,
+                    pending_error_message_claimed=None,
+                    pending_error_message_after=None,
+                    scheduler_attempt_before=1,
+                    scheduler_attempt_claimed=1,
+                    scheduler_attempt_after=1,
+                    lease_owner_before=str(leased_before_recovery["lease_owner"]),
+                    lease_cleared_before_reclaim=True,
+                    reclaimed_by_fresh_owner=True,
+                    reclaimed_lease_owner_after=fresh_owner,
+                    expired_lease_recovery_events=1,
+                    recover_event_work_item_id=str(recovery_event["work_item_id"]),
+                    recover_event_token_id=str(recovery_event["token_id"]),
+                    recover_event_from_status="leased",
+                    recover_event_to_status="pending_sink",
+                    recover_event_from_attempt=1,
+                    recover_event_to_attempt=1,
+                    recover_event_from_lease_owner=str(recovery_event["from_lease_owner"]),
+                    recover_event_to_lease_owner=None,
+                    sink_effects_before=0,
+                    artifacts_before=0,
+                    sink_effects_after=1,
+                    sink_effect_members_after=1,
+                    sink_effect_attempts_after=3,
+                    artifacts_after=1,
+                    publications_after=1,
+                    effect_id_after=effect.effect_id,
+                    member_effect_id_after=members_after[0].effect_id,
+                    attempt_effect_ids_after=tuple(attempt.effect_id for attempt in attempts_after),
+                    artifact_id_after=artifact.artifact_id,
+                    artifact_effect_id_after=artifact.sink_effect_id,
+                    effect_attempt_ids_after=attempt_ids,
+                    terminal_outcome="success",
+                    terminal_work_status="terminal",
+                    final_output_rows=1,
+                    durable_export_parity=True,
+                    provisional_until_deferred_platform_rebase=True,
+                ),
+            ),
+            completed_stages=("config", "build", "runtime", "audit", "recovery"),
+        )
+    finally:
+        final_db.close()
+
+
 def _parallel_sink_finalization_recovery_case(
     scenario: ScenarioSpec,
     case: HarnessCaseSpec,
@@ -3082,4 +3566,6 @@ def run_scenario_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: P
         return _expansion_child_enqueue_recovery_case(scenario, case, tmp_path)
     if case.recovery_kind == "parallel_sink_finalization":
         return _parallel_sink_finalization_recovery_case(scenario, case, tmp_path)
+    if case.recovery_kind == "pending_sink_redrive":
+        return _pending_sink_redrive_recovery_case(scenario, case, tmp_path)
     raise AssertionError(f"unsupported recovery kind: {case.recovery_kind!r}")

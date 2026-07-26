@@ -81,6 +81,7 @@ B3_RUNTIME_CASES = (
 B3_RECOVERY_CASES = (
     ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
     ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
+    ("sink-write-pending-redrive", "pending-redrive-reopen"),
 )
 
 B2_COALESCE_POSITIVE_CASES = tuple(
@@ -1994,6 +1995,7 @@ def test_b3_recovery_cases_are_registered_as_closed_recovery_workflows() -> None
             "resume-after-child-enqueue",
             "expansion_child_enqueue",
         ),
+        ("sink-write-pending-redrive", "pending-redrive-reopen", "pending_sink_redrive"),
     )
     expansion_reference = next(
         reference
@@ -2041,14 +2043,14 @@ def test_b3_recovery_rebuilds_fresh_settings_plugins_graph_and_config(
     evidence = corpus_harness.run_scenario_case(scenario, case, tmp_path)
 
     _assert_declared_recovery_evidence(scenario, case, evidence)
-    assert len(built_objects) == 2
-    initial, fresh = built_objects
-    assert initial is not fresh
-    assert initial.rendered is not fresh.rendered
-    assert initial.rendered.settings is not fresh.rendered.settings
-    assert initial.bundle is not fresh.bundle
-    assert initial.graph is not fresh.graph
-    assert initial.config is not fresh.config
+    expected_build_count = 3 if case.recovery_kind == "pending_sink_redrive" else 2
+    assert len(built_objects) == expected_build_count
+    assert len({id(built) for built in built_objects}) == expected_build_count
+    assert len({id(built.rendered) for built in built_objects}) == expected_build_count
+    assert len({id(built.rendered.settings) for built in built_objects}) == expected_build_count
+    assert len({id(built.bundle) for built in built_objects}) == expected_build_count
+    assert len({id(built.graph) for built in built_objects}) == expected_build_count
+    assert len({id(built.config) for built in built_objects}) == expected_build_count
 
 
 def test_checkpoint_reopen_resume_has_exact_restart_evidence(
@@ -2064,6 +2066,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
+        ("sink-write-pending-redrive", "pending-redrive-reopen"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
 
@@ -2156,6 +2159,37 @@ def test_expansion_recovery_preserves_parent_child_group_and_scheduler_identity(
     assert evidence.runtime.rows_processed == 3
     assert evidence.runtime.rows_succeeded == 6
     assert evidence.runtime.output_rows == 6
+    assert evidence.audit.source_operation_count == 1
+
+
+def test_pending_sink_redrive_recovery_preserves_complete_bundle_and_exactly_once_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("sink-write-pending-redrive", "pending-redrive-reopen")
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    recovery = evidence.recovery.pending_sink_redrive
+    assert recovery is not None
+    assert recovery.work_item_id_before == recovery.work_item_id_claimed == recovery.work_item_id_after
+    assert recovery.token_id_before == recovery.token_id_claimed == recovery.token_id_after
+    assert recovery.row_id_before == recovery.row_id_claimed == recovery.row_id_after
+    assert recovery.row_payload_hash_before == recovery.row_payload_hash_claimed == recovery.row_payload_hash_after
+    assert recovery.scheduler_attempt_before == recovery.scheduler_attempt_claimed == recovery.scheduler_attempt_after == 1
+    assert recovery.pending_sink_name_before == recovery.pending_sink_name_claimed == recovery.pending_sink_name_after == "output"
+    assert recovery.pending_outcome_before == recovery.pending_outcome_claimed == recovery.pending_outcome_after == "success"
+    assert recovery.pending_path_before == recovery.pending_path_claimed == recovery.pending_path_after == "default_flow"
+    assert recovery.pending_error_hash_before is recovery.pending_error_hash_after is None
+    assert recovery.pending_error_message_before is recovery.pending_error_message_after is None
+    assert recovery.expired_lease_recovery_events == 1
+    assert recovery.sink_effects_after == 1
+    assert recovery.artifacts_after == 1
+    assert recovery.publications_after == 1
+    assert evidence.runtime.rows_processed == 1
+    assert evidence.runtime.rows_succeeded == 1
+    assert evidence.runtime.rows_failed == 0
     assert evidence.audit.source_operation_count == 1
 
 

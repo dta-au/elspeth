@@ -54,6 +54,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     GraphNodeTypeCount,
     HarnessCaseSpec,
     ParallelSinkFinalizationRecoveryEvidence,
+    PendingSinkRedriveRecoveryEvidence,
     RecoveryEvidence,
     RecoveryKind,
     RunExpectation,
@@ -263,7 +264,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
+        "pass",
         "partial",
         "pass",
         "partial",
@@ -396,8 +397,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0cffbd3220ba386eeae6c4160e88df85c307c8273bc43d03dac9d480cfe6165d"
-EXPECTED_CASE_REGISTRY_SHA256 = "40650ec12586e549d7432dd6fef995ad9ed57af8592466b6acb850d8a6b1c04d"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "1594707f9f2092d2403f7a4d492e2bb36840895048188ec410c6000f8c9e9770"
+EXPECTED_CASE_REGISTRY_SHA256 = "baafac2ebaab18c6936505f061d0b85485330cd9a99fbca52a96beb262a50d38"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -460,6 +461,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "retry-quarantine-discard-routed-errors:transform-discard": "fb4d0c91d4612e6dcb0d9903f097db8b3e50310386811ddaee15d1749de23948",
     "retry-quarantine-discard-routed-errors:transform-error-route": "d4321f033f305d215563d2bfb62cb190df8a3eff87e10d8ac9805e9e9b45ca71",
     "sink-write-pending-redrive:write-once": "e8344036a8baf85bba035264683e47f3502d17336db55bef5174c87d468577de",
+    "sink-write-pending-redrive:pending-redrive-reopen": "e8344036a8baf85bba035264683e47f3502d17336db55bef5174c87d468577de",
     "checkpoint-deterministic-resume:reopen-resume": "ce62216ce20210600f1a9c20e362aaf299c7538e6c4d3bd0e97627563dc813e6",
 }
 
@@ -554,6 +556,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-sink-write-pending-redrive-write-once",
         "sink-write-pending-redrive:write-once",
         ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-sink-write-pending-redrive-pending-redrive-reopen",
+        "sink-write-pending-redrive:pending-redrive-reopen",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
 )
 
@@ -1415,6 +1422,75 @@ def _valid_sink_finalization_recovery() -> ParallelSinkFinalizationRecoveryEvide
         final_output_rows=6,
         durable_export_parity=True,
         held_barrier_proven=False,
+    )
+
+
+def _valid_pending_sink_redrive_recovery() -> PendingSinkRedriveRecoveryEvidence:
+    return PendingSinkRedriveRecoveryEvidence(
+        fault_seam="before_sink_effect_reservation",
+        fault_count=1,
+        source_exhausted_before=True,
+        work_item_id_before="work-1",
+        work_item_id_claimed="work-1",
+        work_item_id_after="work-1",
+        token_id_before="token-1",
+        token_id_claimed="token-1",
+        token_id_after="token-1",
+        row_id_before="row-1",
+        row_id_claimed="row-1",
+        row_id_after="row-1",
+        row_payload_hash_before="a" * 64,
+        row_payload_hash_claimed="a" * 64,
+        row_payload_hash_after="a" * 64,
+        pending_sink_name_before="output",
+        pending_sink_name_claimed="output",
+        pending_sink_name_after="output",
+        pending_outcome_before="success",
+        pending_outcome_claimed="success",
+        pending_outcome_after="success",
+        pending_path_before="default_flow",
+        pending_path_claimed="default_flow",
+        pending_path_after="default_flow",
+        pending_error_hash_before=None,
+        pending_error_hash_claimed=None,
+        pending_error_hash_after=None,
+        pending_error_message_before=None,
+        pending_error_message_claimed=None,
+        pending_error_message_after=None,
+        scheduler_attempt_before=1,
+        scheduler_attempt_claimed=1,
+        scheduler_attempt_after=1,
+        lease_owner_before="worker-before",
+        lease_cleared_before_reclaim=True,
+        reclaimed_by_fresh_owner=True,
+        reclaimed_lease_owner_after="worker-after",
+        expired_lease_recovery_events=1,
+        recover_event_work_item_id="work-1",
+        recover_event_token_id="token-1",
+        recover_event_from_status="leased",
+        recover_event_to_status="pending_sink",
+        recover_event_from_attempt=1,
+        recover_event_to_attempt=1,
+        recover_event_from_lease_owner="worker-before",
+        recover_event_to_lease_owner=None,
+        sink_effects_before=0,
+        artifacts_before=0,
+        sink_effects_after=1,
+        sink_effect_members_after=1,
+        sink_effect_attempts_after=3,
+        artifacts_after=1,
+        publications_after=1,
+        effect_id_after="b" * 64,
+        member_effect_id_after="b" * 64,
+        attempt_effect_ids_after=("b" * 64,) * 3,
+        artifact_id_after="c" * 64,
+        artifact_effect_id_after="b" * 64,
+        effect_attempt_ids_after=("attempt-a", "attempt-b", "attempt-c"),
+        terminal_outcome="success",
+        terminal_work_status="terminal",
+        final_output_rows=1,
+        durable_export_parity=True,
+        provisional_until_deferred_platform_rebase=True,
     )
 
 
@@ -3161,6 +3237,7 @@ def test_closed_vocabularies_are_exact() -> None:
         "eof_aggregation",
         "expansion_child_enqueue",
         "parallel_sink_finalization",
+        "pending_sink_redrive",
     )
 
 
@@ -3690,6 +3767,77 @@ def test_parallel_sink_finalization_recovery_rejects_identity_drift(
         ParallelSinkFinalizationRecoveryEvidence.model_validate(values)
 
 
+def test_pending_sink_redrive_recovery_pins_exact_preserved_bundle_and_effect_counts() -> None:
+    pending_redrive = _valid_pending_sink_redrive_recovery()
+    values = _valid_recovery().model_dump(mode="json")
+    values["pending_sink_redrive"] = pending_redrive.model_dump(mode="json")
+
+    evidence = RecoveryEvidence.model_validate(values)
+
+    assert evidence.pending_sink_redrive == pending_redrive
+    assert pending_redrive.scheduler_attempt_before == pending_redrive.scheduler_attempt_after == 1
+    assert pending_redrive.sink_effects_before == pending_redrive.artifacts_before == 0
+    assert pending_redrive.sink_effects_after == pending_redrive.artifacts_after == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("work_item_id_after", "work-drift", "preserve exact work item identity"),
+        ("work_item_id_claimed", "work-drift", "preserve exact work item identity"),
+        ("token_id_after", "token-drift", "preserve exact token identity"),
+        ("token_id_claimed", "token-drift", "preserve exact token identity"),
+        ("row_id_after", "row-drift", "preserve exact row identity"),
+        ("row_id_claimed", "row-drift", "preserve exact row identity"),
+        ("row_payload_hash_after", "d" * 64, "preserve exact row payload identity"),
+        ("row_payload_hash_claimed", "d" * 64, "preserve exact row payload identity"),
+        ("pending_sink_name_after", "other", "preserve exact sink name identity"),
+        ("pending_sink_name_claimed", "other", "preserve exact sink name identity"),
+        ("recover_event_work_item_id", "work-drift", "identify the exact recovered work item and token"),
+        ("recover_event_token_id", "token-drift", "identify the exact recovered work item and token"),
+        ("recover_event_from_lease_owner", "other-worker", "clear the exact expired lease owner"),
+        ("reclaimed_lease_owner_after", "worker-before", "reclaimed by a fresh lease owner"),
+        ("member_effect_id_after", "d" * 64, "member must retain the sole effect identity"),
+        ("attempt_effect_ids_after", ("b" * 64, "d" * 64, "b" * 64), "attempts must retain the sole effect identity"),
+        ("artifact_effect_id_after", "d" * 64, "artifact must retain the sole effect identity"),
+        ("effect_attempt_ids_after", ("attempt-a", "attempt-a", "attempt-c"), "three unique sorted sink-effect attempt identities"),
+    ),
+)
+def test_pending_sink_redrive_recovery_rejects_identity_event_and_attempt_drift(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    values = _valid_pending_sink_redrive_recovery().model_dump(mode="json")
+    values[field] = value
+
+    with pytest.raises(ValidationError, match=message):
+        PendingSinkRedriveRecoveryEvidence.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("scheduler_attempt_after", 2),
+        ("scheduler_attempt_claimed", 2),
+        ("pending_outcome_claimed", "discard"),
+        ("pending_path_claimed", "error_route"),
+        ("pending_error_hash_claimed", "unexpected-error"),
+        ("pending_error_message_claimed", "unexpected error"),
+        ("pending_error_hash_before", "unexpected-error"),
+        ("pending_error_message_after", "unexpected error"),
+        ("sink_effects_before", 1),
+        ("publications_after", 0),
+    ),
+)
+def test_pending_sink_redrive_recovery_rejects_non_exact_boundary_values(field: str, value: object) -> None:
+    values = _valid_pending_sink_redrive_recovery().model_dump(mode="json")
+    values[field] = value
+
+    with pytest.raises(ValidationError):
+        PendingSinkRedriveRecoveryEvidence.model_validate(values)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
@@ -3846,8 +3994,11 @@ def test_expansion_recovery_rejects_inexact_partition_cardinality_and_shape(muta
     (
         ("sink_finalization", "aggregation_eof"),
         ("sink_finalization", "expansion_child_enqueue"),
+        ("sink_finalization", "pending_sink_redrive"),
         ("aggregation_eof", "expansion_child_enqueue"),
-        ("sink_finalization", "aggregation_eof", "expansion_child_enqueue"),
+        ("aggregation_eof", "pending_sink_redrive"),
+        ("expansion_child_enqueue", "pending_sink_redrive"),
+        ("sink_finalization", "aggregation_eof", "expansion_child_enqueue", "pending_sink_redrive"),
     ),
 )
 def test_recovery_evidence_rejects_multiple_seam_specific_proofs(seams: tuple[str, ...]) -> None:
@@ -3855,6 +4006,7 @@ def test_recovery_evidence_rejects_multiple_seam_specific_proofs(seams: tuple[st
         "sink_finalization": _valid_sink_finalization_recovery(),
         "aggregation_eof": _valid_aggregation_eof_recovery(),
         "expansion_child_enqueue": _valid_expansion_child_enqueue_recovery(),
+        "pending_sink_redrive": _valid_pending_sink_redrive_recovery(),
     }
     values = _valid_recovery().model_dump(mode="json")
     for seam in seams:
@@ -3870,6 +4022,7 @@ def test_recovery_evidence_rejects_multiple_seam_specific_proofs(seams: tuple[st
         ("sink_finalization", _valid_sink_finalization_recovery()),
         ("aggregation_eof", _valid_aggregation_eof_recovery()),
         ("expansion_child_enqueue", _valid_expansion_child_enqueue_recovery()),
+        ("pending_sink_redrive", _valid_pending_sink_redrive_recovery()),
     ),
 )
 @pytest.mark.parametrize(
@@ -3901,6 +4054,7 @@ def test_seam_specific_recovery_rejects_contradictory_public_resume_flags(
         ("sink_finalization", _valid_sink_finalization_recovery()),
         ("aggregation_eof", _valid_aggregation_eof_recovery()),
         ("expansion_child_enqueue", _valid_expansion_child_enqueue_recovery()),
+        ("pending_sink_redrive", _valid_pending_sink_redrive_recovery()),
     ),
 )
 def test_unattempted_recovery_forbids_seam_specific_proof(field: str, proof: BaseModel) -> None:
@@ -4066,6 +4220,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("retry-quarantine-discard-routed-errors", "transform-discard"),
         ("retry-quarantine-discard-routed-errors", "transform-error-route"),
         ("sink-write-pending-redrive", "write-once"),
+        ("sink-write-pending-redrive", "pending-redrive-reopen"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     assert manifest.verdict == "not_complete"
@@ -4080,11 +4235,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 98
+    assert len(manifest.evidence) == 99
     assert len(assessment_evidence) == 59
-    assert len(harness_evidence) == 38
-    assert len({reference.id for reference in manifest.evidence}) == 98
-    assert len({reference.locator for reference in manifest.evidence}) == 98
+    assert len(harness_evidence) == 39
+    assert len({reference.id for reference in manifest.evidence}) == 99
+    assert len({reference.locator for reference in manifest.evidence}) == 99
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4116,6 +4271,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("retry-quarantine-discard-routed-errors", "transform-discard"),
         ("retry-quarantine-discard-routed-errors", "transform-error-route"),
         ("sink-write-pending-redrive", "write-once"),
+        ("sink-write-pending-redrive", "pending-redrive-reopen"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     normalized_cases = json.dumps(cases, sort_keys=True, separators=(",", ":")).encode()
@@ -4214,6 +4370,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("sink-write-pending-redrive", "runtime"),
             ("sink-write-pending-redrive", "audit"),
         ),
+        "harness-sink-write-pending-redrive-pending-redrive-reopen": (("sink-write-pending-redrive", "recovery"),),
         "harness-checkpoint-deterministic-resume-reopen-resume": (
             ("checkpoint-deterministic-resume", "runtime"),
             ("checkpoint-deterministic-resume", "audit"),

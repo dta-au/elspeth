@@ -68,10 +68,15 @@ without broadening terminal semantics or inferring omitted material.
 The current B3 set is deliberately bounded: EOF immutable aggregation, JSON
 parent/child expansion, retry success, source quarantine, transform discard,
 transform error routing, and one ordinary write-once sink. The ordinary cases
-provide runtime/audit evidence. Two dedicated fresh-object cases also provide
-recovery evidence at the EOF aggregation and expansion child-handoff seams;
-they do not promote concurrency or scale, whose gaps remain independently
-owned in the manifest.
+provide runtime/audit evidence. Three dedicated fresh-object cases also
+provide recovery evidence at the EOF aggregation, expansion child-handoff,
+and pending-sink redrive seams. The pending-sink case deliberately spans three
+fresh runtime/object lifetimes within one process: the initial run durably
+reaches `PENDING_SINK` after source exhaustion, the first public resume claims
+that exact work item and faults before sink-effect reservation, and the second
+public resume uses an injected clock to expire and recover that lease before
+publishing. These cases do not promote concurrency or scale, whose gaps remain
+independently owned in the manifest.
 The disposition scenario also keeps runtime and audit partial until the
 authoritative scheduler-disposition and follower-drain work tracked by
 `elspeth-2e66723070` and `elspeth-6f6bbbec00` is integrated; the local exact
@@ -92,8 +97,16 @@ all children are enqueued but before sink flush, then proves exact 3-parent,
 the supported observed-schema JSON source contract; fixed-schema `any` resume
 reconstruction remains separately owned by P1 `elspeth-0b0eaa63df`. Both cases
 also require terminal token/work state, checkpoint removal, no source replay,
-canonical outputs, and exact durable/export parity. Their evidence remains
-provisional until it is rerun after the deferred-platform rebase.
+canonical outputs, and exact durable/export parity. The
+`pending_sink_redrive` case proves the same work, token, row, payload, sink,
+outcome, path, error, and scheduler-attempt bundle survives expiry. It requires
+one exact sink-specific `RECOVER_EXPIRED_LEASE` transition that clears the old
+owner before a fresh claim, no effect or artifact before recovery, and exactly
+one final sink effect, member, artifact, and publication with the expected
+three public sink-effect attempts. It also proves terminal state, checkpoint
+cleanup, no source replay, and durable/export parity. All three recovery
+proofs remain provisional until they are rerun after the deferred-platform
+rebase.
 
 The manifest does not replace the criteria, and a dated assessment does not
 replace the live manifest. Documentary evidence can explain a cell, but only

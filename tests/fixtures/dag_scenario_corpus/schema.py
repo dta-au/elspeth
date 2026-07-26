@@ -44,7 +44,12 @@ Dimension = Literal[
 EvidenceKind = Literal["harness", "pytest", "document", "decision"]
 Stage = Literal["config", "build", "runtime", "audit", "recovery"]
 Workflow = Literal["run", "recovery", "build"]
-RecoveryKind = Literal["eof_aggregation", "expansion_child_enqueue", "parallel_sink_finalization"]
+RecoveryKind = Literal[
+    "eof_aggregation",
+    "expansion_child_enqueue",
+    "parallel_sink_finalization",
+    "pending_sink_redrive",
+]
 GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "sink", "source", "transform"]
 
 EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
@@ -1562,6 +1567,105 @@ class ExpansionChildEnqueueRecoveryEvidence(ClosedModel):
         return self
 
 
+class PendingSinkRedriveRecoveryEvidence(ClosedModel):
+    """Exact TS-04/TS-06 bundle identity across expiry and public resume."""
+
+    fault_seam: Literal["before_sink_effect_reservation"]
+    fault_count: Literal[1]
+    source_exhausted_before: Literal[True]
+    work_item_id_before: NonEmpty
+    work_item_id_claimed: NonEmpty
+    work_item_id_after: NonEmpty
+    token_id_before: NonEmpty
+    token_id_claimed: NonEmpty
+    token_id_after: NonEmpty
+    row_id_before: NonEmpty
+    row_id_claimed: NonEmpty
+    row_id_after: NonEmpty
+    row_payload_hash_before: NonEmpty
+    row_payload_hash_claimed: NonEmpty
+    row_payload_hash_after: NonEmpty
+    pending_sink_name_before: NonEmpty
+    pending_sink_name_claimed: NonEmpty
+    pending_sink_name_after: NonEmpty
+    pending_outcome_before: Literal["success"]
+    pending_outcome_claimed: Literal["success"]
+    pending_outcome_after: Literal["success"]
+    pending_path_before: Literal["default_flow"]
+    pending_path_claimed: Literal["default_flow"]
+    pending_path_after: Literal["default_flow"]
+    pending_error_hash_before: None = None
+    pending_error_hash_claimed: None = None
+    pending_error_hash_after: None = None
+    pending_error_message_before: None = None
+    pending_error_message_claimed: None = None
+    pending_error_message_after: None = None
+    scheduler_attempt_before: Literal[1]
+    scheduler_attempt_claimed: Literal[1]
+    scheduler_attempt_after: Literal[1]
+    lease_owner_before: NonEmpty
+    lease_cleared_before_reclaim: Literal[True]
+    reclaimed_by_fresh_owner: Literal[True]
+    reclaimed_lease_owner_after: NonEmpty
+    expired_lease_recovery_events: Literal[1]
+    recover_event_work_item_id: NonEmpty
+    recover_event_token_id: NonEmpty
+    recover_event_from_status: Literal["leased"]
+    recover_event_to_status: Literal["pending_sink"]
+    recover_event_from_attempt: Literal[1]
+    recover_event_to_attempt: Literal[1]
+    recover_event_from_lease_owner: NonEmpty
+    recover_event_to_lease_owner: None = None
+    sink_effects_before: Literal[0]
+    artifacts_before: Literal[0]
+    sink_effects_after: Literal[1]
+    sink_effect_members_after: Literal[1]
+    sink_effect_attempts_after: Literal[3]
+    artifacts_after: Literal[1]
+    publications_after: Literal[1]
+    effect_id_after: NonEmpty
+    member_effect_id_after: NonEmpty
+    attempt_effect_ids_after: tuple[NonEmpty, ...]
+    artifact_id_after: NonEmpty
+    artifact_effect_id_after: NonEmpty
+    effect_attempt_ids_after: tuple[NonEmpty, ...]
+    terminal_outcome: Literal["success"]
+    terminal_work_status: Literal["terminal"]
+    final_output_rows: Literal[1]
+    durable_export_parity: Literal[True]
+    provisional_until_deferred_platform_rebase: Literal[True]
+
+    @model_validator(mode="after")
+    def _validate_exact_bundle_identity(self) -> Self:
+        identity_triples = (
+            (self.work_item_id_before, self.work_item_id_claimed, self.work_item_id_after, "work item"),
+            (self.token_id_before, self.token_id_claimed, self.token_id_after, "token"),
+            (self.row_id_before, self.row_id_claimed, self.row_id_after, "row"),
+            (self.row_payload_hash_before, self.row_payload_hash_claimed, self.row_payload_hash_after, "row payload"),
+            (self.pending_sink_name_before, self.pending_sink_name_claimed, self.pending_sink_name_after, "sink name"),
+            (self.pending_outcome_before, self.pending_outcome_claimed, self.pending_outcome_after, "outcome"),
+            (self.pending_path_before, self.pending_path_claimed, self.pending_path_after, "path"),
+        )
+        for before, claimed, after, label in identity_triples:
+            if before != claimed or claimed != after:
+                raise ValueError(f"pending-sink redrive must preserve exact {label} identity across pending, claim, and recovery")
+        if self.recover_event_work_item_id != self.work_item_id_before or self.recover_event_token_id != self.token_id_before:
+            raise ValueError("pending-sink recovery event must identify the exact recovered work item and token")
+        if self.recover_event_from_lease_owner != self.lease_owner_before:
+            raise ValueError("pending-sink recovery event must clear the exact expired lease owner")
+        if self.reclaimed_lease_owner_after == self.lease_owner_before:
+            raise ValueError("pending-sink redrive must be reclaimed by a fresh lease owner")
+        if self.member_effect_id_after != self.effect_id_after:
+            raise ValueError("pending-sink redrive member must retain the sole effect identity")
+        if self.attempt_effect_ids_after != (self.effect_id_after,) * 3:
+            raise ValueError("pending-sink redrive attempts must retain the sole effect identity")
+        if self.artifact_effect_id_after != self.effect_id_after:
+            raise ValueError("pending-sink redrive artifact must retain the sole effect identity")
+        if len(self.effect_attempt_ids_after) != 3 or self.effect_attempt_ids_after != tuple(sorted(set(self.effect_attempt_ids_after))):
+            raise ValueError("pending-sink redrive requires three unique sorted sink-effect attempt identities")
+        return self
+
+
 class RecoveryEvidence(ClosedModel):
     attempted: StrictBool
     database_reopened: StrictBool
@@ -1582,10 +1686,14 @@ class RecoveryEvidence(ClosedModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    pending_sink_redrive: PendingSinkRedriveRecoveryEvidence | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_recovery_shape(self) -> Self:
-        seam_proofs = (self.sink_finalization, self.aggregation_eof, self.expansion_child_enqueue)
+        seam_proofs = (self.sink_finalization, self.aggregation_eof, self.expansion_child_enqueue, self.pending_sink_redrive)
         if sum(proof is not None for proof in seam_proofs) > 1:
             raise ValueError("recovery evidence permits at most one seam-specific proof")
         if self.attempted:
@@ -1601,6 +1709,7 @@ class RecoveryEvidence(ClosedModel):
             or self.sink_finalization is not None
             or self.aggregation_eof is not None
             or self.expansion_child_enqueue is not None
+            or self.pending_sink_redrive is not None
         ):
             raise ValueError("unattempted recovery forbids checkpoint identity and true result flags")
         if any(proof is not None for proof in seam_proofs) and not (
