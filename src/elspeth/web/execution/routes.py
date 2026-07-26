@@ -15,14 +15,18 @@ run's parent session.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
+from urllib.parse import quote
 from uuid import UUID
 
 import structlog
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pydantic import ValidationError
 
 from elspeth.web.async_workers import run_sync_in_worker
@@ -47,7 +51,7 @@ from elspeth.web.execution.outputs import (
     load_run_outputs_for_settings,
     path_or_uri_to_filesystem_path,
 )
-from elspeth.web.execution.preview import build_artifact_preview
+from elspeth.web.execution.preview import build_artifact_preview_from_bytes
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService, StateAccessError
 from elspeth.web.execution.schemas import (
@@ -62,13 +66,13 @@ from elspeth.web.execution.schemas import (
     RunDiagnosticsWorkingView,
     RunEvent,
     RunEventType,
+    RunOutputArtifact,
     RunOutputArtifactPreview,
     RunOutputsResponse,
     RunResultsResponse,
     RunStatusResponse,
     ValidationResult,
 )
-from elspeth.web.paths import allowed_sink_directories
 from elspeth.web.sessions.ownership import verify_session_ownership
 from elspeth.web.sessions.protocol import (
     OPERATOR_COMPLETION_RUN_STATUS_VALUES,
@@ -100,12 +104,8 @@ async def _get_session_service(request: Request) -> SessionServiceProtocol:
 # Run-ownership verification remains here — only execution/ runs care.
 
 
-async def _verify_run_ownership(run_id: UUID, user: UserIdentity, request: Request) -> None:
-    """Verify the run exists and belongs to the current user's session.
-
-    Looks up the run's parent session and checks ownership.
-    Returns 404 (not 403) to avoid leaking run existence (IDOR).
-    """
+async def _get_owned_run_record(run_id: UUID, user: UserIdentity, request: Request) -> RunRecord:
+    """Return the run row after IDOR-safe ownership verification."""
     session_service: SessionServiceProtocol = request.app.state.session_service
     settings: WebSettings = request.app.state.settings
     try:
@@ -120,6 +120,89 @@ async def _verify_run_ownership(run_id: UUID, user: UserIdentity, request: Reque
 
     if session.user_id != user.user_id or session.auth_provider_type != settings.auth_provider:
         raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+async def _verify_run_ownership(run_id: UUID, user: UserIdentity, request: Request) -> None:
+    """Verify the run exists and belongs to the current user's session.
+
+    Looks up the run's parent session and checks ownership.
+    Returns 404 (not 403) to avoid leaking run existence (IDOR).
+    """
+    await _get_owned_run_record(run_id, user, request)
+
+
+def _artifact_path_owned_by_session(resolved: Path, *, data_dir: str, session_id: UUID) -> bool:
+    """Return True iff a filesystem artifact lives in this session's namespace.
+
+    The sink allowlist is intentionally global for write compatibility, but
+    readback is an authorization boundary. Downloads/previews therefore require
+    a session-owned namespace under ``data_dir/outputs/{session_id}`` or
+    ``data_dir/blobs/{session_id}``; a global ``data_dir/outputs/shared.jsonl``
+    path is only a mutable filesystem location, not proof that the current
+    bytes belong to the caller's run.
+    """
+    base = Path(data_dir).resolve()
+    session_key = str(session_id)
+    session_roots = (base / "outputs" / session_key, base / "blobs" / session_key)
+    return any(resolved.is_relative_to(root) for root in session_roots)
+
+
+def _artifact_path_unauthorized_http(path_or_uri: str) -> HTTPException:
+    return HTTPException(
+        status_code=403,
+        detail={
+            "error_type": "output_path_outside_allowlist",
+            "path_or_uri": path_or_uri,
+        },
+    )
+
+
+def _artifact_not_available_http(path_or_uri: str) -> HTTPException:
+    return HTTPException(
+        status_code=410,
+        detail={
+            "error_type": "artifact_purged_or_moved",
+            "path_or_uri": path_or_uri,
+        },
+    )
+
+
+def _artifact_content_changed_http(artifact_id: str, path_or_uri: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error_type": "artifact_content_changed",
+            "artifact_id": artifact_id,
+            "path_or_uri": path_or_uri,
+        },
+    )
+
+
+def _read_verified_artifact_bytes(resolved: Path, artifact: RunOutputArtifact) -> bytes:
+    """Read bytes and verify they still match the audit artifact descriptor."""
+    try:
+        content = resolved.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        raise _artifact_not_available_http(artifact.path_or_uri) from None
+    except IsADirectoryError:
+        raise _artifact_not_available_http(artifact.path_or_uri) from None
+
+    actual_hash = hashlib.sha256(content).hexdigest()
+    if len(content) != artifact.size_bytes or not hmac.compare_digest(actual_hash, artifact.content_hash):
+        raise _artifact_content_changed_http(artifact.artifact_id, artifact.path_or_uri)
+    return content
+
+
+def _artifact_is_download_authorized(artifact: RunOutputArtifact, *, data_dir: str, session_id: UUID) -> bool:
+    fs_path = path_or_uri_to_filesystem_path(artifact.path_or_uri)
+    if artifact.artifact_type != "file" or fs_path is None:
+        return False
+    try:
+        resolved = fs_path.resolve()
+    except OSError:
+        return False
+    return resolved.exists() and _artifact_path_owned_by_session(resolved, data_dir=data_dir, session_id=session_id)
 
 
 def _run_not_found_http() -> HTTPException:
@@ -946,7 +1029,7 @@ def create_execution_router() -> APIRouter:
         endpoint is the audit-evidence retrieval surface — every artefact
         the run wrote, with ``content_hash`` and ``exists_now``.
         """
-        await _verify_run_ownership(run_id, user, request)
+        owned_run = await _get_owned_run_record(run_id, user, request)
         try:
             status = await _load_run_status_with_accounting(run_id, app=request.app, service=service)
         except _RunStatusNotFoundError:
@@ -956,7 +1039,7 @@ def create_execution_router() -> APIRouter:
 
         landscape_run_id = status.landscape_run_id or status.run_id
         try:
-            return await run_sync_in_worker(
+            manifest = await run_sync_in_worker(
                 load_run_outputs_for_settings,
                 request.app.state.settings,
                 run_id=status.run_id,
@@ -972,6 +1055,20 @@ def create_execution_router() -> APIRouter:
                 },
             ) from exc
 
+        artifacts = [
+            artifact.model_copy(
+                update={
+                    "downloadable": _artifact_is_download_authorized(
+                        artifact,
+                        data_dir=str(request.app.state.settings.data_dir),
+                        session_id=owned_run.session_id,
+                    )
+                }
+            )
+            for artifact in manifest.artifacts
+        ]
+        return manifest.model_copy(update={"artifacts": artifacts})
+
     @router.get("/api/runs/{run_id}/outputs/{artifact_id}/content")
     async def get_run_output_content(
         run_id: UUID,
@@ -982,20 +1079,23 @@ def create_execution_router() -> APIRouter:
     ) -> Any:
         """Stream the bytes of one artefact written by a run.
 
-        Path-allowlist guard: refuses any artefact whose ``path_or_uri``
-        resolves outside ``allowed_sink_directories(data_dir)`` (the
-        canonical ``data_dir/{outputs,blobs}`` set). This is
-        defence-in-depth — the path was already allowlisted at write
-        time, but the audit row is read-mutable in principle and the
-        read-side guard MUST NOT trust it.
+        Readback guard: refuses filesystem artefacts outside this run's
+        session-owned namespace under ``data_dir/outputs/{session_id}``
+        or ``data_dir/blobs/{session_id}``, then verifies the current
+        bytes against the audit row's ``size_bytes`` and
+        ``content_hash`` before returning the captured bytes. The global
+        sink allowlist is a write-boundary guard only; it is not proof
+        that a mutable path's current bytes belong to this run.
 
         Returns:
-        * 200 with file bytes when path is in-allowlist and exists.
-        * 403 when path is outside allowlist.
+        * 200 with file bytes when path is session-owned, exists, and
+          still matches the audit descriptor.
+        * 403 when path is outside the session-owned read namespace.
         * 404 when artefact is not in the run's manifest.
-        * 410 when path was in-allowlist but file no longer exists.
+        * 409 when current bytes differ from the audited artefact bytes.
+        * 410 when path was session-owned but file no longer exists.
         """
-        await _verify_run_ownership(run_id, user, request)
+        owned_run = await _get_owned_run_record(run_id, user, request)
         try:
             status = await _load_run_status_with_accounting(run_id, app=request.app, service=service)
         except _RunStatusNotFoundError:
@@ -1046,34 +1146,18 @@ def create_execution_router() -> APIRouter:
         try:
             resolved = fs_path.resolve()
         except OSError:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "error_type": "output_path_outside_allowlist",
-                    "path_or_uri": artifact.path_or_uri,
-                },
-            ) from None
+            raise _artifact_path_unauthorized_http(artifact.path_or_uri) from None
         data_dir = request.app.state.settings.data_dir
-        allowed = allowed_sink_directories(data_dir)
-        if not any(resolved.is_relative_to(base) for base in allowed):
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "error_type": "output_path_outside_allowlist",
-                    "path_or_uri": artifact.path_or_uri,
-                },
-            )
+        if not _artifact_path_owned_by_session(resolved, data_dir=str(data_dir), session_id=owned_run.session_id):
+            raise _artifact_path_unauthorized_http(artifact.path_or_uri)
 
-        if not resolved.exists():
-            raise HTTPException(
-                status_code=410,
-                detail={
-                    "error_type": "artifact_purged_or_moved",
-                    "path_or_uri": artifact.path_or_uri,
-                },
-            )
-
-        return FileResponse(resolved, filename=resolved.name)
+        content = await run_sync_in_worker(_read_verified_artifact_bytes, resolved, artifact)
+        filename = quote(resolved.name)
+        return Response(
+            content=content,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+        )
 
     @router.get(
         "/api/runs/{run_id}/outputs/{artifact_id}/preview",
@@ -1091,19 +1175,21 @@ def create_execution_router() -> APIRouter:
         Companion to ``/content``: where ``/content`` streams the full
         file, ``/preview`` reads at most 256 KiB or 100 rows so the
         operator UI can render an inline preview without a full
-        download. Same path-allowlist guard, same ownership check —
-        the only behavioural difference is bounded read.
+        download. Same session-owned path guard, same audited-byte
+        verification, same ownership check — the only behavioural
+        difference is bounded rendering.
 
         Returns:
         * 200 with ``RunOutputArtifactPreview`` on success.
-        * 403 when path is outside allowlist.
+        * 403 when path is outside the session-owned read namespace.
         * 404 when artefact is not in the run's manifest.
-        * 410 when path was in-allowlist but file no longer exists
+        * 409 when current bytes differ from the audited artefact bytes.
+        * 410 when path was session-owned but file no longer exists
           (frontend treats this as the "no longer available on disk"
           state, mirroring the manifest's ``exists_now=False``).
         * 415 when the artefact is non-file (object-store URI).
         """
-        await _verify_run_ownership(run_id, user, request)
+        owned_run = await _get_owned_run_record(run_id, user, request)
         try:
             status = await _load_run_status_with_accounting(run_id, app=request.app, service=service)
         except _RunStatusNotFoundError:
@@ -1151,40 +1237,16 @@ def create_execution_router() -> APIRouter:
         try:
             resolved = fs_path.resolve()
         except OSError:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "error_type": "output_path_outside_allowlist",
-                    "path_or_uri": artifact.path_or_uri,
-                },
-            ) from None
+            raise _artifact_path_unauthorized_http(artifact.path_or_uri) from None
         data_dir = request.app.state.settings.data_dir
-        allowed = allowed_sink_directories(data_dir)
-        if not any(resolved.is_relative_to(base) for base in allowed):
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "error_type": "output_path_outside_allowlist",
-                    "path_or_uri": artifact.path_or_uri,
-                },
-            )
+        if not _artifact_path_owned_by_session(resolved, data_dir=str(data_dir), session_id=owned_run.session_id):
+            raise _artifact_path_unauthorized_http(artifact.path_or_uri)
 
-        if not resolved.exists():
-            # Manifest/preview race: file existed at manifest-load time
-            # but is gone now (purged, retention, manual delete). Match
-            # the /content endpoint's vocabulary — frontend handles either.
-            raise HTTPException(
-                status_code=410,
-                detail={
-                    "error_type": "artifact_purged_or_moved",
-                    "path_or_uri": artifact.path_or_uri,
-                },
-            )
-
-        return await run_sync_in_worker(
-            build_artifact_preview,
-            resolved,
+        content = await run_sync_in_worker(_read_verified_artifact_bytes, resolved, artifact)
+        return build_artifact_preview_from_bytes(
+            content,
             artifact_id=artifact_id,
+            display_path=resolved,
         )
 
     return router

@@ -639,11 +639,11 @@ class RunOutputArtifact(_StrictResponse):
     re-fetch flows. Returned by ``/api/runs/{rid}/outputs``.
 
     ``downloadable`` is a server-computed convenience: true iff the
-    ``/outputs/{artifact_id}/content`` endpoint would actually serve
-    bytes for this row. False when the artifact is not file-backed,
-    when the file is gone, or when the path resolves outside the
-    sink-allowlist. Lets the UI suppress download buttons that would
-    otherwise 4xx on click.
+    artifact is file-backed and currently resolves to an existing file in
+    the caller's session-owned read namespace. The content/preview
+    endpoints still verify ``content_hash`` and ``size_bytes`` at read
+    time, so a mutable path that changed after audit may return 409 even
+    when this UI hint was true.
     """
 
     artifact_id: str

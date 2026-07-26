@@ -82,22 +82,16 @@ def _select_content_type(suffix: str) -> PreviewContentType:
     return "text"
 
 
-def build_artifact_preview(
-    fs_path: Path,
+def _build_artifact_preview_from_head(
+    head_bytes: bytes,
     *,
+    total_size_bytes: int,
     artifact_id: str,
-    byte_cap: int = _DEFAULT_BYTE_CAP,
-    row_cap: int = _DEFAULT_ROW_CAP,
+    display_path: Path,
+    byte_cap: int,
+    row_cap: int,
 ) -> RunOutputArtifactPreview:
-    """Build a bounded preview for ``fs_path``.
-
-    Caller is responsible for verifying ``fs_path`` is in the sink
-    allowlist and exists. This function reads at most ``byte_cap`` bytes
-    and, for tabular content types, additionally caps at ``row_cap`` rows.
-    """
-    total_size_bytes = fs_path.stat().st_size
-    with fs_path.open("rb") as f:
-        head_bytes = f.read(byte_cap)
+    """Build the preview model from already-captured head bytes."""
     bytes_read = len(head_bytes)
     truncated_by_bytes = bytes_read < total_size_bytes
 
@@ -112,7 +106,7 @@ def build_artifact_preview(
             row_count_preview=None,
         )
 
-    content_type = _select_content_type(fs_path.suffix)
+    content_type = _select_content_type(display_path.suffix)
     is_tabular = content_type in {"csv", "jsonl"}
 
     if is_tabular:
@@ -143,4 +137,55 @@ def build_artifact_preview(
         truncated=truncated,
         total_size_bytes=total_size_bytes,
         row_count_preview=row_count_preview,
+    )
+
+
+def build_artifact_preview_from_bytes(
+    content: bytes,
+    *,
+    artifact_id: str,
+    display_path: Path,
+    byte_cap: int = _DEFAULT_BYTE_CAP,
+    row_cap: int = _DEFAULT_ROW_CAP,
+) -> RunOutputArtifactPreview:
+    """Build a bounded preview from already-authorized artifact bytes.
+
+    ``display_path`` supplies only the suffix used for renderer selection;
+    the bytes are the caller-captured content. This lets authorization
+    code verify an artifact hash once and preview exactly those bytes,
+    rather than reopening a mutable filesystem path after verification.
+    """
+    return _build_artifact_preview_from_head(
+        content[:byte_cap],
+        total_size_bytes=len(content),
+        artifact_id=artifact_id,
+        display_path=display_path,
+        byte_cap=byte_cap,
+        row_cap=row_cap,
+    )
+
+
+def build_artifact_preview(
+    fs_path: Path,
+    *,
+    artifact_id: str,
+    byte_cap: int = _DEFAULT_BYTE_CAP,
+    row_cap: int = _DEFAULT_ROW_CAP,
+) -> RunOutputArtifactPreview:
+    """Build a bounded preview for ``fs_path``.
+
+    Caller is responsible for verifying ``fs_path`` is in the sink
+    allowlist and exists. This function reads at most ``byte_cap`` bytes
+    and, for tabular content types, additionally caps at ``row_cap`` rows.
+    """
+    total_size_bytes = fs_path.stat().st_size
+    with fs_path.open("rb") as f:
+        head_bytes = f.read(byte_cap)
+    return _build_artifact_preview_from_head(
+        head_bytes,
+        total_size_bytes=total_size_bytes,
+        artifact_id=artifact_id,
+        display_path=fs_path,
+        byte_cap=byte_cap,
+        row_cap=row_cap,
     )
