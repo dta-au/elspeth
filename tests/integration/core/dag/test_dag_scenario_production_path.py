@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape import LandscapeDB, LandscapeExporter
 from elspeth.core.landscape.schema import node_states_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
@@ -246,6 +246,55 @@ def test_run_case_owns_production_preflight_without_pytest_defaults(
     assert evidence.runtime.status == "completed"
 
 
+def test_exact_runtime_projection_rejects_corrupted_portable_sink_effect_artifact_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    export_run = LandscapeExporter.export_run
+
+    def export_run_with_corrupted_artifact_reference(
+        self: LandscapeExporter,
+        run_id: str,
+    ) -> Any:
+        for record in export_run(self, run_id):
+            if record["record_type"] == "sink_effect":
+                yield {**record, "artifact_id": "CORRUPTED"}
+            else:
+                yield record
+
+    monkeypatch.setattr(
+        LandscapeExporter,
+        "export_run",
+        export_run_with_corrupted_artifact_reference,
+    )
+    install_corpus_plugin_manager(monkeypatch)
+
+    with pytest.raises(AssertionError, match=r"portable sink_effect.*artifact"):
+        run_scenario_case(scenario, case, tmp_path)
+
+
+def test_exact_runtime_projection_preserves_same_name_semantic_config_difference() -> None:
+    first = {
+        "node_id": "sink_shared_aaaaaaaaaaaa",
+        "node_type": "sink",
+        "config": {"operation": "first", "path": "/volatile/runtime/first"},
+    }
+    second = {
+        "node_id": "sink_shared_bbbbbbbbbbbb",
+        "node_type": "sink",
+        "config": {"operation": "second", "path": "/volatile/runtime/second"},
+    }
+    path_only_difference = {
+        "node_id": "sink_shared_cccccccccccc",
+        "node_type": "sink",
+        "config": {"operation": "first", "path": "/volatile/runtime/third"},
+    }
+
+    assert corpus_harness._stable_node_key(first) != corpus_harness._stable_node_key(second)
+    assert corpus_harness._stable_node_key(first) == corpus_harness._stable_node_key(path_only_difference)
+
+
 def test_render_settings_quotes_yaml_significant_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -444,6 +493,23 @@ def test_per_sink_artifact_binding_renders_exact_sink_map(
         "accepted": tmp_path / "runtime/accepted.jsonl",
         "rejected": tmp_path / "runtime/rejected.jsonl",
     }
+
+
+def test_per_sink_artifact_binding_rejects_existing_symlink_leaf_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "fixtures"
+    case = _write_plural_binding_fixture(fixture_root)
+    monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    outside_artifact = tmp_path / "outside.jsonl"
+    outside_artifact.write_text("outside\n", encoding="utf-8")
+    (runtime_root / "accepted.jsonl").symlink_to(outside_artifact)
+
+    with pytest.raises(ValueError, match=r"sink 'accepted'.*resolve beneath.*runtime"):
+        render_settings(case, runtime_root)
 
 
 @pytest.mark.parametrize(

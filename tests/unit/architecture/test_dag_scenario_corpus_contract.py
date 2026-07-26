@@ -364,7 +364,7 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for index, locator in enumerate(locators, start=1)
 )
 EXPECTED_EVIDENCE_REGISTRY_SHA256 = "409034bb798cd578ce8e4cd741b1d77fc6858a042dc5f1f917f50b3272355d70"
-EXPECTED_CASE_REGISTRY_SHA256 = "5efcf730800cbc54e5ccb16a8185e147000eab5e90610ded95f092875df02fea"
+EXPECTED_CASE_REGISTRY_SHA256 = "f27758e8a8f29879e01e288b531d5b1f373215c9e0065a6589a53c6a6eecd28a"
 EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
@@ -951,6 +951,14 @@ def _exact_runtime_projection_values() -> dict[str, object]:
                 "node_key": "queue:inbound",
                 "transitions": ("enqueue:ready", "mark_terminal:terminal"),
                 "final_status": "terminal",
+            },
+        ),
+        "audit_records": (
+            {
+                "key": "run|run",
+                "record_type": "run",
+                "material": '{"status":"completed"}',
+                "references": (),
             },
         ),
     }

@@ -236,7 +236,56 @@ StableKeyedProjection = (
 )
 
 
-def _require_unique_sorted_keys(label: str, values: tuple[StableKeyedProjection, ...]) -> None:
+StableAuditRecordType = Literal[
+    "artifact",
+    "call",
+    "edge",
+    "manifest",
+    "node",
+    "operation",
+    "run",
+    "sink_effect",
+    "sink_effect_attempt",
+    "sink_effect_member",
+    "sink_effect_stream",
+]
+
+
+class StableAuditRecordProjection(ClosedModel):
+    """Exact stable material and relationships for one claimed audit record."""
+
+    key: NonEmpty
+    record_type: StableAuditRecordType
+    material: NonEmpty
+    references: tuple[NonEmpty, ...] = ()
+
+    @field_validator("material")
+    @classmethod
+    def _require_canonical_json_material(cls, material: str) -> str:
+        import json
+
+        try:
+            parsed = json.loads(material)
+        except json.JSONDecodeError as exc:
+            raise ValueError("stable audit material must be valid JSON") from exc
+        if not isinstance(parsed, dict) or not parsed:
+            raise ValueError("stable audit material must be a non-empty JSON object")
+        if json.dumps(parsed, sort_keys=True, separators=(",", ":")) != material:
+            raise ValueError("stable audit material must use canonical JSON")
+        return material
+
+    @field_validator("references")
+    @classmethod
+    def _require_sorted_references(cls, references: tuple[str, ...]) -> tuple[str, ...]:
+        if references != tuple(sorted(set(references))):
+            raise ValueError("stable audit references must be unique and sorted")
+        return references
+
+
+def _require_unique_sorted_keys(
+    label: str,
+    values: tuple[StableKeyedProjection | StableAuditRecordProjection, ...],
+) -> None:
     keys = tuple(value.key for value in values)
     if keys != tuple(sorted(keys)) or len(set(keys)) != len(keys):
         raise ValueError(f"{label} must contain unique sorted keys")
@@ -249,6 +298,7 @@ class StableRunProjection(ClosedModel):
     routes: tuple[StableRouteProjection, ...]
     terminal_dispositions: tuple[StableTerminalDisposition, ...]
     scheduler_work: tuple[StableSchedulerWorkProjection, ...]
+    audit_records: tuple[StableAuditRecordProjection, ...]
 
     @model_validator(mode="after")
     def _validate_projection(self) -> Self:
@@ -259,6 +309,7 @@ class StableRunProjection(ClosedModel):
             ("routes", self.routes),
             ("terminal dispositions", self.terminal_dispositions),
             ("scheduler work", self.scheduler_work),
+            ("audit records", self.audit_records),
         ):
             _require_unique_sorted_keys(label, values)
 

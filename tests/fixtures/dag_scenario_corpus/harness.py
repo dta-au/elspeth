@@ -24,6 +24,7 @@ from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidat
 from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter, RecorderFactory
+from elspeth.core.landscape.export_read_model import open_export_read_transaction
 from elspeth.core.landscape.schema import node_states_table, token_work_items_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
@@ -50,6 +51,8 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     ScenarioRunEvidence,
     ScenarioSpec,
     SinkOutputProjection,
+    StableAuditRecordProjection,
+    StableAuditRecordType,
     StableNodeStateProjection,
     StableRouteProjection,
     StableRowProjection,
@@ -153,6 +156,15 @@ def render_settings(case: HarnessCaseSpec, tmp_path: Path) -> RenderedScenario:
 
     input_paths = {name: resolve_fixture_path(path) for name, path in case.input_fixtures.items()}
     output_paths = {name: tmp_path / filename for name, filename in case.output_artifacts.items()}
+    runtime_root = tmp_path.resolve()
+    for sink_name, output_path in output_paths.items():
+        resolved_output = output_path.resolve()
+        try:
+            resolved_output.relative_to(runtime_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"DAG scenario sink {sink_name!r} artifact must resolve beneath runtime root {runtime_root}: {resolved_output}"
+            ) from exc
     fault_marker = tmp_path / "fault-triggered.marker"
     substitutions = {
         **{f"input_{normalize_template_name(name)}": json.dumps(str(path)) for name, path in input_paths.items()},
@@ -272,10 +284,441 @@ def _stable_node_key(record: Mapping[str, Any]) -> str:
     match = re.fullmatch(rf"{re.escape(prefix)}_(.+)_[0-9a-f]{{12}}(?:_[0-9]+)?", node_id)
     if match is None:
         raise AssertionError(f"DAG corpus cannot derive stable identity for {node_type} node {node_id!r}")
-    return f"{node_type}:{match.group(1)}"
+    config = record.get("config")
+    if not isinstance(config, Mapping):
+        raise AssertionError(f"DAG corpus node {node_id!r} lacks material audit config")
+    semantic_config = _semantic_node_config(record)
+    config_fingerprint = hashlib.sha256(_canonical_json(semantic_config).encode()).hexdigest()[:12]
+    return f"{node_type}:{match.group(1)}@{config_fingerprint}"
 
 
-def _stable_projection(records: list[dict[str, Any]]) -> StableRunProjection:
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _semantic_node_config(record: Mapping[str, Any]) -> dict[str, object]:
+    """Normalize only the source/sink paths bound by ``render_settings``."""
+
+    config = record.get("config")
+    if not isinstance(config, Mapping):
+        raise AssertionError(f"DAG corpus node {record.get('node_id')!r} lacks material audit config")
+    semantic = dict(config)
+    if record.get("node_type") in {"source", "sink"} and "path" in semantic:
+        semantic["path"] = "$CORPUS_RUNTIME_PATH"
+    return semantic
+
+
+def _semantic_run_settings(raw_settings: object) -> dict[str, object]:
+    if not isinstance(raw_settings, Mapping):
+        raise AssertionError("DAG corpus run lacks material settings")
+    settings = json.loads(json.dumps(raw_settings))
+    for section in ("sources", "sinks"):
+        declarations = settings.get(section)
+        if not isinstance(declarations, dict):
+            continue
+        for declaration in declarations.values():
+            if isinstance(declaration, dict) and isinstance(declaration.get("options"), dict) and "path" in declaration["options"]:
+                declaration["options"]["path"] = "$CORPUS_RUNTIME_PATH"
+    return cast(dict[str, object], settings)
+
+
+def _stable_ref(
+    refs: Mapping[str, str],
+    raw_ref: object,
+    *,
+    source: str,
+    record_type: str,
+    field: str,
+) -> str | None:
+    if raw_ref is None:
+        return None
+    try:
+        return refs[str(raw_ref)]
+    except KeyError as exc:
+        raise AssertionError(f"DAG corpus {source} {record_type} references unknown {field} {raw_ref!r}") from exc
+
+
+def _stable_audit_records(
+    records: list[dict[str, Any]],
+    *,
+    source: str,
+    node_keys: Mapping[str, str],
+    row_keys: Mapping[str, str],
+    token_keys: Mapping[str, str],
+    state_keys: Mapping[str, dict[str, Any]],
+) -> tuple[StableAuditRecordProjection, ...]:
+    """Project every audit family claimed by the exact F0 linear oracle."""
+
+    audit: list[StableAuditRecordProjection] = []
+
+    def add(record_type: StableAuditRecordType, key: str, material: Mapping[str, object], *references: str | None) -> None:
+        audit.append(
+            StableAuditRecordProjection(
+                key=f"{record_type}|{key}",
+                record_type=record_type,
+                material=_canonical_json(material),
+                references=tuple(sorted({reference for reference in references if reference is not None})),
+            )
+        )
+
+    run_records = [record for record in records if record.get("record_type") == "run"]
+    if len(run_records) != 1:
+        raise AssertionError(f"DAG corpus {source} projection requires exactly one run record")
+    run = run_records[0]
+    settings = _semantic_run_settings(run["settings"])
+    add(
+        "run",
+        "run",
+        {
+            "canonical_version": run["canonical_version"],
+            "reproducibility_grade": run.get("reproducibility_grade"),
+            "semantic_settings_sha256": hashlib.sha256(_canonical_json(settings).encode()).hexdigest(),
+            "status": run["status"],
+        },
+    )
+
+    for record in (record for record in records if record.get("record_type") == "node"):
+        node_key = node_keys[str(record["node_id"])]
+        semantic_config = _semantic_node_config(record)
+        add(
+            "node",
+            node_key,
+            {
+                "config": semantic_config,
+                "determinism": record["determinism"],
+                "node_type": record["node_type"],
+                "plugin_name": record["plugin_name"],
+                "plugin_version": record["plugin_version"],
+                "schema_fields": record.get("schema_fields"),
+                "schema_hash": record.get("schema_hash"),
+                "schema_mode": record.get("schema_mode"),
+                "sequence_in_pipeline": record.get("sequence_in_pipeline"),
+                "source_file_hash": record.get("source_file_hash"),
+            },
+        )
+
+    edge_keys: dict[str, str] = {}
+    for record in (record for record in records if record.get("record_type") == "edge"):
+        from_key = _stable_ref(node_keys, record["from_node_id"], source=source, record_type="edge", field="from_node_id")
+        to_key = _stable_ref(node_keys, record["to_node_id"], source=source, record_type="edge", field="to_node_id")
+        assert from_key is not None and to_key is not None
+        key = f"{from_key}|{record['label']}|{record['default_mode']}|{to_key}"
+        edge_keys[str(record["edge_id"])] = key
+        add("edge", key, {"default_mode": record["default_mode"], "label": record["label"]}, from_key, to_key)
+
+    operation_keys: dict[str, str] = {}
+    operation_records_by_id: dict[str, dict[str, Any]] = {}
+    operation_counts: defaultdict[tuple[str, str], int] = defaultdict(int)
+    for record in (record for record in records if record.get("record_type") == "operation"):
+        operation_node_key = _stable_ref(node_keys, record["node_id"], source=source, record_type="operation", field="node_id")
+        assert operation_node_key is not None
+        identity = (operation_node_key, str(record["operation_type"]))
+        ordinal = operation_counts[identity]
+        operation_counts[identity] += 1
+        key = f"{operation_node_key}|{record['operation_type']}|{ordinal}"
+        operation_keys[str(record["operation_id"])] = key
+        operation_records_by_id[str(record["operation_id"])] = record
+
+    stream_keys: dict[str, str] = {}
+    for record in (record for record in records if record.get("record_type") == "sink_effect_stream"):
+        stream_node_key = _stable_ref(
+            node_keys, record["sink_node_id"], source=source, record_type="sink_effect_stream", field="sink_node_id"
+        )
+        assert stream_node_key is not None
+        key = f"{stream_node_key}|{record['role']}"
+        stream_keys[str(record["stream_id"])] = key
+
+    effect_keys: dict[str, str] = {}
+    for record in (record for record in records if record.get("record_type") == "sink_effect"):
+        effect_node_key = _stable_ref(node_keys, record["sink_node_id"], source=source, record_type="sink_effect", field="sink_node_id")
+        assert effect_node_key is not None
+        key = f"{effect_node_key}|{record['role']}|{record.get('stream_sequence')}"
+        effect_keys[str(record["effect_id"])] = key
+
+    artifact_keys: dict[str, str] = {}
+    for record in (record for record in records if record.get("record_type") == "artifact"):
+        effect_key = _stable_ref(
+            effect_keys,
+            record.get("sink_effect_id"),
+            source=source,
+            record_type="artifact",
+            field="sink_effect_id",
+        )
+        state = state_keys.get(str(record.get("produced_by_state_id"))) if record.get("produced_by_state_id") is not None else None
+        state_key = None
+        if state is not None:
+            state_key = (
+                f"{token_keys[str(state['token_id'])]}|{node_keys[str(state['node_id'])]}|"
+                f"{int(state['step_index'])}|{int(state['attempt'])}"
+            )
+        producer_key = effect_key or state_key
+        if producer_key is None:
+            raise AssertionError(f"DAG corpus {source} artifact has no stable producer")
+        key = f"{producer_key}|{record['artifact_type']}"
+        artifact_keys[str(record["artifact_id"])] = key
+        sink_key = _stable_ref(node_keys, record["sink_node_id"], source=source, record_type="artifact", field="sink_node_id")
+        add(
+            "artifact",
+            key,
+            {
+                "artifact_type": record["artifact_type"],
+                "content_hash": record["content_hash"],
+                "idempotency_witness": effect_key,
+                "path_or_uri": "$CORPUS_RUNTIME_PATH",
+                "producer_kind": record["producer_kind"],
+                "publication_evidence_kind": record["publication_evidence_kind"],
+                "publication_performed": record["publication_performed"],
+                "size_bytes": record["size_bytes"],
+            },
+            producer_key,
+            sink_key,
+        )
+
+    attempt_keys: dict[str, str] = {}
+    for record in (record for record in records if record.get("record_type") == "sink_effect_attempt"):
+        effect_key = _stable_ref(effect_keys, record["effect_id"], source=source, record_type="sink_effect_attempt", field="effect_id")
+        assert effect_key is not None
+        attempt_keys[str(record["attempt_id"])] = f"{effect_key}|{int(record['attempt_index'])}"
+
+    calls_by_operation_index: dict[tuple[str, int], str] = {}
+    for record in (record for record in records if record.get("record_type") == "call"):
+        operation_key = _stable_ref(
+            operation_keys,
+            record.get("operation_id"),
+            source=source,
+            record_type="call",
+            field="operation_id",
+        )
+        parent_key = operation_key
+        if parent_key is None:
+            state = state_keys.get(str(record.get("state_id")))
+            if state is None:
+                raise AssertionError(f"DAG corpus {source} call has no stable parent")
+            parent_key = (
+                f"{token_keys[str(state['token_id'])]}|{node_keys[str(state['node_id'])]}|"
+                f"{int(state['step_index'])}|{int(state['attempt'])}"
+            )
+        key = f"{parent_key}|{int(record['call_index'])}"
+        if operation_key is not None:
+            calls_by_operation_index[(operation_key, int(record["call_index"]))] = key
+        operation = operation_records_by_id.get(str(record.get("operation_id")))
+        sink_effect_call = operation is not None and operation.get("sink_effect_id") is not None
+        add(
+            "call",
+            key,
+            {
+                "call_index": record["call_index"],
+                "call_type": record["call_type"],
+                "error_json": record.get("error_json"),
+                "request_hash": "$SINK_EFFECT_REQUEST" if sink_effect_call else record.get("request_hash"),
+                "request_ref": record.get("request_ref"),
+                "resolved_prompt_template_hash": record.get("resolved_prompt_template_hash"),
+                "response_hash": "$SINK_EFFECT_RESPONSE" if sink_effect_call else record.get("response_hash"),
+                "response_ref": record.get("response_ref"),
+                "status": record["status"],
+            },
+            parent_key,
+        )
+
+    for record in (record for record in records if record.get("record_type") == "operation"):
+        key = operation_keys[str(record["operation_id"])]
+        operation_node_key = _stable_ref(node_keys, record["node_id"], source=source, record_type="operation", field="node_id")
+        effect_key = _stable_ref(
+            effect_keys,
+            record.get("sink_effect_id"),
+            source=source,
+            record_type="operation",
+            field="sink_effect_id",
+        )
+        add(
+            "operation",
+            key,
+            {
+                "error_message": record.get("error_message"),
+                "input_data_hash": record.get("input_data_hash"),
+                "input_data_ref": record.get("input_data_ref"),
+                "operation_type": record["operation_type"],
+                "output_data_hash": "$SINK_EFFECT_RESULT" if effect_key is not None else record.get("output_data_hash"),
+                "output_data_ref": record.get("output_data_ref"),
+                "status": record["status"],
+            },
+            operation_node_key,
+            effect_key,
+        )
+
+    members_by_effect: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in (record for record in records if record.get("record_type") == "sink_effect_member"):
+        members_by_effect[str(record["effect_id"])].append(record)
+
+    for record in (record for record in records if record.get("record_type") == "sink_effect_stream"):
+        key = stream_keys[str(record["stream_id"])]
+        stream_node_key = _stable_ref(
+            node_keys, record["sink_node_id"], source=source, record_type="sink_effect_stream", field="sink_node_id"
+        )
+        head_key = _stable_ref(
+            effect_keys, record.get("head_effect_id"), source=source, record_type="sink_effect_stream", field="head_effect_id"
+        )
+        tail_key = _stable_ref(
+            effect_keys, record.get("tail_effect_id"), source=source, record_type="sink_effect_stream", field="tail_effect_id"
+        )
+        add(
+            "sink_effect_stream",
+            key,
+            {
+                "head_descriptor_witness": head_key,
+                "next_sequence": record["next_sequence"],
+                "requested_target": "$CORPUS_RUNTIME_PATH",
+                "role": record["role"],
+            },
+            stream_node_key,
+            head_key,
+            tail_key,
+        )
+
+    for record in (record for record in records if record.get("record_type") == "sink_effect"):
+        raw_effect_id = str(record["effect_id"])
+        key = effect_keys[raw_effect_id]
+        effect_node_key = _stable_ref(node_keys, record["sink_node_id"], source=source, record_type="sink_effect", field="sink_node_id")
+        stream_key = _stable_ref(stream_keys, record.get("stream_id"), source=source, record_type="sink_effect", field="stream_id")
+        artifact_key = _stable_ref(artifact_keys, record["artifact_id"], source=source, record_type="sink_effect", field="artifact_id")
+        inspection_key = _stable_ref(
+            attempt_keys,
+            record.get("inspection_attempt_id"),
+            source=source,
+            record_type="sink_effect",
+            field="inspection_attempt_id",
+        )
+        primary_key = _stable_ref(
+            effect_keys, record.get("primary_effect_id"), source=source, record_type="sink_effect", field="primary_effect_id"
+        )
+        predecessor_key = _stable_ref(
+            effect_keys,
+            record.get("predecessor_effect_id"),
+            source=source,
+            record_type="sink_effect",
+            field="predecessor_effect_id",
+        )
+        member_payload_hashes = [
+            member["payload_hash"] for member in sorted(members_by_effect[raw_effect_id], key=lambda member: int(member["ordinal"]))
+        ]
+        add(
+            "sink_effect",
+            key,
+            {
+                "descriptor_mode": record.get("descriptor_mode"),
+                "descriptor_witness": artifact_key,
+                "generation": record["generation"],
+                "group_payload_hash": record["group_payload_hash"],
+                "input_kind": record["input_kind"],
+                "inspection_mode": record.get("inspection_mode"),
+                "member_payload_hashes": member_payload_hashes,
+                "plan_present": record.get("plan_hash") is not None,
+                "precondition_witness": stream_key,
+                "protocol_version": record["protocol_version"],
+                "publication_evidence_kind": record.get("publication_evidence_kind"),
+                "publication_performed": record.get("publication_performed"),
+                "reconcile_kind": record.get("reconcile_kind"),
+                "role": record["role"],
+                "state": record["state"],
+                "stream_sequence": record.get("stream_sequence"),
+            },
+            artifact_key,
+            inspection_key,
+            effect_node_key,
+            predecessor_key,
+            primary_key,
+            stream_key,
+        )
+
+    for record in (record for record in records if record.get("record_type") == "sink_effect_member"):
+        effect_key = _stable_ref(effect_keys, record["effect_id"], source=source, record_type="sink_effect_member", field="effect_id")
+        token_key = _stable_ref(token_keys, record["token_id"], source=source, record_type="sink_effect_member", field="token_id")
+        row_key = _stable_ref(row_keys, record["row_id"], source=source, record_type="sink_effect_member", field="row_id")
+        member_node_key = _stable_ref(
+            node_keys, record["sink_node_id"], source=source, record_type="sink_effect_member", field="sink_node_id"
+        )
+        primary_key = _stable_ref(
+            effect_keys, record.get("primary_effect_id"), source=source, record_type="sink_effect_member", field="primary_effect_id"
+        )
+        assert effect_key is not None
+        key = f"{effect_key}|{int(record['ordinal'])}"
+        add(
+            "sink_effect_member",
+            key,
+            {
+                "descriptor_witness": effect_key,
+                "evidence_present": record.get("evidence_hash") is not None,
+                "ingest_sequence": record["ingest_sequence"],
+                "lineage_hash": record["lineage_hash"],
+                "member_effect_bound": record.get("member_effect_id") is not None,
+                "member_state": record.get("member_state"),
+                "ordinal": record["ordinal"],
+                "payload_hash": record["payload_hash"],
+                "prepared_disposition": record.get("prepared_disposition"),
+                "reason_hash": record.get("reason_hash"),
+                "role": record["role"],
+            },
+            effect_key,
+            member_node_key,
+            primary_key,
+            row_key,
+            token_key,
+        )
+
+    sink_operation_by_effect = {
+        str(record["sink_effect_id"]): operation_keys[str(record["operation_id"])]
+        for record in records
+        if record.get("record_type") == "operation" and record.get("sink_effect_id") is not None
+    }
+    for record in (record for record in records if record.get("record_type") == "sink_effect_attempt"):
+        effect_key = _stable_ref(effect_keys, record["effect_id"], source=source, record_type="sink_effect_attempt", field="effect_id")
+        assert effect_key is not None
+        key = attempt_keys[str(record["attempt_id"])]
+        operation_key = sink_operation_by_effect.get(str(record["effect_id"]))
+        call_key = calls_by_operation_index.get((operation_key, int(record["attempt_index"]))) if operation_key is not None else None
+        add(
+            "sink_effect_attempt",
+            key,
+            {
+                "action": record["action"],
+                "attempt_index": record["attempt_index"],
+                "call_kind": record["call_kind"],
+                "evidence_present": record.get("evidence_hash") is not None,
+                "evidence_witness": call_key,
+                "generation": record["generation"],
+                "member_ordinal": record.get("member_ordinal"),
+                "request_witness": call_key,
+                "state": record["state"],
+            },
+            call_key,
+            effect_key,
+        )
+
+    manifest_records = [record for record in records if record.get("record_type") == "manifest"]
+    if len(manifest_records) != 1:
+        raise AssertionError(f"DAG corpus {source} projection requires exactly one manifest record")
+    manifest = manifest_records[0]
+    add(
+        "manifest",
+        "manifest",
+        {
+            "chunk_count": manifest["chunk_count"],
+            "derivation_version": manifest["derivation_version"],
+            "export_format": manifest["export_format"],
+            "hash_algorithm": manifest["hash_algorithm"],
+            "record_chain_algorithm": manifest["record_chain_algorithm"],
+            "record_count": manifest["record_count"],
+            "schema": manifest["schema"],
+            "signature_algorithm": manifest["signature_algorithm"],
+            "signature_key_id": manifest["signature_key_id"],
+            "source_status": manifest["source_status"],
+        },
+        "run|run",
+    )
+    return tuple(sorted(audit, key=lambda record: record.key))
+
+
+def _stable_projection(records: list[dict[str, Any]], *, source: str = "projection") -> StableRunProjection:
     """Normalize one public durable/export view without retaining run-local IDs."""
 
     node_records = [record for record in records if record.get("record_type") == "node"]
@@ -287,7 +730,7 @@ def _stable_projection(records: list[dict[str, Any]]) -> StableRunProjection:
     rows: list[StableRowProjection] = []
     for record in (record for record in records if record.get("record_type") == "row"):
         source_key = node_keys[str(record["source_node_id"])]
-        source_name = source_key.split(":", 1)[1]
+        source_name = source_key.split(":", 1)[1].rsplit("@", 1)[0]
         source_row_index = int(record["source_row_index"])
         key = f"{source_name}:{source_row_index}"
         rows_by_id[str(record["row_id"])] = key
@@ -440,24 +883,50 @@ def _stable_projection(records: list[dict[str, Any]]) -> StableRunProjection:
         routes=tuple(sorted(routes, key=lambda route: route.key)),
         terminal_dispositions=tuple(sorted(terminal_dispositions, key=lambda disposition: disposition.key)),
         scheduler_work=tuple(sorted(scheduler_work, key=lambda work: work.key)),
+        audit_records=_stable_audit_records(
+            records,
+            source=source,
+            node_keys=node_keys,
+            row_keys=rows_by_id,
+            token_keys=token_keys,
+            state_keys=state_keys,
+        ),
     )
 
 
 def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: FilesystemPayloadStore) -> list[dict[str, Any]]:
     repositories = RecorderFactory.read_only(db, payload_store=payload_store)
-    records: list[dict[str, Any]] = []
-    for node in repositories.data_flow.get_nodes(run_id):
-        records.append({"record_type": "node", "node_id": node.node_id, "node_type": node.node_type.value})
-    for edge in repositories.data_flow.get_edges(run_id):
-        records.append(
-            {
-                "record_type": "edge",
-                "edge_id": edge.edge_id,
-                "from_node_id": edge.from_node_id,
-                "to_node_id": edge.to_node_id,
-                "label": edge.label,
-            }
-        )
+    with open_export_read_transaction(db.engine) as read_model:
+        unsigned_records = list(LandscapeExporter(db, read_model=read_model).iter_unsigned_run_records(run_id))
+    audit_types = {
+        "artifact",
+        "call",
+        "edge",
+        "node",
+        "operation",
+        "run",
+        "sink_effect",
+        "sink_effect_attempt",
+        "sink_effect_member",
+        "sink_effect_stream",
+    }
+    records = [dict(record) for record in unsigned_records if record["record_type"] in audit_types]
+    run = next(record for record in records if record["record_type"] == "run")
+    records.append(
+        {
+            "record_type": "manifest",
+            "chunk_count": 1,
+            "derivation_version": "audit-export-derivation-v1",
+            "export_format": "json",
+            "hash_algorithm": "sha256",
+            "record_chain_algorithm": "sha256_concat_record_sha256_v1",
+            "record_count": len(unsigned_records),
+            "schema": "elspeth.audit-export-manifest.v2",
+            "signature_algorithm": "unsigned",
+            "signature_key_id": "UNSIGNED",
+            "source_status": run["status"],
+        }
+    )
     for row in repositories.query.get_rows(run_id):
         records.append(
             {
@@ -582,9 +1051,12 @@ def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> 
             openrouter_catalog_source=catalog_source,
         )
         sink_outputs = _sink_outputs(rendered)
-        durable_projection = _stable_projection(_public_durable_records(db, run_id=result.run_id, payload_store=payload_store))
+        durable_projection = _stable_projection(
+            _public_durable_records(db, run_id=result.run_id, payload_store=payload_store),
+            source="durable",
+        )
         records = list(LandscapeExporter(db).export_run(result.run_id))
-        portable_projection = _stable_projection(records)
+        portable_projection = _stable_projection(records, source="portable")
         if durable_projection != portable_projection:
             raise AssertionError("DAG corpus public durable query and portable export projections differ")
         audit = _audit_evidence(records, portable_projection=portable_projection)
