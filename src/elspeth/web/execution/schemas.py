@@ -37,6 +37,7 @@ ValidationCheckName = Literal[
     "required_control_coverage",
     "path_allowlist",
     "web_scrape_network_policy",
+    "web_fetch_resource_policy",
     "secret_refs",
     "semantic_contracts",
     "batch_transform_options",
@@ -47,6 +48,7 @@ ValidationCheckName = Literal[
     "llm_base_url_policy",
     "llm_tracing_policy",
     "aws_s3_endpoint_url_policy",
+    "aws_s3_source_policy",
     "settings_load",
     "plugin_instantiation",
     "value_source_compliance",
@@ -66,6 +68,7 @@ CHECK_REQUIRED_CONTROL_AVAILABILITY: Final[ValidationCheckName] = "required_cont
 CHECK_REQUIRED_CONTROL_COVERAGE: Final[ValidationCheckName] = "required_control_coverage"
 CHECK_PATH_ALLOWLIST: Final[ValidationCheckName] = "path_allowlist"
 CHECK_WEB_SCRAPE_NETWORK_POLICY: Final[ValidationCheckName] = "web_scrape_network_policy"
+CHECK_WEB_FETCH_RESOURCE_POLICY: Final[ValidationCheckName] = "web_fetch_resource_policy"
 CHECK_SECRET_REFS: Final[ValidationCheckName] = "secret_refs"
 CHECK_SEMANTIC_CONTRACTS: Final[ValidationCheckName] = "semantic_contracts"
 CHECK_BATCH_TRANSFORM_OPTIONS: Final[ValidationCheckName] = "batch_transform_options"
@@ -76,6 +79,7 @@ CHECK_LLM_RETRY_BUDGET_POLICY: Final[ValidationCheckName] = "llm_retry_budget_po
 CHECK_LLM_BASE_URL_POLICY: Final[ValidationCheckName] = "llm_base_url_policy"
 CHECK_LLM_TRACING_POLICY: Final[ValidationCheckName] = "llm_tracing_policy"
 CHECK_AWS_S3_ENDPOINT_URL_POLICY: Final[ValidationCheckName] = "aws_s3_endpoint_url_policy"
+CHECK_AWS_S3_SOURCE_POLICY: Final[ValidationCheckName] = "aws_s3_source_policy"
 CHECK_SETTINGS: Final[ValidationCheckName] = "settings_load"
 RUNTIME_CHECK_PLUGIN_INSTANTIATION: Final[ValidationCheckName] = "plugin_instantiation"
 CHECK_VALUE_SOURCE_COMPLIANCE: Final[ValidationCheckName] = "value_source_compliance"
@@ -94,6 +98,7 @@ VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     CHECK_REQUIRED_CONTROL_COVERAGE,
     CHECK_PATH_ALLOWLIST,
     CHECK_WEB_SCRAPE_NETWORK_POLICY,
+    CHECK_WEB_FETCH_RESOURCE_POLICY,
     CHECK_SECRET_REFS,
     CHECK_SEMANTIC_CONTRACTS,
     CHECK_BATCH_TRANSFORM_OPTIONS,
@@ -104,6 +109,7 @@ VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     CHECK_LLM_BASE_URL_POLICY,
     CHECK_LLM_TRACING_POLICY,
     CHECK_AWS_S3_ENDPOINT_URL_POLICY,
+    CHECK_AWS_S3_SOURCE_POLICY,
     CHECK_SETTINGS,
     RUNTIME_CHECK_PLUGIN_INSTANTIATION,
     CHECK_VALUE_SOURCE_COMPLIANCE,

@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 import yaml
+from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.blobs import BlobRecord
@@ -81,6 +82,7 @@ from elspeth.web.execution.preflight import (
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
     CHECK_AWS_S3_ENDPOINT_URL_POLICY,
+    CHECK_AWS_S3_SOURCE_POLICY,
     CHECK_BATCH_TRANSFORM_OPTIONS,
     CHECK_BLOB_INLINE_REFS,
     CHECK_IDENTITY_NODE_ADVISORY,
@@ -104,6 +106,7 @@ from elspeth.web.execution.schemas import (
     CHECK_SEMANTIC_CONTRACTS,
     CHECK_SETTINGS,
     CHECK_VALUE_SOURCE_COMPLIANCE,
+    CHECK_WEB_FETCH_RESOURCE_POLICY,
     CHECK_WEB_SCRAPE_NETWORK_POLICY,
     VALIDATION_BLOCKING_CHECK_NAMES,
     ValidationCheck,
@@ -126,6 +129,7 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
+    web_aws_s3_source_policy_error,
     web_llm_base_url_policy_error,
     web_llm_retry_budget_policy_error,
     web_llm_tracing_policy_error,
@@ -140,6 +144,7 @@ _CHECK_REQUIRED_CONTROL_AVAILABILITY = CHECK_REQUIRED_CONTROL_AVAILABILITY
 _CHECK_REQUIRED_CONTROL_COVERAGE = CHECK_REQUIRED_CONTROL_COVERAGE
 _CHECK_PATH_ALLOWLIST = CHECK_PATH_ALLOWLIST
 _CHECK_WEB_SCRAPE_NETWORK_POLICY = CHECK_WEB_SCRAPE_NETWORK_POLICY
+_CHECK_WEB_FETCH_RESOURCE_POLICY = CHECK_WEB_FETCH_RESOURCE_POLICY
 _CHECK_SECRET_REFS = CHECK_SECRET_REFS
 _CHECK_BLOB_INLINE_REFS = CHECK_BLOB_INLINE_REFS
 _CHECK_SEMANTIC_CONTRACTS = CHECK_SEMANTIC_CONTRACTS
@@ -150,6 +155,7 @@ _CHECK_LLM_RETRY_BUDGET_POLICY = CHECK_LLM_RETRY_BUDGET_POLICY
 _CHECK_LLM_BASE_URL_POLICY = CHECK_LLM_BASE_URL_POLICY
 _CHECK_LLM_TRACING_POLICY = CHECK_LLM_TRACING_POLICY
 _CHECK_AWS_S3_ENDPOINT_URL_POLICY = CHECK_AWS_S3_ENDPOINT_URL_POLICY
+_CHECK_AWS_S3_SOURCE_POLICY = CHECK_AWS_S3_SOURCE_POLICY
 _CHECK_SETTINGS = CHECK_SETTINGS
 _CHECK_PLUGINS = RUNTIME_CHECK_PLUGIN_INSTANTIATION
 _CHECK_VALUE_SOURCE_COMPLIANCE = CHECK_VALUE_SOURCE_COMPLIANCE
@@ -159,6 +165,9 @@ _CHECK_SCHEMA = RUNTIME_CHECK_SCHEMA_COMPATIBILITY
 assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA)
 
 _WEB_FETCH_TRANSFORMS = frozenset({"blob_fetch", "web_scrape"})
+_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS = 30
+_WEB_BLOB_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
+_WEB_BLOB_FETCH_INT_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
 
 
 def _execution_ready() -> ValidationReadiness:
@@ -1134,34 +1143,35 @@ def validate_pipeline(
         http_options = node.options["http"] if "http" in node.options else None
         if not isinstance(http_options, Mapping):
             continue
-        if "allowed_hosts" not in http_options:
-            continue
-        allowed_hosts = http_options["allowed_hosts"]
-        if allowed_hosts == "allow_private":
-            message = (
-                f"{node.plugin}.http.allowed_hosts='allow_private' is not permitted in web execution. "
-                "Web-authored pipelines may only use public SSRF policy; private-network fetching requires "
-                "an operator-owned runtime outside the web composer."
-            )
-        elif isinstance(allowed_hosts, Sequence) and not isinstance(allowed_hosts, str):
-            message = (
-                f"{node.plugin}.http.allowed_hosts CIDR allowlists are not permitted in web execution. "
-                "Web-authored pipelines may only use allowed_hosts='public_only'; private-network fetching "
-                "requires an operator-owned runtime outside the web composer."
-            )
-        else:
-            continue
-        error_code = "web_scrape_private_network_not_allowed" if node.plugin == "web_scrape" else "web_fetch_private_network_not_allowed"
-        web_fetch_network_errors.append(
-            ValidationError(
-                component_id=node.id,
-                component_type="transform",
-                message=message,
-                suggestion=f"Set {node.plugin}.http.allowed_hosts to 'public_only' or remove the option.",
-                error_code=error_code,
-            )
-        )
-
+        if "allowed_hosts" in http_options:
+            allowed_hosts = http_options["allowed_hosts"]
+            if allowed_hosts == "allow_private":
+                message = (
+                    f"{node.plugin}.http.allowed_hosts='allow_private' is not permitted in web execution. "
+                    "Web-authored pipelines may only use public SSRF policy; private-network fetching requires "
+                    "an operator-owned runtime outside the web composer."
+                )
+            elif isinstance(allowed_hosts, Sequence) and not isinstance(allowed_hosts, str):
+                message = (
+                    f"{node.plugin}.http.allowed_hosts CIDR allowlists are not permitted in web execution. "
+                    "Web-authored pipelines may only use allowed_hosts='public_only'; private-network fetching "
+                    "requires an operator-owned runtime outside the web composer."
+                )
+            else:
+                message = None
+            if message is not None:
+                error_code = (
+                    "web_scrape_private_network_not_allowed" if node.plugin == "web_scrape" else "web_fetch_private_network_not_allowed"
+                )
+                web_fetch_network_errors.append(
+                    ValidationError(
+                        component_id=node.id,
+                        component_type="transform",
+                        message=message,
+                        suggestion=f"Set {node.plugin}.http.allowed_hosts to 'public_only' or remove the option.",
+                        error_code=error_code,
+                    )
+                )
     if web_fetch_network_errors:
         affected_nodes = tuple(error.component_id for error in web_fetch_network_errors if error.component_id is not None)
         checks.append(
@@ -1191,6 +1201,89 @@ def validate_pipeline(
             name=_CHECK_WEB_SCRAPE_NETWORK_POLICY,
             passed=True,
             detail="No web fetch transform private-network allowlists found",
+            affected_nodes=(),
+            outcome_code=None,
+        )
+    )
+
+    web_fetch_resource_errors: list[ValidationError] = []
+    if plugin_snapshot.principal_scope != "local:trained-operator":
+        for node in state.nodes:
+            if node.plugin != "blob_fetch":
+                continue
+            http_options = node.options["http"] if "http" in node.options else None
+            if not isinstance(http_options, Mapping):
+                continue
+
+            try:
+                timeout = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(http_options.get("timeout"))
+            except PydanticValidationError:
+                timeout = None
+            if timeout is not None and timeout > _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS:
+                web_fetch_resource_errors.append(
+                    ValidationError(
+                        component_id=node.id,
+                        component_type="transform",
+                        message=(
+                            f"blob_fetch.http.timeout={timeout} exceeds the web execution limit of "
+                            f"{_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} seconds."
+                        ),
+                        suggestion=f"Set blob_fetch.http.timeout to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} or less.",
+                        error_code="web_fetch_resource_limit_exceeded",
+                    )
+                )
+
+            try:
+                max_body_bytes = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(http_options.get("max_body_bytes"))
+            except PydanticValidationError:
+                max_body_bytes = None
+            if max_body_bytes is not None and max_body_bytes > _WEB_BLOB_FETCH_MAX_BODY_BYTES:
+                web_fetch_resource_errors.append(
+                    ValidationError(
+                        component_id=node.id,
+                        component_type="transform",
+                        message=(
+                            f"blob_fetch.http.max_body_bytes={max_body_bytes} exceeds the web execution limit of "
+                            f"{_WEB_BLOB_FETCH_MAX_BODY_BYTES} bytes."
+                        ),
+                        suggestion=f"Set blob_fetch.http.max_body_bytes to {_WEB_BLOB_FETCH_MAX_BODY_BYTES} or less.",
+                        error_code="web_fetch_resource_limit_exceeded",
+                    )
+                )
+
+    if web_fetch_resource_errors:
+        affected_nodes = tuple(error.component_id for error in web_fetch_resource_errors if error.component_id is not None)
+        checks.append(
+            ValidationCheck(
+                name=_CHECK_WEB_FETCH_RESOURCE_POLICY,
+                passed=False,
+                detail="blob_fetch resource limits exceed the web execution policy",
+                affected_nodes=affected_nodes,
+                outcome_code=None,
+            )
+        )
+        _append_skipped_checks(checks, _CHECK_WEB_FETCH_RESOURCE_POLICY)
+        return ValidationResult(
+            is_valid=False,
+            checks=checks,
+            errors=web_fetch_resource_errors,
+            readiness=_blocked_readiness(
+                code=_CHECK_WEB_FETCH_RESOURCE_POLICY,
+                detail="blob_fetch resource limits exceed the web execution policy.",
+                component_id=web_fetch_resource_errors[0].component_id,
+                component_type="transform",
+            ),
+        )
+
+    checks.append(
+        ValidationCheck(
+            name=_CHECK_WEB_FETCH_RESOURCE_POLICY,
+            passed=True,
+            detail=(
+                "No blob_fetch resource limits exceed the web execution policy"
+                if plugin_snapshot.principal_scope != "local:trained-operator"
+                else "Local trained-operator validation is exempt from the web blob_fetch resource policy"
+            ),
             affected_nodes=(),
             outcome_code=None,
         )
@@ -1854,6 +1947,57 @@ def validate_pipeline(
             name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
             passed=True,
             detail="No web-authored aws_s3 endpoint_url override",
+            affected_nodes=(),
+            outcome_code=None,
+        )
+    )
+
+    if plugin_snapshot.principal_scope != "local:trained-operator":
+        for source_name, source in state.sources.items():
+            source_policy_error = web_aws_s3_source_policy_error(source.plugin)
+            if source_policy_error is None:
+                continue
+            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            checks.append(
+                ValidationCheck(
+                    name=_CHECK_AWS_S3_SOURCE_POLICY,
+                    passed=False,
+                    detail=f"Source '{source_name}' uses aws_s3 in a web-authored pipeline",
+                    affected_nodes=(source_component,),
+                    outcome_code=None,
+                )
+            )
+            _append_skipped_checks(checks, _CHECK_AWS_S3_SOURCE_POLICY)
+            return ValidationResult(
+                is_valid=False,
+                checks=checks,
+                errors=[
+                    ValidationError(
+                        component_id=source_component,
+                        component_type="source",
+                        message=source_policy_error,
+                        suggestion=("Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads."),
+                        error_code="aws_s3_source_not_allowed",
+                    )
+                ],
+                readiness=_blocked_readiness(
+                    code=_CHECK_AWS_S3_SOURCE_POLICY,
+                    detail=f"source {source_component} uses aws_s3 in a web-authored pipeline",
+                    component_id=source_component,
+                    component_type="source",
+                ),
+                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            )
+
+    checks.append(
+        ValidationCheck(
+            name=_CHECK_AWS_S3_SOURCE_POLICY,
+            passed=True,
+            detail=(
+                "Web-authored pipeline does not use an aws_s3 source"
+                if plugin_snapshot.principal_scope != "local:trained-operator"
+                else "Local trained-operator validation is exempt from the web aws_s3 source policy"
+            ),
             affected_nodes=(),
             outcome_code=None,
         )
