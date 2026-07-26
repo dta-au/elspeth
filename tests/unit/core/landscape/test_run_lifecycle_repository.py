@@ -17,6 +17,7 @@ import json
 import pytest
 from sqlalchemy import select, update
 
+import elspeth.core.landscape.run_lifecycle_repository as run_lifecycle_repository_module
 from elspeth.contracts import (
     Determinism,
     ExportStatus,
@@ -394,6 +395,26 @@ class TestBeginRunRuntimeValManifest:
         manifest_json = row[0]
         assert manifest_json is not None, "runtime_val_manifest_json is NULL"
         return json.loads(manifest_json)
+
+    def test_begin_run_rebuilds_manifest_for_each_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Run-start evidence must reflect implementation drift between runs."""
+        build_count = 0
+
+        def build_manifest() -> dict[str, object]:
+            nonlocal build_count
+            build_count += 1
+            return {"implementation_generation": build_count}
+
+        monkeypatch.setattr(run_lifecycle_repository_module, "build_runtime_val_manifest", build_manifest)
+        db = make_landscape_db()
+        repo = RunLifecycleRepository(db, DatabaseOps(db), RunLoader())
+
+        repo.begin_run(config={}, canonical_version="v1", run_id="manifest-before-drift")
+        repo.begin_run(config={}, canonical_version="v1", run_id="manifest-after-drift")
+
+        assert self._fetch_manifest(db, "manifest-before-drift") == {"implementation_generation": 1}
+        assert self._fetch_manifest(db, "manifest-after-drift") == {"implementation_generation": 2}
+        assert build_count == 2
 
     def test_manifest_records_declaration_contract_registry(self) -> None:
         """Registered DeclarationContract instances appear in the manifest."""
