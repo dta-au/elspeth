@@ -291,6 +291,48 @@ def _require_unique_sorted_keys(
         raise ValueError(f"{label} must contain unique sorted keys")
 
 
+def _validate_projected_token_parent_graph(
+    tokens: tuple[StableTokenProjection, ...],
+    dispositions: tuple[StableTerminalDisposition, ...],
+) -> None:
+    parents_by_token = {token.key: token.parents for token in tokens}
+    children_by_token: dict[str, list[str]] = {token.key: [] for token in tokens}
+    remaining_parents = {token.key: len(token.parents) for token in tokens}
+    for token in tokens:
+        for parent in token.parents:
+            children_by_token[parent].append(token.key)
+
+    ready = [token.key for token in tokens if remaining_parents[token.key] == 0]
+    visited = 0
+    for token_key in ready:
+        visited += 1
+        for child in children_by_token[token_key]:
+            remaining_parents[child] -= 1
+            if remaining_parents[child] == 0:
+                ready.append(child)
+    if visited != len(tokens):
+        raise ValueError("projected token parent graph must be acyclic")
+
+    fork_parent_keys = tuple(
+        disposition.token_key for disposition in dispositions if disposition.outcome == "transient" and disposition.path == "fork_parent"
+    )
+    if any(not children_by_token[token_key] for token_key in fork_parent_keys):
+        raise ValueError("transient fork_parent token must parent a projected child token")
+
+    terminal_reachable = {disposition.token_key for disposition in dispositions if disposition.outcome in ("success", "failure")}
+    if tokens and not terminal_reachable:
+        raise ValueError("non-empty projection must contain a terminal success or failure outcome")
+    pending = sorted(terminal_reachable, reverse=True)
+    while pending:
+        token_key = pending.pop()
+        for parent in parents_by_token[token_key]:
+            if parent not in terminal_reachable:
+                terminal_reachable.add(parent)
+                pending.append(parent)
+    if any(token_key not in terminal_reachable for token_key in fork_parent_keys):
+        raise ValueError("transient fork_parent token must reach a terminal descendant")
+
+
 class StableRunProjection(ClosedModel):
     rows: tuple[StableRowProjection, ...]
     tokens: tuple[StableTokenProjection, ...]
@@ -325,14 +367,7 @@ class StableRunProjection(ClosedModel):
             raise ValueError("every route must reference a projected token")
         if {disposition.token_key for disposition in self.terminal_dispositions} != token_keys:
             raise ValueError("terminal dispositions must exactly cover tokens")
-        projected_parent_keys = {parent for token in self.tokens for parent in token.parents}
-        if any(
-            disposition.outcome == "transient" and disposition.path == "fork_parent" and disposition.token_key not in projected_parent_keys
-            for disposition in self.terminal_dispositions
-        ):
-            raise ValueError("transient fork_parent token must parent a projected child token")
-        if token_keys and not any(disposition.outcome in ("success", "failure") for disposition in self.terminal_dispositions):
-            raise ValueError("non-empty projection must contain a terminal success or failure outcome")
+        _validate_projected_token_parent_graph(self.tokens, self.terminal_dispositions)
         if any(work.token_key not in token_keys for work in self.scheduler_work):
             raise ValueError("every scheduler work item must reference a projected token")
         return self

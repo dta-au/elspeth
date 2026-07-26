@@ -1057,6 +1057,58 @@ def _exact_run_expectation_values() -> dict[str, object]:
     }
 
 
+def _exact_runtime_evidence_values(projection: dict[str, object]) -> dict[str, object]:
+    return {
+        "kind": "exact",
+        "attempted": True,
+        "run_id": "run-1",
+        "status": "completed",
+        "rows_processed": 1,
+        "rows_succeeded": 1,
+        "rows_failed": 0,
+        "output_rows": 1,
+        "sink_outputs": ({"sink_name": "output", "rows": ('{"id":1,"value":10}',)},),
+        "durable_projection": projection,
+    }
+
+
+def _projection_with_disconnected_terminal(*, cyclic: bool) -> dict[str, object]:
+    projection = _exact_runtime_projection_values()
+    projection["tokens"] = (
+        {
+            "key": "primary:0#0",
+            "row_key": "primary:0",
+            "parents": ("primary:0#1",) if cyclic else (),
+        },
+        {"key": "primary:0#1", "row_key": "primary:0", "parents": ("primary:0#0",)},
+        {"key": "primary:0#2", "row_key": "primary:0", "parents": ()},
+    )
+    projection["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "fork_parent",
+            "sink_name": None,
+        },
+        {
+            "key": "primary:0#1",
+            "token_key": "primary:0#1",
+            "outcome": "transient",
+            "path": "batch_consumed",
+            "sink_name": None,
+        },
+        {
+            "key": "primary:0#2",
+            "token_key": "primary:0#2",
+            "outcome": "success",
+            "path": "default_flow",
+            "sink_name": "output",
+        },
+    )
+    return projection
+
+
 def test_exact_runtime_projection_expectation_is_discriminated_immutable_and_canonical() -> None:
     expectation = RunExpectation.model_validate(_exact_run_expectation_values())
 
@@ -1200,6 +1252,38 @@ def test_exact_projection_rejects_zero_terminal_outcomes_when_fork_parent_has_ch
 
     with pytest.raises(ValidationError, match="non-empty projection must contain a terminal success or failure outcome"):
         RunExpectation.model_validate(values)
+
+
+@pytest.mark.parametrize("container", ("expectation", "runtime"))
+def test_exact_projection_rejects_fork_parent_with_only_disconnected_terminal(container: str) -> None:
+    projection = _projection_with_disconnected_terminal(cyclic=False)
+    validator: type[RunExpectation] | type[RuntimeEvidence]
+    if container == "expectation":
+        values = _exact_run_expectation_values()
+        values["projection"] = projection
+        validator = RunExpectation
+    else:
+        values = _exact_runtime_evidence_values(projection)
+        validator = RuntimeEvidence
+
+    with pytest.raises(ValidationError, match="transient fork_parent token must reach a terminal descendant"):
+        validator.model_validate(values)
+
+
+@pytest.mark.parametrize("container", ("expectation", "runtime"))
+def test_exact_projection_rejects_cyclic_token_parent_graph(container: str) -> None:
+    projection = _projection_with_disconnected_terminal(cyclic=True)
+    validator: type[RunExpectation] | type[RuntimeEvidence]
+    if container == "expectation":
+        values = _exact_run_expectation_values()
+        values["projection"] = projection
+        validator = RunExpectation
+    else:
+        values = _exact_runtime_evidence_values(projection)
+        validator = RuntimeEvidence
+
+    with pytest.raises(ValidationError, match="projected token parent graph must be acyclic"):
+        validator.model_validate(values)
 
 
 def test_expected_dimension_and_scenario_constants_are_exact_and_ordered() -> None:
