@@ -25,6 +25,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectInputKind,
     SinkEffectMember,
     SinkEffectReservationRequest,
+    SinkEffectRole,
     SinkEffectState,
 )
 from elspeth.core.landscape._helpers import now
@@ -423,6 +424,7 @@ class SinkEffectReservation:
             return SinkEffectReservationResult(finalized, opened, None)
 
         identity = _pipeline_identity(request, unbound)
+        self._validate_primary_links(conn, request, identity)
         sequence: int | None = None
         predecessor: str | None = None
         if request.replacing_target:
@@ -465,6 +467,40 @@ class SinkEffectReservation:
             if result.rowcount != 1:
                 raise ValueError("sink effect stream tail changed during reservation")
         return SinkEffectReservationResult(finalized, opened, effect)
+
+    @staticmethod
+    def _validate_primary_links(
+        conn: Connection,
+        request: SinkEffectReservationRequest,
+        identity: _EffectIdentity,
+    ) -> None:
+        """Require every failsink member to name its own same-run primary effect."""
+        if request.role is SinkEffectRole.PRIMARY:
+            return
+
+        primary_effect_ids = {str(member.primary_effect_id) for member in identity.members}
+        if identity.effect_id in primary_effect_ids:
+            raise ValueError("failsink effect cannot refer to itself as its primary effect")
+        primary_rows = conn.execute(
+            select(sink_effects_table.c.effect_id).where(
+                sink_effects_table.c.effect_id.in_(tuple(sorted(primary_effect_ids))),
+                sink_effects_table.c.run_id == request.run_id,
+                sink_effects_table.c.role == SinkEffectRole.PRIMARY.value,
+            )
+        ).fetchall()
+        if {str(row.effect_id) for row in primary_rows} != primary_effect_ids:
+            raise ValueError("failsink effects require same-run primary effects")
+
+        linked_members = conn.execute(
+            select(sink_effect_members_table.c.effect_id, sink_effect_members_table.c.token_id).where(
+                sink_effect_members_table.c.effect_id.in_(tuple(sorted(primary_effect_ids))),
+                sink_effect_members_table.c.run_id == request.run_id,
+                sink_effect_members_table.c.role == SinkEffectRole.PRIMARY.value,
+            )
+        ).fetchall()
+        primary_members = {(str(row.effect_id), str(row.token_id)) for row in linked_members}
+        if any((str(member.primary_effect_id), member.token_id) not in primary_members for member in identity.members):
+            raise ValueError("failsink members require a primary effect for the same token")
 
     def _reserve_export(self, request: SinkEffectReservationRequest) -> SinkEffectReservationResult:
         assert request.audit_export_snapshot_id is not None

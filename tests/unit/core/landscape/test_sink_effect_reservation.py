@@ -132,6 +132,31 @@ def test_pipeline_reservation_is_idempotent_under_reverse_arrival(db_factory: tu
         assert conn.scalar(select(func.count()).select_from(operations_table)) == 1
 
 
+def test_failsink_reservation_rejects_cross_run_primary_link_before_mutation(
+    db_factory: tuple[LandscapeDB, RecorderFactory],
+) -> None:
+    db, factory = db_factory
+    first_run_id, first_sink_id, first_members = _pipeline_members(factory, count=1)
+    primary = factory.execution.sink_effects.reserve(_pipeline_request(first_run_id, first_sink_id, first_members)).new_effect
+    assert primary is not None
+
+    second_run_id, second_sink_id, second_members = _pipeline_members(factory, count=1)
+    request = _pipeline_request(second_run_id, second_sink_id, second_members)
+    failsink_request = replace(
+        request,
+        role=SinkEffectRole.FAILSINK,
+        members=tuple(replace(member, primary_effect_id=primary.effect_id) for member in second_members),
+        primary_effect_id=primary.effect_id,
+    )
+
+    with pytest.raises(ValueError, match="same-run primary effects"):
+        factory.execution.sink_effects.reserve(failsink_request)
+
+    with db.read_only_connection() as conn:
+        assert conn.scalar(select(func.count()).select_from(sink_effects_table)) == 1
+        assert conn.scalar(select(func.count()).select_from(sink_effect_members_table)) == 1
+
+
 @pytest.mark.parametrize("terminal_status", (NodeStateStatus.COMPLETED, NodeStateStatus.FAILED))
 def test_pipeline_reservation_refuses_non_open_latest_sink_state_before_mutation(
     db_factory: tuple[LandscapeDB, RecorderFactory],
