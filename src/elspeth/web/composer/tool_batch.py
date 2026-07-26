@@ -24,6 +24,7 @@ from uuid import UUID
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -131,6 +132,97 @@ if TYPE_CHECKING:
 
 
 _MAX_PENDING_PROPOSALS_PER_TURN: Final[int] = 10
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedToolFunction:
+    """Immutable copy of execution-relevant provider function metadata."""
+
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedToolCall:
+    """Immutable provider call admitted for this dispatch batch."""
+
+    id: str
+    function: _AdmittedToolFunction
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedToolBatch:
+    """Immutable batch used exclusively after provider-boundary admission."""
+
+    calls: tuple[_AdmittedToolCall, ...]
+    call_ids: frozenset[str]
+
+
+_MISSING_TOOL_CALL_FIELD = object()
+
+
+def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
+    """Copy and validate provider calls before the first await or side effect."""
+    admitted_calls: list[_AdmittedToolCall] = []
+    call_ids: set[str] = set()
+    for tool_call in tool_calls:
+        call_id = getattr(tool_call, "id", _MISSING_TOOL_CALL_FIELD)
+        if call_id is _MISSING_TOOL_CALL_FIELD:
+            raise AuditIntegrityError("Composer tool batch is missing a provider tool-call ID")
+        if type(call_id) is not str:
+            raise AuditIntegrityError("Composer tool batch contains a non-string provider tool-call ID")
+        if not call_id.strip():
+            raise AuditIntegrityError("Composer tool batch contains a blank provider tool-call ID")
+        if len(call_id) > PROVIDER_TOOL_CALL_ID_MAX_LENGTH:
+            raise AuditIntegrityError("Composer tool batch contains an oversized provider tool-call ID")
+        if call_id in call_ids:
+            raise AuditIntegrityError("Composer tool batch contains duplicate provider tool-call IDs")
+
+        function = getattr(tool_call, "function", _MISSING_TOOL_CALL_FIELD)
+        function_name = getattr(function, "name", _MISSING_TOOL_CALL_FIELD)
+        function_arguments = getattr(function, "arguments", _MISSING_TOOL_CALL_FIELD)
+        if type(function_name) is not str or type(function_arguments) is not str:
+            raise AuditIntegrityError("Composer tool batch contains malformed provider function metadata")
+
+        call_ids.add(call_id)
+        admitted_calls.append(
+            _AdmittedToolCall(
+                id=call_id,
+                function=_AdmittedToolFunction(
+                    name=function_name,
+                    arguments=function_arguments,
+                ),
+            )
+        )
+    return _AdmittedToolBatch(
+        calls=tuple(admitted_calls),
+        call_ids=frozenset(call_ids),
+    )
+
+
+async def _preflight_session_tool_call_ids(
+    batch: _AdmittedToolBatch,
+    *,
+    sessions_service: SessionServiceProtocol | None,
+    session_id: UUID | None,
+) -> None:
+    """Reject IDs already owned by durable rows before current-turn effects."""
+    if sessions_service is None or session_id is None:
+        return
+
+    prior_messages = await sessions_service.get_messages(session_id, limit=None)
+    prior_tool_call_ids = {
+        message.tool_call_id for message in prior_messages if message.role == "tool" and message.tool_call_id is not None
+    }
+    prior_proposals = await sessions_service.list_composition_proposals(session_id)
+    prior_tool_call_ids.update(proposal.tool_call_id for proposal in prior_proposals)
+    prior_interpretations = await sessions_service.list_interpretation_events(
+        session_id,
+        status="all",
+    )
+    prior_tool_call_ids.update(event.tool_call_id for event in prior_interpretations if event.tool_call_id is not None)
+    if not batch.call_ids.isdisjoint(prior_tool_call_ids):
+        raise AuditIntegrityError("Composer tool batch reuses a provider tool-call ID already persisted in this session")
 
 
 async def _try_finalize_proposal_custody(
@@ -300,13 +392,20 @@ async def run_tool_batch(
 
     assistant_message = call_model.assistant_message
     raw_assistant_content = call_model.raw_assistant_content
-    assistant_tool_calls = call_model.assistant_tool_calls
     response = call_model.response
+
+    admitted_batch = _admit_tool_batch(call_model.assistant_tool_calls)
+    assistant_tool_calls = admitted_batch.calls
+    await _preflight_session_tool_call_ids(
+        admitted_batch,
+        sessions_service=turn_sessions_service,
+        session_id=turn_session_uuid,
+    )
 
     await emit_progress(
         progress,
         tool_batch_progress_event(
-            tuple(tool_call.function.name for tool_call in assistant_message.tool_calls),
+            tuple(tool_call.function.name for tool_call in assistant_tool_calls),
         ),
     )
 
@@ -324,7 +423,7 @@ async def run_tool_batch(
                         "arguments": tc.function.arguments,
                     },
                 }
-                for tc in assistant_message.tool_calls
+                for tc in assistant_tool_calls
             ],
         }
     )
@@ -350,7 +449,7 @@ async def run_tool_batch(
     mutation_success_observed = False
     from elspeth.web.composer.redaction import MANIFEST
 
-    for tool_call in assistant_message.tool_calls:
+    for tool_call in assistant_tool_calls:
         if ctx.cancellation_requested.is_set():
             # The enclosing compose-loop critical section has observed a
             # cancellation. If no tool started, abort without publishing a

@@ -7,20 +7,31 @@ import json
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
+from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_tool_call_response
 from elspeth.web.composer.service import ComposerServiceImpl
-from elspeth.web.composer.state import ValidationSummary
+from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
-from elspeth.web.sessions.models import chat_messages_table
+from elspeth.web.sessions.models import (
+    blobs_table,
+    chat_messages_table,
+    composition_proposals_table,
+    composition_states_table,
+    interpretation_events_table,
+    proposal_events_table,
+    sessions_table,
+)
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, CompositionStateData
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
@@ -99,6 +110,106 @@ def _metadata_tool_response(call_id: str, name: str) -> Any:
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
 
 
+def _tool_batch_response(*calls: tuple[object, str, dict[str, Any]]) -> Any:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id=call_id,
+                            function=SimpleNamespace(
+                                name=tool_name,
+                                arguments=json.dumps(arguments),
+                            ),
+                        )
+                        for call_id, tool_name, arguments in calls
+                    ],
+                )
+            )
+        ],
+    )
+
+
+def _record_real_tool_handlers(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    handler_calls: list[str] = []
+    real_execute_tool = tool_batch_module.execute_tool
+
+    def _record(tool_name: str, *args: Any, **kwargs: Any) -> Any:
+        handler_calls.append(tool_name)
+        return real_execute_tool(tool_name, *args, **kwargs)
+
+    monkeypatch.setattr(tool_batch_module, "execute_tool", _record)
+    return handler_calls
+
+
+async def _capture_tool_batch_rejection(
+    service: ComposerServiceImpl,
+    *,
+    session_id: str,
+    response: Any,
+    current_state_id: str | None = None,
+) -> BaseException | None:
+    responses = [response, _text_response("Done.")]
+
+    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    try:
+        await _run_one_turn(
+            service,
+            llm=_fake_llm,
+            session_id=session_id,
+            current_state_id=current_state_id,
+        )
+    except BaseException as exc:
+        return exc
+    return None
+
+
+def _assert_no_blob_side_effects(
+    service: ComposerServiceImpl,
+    *,
+    session_id: str,
+    tmp_path: Path,
+) -> None:
+    sessions_service = service._sessions_service  # type: ignore[attr-defined]
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        assert conn.execute(select(blobs_table.c.id).where(blobs_table.c.session_id == session_id)).fetchall() == []
+    blob_dir = tmp_path / "blobs" / session_id
+    assert not blob_dir.exists() or list(blob_dir.iterdir()) == []
+
+
+def _interpretation_review_node() -> dict[str, Any]:
+    """Return a persisted LLM node with one unresolved vague-term slot."""
+    state = CompositionState(
+        source=None,
+        nodes=(
+            NodeSpec(
+                id="interpretation_node",
+                node_type="transform",
+                plugin="llm",
+                input="input",
+                on_success="out",
+                on_error="quarantine",
+                options={"prompt_template": "Rate how {{interpretation:cool}} this is."},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(name="Interpretation ID ownership"),
+        version=1,
+    )
+    return state.to_dict()["nodes"][0]
+
+
 def _unknown_tool_response(call_id: str, *, arguments: dict[str, Any]) -> Any:
     tool_call = SimpleNamespace(
         id=call_id,
@@ -116,6 +227,643 @@ def _advisor_model_response(content: str = "Try setting `provider: azure` with t
         model="anthropic/claude-sonnet-4-6",
         usage=SimpleNamespace(prompt_tokens=120, completion_tokens=45, total_tokens=165),
     )
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_rejects_duplicate_ids_before_real_handlers_or_blob_state_side_effects(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    batch_progress_calls = 0
+    real_emit_progress = tool_batch_module.emit_progress
+
+    async def _record_batch_progress(*args: Any, **kwargs: Any) -> Any:
+        nonlocal batch_progress_calls
+        batch_progress_calls += 1
+        return await real_emit_progress(*args, **kwargs)
+
+    monkeypatch.setattr(tool_batch_module, "emit_progress", _record_batch_progress)
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(
+            (
+                "call_duplicate",
+                "create_blob",
+                {
+                    "filename": "duplicate-tripwire.txt",
+                    "mime_type": "text/plain",
+                    "content": "must never be written",
+                },
+            ),
+            (
+                "call_duplicate",
+                "set_metadata",
+                {"patch": {"name": "must never mutate state"}},
+            ),
+        ),
+    )
+
+    assert handler_calls == []
+    assert batch_progress_calls == 0
+    assert getattr(composer_service_with_real_sessions, "_phase3_last_tool_outcomes", ()) == ()
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        assert (
+            conn.execute(select(composition_states_table.c.id).where(composition_states_table.c.session_id == result_session_id)).fetchall()
+            == []
+        )
+        assert (
+            conn.execute(
+                select(chat_messages_table.c.id)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+            ).fetchall()
+            == []
+        )
+    _assert_no_blob_side_effects(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        tmp_path=tmp_path,
+    )
+    assert type(caught) is AuditIntegrityError
+    assert str(caught) == "Composer tool batch contains duplicate provider tool-call IDs"
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_rejects_duplicate_ids_before_durable_proposal_creation(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+        conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+
+    proposal_calls = 0
+    real_create_proposal = sessions_service.create_composition_proposal
+
+    async def _record_real_proposal(*args: Any, **kwargs: Any) -> Any:
+        nonlocal proposal_calls
+        proposal_calls += 1
+        return await real_create_proposal(*args, **kwargs)
+
+    monkeypatch.setattr(sessions_service, "create_composition_proposal", _record_real_proposal)
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(
+            ("call_duplicate_proposal", "set_metadata", {"patch": {"name": "first"}}),
+            ("call_duplicate_proposal", "set_metadata", {"patch": {"name": "second"}}),
+        ),
+    )
+
+    assert proposal_calls == 0
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        assert (
+            conn.execute(
+                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+            ).fetchall()
+            == []
+        )
+        assert (
+            conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall() == []
+        )
+    assert type(caught) is AuditIntegrityError
+    assert str(caught) == "Composer tool batch contains duplicate provider tool-call IDs"
+
+
+@pytest.mark.parametrize(
+    ("call_id", "expected_message"),
+    [
+        ("", "Composer tool batch contains a blank provider tool-call ID"),
+        ("x" * 257, "Composer tool batch contains an oversized provider tool-call ID"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_batch_rejects_invalid_id_before_real_handler_or_blob_side_effects(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    call_id: str,
+    expected_message: str,
+) -> None:
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(
+            (
+                call_id,
+                "create_blob",
+                {
+                    "filename": "invalid-id-tripwire.txt",
+                    "mime_type": "text/plain",
+                    "content": "must never be written",
+                },
+            ),
+        ),
+    )
+
+    assert handler_calls == []
+    _assert_no_blob_side_effects(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        tmp_path=tmp_path,
+    )
+    assert type(caught) is AuditIntegrityError
+    assert str(caught) == expected_message
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_snapshots_calls_before_first_await(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admitted_call = SimpleNamespace(
+        id="call_admitted",
+        function=SimpleNamespace(
+            name="set_metadata",
+            arguments=json.dumps({"patch": {"name": "admitted"}}),
+        ),
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[admitted_call],
+                )
+            )
+        ],
+    )
+    responses = [response, _text_response("Done.")]
+
+    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    real_emit_progress = tool_batch_module.emit_progress
+    mutated = False
+
+    async def _mutate_provider_call_after_admission(*args: Any, **kwargs: Any) -> Any:
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            admitted_call.id = "call_mutated"
+            admitted_call.function.name = "create_blob"
+            admitted_call.function.arguments = json.dumps(
+                {
+                    "filename": "toctou-tripwire.txt",
+                    "mime_type": "text/plain",
+                    "content": "must never be written",
+                }
+            )
+        return await real_emit_progress(*args, **kwargs)
+
+    monkeypatch.setattr(tool_batch_module, "emit_progress", _mutate_provider_call_after_admission)
+
+    result = await _run_one_turn(
+        composer_service_with_real_sessions,
+        llm=_fake_llm,
+        session_id=result_session_id,
+    )
+
+    assert mutated is True
+    assert handler_calls == ["set_metadata"]
+    assert result.tool_outcomes[0].call.id == "call_admitted"
+    assert result.tool_outcomes[0].call.function.name == "set_metadata"
+    assert result.tool_outcomes[0].response.updated_state.metadata.name == "admitted"
+    assert result.persisted_assistant_tool_calls[0]["id"] == "call_admitted"
+    _assert_no_blob_side_effects(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        tmp_path=tmp_path,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_snapshots_calls_before_preference_await(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admitted_call = SimpleNamespace(
+        id="call_admitted_before_preferences",
+        function=SimpleNamespace(
+            name="set_metadata",
+            arguments=json.dumps({"patch": {"name": "admitted before preferences"}}),
+        ),
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[admitted_call],
+                )
+            )
+        ],
+    )
+    responses = [response, _text_response("Done.")]
+
+    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    real_get_preferences = sessions_service.get_composer_preferences
+    mutated = False
+
+    async def _mutate_provider_call_during_preferences(session_id: UUID) -> ComposerSessionPreferencesRecord:
+        nonlocal mutated
+        preferences = await real_get_preferences(session_id)
+        mutated = True
+        admitted_call.id = "call_mutated_during_preferences"
+        admitted_call.function.name = "create_blob"
+        admitted_call.function.arguments = json.dumps(
+            {
+                "filename": "preference-toctou-tripwire.txt",
+                "mime_type": "text/plain",
+                "content": "must never be written",
+            }
+        )
+        return preferences
+
+    monkeypatch.setattr(
+        sessions_service,
+        "get_composer_preferences",
+        _mutate_provider_call_during_preferences,
+    )
+
+    result = await _run_one_turn(
+        composer_service_with_real_sessions,
+        llm=_fake_llm,
+        session_id=result_session_id,
+    )
+
+    assert mutated is True
+    assert handler_calls == ["set_metadata"]
+    assert result.tool_outcomes[0].call.id == "call_admitted_before_preferences"
+    assert result.tool_outcomes[0].call.function.name == "set_metadata"
+    assert result.tool_outcomes[0].response.updated_state.metadata.name == "admitted before preferences"
+    assert result.persisted_assistant_tool_calls[0]["id"] == "call_admitted_before_preferences"
+    _assert_no_blob_side_effects(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        tmp_path=tmp_path,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_rejects_session_reused_id_before_current_turn_proposal_or_blob_effects(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+        conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+
+    responses = [
+        _tool_batch_response(
+            ("call_session_reuse", "set_metadata", {"patch": {"name": "prior proposal"}}),
+        ),
+        _tool_batch_response(
+            ("call_fresh_proposal", "set_metadata", {"patch": {"name": "must not propose"}}),
+            (
+                "call_session_reuse",
+                "create_blob",
+                {
+                    "filename": "session-reuse-tripwire.txt",
+                    "mime_type": "text/plain",
+                    "content": "must never be written",
+                },
+            ),
+        ),
+        _text_response("Done."),
+    ]
+
+    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    proposal_calls = 0
+    real_create_proposal = sessions_service.create_composition_proposal
+
+    async def _record_real_proposal(*args: Any, **kwargs: Any) -> Any:
+        nonlocal proposal_calls
+        proposal_calls += 1
+        return await real_create_proposal(*args, **kwargs)
+
+    monkeypatch.setattr(sessions_service, "create_composition_proposal", _record_real_proposal)
+
+    caught: BaseException | None = None
+    try:
+        await _run_one_turn(
+            composer_service_with_real_sessions,
+            llm=_fake_llm,
+            session_id=result_session_id,
+        )
+    except BaseException as exc:
+        caught = exc
+
+    assert handler_calls == []
+    assert proposal_calls == 1
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        assert list(
+            conn.execute(
+                select(composition_proposals_table.c.tool_call_id)
+                .where(composition_proposals_table.c.session_id == result_session_id)
+                .order_by(composition_proposals_table.c.created_at)
+            ).scalars()
+        ) == ["call_session_reuse"]
+        assert list(
+            conn.execute(
+                select(chat_messages_table.c.tool_call_id)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role == "tool")
+                .order_by(chat_messages_table.c.sequence_no)
+            ).scalars()
+        ) == ["call_session_reuse"]
+    _assert_no_blob_side_effects(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        tmp_path=tmp_path,
+    )
+    assert type(caught) is AuditIntegrityError
+    assert str(caught) == "Composer tool batch reuses a provider tool-call ID already persisted in this session"
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_rejects_id_reserved_by_prior_proposal_without_tool_row(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    await sessions_service.create_composition_proposal(
+        session_id=UUID(result_session_id),
+        tool_call_id="call_orphaned_proposal",
+        tool_name="set_metadata",
+        summary="Prior durable proposal.",
+        rationale="Tripwire for proposal-only ID ownership.",
+        affects=("metadata",),
+        arguments_json={"patch": {"name": "prior"}},
+        arguments_redacted_json={"patch": {"name": "prior"}},
+        base_state_id=None,
+        actor="test",
+    )
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(
+            (
+                "call_orphaned_proposal",
+                "create_blob",
+                {
+                    "filename": "proposal-only-reuse-tripwire.txt",
+                    "mime_type": "text/plain",
+                    "content": "must never be written",
+                },
+            ),
+        ),
+    )
+
+    assert handler_calls == []
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        assert list(
+            conn.execute(
+                select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+            ).scalars()
+        ) == ["call_orphaned_proposal"]
+        assert (
+            conn.execute(
+                select(chat_messages_table.c.id)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+            ).fetchall()
+            == []
+        )
+    _assert_no_blob_side_effects(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        tmp_path=tmp_path,
+    )
+    assert type(caught) is AuditIntegrityError
+    assert str(caught) == "Composer tool batch reuses a provider tool-call ID already persisted in this session"
+
+
+@pytest.mark.parametrize(
+    "durable_choice",
+    [
+        InterpretationChoice.PENDING,
+        InterpretationChoice.ACCEPTED_AS_DRAFTED,
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_batch_rejects_id_owned_only_by_prior_interpretation_event(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    durable_choice: InterpretationChoice,
+) -> None:
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    session_uuid = UUID(result_session_id)
+    state = await sessions_service.save_composition_state(
+        session_uuid,
+        CompositionStateData(
+            nodes=[_interpretation_review_node()],
+            metadata_={"name": "Interpretation ID ownership", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    event = await sessions_service.create_pending_interpretation_event(
+        session_id=session_uuid,
+        composition_state_id=state.id,
+        affected_node_id="interpretation_node",
+        tool_call_id="call_interpretation_orphan",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Stylish and appealing.",
+        model_identifier="test/composer",
+        model_version="test-v1",
+        provider="test",
+        composer_skill_hash="a" * 64,
+    )
+    current_state_id = state.id
+    if durable_choice is InterpretationChoice.ACCEPTED_AS_DRAFTED:
+        event, resolved_state = await sessions_service.resolve_interpretation_event(
+            session_id=session_uuid,
+            event_id=event.id,
+            choice=durable_choice,
+            amended_value=None,
+            actor="user:test",
+            runtime_model_identifier=None,
+            runtime_model_version=None,
+        )
+        current_state_id = resolved_state.id
+    assert event.choice is durable_choice
+    assert [
+        row.choice
+        for row in await sessions_service.list_interpretation_events(
+            session_uuid,
+            status="all",
+        )
+    ] == [durable_choice]
+
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    progress_calls = 0
+    real_emit_progress = tool_batch_module.emit_progress
+
+    async def _record_progress(*args: Any, **kwargs: Any) -> Any:
+        nonlocal progress_calls
+        progress_calls += 1
+        return await real_emit_progress(*args, **kwargs)
+
+    monkeypatch.setattr(tool_batch_module, "emit_progress", _record_progress)
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        current_state_id=str(current_state_id),
+        response=_tool_batch_response(
+            (
+                "call_interpretation_orphan",
+                "create_blob",
+                {
+                    "filename": "interpretation-reuse-tripwire.txt",
+                    "mime_type": "text/plain",
+                    "content": "must never be written",
+                },
+            ),
+        ),
+    )
+
+    assert handler_calls == []
+    assert progress_calls == 0
+    _assert_no_blob_side_effects(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        tmp_path=tmp_path,
+    )
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        assert (
+            conn.execute(
+                select(chat_messages_table.c.id)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+            ).fetchall()
+            == []
+        )
+        assert (
+            conn.execute(
+                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+            ).fetchall()
+            == []
+        )
+        assert list(
+            conn.execute(
+                select(interpretation_events_table.c.tool_call_id).where(interpretation_events_table.c.session_id == result_session_id)
+            ).scalars()
+        ) == ["call_interpretation_orphan"]
+    assert type(caught) is AuditIntegrityError
+    assert str(caught) == "Composer tool batch reuses a provider tool-call ID already persisted in this session"
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_accepts_provider_id_at_exact_length_boundary(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(
+            ("x" * 256, "get_pipeline_state", {}),
+        ),
+    )
+
+    assert caught is None
+    assert handler_calls == ["get_pipeline_state"]
+
+
+@pytest.mark.parametrize(
+    ("call_id", "expected_message"),
+    [
+        (7, "Composer tool batch contains a non-string provider tool-call ID"),
+        ("\u2003", "Composer tool batch contains a blank provider tool-call ID"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_batch_rejects_non_string_or_unicode_whitespace_id(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    call_id: object,
+    expected_message: str,
+) -> None:
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=_tool_batch_response(
+            (call_id, "get_pipeline_state", {}),
+        ),
+    )
+
+    assert handler_calls == []
+    assert type(caught) is AuditIntegrityError
+    assert str(caught) == expected_message
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_rejects_missing_id_with_leak_safe_audit_error(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            function=SimpleNamespace(
+                                name="get_pipeline_state",
+                                arguments="{}",
+                            )
+                        )
+                    ],
+                )
+            )
+        ],
+    )
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    caught = await _capture_tool_batch_rejection(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        response=response,
+    )
+
+    assert handler_calls == []
+    assert type(caught) is AuditIntegrityError
+    assert str(caught) == "Composer tool batch is missing a provider tool-call ID"
 
 
 @pytest.mark.asyncio

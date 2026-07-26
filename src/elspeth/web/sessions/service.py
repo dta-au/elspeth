@@ -6102,7 +6102,7 @@ class SessionServiceImpl:
             if status is not None:
                 stmt = stmt.where(composition_proposals_table.c.status == status)
             stmt = stmt.order_by(composition_proposals_table.c.created_at)
-            with self._engine.begin() as conn:
+            with self._engine.connect() as conn:
                 rows = conn.execute(stmt).fetchall()
                 records = [_proposal_record_from_row(row) for row in rows]
                 if not records:
@@ -7129,7 +7129,7 @@ class SessionServiceImpl:
                 interpretation_events_table.c.created_at,
                 interpretation_events_table.c.id,
             )
-            with self._engine.begin() as conn:
+            with self._engine.connect() as conn:
                 rows = conn.execute(stmt).fetchall()
                 return [_interpretation_event_record_from_row(row) for row in rows]
 
@@ -7588,7 +7588,7 @@ class SessionServiceImpl:
         """
 
         def _sync() -> tuple[Sequence[Any], Sequence[Any], Sequence[Any]]:
-            with self._engine.begin() as conn:
+            with self._engine.connect() as conn:
                 message_rows = conn.execute(
                     select(chat_messages_table)
                     .where(chat_messages_table.c.session_id == str(session_id))

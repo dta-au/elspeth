@@ -3044,7 +3044,11 @@ class ComposerServiceImpl:
         )
         assistant_message = response.choices[0].message
         raw_assistant_content = assistant_message.content
-        assistant_tool_calls = assistant_message.tool_calls or ()
+        provider_tool_calls = assistant_message.tool_calls or ()
+        from elspeth.web.composer.tool_batch import _admit_tool_batch
+
+        admitted_batch = _admit_tool_batch(provider_tool_calls)
+        assistant_tool_calls = admitted_batch.calls
         if len(assistant_tool_calls) > self._max_tool_calls_per_turn:
             self._telemetry.tool_call_cap_exceeded_total.add(1)
             raise ComposerConvergenceError.capture(
@@ -3060,12 +3064,13 @@ class ComposerServiceImpl:
                     "cap": self._max_tool_calls_per_turn,
                 },
             )
+
         return _CallModelOutcome(
             response=response,
             assistant_message=assistant_message,
             raw_assistant_content=raw_assistant_content,
             assistant_tool_calls=tuple(assistant_tool_calls),
-            has_tool_calls=bool(assistant_message.tool_calls),
+            has_tool_calls=bool(assistant_tool_calls),
         )
 
     async def _persist_turn_audit(
