@@ -98,6 +98,23 @@ class TestBatchOutlierAnnotator:
             assert row["outlier_missing_indices"] == (1,)
             assert row["outlier_non_finite_indices"] == (2,)
 
+    def test_skipped_index_details_are_bounded_per_output_row(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_outlier_annotator import _MAX_INDEX_DETAIL_ITEMS, BatchOutlierAnnotator
+
+        transform = BatchOutlierAnnotator({"schema": DYNAMIC_SCHEMA, "value_field": "score"})
+        rows = [_make_row({"id": "finite", "score": 10.0})]
+        rows.extend(_make_row({"id": f"missing-{index}", "score": None}) for index in range(_MAX_INDEX_DETAIL_ITEMS + 1))
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["outlier_missing_count"] == _MAX_INDEX_DETAIL_ITEMS + 1
+        assert len(result.row["outlier_missing_indices"]) == _MAX_INDEX_DETAIL_ITEMS
+        assert result.row["outlier_missing_indices_truncated"] is True
+        assert result.row["outlier_non_finite_indices"] == ()
+        assert result.row["outlier_non_finite_indices_truncated"] is False
+
     def test_backward_invariant_probe_exercises_dropped_row_shape(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_outlier_annotator import BatchOutlierAnnotator
 
@@ -236,8 +253,10 @@ class TestBatchOutlierAnnotatorConfig:
                 "outlier_median",
                 "outlier_missing_count",
                 "outlier_missing_indices",
+                "outlier_missing_indices_truncated",
                 "outlier_non_finite_count",
                 "outlier_non_finite_indices",
+                "outlier_non_finite_indices_truncated",
                 "outlier_reason",
                 "outlier_robust_z_score",
                 "outlier_robust_z_threshold",

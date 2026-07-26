@@ -209,6 +209,26 @@ class TestBatchDriftCompare:
         assert shifts[("int", 1)]["baseline_count"] == 0
         assert shifts[("int", 1)]["cohort_count"] == 1
 
+    def test_categorical_detail_lists_are_bounded_for_high_cardinality_batches(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_drift_compare import _MAX_CATEGORY_DETAIL_ITEMS, BatchDriftCompare
+
+        transform = BatchDriftCompare(
+            {"schema": DYNAMIC_SCHEMA, "cohort_field": "cohort", "value_field": "label", "value_type": "categorical"}
+        )
+        rows = [_make_row({"cohort": "baseline", "label": "baseline-only"})]
+        rows.extend(_make_row({"cohort": "current", "label": f"category-{index}"}) for index in range(_MAX_CATEGORY_DETAIL_ITEMS + 1))
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["category_shift_count"] == _MAX_CATEGORY_DETAIL_ITEMS + 2
+        assert len(result.row["category_shifts"]) == _MAX_CATEGORY_DETAIL_ITEMS
+        assert result.row["category_shifts_truncated"] is True
+        assert result.row["new_category_count"] == _MAX_CATEGORY_DETAIL_ITEMS + 1
+        assert len(result.row["new_categories"]) == _MAX_CATEGORY_DETAIL_ITEMS
+        assert result.row["new_categories_truncated"] is True
+
     def test_numeric_non_numeric_values_raise_type_error(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare
 

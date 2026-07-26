@@ -22,6 +22,8 @@ from elspeth.plugins.infrastructure.results import TransformResult
 
 type BatchOutlierAnnotationRow = dict[str, object]
 
+_MAX_INDEX_DETAIL_ITEMS = 1_000
+
 _ANNOTATION_FIELD_SUFFIXES = (
     "batch_size",
     "is_outlier",
@@ -30,8 +32,10 @@ _ANNOTATION_FIELD_SUFFIXES = (
     "median",
     "missing_count",
     "missing_indices",
+    "missing_indices_truncated",
     "non_finite_count",
     "non_finite_indices",
+    "non_finite_indices_truncated",
     "reason",
     "robust_z_score",
     "robust_z_threshold",
@@ -142,7 +146,7 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0fb500fc231b82f9"
+    source_file_hash: str | None = "sha256:8d56aa8f81dd7fdc"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
     passes_through_input = False
@@ -406,8 +410,10 @@ class BatchOutlierAnnotator(BaseTransform):
             self._field("missing_count"): stats.missing_count,
             self._field("non_finite_count"): stats.non_finite_count,
             self._field("skipped_count"): stats.skipped_count,
-            self._field("missing_indices"): stats.missing_indices,
-            self._field("non_finite_indices"): stats.non_finite_indices,
+            self._field("missing_indices"): stats.missing_indices[:_MAX_INDEX_DETAIL_ITEMS],
+            self._field("missing_indices_truncated"): len(stats.missing_indices) > _MAX_INDEX_DETAIL_ITEMS,
+            self._field("non_finite_indices"): stats.non_finite_indices[:_MAX_INDEX_DETAIL_ITEMS],
+            self._field("non_finite_indices_truncated"): len(stats.non_finite_indices) > _MAX_INDEX_DETAIL_ITEMS,
             self._field("mean"): stats.mean,
             self._field("median"): stats.median,
             self._field("stdev"): stats.stdev,

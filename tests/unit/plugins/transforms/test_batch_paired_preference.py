@@ -197,6 +197,28 @@ class TestBatchPairedPreference:
         assert result.reason["operation"] == "paired_delta"
         assert result.reason["group_value"] == "B"
 
+    def test_incomplete_pair_details_are_bounded_for_high_cardinality_batches(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_paired_preference import _MAX_INCOMPLETE_PAIR_DETAILS, BatchPairedPreference
+
+        transform = BatchPairedPreference(
+            {"schema": DYNAMIC_SCHEMA, "pair_field": "case_id", "variant_field": "variant", "score_field": "score"}
+        )
+        rows = [
+            _make_row({"case_id": "complete", "variant": "A", "score": 0.5}),
+            _make_row({"case_id": "complete", "variant": "B", "score": 0.6}),
+        ]
+        rows.extend(
+            _make_row({"case_id": f"incomplete-{index}", "variant": "A", "score": 0.5}) for index in range(_MAX_INCOMPLETE_PAIR_DETAILS + 1)
+        )
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["incomplete_pair_count"] == _MAX_INCOMPLETE_PAIR_DETAILS + 1
+        assert len(result.row["incomplete_pairs"]) == _MAX_INCOMPLETE_PAIR_DETAILS
+        assert result.row["incomplete_pairs_truncated"] is True
+
     def test_non_numeric_scores_raise_type_error(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_paired_preference import BatchPairedPreference
 
@@ -310,6 +332,8 @@ class TestBatchPairedPreferenceConfig:
                 "confidence_95_high",
                 "confidence_95_low",
                 "incomplete_pair_count",
+                "incomplete_pairs",
+                "incomplete_pairs_truncated",
                 "loss_rate",
                 "losses",
                 "mean_paired_delta",

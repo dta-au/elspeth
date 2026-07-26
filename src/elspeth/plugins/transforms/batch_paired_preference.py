@@ -19,12 +19,16 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms._scalar_buckets import (
-    append_unique_bucket_value,
+    ScalarBucketKey,
+    append_unique_bucket_value_with_seen,
+    hashable_scalar_bucket_key,
     same_scalar_bucket_value,
     scalar_bucket_contains,
 )
 
 type BatchPairedPreferenceRow = dict[str, object]
+
+_MAX_INCOMPLETE_PAIR_DETAILS = 1_000
 
 _PAIRED_OUTPUT_FIELDS = frozenset(
     {
@@ -35,6 +39,8 @@ _PAIRED_OUTPUT_FIELDS = frozenset(
         "confidence_95_high",
         "confidence_95_low",
         "incomplete_pair_count",
+        "incomplete_pairs",
+        "incomplete_pairs_truncated",
         "loss_rate",
         "losses",
         "mean_paired_delta",
@@ -62,6 +68,22 @@ class _ScoreEntry:
     score: int | float | None
     missing: bool = False
     non_finite: bool = False
+
+
+@dataclass(slots=True)
+class _PairBucket:
+    pair_id: Any
+    entries: list[_ScoreEntry]
+    entry_by_variant: dict[ScalarBucketKey, _ScoreEntry]
+    unhashable_entries: list[_ScoreEntry]
+
+    def append(self, entry: _ScoreEntry) -> None:
+        self.entries.append(entry)
+        key = hashable_scalar_bucket_key(entry.variant)
+        if key is None:
+            self.unhashable_entries.append(entry)
+            return
+        self.entry_by_variant.setdefault(key, entry)
 
 
 class BatchPairedPreferenceConfig(TransformDataConfig):
@@ -116,7 +138,7 @@ class BatchPairedPreference(BaseTransform):
     name = "batch_paired_preference"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:48862b640e0de744"
+    source_file_hash: str | None = "sha256:e31202f12d98886f"
     config_model = BatchPairedPreferenceConfig
     is_batch_aware = True
 
@@ -216,28 +238,56 @@ class BatchPairedPreference(BaseTransform):
 
         return _ScoreEntry(variant=variant, score=raw_score)
 
-    def _collect_pairs(self, rows: list[PipelineRow]) -> tuple[list[tuple[Any, list[_ScoreEntry]]], list[Any]]:
-        pairs: list[tuple[Any, list[_ScoreEntry]]] = []
+    def _collect_pairs(self, rows: list[PipelineRow]) -> tuple[list[_PairBucket], list[Any]]:
+        pairs: list[_PairBucket] = []
+        pair_indexes: dict[ScalarBucketKey, int] = {}
+        unhashable_pair_indexes: list[tuple[Any, int]] = []
         variants: list[Any] = []
+        variant_keys: set[ScalarBucketKey] = set()
+        unhashable_variants: list[Any] = []
 
         for row_index, row in enumerate(rows):
             pair_id = row[self._pair_field]
             entry = self._score_entry_for(row, row_index=row_index)
 
-            append_unique_bucket_value(variants, entry.variant)
+            append_unique_bucket_value_with_seen(
+                variants,
+                entry.variant,
+                seen_hashable=variant_keys,
+                seen_unhashable=unhashable_variants,
+            )
 
-            for existing_pair, entries in pairs:
-                if same_scalar_bucket_value(pair_id, existing_pair):
-                    entries.append(entry)
-                    break
+            pair_key = hashable_scalar_bucket_key(pair_id)
+            if pair_key is not None:
+                pair_index = pair_indexes.get(pair_key)
             else:
-                pairs.append((pair_id, [entry]))
+                pair_index = next(
+                    (
+                        existing_index
+                        for existing_pair, existing_index in unhashable_pair_indexes
+                        if same_scalar_bucket_value(pair_id, existing_pair)
+                    ),
+                    None,
+                )
+
+            if pair_index is None:
+                pair_index = len(pairs)
+                pairs.append(_PairBucket(pair_id=pair_id, entries=[], entry_by_variant={}, unhashable_entries=[]))
+                if pair_key is not None:
+                    pair_indexes[pair_key] = pair_index
+                else:
+                    unhashable_pair_indexes.append((pair_id, pair_index))
+
+            pairs[pair_index].append(entry)
 
         return pairs, variants
 
     @staticmethod
-    def _find_variant_entry(entries: list[_ScoreEntry], variant: Any) -> _ScoreEntry | None:
-        for entry in entries:
+    def _find_variant_entry(pair: _PairBucket, variant: Any) -> _ScoreEntry | None:
+        key = hashable_scalar_bucket_key(variant)
+        if key is not None:
+            return pair.entry_by_variant.get(key)
+        for entry in pair.unhashable_entries:
             if same_scalar_bucket_value(entry.variant, variant):
                 return entry
         return None
@@ -261,7 +311,7 @@ class BatchPairedPreference(BaseTransform):
     def _comparison_for(
         self,
         *,
-        pairs: list[tuple[Any, list[_ScoreEntry]]],
+        pairs: list[_PairBucket],
         baseline_variant: Any,
         variant: Any,
         batch_size: int,
@@ -270,23 +320,28 @@ class BatchPairedPreference(BaseTransform):
         variant_scores: list[int | float] = []
         deltas: list[float] = []
         incomplete_pairs: list[Any] = []
+        incomplete_pair_count = 0
         missing_score_count = 0
         non_finite_score_count = 0
         wins = 0
         losses = 0
         ties = 0
 
-        for pair_id, entries in pairs:
-            baseline = self._find_variant_entry(entries, baseline_variant)
-            candidate = self._find_variant_entry(entries, variant)
+        for pair in pairs:
+            baseline = self._find_variant_entry(pair, baseline_variant)
+            candidate = self._find_variant_entry(pair, variant)
             if baseline is None or candidate is None:
-                incomplete_pairs.append(pair_id)
+                incomplete_pair_count += 1
+                if len(incomplete_pairs) < _MAX_INCOMPLETE_PAIR_DETAILS:
+                    incomplete_pairs.append(pair.pair_id)
                 continue
 
             missing_score_count += int(baseline.missing) + int(candidate.missing)
             non_finite_score_count += int(baseline.non_finite) + int(candidate.non_finite)
             if baseline.score is None or candidate.score is None:
-                incomplete_pairs.append(pair_id)
+                incomplete_pair_count += 1
+                if len(incomplete_pairs) < _MAX_INCOMPLETE_PAIR_DETAILS:
+                    incomplete_pairs.append(pair.pair_id)
                 continue
 
             try:
@@ -349,7 +404,8 @@ class BatchPairedPreference(BaseTransform):
             "batch_size": batch_size,
             "total_pair_count": len(pairs),
             "compared_pair_count": compared_count,
-            "incomplete_pair_count": len(incomplete_pairs),
+            "incomplete_pair_count": incomplete_pair_count,
+            "incomplete_pairs_truncated": incomplete_pair_count > len(incomplete_pairs),
             "missing_score_count": missing_score_count,
             "non_finite_score_count": non_finite_score_count,
             "baseline_mean": baseline_mean,

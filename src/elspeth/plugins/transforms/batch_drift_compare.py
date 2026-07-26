@@ -20,9 +20,10 @@ from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms._scalar_buckets import (
     ScalarBucketKey,
-    append_unique_bucket_value,
+    hashable_scalar_bucket_key,
     same_scalar_bucket_value,
     scalar_bucket_key,
+    unique_bucket_values,
 )
 
 type BatchDriftCompareRow = dict[str, object]
@@ -55,11 +56,16 @@ _NUMERIC_OUTPUT_FIELDS = _COMMON_OUTPUT_FIELDS | frozenset(
         "mean_delta",
     }
 )
+_MAX_CATEGORY_DETAIL_ITEMS = 1_000
+
 _CATEGORICAL_OUTPUT_FIELDS = _COMMON_OUTPUT_FIELDS | frozenset(
     {
+        "category_shift_count",
         "category_shifts",
+        "category_shifts_truncated",
         "chi_square_statistic",
         "new_categories",
+        "new_categories_truncated",
         "new_category_count",
         "total_variation",
     }
@@ -127,7 +133,7 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b96cdf96069ddb27"
+    source_file_hash: str | None = "sha256:7a60495bee8a8e68"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
 
@@ -207,14 +213,32 @@ class BatchDriftCompare(BaseTransform):
 
     def _collect_cohorts(self, rows: list[PipelineRow]) -> list[tuple[Any, list[PipelineRow]]]:
         cohorts: list[tuple[Any, list[PipelineRow]]] = []
+        cohort_indexes: dict[ScalarBucketKey, int] = {}
+        unhashable_cohort_indexes: list[tuple[Any, int]] = []
         for row in rows:
             cohort_value = row[self._cohort_field]
-            for existing_cohort, cohort_rows in cohorts:
-                if same_scalar_bucket_value(cohort_value, existing_cohort):
-                    cohort_rows.append(row)
-                    break
+            cohort_key = hashable_scalar_bucket_key(cohort_value)
+            if cohort_key is not None:
+                cohort_index = cohort_indexes.get(cohort_key)
             else:
-                cohorts.append((cohort_value, [row]))
+                cohort_index = next(
+                    (
+                        existing_index
+                        for existing_cohort, existing_index in unhashable_cohort_indexes
+                        if same_scalar_bucket_value(cohort_value, existing_cohort)
+                    ),
+                    None,
+                )
+
+            if cohort_index is None:
+                cohort_index = len(cohorts)
+                cohorts.append((cohort_value, []))
+                if cohort_key is not None:
+                    cohort_indexes[cohort_key] = cohort_index
+                else:
+                    unhashable_cohort_indexes.append((cohort_value, cohort_index))
+
+            cohorts[cohort_index][1].append(row)
         return cohorts
 
     def _numeric_values_for(self, cohort: Any, rows: list[PipelineRow]) -> _CohortValues:
@@ -298,26 +322,42 @@ class BatchDriftCompare(BaseTransform):
     def _ks_statistic(left: tuple[int | float, ...], right: tuple[int | float, ...]) -> float:
         left_values = sorted(float(value) for value in left)
         right_values = sorted(float(value) for value in right)
-        thresholds = sorted(set(left_values + right_values))
+        left_len = len(left_values)
+        right_len = len(right_values)
+        left_index = 0
+        right_index = 0
         max_distance = 0.0
-        for threshold in thresholds:
-            left_cdf = sum(1 for value in left_values if value <= threshold) / len(left_values)
-            right_cdf = sum(1 for value in right_values if value <= threshold) / len(right_values)
+
+        while left_index < left_len or right_index < right_len:
+            if right_index >= right_len or (left_index < left_len and left_values[left_index] <= right_values[right_index]):
+                threshold = left_values[left_index]
+            else:
+                threshold = right_values[right_index]
+
+            while left_index < left_len and left_values[left_index] <= threshold:
+                left_index += 1
+            while right_index < right_len and right_values[right_index] <= threshold:
+                right_index += 1
+
+            left_cdf = left_index / left_len
+            right_cdf = right_index / right_len
             max_distance = max(max_distance, abs(left_cdf - right_cdf))
+
         return max_distance
 
     @staticmethod
-    def _categorical_shifts(baseline: _CohortValues, cohort: _CohortValues) -> tuple[list[dict[str, object]], float, float, list[object]]:
+    def _categorical_shifts(
+        baseline: _CohortValues, cohort: _CohortValues
+    ) -> tuple[list[dict[str, object]], float, float, list[object], int, int, bool, bool]:
         baseline_counts: Counter[ScalarBucketKey] = Counter(scalar_bucket_key(value) for value in baseline.values)
         cohort_counts: Counter[ScalarBucketKey] = Counter(scalar_bucket_key(value) for value in cohort.values)
-        values: list[object] = []
-        for value in baseline.values + cohort.values:
-            append_unique_bucket_value(values, value)
+        values = unique_bucket_values(baseline.values + cohort.values)
 
         shifts: list[dict[str, object]] = []
         total_variation_sum = 0.0
         chi_square = 0.0
         new_categories: list[object] = []
+        total_new_category_count = 0
         for value in values:
             value_key = scalar_bucket_key(value)
             baseline_count = baseline_counts[value_key]
@@ -329,19 +369,31 @@ class BatchDriftCompare(BaseTransform):
             if expected > 0:
                 chi_square += ((cohort_count - expected) ** 2) / expected
             if baseline_count == 0 and cohort_count > 0:
-                new_categories.append(value)
-            shifts.append(
-                {
-                    "value": value,
-                    "baseline_count": baseline_count,
-                    "cohort_count": cohort_count,
-                    "baseline_proportion": baseline_prop,
-                    "cohort_proportion": cohort_prop,
-                    "proportion_delta": cohort_prop - baseline_prop,
-                }
-            )
+                total_new_category_count += 1
+                if len(new_categories) < _MAX_CATEGORY_DETAIL_ITEMS:
+                    new_categories.append(value)
+            if len(shifts) < _MAX_CATEGORY_DETAIL_ITEMS:
+                shifts.append(
+                    {
+                        "value": value,
+                        "baseline_count": baseline_count,
+                        "cohort_count": cohort_count,
+                        "baseline_proportion": baseline_prop,
+                        "cohort_proportion": cohort_prop,
+                        "proportion_delta": cohort_prop - baseline_prop,
+                    }
+                )
 
-        return shifts, 0.5 * total_variation_sum, chi_square, new_categories
+        return (
+            shifts,
+            0.5 * total_variation_sum,
+            chi_square,
+            new_categories,
+            total_new_category_count,
+            len(values),
+            len(values) > _MAX_CATEGORY_DETAIL_ITEMS,
+            total_new_category_count > len(new_categories),
+        )
 
     def _base_result(self, *, baseline: _CohortValues, cohort: _CohortValues, batch_size: int) -> BatchDriftCompareRow:
         return {
@@ -386,15 +438,27 @@ class BatchDriftCompare(BaseTransform):
         return result
 
     def _categorical_result(self, *, baseline: _CohortValues, cohort: _CohortValues, batch_size: int) -> BatchDriftCompareRow:
-        shifts, total_variation, chi_square, new_categories = self._categorical_shifts(baseline, cohort)
+        (
+            shifts,
+            total_variation,
+            chi_square,
+            new_categories,
+            total_new_category_count,
+            category_shift_count,
+            category_shifts_truncated,
+            new_categories_truncated,
+        ) = self._categorical_shifts(baseline, cohort)
         result = self._base_result(baseline=baseline, cohort=cohort, batch_size=batch_size)
         result.update(
             {
                 "category_shifts": shifts,
+                "category_shift_count": category_shift_count,
+                "category_shifts_truncated": category_shifts_truncated,
                 "total_variation": total_variation,
                 "chi_square_statistic": chi_square,
-                "new_category_count": len(new_categories),
+                "new_category_count": total_new_category_count,
                 "new_categories": new_categories,
+                "new_categories_truncated": new_categories_truncated,
             }
         )
         return result
