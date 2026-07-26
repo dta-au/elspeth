@@ -192,6 +192,31 @@ def test_render_settings_rejects_fixture_without_declared_input_reference(
         render_settings(case, tmp_path / "runtime")
 
 
+def test_render_settings_rejects_input_reference_outside_source_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _scenario, case = _declared_case("linear", "happy-path")
+    original_fixture = resolve_fixture_path(case.fixture)
+    original_input = resolve_fixture_path(case.input_fixture)
+    fixture_root = tmp_path / "fixtures"
+    copied_fixture = fixture_root / case.fixture
+    copied_input = fixture_root / case.input_fixture
+    decoy_input = copied_fixture.parent / "decoy.csv"
+    copied_fixture.parent.mkdir(parents=True)
+    copied_fixture.write_text(
+        original_fixture.read_text(encoding="utf-8").replace("${input_csv}", json.dumps(str(decoy_input)))
+        + "\n# declared input: ${input_csv}\n",
+        encoding="utf-8",
+    )
+    copied_input.write_bytes(original_input.read_bytes())
+    decoy_input.write_text("id,value\n99,999\n", encoding="utf-8")
+    monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
+
+    with pytest.raises(ValueError, match="source path must match declared input fixture"):
+        render_settings(case, tmp_path / "runtime")
+
+
 def test_generic_run_case_assertions_accept_future_case_shape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

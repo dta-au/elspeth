@@ -77,7 +77,6 @@ def render_settings(case: HarnessCaseSpec, tmp_path: Path) -> RenderedScenario:
     input_path = resolve_fixture_path(case.input_fixture)
     output_path = tmp_path / "output.jsonl"
     fault_marker = tmp_path / "fault-triggered.marker"
-    input_bytes = input_path.read_bytes()
     rendered = Template(fixture_template).substitute(
         input_csv=json.dumps(str(input_path)),
         output_jsonl=json.dumps(str(output_path)),
@@ -85,8 +84,22 @@ def render_settings(case: HarnessCaseSpec, tmp_path: Path) -> RenderedScenario:
     )
     if "${" in rendered:
         raise ValueError(f"Unresolved DAG scenario template variable in {fixture_path}")
+    settings = load_settings_from_yaml_string(rendered)
+    source_paths = {
+        source_name: Path(source.options["path"]).resolve() for source_name, source in settings.sources.items() if "path" in source.options
+    }
+    if not source_paths:
+        raise ValueError(f"DAG scenario fixture must configure a source path for declared input fixture: {fixture_path}")
+    mismatched_sources = {name: path for name, path in source_paths.items() if path != input_path}
+    if mismatched_sources:
+        raise ValueError(
+            "DAG scenario source path must match declared input fixture "
+            f"{input_path}: {', '.join(f'{name}={path}' for name, path in mismatched_sources.items())}"
+        )
+
+    input_bytes = input_path.read_bytes()
     return RenderedScenario(
-        settings=load_settings_from_yaml_string(rendered),
+        settings=settings,
         settings_yaml=rendered,
         settings_sha256=hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
         fixture_sha256=hashlib.sha256(fixture_bytes + b"\0" + input_bytes).hexdigest(),
