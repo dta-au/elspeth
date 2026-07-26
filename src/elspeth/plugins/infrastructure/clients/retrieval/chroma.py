@@ -29,7 +29,10 @@ from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.enums import CallStatus, CallType
 from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
-from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionConfig
+from elspeth.plugins.infrastructure.clients.retrieval.connection import (
+    ChromaConnectionConfig,
+    _validated_chroma_http_client_args,
+)
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 
 if TYPE_CHECKING:
@@ -133,9 +136,11 @@ class ChromaSearchProvider:
             # host is guaranteed non-None by validate_mode_requirements
             assert config.host is not None
             self._client = chromadb.HttpClient(
-                host=config.host,
-                port=config.port,
-                ssl=config.ssl,
+                **_validated_chroma_http_client_args(
+                    config.host,
+                    config.port,
+                    ssl=config.ssl,
+                )
             )
 
         # Retrieval providers must NOT create collections — that's a sink/indexing

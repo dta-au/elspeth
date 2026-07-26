@@ -7,7 +7,6 @@ document with ChromaDB's default embedding function.
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import math
 import urllib.parse
 from collections.abc import Callable, Mapping
@@ -52,7 +51,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
     ChromaConnectionConfig,
-    _validate_chroma_http_target,
+    _validated_chroma_http_client_args,
 )
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -196,7 +195,7 @@ class ChromaSink(BaseSink):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c2cdec52a5ba4970"
+    source_file_hash: str | None = "sha256:fdc3e5a9884ef30b"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -273,22 +272,12 @@ class ChromaSink(BaseSink):
                 raise FrameworkBugError(
                     "ChromaSinkConfig.host is None in 'client' mode — ChromaConnectionConfig validation should have rejected this"
                 )
-            safe_target = _validate_chroma_http_target(self._config.host, self._config.port, ssl=self._config.ssl)
-            if self._config.ssl:
-                try:
-                    ipaddress.ip_address(safe_target.sni_hostname)
-                except ValueError as exc:
-                    raise ValueError(
-                        "ChromaDB TLS hostname targets are blocked because chromadb.HttpClient "
-                        "cannot use a validated IP while preserving TLS SNI; configure a literal IP "
-                        "with a matching certificate IP SAN, or use persistent mode"
-                    ) from exc
-            sdk_host = f"[{safe_target.resolved_ip}]" if ":" in safe_target.resolved_ip else safe_target.resolved_ip
             self._client = chromadb.HttpClient(
-                host=sdk_host,
-                port=self._config.port,
-                ssl=self._config.ssl,
-                headers={"Host": safe_target.host_header},
+                **_validated_chroma_http_client_args(
+                    self._config.host,
+                    self._config.port,
+                    ssl=self._config.ssl,
+                )
             )
             self._client.heartbeat()
 

@@ -202,7 +202,10 @@ class TestChromaSinkOnStart:
         )
 
         with (
-            patch("elspeth.plugins.sinks.chroma_sink._validate_chroma_http_target", return_value=safe_target),
+            patch(
+                "elspeth.plugins.infrastructure.clients.retrieval.connection.validate_url_for_ssrf",
+                return_value=safe_target,
+            ),
             patch("elspeth.plugins.sinks.chroma_sink.chromadb") as mock_chromadb,
         ):
             mock_client = _make_chroma_client_double()
@@ -240,7 +243,10 @@ class TestChromaSinkOnStart:
         )
 
         with (
-            patch("elspeth.plugins.sinks.chroma_sink._validate_chroma_http_target", return_value=safe_target),
+            patch(
+                "elspeth.plugins.infrastructure.clients.retrieval.connection.validate_url_for_ssrf",
+                return_value=safe_target,
+            ),
             patch("elspeth.plugins.sinks.chroma_sink.chromadb") as mock_chromadb,
         ):
             with pytest.raises(ValueError, match=r"TLS SNI.*literal IP"):
