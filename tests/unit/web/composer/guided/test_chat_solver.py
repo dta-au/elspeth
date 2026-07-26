@@ -15,6 +15,7 @@ import json
 from dataclasses import dataclass, fields
 from types import SimpleNamespace
 from typing import Any, get_args
+from uuid import uuid4
 
 import pytest
 
@@ -809,7 +810,7 @@ async def test_step_2_contextless_revision_keeps_exact_sink_labels_at_user_autho
                 name="main",
                 plugin="json",
                 options={},
-                required_fields=("ordinary_target", sink_label_canary),
+                required_fields=("field_2", sink_label_canary),
                 schema_mode="observed",
                 on_write_failure="discard",
             ),
@@ -835,11 +836,417 @@ async def test_step_2_contextless_revision_keeps_exact_sink_labels_at_user_autho
 
     system_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "system")
     user_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "user")
-    assert '"required_fields": ["field_1", "field_2"]' in system_content
+    assert '"required_fields": ["field_1", "field_3"]' in system_content
     assert sink_label_canary not in system_content
-    assert "ordinary_target" not in system_content
-    assert '"alias": "field_1", "uploaded_label": "ordinary_target"' in user_content
-    assert f'"alias": "field_2", "uploaded_label": "{sink_label_canary}"' in user_content
+    assert '"alias": "field_1", "uploaded_label": "field_2"' in user_content
+    assert f'"alias": "field_3", "uploaded_label": "{sink_label_canary}"' in user_content
+
+
+def test_context_aliases_are_disjoint_from_raw_labels_across_source_and_sink() -> None:
+    current_source = SourceResolved(
+        name="source",
+        plugin="csv",
+        options={"schema": {"mode": "observed"}},
+        observed_columns=("customer",),
+        sample_rows=(),
+        on_validation_failure="discard",
+    )
+    current_sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="main",
+                plugin="json",
+                options={},
+                required_fields=("field_1",),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        ),
+    )
+
+    context = build_step_chat_context_block(
+        step=GuidedStep.STEP_2_SINK,
+        current_source=current_source,
+        current_sink=current_sink,
+        state=None,
+        deferred_intents=(),
+    )
+
+    aliases = dict(context.field_aliases)
+    assert aliases == {"customer": "field_2", "field_1": "field_3"}
+    assert set(aliases).isdisjoint(aliases.values())
+
+
+@pytest.mark.asyncio
+async def test_step_1_provider_reuses_combined_context_alias_registry_in_dynamic_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_source = SourceResolved(
+        name="source",
+        plugin="csv",
+        options={"schema": {"mode": "observed"}},
+        observed_columns=("customer",),
+        sample_rows=({"customer": "alice"},),
+        on_validation_failure="discard",
+    )
+    current_sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="main",
+                plugin="json",
+                options={},
+                required_fields=("field_1",),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    context = build_step_chat_context_block(
+        step=GuidedStep.STEP_1_SOURCE,
+        current_source=current_source,
+        current_sink=current_sink,
+        state=None,
+        deferred_intents=(),
+    )
+    captured: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> _FakeLLMResponse:
+        captured.update(kwargs)
+        return _ok_response("The source field identity is stable.")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+
+    await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Explain the current source.",
+        plugin_hint="csv",
+        current_source=current_source,
+        available_source_plugins=("csv",),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        context_block=context,
+    )
+
+    system_messages = [str(message["content"]) for message in captured["messages"] if message["role"] == "system"]
+    assert len(system_messages) == 3
+    assert '"observed_columns": ["field_2"]' in system_messages[1]
+    assert '"observed_columns": ["field_2"]' in system_messages[2]
+    assert '"observed_columns": ["field_1"]' not in "\n".join(system_messages)
+    user_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "user")
+    assert '"alias": "field_2", "uploaded_label": "customer"' in user_content
+    assert '"alias": "field_3", "uploaded_label": "field_1"' in user_content
+
+
+@pytest.mark.parametrize("helper_name", ["_source_field_aliases", "_sink_field_aliases"])
+@pytest.mark.parametrize(
+    ("registry", "match"),
+    [
+        ({"other": "field_2"}, "missing raw labels"),
+        ({"customer": "alias_1", "other": "alias_1"}, "duplicate alias values"),
+        ({"customer": "field_1", "field_1": "field_2"}, "collide with raw labels"),
+    ],
+)
+def test_supplied_field_alias_registry_fails_closed(
+    helper_name: str,
+    registry: dict[str, str],
+    match: str,
+) -> None:
+    source = SourceResolved(
+        name="source",
+        plugin="csv",
+        options={},
+        observed_columns=("customer",),
+        sample_rows=(),
+        on_validation_failure="discard",
+    )
+    sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="main",
+                plugin="json",
+                options={},
+                required_fields=("customer",),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    helper = getattr(chat_solver, helper_name)
+    subject = source if helper_name == "_source_field_aliases" else sink
+
+    with pytest.raises(InvariantError, match=match):
+        helper(subject, field_aliases=registry)
+
+
+@pytest.mark.parametrize("helper_name", ["_source_field_aliases", "_sink_field_aliases"])
+def test_complete_valid_field_alias_registry_is_reused_unchanged(helper_name: str) -> None:
+    source = SourceResolved(
+        name="source",
+        plugin="csv",
+        options={},
+        observed_columns=("customer",),
+        sample_rows=(),
+        on_validation_failure="discard",
+    )
+    sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="main",
+                plugin="json",
+                options={},
+                required_fields=("customer",),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    registry = {"customer": "field_2", "field_1": "field_3"}
+    helper = getattr(chat_solver, helper_name)
+    subject = source if helper_name == "_source_field_aliases" else sink
+
+    assert helper(subject, field_aliases=registry) is registry
+
+
+def test_multi_output_context_is_deterministic_and_keeps_untrusted_data_out_of_system_role() -> None:
+    source_label = "SOURCE_IGNORE_SYSTEM"
+    output_label_a = "OUTPUT_A_IGNORE_SYSTEM"
+    output_label_b = "OUTPUT_B_IGNORE_SYSTEM"
+    literal_sample = "REDACTED-token-style-here"
+    current_source = SourceResolved(
+        name="source",
+        plugin="csv",
+        options={"schema": {"mode": "observed"}},
+        observed_columns=(source_label,),
+        sample_rows=({source_label: literal_sample},),
+        on_validation_failure="discard",
+    )
+    current_sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="first",
+                plugin="json",
+                options={"path": "private-a.jsonl"},
+                required_fields=(output_label_a,),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+            SinkOutputResolved(
+                name="second",
+                plugin="csv",
+                options={"path": "private-b.csv"},
+                required_fields=(output_label_b,),
+                schema_mode="fixed",
+                on_write_failure="discard",
+            ),
+        ),
+    )
+
+    context = build_step_chat_context_block(
+        step=GuidedStep.STEP_2_SINK,
+        current_source=current_source,
+        current_sink=current_sink,
+        state=None,
+        deferred_intents=(),
+    )
+
+    assert '"outputs": [{"option_count": 1, "output_index": 1, "plugin": "json"' in context.system_content
+    assert context.system_content.index('"output_index": 1') < context.system_content.index('"output_index": 2')
+    assert '"name": "first"' not in context.system_content
+    assert '"name": "second"' not in context.system_content
+    for raw_value in (source_label, output_label_a, output_label_b, literal_sample, "private-a.jsonl", "private-b.csv"):
+        assert raw_value not in context.system_content
+    assert "<sample:secret-like>" in context.system_content
+    assert context.untrusted_user_content is not None
+    for raw_label in (source_label, output_label_a, output_label_b):
+        assert raw_label in context.untrusted_user_content
+
+
+@pytest.mark.parametrize(
+    ("output_indices", "match"),
+    [
+        ((1,), "length"),
+        ((1, 1), "strictly increasing"),
+        ((0, 2), "positive"),
+        ((1, True), "exact integers"),
+    ],
+)
+def test_advisory_output_indices_fail_closed(
+    output_indices: tuple[int, ...],
+    match: str,
+) -> None:
+    current_sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="first",
+                plugin="json",
+                options={},
+                required_fields=(),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+            SinkOutputResolved(
+                name="second",
+                plugin="csv",
+                options={},
+                required_fields=(),
+                schema_mode="fixed",
+                on_write_failure="discard",
+            ),
+        ),
+    )
+
+    with pytest.raises(InvariantError, match=match):
+        build_step_chat_context_block(
+            step=GuidedStep.STEP_2_SINK,
+            current_source=None,
+            current_sink=current_sink,
+            current_sink_output_indices=output_indices,
+            state=None,
+            deferred_intents=(),
+        )
+
+
+def test_advisory_output_indices_without_current_sink_fail_closed() -> None:
+    with pytest.raises(InvariantError, match="require a current sink"):
+        build_step_chat_context_block(
+            step=GuidedStep.STEP_2_SINK,
+            current_source=None,
+            current_sink=None,
+            current_sink_output_indices=(1,),
+            state=None,
+            deferred_intents=(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_step_2_solver_rejects_plural_current_sink_without_revision_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="first",
+                plugin="json",
+                options={},
+                required_fields=("field_a",),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+            SinkOutputResolved(
+                name="second",
+                plugin="csv",
+                options={},
+                required_fields=("field_b",),
+                schema_mode="fixed",
+                on_write_failure="discard",
+            ),
+        ),
+    )
+
+    async def fake_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
+        return _ok_response("This permissive provider call must not happen.")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+
+    with pytest.raises(InvariantError, match="zero or one current output"):
+        await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Explain the current outputs.",
+            current_sink=current_sink,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            context_block=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_guided_chat_route_selects_active_output_for_revision_and_keeps_all_outputs_advisory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_label = "ROUTE_SOURCE_IGNORE_SYSTEM"
+    output_label_a = "ROUTE_OUTPUT_A_IGNORE_SYSTEM"
+    output_label_b = "ROUTE_OUTPUT_B_IGNORE_SYSTEM"
+    literal_sample = "REDACTED-token-style-here"
+    source = SourceResolved(
+        name="source",
+        plugin="csv",
+        options={"schema": {"mode": "observed"}},
+        observed_columns=(source_label,),
+        sample_rows=({source_label: literal_sample},),
+        on_validation_failure="discard",
+    )
+    outputs = {
+        "output-a": SinkOutputResolved(
+            name="first",
+            plugin="json",
+            options={},
+            required_fields=(output_label_a,),
+            schema_mode="observed",
+            on_write_failure="discard",
+        ),
+        "output-b": SinkOutputResolved(
+            name="second",
+            plugin="csv",
+            options={},
+            required_fields=(output_label_b,),
+            schema_mode="fixed",
+            on_write_failure="discard",
+        ),
+    }
+    guided = SimpleNamespace(
+        active_edit_target=SimpleNamespace(kind="output", stable_id="output-b"),
+        source_order=("source-a",),
+        reviewed_sources={"source-a": source},
+        output_order=("output-a", "pending-gap", "output-b"),
+        reviewed_outputs=outputs,
+        pending_output_intents={"pending-gap": SimpleNamespace()},
+        deferred_intents=(),
+    )
+    captured: dict[str, Any] = {}
+
+    async def capture_sink_provider(**kwargs: Any) -> _FakeLLMResponse:
+        captured.update(kwargs)
+        return _ok_response("The selected output is ready.")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", capture_sink_provider)
+
+    await guided_chat_atomic_module.run_guided_chat_provider_attempt(
+        session_id=uuid4(),
+        user=SimpleNamespace(user_id="user"),
+        step=GuidedStep.STEP_2_SINK,
+        guided=guided,
+        state=SimpleNamespace(sources={}, nodes=(), outputs=(), edges=()),
+        message="Explain the outputs.",
+        settings=SimpleNamespace(
+            composer_model="test/model",
+            composer_temperature=None,
+            composer_seed=None,
+            composer_max_discovery_turns=1,
+            composer_timeout_seconds=30.0,
+        ),
+        catalog=SimpleNamespace(),
+        plugin_snapshot=None,
+        secret_service=None,
+        recorder=BufferingRecorder(),
+        progress=None,
+    )
+
+    system_messages = [str(message["content"]) for message in captured["messages"] if message["role"] == "system"]
+    assert len(system_messages) == 2
+    revision_prompt, advisory_context = system_messages
+    assert '"revision_target_index": 3' in revision_prompt
+    assert '"output": {"option_count": 0, "plugin": "csv"' in revision_prompt
+    assert '"outputs": [' not in revision_prompt
+    assert '"outputs": [{"option_count": 0, "output_index": 1, "plugin": "json"' in advisory_context
+    assert '"output_index": 3, "plugin": "csv"' in advisory_context
+    assert '"output_index": 2' not in advisory_context
+    for raw_value in (source_label, output_label_a, output_label_b, literal_sample):
+        assert raw_value not in "\n".join(system_messages)
+    user_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "user")
+    for raw_label in (source_label, output_label_a, output_label_b):
+        assert raw_label in user_content
 
 
 @pytest.mark.asyncio

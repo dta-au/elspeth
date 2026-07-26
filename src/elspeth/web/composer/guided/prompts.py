@@ -161,18 +161,36 @@ def _summarize_sample_row(
 
     Field names are Tier-3 uploaded data just like field values.  Use caller-
     supplied aliases when several source projections must share stable names;
-    otherwise assign deterministic row-local aliases.  A missing caller alias
-    is filled with a fresh opaque name, never the raw mapping key.
+    otherwise assign deterministic row-local aliases disjoint from every raw
+    row label. A label missing from a supplied registry is omitted rather than
+    exposed or assigned an inconsistent fallback alias.
     """
-    aliases = dict(field_aliases or {})
-    next_alias = len(aliases) + 1
+    aliases: Mapping[str, str]
+    if field_aliases is None:
+        labels = tuple(str(key) for key in row)
+        reserved_labels = set(labels)
+        local_aliases: dict[str, str] = {}
+        used_aliases: set[str] = set()
+        next_index = 1
+        for label in labels:
+            if label in local_aliases:
+                continue
+            candidate = f"field_{next_index}"
+            while candidate in reserved_labels or candidate in used_aliases:
+                next_index += 1
+                candidate = f"field_{next_index}"
+            local_aliases[label] = candidate
+            used_aliases.add(candidate)
+            next_index += 1
+        aliases = local_aliases
+    else:
+        aliases = field_aliases
+
     projection: dict[str, str] = {}
     for key, value in row.items():
         label = str(key)
         alias = aliases.get(label)
         if alias is None:
-            alias = f"field_{next_alias}"
-            aliases[label] = alias
-            next_alias += 1
+            continue
         projection[alias] = _summarize_sample_value(value)
     return projection

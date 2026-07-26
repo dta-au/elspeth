@@ -156,6 +156,25 @@ def _current_sink(guided: Any) -> SinkResolved | None:
     return SinkResolved(outputs=outputs) if outputs else None
 
 
+def _current_sink_output_indices(guided: Any) -> tuple[int, ...] | None:
+    output_indices = tuple(index for index, item in enumerate(guided.output_order, start=1) if item in guided.reviewed_outputs)
+    return output_indices or None
+
+
+def _current_sink_revision_target(guided: Any) -> tuple[SinkResolved | None, int | None]:
+    """Select the active output while preserving its user-visible review index."""
+    target = guided.active_edit_target
+    if target is None or target.kind != "output":
+        return None, None
+    if target.stable_id not in guided.reviewed_outputs:
+        raise InvariantError("active output edit target is not present in reviewed outputs")
+    try:
+        target_index = tuple(guided.output_order).index(target.stable_id) + 1
+    except ValueError as exc:
+        raise InvariantError("active output edit target is not present in output order") from exc
+    return SinkResolved(outputs=(guided.reviewed_outputs[target.stable_id],)), target_index
+
+
 async def run_guided_chat_provider_attempt(
     *,
     session_id: UUID,
@@ -177,10 +196,12 @@ async def run_guided_chat_provider_attempt(
 
     source = _current_source(guided)
     sink = _current_sink(guided)
+    sink_output_indices = _current_sink_output_indices(guided)
     context_block = build_step_chat_context_block(
         step=step,
         current_source=source,
         current_sink=sink,
+        current_sink_output_indices=sink_output_indices,
         state=state,
         deferred_intents=guided.deferred_intents,
     )
@@ -217,13 +238,14 @@ async def run_guided_chat_provider_attempt(
             return source_outcome
 
     elif step is GuidedStep.STEP_2_SINK:
+        revision_sink, revision_target_index = _current_sink_revision_target(guided)
         sink_outcome = await resolve_step_2_sink_chat_with_auto_drop(
             site="post_guided_chat",
             session_id=str(session_id),
             user_id=user.user_id,
             model=settings.composer_model,
             user_message=message,
-            current_sink=sink,
+            current_sink=revision_sink,
             temperature=settings.composer_temperature,
             seed=settings.composer_seed,
             recorder=recorder,
@@ -235,6 +257,7 @@ async def run_guided_chat_provider_attempt(
             timeout_seconds=settings.composer_timeout_seconds,
             context_block=context_block,
             progress=progress,
+            revision_target_index=revision_target_index,
         )
         if not isinstance(sink_outcome, GuidedStepChatEmptyResult):
             return sink_outcome

@@ -585,6 +585,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
     progress: ComposerProgressSink | None = None,
+    revision_target_index: int | None = None,
 ) -> Step2SinkChatResult:
     """Wrap Step-2 ``resolve_sink`` chat with the guided-chat fallback contract.
 
@@ -616,6 +617,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
             timeout_seconds=timeout_seconds,
             context_block=context_block,
             progress=progress,
+            revision_target_index=revision_target_index,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         if type(outcome) is Step2SinkResolvedOutcome:
