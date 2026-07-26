@@ -78,6 +78,11 @@ B3_RUNTIME_CASES = (
     ("sink-write-pending-redrive", "write-once"),
 )
 
+B3_RECOVERY_CASES = (
+    ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
+    ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
+)
+
 B2_COALESCE_POSITIVE_CASES = tuple(
     ("fork-coalesce-policies", case_id)
     for case_id in (
@@ -1975,6 +1980,30 @@ def test_exact_runtime_projection_linear_matches_declared_durable_and_export(
     assert evidence.audit.source_operation_count == case.expected.source_operation_count
 
 
+def test_b3_recovery_cases_are_registered_as_closed_recovery_workflows() -> None:
+    observed = tuple(
+        (scenario.id, case.id, case.recovery_kind)
+        for scenario, case in iter_harness_cases(MANIFEST)
+        if (scenario.id, case.id) in B3_RECOVERY_CASES
+    )
+
+    assert observed == (
+        ("aggregation-immutable-batch", "resume-after-eof-flush-fault", "eof_aggregation"),
+        (
+            "row-expansion-parent-child-recovery",
+            "resume-after-child-enqueue",
+            "expansion_child_enqueue",
+        ),
+    )
+    expansion_reference = next(
+        reference
+        for reference in MANIFEST.evidence
+        if reference.id == "harness-row-expansion-parent-child-recovery-resume-after-child-enqueue"
+    )
+    assert "observed-schema" in expansion_reference.claim
+    assert "P1 elspeth-0b0eaa63df" in expansion_reference.claim
+
+
 @pytest.mark.parametrize(("scenario", "case"), RECOVERY_CASES)
 def test_declared_recovery_case_reopens_and_resumes_publicly(
     scenario: ScenarioSpec,
@@ -1988,6 +2017,40 @@ def test_declared_recovery_case_reopens_and_resumes_publicly(
     _assert_declared_recovery_evidence(scenario, case, evidence)
 
 
+@pytest.mark.parametrize(("scenario_id", "case_id"), B3_RECOVERY_CASES)
+def test_b3_recovery_rebuilds_fresh_settings_plugins_graph_and_config(
+    scenario_id: str,
+    case_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case(scenario_id, case_id)
+    monkeypatch.setattr(Orchestrator, "run", inspect.unwrap(Orchestrator.run))
+    monkeypatch.setattr(Orchestrator, "resume", inspect.unwrap(Orchestrator.resume))
+    install_corpus_plugin_manager(monkeypatch)
+    built_objects: list[Any] = []
+    production_build = corpus_harness.build_scenario
+
+    def record_fresh_build(*args: Any, **kwargs: Any) -> Any:
+        built = production_build(*args, **kwargs)
+        built_objects.append(built)
+        return built
+
+    monkeypatch.setattr(corpus_harness, "build_scenario", record_fresh_build)
+
+    evidence = corpus_harness.run_scenario_case(scenario, case, tmp_path)
+
+    _assert_declared_recovery_evidence(scenario, case, evidence)
+    assert len(built_objects) == 2
+    initial, fresh = built_objects
+    assert initial is not fresh
+    assert initial.rendered is not fresh.rendered
+    assert initial.rendered.settings is not fresh.rendered.settings
+    assert initial.bundle is not fresh.bundle
+    assert initial.graph is not fresh.graph
+    assert initial.config is not fresh.config
+
+
 def test_checkpoint_reopen_resume_has_exact_restart_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1999,6 +2062,8 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         if declared_case.workflow == "recovery"
     ) == (
         ("parallel-coalesces", "resume-after-left-finalize"),
+        ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
+        ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
 
@@ -2037,6 +2102,61 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         {"value": 60, "count": 3}
     ]
     assert (tmp_path / "fault-triggered.marker").is_file()
+
+
+def test_eof_aggregation_recovery_preserves_failed_batch_and_member_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("aggregation-immutable-batch", "resume-after-eof-flush-fault")
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    recovery = evidence.recovery.aggregation_eof
+    assert recovery is not None
+    assert recovery.original_batch_id_before == recovery.original_batch_id_after
+    assert recovery.recovery_batch_id_after != recovery.original_batch_id_after
+    assert recovery.member_token_ids_before == recovery.member_token_ids_after
+    assert tuple((batch.attempt, batch.status) for batch in recovery.final_batches) == (
+        (0, "failed"),
+        (1, "completed"),
+    )
+    assert tuple(tuple(member.token_key for member in batch.members) for batch in recovery.final_batches) == (
+        ("primary:0#0", "primary:1#0", "primary:2#0"),
+        ("primary:0#0", "primary:1#0", "primary:2#0"),
+    )
+    assert evidence.runtime.rows_processed == 3
+    assert evidence.runtime.rows_succeeded == 1
+    assert evidence.audit.source_operation_count == 1
+
+
+def test_expansion_recovery_preserves_parent_child_group_and_scheduler_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("row-expansion-parent-child-recovery", "resume-after-child-enqueue")
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    recovery = evidence.recovery.expansion_child_enqueue
+    assert recovery is not None
+    assert recovery.parent_token_ids_before == recovery.parent_token_ids_after
+    assert recovery.child_token_ids_before == recovery.child_token_ids_after
+    assert recovery.expand_group_ids_before == recovery.expand_group_ids_after
+    assert recovery.scheduler_work_ids_before == recovery.scheduler_work_ids_after
+    assert recovery.parent_scheduler_work_ids_before == recovery.parent_scheduler_work_ids_after
+    assert recovery.child_scheduler_work_ids_before == recovery.child_scheduler_work_ids_after
+    assert len(recovery.parent_scheduler_work_ids_before) == 3
+    assert len(recovery.child_scheduler_work_ids_before) == 6
+    assert set(recovery.parent_scheduler_work_ids_before).isdisjoint(recovery.child_scheduler_work_ids_before)
+    assert tuple(len(expansion.children) for expansion in recovery.final_expansions) == (2, 1, 3)
+    assert recovery.pending_children_before == 6
+    assert evidence.runtime.rows_processed == 3
+    assert evidence.runtime.rows_succeeded == 6
+    assert evidence.runtime.output_rows == 6
+    assert evidence.audit.source_operation_count == 1
 
 
 def test_parallel_coalesces_recovery_reuses_finalized_first_sink(

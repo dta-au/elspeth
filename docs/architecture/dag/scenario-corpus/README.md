@@ -65,11 +65,13 @@ sink-effect audit material pins publication and inspect/reconcile/commit
 attempts. This lets the B3 cases prove exact runtime and portable-audit parity
 without broadening terminal semantics or inferring omitted material.
 
-The current B3 runtime set is deliberately bounded: EOF immutable aggregation,
-JSON parent/child expansion, retry success, source quarantine, transform
-discard, transform error routing, and one ordinary write-once sink. These are
-runtime/audit cases only. They do not promote recovery, concurrency, or scale;
-those dimensions remain owned by their named manifest gaps.
+The current B3 set is deliberately bounded: EOF immutable aggregation, JSON
+parent/child expansion, retry success, source quarantine, transform discard,
+transform error routing, and one ordinary write-once sink. The ordinary cases
+provide runtime/audit evidence. Two dedicated fresh-object cases also provide
+recovery evidence at the EOF aggregation and expansion child-handoff seams;
+they do not promote concurrency or scale, whose gaps remain independently
+owned in the manifest.
 The disposition scenario also keeps runtime and audit partial until the
 authoritative scheduler-disposition and follower-drain work tracked by
 `elspeth-2e66723070` and `elspeth-6f6bbbec00` is integrated; the local exact
@@ -80,8 +82,18 @@ harness cannot silently apply one topology's restart assertions to another.
 The `parallel_sink_finalization` evidence records exact before/after sink
 effect, artifact, and attempt identities while fixing `held_barrier_proven` to
 false: terminal-arm asymmetry is useful partial evidence, not proof that one
-parallel coalesce barrier remained held. Pre-platform recovery evidence must
-be rerun after the deferred-platform rebase before it is accepted forward.
+parallel coalesce barrier remained held. The `eof_aggregation` case injects one
+fail-once fault before an EOF transform result, then proves that public resume
+retains the original failed batch, creates one distinct completed retry batch,
+and reuses the same ordered three-member token set. The
+`expansion_child_enqueue` case faults after the source is durably exhausted and
+all children are enqueued but before sink flush, then proves exact 3-parent,
+6-child, 3-group, and 9-work-item identity across public resume. That case uses
+the supported observed-schema JSON source contract; fixed-schema `any` resume
+reconstruction remains separately owned by P1 `elspeth-0b0eaa63df`. Both cases
+also require terminal token/work state, checkpoint removal, no source replay,
+canonical outputs, and exact durable/export parity. Their evidence remains
+provisional until it is rerun after the deferred-platform rebase.
 
 The manifest does not replace the criteria, and a dated assessment does not
 replace the live manifest. Documentary evidence can explain a cell, but only

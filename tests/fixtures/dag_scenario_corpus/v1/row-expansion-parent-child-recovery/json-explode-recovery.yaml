@@ -1,0 +1,27 @@
+sources:
+  primary:
+    plugin: json
+    on_success: source_out
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: observed}
+transforms:
+  - name: explode_items
+    plugin: json_explode
+    input: source_out
+    on_success: output
+    on_error: discard
+    options:
+      array_field: items
+      output_field: item
+      include_index: true
+      schema: {mode: observed}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_output}
+      format: jsonl
+      schema: {mode: observed}

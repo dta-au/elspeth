@@ -460,11 +460,21 @@ evidence:
     locator: aggregation-immutable-batch:eof-immutable-membership
     claim: EOF aggregation produces one exact immutable three-member batch, one aggregate result, exact BUFFERED history and terminal dispositions, and matching durable and portable audit projections.
     stages: [config, build, runtime, audit]
+  - id: harness-aggregation-immutable-batch-resume-after-eof-flush-fault
+    kind: harness
+    locator: aggregation-immutable-batch:resume-after-eof-flush-fault
+    claim: A fresh-object public resume after the honest first EOF-flush fault preserves the original failed batch identity and reuses its exact immutable ordered three-member token set in one distinct completed retry attempt, does not replay the exhausted source, emits one {count:3,value:60} result, reaches terminal scheduler and token state, removes the checkpoint, and preserves durable/export parity; this pre-platform evidence is provisional until the deferred-platform rebase.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-row-expansion-parent-child-recovery-json-explode-parent-child
     kind: harness
     locator: row-expansion-parent-child-recovery:json-explode-parent-child
     claim: JSON expansion produces six exact children from three parents with stable group identity, parent ordinals, terminal outcomes, output, and matching durable and portable audit projections.
     stages: [config, build, runtime, audit]
+  - id: harness-row-expansion-parent-child-recovery-resume-after-child-enqueue
+    kind: harness
+    locator: row-expansion-parent-child-recovery:resume-after-child-enqueue
+    claim: Using the supported observed-schema JSON source contract, a fresh-object public resume after source exhaustion and before sink flush preserves the exact three parents, six children, 2/1/3 expansion groups, and nine scheduler identities, does not replay the source or duplicate enqueue, emits one exact six-row artifact, removes the checkpoint, and preserves durable/export parity; fixed-any schema reconstruction remains separately owned by P1 elspeth-0b0eaa63df, and this pre-platform evidence is provisional until the deferred-platform rebase.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-retry-quarantine-discard-routed-errors-retry-then-success
     kind: harness
     locator: retry-quarantine-discard-routed-errors:retry-then-success
@@ -3652,6 +3662,19 @@ scenarios:
     ordinal: 9
     title: Aggregation, batch closure, and immutable membership
     cases:
+      - id: resume-after-eof-flush-fault
+        workflow: recovery
+        recovery_kind: eof_aggregation
+        fixture: aggregation-immutable-batch/resume-after-eof-flush-fault.yaml
+        input_fixtures:
+          primary: aggregation-immutable-batch/input.csv
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 1
+          required_audit_record_types: [batch, batch_member, run, sink_effect]
       - id: eof-immutable-membership
         workflow: run
         fixture: aggregation-immutable-batch/eof-immutable-membership.yaml
@@ -3673,15 +3696,13 @@ scenarios:
         status: pass
         evidence: [harness-aggregation-immutable-batch-eof-immutable-membership, b3-stateful-runtime-exact-contracts]
       recovery:
-        status: partial
+        status: pass
         evidence:
           - cardinality-identity
           - runtime-disposition-drains-04
           - focused-crash-restart-03
           - focused-crash-restart-04
-        reason: Selected restart seams pass, but the complete scenario recovery path is not executable evidence.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
+          - harness-aggregation-immutable-batch-resume-after-eof-flush-fault
       concurrency:
         status: unknown
         evidence: [cardinality-identity-08]
@@ -3697,6 +3718,19 @@ scenarios:
     ordinal: 10
     title: Row expansion with parent/child identity and recovery
     cases:
+      - id: resume-after-child-enqueue
+        workflow: recovery
+        recovery_kind: expansion_child_enqueue
+        fixture: row-expansion-parent-child-recovery/json-explode-recovery.yaml
+        input_fixtures:
+          primary: row-expansion-parent-child-recovery/input.json
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 6
+          required_audit_record_types: [run, sink_effect, token, token_outcome, token_parent]
       - id: json-explode-parent-child
         workflow: run
         fixture: row-expansion-parent-child-recovery/json-explode-parent-child.yaml
@@ -3746,12 +3780,9 @@ scenarios:
           - cardinality-identity-11
           - harness-row-expansion-parent-child-recovery-json-explode-parent-child
           - b3-stateful-runtime-exact-contracts
-      recovery: &expansion_recovery_partial
-        status: partial
-        evidence: [cardinality-identity-07]
-        reason: Durable per-child payload evidence exists and the reproduced expansion bypass is closed, but the child-enqueue-before-parent-disposition process-death seam remains unexecuted.
-        owner_issue: elspeth-7cdc4da434
-        exit_gate: The expansion corpus recovery case passes child-enqueue interruption with stable child identities and deterministic parent reconciliation.
+      recovery:
+        status: pass
+        evidence: [harness-row-expansion-parent-child-recovery-resume-after-child-enqueue]
       concurrency: &expansion_concurrency_partial
         status: partial
         evidence: [cardinality-identity-10]

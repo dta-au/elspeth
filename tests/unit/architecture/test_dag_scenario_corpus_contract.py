@@ -7,7 +7,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 from string import Template
-from typing import cast, get_args
+from typing import Any, cast, get_args
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -39,6 +39,7 @@ from tests.fixtures.dag_scenario_corpus.plugins import (
 from tests.fixtures.dag_scenario_corpus.schema import (
     EXPECTED_DIMENSIONS,
     EXPECTED_SCENARIOS,
+    AggregationEOFRecoveryEvidence,
     AuditEvidence,
     AuditRecordCount,
     BuildExpectation,
@@ -48,6 +49,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     EvidenceCell,
     EvidenceKind,
     EvidenceReference,
+    ExpansionChildEnqueueRecoveryEvidence,
     GraphEvidence,
     GraphNodeTypeCount,
     HarnessCaseSpec,
@@ -209,7 +211,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
+        "pass",
         "unknown",
         "pass",
         "fail",
@@ -222,7 +224,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
+        "pass",
         "partial",
         "pass",
         "fail",
@@ -394,8 +396,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "fc8821a8c92c517ab5a520745c13237fb3fad194f99f440016643b82647cfd57"
-EXPECTED_CASE_REGISTRY_SHA256 = "1c11627573be66296294b278ac0df8e300cf57244e3b80e747a4ef20587cf337"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0cffbd3220ba386eeae6c4160e88df85c307c8273bc43d03dac9d480cfe6165d"
+EXPECTED_CASE_REGISTRY_SHA256 = "40650ec12586e549d7432dd6fef995ad9ed57af8592466b6acb850d8a6b1c04d"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -450,7 +452,9 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "parallel-coalesces:two-parallel-require-all": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
     "parallel-coalesces:resume-after-left-finalize": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
     "aggregation-immutable-batch:eof-immutable-membership": "0a6a82b9fbe15356ccf0437bf34b72e3324b6884b8990752c05943e0179fb9cb",
+    "aggregation-immutable-batch:resume-after-eof-flush-fault": "c72db99d6e9394db19beaa46770fbdd67ef86ae5b0364bf83094b01bd33945d8",
     "row-expansion-parent-child-recovery:json-explode-parent-child": "bf40f9a9fd913518566c36bd27a0530d6edaed40dde67b69642eabacc48716ed",
+    "row-expansion-parent-child-recovery:resume-after-child-enqueue": "ebd85363be5af5e19acaa2af087ef5dddc10693fe7ac0674ff960d2d4f94a8e6",
     "retry-quarantine-discard-routed-errors:retry-then-success": "add6f84b856bf06915c6275a005bfb4aef5ad50068f7c93038b6b7d99970ab90",
     "retry-quarantine-discard-routed-errors:source-quarantine-routed": "286d04abef045d70a846b65bfc348792ff6242aff237451f30050565d8e5e639",
     "retry-quarantine-discard-routed-errors:transform-discard": "fb4d0c91d4612e6dcb0d9903f097db8b3e50310386811ddaee15d1749de23948",
@@ -524,9 +528,19 @@ EXPECTED_HARNESS_EVIDENCE = (
         ("config", "build", "runtime", "audit"),
     ),
     (
+        "harness-aggregation-immutable-batch-resume-after-eof-flush-fault",
+        "aggregation-immutable-batch:resume-after-eof-flush-fault",
+        ("config", "build", "runtime", "audit", "recovery"),
+    ),
+    (
         "harness-row-expansion-parent-child-recovery-json-explode-parent-child",
         "row-expansion-parent-child-recovery:json-explode-parent-child",
         ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-row-expansion-parent-child-recovery-resume-after-child-enqueue",
+        "row-expansion-parent-child-recovery:resume-after-child-enqueue",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
     *(
         (
@@ -1404,6 +1418,102 @@ def _valid_sink_finalization_recovery() -> ParallelSinkFinalizationRecoveryEvide
     )
 
 
+def _valid_aggregation_eof_recovery() -> AggregationEOFRecoveryEvidence:
+    members = tuple({"ordinal": ordinal, "token_key": f"primary:{ordinal}#0"} for ordinal in range(3))
+    return AggregationEOFRecoveryEvidence(
+        fault_seam="eof_flush_before_transform_result",
+        fault_count=1,
+        source_exhausted_before=True,
+        original_batch_id_before="batch-original",
+        original_batch_id_after="batch-original",
+        recovery_batch_id_after="batch-retry",
+        member_token_ids_before=("token-0", "token-1", "token-2"),
+        member_token_ids_after=("token-0", "token-1", "token-2"),
+        original_batch_identity_preserved=True,
+        member_identity_reused=True,
+        membership_unchanged=True,
+        result_token_absent_before=True,
+        sink_effect_absent_before=True,
+        final_batches=(
+            {
+                "key": "aggregation:eof_sum@stable|0",
+                "aggregation_node_key": "aggregation:eof_sum@stable",
+                "attempt": 0,
+                "status": "failed",
+                "trigger_type": "end_of_source",
+                "trigger_reason": "source_exhausted",
+                "members": members,
+            },
+            {
+                "key": "aggregation:eof_sum@stable|1",
+                "aggregation_node_key": "aggregation:eof_sum@stable",
+                "attempt": 1,
+                "status": "completed",
+                "trigger_type": "end_of_source",
+                "trigger_reason": "source_exhausted",
+                "members": members,
+            },
+        ),
+        final_output_rows=1,
+        final_output_json='{"count":3,"value":60}',
+        durable_export_parity=True,
+        provisional_until_deferred_platform_rebase=True,
+    )
+
+
+def _valid_expansion_child_enqueue_recovery() -> ExpansionChildEnqueueRecoveryEvidence:
+    parent_token_ids = ("parent-0", "parent-1", "parent-2")
+    child_token_ids = tuple(f"child-{ordinal}" for ordinal in range(6))
+    parent_work_ids = ("parent-work-0", "parent-work-1", "parent-work-2")
+    child_work_ids = tuple(f"child-work-{ordinal}" for ordinal in range(6))
+    scheduler_work_ids = (*parent_work_ids, *child_work_ids)
+    child_counts = (2, 1, 3)
+    child_offset = 0
+    expansions: list[dict[str, object]] = []
+    for parent_ordinal, child_count in enumerate(child_counts):
+        children = tuple(
+            {"ordinal": child_ordinal, "token_key": f"primary:{parent_ordinal}#{child_ordinal + 1}"} for child_ordinal in range(child_count)
+        )
+        expansions.append(
+            {
+                "key": f"expand|primary:{parent_ordinal}#0",
+                "parent_token_key": f"primary:{parent_ordinal}#0",
+                "expected_child_count": child_count,
+                "children": children,
+            }
+        )
+        child_offset += child_count
+    assert child_offset == len(child_token_ids)
+    return ExpansionChildEnqueueRecoveryEvidence(
+        fault_seam="after_source_exhausted_before_sink_flush",
+        fault_count=1,
+        source_exhausted_before=True,
+        parent_token_ids_before=parent_token_ids,
+        parent_token_ids_after=parent_token_ids,
+        child_token_ids_before=child_token_ids,
+        child_token_ids_after=child_token_ids,
+        expand_group_ids_before=("group-0", "group-1", "group-2"),
+        expand_group_ids_after=("group-0", "group-1", "group-2"),
+        scheduler_work_ids_before=scheduler_work_ids,
+        scheduler_work_ids_after=scheduler_work_ids,
+        parent_scheduler_work_ids_before=parent_work_ids,
+        parent_scheduler_work_ids_after=parent_work_ids,
+        child_scheduler_work_ids_before=child_work_ids,
+        child_scheduler_work_ids_after=child_work_ids,
+        parent_identity_unchanged=True,
+        child_identity_unchanged=True,
+        group_identity_unchanged=True,
+        scheduler_identity_unchanged=True,
+        pending_children_before=6,
+        sink_effect_absent_before=True,
+        artifact_absent_before=True,
+        final_expansions=tuple(expansions),
+        final_output_rows=6,
+        durable_export_parity=True,
+        provisional_until_deferred_platform_rebase=True,
+    )
+
+
 def _exact_runtime_projection_values() -> dict[str, object]:
     return {
         "rows": (
@@ -1594,6 +1704,66 @@ def test_b3_stable_projection_rejects_batch_and_expansion_cross_reference_drift(
 
     with pytest.raises(ValidationError, match="intermediate outcomes must reference projected batches"):
         corpus_schema.StableRunProjection.model_validate(values)
+
+
+def test_b3_scheduler_event_ordering_accepts_one_exact_reentered_status_chain() -> None:
+    events: list[dict[str, Any]] = [
+        {"event_type": "mark_pending_sink_terminal", "from_status": "leased", "to_status": "terminal"},
+        {"event_type": "claim_pending_sink", "from_status": "pending_sink", "to_status": "leased"},
+        {"event_type": "enqueue", "from_status": None, "to_status": "ready"},
+        {"event_type": "mark_pending_sink", "from_status": "leased", "to_status": "pending_sink"},
+        {"event_type": "claim_ready", "from_status": "ready", "to_status": "leased"},
+    ]
+
+    ordered = corpus_harness._ordered_scheduler_events(events, work_key="primary:0#2")
+
+    assert tuple(event["event_type"] for event in ordered) == (
+        "enqueue",
+        "claim_ready",
+        "mark_pending_sink",
+        "claim_pending_sink",
+        "mark_pending_sink_terminal",
+    )
+
+
+def test_b3_scheduler_event_ordering_rejects_two_complete_chains() -> None:
+    events: list[dict[str, Any]] = [
+        {"event_type": "enqueue", "from_status": None, "to_status": "ready"},
+        {"event_type": "claim_ready:first", "from_status": "ready", "to_status": "leased"},
+        {"event_type": "recover", "from_status": "leased", "to_status": "ready"},
+        {"event_type": "claim_ready:second", "from_status": "ready", "to_status": "leased"},
+        {"event_type": "terminal", "from_status": "leased", "to_status": "terminal"},
+    ]
+
+    with pytest.raises(AssertionError, match="exactly one complete transition chain"):
+        corpus_harness._ordered_scheduler_events(events, work_key="ambiguous")
+
+
+def test_b3_scheduler_event_ordering_rejects_an_unconsumed_stray_event() -> None:
+    events: list[dict[str, Any]] = [
+        {"event_type": "enqueue", "from_status": None, "to_status": "ready"},
+        {"event_type": "terminal", "from_status": "ready", "to_status": "terminal"},
+        {"event_type": "stray", "from_status": "blocked", "to_status": "terminal"},
+    ]
+
+    with pytest.raises(AssertionError, match="exactly one complete transition chain"):
+        corpus_harness._ordered_scheduler_events(events, work_key="stray")
+
+
+def test_b3_expansion_work_partition_rejects_swapped_parent_child_statuses() -> None:
+    work_items = (
+        ("work-parent", "parent", "pending_sink"),
+        ("work-child", "child", "terminal"),
+    )
+
+    with pytest.raises(AssertionError, match="exact parent/child scheduler status partition"):
+        corpus_harness._partition_expansion_work(
+            work_items,
+            parent_token_ids=("parent",),
+            child_token_ids=("child",),
+            parent_status="terminal",
+            child_status="pending_sink",
+        )
 
 
 def test_b3_exact_counter_projection_counts_every_immutable_batch_member_row() -> None:
@@ -2987,7 +3157,11 @@ def test_closed_vocabularies_are_exact() -> None:
     assert get_args(EvidenceKind) == ("harness", "pytest", "document", "decision")
     assert get_args(Stage) == ("config", "build", "runtime", "audit", "recovery")
     assert get_args(Workflow) == ("run", "recovery", "build")
-    assert get_args(RecoveryKind) == ("eof_aggregation", "parallel_sink_finalization")
+    assert get_args(RecoveryKind) == (
+        "eof_aggregation",
+        "expansion_child_enqueue",
+        "parallel_sink_finalization",
+    )
 
 
 def test_build_expectation_is_dedicated_immutable_and_exact() -> None:
@@ -3516,16 +3690,230 @@ def test_parallel_sink_finalization_recovery_rejects_identity_drift(
         ParallelSinkFinalizationRecoveryEvidence.model_validate(values)
 
 
-def test_unattempted_recovery_forbids_sink_finalization_proof() -> None:
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("original_batch_id_after", "batch-drift", "preserve the original failed batch identity"),
+        ("recovery_batch_id_after", "batch-original", "distinct retry batch attempt"),
+        ("member_token_ids_after", ("token-0", "token-2", "token-1"), "preserve immutable ordered batch membership"),
+        ("membership_unchanged", False, "Input should be True"),
+    ),
+)
+def test_eof_aggregation_recovery_rejects_identity_and_flag_drift(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    values = _valid_aggregation_eof_recovery().model_dump(mode="json")
+    values[field] = value
+
+    with pytest.raises(ValidationError, match=message):
+        AggregationEOFRecoveryEvidence.model_validate(values)
+
+
+def test_eof_aggregation_recovery_rejects_duplicate_raw_member_ids() -> None:
+    values = _valid_aggregation_eof_recovery().model_dump(mode="json")
+    values["member_token_ids_before"] = ("token-0", "token-0", "token-2")
+    values["member_token_ids_after"] = ("token-0", "token-0", "token-2")
+
+    with pytest.raises(ValidationError, match="exactly three unique batch members"):
+        AggregationEOFRecoveryEvidence.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("wrong-attempt", "failed-attempt then completed-retry"),
+        ("missing-member", "exact three-member membership"),
+        ("stable-member-drift", "reuse exact stable member identity and order"),
+        ("invalid-ordinal", "ordinals must be dense from zero"),
+    ),
+)
+def test_eof_aggregation_recovery_rejects_invalid_final_batch_evidence(mutation: str, message: str) -> None:
+    values = _valid_aggregation_eof_recovery().model_dump(mode="json")
+    batches = cast(list[dict[str, object]], values["final_batches"])
+    if mutation == "wrong-attempt":
+        batches[1]["attempt"] = 2
+    elif mutation == "missing-member":
+        batches[1]["members"] = cast(list[object], batches[1]["members"])[:2]
+    elif mutation == "stable-member-drift":
+        members = cast(list[dict[str, object]], batches[1]["members"])
+        members[2]["token_key"] = "primary:99#0"
+    else:
+        members = cast(list[dict[str, object]], batches[1]["members"])
+        members[0]["ordinal"] = 1
+
+    with pytest.raises(ValidationError, match=message):
+        AggregationEOFRecoveryEvidence.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "parent_token_ids",
+        "child_token_ids",
+        "expand_group_ids",
+        "scheduler_work_ids",
+        "parent_scheduler_work_ids",
+        "child_scheduler_work_ids",
+    ),
+)
+def test_expansion_recovery_rejects_pre_post_identity_drift(field: str) -> None:
+    values = _valid_expansion_child_enqueue_recovery().model_dump(mode="json")
+    after_field = f"{field}_after"
+    after = cast(list[str], values[after_field])
+    after[-1] = f"{after[-1]}-drift"
+
+    with pytest.raises(ValidationError, match=r"must preserve .* identities"):
+        ExpansionChildEnqueueRecoveryEvidence.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "parent_token_ids",
+        "child_token_ids",
+        "expand_group_ids",
+        "scheduler_work_ids",
+        "parent_scheduler_work_ids",
+        "child_scheduler_work_ids",
+    ),
+)
+def test_expansion_recovery_rejects_duplicate_identities(field: str) -> None:
+    values = _valid_expansion_child_enqueue_recovery().model_dump(mode="json")
+    before_field = f"{field}_before"
+    after_field = f"{field}_after"
+    duplicated = cast(list[str], values[before_field])
+    duplicated[-1] = duplicated[0]
+    values[after_field] = duplicated
+
+    with pytest.raises(ValidationError, match=r"requires unique .* identities"):
+        ExpansionChildEnqueueRecoveryEvidence.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing-parent", "exactly 3 parents, 6 children, and 3 groups"),
+        ("missing-scheduler", "exactly nine stable scheduler work identities"),
+        ("token-overlap", "parent and child token identities must be disjoint"),
+        ("wrong-work-cardinality", "exactly 3 parent and 6 child scheduler identities"),
+        ("wrong-work-partition", "exactly partition parent and child work"),
+        ("wrong-group-shape", "exact 2/1/3 child groups"),
+        ("invalid-child-ordinal", "ordinals must be dense from zero"),
+        ("false-identity-flag", "Input should be True"),
+    ),
+)
+def test_expansion_recovery_rejects_inexact_partition_cardinality_and_shape(mutation: str, message: str) -> None:
+    values = _valid_expansion_child_enqueue_recovery().model_dump(mode="json")
+    if mutation == "missing-parent":
+        values["parent_token_ids_before"] = cast(list[str], values["parent_token_ids_before"])[:2]
+        values["parent_token_ids_after"] = cast(list[str], values["parent_token_ids_after"])[:2]
+    elif mutation == "missing-scheduler":
+        values["scheduler_work_ids_before"] = cast(list[str], values["scheduler_work_ids_before"])[:-1]
+        values["scheduler_work_ids_after"] = cast(list[str], values["scheduler_work_ids_after"])[:-1]
+    elif mutation == "token-overlap":
+        child_ids = cast(list[str], values["child_token_ids_before"])
+        child_ids[0] = cast(list[str], values["parent_token_ids_before"])[0]
+        values["child_token_ids_after"] = child_ids
+    elif mutation == "wrong-work-cardinality":
+        parent_work = cast(list[str], values["parent_scheduler_work_ids_before"])
+        child_work = cast(list[str], values["child_scheduler_work_ids_before"])
+        values["parent_scheduler_work_ids_before"] = parent_work[:2]
+        values["parent_scheduler_work_ids_after"] = parent_work[:2]
+        values["child_scheduler_work_ids_before"] = [parent_work[2], *child_work]
+        values["child_scheduler_work_ids_after"] = [parent_work[2], *child_work]
+    elif mutation == "wrong-work-partition":
+        child_work = cast(list[str], values["child_scheduler_work_ids_before"])
+        child_work[0] = cast(list[str], values["parent_scheduler_work_ids_before"])[0]
+        values["child_scheduler_work_ids_after"] = child_work
+    elif mutation == "wrong-group-shape":
+        expansions = cast(list[dict[str, object]], values["final_expansions"])
+        expansions[0], expansions[1] = expansions[1], expansions[0]
+    elif mutation == "invalid-child-ordinal":
+        expansions = cast(list[dict[str, object]], values["final_expansions"])
+        children = cast(list[dict[str, object]], expansions[0]["children"])
+        children[0]["ordinal"] = 1
+    else:
+        values["scheduler_identity_unchanged"] = False
+
+    with pytest.raises(ValidationError, match=message):
+        ExpansionChildEnqueueRecoveryEvidence.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "seams",
+    (
+        ("sink_finalization", "aggregation_eof"),
+        ("sink_finalization", "expansion_child_enqueue"),
+        ("aggregation_eof", "expansion_child_enqueue"),
+        ("sink_finalization", "aggregation_eof", "expansion_child_enqueue"),
+    ),
+)
+def test_recovery_evidence_rejects_multiple_seam_specific_proofs(seams: tuple[str, ...]) -> None:
+    proofs = {
+        "sink_finalization": _valid_sink_finalization_recovery(),
+        "aggregation_eof": _valid_aggregation_eof_recovery(),
+        "expansion_child_enqueue": _valid_expansion_child_enqueue_recovery(),
+    }
+    values = _valid_recovery().model_dump(mode="json")
+    for seam in seams:
+        values[seam] = proofs[seam].model_dump(mode="json")
+
+    with pytest.raises(ValidationError, match="at most one seam-specific proof"):
+        RecoveryEvidence.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("seam", "proof"),
+    (
+        ("sink_finalization", _valid_sink_finalization_recovery()),
+        ("aggregation_eof", _valid_aggregation_eof_recovery()),
+        ("expansion_child_enqueue", _valid_expansion_child_enqueue_recovery()),
+    ),
+)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("database_reopened", False),
+        ("can_resume", False),
+        ("source_replayed", True),
+        ("checkpoint_removed", False),
+    ),
+)
+def test_seam_specific_recovery_rejects_contradictory_public_resume_flags(
+    seam: str,
+    proof: BaseModel,
+    field: str,
+    value: bool,
+) -> None:
+    values = _valid_recovery().model_dump(mode="json")
+    values[seam] = proof.model_dump(mode="json")
+    values[field] = value
+
+    with pytest.raises(ValidationError, match="requires successful fresh public resume flags"):
+        RecoveryEvidence.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("field", "proof"),
+    (
+        ("sink_finalization", _valid_sink_finalization_recovery()),
+        ("aggregation_eof", _valid_aggregation_eof_recovery()),
+        ("expansion_child_enqueue", _valid_expansion_child_enqueue_recovery()),
+    ),
+)
+def test_unattempted_recovery_forbids_seam_specific_proof(field: str, proof: BaseModel) -> None:
+    values: dict[str, object] = {
+        "attempted": False,
+        "database_reopened": False,
+        "can_resume": False,
+        "source_replayed": False,
+        "checkpoint_removed": False,
+        field: proof.model_dump(mode="json"),
+    }
     with pytest.raises(ValidationError, match="unattempted"):
-        RecoveryEvidence(
-            attempted=False,
-            database_reopened=False,
-            can_resume=False,
-            source_replayed=False,
-            checkpoint_removed=False,
-            sink_finalization=_valid_sink_finalization_recovery(),
-        )
+        RecoveryEvidence.model_validate(values)
 
 
 def test_scenario_run_evidence_accepts_the_complete_observed_shape() -> None:
@@ -3669,7 +4057,9 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
         ("parallel-coalesces", "resume-after-left-finalize"),
+        ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("aggregation-immutable-batch", "eof-immutable-membership"),
+        ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
         ("row-expansion-parent-child-recovery", "json-explode-parent-child"),
         ("retry-quarantine-discard-routed-errors", "retry-then-success"),
         ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
@@ -3690,11 +4080,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 96
+    assert len(manifest.evidence) == 98
     assert len(assessment_evidence) == 59
-    assert len(harness_evidence) == 36
-    assert len({reference.id for reference in manifest.evidence}) == 96
-    assert len({reference.locator for reference in manifest.evidence}) == 96
+    assert len(harness_evidence) == 38
+    assert len({reference.id for reference in manifest.evidence}) == 98
+    assert len({reference.locator for reference in manifest.evidence}) == 98
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -3717,7 +4107,9 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
         ("parallel-coalesces", "resume-after-left-finalize"),
+        ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("aggregation-immutable-batch", "eof-immutable-membership"),
+        ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
         ("row-expansion-parent-child-recovery", "json-explode-parent-child"),
         ("retry-quarantine-discard-routed-errors", "retry-then-success"),
         ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
@@ -3805,10 +4197,12 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("aggregation-immutable-batch", "runtime"),
             ("aggregation-immutable-batch", "audit"),
         ),
+        "harness-aggregation-immutable-batch-resume-after-eof-flush-fault": (("aggregation-immutable-batch", "recovery"),),
         "harness-row-expansion-parent-child-recovery-json-explode-parent-child": (
             ("row-expansion-parent-child-recovery", "runtime"),
             ("row-expansion-parent-child-recovery", "audit"),
         ),
+        "harness-row-expansion-parent-child-recovery-resume-after-child-enqueue": (("row-expansion-parent-child-recovery", "recovery"),),
         **{
             f"harness-retry-quarantine-discard-routed-errors-{case_id}": (
                 ("retry-quarantine-discard-routed-errors", "runtime"),
@@ -4276,12 +4670,12 @@ def test_row_expansion_delta_is_backed_by_repaired_cross_backend_evidence() -> N
             "harness-row-expansion-parent-child-recovery-json-explode-parent-child",
             "b3-stateful-runtime-exact-contracts",
         ),
-        "recovery": ("cardinality-identity-07",),
+        "recovery": ("harness-row-expansion-parent-child-recovery-resume-after-child-enqueue",),
         "concurrency": ("cardinality-identity-10",),
     }
-    assert scenario.dimensions["recovery"].status == "partial"
-    assert scenario.dimensions["recovery"].owner_issue == "elspeth-7cdc4da434"
-    assert scenario.dimensions["recovery"].evidence == ("cardinality-identity-07",)
+    assert scenario.dimensions["recovery"].status == "pass"
+    assert scenario.dimensions["recovery"].owner_issue is None
+    assert scenario.dimensions["recovery"].evidence == ("harness-row-expansion-parent-child-recovery-resume-after-child-enqueue",)
     assert scenario.dimensions["concurrency"].status == "partial"
     for dimension in ("contracts", "runtime", "audit"):
         assert scenario.dimensions[dimension].status == "pass"

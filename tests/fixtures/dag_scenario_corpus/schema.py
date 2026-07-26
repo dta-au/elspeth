@@ -44,7 +44,7 @@ Dimension = Literal[
 EvidenceKind = Literal["harness", "pytest", "document", "decision"]
 Stage = Literal["config", "build", "runtime", "audit", "recovery"]
 Workflow = Literal["run", "recovery", "build"]
-RecoveryKind = Literal["eof_aggregation", "parallel_sink_finalization"]
+RecoveryKind = Literal["eof_aggregation", "expansion_child_enqueue", "parallel_sink_finalization"]
 GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "sink", "source", "transform"]
 
 EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
@@ -1457,6 +1457,111 @@ class ParallelSinkFinalizationRecoveryEvidence(ClosedModel):
         return self
 
 
+class AggregationEOFRecoveryEvidence(ClosedModel):
+    """Exact immutable-batch identity across an EOF-flush public resume."""
+
+    fault_seam: Literal["eof_flush_before_transform_result"]
+    fault_count: Literal[1]
+    source_exhausted_before: Literal[True]
+    original_batch_id_before: NonEmpty
+    original_batch_id_after: NonEmpty
+    recovery_batch_id_after: NonEmpty
+    member_token_ids_before: tuple[NonEmpty, ...]
+    member_token_ids_after: tuple[NonEmpty, ...]
+    original_batch_identity_preserved: Literal[True]
+    member_identity_reused: Literal[True]
+    membership_unchanged: Literal[True]
+    result_token_absent_before: Literal[True]
+    sink_effect_absent_before: Literal[True]
+    final_batches: tuple[StableBatchProjection, ...]
+    final_output_rows: Literal[1]
+    final_output_json: Literal['{"count":3,"value":60}']
+    durable_export_parity: Literal[True]
+    provisional_until_deferred_platform_rebase: Literal[True]
+
+    @model_validator(mode="after")
+    def _validate_identity_reuse(self) -> Self:
+        if self.original_batch_id_before != self.original_batch_id_after:
+            raise ValueError("EOF aggregation recovery must preserve the original failed batch identity")
+        if self.recovery_batch_id_after == self.original_batch_id_after:
+            raise ValueError("EOF aggregation recovery must record a distinct retry batch attempt")
+        if self.member_token_ids_before != self.member_token_ids_after:
+            raise ValueError("EOF aggregation recovery must preserve immutable ordered batch membership")
+        if len(self.member_token_ids_after) != 3 or len(set(self.member_token_ids_after)) != 3:
+            raise ValueError("EOF aggregation recovery requires exactly three unique batch members")
+        if tuple((batch.attempt, batch.status) for batch in self.final_batches) != ((0, "failed"), (1, "completed")):
+            raise ValueError("EOF aggregation recovery requires exact failed-attempt then completed-retry batches")
+        if any(len(batch.members) != 3 for batch in self.final_batches):
+            raise ValueError("EOF aggregation recovery requires exact three-member membership on both attempts")
+        final_member_keys = tuple(tuple(member.token_key for member in batch.members) for batch in self.final_batches)
+        if final_member_keys[0] != final_member_keys[1]:
+            raise ValueError("EOF aggregation recovery retry batches must reuse exact stable member identity and order")
+        return self
+
+
+class ExpansionChildEnqueueRecoveryEvidence(ClosedModel):
+    """Exact expansion identity after durable child handoff and public resume."""
+
+    fault_seam: Literal["after_source_exhausted_before_sink_flush"]
+    fault_count: Literal[1]
+    source_exhausted_before: Literal[True]
+    parent_token_ids_before: tuple[NonEmpty, ...]
+    parent_token_ids_after: tuple[NonEmpty, ...]
+    child_token_ids_before: tuple[NonEmpty, ...]
+    child_token_ids_after: tuple[NonEmpty, ...]
+    expand_group_ids_before: tuple[NonEmpty, ...]
+    expand_group_ids_after: tuple[NonEmpty, ...]
+    scheduler_work_ids_before: tuple[NonEmpty, ...]
+    scheduler_work_ids_after: tuple[NonEmpty, ...]
+    parent_scheduler_work_ids_before: tuple[NonEmpty, ...]
+    parent_scheduler_work_ids_after: tuple[NonEmpty, ...]
+    child_scheduler_work_ids_before: tuple[NonEmpty, ...]
+    child_scheduler_work_ids_after: tuple[NonEmpty, ...]
+    parent_identity_unchanged: Literal[True]
+    child_identity_unchanged: Literal[True]
+    group_identity_unchanged: Literal[True]
+    scheduler_identity_unchanged: Literal[True]
+    pending_children_before: Literal[6]
+    sink_effect_absent_before: Literal[True]
+    artifact_absent_before: Literal[True]
+    final_expansions: tuple[StableExpansionProjection, ...]
+    final_output_rows: Literal[6]
+    durable_export_parity: Literal[True]
+    provisional_until_deferred_platform_rebase: Literal[True]
+
+    @model_validator(mode="after")
+    def _validate_identity_reuse(self) -> Self:
+        equality_checks = (
+            (self.parent_token_ids_before, self.parent_token_ids_after, "parent"),
+            (self.child_token_ids_before, self.child_token_ids_after, "child"),
+            (self.expand_group_ids_before, self.expand_group_ids_after, "group"),
+            (self.scheduler_work_ids_before, self.scheduler_work_ids_after, "scheduler"),
+            (self.parent_scheduler_work_ids_before, self.parent_scheduler_work_ids_after, "parent scheduler"),
+            (self.child_scheduler_work_ids_before, self.child_scheduler_work_ids_after, "child scheduler"),
+        )
+        for before, after, label in equality_checks:
+            if before != after:
+                raise ValueError(f"expansion recovery must preserve {label} identities")
+            if len(after) != len(set(after)):
+                raise ValueError(f"expansion recovery requires unique {label} identities")
+        if (len(self.parent_token_ids_after), len(self.child_token_ids_after), len(self.expand_group_ids_after)) != (3, 6, 3):
+            raise ValueError("expansion recovery requires exactly 3 parents, 6 children, and 3 groups")
+        if len(self.scheduler_work_ids_after) != 9:
+            raise ValueError("expansion recovery requires exactly nine stable scheduler work identities")
+        if set(self.parent_token_ids_after) & set(self.child_token_ids_after):
+            raise ValueError("expansion recovery parent and child token identities must be disjoint")
+        if (len(self.parent_scheduler_work_ids_after), len(self.child_scheduler_work_ids_after)) != (3, 6):
+            raise ValueError("expansion recovery requires exactly 3 parent and 6 child scheduler identities")
+        if set(self.parent_scheduler_work_ids_after) & set(self.child_scheduler_work_ids_after) or set(
+            self.parent_scheduler_work_ids_after
+        ) | set(self.child_scheduler_work_ids_after) != set(self.scheduler_work_ids_after):
+            raise ValueError("expansion recovery scheduler identities must exactly partition parent and child work")
+        child_counts = tuple(expansion.expected_child_count for expansion in self.final_expansions)
+        if child_counts != (2, 1, 3):
+            raise ValueError("expansion recovery requires exact 2/1/3 child groups")
+        return self
+
+
 class RecoveryEvidence(ClosedModel):
     attempted: StrictBool
     database_reopened: StrictBool
@@ -1469,9 +1574,20 @@ class RecoveryEvidence(ClosedModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    aggregation_eof: AggregationEOFRecoveryEvidence | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    expansion_child_enqueue: ExpansionChildEnqueueRecoveryEvidence | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_recovery_shape(self) -> Self:
+        seam_proofs = (self.sink_finalization, self.aggregation_eof, self.expansion_child_enqueue)
+        if sum(proof is not None for proof in seam_proofs) > 1:
+            raise ValueError("recovery evidence permits at most one seam-specific proof")
         if self.attempted:
             if self.checkpoint_id is None or self.checkpoint_sequence is None:
                 raise ValueError("attempted recovery requires checkpoint identity")
@@ -1483,8 +1599,14 @@ class RecoveryEvidence(ClosedModel):
             or self.source_replayed
             or self.checkpoint_removed
             or self.sink_finalization is not None
+            or self.aggregation_eof is not None
+            or self.expansion_child_enqueue is not None
         ):
             raise ValueError("unattempted recovery forbids checkpoint identity and true result flags")
+        if any(proof is not None for proof in seam_proofs) and not (
+            self.database_reopened and self.can_resume and not self.source_replayed and self.checkpoint_removed
+        ):
+            raise ValueError("seam-specific recovery proof requires successful fresh public resume flags")
         return self
 
 

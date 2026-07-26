@@ -36,13 +36,17 @@ from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter, RecorderFactory
 from elspeth.core.landscape.export_read_model import open_export_read_transaction
+from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
 from elspeth.core.landscape.schema import (
     artifacts_table,
+    batch_members_table,
+    batches_table,
     node_states_table,
     rows_table,
     sink_effect_attempts_table,
     sink_effect_members_table,
     sink_effects_table,
+    token_outcomes_table,
     token_parents_table,
     token_work_items_table,
     tokens_table,
@@ -66,9 +70,11 @@ from elspeth.plugins.infrastructure.runtime_factory import PluginBundle, instant
 from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog_snapshot_id
 from tests.fixtures.dag_scenario_corpus.loader import resolve_fixture_path
 from tests.fixtures.dag_scenario_corpus.schema import (
+    AggregationEOFRecoveryEvidence,
     AuditEvidence,
     AuditRecordCount,
     ConfigEvidence,
+    ExpansionChildEnqueueRecoveryEvidence,
     GraphEvidence,
     GraphNodeType,
     GraphNodeTypeCount,
@@ -977,17 +983,7 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
         if len(items) != 1:
             raise AssertionError(f"DAG corpus scheduler work lacks a stable ordering for {token_key!r} at {node_key!r}")
         _work_item_id, unordered_events = items[0]
-        ordered_events: list[dict[str, Any]] = []
-        remaining = list(unordered_events)
-        current_status: object = None
-        while remaining:
-            candidates = [event for event in remaining if event.get("from_status") == current_status]
-            if len(candidates) != 1:
-                raise AssertionError(f"DAG corpus scheduler events do not form one stable transition chain for {token_key!r}")
-            event = candidates[0]
-            ordered_events.append(event)
-            remaining.remove(event)
-            current_status = event["to_status"]
+        ordered_events = _ordered_scheduler_events(unordered_events, work_key=token_key)
         scheduler_work.append(
             StableSchedulerWorkProjection(
                 key=f"{token_key}|{node_key}|0",
@@ -1229,6 +1225,47 @@ def semantic_runtime_projection_counts(projection: SemanticRuntimeProjection) ->
         validation_errors=len(projection.validation_errors),
         transform_errors=len(projection.transform_errors),
     )
+
+
+def _ordered_scheduler_events(
+    events: list[dict[str, Any]],
+    *,
+    work_key: str,
+) -> tuple[dict[str, Any], ...]:
+    """Recover exactly one complete scheduler transition chain.
+
+    Recovery may legitimately re-enter a status (for example, a sink work item
+    moves from ``leased`` to ``pending_sink`` and is later leased again).  A
+    greedy status lookup cannot distinguish the two outgoing ``leased`` events.
+    Search the small per-work-item event graph instead, accepting it only when
+    exactly one ordering consumes every event.
+    """
+
+    if not events:
+        raise AssertionError(f"DAG corpus scheduler events do not form exactly one complete transition chain for {work_key!r}")
+
+    complete_chains: list[tuple[int, ...]] = []
+
+    def search(current_status: object, remaining: tuple[int, ...], prefix: tuple[int, ...]) -> None:
+        if len(complete_chains) > 1:
+            return
+        if not remaining:
+            complete_chains.append(prefix)
+            return
+        for index in remaining:
+            event = events[index]
+            if event.get("from_status") != current_status:
+                continue
+            search(
+                event.get("to_status"),
+                tuple(candidate for candidate in remaining if candidate != index),
+                (*prefix, index),
+            )
+
+    search(None, tuple(range(len(events))), ())
+    if len(complete_chains) != 1:
+        raise AssertionError(f"DAG corpus scheduler events do not form exactly one complete transition chain for {work_key!r}")
+    return tuple(events[index] for index in complete_chains[0])
 
 
 def _record_index(
@@ -1936,6 +1973,190 @@ def _assert_terminal_recovery_state(
         raise AssertionError("DAG recovery corpus requires a completed resumed node-state attempt carrying the checkpoint marker")
 
 
+def _assert_all_tokens_and_work_terminal(
+    db: LandscapeDB,
+    *,
+    run_id: str,
+    payload_store: FilesystemPayloadStore,
+) -> None:
+    repositories = RecorderFactory.read_only(db, payload_store=payload_store)
+    run = repositories.run_lifecycle.get_run(run_id)
+    if run is None or run.status is not RunStatus.COMPLETED:
+        raise AssertionError(f"DAG recovery corpus did not persist a completed run: {run!r}")
+    source_records = repositories.run_lifecycle.get_run_source_lifecycle_records(run_id)
+    if not source_records or any(record.lifecycle_state != "exhausted" for record in source_records.values()):
+        raise AssertionError(f"DAG recovery corpus sources lost their exhausted state: {source_records!r}")
+    tokens = repositories.query.get_all_tokens_for_run(run_id)
+    outcomes = repositories.query.get_all_token_outcomes_for_run(run_id)
+    latest_outcomes = {outcome.token_id: outcome for outcome in outcomes}
+    token_ids = {token.token_id for token in tokens}
+    if (
+        not token_ids
+        or set(latest_outcomes) != token_ids
+        or not all(outcome.completed and outcome.outcome is not None for outcome in latest_outcomes.values())
+    ):
+        raise AssertionError(
+            "DAG recovery corpus requires every token's latest exported outcome to be terminal: "
+            f"tokens={sorted(token_ids)!r}, latest_outcomes={latest_outcomes!r}"
+        )
+    with db.connection() as conn:
+        work_statuses = tuple(
+            conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)).scalars()
+        )
+    if not work_statuses or set(work_statuses) != {"terminal"}:
+        raise AssertionError(f"DAG recovery corpus left non-terminal scheduler work: {work_statuses!r}")
+
+
+def _exact_recovery_views(
+    db: LandscapeDB,
+    *,
+    run_id: str,
+    payload_store: FilesystemPayloadStore,
+) -> tuple[StableRunProjection, AuditEvidence]:
+    durable_records = _public_durable_records(db, run_id=run_id, payload_store=payload_store)
+    _validate_durable_sink_effect_material(durable_records)
+    durable_projection = _stable_projection(durable_records, source="durable recovery")
+    portable_records = list(LandscapeExporter(db).export_run(run_id))
+    _validate_portable_material_matches_durable(durable_records, portable_records)
+    _validate_portable_manifest(portable_records)
+    portable_projection = _stable_projection(portable_records, source="portable recovery")
+    if durable_projection != portable_projection:
+        raise AssertionError("DAG recovery corpus public durable query and portable export projections differ")
+    return durable_projection, _audit_evidence(portable_records, portable_projection=portable_projection)
+
+
+def _aggregation_identity_snapshot(
+    db: LandscapeDB,
+    *,
+    run_id: str,
+) -> tuple[tuple[tuple[str, int, str, tuple[str, ...]], ...], int, int]:
+    with db.connection() as conn:
+        batch_rows = tuple(
+            conn.execute(
+                select(batches_table.c.batch_id, batches_table.c.attempt, batches_table.c.status)
+                .where(batches_table.c.run_id == run_id)
+                .order_by(batches_table.c.attempt)
+            ).mappings()
+        )
+        batches = tuple(
+            (
+                str(row["batch_id"]),
+                int(row["attempt"]),
+                str(row["status"]),
+                tuple(
+                    str(value)
+                    for value in conn.execute(
+                        select(batch_members_table.c.token_id)
+                        .where(batch_members_table.c.run_id == run_id)
+                        .where(batch_members_table.c.batch_id == row["batch_id"])
+                        .order_by(batch_members_table.c.ordinal)
+                    ).scalars()
+                ),
+            )
+            for row in batch_rows
+        )
+        token_count = len(conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id)).all())
+        effect_count = len(conn.execute(select(sink_effects_table.c.effect_id).where(sink_effects_table.c.run_id == run_id)).all())
+    return batches, token_count, effect_count
+
+
+def _expansion_identity_snapshot(
+    db: LandscapeDB,
+    *,
+    run_id: str,
+) -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[tuple[str, str, str], ...],
+    int,
+    int,
+]:
+    with db.connection() as conn:
+        parent_rows = tuple(
+            conn.execute(
+                select(token_outcomes_table.c.token_id, token_outcomes_table.c.expand_group_id)
+                .join(tokens_table, tokens_table.c.token_id == token_outcomes_table.c.token_id)
+                .join(rows_table, rows_table.c.row_id == tokens_table.c.row_id)
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.completed == 1)
+                .where(token_outcomes_table.c.path == "expand_parent")
+                .order_by(rows_table.c.ingest_sequence)
+            ).mappings()
+        )
+        parent_ids = tuple(str(row["token_id"]) for row in parent_rows)
+        group_ids = tuple(str(row["expand_group_id"]) for row in parent_rows)
+        child_ids: list[str] = []
+        for parent_id, group_id in zip(parent_ids, group_ids, strict=True):
+            child_ids.extend(
+                str(value)
+                for value in conn.execute(
+                    select(token_parents_table.c.token_id)
+                    .join(tokens_table, tokens_table.c.token_id == token_parents_table.c.token_id)
+                    .where(token_parents_table.c.run_id == run_id)
+                    .where(token_parents_table.c.parent_token_id == parent_id)
+                    .where(tokens_table.c.expand_group_id == group_id)
+                    .order_by(token_parents_table.c.ordinal)
+                ).scalars()
+            )
+        work_rows = tuple(
+            conn.execute(
+                select(
+                    token_work_items_table.c.work_item_id,
+                    token_work_items_table.c.token_id,
+                    token_work_items_table.c.status,
+                )
+                .where(token_work_items_table.c.run_id == run_id)
+                .order_by(token_work_items_table.c.work_item_id)
+            ).mappings()
+        )
+        effect_count = len(conn.execute(select(sink_effects_table.c.effect_id).where(sink_effects_table.c.run_id == run_id)).all())
+        artifact_count = len(conn.execute(select(artifacts_table.c.artifact_id).where(artifacts_table.c.run_id == run_id)).all())
+    return (
+        parent_ids,
+        tuple(child_ids),
+        group_ids,
+        tuple((str(row["work_item_id"]), str(row["token_id"]), str(row["status"])) for row in work_rows),
+        effect_count,
+        artifact_count,
+    )
+
+
+def _partition_expansion_work(
+    work_items: tuple[tuple[str, str, str], ...],
+    *,
+    parent_token_ids: tuple[str, ...],
+    child_token_ids: tuple[str, ...],
+    parent_status: str,
+    child_status: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Bind every expansion token to exactly one work identity and status."""
+
+    parent_set = set(parent_token_ids)
+    child_set = set(child_token_ids)
+    work_ids = tuple(work_id for work_id, _token_id, _status in work_items)
+    work_token_ids = tuple(token_id for _work_id, token_id, _status in work_items)
+    if (
+        len(parent_set) != len(parent_token_ids)
+        or len(child_set) != len(child_token_ids)
+        or parent_set & child_set
+        or len(work_ids) != len(set(work_ids))
+        or len(work_token_ids) != len(set(work_token_ids))
+        or set(work_token_ids) != parent_set | child_set
+    ):
+        raise AssertionError("expansion recovery corpus lacks an exact parent/child scheduler status partition")
+
+    by_token = {token_id: (work_id, status) for work_id, token_id, status in work_items}
+    if any(by_token[token_id][1] != parent_status for token_id in parent_token_ids) or any(
+        by_token[token_id][1] != child_status for token_id in child_token_ids
+    ):
+        raise AssertionError("expansion recovery corpus lacks an exact parent/child scheduler status partition")
+    return (
+        tuple(by_token[token_id][0] for token_id in parent_token_ids),
+        tuple(by_token[token_id][0] for token_id in child_token_ids),
+    )
+
+
 def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
     db_url = f"sqlite:///{tmp_path / 'audit.db'}"
     payload_root = tmp_path / "payloads"
@@ -1972,6 +2193,24 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
         checkpoint_id = checkpoint.checkpoint_id
         checkpoint_sequence = checkpoint.sequence_number
         checkpoint_topology_hash = checkpoint.upstream_topology_hash
+        batches_before, token_count_before, effect_count_before = _aggregation_identity_snapshot(
+            initial_db,
+            run_id=run_id,
+        )
+        if len(batches_before) != 1:
+            raise AssertionError(f"EOF aggregation recovery requires one failed pre-resume batch, got {batches_before!r}")
+        original_batch_id_before, batch_attempt_before, batch_status_before, member_token_ids_before = batches_before[0]
+        if (
+            batch_attempt_before,
+            batch_status_before,
+            len(member_token_ids_before),
+            token_count_before,
+            effect_count_before,
+        ) != (0, "failed", 3, 3, 0):
+            raise AssertionError(
+                "EOF aggregation recovery requires one failed attempt with three immutable members, no result token, "
+                f"and no sink effect before resume: batch={batches_before!r}, tokens={token_count_before}, effects={effect_count_before}"
+            )
     finally:
         initial_db.close()
 
@@ -1994,6 +2233,7 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
 
         fresh_rendered = render_settings(case, tmp_path)
         fresh_built = build_scenario(fresh_rendered, purpose=SinkEffectExecutionPurpose.RESUME)
+        fresh_checkpoint_config = RuntimeCheckpointConfig.from_settings(fresh_rendered.settings.checkpoint)
         if fresh_built.graph_evidence.topology_hash != checkpoint_topology_hash:
             raise AssertionError("DAG recovery corpus fresh graph does not match the persisted checkpoint topology")
         recovery = RecoveryManager(reopened_db, reopened_checkpoint_manager)
@@ -2009,7 +2249,7 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
         result = Orchestrator(
             reopened_db,
             checkpoint_manager=reopened_checkpoint_manager,
-            checkpoint_config=checkpoint_config,
+            checkpoint_config=fresh_checkpoint_config,
         ).resume(
             resume_point,
             fresh_built.config,
@@ -2023,10 +2263,42 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
         if output_rows != [{"value": 60, "count": 3}]:
             raise AssertionError(f"DAG recovery corpus emitted unexpected output: {output_rows!r}")
 
-        records = list(LandscapeExporter(reopened_db).export_run(run_id))
-        audit = _audit_evidence(records)
+        sink_outputs = _sink_outputs(fresh_rendered)
+        expected_sink_outputs = (SinkOutputProjection(sink_name="output", rows=('{"count":3,"value":60}',)),)
+        if sink_outputs != expected_sink_outputs:
+            raise AssertionError(f"EOF aggregation recovery emitted unexpected canonical sink output: {sink_outputs!r}")
+        durable_projection, audit = _exact_recovery_views(
+            reopened_db,
+            run_id=run_id,
+            payload_store=reopened_store,
+        )
         if audit.source_operation_count != 1:
             raise AssertionError(f"DAG recovery corpus replayed its source: source_load count={audit.source_operation_count}")
+        batches_after, token_count_after, effect_count_after = _aggregation_identity_snapshot(
+            reopened_db,
+            run_id=run_id,
+        )
+        if (token_count_after, effect_count_after) != (4, 1):
+            raise AssertionError(
+                "EOF aggregation recovery requires one reused aggregate result and one sink effect: "
+                f"tokens={token_count_after}, effects={effect_count_after}"
+            )
+        if len(batches_after) != 2:
+            raise AssertionError(f"EOF aggregation recovery requires failed and completed batch attempts: {batches_after!r}")
+        original_batch_id_after, original_attempt_after, original_status_after, original_members_after = batches_after[0]
+        recovery_batch_id_after, recovery_attempt_after, recovery_status_after, member_token_ids_after = batches_after[1]
+        if (
+            original_batch_id_after != original_batch_id_before
+            or original_members_after != member_token_ids_before
+            or member_token_ids_after != member_token_ids_before
+            or (original_attempt_after, original_status_after, recovery_attempt_after, recovery_status_after)
+            != (0, "failed", 1, "completed")
+            or recovery_batch_id_after == original_batch_id_after
+        ):
+            raise AssertionError("EOF aggregation recovery changed original identity, member identity, or retry-attempt semantics")
+        final_batches = tuple(sorted(durable_projection.batches, key=lambda batch: batch.attempt))
+        if len(final_batches) != 2:
+            raise AssertionError(f"EOF aggregation recovery projected unexpected batches: {durable_projection.batches!r}")
         aggregation_node_ids = tuple(str(node_id) for node_id in fresh_built.graph.get_aggregation_id_map().values())
         if len(aggregation_node_ids) != 1:
             raise AssertionError(f"DAG recovery corpus expected one aggregation node, got {aggregation_node_ids!r}")
@@ -2058,6 +2330,8 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
                 rows_succeeded=result_data["rows_succeeded"],
                 rows_failed=result_data["rows_failed"],
                 output_rows=len(output_rows),
+                sink_outputs=sink_outputs,
+                durable_projection=durable_projection,
             ),
             audit=audit,
             recovery=RecoveryEvidence(
@@ -2068,6 +2342,295 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
                 can_resume=True,
                 source_replayed=False,
                 checkpoint_removed=True,
+                aggregation_eof=AggregationEOFRecoveryEvidence(
+                    fault_seam="eof_flush_before_transform_result",
+                    fault_count=1,
+                    source_exhausted_before=True,
+                    original_batch_id_before=original_batch_id_before,
+                    original_batch_id_after=original_batch_id_after,
+                    recovery_batch_id_after=recovery_batch_id_after,
+                    member_token_ids_before=member_token_ids_before,
+                    member_token_ids_after=member_token_ids_after,
+                    original_batch_identity_preserved=True,
+                    member_identity_reused=True,
+                    membership_unchanged=True,
+                    result_token_absent_before=True,
+                    sink_effect_absent_before=True,
+                    final_batches=final_batches,
+                    final_output_rows=1,
+                    final_output_json='{"count":3,"value":60}',
+                    durable_export_parity=True,
+                    provisional_until_deferred_platform_rebase=True,
+                ),
+            ),
+            completed_stages=("config", "build", "runtime", "audit", "recovery"),
+        )
+    finally:
+        reopened_db.close()
+
+
+def _expansion_child_enqueue_recovery_case(
+    scenario: ScenarioSpec,
+    case: HarnessCaseSpec,
+    tmp_path: Path,
+) -> ScenarioRunEvidence:
+    db_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    payload_root = tmp_path / "payloads"
+    initial_rendered = render_settings(case, tmp_path)
+    initial_built = build_scenario(initial_rendered)
+    initial_store = FilesystemPayloadStore(payload_root)
+    initial_db = LandscapeDB(db_url)
+    initial_checkpoint_manager = CheckpointManager(initial_db)
+    checkpoint_config = RuntimeCheckpointConfig.from_settings(initial_rendered.settings.checkpoint)
+    record_run_source = RunLifecycleRepository.record_run_source
+    observed_faults: list[str] = []
+
+    def fail_after_source_exhausted(
+        repository: RunLifecycleRepository,
+        **kwargs: Any,
+    ) -> None:
+        record_run_source(repository, **kwargs)
+        lifecycle = kwargs["lifecycle_state"]
+        if getattr(lifecycle, "value", lifecycle) == "exhausted" and not observed_faults:
+            observed_faults.append("after_source_exhausted_before_sink_flush")
+            raise RuntimeError("injected DAG corpus expansion crash before sink flush")
+
+    try:
+        catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
+        try:
+            with patch.object(RunLifecycleRepository, "record_run_source", new=fail_after_source_exhausted):
+                Orchestrator(
+                    initial_db,
+                    checkpoint_manager=initial_checkpoint_manager,
+                    checkpoint_config=checkpoint_config,
+                ).run(
+                    initial_built.config,
+                    graph=initial_built.graph,
+                    settings=initial_rendered.settings,
+                    payload_store=initial_store,
+                    openrouter_catalog_sha256=catalog_sha256,
+                    openrouter_catalog_source=catalog_source,
+                )
+        except RuntimeError as exc:
+            if str(exc) != "injected DAG corpus expansion crash before sink flush":
+                raise
+        else:
+            raise AssertionError("expansion recovery corpus did not reach the post-exhaustion pre-sink fault seam")
+        if observed_faults != ["after_source_exhausted_before_sink_flush"]:
+            raise AssertionError(f"expansion recovery corpus reached unexpected fault seams: {observed_faults!r}")
+
+        initial_repositories = RecorderFactory.read_only(initial_db, payload_store=initial_store)
+        runs = initial_repositories.run_lifecycle.list_runs()
+        if len(runs) != 1 or runs[0].status is not RunStatus.FAILED:
+            raise AssertionError(f"expansion recovery corpus expected one failed run, got {runs!r}")
+        run_id = runs[0].run_id
+        source_records = initial_repositories.run_lifecycle.get_run_source_lifecycle_records(run_id)
+        if not source_records or any(record.lifecycle_state != "exhausted" for record in source_records.values()):
+            raise AssertionError(f"expansion recovery corpus source was not exhausted before the fault: {source_records!r}")
+        checkpoint = initial_checkpoint_manager.get_latest_checkpoint(run_id)
+        if checkpoint is None or checkpoint.upstream_topology_hash != initial_built.graph_evidence.topology_hash:
+            raise AssertionError("expansion recovery corpus did not preserve its exact topology checkpoint")
+        checkpoint_id = checkpoint.checkpoint_id
+        checkpoint_sequence = checkpoint.sequence_number
+        checkpoint_topology_hash = checkpoint.upstream_topology_hash
+        (
+            parent_token_ids_before,
+            child_token_ids_before,
+            expand_group_ids_before,
+            work_items_before,
+            effect_count_before,
+            artifact_count_before,
+        ) = _expansion_identity_snapshot(initial_db, run_id=run_id)
+        parent_work_ids_before, child_work_ids_before = _partition_expansion_work(
+            work_items_before,
+            parent_token_ids=parent_token_ids_before,
+            child_token_ids=child_token_ids_before,
+            parent_status="terminal",
+            child_status="pending_sink",
+        )
+        scheduler_work_ids_before = tuple(sorted((*parent_work_ids_before, *child_work_ids_before)))
+        if (
+            len(parent_token_ids_before),
+            len(child_token_ids_before),
+            len(expand_group_ids_before),
+            len(scheduler_work_ids_before),
+        ) != (3, 6, 3, 9):
+            raise AssertionError(
+                "expansion recovery corpus requires 3 parents/6 children/3 groups/9 work identities before resume: "
+                f"{len(parent_token_ids_before)}/{len(child_token_ids_before)}/"
+                f"{len(expand_group_ids_before)}/{len(scheduler_work_ids_before)}"
+            )
+        if effect_count_before != 0 or artifact_count_before != 0:
+            raise AssertionError(
+                "expansion recovery corpus crossed the sink boundary before its fault: "
+                f"effects={effect_count_before}, artifacts={artifact_count_before}"
+            )
+    finally:
+        initial_db.close()
+
+    del initial_repositories, initial_store, runs, source_records, checkpoint
+    del initial_built, initial_rendered
+
+    reopened_db = LandscapeDB.from_url(db_url, create_tables=False)
+    try:
+        reopened_store = FilesystemPayloadStore(payload_root)
+        reopened_checkpoint_manager = CheckpointManager(reopened_db)
+        reopened_checkpoint = reopened_checkpoint_manager.get_latest_checkpoint(run_id)
+        if reopened_checkpoint is None or (
+            reopened_checkpoint.checkpoint_id,
+            reopened_checkpoint.sequence_number,
+            reopened_checkpoint.upstream_topology_hash,
+        ) != (checkpoint_id, checkpoint_sequence, checkpoint_topology_hash):
+            raise AssertionError("expansion recovery corpus checkpoint changed across fresh-object reopen")
+
+        fresh_rendered = render_settings(case, tmp_path)
+        fresh_built = build_scenario(fresh_rendered, purpose=SinkEffectExecutionPurpose.RESUME)
+        fresh_checkpoint_config = RuntimeCheckpointConfig.from_settings(fresh_rendered.settings.checkpoint)
+        if fresh_built.graph_evidence.topology_hash != checkpoint_topology_hash:
+            raise AssertionError("expansion recovery corpus fresh graph changed topology")
+        recovery = RecoveryManager(reopened_db, reopened_checkpoint_manager)
+        resume_check = recovery.can_resume(run_id, fresh_built.graph)
+        if not resume_check.can_resume:
+            raise AssertionError(f"expansion recovery corpus was not immediately resumable: {resume_check.reason}")
+        resume_point = recovery.get_resume_point(run_id, fresh_built.graph)
+        if resume_point is None or resume_point.checkpoint.checkpoint_id != checkpoint_id:
+            raise AssertionError("expansion recovery corpus did not use its public reopened resume point")
+
+        result = Orchestrator(
+            reopened_db,
+            checkpoint_manager=reopened_checkpoint_manager,
+            checkpoint_config=fresh_checkpoint_config,
+        ).resume(
+            resume_point,
+            fresh_built.config,
+            fresh_built.graph,
+            payload_store=reopened_store,
+            settings=fresh_rendered.settings,
+        )
+        result_data = result.to_dict()
+        if result.run_id != run_id or (
+            result_data["status"],
+            result_data["rows_processed"],
+            result_data["rows_succeeded"],
+            result_data["rows_failed"],
+        ) != ("completed", 3, 6, 0):
+            raise AssertionError(f"expansion recovery corpus returned the wrong final result: {result_data!r}")
+
+        sink_outputs = _sink_outputs(fresh_rendered)
+        expected_sink_outputs = (
+            SinkOutputProjection(
+                sink_name="output",
+                rows=(
+                    '{"item":{"qty":2,"sku":"A1"},"item_index":0,"order_id":1}',
+                    '{"item":{"qty":1,"sku":"B2"},"item_index":1,"order_id":1}',
+                    '{"item":{"qty":5,"sku":"C3"},"item_index":0,"order_id":2}',
+                    '{"item":{"qty":1,"sku":"A1"},"item_index":0,"order_id":3}',
+                    '{"item":{"qty":3,"sku":"D4"},"item_index":1,"order_id":3}',
+                    '{"item":{"qty":2,"sku":"E5"},"item_index":2,"order_id":3}',
+                ),
+            ),
+        )
+        if sink_outputs != expected_sink_outputs:
+            raise AssertionError(f"expansion recovery corpus emitted unexpected outputs: {sink_outputs!r}")
+
+        _assert_all_tokens_and_work_terminal(reopened_db, run_id=run_id, payload_store=reopened_store)
+        durable_projection, audit = _exact_recovery_views(
+            reopened_db,
+            run_id=run_id,
+            payload_store=reopened_store,
+        )
+        if audit.source_operation_count != 1:
+            raise AssertionError(f"expansion recovery corpus replayed its source: source_load count={audit.source_operation_count}")
+        (
+            parent_token_ids_after,
+            child_token_ids_after,
+            expand_group_ids_after,
+            work_items_after,
+            effect_count_after,
+            artifact_count_after,
+        ) = _expansion_identity_snapshot(reopened_db, run_id=run_id)
+        parent_work_ids_after, child_work_ids_after = _partition_expansion_work(
+            work_items_after,
+            parent_token_ids=parent_token_ids_after,
+            child_token_ids=child_token_ids_after,
+            parent_status="terminal",
+            child_status="terminal",
+        )
+        scheduler_work_ids_after = tuple(sorted((*parent_work_ids_after, *child_work_ids_after)))
+        if (
+            parent_token_ids_after != parent_token_ids_before
+            or child_token_ids_after != child_token_ids_before
+            or expand_group_ids_after != expand_group_ids_before
+            or parent_work_ids_after != parent_work_ids_before
+            or child_work_ids_after != child_work_ids_before
+        ):
+            raise AssertionError("expansion recovery corpus reminted durable expansion or scheduler identity")
+        if (effect_count_after, artifact_count_after) != (1, 1):
+            raise AssertionError(
+                "expansion recovery corpus did not reach exact terminal publication state: "
+                f"effects={effect_count_after}, artifacts={artifact_count_after}"
+            )
+        final_expansions = tuple(sorted(durable_projection.expansions, key=lambda item: item.parent_token_key))
+        if tuple(item.expected_child_count for item in final_expansions) != (2, 1, 3):
+            raise AssertionError(f"expansion recovery corpus projected unexpected groups: {final_expansions!r}")
+        if reopened_checkpoint_manager.get_latest_checkpoint(run_id) is not None:
+            raise AssertionError("expansion recovery corpus retained a checkpoint after successful resume")
+
+        return ScenarioRunEvidence(
+            schema_version=2,
+            scenario_id=scenario.id,
+            case_id=case.id,
+            fixture_sha256=fresh_rendered.fixture_sha256,
+            config=ConfigEvidence(loaded=True, settings_sha256=fresh_rendered.settings_sha256),
+            graph=fresh_built.graph_evidence,
+            runtime=RuntimeEvidence(
+                attempted=True,
+                run_id=result.run_id,
+                status=str(result_data["status"]),
+                rows_processed=result_data["rows_processed"],
+                rows_succeeded=result_data["rows_succeeded"],
+                rows_failed=result_data["rows_failed"],
+                output_rows=sum(len(output.rows) for output in sink_outputs),
+                sink_outputs=sink_outputs,
+                durable_projection=durable_projection,
+            ),
+            audit=audit,
+            recovery=RecoveryEvidence(
+                attempted=True,
+                database_reopened=True,
+                checkpoint_id=checkpoint_id,
+                checkpoint_sequence=checkpoint_sequence,
+                can_resume=True,
+                source_replayed=False,
+                checkpoint_removed=True,
+                expansion_child_enqueue=ExpansionChildEnqueueRecoveryEvidence(
+                    fault_seam="after_source_exhausted_before_sink_flush",
+                    fault_count=1,
+                    source_exhausted_before=True,
+                    parent_token_ids_before=parent_token_ids_before,
+                    parent_token_ids_after=parent_token_ids_after,
+                    child_token_ids_before=child_token_ids_before,
+                    child_token_ids_after=child_token_ids_after,
+                    expand_group_ids_before=expand_group_ids_before,
+                    expand_group_ids_after=expand_group_ids_after,
+                    scheduler_work_ids_before=scheduler_work_ids_before,
+                    scheduler_work_ids_after=scheduler_work_ids_after,
+                    parent_scheduler_work_ids_before=parent_work_ids_before,
+                    parent_scheduler_work_ids_after=parent_work_ids_after,
+                    child_scheduler_work_ids_before=child_work_ids_before,
+                    child_scheduler_work_ids_after=child_work_ids_after,
+                    parent_identity_unchanged=True,
+                    child_identity_unchanged=True,
+                    group_identity_unchanged=True,
+                    scheduler_identity_unchanged=True,
+                    pending_children_before=6,
+                    sink_effect_absent_before=True,
+                    artifact_absent_before=True,
+                    final_expansions=final_expansions,
+                    final_output_rows=6,
+                    durable_export_parity=True,
+                    provisional_until_deferred_platform_rebase=True,
+                ),
             ),
             completed_stages=("config", "build", "runtime", "audit", "recovery"),
         )
@@ -2515,6 +3078,8 @@ def run_scenario_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: P
         return _run_case(scenario, case, tmp_path)
     if case.recovery_kind == "eof_aggregation":
         return _eof_aggregation_recovery_case(scenario, case, tmp_path)
+    if case.recovery_kind == "expansion_child_enqueue":
+        return _expansion_child_enqueue_recovery_case(scenario, case, tmp_path)
     if case.recovery_kind == "parallel_sink_finalization":
         return _parallel_sink_finalization_recovery_case(scenario, case, tmp_path)
     raise AssertionError(f"unsupported recovery kind: {case.recovery_kind!r}")
