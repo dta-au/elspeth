@@ -50,6 +50,7 @@ def test_sample_row_projection_redacts_values() -> None:
         "<sample:url>",
         "<sample:string:26-chars>",
     }
+    assert tuple(projection) == ("field_1", "field_2", "field_3", "field_4")
 
 
 def test_step_3_skill_keeps_fail_closed_mapping_direction_rules() -> None:

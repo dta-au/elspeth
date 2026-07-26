@@ -32,6 +32,7 @@ from elspeth.web.composer.guided.chat_solver import (
     Step1SourcePluginReselectedOutcome,
     Step1SourceResolvedOutcome,
     Step2SinkResolvedOutcome,
+    StepChatContextInput,
     maybe_manage_deferred_intent_chat,
     maybe_resolve_step_1_source_chat,
     maybe_resolve_step_2_sink_chat,
@@ -389,7 +390,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
     seed: int | None,
     recorder: BufferingRecorder | None = None,
     timeout_seconds: float,
-    context_block: str | None = None,
+    context_block: StepChatContextInput | None = None,
     allow_plugin_reselection: bool = False,
 ) -> Step1SourceChatResult:
     """Wrap Step-1 ``resolve_source`` chat with the guided-chat fallback contract.
@@ -582,7 +583,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     secret_service: WebSecretResolver | None = None,
     max_discovery_iters: int | None = None,
     timeout_seconds: float,
-    context_block: str | None = None,
+    context_block: StepChatContextInput | None = None,
     progress: ComposerProgressSink | None = None,
 ) -> Step2SinkChatResult:
     """Wrap Step-2 ``resolve_sink`` chat with the guided-chat fallback contract.
@@ -765,7 +766,7 @@ async def solve_step_chat_with_auto_drop(
     seed: int | None,
     recorder: BufferingRecorder | None = None,
     timeout_seconds: float,
-    context_block: str | None = None,
+    context_block: StepChatContextInput | None = None,
 ) -> StepChatResult:
     """Wrap ``solve_step_chat`` with the synthetic-message-on-transient contract.
 

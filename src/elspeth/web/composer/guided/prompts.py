@@ -152,5 +152,27 @@ def _summarize_sample_value(value: Any) -> str:
     return f"<sample:{type(value).__name__}>"
 
 
-def _summarize_sample_row(row: Mapping[str, Any]) -> dict[str, str]:
-    return {str(key): _summarize_sample_value(value) for key, value in row.items()}
+def _summarize_sample_row(
+    row: Mapping[str, Any],
+    *,
+    field_aliases: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Summarize a sample row without promoting uploaded field labels.
+
+    Field names are Tier-3 uploaded data just like field values.  Use caller-
+    supplied aliases when several source projections must share stable names;
+    otherwise assign deterministic row-local aliases.  A missing caller alias
+    is filled with a fresh opaque name, never the raw mapping key.
+    """
+    aliases = dict(field_aliases or {})
+    next_alias = len(aliases) + 1
+    projection: dict[str, str] = {}
+    for key, value in row.items():
+        label = str(key)
+        alias = aliases.get(label)
+        if alias is None:
+            alias = f"field_{next_alias}"
+            aliases[label] = alias
+            next_alias += 1
+        projection[alias] = _summarize_sample_value(value)
+    return projection
