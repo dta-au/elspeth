@@ -440,6 +440,19 @@ def test_operation_location_host_mismatch_suppresses_get() -> None:
     assert fake.get_calls == 0  # api-key never sent to the attacker host
 
 
+@pytest.mark.parametrize("port", ["invalid", "65536", "-1"])
+def test_operation_location_malformed_port_suppresses_get(port: str) -> None:
+    """Malformed lazy port parsing fails closed before the API key can be sent."""
+    t = _t_for_lro()
+    bad = f"{_ENDPOINT}:{port}/x/analyzeResults/abc"
+    fake = _FakeClient(_Resp(202, headers={"operation-location": bad}), [])
+
+    result = _run_with_fake(t, fake)
+
+    assert result.reason["reason"] == "operation_location_untrusted"
+    assert fake.get_calls == 0
+
+
 def test_poll_request_failed_non_capacity() -> None:
     t = _t_for_lro()
     result = _run_with_fake(t, _FakeClient(_post_202(), [_Resp(404)]))
