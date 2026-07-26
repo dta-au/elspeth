@@ -170,9 +170,9 @@ EXPECTED_STATUS_MATRIX = {
     "fork-coalesce-policies": (
         "pass",
         "pass",
-        "partial",
         "pass",
-        "partial",
+        "pass",
+        "pass",
         "partial",
         "partial",
         "pass",
@@ -372,6 +372,10 @@ EXPECTED_ASSESSMENT_LOCATORS = {
     "coalesce-policy-merge-contract-matrix": (
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_coalesce_full_matrix_declares_exact_contracts",
     ),
+    "coalesce-union-policy-identity": (
+        "tests/unit/core/test_dag.py"
+        "::TestCoalesceNodes::test_union_collision_policy_binds_coalesce_config_and_identity_with_default_compatibility",
+    ),
     "sequential-nested-second-merge-schema-negative": (
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_sequential_nested_rejects_incompatible_second_merge_schema",
     ),
@@ -400,8 +404,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0fb6dfe0e3991e1dd9517e5d5682964d2ed5cdef8f312a9e7dabe957b6bb8820"
-EXPECTED_CASE_REGISTRY_SHA256 = "37ff02b145850dbab3341491efa215b189629f66cf527b3d9837901696978905"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "9da6b219ef4d0969b81f17b7a5e402067bfb661fd258dbf948ceb8f7e86ecf21"
+EXPECTED_CASE_REGISTRY_SHA256 = "7f604fbbe23d0db4d1e22e355888935d8bcf6b8c28d226bb23e3b8319b6ba8ca"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -2235,12 +2239,8 @@ def test_composed_coalesce_semantic_ledger_is_structured_and_identity_is_regress
         assert len(expected.projection_sha256) == 64
         assert all(value > 0 for value in expected.projection_counts.model_dump().values())
         audit = scenario.dimensions["audit"]
-        if scenario.id == "fork-coalesce-policies":
-            assert audit.status == "partial"
-            assert audit.owner_issue == "elspeth-b1f23d8d83"
-        else:
-            assert audit.status == "pass"
-            assert audit.owner_issue is None
+        assert audit.status == "pass"
+        assert audit.owner_issue is None
         assert identity_regression.id in audit.evidence
         assert evidence_by_locator[f"{scenario.id}:{case.id}"].stages == (
             "config",
@@ -4449,11 +4449,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 99
-    assert len(assessment_evidence) == 60
+    assert len(manifest.evidence) == 100
+    assert len(assessment_evidence) == 61
     assert len(harness_evidence) == 39
-    assert len({reference.id for reference in manifest.evidence}) == 99
-    assert len({reference.locator for reference in manifest.evidence}) == 99
+    assert len({reference.id for reference in manifest.evidence}) == 100
+    assert len({reference.locator for reference in manifest.evidence}) == 100
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4964,8 +4964,6 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-7cf763da7c"
             elif dimension == "scale":
                 expected_owner = "elspeth-cb1053fe46"
-            elif scenario.id == "fork-coalesce-policies" and dimension in ("contracts", "audit"):
-                expected_owner = "elspeth-b1f23d8d83"
             else:
                 expected_owner = "elspeth-ef29ef6ba4"
             assert cell.owner_issue == expected_owner

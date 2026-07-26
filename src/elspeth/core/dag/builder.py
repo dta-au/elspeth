@@ -492,6 +492,8 @@ def build_execution_graph(
                 "policy": coalesce_config.policy,
                 "merge": coalesce_config.merge,
             }
+            if coalesce_config.merge == "union":
+                config_dict["union_collision_policy"] = coalesce_config.union_collision_policy
             if coalesce_config.timeout_seconds is not None:
                 config_dict["timeout_seconds"] = coalesce_config.timeout_seconds
             if coalesce_config.quorum_count is not None:

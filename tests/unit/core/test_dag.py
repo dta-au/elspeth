@@ -3740,6 +3740,126 @@ class TestCoalesceNodes:
         assert node_info.config["timeout_seconds"] == 30.0
         assert node_info.config["quorum_count"] == 1
 
+    def test_union_collision_policy_binds_coalesce_config_and_identity_with_default_compatibility(
+        self,
+        plugin_manager,
+    ) -> None:
+        """Behavior-changing union policies must bind audit and fail-closed resume identity."""
+        from datetime import UTC, datetime
+
+        from elspeth.contracts import Checkpoint, CoalesceName
+        from elspeth.core.canonical import compute_full_topology_hash
+        from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
+        from elspeth.core.config import (
+            CoalesceSettings,
+            ElspethSettings,
+            SinkSettings,
+            SourceSettings,
+        )
+        from elspeth.core.dag import ExecutionGraph
+
+        def build(policy: str | None) -> tuple[str, dict[str, Any], ExecutionGraph]:
+            coalesce_kwargs: dict[str, Any] = {
+                "name": "merge_results",
+                "branches": ["path_a", "path_b"],
+                "policy": "require_all",
+                "merge": "union",
+            }
+            if policy is not None:
+                coalesce_kwargs["union_collision_policy"] = policy
+            settings = ElspethSettings(
+                sources={
+                    "primary": _source_settings(
+                        SourceSettings,
+                        plugin="csv",
+                        options={
+                            "path": "test.csv",
+                            "on_validation_failure": "discard",
+                            "schema": {"mode": "observed"},
+                        },
+                    )
+                },
+                sinks={
+                    "output": SinkSettings(
+                        plugin="json",
+                        on_write_failure="discard",
+                        options={"path": "output.json", "schema": {"mode": "observed"}},
+                    ),
+                },
+                gates=[
+                    _gate_settings(
+                        GateSettings,
+                        name="forker",
+                        condition="True",
+                        routes={"true": "fork", "false": "output"},
+                        fork_to=["path_a", "path_b"],
+                    ),
+                ],
+                coalesce=[CoalesceSettings(**coalesce_kwargs)],
+            )
+            plugins = instantiate_plugins_from_config(settings)
+            graph = ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=list(settings.gates),
+                coalesce_settings=settings.coalesce,
+            )
+            coalesce_id = graph.get_coalesce_id_map()[CoalesceName("merge_results")]
+            return str(coalesce_id), dict(graph.get_node_info(coalesce_id).config), graph
+
+        default_id, default_config, default_graph = build(None)
+        explicit_last_id, explicit_last_config, explicit_last_graph = build("last_wins")
+        first_id, first_config, first_graph = build("first_wins")
+        fail_id, fail_config, fail_graph = build("fail")
+
+        assert default_id == explicit_last_id
+        assert len({default_id, first_id, fail_id}) == 3
+        assert default_config == explicit_last_config
+        assert {
+            policy: config["union_collision_policy"]
+            for policy, config in (
+                ("last_wins", default_config),
+                ("first_wins", first_config),
+                ("fail", fail_config),
+            )
+        } == {
+            "last_wins": "last_wins",
+            "first_wins": "first_wins",
+            "fail": "fail",
+        }
+
+        default_topology_hash = compute_full_topology_hash(default_graph)
+        assert compute_full_topology_hash(explicit_last_graph) == default_topology_hash
+        assert (
+            len(
+                {
+                    default_topology_hash,
+                    compute_full_topology_hash(first_graph),
+                    compute_full_topology_hash(fail_graph),
+                }
+            )
+            == 3
+        )
+
+        checkpoint = Checkpoint(
+            checkpoint_id="cp-coalesce-policy",
+            run_id="run-coalesce-policy",
+            sequence_number=1,
+            created_at=datetime.now(UTC),
+            upstream_topology_hash=default_topology_hash,
+            format_version=Checkpoint.CURRENT_FORMAT_VERSION,
+        )
+        validator = CheckpointCompatibilityValidator()
+        assert validator.validate(checkpoint, explicit_last_graph).can_resume is True
+        for drifted_graph in (first_graph, fail_graph):
+            result = validator.validate(checkpoint, drifted_graph)
+            assert result.can_resume is False
+            assert result.reason is not None
+            assert "Pipeline configuration changed since checkpoint was created." in result.reason
+
     def test_select_merge_coalesce_through_production_path(self, plugin_manager) -> None:
         """Select merge coalesce builds through from_plugin_instances() with select_branch.
 
