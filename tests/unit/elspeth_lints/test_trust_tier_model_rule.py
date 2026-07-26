@@ -718,6 +718,21 @@ class TestR6SilentExcept:
         r6_findings = [f for f in findings if f.rule_id == "R6"]
         assert len(r6_findings) == 1
 
+    def test_quarantined_generator_result_is_explicit(self) -> None:
+        source = dedent("""
+            def load(rows):
+                for row in rows:
+                    try:
+                        validate(row)
+                    except ValidationError as exc:
+                        yield SourceRow.quarantined(row=row, error=str(exc))
+                        continue
+        """)
+        findings = parse_and_visit(source)
+
+        r6_findings = [f for f in findings if f.rule_id == "R6"]
+        assert r6_findings == []
+
     def test_nested_non_default_return_does_not_make_handler_non_silent(self) -> None:
         source = dedent("""
             try:

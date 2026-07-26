@@ -969,13 +969,17 @@ class TierModelVisitor(ast.NodeVisitor):
         return False
 
     def _handler_is_silent(self, node: ast.ExceptHandler) -> bool:
-        """Return True if the except handler swallows errors without re-raise or explicit return."""
+        """Return True if the handler swallows errors without an explicit outcome."""
         own_scope_nodes = [child for statement in node.body for child in iter_own_scope(statement)]
         has_raise = any(isinstance(child, ast.Raise) for child in own_scope_nodes)
         if has_raise:
             return False
 
         if self._routes_transform_error_to_completion(own_scope_nodes):
+            return False
+
+        yields = [child for child in own_scope_nodes if isinstance(child, (ast.Yield, ast.YieldFrom))]
+        if any(not self._is_default_return_value(item.value) for item in yields):
             return False
 
         returns: list[ast.Return] = [child for child in own_scope_nodes if isinstance(child, ast.Return)]

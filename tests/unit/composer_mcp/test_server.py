@@ -13,6 +13,7 @@ import yaml
 
 from elspeth.composer_mcp.server import _build_tool_defs, _dispatch_tool, create_server
 from elspeth.composer_mcp.session import SessionCheckout, SessionManager
+from elspeth.contracts.composer_audit import ComposerToolRecorder
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer.state import (
@@ -252,7 +253,7 @@ class TestBuildToolDefs:
 class TestDispatchTool:
     @pytest.mark.asyncio
     async def test_live_session_manager_token_authorizes_save_after_mutation(self, scratch_dir: Path) -> None:
-        recorder = MagicMock()
+        recorder = MagicMock(spec_set=ComposerToolRecorder)
         server = create_server(_mock_catalog(), scratch_dir, recorder=recorder)
         created = await _call_handler(server.request_handlers, "new_session", {"name": "CAS"})  # type: ignore[misc]
         created_payload = json.loads(created.root.content[0].text)
