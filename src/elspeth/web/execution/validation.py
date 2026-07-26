@@ -140,6 +140,8 @@ _CHECK_SCHEMA = RUNTIME_CHECK_SCHEMA_COMPATIBILITY
 assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA)
 
 _WEB_FETCH_TRANSFORMS = frozenset({"blob_fetch", "web_scrape"})
+_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS = 30
+_WEB_BLOB_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
 
 
 def _execution_ready() -> ValidationReadiness:
@@ -1025,33 +1027,65 @@ def validate_pipeline(
         http_options = node.options["http"] if "http" in node.options else None
         if not isinstance(http_options, Mapping):
             continue
-        if "allowed_hosts" not in http_options:
+        if "allowed_hosts" in http_options:
+            allowed_hosts = http_options["allowed_hosts"]
+            if allowed_hosts == "allow_private":
+                message = (
+                    f"{node.plugin}.http.allowed_hosts='allow_private' is not permitted in web execution. "
+                    "Web-authored pipelines may only use public SSRF policy; private-network fetching requires "
+                    "an operator-owned runtime outside the web composer."
+                )
+            elif isinstance(allowed_hosts, Sequence) and not isinstance(allowed_hosts, str):
+                message = (
+                    f"{node.plugin}.http.allowed_hosts CIDR allowlists are not permitted in web execution. "
+                    "Web-authored pipelines may only use allowed_hosts='public_only'; private-network fetching "
+                    "requires an operator-owned runtime outside the web composer."
+                )
+            else:
+                message = None
+            if message is not None:
+                error_code = (
+                    "web_scrape_private_network_not_allowed" if node.plugin == "web_scrape" else "web_fetch_private_network_not_allowed"
+                )
+                web_fetch_network_errors.append(
+                    ValidationError(
+                        component_id=node.id,
+                        component_type="transform",
+                        message=message,
+                        suggestion=f"Set {node.plugin}.http.allowed_hosts to 'public_only' or remove the option.",
+                        error_code=error_code,
+                    )
+                )
+        if node.plugin != "blob_fetch":
             continue
-        allowed_hosts = http_options["allowed_hosts"]
-        if allowed_hosts == "allow_private":
-            message = (
-                f"{node.plugin}.http.allowed_hosts='allow_private' is not permitted in web execution. "
-                "Web-authored pipelines may only use public SSRF policy; private-network fetching requires "
-                "an operator-owned runtime outside the web composer."
+        timeout = http_options.get("timeout")
+        if isinstance(timeout, int) and not isinstance(timeout, bool) and timeout > _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS:
+            web_fetch_network_errors.append(
+                ValidationError(
+                    component_id=node.id,
+                    component_type="transform",
+                    message=(
+                        f"blob_fetch.http.timeout={timeout} exceeds the web execution limit of "
+                        f"{_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} seconds."
+                    ),
+                    suggestion=f"Set blob_fetch.http.timeout to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} or less.",
+                    error_code="web_fetch_resource_limit_exceeded",
+                )
             )
-        elif isinstance(allowed_hosts, Sequence) and not isinstance(allowed_hosts, str):
-            message = (
-                f"{node.plugin}.http.allowed_hosts CIDR allowlists are not permitted in web execution. "
-                "Web-authored pipelines may only use allowed_hosts='public_only'; private-network fetching "
-                "requires an operator-owned runtime outside the web composer."
+        max_body_bytes = http_options.get("max_body_bytes")
+        if isinstance(max_body_bytes, int) and not isinstance(max_body_bytes, bool) and max_body_bytes > _WEB_BLOB_FETCH_MAX_BODY_BYTES:
+            web_fetch_network_errors.append(
+                ValidationError(
+                    component_id=node.id,
+                    component_type="transform",
+                    message=(
+                        f"blob_fetch.http.max_body_bytes={max_body_bytes} exceeds the web execution limit of "
+                        f"{_WEB_BLOB_FETCH_MAX_BODY_BYTES} bytes."
+                    ),
+                    suggestion=f"Set blob_fetch.http.max_body_bytes to {_WEB_BLOB_FETCH_MAX_BODY_BYTES} or less.",
+                    error_code="web_fetch_resource_limit_exceeded",
+                )
             )
-        else:
-            continue
-        error_code = "web_scrape_private_network_not_allowed" if node.plugin == "web_scrape" else "web_fetch_private_network_not_allowed"
-        web_fetch_network_errors.append(
-            ValidationError(
-                component_id=node.id,
-                component_type="transform",
-                message=message,
-                suggestion=f"Set {node.plugin}.http.allowed_hosts to 'public_only' or remove the option.",
-                error_code=error_code,
-            )
-        )
 
     if web_fetch_network_errors:
         affected_nodes = tuple(error.component_id for error in web_fetch_network_errors if error.component_id is not None)
