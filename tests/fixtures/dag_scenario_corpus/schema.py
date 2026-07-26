@@ -325,6 +325,14 @@ class StableRunProjection(ClosedModel):
             raise ValueError("every route must reference a projected token")
         if {disposition.token_key for disposition in self.terminal_dispositions} != token_keys:
             raise ValueError("terminal dispositions must exactly cover tokens")
+        projected_parent_keys = {parent for token in self.tokens for parent in token.parents}
+        if any(
+            disposition.outcome == "transient" and disposition.path == "fork_parent" and disposition.token_key not in projected_parent_keys
+            for disposition in self.terminal_dispositions
+        ):
+            raise ValueError("transient fork_parent token must parent a projected child token")
+        if token_keys and not any(disposition.outcome in ("success", "failure") for disposition in self.terminal_dispositions):
+            raise ValueError("non-empty projection must contain a terminal success or failure outcome")
         if any(work.token_key not in token_keys for work in self.scheduler_work):
             raise ValueError("every scheduler work item must reference a projected token")
         return self

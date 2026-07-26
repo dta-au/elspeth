@@ -1127,6 +1127,81 @@ def test_exact_runtime_projection_rejects_count_and_output_mismatches() -> None:
         RunExpectation.model_validate(values)
 
 
+def test_run_expectation_rejects_unjustified_transient_fork_parent() -> None:
+    values = _exact_run_expectation_values()
+    values["rows_succeeded"] = 0
+    projection = cast(dict[str, object], values["projection"])
+    projection["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "fork_parent",
+            "sink_name": None,
+        },
+    )
+
+    with pytest.raises(ValidationError, match="transient fork_parent token must parent a projected child token"):
+        RunExpectation.model_validate(values)
+
+
+def test_runtime_evidence_rejects_unjustified_transient_fork_parent() -> None:
+    projection = _exact_runtime_projection_values()
+    projection["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "fork_parent",
+            "sink_name": None,
+        },
+    )
+    values = {
+        "kind": "exact",
+        "attempted": True,
+        "run_id": "run-1",
+        "status": "completed",
+        "rows_processed": 1,
+        "rows_succeeded": 0,
+        "rows_failed": 0,
+        "output_rows": 1,
+        "sink_outputs": ({"sink_name": "output", "rows": ('{"id":1,"value":10}',)},),
+        "durable_projection": projection,
+    }
+
+    with pytest.raises(ValidationError, match="transient fork_parent token must parent a projected child token"):
+        RuntimeEvidence.model_validate(values)
+
+
+def test_exact_projection_rejects_zero_terminal_outcomes_when_fork_parent_has_child() -> None:
+    values = _exact_run_expectation_values()
+    values["rows_succeeded"] = 0
+    projection = cast(dict[str, object], values["projection"])
+    projection["tokens"] = (
+        {"key": "primary:0#0", "row_key": "primary:0", "parents": ()},
+        {"key": "primary:0#1", "row_key": "primary:0", "parents": ("primary:0#0",)},
+    )
+    projection["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "fork_parent",
+            "sink_name": None,
+        },
+        {
+            "key": "primary:0#1",
+            "token_key": "primary:0#1",
+            "outcome": "transient",
+            "path": "batch_consumed",
+            "sink_name": None,
+        },
+    )
+
+    with pytest.raises(ValidationError, match="non-empty projection must contain a terminal success or failure outcome"):
+        RunExpectation.model_validate(values)
+
+
 def test_expected_dimension_and_scenario_constants_are_exact_and_ordered() -> None:
     assert EXPECTED_DIMENSIONS == EXPECTED_DIMENSION_VALUES
     assert EXPECTED_SCENARIOS == EXPECTED_SCENARIO_VALUES
