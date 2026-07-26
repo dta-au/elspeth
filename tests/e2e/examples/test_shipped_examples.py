@@ -137,6 +137,7 @@ class TestShippedExamples:
             copied_example_dir,
             ignore=shutil.ignore_patterns("*.db", "*.db-shm", "*.db-wal", "*.jsonl", "payloads"),
         )
+        (copied_example_dir / "runs").mkdir(exist_ok=True)
         return copied_example_dir
 
     @staticmethod
