@@ -53,20 +53,24 @@ APIs, Filigree, Loomweave, Warpline, Ruff, and mypy.
 
 ## Post-integration execution checkpoint
 
-Refreshed on 2026-07-27 after Wave B integration and the resulting P1
-correctness wave. The immutable Wave B implementation/evidence head remains
+Refreshed on 2026-07-27 after Wave B integration, the resulting P1 correctness
+wave, and the independent recovery durable/export parity oracle. The immutable
+Wave B implementation/evidence head remains
 `210a92d544dbb10d5d0b438351f123e05da19f5d`; Wave B was integrated at
 `2b47c25428ed0e978443df953e0fd587860aeed8`. The current reviewed
 production/evidence floor is
-`release/0.7.2@2def32c356030949539387ff1c395a8988745a91`. The commit containing
+`release/0.7.2@cb07cfa91f252c86737e8e15c711ccd1ec9fe76e`. The commit containing
 this documentation refresh is coordination-only and is not the platform
 production replay anchor. Capture the exact reviewed release tip after later
 bug-fix/corpus commits before the platform rebase.
 
-The focused final gate reports `545 passed, 0 xfailed, 3 known quorum
-warnings`. Focused Ruff check/format, mypy, and `git diff --check` are green.
-The former coalesce identity xfails now pass after `elspeth-3a6fa9141f` closed
-at `229e2245d84e1195dc6693cf6ab55684190bcf9b`.
+The focused final gate reports `546 passed, 0 xfailed, 3 known quorum
+warnings`. Focused Ruff check/format, mypy, and task-commit diff checks are
+green. The release worktree's repository-wide `git diff --check` still reports
+pre-existing trailing whitespace in the protected, unrelated
+`config/cicd/enforce_tier_model/web.yaml`; this sprint did not alter it. The
+former coalesce identity xfails now pass after `elspeth-3a6fa9141f` closed at
+`229e2245d84e1195dc6693cf6ab55684190bcf9b`.
 
 The current schema-v2 manifest has 15 scenarios, 39 cases, 100 evidence
 references, and 165 cells: 77 `pass`, 27 `partial`, 16 `fail`, 33 `unknown`,
@@ -80,9 +84,12 @@ Four P1 findings from the combined corpus are closed:
 `elspeth-b1f23d8d83` at `8c124889e7275eadb0b99242d9617a2c3601b727`,
 `elspeth-d3960e8463` at `c8f6094a7a5b60c995a7c5e0f3e500ec4d5c45b3`,
 and `elspeth-0b0eaa63df` at
-`a3838611cd7931eb71b9d42a6e9e2bd2e78d14b9`. The next ready independent corpus
-P2 is `elspeth-168c26e22e`, which must make durable/export parity independent
-of the shared serializer.
+`a3838611cd7931eb71b9d42a6e9e2bd2e78d14b9`. `elspeth-168c26e22e` is resolved
+at `cb07cfa91f252c86737e8e15c711ccd1ec9fe76e`: recovery durable/export
+parity now compares the portable export with an explicit direct-table
+`LandscapeDB` oracle. Its adversarial regression detects a shared-serializer
+record-family omission. Existing exact/static/direct recovery assertions stay
+in force, and no manifest cell was promoted.
 
 The sprint did not complete B1-X or B2-X. Seven P2 recovery children remain
 open behind P3 `elspeth-7dcc6554e7`: `elspeth-1805aec2a6`,
@@ -659,20 +666,22 @@ provisional.
   `ca65ecab32f77c8cbd2b33ce8685c381011078e0`. The immutable Wave B
   implementation/evidence head is `210a92d544dbb10d5d0b438351f123e05da19f5d`;
   the only later Wave B commit changes this plan and the handoff document.
-  Exact-current merge and quality reviews approved the integration. Four
-  post-integration P1 fixes now lead to production/evidence floor
-  `2def32c356030949539387ff1c395a8988745a91`. The release checkout gate passes
-  545 tests with zero xfails and 3 warnings; Ruff, formatting, mypy, and diff
-  checks also pass. Deferred platform work remains paused at
+  Exact-current merge and quality reviews approved the integration. The four
+  post-integration P1 fixes and the independent durable/export oracle now lead
+  to production/evidence floor
+  `cb07cfa91f252c86737e8e15c711ccd1ec9fe76e`. The release checkout gate passes
+  546 tests with zero xfails and 3 warnings; Ruff, formatting, mypy, and
+  task-commit diff checks also pass. Deferred platform work remains paused at
   `132bd53232ea6b3885250675c361d3c057b19ac5`. Independent recovery/export
-  parity remains open as `elspeth-168c26e22e`; distributed and scale evidence
-  remain incomplete as recorded in the final ledger.
+  parity is resolved as `elspeth-168c26e22e` without a manifest promotion;
+  distributed and scale evidence remain incomplete as recorded in the final
+  ledger.
 
 - [x] **Step 3: Give the paused platform branch an exact rebase instruction.**
 
   At execution, capture the exact reviewed `release/0.7.2` tip and require it to
   descend from the current production/evidence floor
-  `2def32c356030949539387ff1c395a8988745a91`. Rebase
+  `cb07cfa91f252c86737e8e15c711ccd1ec9fe76e`. Rebase
   `codex/deferred-platform-completion` onto that captured tip, rerun its
   impacted authority suites, then implement B4-B using its real
   independent-process PostgreSQL harness. Do not retain any pre-rebase

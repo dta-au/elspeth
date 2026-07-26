@@ -25,9 +25,10 @@ APIs, PostgreSQL/SQLite, Filigree, Loomweave, Warpline, Ruff, and mypy.
 
 ## Current pre-platform snapshot
 
-Refreshed on 2026-07-27 after Wave B integration and the four resulting P1
-correctness fixes. Refresh volatile platform and tracker facts before executing
-the remaining handoff.
+Refreshed on 2026-07-27 after Wave B integration, the four resulting P1
+correctness fixes, and the independent recovery durable/export parity oracle.
+Refresh volatile platform and tracker facts before executing the remaining
+handoff.
 
 | Surface | Exact recorded fact |
 | --- | --- |
@@ -35,7 +36,7 @@ the remaining handoff.
 | Wave B implementation/evidence head | `210a92d544dbb10d5d0b438351f123e05da19f5d` (immutable evidence boundary) |
 | Wave B integration tip | `ca65ecab32f77c8cbd2b33ce8685c381011078e0` |
 | Combined Wave B merge | `2b47c25428ed0e978443df953e0fd587860aeed8` |
-| Current reviewed production/evidence floor | `release/0.7.2@2def32c356030949539387ff1c395a8988745a91` |
+| Current reviewed production/evidence floor | `release/0.7.2@cb07cfa91f252c86737e8e15c711ccd1ec9fe76e` |
 | Future platform replay anchor | Capture the exact reviewed `release/0.7.2` tip after the bug-fix/corpus sprint; require it to descend from the recorded floor |
 | Coordination-doc refresh | The commit containing this refresh is documentation-only and does not create new production evidence |
 | Paused platform worktree | `/home/john/elspeth/.worktrees/deferred-platform-completion` |
@@ -43,27 +44,28 @@ the remaining handoff.
 | Platform replay base | `696b3d1414ed7a6789c8f25bf5cbdc5450385bdd` |
 | Recorded platform replay range | 13 commits in `696b3d1414ed7a6789c8f25bf5cbdc5450385bdd..132bd53232ea6b3885250675c361d3c057b19ac5` |
 | Platform progress | Clean and paused after Task 5 of the live deferred-platform plan |
-| Focused corpus gate | 545 passed, 0 xfailed, 3 known quorum warnings |
-| Static gate | Focused Ruff check, Ruff format check, and mypy green at the source floor; this two-file handoff diff passes `git diff --check` |
-| Code-index state | Loomweave refreshed and fresh at the production/evidence floor |
+| Focused corpus gate | 546 passed, 0 xfailed, 3 known quorum warnings |
+| Static gate | Focused Ruff check, Ruff format check, and mypy green at the source floor; task commits pass `git diff --check` |
+| Code-index/change-impact state | Loomweave was refreshed before implementation; Warpline sees the changed corpus entities, but its dependency snapshot is partial and 271 commits stale, so its blast-radius result is advisory only |
 | Parent issue | `elspeth-ef29ef6ba4`, open and `in_progress`; leave unassigned between bounded packets |
 
 Wave B is already integrated. Do not recreate the merge, recover the retired
 worktree, or rebase the platform branch onto the historical Wave B head.
 `210a92d544dbb10d5d0b438351f123e05da19f5d` remains the immutable Wave B
 implementation/evidence boundary, while
-`2def32c356030949539387ff1c395a8988745a91` is the reviewed production/evidence
-floor after integration and the four P1 fixes. The commit containing this
-documentation refresh changes no production or corpus source. At the eventual
-platform rebase, capture the exact reviewed `release/0.7.2` tip so later
-bug-fix/corpus commits, including `elspeth-168c26e22e`, are not omitted.
+`cb07cfa91f252c86737e8e15c711ccd1ec9fe76e` is the reviewed
+production/evidence floor after integration, the P1 fixes, and the independent
+recovery durable/export oracle. The commit containing this documentation
+refresh changes no production or corpus source. At the eventual platform
+rebase, capture the exact reviewed `release/0.7.2` tip so no later
+bug-fix/corpus commits are omitted.
 
 At execution, capture and validate the source and platform boundaries:
 
 ```bash
 release_worktree=/home/john/elspeth
 platform_worktree=/home/john/elspeth/.worktrees/deferred-platform-completion
-recorded_source_floor=2def32c356030949539387ff1c395a8988745a91
+recorded_source_floor=cb07cfa91f252c86737e8e15c711ccd1ec9fe76e
 source_anchor=$(git -C "$release_worktree" \
   rev-parse release/0.7.2^{commit})
 platform_replay_base=696b3d1414ed7a6789c8f25bf5cbdc5450385bdd
@@ -167,6 +169,7 @@ rebase. Recompute this ledger mechanically after every manifest change.
 | Post-integration P1 fix | `elspeth-b1f23d8d83` | Union collision policy identity | `8c124889e7275eadb0b99242d9617a2c3601b727` |
 | Post-integration P1 fix | `elspeth-d3960e8463` | Residual pending-sink resume | `c8f6094a7a5b60c995a7c5e0f3e500ec4d5c45b3` |
 | Post-integration P1 fix | `elspeth-0b0eaa63df` | Fixed-any schema reconstruction | `a3838611cd7931eb71b9d42a6e9e2bd2e78d14b9` |
+| Independent corpus oracle | `elspeth-168c26e22e` | Direct-table recovery durable/export parity | `cb07cfa91f252c86737e8e15c711ccd1ec9fe76e` |
 
 The Wave B implementation/evidence range is the 20 commits after
 `5308e8c8867c6c6c26964a82eaf1081e2d1327d0` through
@@ -177,10 +180,10 @@ not reduce the ledger to close commits alone because supporting schema,
 fixture, documentation, review, and handoff repairs are separate commits.
 
 The current reviewed production/evidence floor is
-`2def32c356030949539387ff1c395a8988745a91`. It adds the scheduler-quiescence
-impact-audit follow-up to `elspeth-d3960e8463` after all four P1 close commits.
-Refresh the replay anchor after every later reviewed production or corpus
-commit.
+`cb07cfa91f252c86737e8e15c711ccd1ec9fe76e`. It includes the
+scheduler-quiescence impact-audit follow-up after all four P1 close commits and
+the independent recovery durable/export oracle. Refresh the replay anchor
+after every later reviewed production or corpus commit.
 
 ## Honest open blockers
 
@@ -194,8 +197,17 @@ identity at `8c124889e7275eadb0b99242d9617a2c3601b727`.
 
 The resume findings `elspeth-d3960e8463` and `elspeth-0b0eaa63df` are also
 closed at `c8f6094a7a5b60c995a7c5e0f3e500ec4d5c45b3` and
-`a3838611cd7931eb71b9d42a6e9e2bd2e78d14b9`. The current exact corpus result is
-`545 passed, 0 xfailed, 3 warnings`.
+`a3838611cd7931eb71b9d42a6e9e2bd2e78d14b9`.
+
+`elspeth-168c26e22e` is resolved at
+`cb07cfa91f252c86737e8e15c711ccd1ec9fe76e`. The durable side of recovery
+parity now selects the claimed persisted record families directly from
+`LandscapeDB` tables with explicit identity/material fields, ordering, and
+normalization. An adversarial regression proves that omitting the
+`validation_error` family from the shared portable serializer is detected.
+Existing exact projections, static evidence, and direct recovery assertions
+remain in force; no manifest cell was promoted. The current exact corpus
+result is `546 passed, 0 xfailed, 3 warnings`.
 
 ### Blocked recovery children
 
@@ -214,8 +226,6 @@ because adjacent recovery cases pass.
 
 ### Product and platform blockers
 
-- `elspeth-168c26e22e`: recovery durable/export parity still shares a serializer;
-  this is the next independent, ready corpus P2.
 - `elspeth-f321e3ff21` and `elspeth-245b21351b`: checkpoint compatibility and
   post-leadership cleanup remain on the paused platform branch.
 - `elspeth-9a52eb80f9`: registered independent-process orchestration and sink
@@ -239,8 +249,8 @@ still before deferred-platform Task 21.
 1. **Refresh and freeze inputs.** Keep the platform worktree clean. Capture its
    current tip, verify that the replay base remains its ancestor, and capture
    the exact reviewed `release/0.7.2` tip as `source_anchor`. Require
-   `2def32c356030949539387ff1c395a8988745a91` to be its ancestor so the four
-   closed P1 fixes remain included. Preserve the six
+   `cb07cfa91f252c86737e8e15c711ccd1ec9fe76e` to be its ancestor so the four
+   closed P1 fixes and independent recovery oracle remain included. Preserve the six
    unrelated tier-model YAML changes in the release checkout. Refresh the
    parent, all blocker issues, the release task, Docker task, and operator P0.
    An active or human-owned claim is not available work.
@@ -259,7 +269,7 @@ still before deferred-platform Task 21.
    platform_worktree=/home/john/elspeth/.worktrees/deferred-platform-completion
    platform_branch=codex/deferred-platform-completion
    platform_replay_base=696b3d1414ed7a6789c8f25bf5cbdc5450385bdd
-   recorded_source_floor=2def32c356030949539387ff1c395a8988745a91
+   recorded_source_floor=cb07cfa91f252c86737e8e15c711ccd1ec9fe76e
    source_anchor=$(git -C /home/john/elspeth \
      rev-parse release/0.7.2^{commit})
    test -z "$(git -C "$platform_worktree" status --short)"
@@ -354,7 +364,7 @@ git diff --check
 git status --short --branch
 ```
 
-The current pre-platform expected result is exactly `545 passed, 0 xfailed, 3
+The current pre-platform expected result is exactly `546 passed, 0 xfailed, 3
 warnings`. Investigate any collection shrink, skip/xfail, or warning change.
 The project-supported strict mypy surface is `src/ elspeth-lints/src/`;
 `tests/` and `scripts/` are deliberately outside that gate.
@@ -378,6 +388,12 @@ Copy the exact Task 13 PostgreSQL/testcontainer commands from the live
 deferred-platform plan after rebase; do not preserve a second, drift-prone copy
 here. Run every additional Warpline reverification item.
 
+The latest Warpline worklist for the independent-oracle commit is not
+authoritative: its edge snapshot is partial and 271 commits behind that
+commit. It identifies the changed corpus harness/integration-test entities but
+cannot safely narrow the verification set. Preserve the full focused corpus
+gate above until a fresh complete snapshot is captured.
+
 Before final candidate freeze, run the repository gate:
 
 ```bash
@@ -398,9 +414,9 @@ combined source.
 ## Tracker handoff and closure rule
 
 `elspeth-ef29ef6ba4` remains open. Seventy-six applicable cells are still
-non-pass, seven recovery children are blocked, independent durable/export
-parity remains open as `elspeth-168c26e22e`, distributed B4-B is absent, and
-the scale dependency is unresolved.
+non-pass, seven recovery children are blocked, distributed B4-B is absent, and
+the scale dependency is unresolved. Independent durable/export parity is
+resolved by `elspeth-168c26e22e` without promoting a manifest cell.
 
 After this handoff is added to the parent issue, release the
 `codex-dag-corpus-refresh` claim without reverting workflow status. Do not
@@ -419,13 +435,13 @@ Stop and return to coordination when:
 
 - the platform worktree is dirty, its captured tip changes during replay, or
   the refreshed release/platform ancestry cannot be explained and reviewed;
-- `2def32c356030949539387ff1c395a8988745a91` is not an ancestor of the captured
+- `cb07cfa91f252c86737e8e15c711ccd1ec9fe76e` is not an ancestor of the captured
   source anchor, a later production/corpus commit has not been reviewed and
   reverified, or the platform/source merge base is no longer the recorded replay
   base;
 - a conflict is resolved by accepting one whole side without reviewing the
   production authority and corpus contract together;
-- the 545-test collection shrinks, any skip/xfail appears, or a warning changes
+- the 546-test collection shrinks, any skip/xfail appears, or a warning changes
   without review;
 - a cell would be promoted from analogy, aggregate counts, or pre-rebase
   evidence;
