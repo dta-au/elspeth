@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -20,6 +21,7 @@ from elspeth.contracts.composer_audit import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json as primitive_canonical_json
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
@@ -46,11 +48,10 @@ def _reject_duplicate_json_object_keys(pairs: list[tuple[str, object]]) -> dict[
     return restored
 
 
-def _load_exact_canonical_json(payload: str) -> Any:
+def _validate_exact_canonical_json(payload: str) -> None:
     restored = json.loads(payload, object_pairs_hook=_reject_duplicate_json_object_keys)
-    if canonical_json(restored) != payload:
+    if primitive_canonical_json(restored) != payload:
         raise AuditIntegrityError("persisted pipeline dispatch canonical payload is not the exact canonical representation")
-    return restored
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,8 +108,10 @@ class PipelineDispatchAuditBinding:
         if type(raw_status) is not str or type(tool_call_id) is not str or type(tool_name) is not str:
             raise AuditIntegrityError("persisted pipeline dispatch scalar fields are malformed")
         try:
-            arguments_hash = stable_hash(_load_exact_canonical_json(arguments_canonical))
-            result_hash = stable_hash(_load_exact_canonical_json(result_canonical))
+            _validate_exact_canonical_json(arguments_canonical)
+            _validate_exact_canonical_json(result_canonical)
+            arguments_hash = hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest()
+            result_hash = hashlib.sha256(result_canonical.encode("utf-8")).hexdigest()
             status = ComposerToolStatus(raw_status)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AuditIntegrityError("persisted pipeline dispatch payload is malformed") from exc

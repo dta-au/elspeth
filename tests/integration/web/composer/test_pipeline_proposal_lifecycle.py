@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 import time
 from dataclasses import replace
@@ -16,7 +17,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.core.canonical import stable_hash
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_plugin_crash, finish_success
 from elspeth.web.composer.guided.state_machine import GuidedSession
@@ -758,6 +759,45 @@ async def test_pipeline_dispatch_recovery_rejects_duplicate_json_object_key(serv
 
     with pytest.raises(AuditIntegrityError, match="duplicate JSON object key"):
         await service.get_pipeline_dispatch_recovery(authority=authority)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"__elspeth_canonical_type__": {"literal": True}},
+        {"outer": {"__elspeth_canonical_type__": {"literal": True}}},
+    ],
+    ids=["top_level", "nested"],
+)
+def test_pipeline_dispatch_binding_restores_core_domain_normalized_reserved_mapping(
+    arguments: dict[str, object],
+) -> None:
+    arguments_canonical = canonical_json(arguments)
+    result_canonical = canonical_json({"success": True})
+    assert arguments_canonical.count('"__elspeth_canonical_type__":"mapping"') == 1
+    assert '"entries":[' in arguments_canonical
+    arguments_hash = hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest()
+    result_hash = hashlib.sha256(result_canonical.encode("utf-8")).hexdigest()
+    envelope: dict[str, object] = {
+        "_kind": "audit",
+        "invocation": {
+            "tool_call_id": "reserved-mapping-call",
+            "tool_name": "set_pipeline",
+            "status": ComposerToolStatus.SUCCESS.value,
+            "arguments_canonical": arguments_canonical,
+            "arguments_hash": arguments_hash,
+            "result_canonical": result_canonical,
+            "result_hash": result_hash,
+        },
+    }
+
+    binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
+
+    assert binding.tool_call_id == "reserved-mapping-call"
+    assert binding.tool_name == "set_pipeline"
+    assert binding.status is ComposerToolStatus.SUCCESS
+    assert binding.arguments_hash == arguments_hash
+    assert binding.result_hash == result_hash
 
 
 @pytest.mark.asyncio
