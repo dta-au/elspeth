@@ -209,7 +209,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:05fc9294a95a738c"
+    source_file_hash: str | None = "sha256:e68bc38e85f1a1f6"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -688,7 +688,24 @@ class DataverseSource(BaseSource):
                         else:
                             resolution_map = {k: k for k in validated_row}
 
-                        self._contract_builder.process_first_row(validated_row, resolution_map)
+                        try:
+                            self._contract_builder.process_first_row(validated_row, resolution_map)
+                        except ContractFieldLimitExceeded as e:
+                            quarantine_count += 1
+                            ctx.record_validation_error(
+                                row=validated_row,
+                                error=str(e),
+                                schema_mode=self._schema_config.mode,
+                                destination=self._on_validation_failure,
+                            )
+                            if self._on_validation_failure != "discard":
+                                yield SourceRow.quarantined(
+                                    row=validated_row,
+                                    error=str(e),
+                                    destination=self._on_validation_failure,
+                                    source_row_index=current_source_row_index,
+                                )
+                            continue
                         self.set_schema_contract(self._contract_builder.contract)
                         self._first_valid_row_processed = True
 
@@ -709,6 +726,7 @@ class DataverseSource(BaseSource):
                                 self._field_resolution.resolution_mapping,
                             )
                         except ContractFieldLimitExceeded as e:
+                            quarantine_count += 1
                             ctx.record_validation_error(
                                 row=validated_row,
                                 error=str(e),
