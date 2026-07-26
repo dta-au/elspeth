@@ -26,11 +26,12 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from elspeth.contracts import CallType
+from elspeth.contracts import CallType, Determinism, NodeType
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.sink_effects import SINK_EFFECT_PROTOCOL_VERSION, AuditExportFormat, SinkEffectInputKind
 from elspeth.core.landscape.factory import RecorderFactory as _RealRecorderFactory
 from elspeth.engine.orchestrator.export import (
@@ -1355,6 +1356,57 @@ class TestExportNodeRegistrationIdempotence:
                 ),
                 patch("elspeth.engine.orchestrator.audit_export_effects.execute_audit_export_effect") as execute,
                 pytest.raises(AuditIntegrityError, match="export:output"),
+            ):
+                export_landscape(db, run_id, settings, sink_factory)
+
+            execute.assert_not_called()
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize(
+        ("registered_overrides", "retry_overrides", "divergent_field"),
+        [
+            ({"config": {"path": "/old"}}, {"config": {"path": "/new"}}, "config_hash"),
+            ({"plugin_version": "old"}, {"plugin_version": "new"}, "plugin_version"),
+            (
+                {"source_file_hash": "sha256:" + "a" * 16},
+                {"source_file_hash": "sha256:" + "b" * 16},
+                "source_file_hash",
+            ),
+        ],
+    )
+    def test_export_refuses_to_reuse_node_with_stale_provenance(
+        self,
+        registered_overrides: dict[str, Any],
+        retry_overrides: dict[str, Any],
+        divergent_field: str,
+    ) -> None:
+        db, real_factory, run_id = self._real_db_setup()
+        try:
+            valid_source_hash = "sha256:" + "0" * 16
+            registered_sink, _ = _make_sink_and_factory(**{"source_file_hash": valid_source_hash, **registered_overrides})
+            real_factory.data_flow.register_node(
+                run_id=run_id,
+                node_id="export:output",
+                plugin_name=registered_sink.name,
+                node_type=NodeType.SINK,
+                plugin_version=registered_sink.plugin_version,
+                config=dict(registered_sink.config),
+                schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+                determinism=Determinism.IO_WRITE,
+                source_file_hash=registered_sink.source_file_hash,
+            )
+            settings = _make_settings()
+            _retry_sink, sink_factory = _make_sink_and_factory(**{"source_file_hash": valid_source_hash, **retry_overrides})
+
+            with (
+                patch("elspeth.core.landscape.factory.RecorderFactory", _RealRecorderFactory),
+                patch(
+                    "elspeth.engine.orchestrator.audit_export_effects.prepare_audit_export_snapshot",
+                    return_value=object(),
+                ),
+                patch("elspeth.engine.orchestrator.audit_export_effects.execute_audit_export_effect") as execute,
+                pytest.raises(AuditIntegrityError, match=divergent_field),
             ):
                 export_landscape(db, run_id, settings, sink_factory)
 

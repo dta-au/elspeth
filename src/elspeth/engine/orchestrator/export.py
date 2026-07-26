@@ -221,6 +221,8 @@ def export_landscape(
     from elspeth.contracts import NodeType
     from elspeth.contracts.errors import AuditIntegrityError
     from elspeth.contracts.schema import SchemaConfig
+    from elspeth.core.canonical import canonical_json, stable_hash
+    from elspeth.core.config import sanitize_node_config_for_audit
 
     # Snapshot first: export audit rows can never recurse into their own bytes.
     factory = RecorderFactory(db, payload_store=payload_store)
@@ -229,8 +231,9 @@ def export_landscape(
     # publication response finds the row a prior attempt registered. Reuse it
     # so the retry reaches SinkEffectCoordinator reconciliation of the durable
     # effect instead of crashing on the nodes composite primary key. Fail
-    # closed if the registered identity is not the audit-export sink node this
-    # attempt would register.
+    # closed if the registered provenance is not exactly what this attempt
+    # would register. A partial identity match would let a changed retry run
+    # under stale audit attribution.
     existing_node = factory.data_flow.get_node(sink.node_id, run_id)
     if existing_node is None:
         factory.data_flow.register_node(
@@ -244,12 +247,27 @@ def export_landscape(
             determinism=Determinism.IO_WRITE,
             source_file_hash=sink.source_file_hash,
         )
-    elif existing_node.node_type is not NodeType.SINK or existing_node.plugin_name != sink.name:
-        raise AuditIntegrityError(
-            f"audit export node {sink.node_id!r} for run {run_id!r} is already registered "
-            f"with divergent identity ({existing_node.node_type.value!r}/{existing_node.plugin_name!r}); "
-            f"refusing to reuse it for export sink {sink.name!r}"
-        )
+    else:
+        audit_safe_config = sanitize_node_config_for_audit(dict(sink.config), plugin_name=sink.name)
+        expected_provenance = {
+            "plugin_name": sink.name,
+            "node_type": NodeType.SINK,
+            "plugin_version": sink.plugin_version,
+            "determinism": Determinism.IO_WRITE,
+            "config_hash": stable_hash(audit_safe_config),
+            "config_json": canonical_json(audit_safe_config),
+            "source_file_hash": sink.source_file_hash,
+            "schema_hash": None,
+            "sequence_in_pipeline": None,
+            "schema_mode": "observed",
+            "schema_fields": None,
+        }
+        divergent_fields = [field for field, expected in expected_provenance.items() if getattr(existing_node, field) != expected]
+        if divergent_fields:
+            raise AuditIntegrityError(
+                f"audit export node {sink.node_id!r} for run {run_id!r} is already registered "
+                f"with divergent provenance fields {divergent_fields!r}; refusing to reuse it for export sink {sink.name!r}"
+            )
     try:
         execute_audit_export_effect(
             factory=factory,
