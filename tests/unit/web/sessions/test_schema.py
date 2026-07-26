@@ -15,10 +15,20 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     SESSION_SCHEMA_EPOCH,
     blobs_table,
+    composer_progress_snapshots_table,
+    composition_states_table,
     metadata,
+    run_execution_inputs_table,
+    run_start_permits_table,
+    runs_table,
+    session_operation_fences_table,
     sessions_table,
+    user_secrets_table,
+    web_instances_table,
+    websocket_tickets_table,
 )
 from elspeth.web.sessions.schema import (
+    _EPOCH_37_COORDINATION_TABLES,
     SessionSchemaError,
     _stamp_schema_sentinels,
     _user_tables,
@@ -68,6 +78,55 @@ def engine():
     return eng
 
 
+def _seed_session_state(conn) -> tuple[str, str]:
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+    state_id = str(uuid.uuid4())
+    conn.execute(
+        insert(sessions_table).values(
+            id=session_id,
+            user_id="alice",
+            auth_provider_type="local",
+            title="Schema test",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    conn.execute(
+        insert(composition_states_table).values(
+            id=state_id,
+            session_id=session_id,
+            version=1,
+            is_valid=True,
+            provenance="session_seed",
+            created_at=now,
+        )
+    )
+    return session_id, state_id
+
+
+def _seed_run(conn) -> str:
+    now = datetime.now(UTC)
+    session_id, state_id = _seed_session_state(conn)
+    run_id = str(uuid.uuid4())
+    conn.execute(
+        insert(runs_table).values(
+            id=run_id,
+            session_id=session_id,
+            state_id=state_id,
+            status="pending",
+            started_at=now,
+            rows_processed=0,
+            rows_succeeded=0,
+            rows_failed=0,
+            rows_routed_success=0,
+            rows_routed_failure=0,
+            rows_quarantined=0,
+        )
+    )
+    return run_id
+
+
 def test_validator_rejects_same_named_unique_index_with_wrong_columns(engine) -> None:
     """A same-named unique index with a different column set must be rejected.
 
@@ -113,33 +172,127 @@ def test_epoch_37_coordination_tables_and_expiry_indexes_are_exact() -> None:
     inspector = inspect(eng)
 
     assert SESSION_SCHEMA_EPOCH == 37
-    assert {
-        "web_instances",
-        "session_operation_fences",
-        "run_start_permits",
-        "run_execution_inputs",
-        "websocket_tickets",
-        "composer_inflight_requests",
-        "composer_progress_snapshots",
-        "rate_limit_buckets",
-        "rate_limit_events",
-        "sessions_cleanup_claims",
-    } <= set(inspector.get_table_names())
+    expected_tables = frozenset(
+        {
+            "web_instances",
+            "session_operation_fences",
+            "run_start_permits",
+            "run_execution_inputs",
+            "websocket_tickets",
+            "composer_inflight_requests",
+            "composer_progress_snapshots",
+            "rate_limit_buckets",
+            "rate_limit_events",
+            "sessions_cleanup_claims",
+        }
+    )
+    assert expected_tables == _EPOCH_37_COORDINATION_TABLES
+    assert expected_tables <= set(inspector.get_table_names())
     assert not any("deleted" in table and "session" in table for table in inspector.get_table_names())
 
-    expected_expiry_indexes = {
-        "web_instances": "ix_web_instances_lease_expires_at",
-        "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
-        "run_start_permits": "ix_run_start_permits_retention_expires_at",
-        "websocket_tickets": "ix_websocket_tickets_expires_at",
-        "composer_inflight_requests": "ix_composer_inflight_requests_expires_at",
-        "composer_progress_snapshots": "ix_composer_progress_snapshots_expires_at",
-        "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
-        "rate_limit_events": "ix_rate_limit_events_expires_at",
-        "sessions_cleanup_claims": "ix_sessions_cleanup_claims_lease_expires_at",
+    expected_indexes = {
+        "web_instances": {"ix_web_instances_compatibility", "ix_web_instances_lease_expires_at"},
+        "session_operation_fences": {"ix_session_operation_fences_lease_expires_at"},
+        "run_start_permits": {"ix_run_start_permits_retention_expires_at"},
+        "run_execution_inputs": set(),
+        "websocket_tickets": {"ix_websocket_tickets_expires_at", "ix_websocket_tickets_run_id"},
+        "composer_inflight_requests": {
+            "ix_composer_inflight_requests_expires_at",
+            "ix_composer_inflight_requests_session_id",
+        },
+        "composer_progress_snapshots": {"ix_composer_progress_snapshots_expires_at"},
+        "rate_limit_buckets": {"ix_rate_limit_buckets_expires_at"},
+        "rate_limit_events": {"ix_rate_limit_events_expires_at", "ix_rate_limit_events_subject_occurred"},
+        "sessions_cleanup_claims": {"ix_sessions_cleanup_claims_lease_expires_at"},
     }
-    for table_name, index_name in expected_expiry_indexes.items():
-        assert index_name in {index["name"] for index in inspector.get_indexes(table_name)}, table_name
+    for table_name, index_names in expected_indexes.items():
+        assert {index["name"] for index in inspector.get_indexes(table_name)} == index_names, table_name
+
+    run_indexes = {index["name"] for index in inspector.get_indexes("runs")}
+    assert {"ix_runs_owner_lease_expires_at", "ix_runs_saga_state"} <= run_indexes
+
+
+def test_epoch_37_coordination_check_constraints_are_exact() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    inspector = inspect(eng)
+
+    expected_checks = {
+        "web_instances": {
+            "ck_web_instances_generation_nonblank",
+            "ck_web_instances_image_digest_nonblank",
+            "ck_web_instances_instance_id_nonblank",
+            "ck_web_instances_positive_compatibility",
+            "ck_web_instances_revision_label_nonblank",
+            "ck_web_instances_state",
+            "ck_web_instances_target_nonblank",
+        },
+        "session_operation_fences": {
+            "ck_session_operation_fences_kind",
+            "ck_session_operation_fences_lease_token_nonblank",
+            "ck_session_operation_fences_operation_id_nonblank",
+            "ck_session_operation_fences_owner_nonblank",
+            "ck_session_operation_fences_positive_epoch",
+            "ck_session_operation_fences_session_id_nonblank",
+            "ck_session_operation_fences_token_not_owner",
+        },
+        "run_start_permits": {
+            "ck_run_start_permits_run_id_nonblank",
+            "ck_run_start_permits_state",
+            "ck_run_start_permits_state_fields",
+        },
+        "run_execution_inputs": {
+            "ck_run_execution_inputs_deployment_generation_nonblank",
+            "ck_run_execution_inputs_positive_compatibility",
+            "ck_run_execution_inputs_positive_schema_version",
+            "ck_run_execution_inputs_run_id_nonblank",
+            "ck_run_execution_inputs_sha256_identities",
+        },
+        "websocket_tickets": {
+            "ck_websocket_tickets_auth_provider_type",
+            "ck_websocket_tickets_digest_sha256",
+            "ck_websocket_tickets_run_id_nonblank",
+            "ck_websocket_tickets_user_id_nonblank",
+        },
+        "composer_inflight_requests": {
+            "ck_composer_inflight_requests_operation_id_nonblank",
+            "ck_composer_inflight_requests_positive_epoch",
+            "ck_composer_inflight_requests_request_id_nonblank",
+            "ck_composer_inflight_requests_session_id_nonblank",
+            "ck_composer_inflight_requests_user_id_nonblank",
+        },
+        "composer_progress_snapshots": {
+            "ck_composer_progress_snapshots_operation_id_nonblank",
+            "ck_composer_progress_snapshots_phase",
+            "ck_composer_progress_snapshots_positive_epoch",
+            "ck_composer_progress_snapshots_request_id_nonblank",
+            "ck_composer_progress_snapshots_session_id_nonblank",
+            "ck_composer_progress_snapshots_user_id_nonblank",
+        },
+        "rate_limit_buckets": {
+            "ck_rate_limit_buckets_digest_sha256",
+            "ck_rate_limit_buckets_positive_window",
+        },
+        "rate_limit_events": {
+            "ck_rate_limit_events_digest_sha256",
+            "ck_rate_limit_events_event_id_nonblank",
+        },
+        "sessions_cleanup_claims": {
+            "ck_sessions_cleanup_claims_bounded_counts",
+            "ck_sessions_cleanup_claims_name_nonblank",
+            "ck_sessions_cleanup_claims_owner_nonblank",
+            "ck_sessions_cleanup_claims_positive_epoch",
+            "ck_sessions_cleanup_claims_token_nonblank",
+            "ck_sessions_cleanup_claims_token_not_owner",
+        },
+    }
+    for table_name, check_names in expected_checks.items():
+        assert {check["name"] for check in inspector.get_check_constraints(table_name)} == check_names, table_name
+
+    run_checks = {check["name"] for check in inspector.get_check_constraints("runs")}
+    assert {"ck_runs_id_nonblank", "ck_runs_session_id_nonblank", "ck_runs_ownership_all_or_none"} <= run_checks
+    user_secret_checks = {check["name"] for check in inspector.get_check_constraints("user_secrets")}
+    assert "ck_user_secrets_id_nonblank" in user_secret_checks
 
 
 def test_session_operation_authority_shape_retains_exact_nonnull_fields() -> None:
@@ -221,9 +374,288 @@ def test_postgres_schema_uses_postgres_non_blank_check_syntax() -> None:
     assert "ck_blobs_creating_llm_provenance_nullability" in ddl
     assert "btrim(composer_model_identifier" in ddl
     assert "btrim(creating_model_identifier" in ddl
+    for constraint_name in (
+        "ck_web_instances_instance_id_nonblank",
+        "ck_session_operation_fences_session_id_nonblank",
+        "ck_runs_id_nonblank",
+        "ck_runs_session_id_nonblank",
+        "ck_runs_ownership_all_or_none",
+        "ck_run_start_permits_run_id_nonblank",
+        "ck_run_start_permits_state_fields",
+        "ck_run_execution_inputs_run_id_nonblank",
+        "ck_run_execution_inputs_deployment_generation_nonblank",
+        "ck_websocket_tickets_run_id_nonblank",
+        "ck_composer_inflight_requests_request_id_nonblank",
+        "ck_composer_progress_snapshots_session_id_nonblank",
+        "ck_composer_progress_snapshots_request_id_nonblank",
+        "ck_rate_limit_events_event_id_nonblank",
+        "ck_sessions_cleanup_claims_name_nonblank",
+        "ck_user_secrets_id_nonblank",
+    ):
+        assert constraint_name in ddl
+    assert "ck_run_execution_inputs_sha256_identities" in ddl
+    assert "~ '^[a-f0-9]+$'" in ddl
     assert "chr(9)" in ddl
     assert "char(9)" not in ddl
     assert " NOT GLOB " not in ddl
+    assert "length(trim(" not in ddl
+
+
+@pytest.mark.parametrize("blank", ["\t", "\n", "\r", "\t\n\r "])
+def test_coordination_identifiers_reject_ascii_whitespace(engine, blank: str) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn, pytest.raises(IntegrityError):
+        conn.execute(
+            insert(web_instances_table).values(
+                instance_id=blank,
+                deployment_target="web",
+                deployment_generation="generation-1",
+                session_epoch=SESSION_SCHEMA_EPOCH,
+                landscape_epoch=1,
+                coordination_protocol=1,
+                image_digest="sha256:image",
+                revision_label="revision-1",
+                state="active",
+                started_at=now,
+                last_heartbeat_at=now,
+                lease_expires_at=now,
+            )
+        )
+
+
+def test_session_operation_fence_rejects_ascii_whitespace_authority(engine) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        session_id, _ = _seed_session_state(conn)
+        with pytest.raises(IntegrityError):
+            conn.execute(
+                insert(session_operation_fences_table).values(
+                    session_id=session_id,
+                    operation_id="\t",
+                    lease_token="\n",
+                    operation_kind="execute",
+                    owner_instance_id="\r",
+                    operation_epoch=1,
+                    lease_expires_at=now,
+                )
+            )
+
+
+def test_nullable_composer_progress_request_id_rejects_ascii_whitespace(engine) -> None:
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+    with engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=session_id,
+                user_id="alice",
+                auth_provider_type="local",
+                title="Schema test",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            conn.execute(
+                insert(composer_progress_snapshots_table).values(
+                    session_id=session_id,
+                    request_id="\t\n\r",
+                    user_id="alice",
+                    phase="starting",
+                    headline="Starting",
+                    evidence=[],
+                    operation_id="operation-1",
+                    operation_epoch=1,
+                    updated_at=now,
+                    expires_at=now,
+                )
+            )
+
+
+def test_runs_id_rejects_ascii_whitespace(engine) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        session_id, state_id = _seed_session_state(conn)
+        with pytest.raises(IntegrityError, match="ck_runs_id_nonblank"):
+            conn.execute(
+                insert(runs_table).values(
+                    id="\t",
+                    session_id=session_id,
+                    state_id=state_id,
+                    status="completed",
+                    started_at=now,
+                )
+            )
+
+
+def test_runs_session_id_rejects_ascii_whitespace(engine) -> None:
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_runs_session_id_nonblank"):
+        conn.execute(
+            insert(runs_table).values(
+                id=str(uuid.uuid4()),
+                session_id="\n",
+                state_id=str(uuid.uuid4()),
+                status="completed",
+                started_at=datetime.now(UTC),
+            )
+        )
+
+
+def test_run_start_permit_run_id_rejects_ascii_whitespace(engine) -> None:
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_run_start_permits_run_id_nonblank"):
+        conn.execute(insert(run_start_permits_table).values(run_id="\r", start_state="pending"))
+
+
+def test_run_execution_input_run_id_rejects_ascii_whitespace(engine) -> None:
+    valid_hash = "a" * 64
+    values = {
+        "run_id": "\t",
+        "schema_version": 1,
+        "envelope": {},
+        **dict.fromkeys(_EXECUTION_IDENTITY_COLUMNS, valid_hash),
+        "deployment_generation": "generation-1",
+        "session_epoch": SESSION_SCHEMA_EPOCH,
+        "landscape_epoch": 1,
+        "coordination_protocol": 1,
+        "automatic_recovery_eligible": True,
+        "created_at": datetime.now(UTC),
+    }
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_run_execution_inputs_run_id_nonblank"):
+        conn.execute(insert(run_execution_inputs_table).values(**values))
+
+
+def test_websocket_ticket_run_id_rejects_ascii_whitespace(engine) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_websocket_tickets_run_id_nonblank"):
+        conn.execute(
+            insert(websocket_tickets_table).values(
+                ticket_digest="a" * 64,
+                run_id="\n",
+                user_id="alice",
+                auth_provider_type="local",
+                issued_at=now,
+                expires_at=now,
+            )
+        )
+
+
+def test_composer_progress_session_id_rejects_ascii_whitespace(engine) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_composer_progress_snapshots_session_id_nonblank"):
+        conn.execute(
+            insert(composer_progress_snapshots_table).values(
+                session_id="\r",
+                request_id=None,
+                user_id="alice",
+                phase="starting",
+                headline="Starting",
+                evidence=[],
+                operation_id="operation-1",
+                operation_epoch=1,
+                updated_at=now,
+                expires_at=now,
+            )
+        )
+
+
+_EXECUTION_IDENTITY_COLUMNS = (
+    "canonical_input_digest",
+    "topology_digest",
+    "source_manifest_digest",
+    "application_fingerprint",
+    "plugin_registry_fingerprint",
+    "configuration_fingerprint",
+    "graph_fingerprint",
+    "runtime_fingerprint",
+    "implementation_fingerprint",
+)
+
+
+@pytest.mark.parametrize("column_name", _EXECUTION_IDENTITY_COLUMNS)
+def test_run_execution_inputs_reject_malformed_sha256_identity(engine, column_name: str) -> None:
+    now = datetime.now(UTC)
+    valid_hash = "a" * 64
+    values = {
+        "schema_version": 1,
+        "envelope": {},
+        **dict.fromkeys(_EXECUTION_IDENTITY_COLUMNS, valid_hash),
+        "deployment_generation": "generation-1",
+        "session_epoch": SESSION_SCHEMA_EPOCH,
+        "landscape_epoch": 1,
+        "coordination_protocol": 1,
+        "automatic_recovery_eligible": True,
+        "created_at": now,
+    }
+    values[column_name] = "a" * 63
+
+    with engine.begin() as conn:
+        values["run_id"] = _seed_run(conn)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(run_execution_inputs_table).values(**values))
+
+
+@pytest.mark.parametrize("invalid_identity", ["A" * 64, "g" * 64, "\t" * 64])
+def test_run_execution_inputs_reject_non_lowercase_hex_identity(engine, invalid_identity: str) -> None:
+    now = datetime.now(UTC)
+    valid_hash = "a" * 64
+    values = {
+        "schema_version": 1,
+        "envelope": {},
+        **dict.fromkeys(_EXECUTION_IDENTITY_COLUMNS, valid_hash),
+        "canonical_input_digest": invalid_identity,
+        "deployment_generation": "generation-1",
+        "session_epoch": SESSION_SCHEMA_EPOCH,
+        "landscape_epoch": 1,
+        "coordination_protocol": 1,
+        "automatic_recovery_eligible": True,
+        "created_at": now,
+    }
+
+    with engine.begin() as conn:
+        values["run_id"] = _seed_run(conn)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(run_execution_inputs_table).values(**values))
+
+
+@pytest.mark.parametrize("blank", ["\t", "\n", "\r"])
+def test_run_execution_inputs_reject_blank_deployment_generation(engine, blank: str) -> None:
+    now = datetime.now(UTC)
+    valid_hash = "a" * 64
+    values = {
+        "schema_version": 1,
+        "envelope": {},
+        **dict.fromkeys(_EXECUTION_IDENTITY_COLUMNS, valid_hash),
+        "deployment_generation": blank,
+        "session_epoch": SESSION_SCHEMA_EPOCH,
+        "landscape_epoch": 1,
+        "coordination_protocol": 1,
+        "automatic_recovery_eligible": True,
+        "created_at": now,
+    }
+
+    with engine.begin() as conn:
+        values["run_id"] = _seed_run(conn)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(run_execution_inputs_table).values(**values))
+
+
+@pytest.mark.parametrize("blank", ["\t", "\n", "\r"])
+def test_user_secret_id_rejects_ascii_whitespace(engine, blank: str) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_user_secrets_id_nonblank"):
+        conn.execute(
+            insert(user_secrets_table).values(
+                id=blank,
+                name="api-key",
+                user_id="alice",
+                auth_provider_type="local",
+                encrypted_value=b"ciphertext",
+                salt=b"salt",
+                version=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
 
 def test_initialize_session_schema_is_idempotent_for_current_schema() -> None:

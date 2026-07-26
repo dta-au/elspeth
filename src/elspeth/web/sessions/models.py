@@ -186,6 +186,36 @@ def _sql_non_blank_text(column_name: str, *, dialect: Literal["sqlite", "postgre
     return f"length(btrim({column_name}, {_POSTGRESQL_ASCII_WHITESPACE})) > 0"
 
 
+def _non_blank_text_constraints(
+    column_name: str,
+    *,
+    name: str,
+    nullable: bool = False,
+) -> tuple[CheckConstraint, CheckConstraint]:
+    def expression(dialect: Literal["sqlite", "postgresql"]) -> str:
+        non_blank = _sql_non_blank_text(column_name, dialect=dialect)
+        return f"{column_name} IS NULL OR {non_blank}" if nullable else non_blank
+
+    return (
+        CheckConstraint(expression("sqlite"), name=name).ddl_if(dialect="sqlite"),
+        CheckConstraint(expression("postgresql"), name=name).ddl_if(dialect="postgresql"),
+    )
+
+
+def _lower_sha256_check(column_name: str, *, dialect: Literal["sqlite", "postgresql"]) -> str:
+    base = f"length({column_name}) = 64"
+    if dialect == "sqlite":
+        return f"{base} AND {column_name} NOT GLOB '*[^a-f0-9]*'"
+    return f"{base} AND {column_name} ~ '^[a-f0-9]+$'"
+
+
+def _lower_sha256_constraints(column_name: str, *, name: str) -> tuple[CheckConstraint, CheckConstraint]:
+    return (
+        CheckConstraint(_lower_sha256_check(column_name, dialect="sqlite"), name=name).ddl_if(dialect="sqlite"),
+        CheckConstraint(_lower_sha256_check(column_name, dialect="postgresql"), name=name).ddl_if(dialect="postgresql"),
+    )
+
+
 def _composition_proposals_composer_provenance_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
     return (
         "((composer_model_identifier IS NULL AND composer_model_version IS NULL AND "
@@ -353,11 +383,11 @@ web_instances_table = Table(
     Column("started_at", DateTime(timezone=True), nullable=False),
     Column("last_heartbeat_at", DateTime(timezone=True), nullable=False),
     Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
-    CheckConstraint("length(trim(instance_id)) > 0", name="ck_web_instances_instance_id_nonblank"),
-    CheckConstraint("length(trim(deployment_target)) > 0", name="ck_web_instances_target_nonblank"),
-    CheckConstraint("length(trim(deployment_generation)) > 0", name="ck_web_instances_generation_nonblank"),
-    CheckConstraint("length(trim(image_digest)) > 0", name="ck_web_instances_image_digest_nonblank"),
-    CheckConstraint("length(trim(revision_label)) > 0", name="ck_web_instances_revision_label_nonblank"),
+    *_non_blank_text_constraints("instance_id", name="ck_web_instances_instance_id_nonblank"),
+    *_non_blank_text_constraints("deployment_target", name="ck_web_instances_target_nonblank"),
+    *_non_blank_text_constraints("deployment_generation", name="ck_web_instances_generation_nonblank"),
+    *_non_blank_text_constraints("image_digest", name="ck_web_instances_image_digest_nonblank"),
+    *_non_blank_text_constraints("revision_label", name="ck_web_instances_revision_label_nonblank"),
     CheckConstraint(
         "session_epoch > 0 AND landscape_epoch > 0 AND coordination_protocol > 0",
         name="ck_web_instances_positive_compatibility",
@@ -392,10 +422,10 @@ session_operation_fences_table = Table(
     Column("operation_epoch", Integer, nullable=False),
     Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
     Column("released_at", DateTime(timezone=True), nullable=True),
-    CheckConstraint("length(trim(session_id)) > 0", name="ck_session_operation_fences_session_id_nonblank"),
-    CheckConstraint("length(trim(operation_id)) > 0", name="ck_session_operation_fences_operation_id_nonblank"),
-    CheckConstraint("length(trim(lease_token)) > 0", name="ck_session_operation_fences_lease_token_nonblank"),
-    CheckConstraint("length(trim(owner_instance_id)) > 0", name="ck_session_operation_fences_owner_nonblank"),
+    *_non_blank_text_constraints("session_id", name="ck_session_operation_fences_session_id_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_session_operation_fences_operation_id_nonblank"),
+    *_non_blank_text_constraints("lease_token", name="ck_session_operation_fences_lease_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_session_operation_fences_owner_nonblank"),
     CheckConstraint("lease_token <> owner_instance_id", name="ck_session_operation_fences_token_not_owner"),
     CheckConstraint("operation_epoch > 0", name="ck_session_operation_fences_positive_epoch"),
     CheckConstraint(
@@ -705,15 +735,6 @@ composition_proposals_table = Table(
         name="ck_composition_proposals_composer_provenance_all_or_none",
     ).ddl_if(dialect="postgresql"),
 )
-
-
-def _lower_sha256_check(column_name: str, *, dialect: Literal["sqlite", "postgresql"]) -> str:
-    base = f"length({column_name}) = 64"
-    if dialect == "sqlite":
-        return f"{base} AND {column_name} NOT GLOB '*[^a-f0-9]*'"
-    return f"{base} AND {column_name} ~ '^[a-f0-9]+$'"
-
-
 # Durable negative admission authority for a guided start whose client lost
 # its request body before the server ever reserved an operation row. The row
 # deliberately carries no request hash or raw intent: an exact operation id is
@@ -1969,6 +1990,16 @@ for postgresql_audit_ddl in POSTGRESQL_AUDIT_DDL_COHORT:
         DDL(postgresql_audit_ddl.trigger_sql).execute_if(dialect="postgresql"),  # type: ignore[no-untyped-call]
     )
 
+
+def _runs_ownership_all_or_none_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return (
+        "((owner_instance_id IS NULL AND owner_epoch IS NULL AND owner_lease_expires_at IS NULL) OR "
+        "(owner_instance_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('owner_instance_id', dialect=dialect)} AND "
+        "owner_epoch IS NOT NULL AND owner_epoch > 0 AND owner_lease_expires_at IS NOT NULL))"
+    )
+
+
 runs_table = Table(
     "runs",
     metadata,
@@ -2019,12 +2050,16 @@ runs_table = Table(
         "status IN ('pending', 'running', 'completed', 'completed_with_failures', 'failed', 'empty', 'cancelled')",
         name="ck_runs_status",
     ),
+    *_non_blank_text_constraints("id", name="ck_runs_id_nonblank"),
+    *_non_blank_text_constraints("session_id", name="ck_runs_session_id_nonblank"),
     CheckConstraint(
-        "((owner_instance_id IS NULL AND owner_epoch IS NULL AND owner_lease_expires_at IS NULL) OR "
-        "(owner_instance_id IS NOT NULL AND length(trim(owner_instance_id)) > 0 AND "
-        "owner_epoch IS NOT NULL AND owner_epoch > 0 AND owner_lease_expires_at IS NOT NULL))",
+        _runs_ownership_all_or_none_check(dialect="sqlite"),
         name="ck_runs_ownership_all_or_none",
-    ),
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _runs_ownership_all_or_none_check(dialect="postgresql"),
+        name="ck_runs_ownership_all_or_none",
+    ).ddl_if(dialect="postgresql"),
     CheckConstraint(
         "cancellation_source IS NULL OR cancellation_source IN ('user', 'operator', 'shutdown', 'reconciler')",
         name="ck_runs_cancellation_source",
@@ -2077,6 +2112,31 @@ _RUN_START_PERMIT_SUBJECT_IS_NULL = (
     "checkpoint_subject_hash IS NULL AND deployment_generation IS NULL AND session_epoch IS NULL AND "
     "landscape_epoch IS NULL AND coordination_protocol IS NULL AND permit_subject_hash IS NULL AND issued_at IS NULL"
 )
+
+
+def _run_start_permits_state_fields_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return (
+        f"((start_state = 'pending' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NULL) OR "
+        f"(start_state = 'cancelled_before_permit' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NOT NULL) OR "
+        "(start_state = 'start_permitted' AND permit_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('permit_id', dialect=dialect)} AND "
+        "permit_epoch IS NOT NULL AND permit_epoch > 0 AND session_operation_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('session_operation_id', dialect=dialect)} AND "
+        "session_operation_epoch IS NOT NULL AND session_operation_epoch > 0 AND run_owner_instance_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('run_owner_instance_id', dialect=dialect)} AND "
+        "run_owner_epoch IS NOT NULL AND run_owner_epoch > 0 AND envelope_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('envelope_hash', dialect=dialect)} AND topology_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('topology_hash', dialect=dialect)} AND source_manifest_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('source_manifest_hash', dialect=dialect)} AND checkpoint_subject_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('checkpoint_subject_hash', dialect=dialect)} AND deployment_generation IS NOT NULL AND "
+        f"{_sql_non_blank_text('deployment_generation', dialect=dialect)} AND "
+        "session_epoch IS NOT NULL AND session_epoch > 0 AND landscape_epoch IS NOT NULL AND landscape_epoch > 0 AND "
+        "coordination_protocol IS NOT NULL AND coordination_protocol > 0 AND permit_subject_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('permit_subject_hash', dialect=dialect)} AND "
+        "issued_at IS NOT NULL AND cancelled_at IS NULL))"
+    )
+
+
 run_start_permits_table = Table(
     "run_start_permits",
     metadata,
@@ -2101,31 +2161,37 @@ run_start_permits_table = Table(
     Column("cancelled_at", DateTime(timezone=True), nullable=True),
     Column("retention_expires_at", DateTime(timezone=True), nullable=True, index=True),
     CheckConstraint("start_state IN ('pending', 'start_permitted', 'cancelled_before_permit')", name="ck_run_start_permits_state"),
+    *_non_blank_text_constraints("run_id", name="ck_run_start_permits_run_id_nonblank"),
     CheckConstraint(
-        f"((start_state = 'pending' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NULL) OR "
-        f"(start_state = 'cancelled_before_permit' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NOT NULL) OR "
-        "(start_state = 'start_permitted' AND permit_id IS NOT NULL AND length(trim(permit_id)) > 0 AND "
-        "permit_epoch IS NOT NULL AND permit_epoch > 0 AND "
-        "session_operation_id IS NOT NULL AND length(trim(session_operation_id)) > 0 AND "
-        "session_operation_epoch IS NOT NULL AND session_operation_epoch > 0 AND "
-        "run_owner_instance_id IS NOT NULL AND length(trim(run_owner_instance_id)) > 0 AND "
-        "run_owner_epoch IS NOT NULL AND run_owner_epoch > 0 AND "
-        "envelope_hash IS NOT NULL AND length(envelope_hash) = 64 AND "
-        "topology_hash IS NOT NULL AND length(topology_hash) = 64 AND "
-        "source_manifest_hash IS NOT NULL AND length(source_manifest_hash) = 64 AND "
-        "checkpoint_subject_hash IS NOT NULL AND length(checkpoint_subject_hash) = 64 AND "
-        "deployment_generation IS NOT NULL AND length(trim(deployment_generation)) > 0 AND "
-        "session_epoch IS NOT NULL AND session_epoch > 0 AND landscape_epoch IS NOT NULL AND landscape_epoch > 0 AND "
-        "coordination_protocol IS NOT NULL AND coordination_protocol > 0 AND "
-        "permit_subject_hash IS NOT NULL AND length(permit_subject_hash) = 64 AND "
-        "issued_at IS NOT NULL AND cancelled_at IS NULL))",
+        _run_start_permits_state_fields_check(dialect="sqlite"),
         name="ck_run_start_permits_state_fields",
-    ),
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _run_start_permits_state_fields_check(dialect="postgresql"),
+        name="ck_run_start_permits_state_fields",
+    ).ddl_if(dialect="postgresql"),
 )
 
 # Immutable, secret-reference-only envelope substrate. Task 8 owns the public
 # serialization and resolver carrier; epoch 37 reserves and constrains its
 # durable shape now so deployment compatibility cannot drift underneath it.
+_RUN_EXECUTION_IDENTITY_COLUMNS = (
+    "canonical_input_digest",
+    "topology_digest",
+    "source_manifest_digest",
+    "application_fingerprint",
+    "plugin_registry_fingerprint",
+    "configuration_fingerprint",
+    "graph_fingerprint",
+    "runtime_fingerprint",
+    "implementation_fingerprint",
+)
+
+
+def _run_execution_inputs_identity_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return " AND ".join(f"({_lower_sha256_check(column_name, dialect=dialect)})" for column_name in _RUN_EXECUTION_IDENTITY_COLUMNS)
+
+
 run_execution_inputs_table = Table(
     "run_execution_inputs",
     metadata,
@@ -2147,6 +2213,19 @@ run_execution_inputs_table = Table(
     Column("coordination_protocol", Integer, nullable=False),
     Column("automatic_recovery_eligible", Boolean, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
+    *_non_blank_text_constraints("run_id", name="ck_run_execution_inputs_run_id_nonblank"),
+    *_non_blank_text_constraints(
+        "deployment_generation",
+        name="ck_run_execution_inputs_deployment_generation_nonblank",
+    ),
+    CheckConstraint(
+        _run_execution_inputs_identity_check(dialect="sqlite"),
+        name="ck_run_execution_inputs_sha256_identities",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _run_execution_inputs_identity_check(dialect="postgresql"),
+        name="ck_run_execution_inputs_sha256_identities",
+    ).ddl_if(dialect="postgresql"),
     CheckConstraint("schema_version > 0", name="ck_run_execution_inputs_positive_schema_version"),
     CheckConstraint(
         "session_epoch > 0 AND landscape_epoch > 0 AND coordination_protocol > 0",
@@ -2164,8 +2243,9 @@ websocket_tickets_table = Table(
     Column("issued_at", DateTime(timezone=True), nullable=False),
     Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
     Column("consumed_at", DateTime(timezone=True), nullable=True),
-    CheckConstraint("length(ticket_digest) = 64", name="ck_websocket_tickets_digest_length"),
-    CheckConstraint("length(trim(user_id)) > 0", name="ck_websocket_tickets_user_id_nonblank"),
+    *_lower_sha256_constraints("ticket_digest", name="ck_websocket_tickets_digest_sha256"),
+    *_non_blank_text_constraints("run_id", name="ck_websocket_tickets_run_id_nonblank"),
+    *_non_blank_text_constraints("user_id", name="ck_websocket_tickets_user_id_nonblank"),
     CheckConstraint(_AUTH_PROVIDER_TYPE_CHECK, name="ck_websocket_tickets_auth_provider_type"),
 )
 
@@ -2181,10 +2261,10 @@ composer_inflight_requests_table = Table(
     Column("updated_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True), nullable=True),
     Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
-    CheckConstraint("length(trim(request_id)) > 0", name="ck_composer_inflight_requests_request_id_nonblank"),
-    CheckConstraint("length(trim(session_id)) > 0", name="ck_composer_inflight_requests_session_id_nonblank"),
-    CheckConstraint("length(trim(user_id)) > 0", name="ck_composer_inflight_requests_user_id_nonblank"),
-    CheckConstraint("length(trim(operation_id)) > 0", name="ck_composer_inflight_requests_operation_id_nonblank"),
+    *_non_blank_text_constraints("request_id", name="ck_composer_inflight_requests_request_id_nonblank"),
+    *_non_blank_text_constraints("session_id", name="ck_composer_inflight_requests_session_id_nonblank"),
+    *_non_blank_text_constraints("user_id", name="ck_composer_inflight_requests_user_id_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_composer_inflight_requests_operation_id_nonblank"),
     CheckConstraint("operation_epoch > 0", name="ck_composer_inflight_requests_positive_epoch"),
 )
 
@@ -2203,8 +2283,14 @@ composer_progress_snapshots_table = Table(
     Column("operation_epoch", Integer, nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
-    CheckConstraint("length(trim(user_id)) > 0", name="ck_composer_progress_snapshots_user_id_nonblank"),
-    CheckConstraint("length(trim(operation_id)) > 0", name="ck_composer_progress_snapshots_operation_id_nonblank"),
+    *_non_blank_text_constraints("session_id", name="ck_composer_progress_snapshots_session_id_nonblank"),
+    *_non_blank_text_constraints(
+        "request_id",
+        name="ck_composer_progress_snapshots_request_id_nonblank",
+        nullable=True,
+    ),
+    *_non_blank_text_constraints("user_id", name="ck_composer_progress_snapshots_user_id_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_composer_progress_snapshots_operation_id_nonblank"),
     CheckConstraint("operation_epoch > 0", name="ck_composer_progress_snapshots_positive_epoch"),
     CheckConstraint(
         "phase IN ('idle', 'starting', 'calling_model', 'using_tools', 'validating', 'saving', 'complete', 'failed', 'cancelled')",
@@ -2219,7 +2305,7 @@ rate_limit_buckets_table = Table(
     Column("window_seconds", Integer, nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
-    CheckConstraint("length(subject_digest) = 64", name="ck_rate_limit_buckets_digest_length"),
+    *_lower_sha256_constraints("subject_digest", name="ck_rate_limit_buckets_digest_sha256"),
     CheckConstraint("window_seconds > 0", name="ck_rate_limit_buckets_positive_window"),
 )
 
@@ -2235,8 +2321,8 @@ rate_limit_events_table = Table(
     ),
     Column("occurred_at", DateTime(timezone=True), nullable=False),
     Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
-    CheckConstraint("length(trim(event_id)) > 0", name="ck_rate_limit_events_event_id_nonblank"),
-    CheckConstraint("length(subject_digest) = 64", name="ck_rate_limit_events_digest_length"),
+    *_non_blank_text_constraints("event_id", name="ck_rate_limit_events_event_id_nonblank"),
+    *_lower_sha256_constraints("subject_digest", name="ck_rate_limit_events_digest_sha256"),
 )
 Index("ix_rate_limit_events_subject_occurred", rate_limit_events_table.c.subject_digest, rate_limit_events_table.c.occurred_at)
 
@@ -2254,9 +2340,9 @@ sessions_cleanup_claims_table = Table(
     Column("max_batches", Integer, nullable=False),
     Column("acquired_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
-    CheckConstraint("length(trim(claim_name)) > 0", name="ck_sessions_cleanup_claims_name_nonblank"),
-    CheckConstraint("length(trim(claim_token)) > 0", name="ck_sessions_cleanup_claims_token_nonblank"),
-    CheckConstraint("length(trim(owner_instance_id)) > 0", name="ck_sessions_cleanup_claims_owner_nonblank"),
+    *_non_blank_text_constraints("claim_name", name="ck_sessions_cleanup_claims_name_nonblank"),
+    *_non_blank_text_constraints("claim_token", name="ck_sessions_cleanup_claims_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_sessions_cleanup_claims_owner_nonblank"),
     CheckConstraint("claim_token <> owner_instance_id", name="ck_sessions_cleanup_claims_token_not_owner"),
     CheckConstraint("claim_epoch > 0", name="ck_sessions_cleanup_claims_positive_epoch"),
     CheckConstraint(
@@ -2559,6 +2645,7 @@ user_secrets_table = Table(
         _AUTH_PROVIDER_TYPE_CHECK,
         name="ck_user_secrets_auth_provider_type",
     ),
+    *_non_blank_text_constraints("id", name="ck_user_secrets_id_nonblank"),
     CheckConstraint("version > 0", name="ck_user_secrets_positive_version"),
 )
 Index("ix_user_secrets_user_provider", user_secrets_table.c.user_id, user_secrets_table.c.auth_provider_type)
