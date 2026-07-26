@@ -930,7 +930,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
 
         with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
-            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
+            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
         assert result.is_valid is False
         assert _check(result, "web_scrape_network_policy").passed is False
@@ -938,6 +938,28 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         assert result.errors[0].error_code == "web_scrape_private_network_not_allowed"
         assert "allow_private" in result.errors[0].message
         mock_yaml_gen.generate_yaml.assert_not_called()
+
+    @pytest.mark.parametrize("plugin", ["web_scrape", "blob_fetch"])
+    def test_trained_operator_private_network_allowlist_is_exempt_from_web_policy(self, plugin: str) -> None:
+        options = self._web_scrape_options("allow_private") if plugin == "web_scrape" else self._blob_fetch_options("allow_private")
+        state = _make_state(
+            nodes=(_make_node(plugin=plugin, options=options),),
+            outputs=(_make_output(name="results"),),
+        )
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+            mock_load.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_trained_operator(state, _make_settings(), mock_yaml_gen)
+
+        assert _check(result, "web_scrape_network_policy").passed is True
+        assert "trained-operator" in _check(result, "web_scrape_network_policy").detail
+        assert all(
+            error.error_code not in {"web_scrape_private_network_not_allowed", "web_fetch_private_network_not_allowed"}
+            for error in result.errors
+        )
+        mock_load.assert_called_once()
 
     def test_blob_fetch_allow_private_rejected_before_yaml_generation(self) -> None:
         state = _make_state(
@@ -955,7 +977,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
 
         with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
-            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
+            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
         assert result.is_valid is False
         assert _check(result, "web_scrape_network_policy").passed is False
@@ -1070,7 +1092,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
 
         with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
-            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
+            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
         assert result.is_valid is False
         assert _check(result, "web_scrape_network_policy").passed is False
@@ -1100,7 +1122,7 @@ class TestValidatePipelineWebFetchNetworkPolicy:
 
         with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
             mock_load.side_effect = ValueError("settings stop")
-            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
+            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
         assert result.is_valid is False
         assert _check(result, "web_scrape_network_policy").passed is False
@@ -1320,6 +1342,32 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
 
     _ENDPOINT_SENTINEL = "https://credential-canary.attacker.invalid/private"
 
+    @pytest.mark.parametrize("component", ["source", "sink"])
+    def test_trained_operator_aws_s3_endpoint_url_is_exempt_from_web_policy(self, component: str) -> None:
+        endpoint_options = {"endpoint_url": "https://minio.operator.invalid"}
+        state = (
+            _make_state(
+                source_plugin="aws_s3",
+                source_options=endpoint_options,
+                outputs=(_make_output(name="results"),),
+            )
+            if component == "source"
+            else _make_state(
+                outputs=(_make_output(name="archive", plugin="aws_s3", options=endpoint_options),),
+            )
+        )
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+            mock_load.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_trained_operator(state, _make_settings(), mock_yaml_gen)
+
+        assert _check(result, "aws_s3_endpoint_url_policy").passed is True
+        assert "trained-operator" in _check(result, "aws_s3_endpoint_url_policy").detail
+        assert all(error.error_code != "aws_s3_endpoint_url_not_allowed" for error in result.errors)
+        mock_load.assert_called_once()
+
     def test_aws_s3_source_endpoint_url_is_blocked_before_settings_or_plugins(self) -> None:
         state = _make_state(
             source_plugin="aws_s3",
@@ -1334,7 +1382,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
             patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
         ):
-            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
+            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
         assert result.is_valid is False
         assert _check(result, "aws_s3_endpoint_url_policy").passed is False
@@ -1366,7 +1414,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
             patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
         ):
-            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
+            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
         assert result.is_valid is False
         assert _check(result, "aws_s3_endpoint_url_policy").passed is False
@@ -1473,7 +1521,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
         with capture_logs() as logs:
-            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
+            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
         assert result.errors[0].message == AWS_S3_ENDPOINT_URL_POLICY_ERROR
         serialized_surfaces = (

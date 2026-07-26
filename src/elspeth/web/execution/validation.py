@@ -1138,7 +1138,7 @@ def validate_pipeline(
 
     web_fetch_network_errors: list[ValidationError] = []
     for node in state.nodes:
-        if node.plugin not in _WEB_FETCH_TRANSFORMS:
+        if plugin_snapshot.principal_scope == "local:trained-operator" or node.plugin not in _WEB_FETCH_TRANSFORMS:
             continue
         http_options = node.options["http"] if "http" in node.options else None
         if not isinstance(http_options, Mapping):
@@ -1200,7 +1200,11 @@ def validate_pipeline(
         ValidationCheck(
             name=_CHECK_WEB_SCRAPE_NETWORK_POLICY,
             passed=True,
-            detail="No web fetch transform private-network allowlists found",
+            detail=(
+                "No web fetch transform private-network allowlists found"
+                if plugin_snapshot.principal_scope != "local:trained-operator"
+                else "Local trained-operator validation is exempt from the web fetch private-network policy"
+            ),
             affected_nodes=(),
             outcome_code=None,
         )
@@ -1872,7 +1876,11 @@ def validate_pipeline(
     )
 
     for source_name, source in state.sources.items():
-        endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
+        endpoint_policy_error = (
+            None
+            if plugin_snapshot.principal_scope == "local:trained-operator"
+            else web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
+        )
         if endpoint_policy_error is None:
             continue
         source_component = "source" if source_name == "source" else f"source:{source_name}"
@@ -1908,7 +1916,11 @@ def validate_pipeline(
         )
 
     for output in state.outputs:
-        endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(output.plugin, output.options)
+        endpoint_policy_error = (
+            None
+            if plugin_snapshot.principal_scope == "local:trained-operator"
+            else web_aws_s3_endpoint_url_policy_error(output.plugin, output.options)
+        )
         if endpoint_policy_error is None:
             continue
         checks.append(
@@ -1946,7 +1958,11 @@ def validate_pipeline(
         ValidationCheck(
             name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
             passed=True,
-            detail="No web-authored aws_s3 endpoint_url override",
+            detail=(
+                "No web-authored aws_s3 endpoint_url override"
+                if plugin_snapshot.principal_scope != "local:trained-operator"
+                else "Local trained-operator validation is exempt from the web aws_s3 endpoint_url policy"
+            ),
             affected_nodes=(),
             outcome_code=None,
         )
