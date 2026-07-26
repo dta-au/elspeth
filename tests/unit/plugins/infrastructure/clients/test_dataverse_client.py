@@ -491,6 +491,43 @@ class TestErrorClassification:
         assert exc_info.value.retryable is retryable
         assert exc_info.value.status_code == status_code
 
+    @pytest.mark.parametrize("status_code", [400, 404, 409, 412, 422])
+    def test_patch_row_errors_are_classified_as_row_data(
+        self,
+        client: DataverseClient,
+        transport: MockTransport,
+        status_code: int,
+    ) -> None:
+        transport.add_response(httpx.Response(status_code=status_code, text=""))
+
+        with pytest.raises(DataverseClientError) as exc_info:
+            client.upsert(f"{ENV_URL}/api/data/v9.2/accounts(1)", {"name": "invalid"})
+
+        assert exc_info.value.retryable is False
+        assert exc_info.value.error_category == "row_data_error"
+
+    @pytest.mark.parametrize("status_code", [400, 403, 404, 409, 412, 422])
+    def test_get_client_errors_remain_protocol_errors(
+        self,
+        client: DataverseClient,
+        transport: MockTransport,
+        status_code: int,
+    ) -> None:
+        transport.add_response(httpx.Response(status_code=status_code, text=""))
+
+        with pytest.raises(DataverseClientError) as exc_info:
+            client.get_page(f"{ENV_URL}/api/data/v9.2/accounts")
+
+        assert exc_info.value.error_category == "protocol_error"
+
+    def test_patch_forbidden_remains_protocol_error(self, client: DataverseClient, transport: MockTransport) -> None:
+        transport.add_response(httpx.Response(status_code=403, text=""))
+
+        with pytest.raises(DataverseClientError) as exc_info:
+            client.upsert(f"{ENV_URL}/api/data/v9.2/accounts(1)", {"name": "invalid"})
+
+        assert exc_info.value.error_category == "protocol_error"
+
 
 # ---------------------------------------------------------------------------
 # Redirect rejection

@@ -367,6 +367,7 @@ class DataverseClient:
         headers: dict[str, str],
         latency_ms: float,
         *,
+        request_method: Literal["GET", "PATCH"],
         request_url: str | None = None,
         request_headers: dict[str, str] | None = None,
     ) -> DataverseClientError:
@@ -418,20 +419,23 @@ class DataverseClient:
                 request_headers=request_headers,
             )
 
-        # Non-retryable client errors
-        if status_code in (400, 403, 404, 409, 412):
+        # Non-retryable client errors. For writes, these statuses describe the
+        # submitted row and can be handled by the sink's per-row failure policy.
+        if status_code in (400, 403, 404, 409, 412, 422):
             labels = {
                 400: "Bad request",
                 403: "Forbidden",
                 404: "Not found",
                 409: "Conflict (duplicate)",
                 412: "Precondition failed (optimistic concurrency)",
+                422: "Unprocessable entity",
             }
             return DataverseClientError(
                 f"{labels[status_code]} ({status_code})",
                 retryable=False,
                 status_code=status_code,
                 latency_ms=latency_ms,
+                error_category=("row_data_error" if request_method == "PATCH" and status_code != 403 else "protocol_error"),
                 request_url=request_url,
                 request_headers=request_headers,
             )
@@ -459,7 +463,7 @@ class DataverseClient:
 
     def _execute_request(
         self,
-        method: str,
+        method: Literal["GET", "PATCH"],
         url: str,
         *,
         json_body: dict[str, Any] | None = None,
@@ -578,6 +582,7 @@ class DataverseClient:
                 response.status_code,
                 resp_headers,
                 latency_ms,
+                request_method=method,
                 request_url=url,
                 request_headers=fingerprinted,
             )
