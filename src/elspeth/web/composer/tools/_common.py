@@ -1314,7 +1314,7 @@ def _validate_plugin_name(
     name: str,
 ) -> PluginPolicyViolation | None:
     """Validate a new plugin selection against one request policy view."""
-    if plugin_type == "transform" and name in _STRUCTURAL_NODE_TYPE_GUIDANCE:
+    if isinstance(name, str) and plugin_type == "transform" and name in _STRUCTURAL_NODE_TYPE_GUIDANCE:
         return PluginPolicyViolation(
             error_code=PluginUnavailableReason.NOT_INSTALLED,
             message=_STRUCTURAL_NODE_TYPE_GUIDANCE[name],

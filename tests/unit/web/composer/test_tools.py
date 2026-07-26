@@ -14110,6 +14110,21 @@ class TestStructuralNodeTypeProbedAsPlugin:
         for fragment in expected_fragments:
             assert fragment in message, f"teaching message for {name!r} must mention {fragment!r}: {message}"
 
+    @pytest.mark.parametrize("name", [[], {}])
+    def test_get_plugin_schema_rejects_unhashable_name(self, name: object) -> None:
+        policy_catalog, snapshot = self._trained_pair()
+
+        result = execute_tool(
+            "get_plugin_schema",
+            {"plugin_type": "transform", "name": name},
+            _empty_state(),
+            policy_catalog,
+            plugin_snapshot=snapshot,
+        )
+
+        assert result.success is False
+        assert result.data["error_code"] == "not_installed"
+
 
 class TestExplainGateRouteLabels:
     def test_explains_gate_route_labels_mismatch(self) -> None:
