@@ -19,7 +19,13 @@ from tests.fixtures.dag_scenario_corpus import loader as corpus_loader
 from tests.fixtures.dag_scenario_corpus.harness import build_scenario, render_settings, run_scenario_case
 from tests.fixtures.dag_scenario_corpus.loader import iter_harness_cases, load_manifest, resolve_fixture_path
 from tests.fixtures.dag_scenario_corpus.plugins import install_corpus_plugin_manager
-from tests.fixtures.dag_scenario_corpus.schema import HarnessCaseSpec, ScenarioRunEvidence, ScenarioSpec
+from tests.fixtures.dag_scenario_corpus.schema import (
+    BuildExpectation,
+    HarnessCaseSpec,
+    RunExpectation,
+    ScenarioRunEvidence,
+    ScenarioSpec,
+)
 
 MANIFEST = load_manifest()
 RUN_CASES = [
@@ -29,6 +35,12 @@ RECOVERY_CASES = [
     pytest.param(scenario, case, id=f"{scenario.id}:{case.id}")
     for scenario, case in iter_harness_cases(MANIFEST)
     if case.workflow == "recovery"
+]
+BUILD_CASES = [
+    pytest.param("multiple-independent-sources", "independent-roots", id="multiple-independent-sources:independent-roots"),
+    pytest.param("multi-source-queue-fan-in", "queued-fan-in", id="multi-source-queue-fan-in:queued-fan-in"),
+    pytest.param("conditional-routing", "two-way-gate", id="conditional-routing:two-way-gate"),
+    pytest.param("fork-coalesce-policies", "require-all-nested", id="fork-coalesce-policies:require-all-nested"),
 ]
 
 
@@ -41,6 +53,7 @@ def _assert_declared_run_evidence(
     case: HarnessCaseSpec,
     evidence: ScenarioRunEvidence,
 ) -> None:
+    assert isinstance(case.expected, RunExpectation)
     fixture_path = resolve_fixture_path(case.fixture)
     input_path = resolve_fixture_path(case.input_fixture)
     expected_fixture_hash = hashlib.sha256(fixture_path.read_bytes() + b"\0" + input_path.read_bytes()).hexdigest()
@@ -56,6 +69,11 @@ def _assert_declared_run_evidence(
     assert evidence.graph.accepted is True
     assert evidence.graph.node_count is not None and evidence.graph.node_count > 0
     assert evidence.graph.edge_count is not None and evidence.graph.edge_count > 0
+    assert evidence.graph.node_type_counts is not None
+    assert sum(item.count for item in evidence.graph.node_type_counts) == evidence.graph.node_count
+    assert evidence.graph.edge_labels is not None
+    assert evidence.graph.edge_labels == tuple(sorted(evidence.graph.edge_labels))
+    assert len(evidence.graph.edge_labels) == evidence.graph.edge_count
     assert evidence.graph.topology_hash is not None
     assert len(evidence.graph.topology_hash) == 64
 
@@ -86,6 +104,7 @@ def _assert_declared_recovery_evidence(
     case: HarnessCaseSpec,
     evidence: ScenarioRunEvidence,
 ) -> None:
+    assert isinstance(case.expected, RunExpectation)
     fixture_path = resolve_fixture_path(case.fixture)
     input_path = resolve_fixture_path(case.input_fixture)
     expected_fixture_hash = hashlib.sha256(fixture_path.read_bytes() + b"\0" + input_path.read_bytes()).hexdigest()
@@ -100,6 +119,11 @@ def _assert_declared_recovery_evidence(
     assert evidence.graph.accepted is True
     assert evidence.graph.node_count is not None and evidence.graph.node_count > 0
     assert evidence.graph.edge_count is not None and evidence.graph.edge_count > 0
+    assert evidence.graph.node_type_counts is not None
+    assert sum(item.count for item in evidence.graph.node_type_counts) == evidence.graph.node_count
+    assert evidence.graph.edge_labels is not None
+    assert evidence.graph.edge_labels == tuple(sorted(evidence.graph.edge_labels))
+    assert len(evidence.graph.edge_labels) == evidence.graph.edge_count
     assert evidence.graph.topology_hash is not None and len(evidence.graph.topology_hash) == 64
 
     assert evidence.runtime.attempted is True
@@ -120,6 +144,84 @@ def _assert_declared_recovery_evidence(
     assert evidence.recovery.can_resume is True
     assert evidence.recovery.source_replayed is False
     assert evidence.recovery.checkpoint_removed is True
+
+
+def _assert_declared_build_evidence(
+    scenario: ScenarioSpec,
+    case: HarnessCaseSpec,
+    evidence: ScenarioRunEvidence,
+) -> None:
+    fixture_path = resolve_fixture_path(case.fixture)
+    input_path = resolve_fixture_path(case.input_fixture)
+    expected_fixture_hash = hashlib.sha256(fixture_path.read_bytes() + b"\0" + input_path.read_bytes()).hexdigest()
+    expected = case.expected
+    assert isinstance(expected, BuildExpectation)
+
+    assert evidence.schema_version == 1
+    assert (evidence.scenario_id, evidence.case_id) == (scenario.id, case.id)
+    assert evidence.fixture_sha256 == expected_fixture_hash
+    assert evidence.completed_stages == ("config", "build")
+
+    assert evidence.config.loaded is True
+    assert len(evidence.config.settings_sha256) == 64
+    assert evidence.graph.accepted is True
+    assert evidence.graph.node_count == expected.node_count
+    assert evidence.graph.edge_count == expected.edge_count
+    assert evidence.graph.node_type_counts == expected.node_type_counts
+    assert evidence.graph.edge_labels == expected.edge_labels
+    assert evidence.graph.topology_hash is not None and len(evidence.graph.topology_hash) == 64
+
+    assert evidence.runtime.model_dump() == {
+        "attempted": False,
+        "run_id": None,
+        "status": None,
+        "rows_processed": 0,
+        "rows_succeeded": 0,
+        "rows_failed": 0,
+        "output_rows": 0,
+    }
+    assert evidence.audit.model_dump() == {
+        "attempted": False,
+        "total_records": 0,
+        "record_counts": (),
+        "source_operation_count": 0,
+    }
+    assert evidence.recovery.model_dump() == {
+        "attempted": False,
+        "database_reopened": False,
+        "checkpoint_id": None,
+        "checkpoint_sequence": None,
+        "can_resume": False,
+        "source_replayed": False,
+        "checkpoint_removed": False,
+    }
+
+
+def test_build_workflow_has_dedicated_dispatcher() -> None:
+    assert callable(corpus_harness._build_case)
+
+
+@pytest.mark.parametrize(("scenario_id", "case_id"), BUILD_CASES)
+def test_declared_build_case_uses_complete_production_build_path(
+    scenario_id: str,
+    case_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case(scenario_id, case_id)
+
+    def forbid_runtime_or_audit(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("build-only corpus workflow crossed the runtime/audit boundary")
+
+    monkeypatch.setattr(corpus_harness, "Orchestrator", forbid_runtime_or_audit)
+    monkeypatch.setattr(corpus_harness, "LandscapeDB", forbid_runtime_or_audit)
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    _assert_declared_build_evidence(scenario, case, evidence)
+    assert not (tmp_path / "output.jsonl").exists()
+    assert not (tmp_path / "fault-triggered.marker").exists()
 
 
 def test_run_case_owns_production_preflight_without_pytest_defaults(
@@ -230,7 +332,17 @@ def test_generic_run_case_assertions_accept_future_case_shape(
         update={
             "scenario_id": future_scenario.id,
             "case_id": future_case.id,
-            "graph": evidence.graph.model_copy(update={"node_count": 7, "edge_count": 6}),
+            "graph": evidence.graph.model_copy(
+                update={
+                    "node_count": 7,
+                    "edge_count": 6,
+                    "node_type_counts": tuple(
+                        item.model_copy(update={"count": 4}) if item.node_type == "transform" else item
+                        for item in evidence.graph.node_type_counts or ()
+                    ),
+                    "edge_labels": ("continue", "continue", "continue", "continue", "on_error", "on_success"),
+                }
+            ),
         }
     )
 

@@ -274,6 +274,26 @@ evidence:
     locator: checkpoint-deterministic-resume:reopen-resume
     claim: The deterministic-resume corpus case exercises production restart and recovery with fresh objects.
     stages: [config, build, runtime, audit, recovery]
+  - id: harness-multiple-independent-sources-independent-roots
+    kind: harness
+    locator: multiple-independent-sources:independent-roots
+    claim: Two independently named source roots build through the production config and graph path into one shared sink.
+    stages: [config, build]
+  - id: harness-multi-source-queue-fan-in-queued-fan-in
+    kind: harness
+    locator: multi-source-queue-fan-in:queued-fan-in
+    claim: Two source roots build through an explicit scheduling queue and downstream transform into one sink.
+    stages: [config, build]
+  - id: harness-conditional-routing-two-way-gate
+    kind: harness
+    locator: conditional-routing:two-way-gate
+    claim: A two-way conditional gate builds through the production config and graph path with exact route edges.
+    stages: [config, build]
+  - id: harness-fork-coalesce-policies-require-all-nested
+    kind: harness
+    locator: fork-coalesce-policies:require-all-nested
+    claim: A two-branch fork and require-all nested merge build through the production config and graph path.
+    stages: [config, build]
 
 scenarios:
   - id: linear
@@ -343,7 +363,18 @@ scenarios:
   - id: multiple-independent-sources
     ordinal: 2
     title: Multiple independent sources
-    cases: []
+    cases:
+      - id: independent-roots
+        workflow: build
+        fixture: multiple-independent-sources/independent-roots.yaml
+        input_fixture: multiple-independent-sources/input.csv
+        expected:
+          node_count: 3
+          edge_count: 2
+          node_type_counts:
+            - {node_type: sink, count: 1}
+            - {node_type: source, count: 2}
+          edge_labels: [on_success, on_success]
     dimensions:
       config:
         status: pass
@@ -352,6 +383,7 @@ scenarios:
           - core-builder-schema-plural-sources-06
           - core-builder-schema-plural-sources-08
           - core-builder-schema-plural-sources-10
+          - harness-multiple-independent-sources-independent-roots
       build:
         status: pass
         evidence:
@@ -359,6 +391,7 @@ scenarios:
           - core-builder-schema-plural-sources-02
           - core-builder-schema-plural-sources-08
           - core-builder-schema-plural-sources-11
+          - harness-multiple-independent-sources-independent-roots
       contracts: *contracts_pass
       runtime: &runtime_partial
         status: partial
@@ -394,11 +427,27 @@ scenarios:
   - id: multi-source-queue-fan-in
     ordinal: 3
     title: Multi-source queue fan-in
-    cases: []
+    cases:
+      - id: queued-fan-in
+        workflow: build
+        fixture: multi-source-queue-fan-in/queued-fan-in.yaml
+        input_fixture: multi-source-queue-fan-in/input.csv
+        expected:
+          node_count: 5
+          edge_count: 4
+          node_type_counts:
+            - {node_type: queue, count: 1}
+            - {node_type: sink, count: 1}
+            - {node_type: source, count: 2}
+            - {node_type: transform, count: 1}
+          edge_labels: [continue, continue, continue, on_success]
     dimensions:
       config:
         status: pass
-        evidence: [core-builder-schema-plural-sources-04, core-builder-schema-plural-sources-09]
+        evidence:
+          - core-builder-schema-plural-sources-04
+          - core-builder-schema-plural-sources-09
+          - harness-multi-source-queue-fan-in-queued-fan-in
       build:
         status: pass
         evidence:
@@ -406,6 +455,7 @@ scenarios:
           - core-builder-schema-plural-sources-02
           - core-builder-schema-plural-sources-09
           - core-builder-schema-plural-sources-12
+          - harness-multi-source-queue-fan-in-queued-fan-in
       contracts:
         status: pass
         evidence:
@@ -432,12 +482,26 @@ scenarios:
   - id: conditional-routing
     ordinal: 4
     title: Conditional routing, including missing and error destinations
-    cases: []
+    cases:
+      - id: two-way-gate
+        workflow: build
+        fixture: conditional-routing/two-way-gate.yaml
+        input_fixture: conditional-routing/input.csv
+        expected:
+          node_count: 4
+          edge_count: 3
+          node_type_counts:
+            - {node_type: gate, count: 1}
+            - {node_type: sink, count: 2}
+            - {node_type: source, count: 1}
+          edge_labels: [continue, "false", "true"]
     dimensions:
-      config: &config_pass
+      config:
         status: pass
-        evidence: [yaml-importer-generator]
-      build: *build_pass
+        evidence: [yaml-importer-generator, harness-conditional-routing-two-way-gate]
+      build:
+        status: pass
+        evidence: [core-builder-schema-plural-sources, harness-conditional-routing-two-way-gate]
       contracts:
         status: pass
         evidence: [core-builder-schema-plural-sources-03, composer-runtime-agreement-07]
@@ -455,7 +519,9 @@ scenarios:
     title: Fork to multiple terminals with partial failure
     cases: []
     dimensions:
-      config: *config_pass
+      config: &config_pass
+        status: pass
+        evidence: [yaml-importer-generator]
       build: *build_pass
       contracts:
         status: pass
@@ -476,10 +542,27 @@ scenarios:
   - id: fork-coalesce-policies
     ordinal: 6
     title: Fork and coalesce across every completion policy and merge strategy
-    cases: []
+    cases:
+      - id: require-all-nested
+        workflow: build
+        fixture: fork-coalesce-policies/require-all-nested.yaml
+        input_fixture: fork-coalesce-policies/input.csv
+        expected:
+          node_count: 4
+          edge_count: 4
+          node_type_counts:
+            - {node_type: coalesce, count: 1}
+            - {node_type: gate, count: 1}
+            - {node_type: sink, count: 1}
+            - {node_type: source, count: 1}
+          edge_labels: [continue, on_success, path_a, path_b]
     dimensions:
-      config: *config_pass
-      build: *build_pass
+      config:
+        status: pass
+        evidence: [yaml-importer-generator, harness-fork-coalesce-policies-require-all-nested]
+      build:
+        status: pass
+        evidence: [core-builder-schema-plural-sources, harness-fork-coalesce-policies-require-all-nested]
       contracts:
         status: partial
         evidence:

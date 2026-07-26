@@ -8,7 +8,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select
 
@@ -38,6 +38,8 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     AuditRecordCount,
     ConfigEvidence,
     GraphEvidence,
+    GraphNodeType,
+    GraphNodeTypeCount,
     HarnessCaseSpec,
     RecoveryEvidence,
     RuntimeEvidence,
@@ -157,10 +159,16 @@ def build_scenario(
         sink_effect_modes=sink_effect_modes,
         sink_effect_admission=sink_effect_admission,
     )
+    node_type_counts = Counter(node.node_type.value for node in graph.get_nodes())
     graph_evidence = GraphEvidence(
         accepted=True,
         node_count=len(graph.get_nodes()),
         edge_count=len(graph.get_edges()),
+        node_type_counts=tuple(
+            GraphNodeTypeCount(node_type=cast(GraphNodeType, node_type), count=count)
+            for node_type, count in sorted(node_type_counts.items())
+        ),
+        edge_labels=tuple(sorted(edge.label for edge in graph.get_edges())),
         topology_hash=CheckpointCompatibilityValidator().compute_full_topology_hash(graph),
     )
     return BuiltScenario(rendered, bundle, graph, config, graph_evidence)
@@ -223,6 +231,44 @@ def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> 
         )
     finally:
         db.close()
+
+
+def _build_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
+    rendered = render_settings(case, tmp_path)
+    built = build_scenario(rendered)
+    return ScenarioRunEvidence(
+        schema_version=1,
+        scenario_id=scenario.id,
+        case_id=case.id,
+        fixture_sha256=rendered.fixture_sha256,
+        config=ConfigEvidence(loaded=True, settings_sha256=rendered.settings_sha256),
+        graph=built.graph_evidence,
+        runtime=RuntimeEvidence(
+            attempted=False,
+            run_id=None,
+            status=None,
+            rows_processed=0,
+            rows_succeeded=0,
+            rows_failed=0,
+            output_rows=0,
+        ),
+        audit=AuditEvidence(
+            attempted=False,
+            total_records=0,
+            record_counts=(),
+            source_operation_count=0,
+        ),
+        recovery=RecoveryEvidence(
+            attempted=False,
+            database_reopened=False,
+            checkpoint_id=None,
+            checkpoint_sequence=None,
+            can_resume=False,
+            source_replayed=False,
+            checkpoint_removed=False,
+        ),
+        completed_stages=("config", "build"),
+    )
 
 
 def _require_exact_eof_crash(orchestrator: Orchestrator, built: BuiltScenario, payload_store: FilesystemPayloadStore) -> None:
@@ -438,6 +484,8 @@ def _recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path
 def run_scenario_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
     """Execute a declared case through the workflow implemented for this task."""
 
+    if case.workflow == "build":
+        return _build_case(scenario, case, tmp_path)
     if case.workflow == "run":
         return _run_case(scenario, case, tmp_path)
     return _recovery_case(scenario, case, tmp_path)

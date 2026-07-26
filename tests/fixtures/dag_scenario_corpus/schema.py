@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 NonEmpty = Annotated[str, StringConstraints(strict=True, strip_whitespace=True, min_length=1)]
 IssueId = Annotated[str, StringConstraints(strict=True, pattern=r"^elspeth-[0-9a-f]{10}$")]
 Count = Annotated[int, Field(strict=True, ge=0)]
+PositiveCount = Annotated[int, Field(strict=True, ge=1)]
 
 CellStatus = Literal["pass", "partial", "fail", "unknown", "not_applicable"]
 Dimension = Literal[
@@ -28,7 +29,8 @@ Dimension = Literal[
 ]
 EvidenceKind = Literal["harness", "pytest", "document", "decision"]
 Stage = Literal["config", "build", "runtime", "audit", "recovery"]
-Workflow = Literal["run", "recovery"]
+Workflow = Literal["run", "recovery", "build"]
+GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "sink", "source", "transform"]
 
 EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
     "config",
@@ -115,12 +117,61 @@ class RunExpectation(ClosedModel):
     required_audit_record_types: tuple[NonEmpty, ...]
 
 
+class GraphNodeTypeCount(ClosedModel):
+    node_type: GraphNodeType
+    count: PositiveCount
+
+
+def _validate_exact_graph_shape(
+    *,
+    node_count: int,
+    edge_count: int,
+    node_type_counts: tuple[GraphNodeTypeCount, ...],
+    edge_labels: tuple[str, ...],
+) -> None:
+    node_types = tuple(item.node_type for item in node_type_counts)
+    if node_types != tuple(sorted(node_types)) or len(set(node_types)) != len(node_types):
+        raise ValueError("node_type_counts must contain unique node types in sorted order")
+    if sum(item.count for item in node_type_counts) != node_count:
+        raise ValueError("node_type_counts must sum exactly to node_count")
+    if edge_labels != tuple(sorted(edge_labels)):
+        raise ValueError("edge_labels must be sorted")
+    if len(edge_labels) != edge_count:
+        raise ValueError("edge_labels must contain exactly edge_count labels")
+
+
+class BuildExpectation(ClosedModel):
+    node_count: Count
+    edge_count: Count
+    node_type_counts: tuple[GraphNodeTypeCount, ...]
+    edge_labels: tuple[NonEmpty, ...]
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> Self:
+        _validate_exact_graph_shape(
+            node_count=self.node_count,
+            edge_count=self.edge_count,
+            node_type_counts=self.node_type_counts,
+            edge_labels=self.edge_labels,
+        )
+        return self
+
+
 class HarnessCaseSpec(ClosedModel):
     id: NonEmpty
     workflow: Workflow
     fixture: NonEmpty
     input_fixture: NonEmpty
-    expected: RunExpectation
+    expected: RunExpectation | BuildExpectation
+
+    @model_validator(mode="after")
+    def _validate_workflow_expectation(self) -> Self:
+        if self.workflow == "build":
+            if not isinstance(self.expected, BuildExpectation):
+                raise ValueError("build workflow requires BuildExpectation")
+        elif not isinstance(self.expected, RunExpectation):
+            raise ValueError(f"{self.workflow} workflow requires RunExpectation")
+        return self
 
 
 class ScenarioSpec(ClosedModel):
@@ -162,17 +213,32 @@ class GraphEvidence(ClosedModel):
     accepted: StrictBool
     node_count: Count | None = None
     edge_count: Count | None = None
+    node_type_counts: tuple[GraphNodeTypeCount, ...] | None = None
+    edge_labels: tuple[NonEmpty, ...] | None = None
     topology_hash: NonEmpty | None = None
     rejection_type: NonEmpty | None = None
     rejection_message: NonEmpty | None = None
 
     @model_validator(mode="after")
     def _validate_graph_shape(self) -> Self:
-        graph_facts = (self.node_count, self.edge_count, self.topology_hash)
+        graph_facts = (self.node_count, self.edge_count, self.node_type_counts, self.edge_labels, self.topology_hash)
         rejection_facts = (self.rejection_type, self.rejection_message)
         if self.accepted:
-            if any(value is None for value in graph_facts) or any(value is not None for value in rejection_facts):
+            if (
+                self.node_count is None
+                or self.edge_count is None
+                or self.node_type_counts is None
+                or self.edge_labels is None
+                or self.topology_hash is None
+                or any(value is not None for value in rejection_facts)
+            ):
                 raise ValueError("accepted graph requires all graph facts and forbids rejection facts")
+            _validate_exact_graph_shape(
+                node_count=self.node_count,
+                edge_count=self.edge_count,
+                node_type_counts=self.node_type_counts,
+                edge_labels=self.edge_labels,
+            )
         elif any(value is not None for value in graph_facts) or any(value is None for value in rejection_facts):
             raise ValueError("rejected graph requires both rejection facts and forbids graph facts")
         return self

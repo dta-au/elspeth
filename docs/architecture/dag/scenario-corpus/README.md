@@ -31,6 +31,17 @@ These files have distinct jobs:
   executes registered cases and returns one common `ScenarioRunEvidence`
   record for configuration, build, runtime, audit, and recovery facts.
 
+Harness workflows are deliberately typed by the boundary they cross. `build`
+loads the real YAML, instantiates plugins in preflight mode, constructs and
+validates the production execution graph, and assembles the pipeline config.
+It records exact node counts, node-type counts, edge counts, sorted edge labels
+(including duplicates), and the topology hash through `BuildExpectation`.
+It does not create an audit database or an orchestrator, and its runtime,
+audit, and recovery evidence remains explicitly unattempted. A `build` case is
+therefore executable evidence only for `config` and `build`; it cannot support
+runtime, audit, or recovery cells. The `run` and `recovery` workflows continue
+to use `RunExpectation` and cross their declared later lifecycle stages.
+
 The manifest does not replace the criteria, and a dated assessment does not
 replace the live manifest. Documentary evidence can explain a cell, but only
 executable `harness` or `pytest` evidence can support `pass`.
@@ -62,10 +73,15 @@ For a corpus harness case:
    `tests/fixtures/dag_scenario_corpus/v1/<scenario-id>/`.
 2. Add a case beneath that scenario's `cases` list. Its locator is
    `<scenario-id>:<case-id>`.
-3. Add one top-level evidence record with `kind: harness`, the same locator,
-   a precise claim, and the stages it proves.
-4. Reference that evidence ID only from cells its assertions actually prove.
-5. Extend the table-driven assertions in the
+3. Select the narrowest honest workflow: `build` with an exact
+   `BuildExpectation`, `run` with a `RunExpectation`, or `recovery` with a
+   `RunExpectation`. The schema rejects mismatched workflow and expectation
+   kinds.
+4. Add one top-level evidence record with `kind: harness`, the same locator,
+   a precise claim, and only the stages it proves. Build-only evidence must use
+   exactly `[config, build]`.
+5. Reference that evidence ID only from cells its assertions actually prove.
+6. Extend the table-driven assertions in the
    [production-path integration test](../../../../tests/integration/core/dag/test_dag_scenario_production_path.py)
    when the common expectation schema is not sufficient.
 

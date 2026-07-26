@@ -33,6 +33,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     EXPECTED_SCENARIOS,
     AuditEvidence,
     AuditRecordCount,
+    BuildExpectation,
     CellStatus,
     ConfigEvidence,
     Dimension,
@@ -40,6 +41,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     EvidenceKind,
     EvidenceReference,
     GraphEvidence,
+    GraphNodeTypeCount,
     HarnessCaseSpec,
     RecoveryEvidence,
     RunExpectation,
@@ -359,7 +361,7 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "867f145a96296ce3f72d0491c7aa9b40b8087ade49501250d9a11211fcfae03e"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "409034bb798cd578ce8e4cd741b1d77fc6858a042dc5f1f917f50b3272355d70"
 
 EXPECTED_HARNESS_EVIDENCE = (
     (
@@ -371,6 +373,26 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-checkpoint-deterministic-resume-reopen-resume",
         "checkpoint-deterministic-resume:reopen-resume",
         ("config", "build", "runtime", "audit", "recovery"),
+    ),
+    (
+        "harness-multiple-independent-sources-independent-roots",
+        "multiple-independent-sources:independent-roots",
+        ("config", "build"),
+    ),
+    (
+        "harness-multi-source-queue-fan-in-queued-fan-in",
+        "multi-source-queue-fan-in:queued-fan-in",
+        ("config", "build"),
+    ),
+    (
+        "harness-conditional-routing-two-way-gate",
+        "conditional-routing:two-way-gate",
+        ("config", "build"),
+    ),
+    (
+        "harness-fork-coalesce-policies-require-all-nested",
+        "fork-coalesce-policies:require-all-nested",
+        ("config", "build"),
     ),
 )
 
@@ -427,6 +449,124 @@ aggregations:
     options:
       schema: {mode: observed}
       fault_marker_path: ${fault_marker}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_jsonl}
+      format: jsonl
+      schema: {mode: observed}
+"""
+
+EXPECTED_INDEPENDENT_ROOTS_YAML = b"""sources:
+  orders:
+    plugin: csv
+    on_success: output
+    options:
+      path: ${input_csv}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+  refunds:
+    plugin: csv
+    on_success: output
+    options:
+      path: ${input_csv}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_jsonl}
+      format: jsonl
+      schema: {mode: observed}
+"""
+
+EXPECTED_QUEUED_FAN_IN_YAML = b"""sources:
+  orders:
+    plugin: csv
+    on_success: inbound
+    options:
+      path: ${input_csv}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+  refunds:
+    plugin: csv
+    on_success: inbound
+    options:
+      path: ${input_csv}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+queues: {inbound: {description: deterministic multi-source fan-in}}
+transforms:
+  - name: normalize_rows
+    plugin: passthrough
+    input: inbound
+    on_success: output
+    on_error: discard
+    options: {schema: {mode: observed}}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_jsonl}
+      format: jsonl
+      schema: {mode: observed}
+"""
+
+EXPECTED_TWO_WAY_GATE_YAML = b"""sources:
+  primary:
+    plugin: csv
+    on_success: routing
+    options:
+      path: ${input_csv}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: route_by_value
+    input: routing
+    condition: "row['value'] >= 20"
+    routes: {"true": accepted, "false": rejected}
+sinks:
+  accepted:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_jsonl}
+      format: jsonl
+      schema: {mode: observed}
+  rejected:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${fault_marker}
+      format: jsonl
+      schema: {mode: observed}
+"""
+
+EXPECTED_REQUIRE_ALL_NESTED_YAML = b"""sources:
+  primary:
+    plugin: csv
+    on_success: fork_input
+    options:
+      path: ${input_csv}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: fork_gate
+    input: fork_input
+    condition: "True"
+    routes: {"true": fork, "false": discard}
+    fork_to: [path_a, path_b]
+coalesce:
+  - name: merge_paths
+    branches: [path_a, path_b]
+    policy: require_all
+    merge: nested
+    on_success: output
 sinks:
   output:
     plugin: json
@@ -652,7 +792,101 @@ def test_closed_vocabularies_are_exact() -> None:
     assert get_args(Dimension) == EXPECTED_DIMENSION_VALUES
     assert get_args(EvidenceKind) == ("harness", "pytest", "document", "decision")
     assert get_args(Stage) == ("config", "build", "runtime", "audit", "recovery")
-    assert get_args(Workflow) == ("run", "recovery")
+    assert get_args(Workflow) == ("run", "recovery", "build")
+
+
+def test_build_expectation_is_dedicated_immutable_and_exact() -> None:
+    expectation = BuildExpectation(
+        node_count=3,
+        edge_count=2,
+        node_type_counts=(
+            GraphNodeTypeCount(node_type="sink", count=1),
+            GraphNodeTypeCount(node_type="source", count=2),
+        ),
+        edge_labels=("on_success", "on_success"),
+    )
+
+    assert expectation.model_dump(mode="json") == {
+        "node_count": 3,
+        "edge_count": 2,
+        "node_type_counts": [
+            {"node_type": "sink", "count": 1},
+            {"node_type": "source", "count": 2},
+        ],
+        "edge_labels": ["on_success", "on_success"],
+    }
+    with pytest.raises(ValidationError, match="frozen"):
+        expectation.__setattr__("node_count", 4)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "node_type_counts",
+            ({"node_type": "source", "count": 2}, {"node_type": "sink", "count": 1}),
+            "sorted order",
+        ),
+        (
+            "node_type_counts",
+            ({"node_type": "sink", "count": 1}, {"node_type": "source", "count": 1}),
+            "sum exactly",
+        ),
+        ("edge_labels", ("on_success", "continue"), "sorted"),
+        ("edge_labels", ("on_success",), "exactly edge_count"),
+    ],
+    ids=("node-types-order", "node-types-sum", "labels-order", "labels-count"),
+)
+def test_build_expectation_rejects_inexact_graph_shape(field: str, value: object, message: str) -> None:
+    values: dict[str, object] = {
+        "node_count": 3,
+        "edge_count": 2,
+        "node_type_counts": (
+            {"node_type": "sink", "count": 1},
+            {"node_type": "source", "count": 2},
+        ),
+        "edge_labels": ("on_success", "on_success"),
+        field: value,
+    }
+
+    with pytest.raises(ValidationError, match=message):
+        BuildExpectation.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("workflow", "expected", "expected_kind"),
+    [
+        ("build", _expectation(), "BuildExpectation"),
+        (
+            "run",
+            {
+                "node_count": 3,
+                "edge_count": 2,
+                "node_type_counts": [
+                    {"node_type": "sink", "count": 1},
+                    {"node_type": "source", "count": 2},
+                ],
+                "edge_labels": ["on_success", "on_success"],
+            },
+            "RunExpectation",
+        ),
+    ],
+)
+def test_harness_case_rejects_workflow_expectation_kind_mismatch(
+    workflow: str,
+    expected: object,
+    expected_kind: str,
+) -> None:
+    values = {
+        "id": "kind-mismatch",
+        "workflow": workflow,
+        "fixture": "linear/happy-path.yaml",
+        "input_fixture": "linear/input.csv",
+        "expected": expected,
+    }
+
+    with pytest.raises(ValidationError, match=rf"{workflow} workflow requires {expected_kind}"):
+        HarnessCaseSpec.model_validate(values)
 
 
 def test_non_empty_strings_are_strict_stripped_and_non_empty() -> None:
@@ -810,12 +1044,20 @@ def test_strict_scalar_types_reject_coercion() -> None:
         AuditRecordCount(record_type="run_started", count=True)
 
 
-@pytest.mark.parametrize("missing", ["node_count", "edge_count", "topology_hash"])
+@pytest.mark.parametrize(
+    "missing",
+    ["node_count", "edge_count", "node_type_counts", "edge_labels", "topology_hash"],
+)
 def test_accepted_graph_requires_all_graph_facts(missing: str) -> None:
     values: dict[str, object] = {
         "accepted": True,
         "node_count": 3,
         "edge_count": 2,
+        "node_type_counts": (
+            {"node_type": "sink", "count": 1},
+            {"node_type": "source", "count": 2},
+        ),
+        "edge_labels": ("on_success", "on_success"),
         "topology_hash": "topology-sha",
     }
     del values[missing]
@@ -829,6 +1071,11 @@ def test_accepted_graph_forbids_rejection_facts(field: str) -> None:
         "accepted": True,
         "node_count": 3,
         "edge_count": 2,
+        "node_type_counts": (
+            {"node_type": "sink", "count": 1},
+            {"node_type": "source", "count": 2},
+        ),
+        "edge_labels": ("on_success", "on_success"),
         "topology_hash": "topology-sha",
         field: "rejected",
     }
@@ -850,7 +1097,13 @@ def test_rejected_graph_requires_both_rejection_facts(missing: str) -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("node_count", 3), ("edge_count", 2), ("topology_hash", "topology-sha")],
+    [
+        ("node_count", 3),
+        ("edge_count", 2),
+        ("node_type_counts", ({"node_type": "source", "count": 3},)),
+        ("edge_labels", ("continue", "continue")),
+        ("topology_hash", "topology-sha"),
+    ],
 )
 def test_rejected_graph_forbids_graph_facts(field: str, value: object) -> None:
     values: dict[str, object] = {
@@ -864,9 +1117,21 @@ def test_rejected_graph_forbids_graph_facts(field: str, value: object) -> None:
 
 
 def test_accepted_and_rejected_graph_shapes_are_accepted() -> None:
-    accepted = GraphEvidence(accepted=True, node_count=3, edge_count=2, topology_hash="topology-sha")
+    accepted = GraphEvidence(
+        accepted=True,
+        node_count=3,
+        edge_count=2,
+        node_type_counts=(
+            {"node_type": "sink", "count": 1},
+            {"node_type": "source", "count": 2},
+        ),
+        edge_labels=("on_success", "on_success"),
+        topology_hash="topology-sha",
+    )
     rejected = GraphEvidence(accepted=False, rejection_type="ValueError", rejection_message="unsupported topology")
     assert accepted.node_count == 3
+    assert accepted.node_type_counts is not None
+    assert accepted.node_type_counts[1].node_type == "source"
     assert rejected.rejection_type == "ValueError"
 
 
@@ -984,7 +1249,17 @@ def test_scenario_run_evidence_accepts_the_complete_observed_shape() -> None:
         case_id="happy-path",
         fixture_sha256="fixture-sha",
         config=ConfigEvidence(loaded=True, settings_sha256="settings-sha"),
-        graph=GraphEvidence(accepted=True, node_count=3, edge_count=2, topology_hash="topology-sha"),
+        graph=GraphEvidence(
+            accepted=True,
+            node_count=3,
+            edge_count=2,
+            node_type_counts=(
+                {"node_type": "sink", "count": 1},
+                {"node_type": "source", "count": 2},
+            ),
+            edge_labels=("on_success", "on_success"),
+            topology_hash="topology-sha",
+        ),
         runtime=_valid_runtime(),
         audit=_valid_audit(),
         recovery=_valid_recovery(),
@@ -1083,7 +1358,7 @@ def _register_linear_case(raw: dict[str, object], case: dict[str, object]) -> No
     _raw_dimensions(scenario)["runtime"] = runtime_cell
 
 
-def test_manifest_has_exact_inventory_status_matrix_and_task_3_cases() -> None:
+def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> None:
     manifest = load_manifest()
 
     assert manifest.schema_version == 1
@@ -1096,6 +1371,10 @@ def test_manifest_has_exact_inventory_status_matrix_and_task_3_cases() -> None:
         assert tuple(cell.status for cell in scenario.dimensions.values()) == EXPECTED_STATUS_MATRIX[scenario.id]
     assert tuple((scenario.id, case.id) for scenario, case in iter_harness_cases(manifest)) == (
         ("linear", "happy-path"),
+        ("multiple-independent-sources", "independent-roots"),
+        ("multi-source-queue-fan-in", "queued-fan-in"),
+        ("conditional-routing", "two-way-gate"),
+        ("fork-coalesce-policies", "require-all-nested"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     assert manifest.verdict == "not_complete"
@@ -1110,11 +1389,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 53
+    assert len(manifest.evidence) == 57
     assert len(assessment_evidence) == 51
-    assert len(harness_evidence) == 2
-    assert len({reference.id for reference in manifest.evidence}) == 53
-    assert len({reference.locator for reference in manifest.evidence}) == 53
+    assert len(harness_evidence) == 6
+    assert len({reference.id for reference in manifest.evidence}) == 57
+    assert len({reference.locator for reference in manifest.evidence}) == 57
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -1123,7 +1402,7 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     assert hashlib.sha256(normalized_registry).hexdigest() == EXPECTED_EVIDENCE_REGISTRY_SHA256
 
 
-def test_task_3_cases_and_harness_references_have_exact_atomic_parity() -> None:
+def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> None:
     manifest = load_manifest()
     cases = tuple((scenario.id, case.model_dump(mode="json")) for scenario, case in iter_harness_cases(manifest))
     assert cases == (
@@ -1138,6 +1417,83 @@ def test_task_3_cases_and_harness_references_have_exact_atomic_parity() -> None:
                     "status": "completed",
                     "output_rows": 3,
                     "required_audit_record_types": ["run"],
+                },
+            },
+        ),
+        (
+            "multiple-independent-sources",
+            {
+                "id": "independent-roots",
+                "workflow": "build",
+                "fixture": "multiple-independent-sources/independent-roots.yaml",
+                "input_fixture": "multiple-independent-sources/input.csv",
+                "expected": {
+                    "node_count": 3,
+                    "edge_count": 2,
+                    "node_type_counts": [
+                        {"node_type": "sink", "count": 1},
+                        {"node_type": "source", "count": 2},
+                    ],
+                    "edge_labels": ["on_success", "on_success"],
+                },
+            },
+        ),
+        (
+            "multi-source-queue-fan-in",
+            {
+                "id": "queued-fan-in",
+                "workflow": "build",
+                "fixture": "multi-source-queue-fan-in/queued-fan-in.yaml",
+                "input_fixture": "multi-source-queue-fan-in/input.csv",
+                "expected": {
+                    "node_count": 5,
+                    "edge_count": 4,
+                    "node_type_counts": [
+                        {"node_type": "queue", "count": 1},
+                        {"node_type": "sink", "count": 1},
+                        {"node_type": "source", "count": 2},
+                        {"node_type": "transform", "count": 1},
+                    ],
+                    "edge_labels": ["continue", "continue", "continue", "on_success"],
+                },
+            },
+        ),
+        (
+            "conditional-routing",
+            {
+                "id": "two-way-gate",
+                "workflow": "build",
+                "fixture": "conditional-routing/two-way-gate.yaml",
+                "input_fixture": "conditional-routing/input.csv",
+                "expected": {
+                    "node_count": 4,
+                    "edge_count": 3,
+                    "node_type_counts": [
+                        {"node_type": "gate", "count": 1},
+                        {"node_type": "sink", "count": 2},
+                        {"node_type": "source", "count": 1},
+                    ],
+                    "edge_labels": ["continue", "false", "true"],
+                },
+            },
+        ),
+        (
+            "fork-coalesce-policies",
+            {
+                "id": "require-all-nested",
+                "workflow": "build",
+                "fixture": "fork-coalesce-policies/require-all-nested.yaml",
+                "input_fixture": "fork-coalesce-policies/input.csv",
+                "expected": {
+                    "node_count": 4,
+                    "edge_count": 4,
+                    "node_type_counts": [
+                        {"node_type": "coalesce", "count": 1},
+                        {"node_type": "gate", "count": 1},
+                        {"node_type": "sink", "count": 1},
+                        {"node_type": "source", "count": 1},
+                    ],
+                    "edge_labels": ["continue", "on_success", "path_a", "path_b"],
                 },
             },
         ),
@@ -1169,6 +1525,22 @@ def test_task_3_cases_and_harness_references_have_exact_atomic_parity() -> None:
     }
     assert referenced_cells == {
         "harness-linear-happy-path": (("linear", "runtime"), ("linear", "audit")),
+        "harness-multiple-independent-sources-independent-roots": (
+            ("multiple-independent-sources", "config"),
+            ("multiple-independent-sources", "build"),
+        ),
+        "harness-multi-source-queue-fan-in-queued-fan-in": (
+            ("multi-source-queue-fan-in", "config"),
+            ("multi-source-queue-fan-in", "build"),
+        ),
+        "harness-conditional-routing-two-way-gate": (
+            ("conditional-routing", "config"),
+            ("conditional-routing", "build"),
+        ),
+        "harness-fork-coalesce-policies-require-all-nested": (
+            ("fork-coalesce-policies", "config"),
+            ("fork-coalesce-policies", "build"),
+        ),
         "harness-checkpoint-deterministic-resume-reopen-resume": (
             ("checkpoint-deterministic-resume", "runtime"),
             ("checkpoint-deterministic-resume", "audit"),
@@ -1288,10 +1660,18 @@ def test_corpus_transform_rejects_invalid_fault_marker_config(marker: object) ->
         CorpusFailOnceEOFBatchTransform({"fault_marker_path": marker})
 
 
-def test_task_3_fixture_bytes_and_production_config_loading_are_exact(tmp_path: Path) -> None:
+def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_path: Path) -> None:
     fixture_bytes = {
         "linear/happy-path.yaml": EXPECTED_HAPPY_PATH_YAML,
         "linear/input.csv": EXPECTED_INPUT_CSV,
+        "multiple-independent-sources/independent-roots.yaml": EXPECTED_INDEPENDENT_ROOTS_YAML,
+        "multiple-independent-sources/input.csv": EXPECTED_INPUT_CSV,
+        "multi-source-queue-fan-in/queued-fan-in.yaml": EXPECTED_QUEUED_FAN_IN_YAML,
+        "multi-source-queue-fan-in/input.csv": EXPECTED_INPUT_CSV,
+        "conditional-routing/two-way-gate.yaml": EXPECTED_TWO_WAY_GATE_YAML,
+        "conditional-routing/input.csv": EXPECTED_INPUT_CSV,
+        "fork-coalesce-policies/require-all-nested.yaml": EXPECTED_REQUIRE_ALL_NESTED_YAML,
+        "fork-coalesce-policies/input.csv": EXPECTED_INPUT_CSV,
         "checkpoint-deterministic-resume/reopen-resume.yaml": EXPECTED_REOPEN_RESUME_YAML,
         "checkpoint-deterministic-resume/input.csv": EXPECTED_INPUT_CSV,
     }
@@ -1328,12 +1708,25 @@ def test_task_3_fixture_bytes_and_production_config_loading_are_exact(tmp_path: 
     [
         ("linear/happy-path.yaml", "linear/input.csv"),
         (
+            "multiple-independent-sources/independent-roots.yaml",
+            "multiple-independent-sources/input.csv",
+        ),
+        (
+            "multi-source-queue-fan-in/queued-fan-in.yaml",
+            "multi-source-queue-fan-in/input.csv",
+        ),
+        ("conditional-routing/two-way-gate.yaml", "conditional-routing/input.csv"),
+        (
+            "fork-coalesce-policies/require-all-nested.yaml",
+            "fork-coalesce-policies/input.csv",
+        ),
+        (
             "checkpoint-deterministic-resume/reopen-resume.yaml",
             "checkpoint-deterministic-resume/input.csv",
         ),
     ],
 )
-def test_task_3_fixtures_cross_the_real_production_build_boundary(
+def test_registered_fixtures_cross_the_real_production_build_boundary(
     fixture: str,
     input_fixture: str,
     tmp_path: Path,
