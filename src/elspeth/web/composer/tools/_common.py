@@ -1658,13 +1658,29 @@ def _resolver_owned_interpretation_requirement_error(
     LLM-SUPPLIED delta (full options on a create, the ``patch`` on a merge) so a
     legitimately-resolved requirement already in stored state is not re-flagged.
     """
-    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
-    if not isinstance(requirements_value, (list, tuple)):
+    if INTERPRETATION_REQUIREMENTS_KEY not in options:
         return None
+    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
+    if not isinstance(requirements_value, (list, tuple)):
+        return f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY} must be a list of review entry objects."
 
     for index, requirement in enumerate(requirements_value):
         if not isinstance(requirement, Mapping):
-            continue
+            return (
+                f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] must be a review entry object "
+                "with non-empty string fields kind, user_term, and draft."
+            )
+        malformed_fields = [
+            field
+            for field in ("kind", "user_term", "draft")
+            if not isinstance(requirement.get(field), str) or not requirement[field].strip()
+        ]
+        if malformed_fields:
+            field_names = ", ".join(malformed_fields)
+            return (
+                f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] has invalid field(s): {field_names}. "
+                "Composer-authored review entries require non-empty string fields kind, user_term, and draft."
+            )
         status = requirement["status"] if "status" in requirement else None
         if status not in (None, "pending"):
             return (

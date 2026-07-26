@@ -7803,6 +7803,42 @@ def _llm_options_with_forged_resolved_reviews(api_key: Any) -> dict[str, Any]:
     return options
 
 
+@pytest.mark.parametrize(
+    "malformed_requirement",
+    [
+        {"status": "pending", "user_term": "llm_prompt_template:classify", "draft": "Classify the current row."},
+        {"kind": "llm_prompt_template", "status": "pending", "user_term": 123, "draft": "Classify the current row."},
+    ],
+)
+def test_upsert_node_rejects_malformed_pending_interpretation_requirement(
+    malformed_requirement: dict[str, Any],
+) -> None:
+    """Malformed LLM-authored review rows fail at the tool boundary, not in backend surfacing."""
+    state = _empty_state()
+    options = _llm_options_with_api_key({"secret_ref": "OPENROUTER_API_KEY"})
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [malformed_requirement]
+
+    result = execute_tool(
+        "upsert_node",
+        {
+            "id": "classify",
+            "node_type": "transform",
+            "plugin": "llm",
+            "input": "source_out",
+            "on_success": "main",
+            "on_error": "discard",
+            "options": options,
+        },
+        state,
+        _mock_catalog(),
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert "interpretation_requirements[0]" in result.data["error"]
+    assert "invalid field(s)" in result.data["error"]
+
+
 def _assert_secret_wiring_contract_failure(
     result: ToolResult,
     original_state: CompositionState,
