@@ -269,7 +269,6 @@ class WebSettings(BaseModel):
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "AZURE_API_KEY",
-        "AZURE_CONTENT_SAFETY_KEY",
     )
     # Universal web plugin policy.  These user-facing Pydantic values are
     # converted immediately to RuntimeWebPluginConfig before consumption.
