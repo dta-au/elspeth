@@ -26,6 +26,24 @@ class CorpusOutputSchema(PluginSchema):
     count: int
 
 
+class CorpusAlwaysErrorTransform(BaseTransform):
+    name = "dag_corpus_always_error"
+    determinism = Determinism.DETERMINISTIC
+    input_schema = CorpusInputSchema
+    output_schema = CorpusInputSchema
+    on_error = "discard"
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        del row, ctx
+        return TransformResult.error(
+            {
+                "reason": "invalid_input",
+                "error": "injected DAG corpus routed error",
+            },
+            retryable=False,
+        )
+
+
 class CorpusFailOnceEOFBatchTransform(BaseTransform):
     name = "dag_corpus_fail_once_eof_batch"
     determinism = Determinism.DETERMINISTIC
@@ -87,7 +105,12 @@ class CorpusFailOnceEOFBatchTransform(BaseTransform):
 def make_corpus_plugin_manager() -> PluginManager:
     manager = PluginManager()
     manager.register_builtin_plugins()
-    manager.register(create_dynamic_hookimpl([CorpusFailOnceEOFBatchTransform], "elspeth_get_transforms"))
+    manager.register(
+        create_dynamic_hookimpl(
+            [CorpusAlwaysErrorTransform, CorpusFailOnceEOFBatchTransform],
+            "elspeth_get_transforms",
+        )
+    )
     return manager
 
 

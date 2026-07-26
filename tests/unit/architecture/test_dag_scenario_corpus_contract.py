@@ -24,6 +24,7 @@ from tests.fixtures.dag_scenario_corpus.loader import (
     resolve_fixture_path,
 )
 from tests.fixtures.dag_scenario_corpus.plugins import (
+    CorpusAlwaysErrorTransform,
     CorpusFailOnceEOFBatchTransform,
     CorpusInputSchema,
     CorpusOutputSchema,
@@ -353,6 +354,10 @@ EXPECTED_ASSESSMENT_LOCATORS = {
         "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_routes_registered_worker_to_strict_and_unregistered_to_explicit_legacy",
         "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinned",
     ),
+    "conditional-routing-destination-negatives": (
+        "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b1_conditional_routing_rejects_missing_boolean_gate_destination",
+        "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b1_conditional_routing_rejects_invalid_gate_destination_during_production_build",
+    ),
 }
 
 EXPECTED_ASSESSMENT_EVIDENCE = tuple(
@@ -363,13 +368,14 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "eb1c5191fb7cbec13ca245694de09872c15353207c6aa4cd6460b1f640df3ead"
-EXPECTED_CASE_REGISTRY_SHA256 = "218629569166379ee55a67331626835f02c00ee1c29017eee2f5927d8b938f58"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "3e83fcff25bcb570bb16f8deb37b01fc8b9f542678f3dad9a548178f0dcfde50"
+EXPECTED_CASE_REGISTRY_SHA256 = "252aa85fd1129859168092e8e1488c9237ae9c8ea91a784f369923c375e55cd6"
 EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
     "multi-source-queue-fan-in:queued-fan-in": "ccff919ce91062633679fcbe577194b4ce3c852a90c1f8f97622ac371b377c4e",
     "conditional-routing:two-way-gate": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
+    "conditional-routing:error-route-and-discard": "27dbf1f2d1908a6f6f3df8166bff152e56977d93ffc4061c91c48871c26a282b",
     "fork-coalesce-policies:require-all-nested": "55b934bdb55c478ec552209008eda10bc6b211b6a17d8844acbf81609772acd2",
     "checkpoint-deterministic-resume:reopen-resume": "ce62216ce20210600f1a9c20e362aaf299c7538e6c4d3bd0e97627563dc813e6",
 }
@@ -398,6 +404,11 @@ EXPECTED_HARNESS_EVIDENCE = (
     (
         "harness-conditional-routing-two-way-gate",
         "conditional-routing:two-way-gate",
+        ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-conditional-routing-error-route-and-discard",
+        "conditional-routing:error-route-and-discard",
         ("config", "build", "runtime", "audit"),
     ),
     (
@@ -556,6 +567,37 @@ sinks:
     on_write_failure: discard
     options:
       path: ${output_rejected}
+      format: jsonl
+      schema: {mode: observed}
+"""
+
+EXPECTED_ERROR_ROUTE_AND_DISCARD_YAML = b"""sources:
+  primary:
+    plugin: csv
+    on_success: routing
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: select_failure_policy
+    input: routing
+    condition: "row['value'] >= 20"
+    routes: {"true": routed_error, "false": discard}
+transforms:
+  - name: fail_selected
+    plugin: dag_corpus_always_error
+    input: routed_error
+    on_success: errors
+    on_error: errors
+    options:
+      schema: {mode: observed}
+sinks:
+  errors:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_errors}
       format: jsonl
       schema: {mode: observed}
 """
@@ -1687,6 +1729,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("multiple-independent-sources", "independent-roots"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
+        ("conditional-routing", "error-route-and-discard"),
         ("fork-coalesce-policies", "require-all-nested"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
@@ -1702,11 +1745,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 57
-    assert len(assessment_evidence) == 51
-    assert len(harness_evidence) == 6
-    assert len({reference.id for reference in manifest.evidence}) == 57
-    assert len({reference.locator for reference in manifest.evidence}) == 57
+    assert len(manifest.evidence) == 60
+    assert len(assessment_evidence) == 53
+    assert len(harness_evidence) == 7
+    assert len({reference.id for reference in manifest.evidence}) == 60
+    assert len({reference.locator for reference in manifest.evidence}) == 60
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -1723,6 +1766,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("multiple-independent-sources", "independent-roots"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
+        ("conditional-routing", "error-route-and-discard"),
         ("fork-coalesce-policies", "require-all-nested"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
@@ -1760,6 +1804,12 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("multi-source-queue-fan-in", "audit"),
         ),
         "harness-conditional-routing-two-way-gate": (
+            ("conditional-routing", "config"),
+            ("conditional-routing", "build"),
+            ("conditional-routing", "runtime"),
+            ("conditional-routing", "audit"),
+        ),
+        "harness-conditional-routing-error-route-and-discard": (
             ("conditional-routing", "config"),
             ("conditional-routing", "build"),
             ("conditional-routing", "runtime"),
@@ -1818,15 +1868,19 @@ def test_corpus_plugin_manager_exposes_builtins_and_custom_through_public_instan
         "dag_corpus_fail_once_eof_batch",
         {"fault_marker_path": str(tmp_path / "fault.marker")},
     )
+    always_error = manager.create_transform("dag_corpus_always_error", {"schema": {"mode": "observed"}})
 
-    assert (csv_source.name, passthrough.name, json_sink.name, custom.name) == (
+    assert (csv_source.name, passthrough.name, json_sink.name, custom.name, always_error.name) == (
         "csv",
         "passthrough",
         "json",
         "dag_corpus_fail_once_eof_batch",
+        "dag_corpus_always_error",
     )
     registered_transform: object = manager.get_transform_by_name("dag_corpus_fail_once_eof_batch")
     assert registered_transform is CorpusFailOnceEOFBatchTransform
+    registered_always_error: object = manager.get_transform_by_name("dag_corpus_always_error")
+    assert registered_always_error is CorpusAlwaysErrorTransform
     assert manager_module.get_shared_plugin_manager() is manager
 
 
@@ -1843,6 +1897,22 @@ def test_corpus_transform_declares_exact_schema_and_runtime_contract() -> None:
     assert CorpusFailOnceEOFBatchTransform.output_schema is CorpusOutputSchema
     assert CorpusFailOnceEOFBatchTransform.is_batch_aware is True
     assert CorpusFailOnceEOFBatchTransform.on_error == "discard"
+    assert CorpusAlwaysErrorTransform.name == "dag_corpus_always_error"
+    assert CorpusAlwaysErrorTransform.determinism is Determinism.DETERMINISTIC
+    assert CorpusAlwaysErrorTransform.input_schema is CorpusInputSchema
+    assert CorpusAlwaysErrorTransform.output_schema is CorpusInputSchema
+    assert CorpusAlwaysErrorTransform.on_error == "discard"
+
+
+def test_corpus_always_error_transform_returns_stable_non_retryable_error() -> None:
+    result = CorpusAlwaysErrorTransform({"schema": {"mode": "observed"}}).process(_corpus_rows()[0], object())
+
+    assert result.status == "error"
+    assert result.reason == {
+        "reason": "invalid_input",
+        "error": "injected DAG corpus routed error",
+    }
+    assert result.retryable is False
 
 
 def test_corpus_transform_scalar_call_buffers_the_same_row(tmp_path: Path) -> None:
@@ -1899,6 +1969,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         "multi-source-queue-fan-in/orders.csv": EXPECTED_ORDERS_CSV,
         "multi-source-queue-fan-in/refunds.csv": EXPECTED_REFUNDS_CSV,
         "conditional-routing/two-way-gate.yaml": EXPECTED_TWO_WAY_GATE_YAML,
+        "conditional-routing/error-route-and-discard.yaml": EXPECTED_ERROR_ROUTE_AND_DISCARD_YAML,
         "conditional-routing/input.csv": EXPECTED_INPUT_CSV,
         "fork-coalesce-policies/require-all-nested.yaml": EXPECTED_REQUIRE_ALL_NESTED_YAML,
         "fork-coalesce-policies/input.csv": EXPECTED_INPUT_CSV,
@@ -1945,6 +2016,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("multiple-independent-sources", "independent-roots"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
+        ("conditional-routing", "error-route-and-discard"),
         ("fork-coalesce-policies", "require-all-nested"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     ],

@@ -47,6 +47,7 @@ B1_RUNTIME_CASES = (
     ("multiple-independent-sources", "independent-roots"),
     ("multi-source-queue-fan-in", "queued-fan-in"),
     ("conditional-routing", "two-way-gate"),
+    ("conditional-routing", "error-route-and-discard"),
 )
 
 
@@ -177,6 +178,40 @@ def test_b1_conditional_routing_proves_exact_artifacts_routes_and_dispositions(
         ("primary:0#0", "success", "gate_routed", "rejected"),
         ("primary:1#0", "success", "gate_routed", "accepted"),
         ("primary:2#0", "success", "gate_routed", "accepted"),
+    ]
+
+
+def test_b1_conditional_routing_proves_error_route_discard_and_audit_parity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered_cases = {(scenario.id, case.id) for scenario, case in iter_harness_cases(MANIFEST)}
+    assert ("conditional-routing", "error-route-and-discard") in registered_cases
+    scenario, case = _declared_case("conditional-routing", "error-route-and-discard")
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    _assert_declared_run_evidence(scenario, case, evidence)
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    assert evidence.audit.portable_projection == projection
+    assert [(output.sink_name, output.rows) for output in evidence.runtime.sink_outputs] == [
+        ("errors", ('{"id":2,"value":20}', '{"id":3,"value":30}')),
+    ]
+    assert [(route.token_key, route.label, route.mode) for route in projection.routes] == [
+        ("primary:1#0", "true", "move"),
+        ("primary:1#0", "__error_fail_selected__", "divert"),
+        ("primary:2#0", "true", "move"),
+        ("primary:2#0", "__error_fail_selected__", "divert"),
+    ]
+    assert [
+        (disposition.token_key, disposition.outcome, disposition.path, disposition.sink_name)
+        for disposition in projection.terminal_dispositions
+    ] == [
+        ("primary:0#0", "success", "gate_discarded", None),
+        ("primary:1#0", "failure", "on_error_routed", "errors"),
+        ("primary:2#0", "failure", "on_error_routed", "errors"),
     ]
 
 

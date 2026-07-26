@@ -264,6 +264,17 @@ evidence:
     claim: Initial enqueue routing and legacy references remain pinned.
     stages: [runtime, audit]
 
+  - id: conditional-routing-destination-negatives
+    kind: pytest
+    locator: tests/integration/core/dag/test_dag_scenario_production_path.py::test_b1_conditional_routing_rejects_missing_boolean_gate_destination
+    claim: Missing mandatory boolean gate destinations fail during production configuration loading.
+    stages: [config]
+  - id: conditional-routing-destination-negatives-02
+    kind: pytest
+    locator: tests/integration/core/dag/test_dag_scenario_production_path.py::test_b1_conditional_routing_rejects_invalid_gate_destination_during_production_build
+    claim: Named gate destinations that do not resolve fail during the production graph build.
+    stages: [build]
+
   - id: harness-linear-happy-path
     kind: harness
     locator: linear:happy-path
@@ -288,6 +299,11 @@ evidence:
     kind: harness
     locator: conditional-routing:two-way-gate
     claim: The two-way-gate corpus case executes exact accepted and rejected artifacts, route labels, dispositions, and durable and portable audit evidence.
+    stages: [config, build, runtime, audit]
+  - id: harness-conditional-routing-error-route-and-discard
+    kind: harness
+    locator: conditional-routing:error-route-and-discard
+    claim: The error-route-and-discard corpus case executes exact gate discard and routed error dispositions, error artifacts, route labels, and durable and portable audit evidence.
     stages: [config, build, runtime, audit]
   - id: harness-fork-coalesce-policies-require-all-nested
     kind: harness
@@ -2441,22 +2457,559 @@ scenarios:
             ],
             "source_operation_count": 1
           }
+      - id: error-route-and-discard
+        workflow: run
+        fixture: conditional-routing/error-route-and-discard.yaml
+        input_fixtures:
+          primary: conditional-routing/input.csv
+        output_artifacts:
+          errors: errors.jsonl
+        expected:
+          {
+            "audit_record_counts": [
+              {
+                "count": 1,
+                "record_type": "artifact"
+              },
+              {
+                "count": 3,
+                "record_type": "call"
+              },
+              {
+                "count": 5,
+                "record_type": "edge"
+              },
+              {
+                "count": 1,
+                "record_type": "manifest"
+              },
+              {
+                "count": 4,
+                "record_type": "node"
+              },
+              {
+                "count": 10,
+                "record_type": "node_state"
+              },
+              {
+                "count": 2,
+                "record_type": "operation"
+              },
+              {
+                "count": 4,
+                "record_type": "routing_event"
+              },
+              {
+                "count": 3,
+                "record_type": "row"
+              },
+              {
+                "count": 1,
+                "record_type": "run"
+              },
+              {
+                "count": 11,
+                "record_type": "scheduler_event"
+              },
+              {
+                "count": 1,
+                "record_type": "sink_effect"
+              },
+              {
+                "count": 3,
+                "record_type": "sink_effect_attempt"
+              },
+              {
+                "count": 2,
+                "record_type": "sink_effect_member"
+              },
+              {
+                "count": 1,
+                "record_type": "sink_effect_stream"
+              },
+              {
+                "count": 3,
+                "record_type": "token"
+              },
+              {
+                "count": 3,
+                "record_type": "token_outcome"
+              },
+              {
+                "count": 2,
+                "record_type": "transform_error"
+              }
+            ],
+            "kind": "exact",
+            "projection": {
+              "audit_records": [
+                {
+                  "key": "artifact|sink:errors@468d2923fe79|primary|0|file",
+                  "material": "{\"artifact_type\":\"file\",\"content_hash\":\"cd5ddabd29324ba65e9347ba4b2454d2a92349e02fd9f386dc9eac9840c0fde9\",\"idempotency_witness\":\"sink:errors@468d2923fe79|primary|0\",\"path_or_uri\":\"$CORPUS_RUNTIME_PATH\",\"producer_kind\":\"sink_effect\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"size_bytes\":46}",
+                  "record_type": "artifact",
+                  "references": [
+                    "sink:errors@468d2923fe79",
+                    "sink:errors@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:errors@468d2923fe79|sink_write|0|0",
+                  "material": "{\"call_index\":0,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "record_type": "call",
+                  "references": [
+                    "sink:errors@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:errors@468d2923fe79|sink_write|0|1",
+                  "material": "{\"call_index\":1,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "record_type": "call",
+                  "references": [
+                    "sink:errors@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "call|sink:errors@468d2923fe79|sink_write|0|2",
+                  "material": "{\"call_index\":2,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}",
+                  "record_type": "call",
+                  "references": [
+                    "sink:errors@468d2923fe79|sink_write|0"
+                  ]
+                },
+                {
+                  "key": "edge|gate:select_failure_policy@64d99782702a|continue|move|transform:fail_selected@e7eff0f8b3dc",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"continue\"}",
+                  "record_type": "edge",
+                  "references": [
+                    "gate:select_failure_policy@64d99782702a",
+                    "transform:fail_selected@e7eff0f8b3dc"
+                  ]
+                },
+                {
+                  "key": "edge|gate:select_failure_policy@64d99782702a|true|move|transform:fail_selected@e7eff0f8b3dc",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"true\"}",
+                  "record_type": "edge",
+                  "references": [
+                    "gate:select_failure_policy@64d99782702a",
+                    "transform:fail_selected@e7eff0f8b3dc"
+                  ]
+                },
+                {
+                  "key": "edge|source:primary@5a21cc0bf019|continue|move|gate:select_failure_policy@64d99782702a",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"continue\"}",
+                  "record_type": "edge",
+                  "references": [
+                    "gate:select_failure_policy@64d99782702a",
+                    "source:primary@5a21cc0bf019"
+                  ]
+                },
+                {
+                  "key": "edge|transform:fail_selected@e7eff0f8b3dc|__error_fail_selected__|divert|sink:errors@468d2923fe79",
+                  "material": "{\"default_mode\":\"divert\",\"label\":\"__error_fail_selected__\"}",
+                  "record_type": "edge",
+                  "references": [
+                    "sink:errors@468d2923fe79",
+                    "transform:fail_selected@e7eff0f8b3dc"
+                  ]
+                },
+                {
+                  "key": "edge|transform:fail_selected@e7eff0f8b3dc|on_success|move|sink:errors@468d2923fe79",
+                  "material": "{\"default_mode\":\"move\",\"label\":\"on_success\"}",
+                  "record_type": "edge",
+                  "references": [
+                    "sink:errors@468d2923fe79",
+                    "transform:fail_selected@e7eff0f8b3dc"
+                  ]
+                },
+                {
+                  "key": "manifest|manifest",
+                  "material": "{\"chunk_count\":1,\"derivation_version\":\"audit-export-derivation-v1\",\"export_format\":\"json\",\"hash_algorithm\":\"sha256\",\"record_chain_algorithm\":\"sha256_concat_record_sha256_v1\",\"record_count\":59,\"schema\":\"elspeth.audit-export-manifest.v2\",\"signature_algorithm\":\"unsigned\",\"signature_key_id\":\"UNSIGNED\",\"source_status\":\"completed_with_failures\"}",
+                  "record_type": "manifest",
+                  "references": [
+                    "run|run"
+                  ]
+                },
+                {
+                  "key": "node|gate:select_failure_policy@64d99782702a",
+                  "material": "{\"config\":{\"condition\":\"row['value'] >= 20\",\"routes\":{\"false\":\"discard\",\"true\":\"routed_error\"}},\"determinism\":\"deterministic\",\"node_type\":\"gate\",\"plugin_name\":\"config_gate:select_failure_policy\",\"plugin_version\":\"engine:0.7.2\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":null}",
+                  "record_type": "node",
+                  "references": []
+                },
+                {
+                  "key": "node|sink:errors@468d2923fe79",
+                  "material": "{\"config\":{\"format\":\"jsonl\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"mode\":\"observed\"}},\"determinism\":\"io_write\",\"node_type\":\"sink\",\"plugin_name\":\"json\",\"plugin_version\":\"1.0.0\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:c7e72d6839c80dea\"}",
+                  "record_type": "node",
+                  "references": []
+                },
+                {
+                  "key": "node|source:primary@5a21cc0bf019",
+                  "material": "{\"config\":{\"on_validation_failure\":\"discard\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"fields\":[\"id: int\",\"value: int\"],\"mode\":\"fixed\"},\"source_name\":\"primary\"},\"determinism\":\"io_read\",\"node_type\":\"source\",\"plugin_name\":\"csv\",\"plugin_version\":\"1.0.0\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:da40c7c68226f54a\"}",
+                  "record_type": "node",
+                  "references": []
+                },
+                {
+                  "key": "node|transform:fail_selected@e7eff0f8b3dc",
+                  "material": "{\"config\":{\"schema\":{\"mode\":\"observed\"}},\"determinism\":\"deterministic\",\"node_type\":\"transform\",\"plugin_name\":\"dag_corpus_always_error\",\"plugin_version\":\"0.0.0\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":null}",
+                  "record_type": "node",
+                  "references": []
+                },
+                {
+                  "key": "operation|sink:errors@468d2923fe79|sink_write|0",
+                  "material": "{\"error_message\":null,\"input_data_hash\":null,\"input_data_ref\":null,\"operation_type\":\"sink_write\",\"output_data_hash\":\"$SINK_EFFECT_RESULT\",\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "record_type": "operation",
+                  "references": [
+                    "sink:errors@468d2923fe79",
+                    "sink:errors@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "operation|source:primary@5a21cc0bf019|source_load|0",
+                  "material": "{\"error_message\":null,\"input_data_hash\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"input_data_ref\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"operation_type\":\"source_load\",\"output_data_hash\":null,\"output_data_ref\":null,\"status\":\"completed\"}",
+                  "record_type": "operation",
+                  "references": [
+                    "source:primary@5a21cc0bf019"
+                  ]
+                },
+                {
+                  "key": "run|run",
+                  "material": "{\"canonical_version\":\"sha256-rfc8785-v1\",\"reproducibility_grade\":\"replay_reproducible\",\"semantic_settings_sha256\":\"cb2fc4189d47daa40c09dbeaaf282474561f891910ea8c463823940b36d5ec3e\",\"status\":\"completed_with_failures\"}",
+                  "record_type": "run",
+                  "references": []
+                },
+                {
+                  "key": "sink_effect_attempt|sink:errors@468d2923fe79|primary|0|0",
+                  "material": "{\"action\":\"inspect\",\"attempt_index\":0,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:errors@468d2923fe79|sink_write|0|0\",\"generation\":1,\"member_ordinal\":null,\"request_witness\":\"sink:errors@468d2923fe79|sink_write|0|0\",\"state\":\"returned\"}",
+                  "record_type": "sink_effect_attempt",
+                  "references": [
+                    "sink:errors@468d2923fe79|primary|0",
+                    "sink:errors@468d2923fe79|sink_write|0|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:errors@468d2923fe79|primary|0|1",
+                  "material": "{\"action\":\"reconcile\",\"attempt_index\":1,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:errors@468d2923fe79|sink_write|0|1\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:errors@468d2923fe79|sink_write|0|1\",\"state\":\"returned\"}",
+                  "record_type": "sink_effect_attempt",
+                  "references": [
+                    "sink:errors@468d2923fe79|primary|0",
+                    "sink:errors@468d2923fe79|sink_write|0|1"
+                  ]
+                },
+                {
+                  "key": "sink_effect_attempt|sink:errors@468d2923fe79|primary|0|2",
+                  "material": "{\"action\":\"commit\",\"attempt_index\":2,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:errors@468d2923fe79|sink_write|0|2\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:errors@468d2923fe79|sink_write|0|2\",\"state\":\"returned\"}",
+                  "record_type": "sink_effect_attempt",
+                  "references": [
+                    "sink:errors@468d2923fe79|primary|0",
+                    "sink:errors@468d2923fe79|sink_write|0|2"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:errors@468d2923fe79|primary|0|0",
+                  "material": "{\"descriptor_witness\":\"sink:errors@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":1,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":0,\"payload_hash\":\"ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "record_type": "sink_effect_member",
+                  "references": [
+                    "primary:1",
+                    "primary:1#0",
+                    "sink:errors@468d2923fe79",
+                    "sink:errors@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_member|sink:errors@468d2923fe79|primary|0|1",
+                  "material": "{\"descriptor_witness\":\"sink:errors@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":2,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":1,\"payload_hash\":\"d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}",
+                  "record_type": "sink_effect_member",
+                  "references": [
+                    "primary:2",
+                    "primary:2#0",
+                    "sink:errors@468d2923fe79",
+                    "sink:errors@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect_stream|sink:errors@468d2923fe79|primary",
+                  "material": "{\"head_descriptor_witness\":\"sink:errors@468d2923fe79|primary|0\",\"next_sequence\":1,\"requested_target\":\"$CORPUS_RUNTIME_PATH\",\"role\":\"primary\"}",
+                  "record_type": "sink_effect_stream",
+                  "references": [
+                    "sink:errors@468d2923fe79",
+                    "sink:errors@468d2923fe79|primary|0"
+                  ]
+                },
+                {
+                  "key": "sink_effect|sink:errors@468d2923fe79|primary|0",
+                  "material": "{\"descriptor_mode\":\"precomputed\",\"descriptor_witness\":\"sink:errors@468d2923fe79|primary|0|file\",\"generation\":2,\"group_payload_hash\":\"c0925c7088613db0cfc39108f84b253d72b026ff7e56f1aa632dd652d4a9e8f9\",\"input_kind\":\"pipeline_members\",\"inspection_mode\":\"inspected\",\"member_payload_hashes\":[\"ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d\",\"d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9\"],\"plan_present\":true,\"precondition_witness\":\"sink:errors@468d2923fe79|primary\",\"protocol_version\":\"sink-effect-v1\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"reconcile_kind\":null,\"role\":\"primary\",\"state\":\"finalized\",\"stream_sequence\":0}",
+                  "record_type": "sink_effect",
+                  "references": [
+                    "sink:errors@468d2923fe79",
+                    "sink:errors@468d2923fe79|primary",
+                    "sink:errors@468d2923fe79|primary|0|0",
+                    "sink:errors@468d2923fe79|primary|0|file"
+                  ]
+                }
+              ],
+              "node_states": [
+                {
+                  "attempt": 0,
+                  "key": "primary:0#0|gate:select_failure_policy@64d99782702a|1|0",
+                  "node_key": "gate:select_failure_policy@64d99782702a",
+                  "status": "completed",
+                  "step_index": 1,
+                  "token_key": "primary:0#0"
+                },
+                {
+                  "attempt": 0,
+                  "key": "primary:0#0|source:primary@5a21cc0bf019|0|0",
+                  "node_key": "source:primary@5a21cc0bf019",
+                  "status": "completed",
+                  "step_index": 0,
+                  "token_key": "primary:0#0"
+                },
+                {
+                  "attempt": 0,
+                  "key": "primary:1#0|gate:select_failure_policy@64d99782702a|1|0",
+                  "node_key": "gate:select_failure_policy@64d99782702a",
+                  "status": "completed",
+                  "step_index": 1,
+                  "token_key": "primary:1#0"
+                },
+                {
+                  "attempt": 0,
+                  "key": "primary:1#0|sink:errors@468d2923fe79|3|0",
+                  "node_key": "sink:errors@468d2923fe79",
+                  "status": "completed",
+                  "step_index": 3,
+                  "token_key": "primary:1#0"
+                },
+                {
+                  "attempt": 0,
+                  "key": "primary:1#0|source:primary@5a21cc0bf019|0|0",
+                  "node_key": "source:primary@5a21cc0bf019",
+                  "status": "completed",
+                  "step_index": 0,
+                  "token_key": "primary:1#0"
+                },
+                {
+                  "attempt": 0,
+                  "key": "primary:1#0|transform:fail_selected@e7eff0f8b3dc|2|0",
+                  "node_key": "transform:fail_selected@e7eff0f8b3dc",
+                  "status": "failed",
+                  "step_index": 2,
+                  "token_key": "primary:1#0"
+                },
+                {
+                  "attempt": 0,
+                  "key": "primary:2#0|gate:select_failure_policy@64d99782702a|1|0",
+                  "node_key": "gate:select_failure_policy@64d99782702a",
+                  "status": "completed",
+                  "step_index": 1,
+                  "token_key": "primary:2#0"
+                },
+                {
+                  "attempt": 0,
+                  "key": "primary:2#0|sink:errors@468d2923fe79|3|0",
+                  "node_key": "sink:errors@468d2923fe79",
+                  "status": "completed",
+                  "step_index": 3,
+                  "token_key": "primary:2#0"
+                },
+                {
+                  "attempt": 0,
+                  "key": "primary:2#0|source:primary@5a21cc0bf019|0|0",
+                  "node_key": "source:primary@5a21cc0bf019",
+                  "status": "completed",
+                  "step_index": 0,
+                  "token_key": "primary:2#0"
+                },
+                {
+                  "attempt": 0,
+                  "key": "primary:2#0|transform:fail_selected@e7eff0f8b3dc|2|0",
+                  "node_key": "transform:fail_selected@e7eff0f8b3dc",
+                  "status": "failed",
+                  "step_index": 2,
+                  "token_key": "primary:2#0"
+                }
+              ],
+              "routes": [
+                {
+                  "from_node_key": "gate:select_failure_policy@64d99782702a",
+                  "key": "primary:1#0|gate:select_failure_policy@64d99782702a|0|transform:fail_selected@e7eff0f8b3dc",
+                  "label": "true",
+                  "mode": "move",
+                  "ordinal": 0,
+                  "to_node_key": "transform:fail_selected@e7eff0f8b3dc",
+                  "token_key": "primary:1#0"
+                },
+                {
+                  "from_node_key": "transform:fail_selected@e7eff0f8b3dc",
+                  "key": "primary:1#0|transform:fail_selected@e7eff0f8b3dc|0|sink:errors@468d2923fe79",
+                  "label": "__error_fail_selected__",
+                  "mode": "divert",
+                  "ordinal": 0,
+                  "to_node_key": "sink:errors@468d2923fe79",
+                  "token_key": "primary:1#0"
+                },
+                {
+                  "from_node_key": "gate:select_failure_policy@64d99782702a",
+                  "key": "primary:2#0|gate:select_failure_policy@64d99782702a|0|transform:fail_selected@e7eff0f8b3dc",
+                  "label": "true",
+                  "mode": "move",
+                  "ordinal": 0,
+                  "to_node_key": "transform:fail_selected@e7eff0f8b3dc",
+                  "token_key": "primary:2#0"
+                },
+                {
+                  "from_node_key": "transform:fail_selected@e7eff0f8b3dc",
+                  "key": "primary:2#0|transform:fail_selected@e7eff0f8b3dc|0|sink:errors@468d2923fe79",
+                  "label": "__error_fail_selected__",
+                  "mode": "divert",
+                  "ordinal": 0,
+                  "to_node_key": "sink:errors@468d2923fe79",
+                  "token_key": "primary:2#0"
+                }
+              ],
+              "rows": [
+                {
+                  "ingest_sequence": 0,
+                  "key": "primary:0",
+                  "source_data_hash": "19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2",
+                  "source_name": "primary",
+                  "source_row_index": 0
+                },
+                {
+                  "ingest_sequence": 1,
+                  "key": "primary:1",
+                  "source_data_hash": "ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d",
+                  "source_name": "primary",
+                  "source_row_index": 1
+                },
+                {
+                  "ingest_sequence": 2,
+                  "key": "primary:2",
+                  "source_data_hash": "d7c1d668deaae7fb498b23776bd8b3a5f898bf11e8b73cd42bd1d415f0baf4c9",
+                  "source_name": "primary",
+                  "source_row_index": 2
+                }
+              ],
+              "scheduler_work": [
+                {
+                  "final_status": "terminal",
+                  "key": "primary:0#0|gate:select_failure_policy@64d99782702a|0",
+                  "node_key": "gate:select_failure_policy@64d99782702a",
+                  "token_key": "primary:0#0",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_terminal:terminal"
+                  ]
+                },
+                {
+                  "final_status": "terminal",
+                  "key": "primary:1#0|gate:select_failure_policy@64d99782702a|0",
+                  "node_key": "gate:select_failure_policy@64d99782702a",
+                  "token_key": "primary:1#0",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ]
+                },
+                {
+                  "final_status": "terminal",
+                  "key": "primary:2#0|gate:select_failure_policy@64d99782702a|0",
+                  "node_key": "gate:select_failure_policy@64d99782702a",
+                  "token_key": "primary:2#0",
+                  "transitions": [
+                    "enqueue:ready",
+                    "claim_ready:leased",
+                    "mark_pending_sink:pending_sink",
+                    "mark_pending_sink_terminal:terminal"
+                  ]
+                }
+              ],
+              "terminal_dispositions": [
+                {
+                  "key": "primary:0#0",
+                  "outcome": "success",
+                  "path": "gate_discarded",
+                  "sink_name": null,
+                  "token_key": "primary:0#0"
+                },
+                {
+                  "key": "primary:1#0",
+                  "outcome": "failure",
+                  "path": "on_error_routed",
+                  "sink_name": "errors",
+                  "token_key": "primary:1#0"
+                },
+                {
+                  "key": "primary:2#0",
+                  "outcome": "failure",
+                  "path": "on_error_routed",
+                  "sink_name": "errors",
+                  "token_key": "primary:2#0"
+                }
+              ],
+              "tokens": [
+                {
+                  "key": "primary:0#0",
+                  "parents": [],
+                  "row_key": "primary:0"
+                },
+                {
+                  "key": "primary:1#0",
+                  "parents": [],
+                  "row_key": "primary:1"
+                },
+                {
+                  "key": "primary:2#0",
+                  "parents": [],
+                  "row_key": "primary:2"
+                }
+              ]
+            },
+            "rows_failed": 2,
+            "rows_processed": 3,
+            "rows_succeeded": 1,
+            "sink_outputs": [
+              {
+                "rows": [
+                  "{\"id\":2,\"value\":20}",
+                  "{\"id\":3,\"value\":30}"
+                ],
+                "sink_name": "errors"
+              }
+            ],
+            "source_operation_count": 1,
+            "status": "completed_with_failures"
+          }
     dimensions:
       config:
         status: pass
-        evidence: [yaml-importer-generator, harness-conditional-routing-two-way-gate]
+        evidence:
+          - yaml-importer-generator
+          - conditional-routing-destination-negatives
+          - harness-conditional-routing-two-way-gate
+          - harness-conditional-routing-error-route-and-discard
       build:
         status: pass
-        evidence: [core-builder-schema-plural-sources, harness-conditional-routing-two-way-gate]
+        evidence:
+          - core-builder-schema-plural-sources
+          - conditional-routing-destination-negatives-02
+          - harness-conditional-routing-two-way-gate
+          - harness-conditional-routing-error-route-and-discard
       contracts:
         status: pass
         evidence: [core-builder-schema-plural-sources-03, composer-runtime-agreement-07]
       runtime:
         status: pass
-        evidence: [harness-conditional-routing-two-way-gate]
+        evidence:
+          - harness-conditional-routing-two-way-gate
+          - harness-conditional-routing-error-route-and-discard
       audit:
         status: pass
-        evidence: [harness-conditional-routing-two-way-gate]
+        evidence:
+          - harness-conditional-routing-two-way-gate
+          - harness-conditional-routing-error-route-and-discard
       recovery: *recovery_unknown
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
