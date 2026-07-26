@@ -726,6 +726,77 @@ def test_schema_forms_reject_wrong_knob_types() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("component_kind", "plugin", "credential_field"),
+    [
+        ("source", "csv", "connection_string"),
+        ("sink", "json", "client_secret"),
+        ("sink", "database", "url"),
+    ],
+)
+def test_schema_forms_reject_literal_credentials_before_guided_state_persistence(
+    component_kind: str,
+    plugin: str,
+    credential_field: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    canary = "guided-literal-credential-canary-7f3a9d"
+    knobs = {
+        "fields": [
+            {
+                "name": credential_field,
+                "kind": "text",
+                "required": False,
+                "nullable": False,
+            }
+        ]
+    }
+    authority = SchemaFormAuthority(
+        knobs=knobs,
+        model_validated_options={credential_field: canary},
+    )
+    response = SchemaFormResponse(plugin=plugin, options={credential_field: canary})
+
+    if component_kind == "source":
+        session, turn = _source_options_session(facts=None)
+        source_pending = dict(session.pending_source_intents)
+        source_pending[SOURCE_A] = replace(source_pending[SOURCE_A], plugin=plugin)
+        session = replace(session, pending_source_intents=source_pending)
+
+        def submit() -> GuidedSession:
+            return transition_source_schema_form(
+                session,
+                target_id=SOURCE_A,
+                turn=turn,
+                response=response,
+                authority=authority,
+            )
+
+    else:
+        session, turn = _sink_options_session()
+        sink_pending = dict(session.pending_output_intents)
+        sink_pending[OUTPUT_A] = replace(sink_pending[OUTPUT_A], plugin=plugin)
+        session = replace(session, pending_output_intents=sink_pending)
+
+        def submit() -> GuidedSession:
+            return transition_sink_schema_form(
+                session,
+                target_id=OUTPUT_A,
+                turn=turn,
+                response=response,
+                authority=authority,
+            )
+
+    persisted_before = session.to_dict()
+    with pytest.raises(ValueError, match=credential_field) as exc_info:
+        submit()
+
+    assert session.to_dict() == persisted_before
+    assert canary not in repr(session.to_dict())
+    assert canary not in str(exc_info.value)
+    assert canary not in caplog.text
+
+
 def _sink_schema_form_with_path(path: str) -> GuidedSession:
     session, turn = _sink_options_session()
     return transition_sink_schema_form(
