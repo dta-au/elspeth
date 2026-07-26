@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from threading import Lock
 from typing import Any, Final, NotRequired, Required, TypedDict
 
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -860,6 +861,7 @@ def fork_coalesce_exemplar_args(
 # caller can poison the cached payload.
 _AIDS_MEMO: dict[str, _PlannerAuthoringAids] = {}
 _AIDS_MEMO_MAX: Final[int] = 8
+_AIDS_MEMO_LOCK = Lock()
 
 
 def build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthoringAids:
@@ -870,12 +872,19 @@ def build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthorin
     policy-hidden are omitted rather than rendered with invented names.
     """
     key = catalog.snapshot.snapshot_hash
-    cached = _AIDS_MEMO.get(key)
+    with _AIDS_MEMO_LOCK:
+        cached = _AIDS_MEMO.get(key)
     if cached is None:
-        cached = _build_planner_authoring_aids(catalog)
-        if len(_AIDS_MEMO) >= _AIDS_MEMO_MAX:
-            _AIDS_MEMO.pop(next(iter(_AIDS_MEMO)))
-        _AIDS_MEMO[key] = cached
+        built = _build_planner_authoring_aids(catalog)
+        with _AIDS_MEMO_LOCK:
+            # Another worker may have populated this snapshot while the
+            # catalog sweep ran. Prefer that value and mutate/evict only while
+            # holding the cache lock.
+            cached = _AIDS_MEMO.get(key)
+            if cached is None:
+                if len(_AIDS_MEMO) >= _AIDS_MEMO_MAX:
+                    _AIDS_MEMO.pop(next(iter(_AIDS_MEMO)))
+                _AIDS_MEMO[key] = cached = built
     return deepcopy(cached)
 
 

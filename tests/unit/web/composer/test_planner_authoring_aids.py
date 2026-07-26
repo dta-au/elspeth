@@ -15,13 +15,16 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer import planner_authoring_aids
 from elspeth.web.composer.planner_authoring_aids import (
     PLACEHOLDER_BLOB_ID,
     build_planner_authoring_aids,
@@ -47,6 +50,37 @@ def _trained_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     return PolicyCatalogView.for_trained_operator(catalog, snapshot), snapshot
+
+
+def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every cache operation is serialized across planner worker threads."""
+
+    class LockCheckedMemo(dict[str, dict[str, Any]]):
+        def _assert_locked(self) -> None:
+            assert planner_authoring_aids._AIDS_MEMO_LOCK.locked()
+
+        def get(self, key: str, default: Any = None) -> Any:
+            self._assert_locked()
+            return super().get(key, default)
+
+        def __len__(self) -> int:
+            self._assert_locked()
+            return super().__len__()
+
+        def __setitem__(self, key: str, value: dict[str, Any]) -> None:
+            self._assert_locked()
+            super().__setitem__(key, value)
+
+    memo = LockCheckedMemo()
+    monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO", memo)
+    monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", lambda catalog: {"key": "value"})
+    catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="snapshot"))
+
+    first = planner_authoring_aids.build_planner_authoring_aids(catalog)
+    second = planner_authoring_aids.build_planner_authoring_aids(catalog)
+
+    assert first == second == {"key": "value"}
+    assert first is not second
 
 
 def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
