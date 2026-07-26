@@ -69,12 +69,16 @@ def render_settings(case: HarnessCaseSpec, tmp_path: Path) -> RenderedScenario:
     """Resolve and load one trusted corpus fixture without environment expansion."""
 
     fixture_path = resolve_fixture_path(case.fixture)
+    fixture_bytes = fixture_path.read_bytes()
+    fixture_template = fixture_bytes.decode("utf-8")
+    if "${input_csv}" not in fixture_template:
+        raise ValueError(f"DAG scenario fixture must reference ${{input_csv}}: {fixture_path}")
+
     input_path = resolve_fixture_path(case.input_fixture)
     output_path = tmp_path / "output.jsonl"
     fault_marker = tmp_path / "fault-triggered.marker"
-    fixture_bytes = fixture_path.read_bytes()
     input_bytes = input_path.read_bytes()
-    rendered = Template(fixture_bytes.decode("utf-8")).substitute(
+    rendered = Template(fixture_template).substitute(
         input_csv=json.dumps(str(input_path)),
         output_jsonl=json.dumps(str(output_path)),
         fault_marker=json.dumps(str(fault_marker)),
