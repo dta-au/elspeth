@@ -588,6 +588,11 @@ def test_composition_state_from_runtime_yaml_rejects_unknown_queue_field() -> No
         composition_state_from_runtime_yaml("queues:\n  inbound:\n    priority: 5\n")
 
 
+def test_composition_state_from_runtime_yaml_rejects_mixed_type_unknown_queue_fields() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"queues\.inbound contains unknown field\(s\): \[1, 'priority'\]"):
+        composition_state_from_runtime_yaml("queues:\n  inbound:\n    priority: 5\n    1: invalid\n")
+
+
 def test_composition_state_from_runtime_yaml_rejects_non_string_queue_description() -> None:
     with pytest.raises(RuntimeYamlImportError, match=r"queues\.inbound\.description must be a string"):
         composition_state_from_runtime_yaml("queues:\n  inbound:\n    description: 7\n")
