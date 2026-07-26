@@ -1032,6 +1032,11 @@ test "${TARGET_PLATFORM:?}" = linux/amd64 || test "$TARGET_PLATFORM" = linux/arm
   chmod 700 "$ROLLBACK_CONTEXT"
   trap 'rm -rf -- "$ROLLBACK_CONTEXT"' EXIT HUP INT TERM
   git archive "$ROLLBACK_BASELINE_SHA" | tar -x -C "$ROLLBACK_CONTEXT"
+  # Do not let archived symlinks (including dangling ones) redirect these
+  # writes outside the private context or make chmod follow an external path.
+  rm -rf -- "$ROLLBACK_CONTEXT/Dockerfile" "$ROLLBACK_CONTEXT/.dockerignore"
+  test ! -e "$ROLLBACK_CONTEXT/Dockerfile" && test ! -L "$ROLLBACK_CONTEXT/Dockerfile"
+  test ! -e "$ROLLBACK_CONTEXT/.dockerignore" && test ! -L "$ROLLBACK_CONTEXT/.dockerignore"
   git show "$CANDIDATE_SHA:Dockerfile" >"$ROLLBACK_CONTEXT/Dockerfile"
   git show "$CANDIDATE_SHA:.dockerignore" >"$ROLLBACK_CONTEXT/.dockerignore"
   chmod 600 "$ROLLBACK_CONTEXT/Dockerfile" "$ROLLBACK_CONTEXT/.dockerignore"
