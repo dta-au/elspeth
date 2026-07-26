@@ -329,7 +329,7 @@ def _queues_from_runtime_mapping(section: object) -> list[NodeSpec]:
             raise RuntimeYamlImportError("queues keys must be non-empty strings")
         path = f"queues.{raw_name}"
         entry = _require_mapping(raw_entry, path)
-        unknown = sorted(set(entry) - {"description"})
+        unknown = sorted(set(entry) - {"description"}, key=lambda field: (type(field).__name__, repr(field)))
         if unknown:
             raise RuntimeYamlImportError(f"{path} contains unknown field(s): {unknown}")
         description = entry.get("description")
