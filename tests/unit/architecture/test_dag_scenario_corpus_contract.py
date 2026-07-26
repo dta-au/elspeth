@@ -49,7 +49,9 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     GraphEvidence,
     GraphNodeTypeCount,
     HarnessCaseSpec,
+    ParallelSinkFinalizationRecoveryEvidence,
     RecoveryEvidence,
+    RecoveryKind,
     RunExpectation,
     RuntimeEvidence,
     ScenarioManifest,
@@ -192,7 +194,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "partial",
-        "unknown",
+        "partial",
         "unknown",
         "pass",
         "fail",
@@ -387,8 +389,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ea35aca5d16f200f99df6ff2449b4193242972adf590d3e767aa7bf3c8320f49"
-EXPECTED_CASE_REGISTRY_SHA256 = "7dac26d82d6deffe9cfde48b3c8c5b3d01efe62cfa82c7170dc4e1aa0ed050c4"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "67379e4d8933c14c460891c64c8e66937dcf285e135f421c49469d164d863e57"
+EXPECTED_CASE_REGISTRY_SHA256 = "c6e4e174121303e3e499638649df9732eaed7ce9549d04814009c1f90ed37185"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -441,6 +443,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "fork-coalesce-policies:union-collision-fail": "973269df09a38f4beabc778c2b06365a10363444229530974e71888f98a4d57f",
     "sequential-nested-fork-coalesce:two-sequential-require-all": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
     "parallel-coalesces:two-parallel-require-all": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
+    "parallel-coalesces:resume-after-left-finalize": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
     "checkpoint-deterministic-resume:reopen-resume": "ce62216ce20210600f1a9c20e362aaf299c7538e6c4d3bd0e97627563dc813e6",
 }
 
@@ -497,6 +500,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-parallel-coalesces-two-parallel-require-all",
         "parallel-coalesces:two-parallel-require-all",
         ("config", "build", "runtime"),
+    ),
+    (
+        "harness-parallel-coalesces-resume-after-left-finalize",
+        "parallel-coalesces:resume-after-left-finalize",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
 )
 
@@ -1126,6 +1134,24 @@ def _case() -> HarnessCaseSpec:
     )
 
 
+def test_recovery_workflow_requires_a_closed_recovery_kind() -> None:
+    values = _case().model_dump(mode="json")
+    values["workflow"] = "recovery"
+    with pytest.raises(ValidationError, match="recovery workflow requires recovery_kind"):
+        HarnessCaseSpec.model_validate(values)
+
+    values["recovery_kind"] = "parallel_sink_finalization"
+    assert HarnessCaseSpec.model_validate(values).recovery_kind == "parallel_sink_finalization"
+
+
+def test_non_recovery_workflow_forbids_recovery_kind() -> None:
+    values = _case().model_dump(mode="json")
+    values["recovery_kind"] = "eof_aggregation"
+
+    with pytest.raises(ValidationError, match="recovery_kind is valid only for the recovery workflow"):
+        HarnessCaseSpec.model_validate(values)
+
+
 def _plural_binding_case_values() -> dict[str, object]:
     return {
         "id": "plural-bindings",
@@ -1309,6 +1335,37 @@ def _valid_recovery() -> RecoveryEvidence:
         can_resume=True,
         source_replayed=False,
         checkpoint_removed=True,
+    )
+
+
+def _valid_sink_finalization_recovery() -> ParallelSinkFinalizationRecoveryEvidence:
+    return ParallelSinkFinalizationRecoveryEvidence(
+        fault_seam="after_finalize_before_response",
+        fault_count=1,
+        first_sink="left",
+        second_sink="right",
+        source_exhausted_before=True,
+        completed_coalesces_before=2,
+        first_sink_rows_before=3,
+        first_effect_id_before="a" * 64,
+        first_effect_id_after="a" * 64,
+        first_artifact_id_before="b" * 64,
+        first_artifact_id_after="b" * 64,
+        first_attempt_ids_before=("attempt-a", "attempt-b", "attempt-c"),
+        first_attempt_ids_after=("attempt-a", "attempt-b", "attempt-c"),
+        first_effect_unchanged=True,
+        first_artifact_unchanged=True,
+        first_attempts_unchanged=True,
+        first_sink_republished=False,
+        second_effect_absent_before=True,
+        second_artifact_absent_before=True,
+        second_attempt_count_before=0,
+        second_effect_id_after="c" * 64,
+        second_artifact_id_after="d" * 64,
+        second_attempt_ids_after=("attempt-d", "attempt-e", "attempt-f"),
+        final_output_rows=6,
+        durable_export_parity=True,
+        held_barrier_proven=False,
     )
 
 
@@ -2528,6 +2585,7 @@ def test_closed_vocabularies_are_exact() -> None:
     assert get_args(EvidenceKind) == ("harness", "pytest", "document", "decision")
     assert get_args(Stage) == ("config", "build", "runtime", "audit", "recovery")
     assert get_args(Workflow) == ("run", "recovery", "build")
+    assert get_args(RecoveryKind) == ("eof_aggregation", "parallel_sink_finalization")
 
 
 def test_build_expectation_is_dedicated_immutable_and_exact() -> None:
@@ -3021,6 +3079,53 @@ def test_attempted_and_unattempted_recovery_shapes_are_accepted() -> None:
     assert unattempted.checkpoint_id is None
 
 
+def test_parallel_sink_finalization_recovery_pins_stable_identity_and_honest_ceiling() -> None:
+    sink_recovery = _valid_sink_finalization_recovery()
+    values = _valid_recovery().model_dump(mode="json")
+    values["sink_finalization"] = sink_recovery.model_dump(mode="json")
+    evidence = RecoveryEvidence.model_validate(values)
+
+    assert evidence.sink_finalization == sink_recovery
+    assert sink_recovery.first_effect_id_before == sink_recovery.first_effect_id_after
+    assert sink_recovery.first_artifact_id_before == sink_recovery.first_artifact_id_after
+    assert sink_recovery.first_attempt_ids_before == sink_recovery.first_attempt_ids_after
+    assert sink_recovery.held_barrier_proven is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("first_effect_id_after", "e" * 64, "effect identity must be stable"),
+        ("first_artifact_id_after", "e" * 64, "artifact identity must be stable"),
+        ("first_attempt_ids_after", ("attempt-a", "attempt-b", "attempt-z"), "attempt identities must be stable"),
+        ("second_effect_id_after", "a" * 64, "distinct effect identities"),
+        ("second_artifact_id_after", "b" * 64, "distinct artifact identities"),
+    ],
+)
+def test_parallel_sink_finalization_recovery_rejects_identity_drift(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    values = _valid_sink_finalization_recovery().model_dump(mode="json")
+    values[field] = value
+
+    with pytest.raises(ValidationError, match=message):
+        ParallelSinkFinalizationRecoveryEvidence.model_validate(values)
+
+
+def test_unattempted_recovery_forbids_sink_finalization_proof() -> None:
+    with pytest.raises(ValidationError, match="unattempted"):
+        RecoveryEvidence(
+            attempted=False,
+            database_reopened=False,
+            can_resume=False,
+            source_replayed=False,
+            checkpoint_removed=False,
+            sink_finalization=_valid_sink_finalization_recovery(),
+        )
+
+
 def test_scenario_run_evidence_accepts_the_complete_observed_shape() -> None:
     evidence = ScenarioRunEvidence(
         schema_version=2,
@@ -3161,6 +3266,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
+        ("parallel-coalesces", "resume-after-left-finalize"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     assert manifest.verdict == "not_complete"
@@ -3175,11 +3281,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 87
+    assert len(manifest.evidence) == 88
     assert len(assessment_evidence) == 58
-    assert len(harness_evidence) == 28
-    assert len({reference.id for reference in manifest.evidence}) == 87
-    assert len({reference.locator for reference in manifest.evidence}) == 87
+    assert len(harness_evidence) == 29
+    assert len({reference.id for reference in manifest.evidence}) == 88
+    assert len({reference.locator for reference in manifest.evidence}) == 88
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -3201,6 +3307,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
+        ("parallel-coalesces", "resume-after-left-finalize"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     normalized_cases = json.dumps(cases, sort_keys=True, separators=(",", ":")).encode()
@@ -3277,6 +3384,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("parallel-coalesces", "build"),
             ("parallel-coalesces", "runtime"),
         ),
+        "harness-parallel-coalesces-resume-after-left-finalize": (("parallel-coalesces", "recovery"),),
         "harness-checkpoint-deterministic-resume-reopen-resume": (
             ("checkpoint-deterministic-resume", "runtime"),
             ("checkpoint-deterministic-resume", "audit"),

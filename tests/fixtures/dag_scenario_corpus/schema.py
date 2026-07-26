@@ -44,6 +44,7 @@ Dimension = Literal[
 EvidenceKind = Literal["harness", "pytest", "document", "decision"]
 Stage = Literal["config", "build", "runtime", "audit", "recovery"]
 Workflow = Literal["run", "recovery", "build"]
+RecoveryKind = Literal["eof_aggregation", "parallel_sink_finalization"]
 GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "sink", "source", "transform"]
 
 EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
@@ -825,6 +826,7 @@ def normalize_template_name(name: str) -> str:
 class HarnessCaseSpec(ClosedModel):
     id: NonEmpty
     workflow: Workflow
+    recovery_kind: RecoveryKind | None = Field(default=None, exclude_if=lambda value: value is None)
     fixture: NonEmpty
     input_fixtures: Mapping[NonEmpty, NonEmpty]
     output_artifacts: Mapping[NonEmpty, OutputArtifactExpectation]
@@ -885,6 +887,10 @@ class HarnessCaseSpec(ClosedModel):
     def _validate_workflow_expectation(self) -> Self:
         if isinstance(self.expected, SemanticRunExpectation) and self.workflow != "run":
             raise ValueError("semantic_runtime expectation is valid only for the run workflow")
+        if self.workflow == "recovery" and self.recovery_kind is None:
+            raise ValueError("recovery workflow requires recovery_kind")
+        if self.workflow != "recovery" and self.recovery_kind is not None:
+            raise ValueError("recovery_kind is valid only for the recovery workflow")
         if self.workflow == "build":
             if not isinstance(self.expected, BuildExpectation):
                 raise ValueError("build workflow requires BuildExpectation")
@@ -1132,6 +1138,59 @@ class AuditEvidence(ClosedModel):
         return data
 
 
+class ParallelSinkFinalizationRecoveryEvidence(ClosedModel):
+    """Exact asymmetric sink-finalization proof; never a held-barrier claim."""
+
+    fault_seam: Literal["after_finalize_before_response"]
+    fault_count: Literal[1]
+    first_sink: NonEmpty
+    second_sink: NonEmpty
+    source_exhausted_before: Literal[True]
+    completed_coalesces_before: Literal[2]
+    first_sink_rows_before: Literal[3]
+    first_effect_id_before: NonEmpty
+    first_effect_id_after: NonEmpty
+    first_artifact_id_before: NonEmpty
+    first_artifact_id_after: NonEmpty
+    first_attempt_ids_before: tuple[NonEmpty, ...]
+    first_attempt_ids_after: tuple[NonEmpty, ...]
+    first_effect_unchanged: Literal[True]
+    first_artifact_unchanged: Literal[True]
+    first_attempts_unchanged: Literal[True]
+    first_sink_republished: Literal[False]
+    second_effect_absent_before: Literal[True]
+    second_artifact_absent_before: Literal[True]
+    second_attempt_count_before: Literal[0]
+    second_effect_id_after: NonEmpty
+    second_artifact_id_after: NonEmpty
+    second_attempt_ids_after: tuple[NonEmpty, ...]
+    final_output_rows: Literal[6]
+    durable_export_parity: Literal[True]
+    held_barrier_proven: Literal[False]
+
+    @model_validator(mode="after")
+    def _validate_stable_identity(self) -> Self:
+        if self.first_sink == self.second_sink:
+            raise ValueError("parallel sink-finalization recovery requires distinct sinks")
+        if self.first_effect_id_before != self.first_effect_id_after:
+            raise ValueError("first sink effect identity must be stable across resume")
+        if self.first_artifact_id_before != self.first_artifact_id_after:
+            raise ValueError("first sink artifact identity must be stable across resume")
+        if self.first_attempt_ids_before != self.first_attempt_ids_after:
+            raise ValueError("first sink attempt identities must be stable across resume")
+        for label, attempt_ids in (
+            ("first sink", self.first_attempt_ids_after),
+            ("second sink", self.second_attempt_ids_after),
+        ):
+            if len(attempt_ids) != 3 or attempt_ids != tuple(sorted(set(attempt_ids))):
+                raise ValueError(f"{label} recovery requires three unique sorted attempt identities")
+        if self.first_effect_id_after == self.second_effect_id_after:
+            raise ValueError("parallel sinks must use distinct effect identities")
+        if self.first_artifact_id_after == self.second_artifact_id_after:
+            raise ValueError("parallel sinks must use distinct artifact identities")
+        return self
+
+
 class RecoveryEvidence(ClosedModel):
     attempted: StrictBool
     database_reopened: StrictBool
@@ -1140,6 +1199,10 @@ class RecoveryEvidence(ClosedModel):
     can_resume: StrictBool
     source_replayed: StrictBool
     checkpoint_removed: StrictBool
+    sink_finalization: ParallelSinkFinalizationRecoveryEvidence | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_recovery_shape(self) -> Self:
@@ -1153,6 +1216,7 @@ class RecoveryEvidence(ClosedModel):
             or self.can_resume
             or self.source_replayed
             or self.checkpoint_removed
+            or self.sink_finalization is not None
         ):
             raise ValueError("unattempted recovery forbids checkpoint identity and true result flags")
         return self

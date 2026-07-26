@@ -54,6 +54,14 @@ and an order-insensitive runtime projection, but deliberately excludes raw
 audit identity. Its harness evidence is therefore limited to exactly
 `[config, build, runtime]` and cannot support an audit or recovery pass.
 
+Every `recovery` case also declares a closed `recovery_kind`, so the shared
+harness cannot silently apply one topology's restart assertions to another.
+The `parallel_sink_finalization` evidence records exact before/after sink
+effect, artifact, and attempt identities while fixing `held_barrier_proven` to
+false: terminal-arm asymmetry is useful partial evidence, not proof that one
+parallel coalesce barrier remained held. Pre-platform recovery evidence must
+be rerun after the deferred-platform rebase before it is accepted forward.
+
 The manifest does not replace the criteria, and a dated assessment does not
 replace the live manifest. Documentary evidence can explain a cell, but only
 executable `harness` or `pytest` evidence can support `pass`.

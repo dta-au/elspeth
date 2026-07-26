@@ -425,6 +425,11 @@ evidence:
     locator: parallel-coalesces:two-parallel-require-all
     claim: Two independent require-all nested barriers execute exact dual artifacts, parent-set, disposition, and scheduler runtime evidence.
     stages: [config, build, runtime]
+  - id: harness-parallel-coalesces-resume-after-left-finalize
+    kind: harness
+    locator: parallel-coalesces:resume-after-left-finalize
+    claim: A fresh-object public resume reuses the finalized first sink effect and artifact without republication, drives only the absent second sink, preserves exact DAG cardinalities and terminal state, removes the checkpoint, and keeps durable/export parity; this terminal-arm asymmetry does not prove a held coalesce barrier.
+    stages: [config, build, runtime, audit, recovery]
   - id: parallel-coalesces-branch-ownership-negative
     kind: pytest
     locator: tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_parallel_coalesces_reject_cross_claimed_branch
@@ -3500,6 +3505,20 @@ scenarios:
           left: left.jsonl
           right: right.jsonl
         expected: {"kind":"semantic_runtime","status":"completed","sink_outputs":[{"sink_name":"left","rows":["{\"left_a\":{\"id\":1,\"value\":10},\"left_b\":{\"id\":1,\"value\":10}}","{\"left_a\":{\"id\":2,\"value\":20},\"left_b\":{\"id\":2,\"value\":20}}","{\"left_a\":{\"id\":3,\"value\":30},\"left_b\":{\"id\":3,\"value\":30}}"]},{"sink_name":"right","rows":["{\"right_a\":{\"id\":1,\"value\":10},\"right_b\":{\"id\":1,\"value\":10}}","{\"right_a\":{\"id\":2,\"value\":20},\"right_b\":{\"id\":2,\"value\":20}}","{\"right_a\":{\"id\":3,\"value\":30},\"right_b\":{\"id\":3,\"value\":30}}"]}],"rows_processed":3,"rows_succeeded":6,"rows_failed":0,"audit_record_counts":[{"record_type":"artifact","count":2},{"record_type":"call","count":6},{"record_type":"edge","count":8},{"record_type":"manifest","count":1},{"record_type":"node","count":6},{"record_type":"node_state","count":24},{"record_type":"operation","count":3},{"record_type":"routing_event","count":12},{"record_type":"row","count":3},{"record_type":"run","count":1},{"record_type":"scheduler_event","count":69},{"record_type":"sink_effect","count":2},{"record_type":"sink_effect_attempt","count":6},{"record_type":"sink_effect_member","count":6},{"record_type":"sink_effect_stream","count":2},{"record_type":"token","count":21},{"record_type":"token_outcome","count":21},{"record_type":"token_parent","count":24}],"source_operation_count":1,"projection_sha256":"5efdc6c0e40376df1399ab77dba9c9a1a53f5fc53a1c22769a20511cd879e930","projection_counts":{"rows":3,"tokens":21,"parent_links":24,"node_states":24,"routes":12,"terminal_dispositions":21,"scheduler_work":21}}
+      - id: resume-after-left-finalize
+        workflow: recovery
+        recovery_kind: parallel_sink_finalization
+        fixture: parallel-coalesces/two-parallel-require-all.yaml
+        input_fixtures:
+          primary: parallel-coalesces/input.csv
+        output_artifacts:
+          left: left.jsonl
+          right: right.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 6
+          required_audit_record_types: [artifact, call, edge, manifest, node, node_state, operation, routing_event, row, run, scheduler_event, sink_effect, sink_effect_attempt, sink_effect_member, sink_effect_stream, token, token_outcome, token_parent]
     dimensions:
       config: *config_pass
       build:
@@ -3526,7 +3545,13 @@ scenarios:
         reason: Durable and portable audit views match within every run, but equivalent independent require-all coalesces can assign parent ordinals by scheduler arrival order and therefore derive different sink-effect lineage identity.
         owner_issue: elspeth-3a6fa9141f
         exit_gate: Require-all coalesces persist parents and aligned state completions in declared branch order, then equivalent-run corpus raw parent, lineage, and effect identity assertions pass without weakening arrival-order audit context.
-      recovery: *recovery_unknown
+      recovery:
+        status: partial
+        evidence:
+          - harness-parallel-coalesces-resume-after-left-finalize
+        reason: Fresh-object public resume after first-sink finalization reuses the exact finalized effect and artifact without republication and drives the absent second sink, but this terminal-arm asymmetry does not prove recovery while exactly one coalesce barrier is still held; the evidence is provisional until rerun after the deferred-platform rebase.
+        owner_issue: elspeth-ef29ef6ba4
+        exit_gate: A public-resume case passes with one parallel coalesce barrier durably complete while the other remains held, then this case and the complete corpus gate pass again after the deferred-platform rebase.
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: *guided_fail
@@ -3759,6 +3784,7 @@ scenarios:
     cases:
       - id: reopen-resume
         workflow: recovery
+        recovery_kind: eof_aggregation
         fixture: checkpoint-deterministic-resume/reopen-resume.yaml
         input_fixtures:
           primary: checkpoint-deterministic-resume/input.csv

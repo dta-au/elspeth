@@ -12,6 +12,7 @@ from pathlib import Path
 from string import Template
 from types import MappingProxyType
 from typing import Any, cast
+from unittest.mock import patch
 
 import yaml
 from sqlalchemy import select
@@ -35,8 +36,23 @@ from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter, RecorderFactory
 from elspeth.core.landscape.export_read_model import open_export_read_transaction
-from elspeth.core.landscape.schema import node_states_table, token_work_items_table
+from elspeth.core.landscape.schema import (
+    artifacts_table,
+    node_states_table,
+    rows_table,
+    sink_effect_attempts_table,
+    sink_effect_members_table,
+    sink_effects_table,
+    token_parents_table,
+    token_work_items_table,
+    tokens_table,
+)
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.engine.executors.sink_effects import (
+    SinkEffectCoordinator,
+    SinkEffectExecutionSeam,
+    SinkEffectInjectedFault,
+)
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.engine.orchestrator.preflight import (
     assemble_and_validate_pipeline_config,
@@ -58,6 +74,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     GraphNodeTypeCount,
     HarnessCaseSpec,
     OutputArtifactExpectation,
+    ParallelSinkFinalizationRecoveryEvidence,
     PortableExportUnavailableByPolicy,
     RecoveryEvidence,
     RunExpectation,
@@ -1725,7 +1742,7 @@ def _assert_terminal_recovery_state(
         raise AssertionError("DAG recovery corpus requires a completed resumed node-state attempt carrying the checkpoint marker")
 
 
-def _recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
+def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
     db_url = f"sqlite:///{tmp_path / 'audit.db'}"
     payload_root = tmp_path / "payloads"
     initial_rendered = render_settings(case, tmp_path)
@@ -1864,6 +1881,437 @@ def _recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path
         reopened_db.close()
 
 
+def _sink_effect_snapshot(
+    db: LandscapeDB,
+    *,
+    run_id: str,
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+]:
+    with db.connection() as conn:
+        effects = tuple(
+            sorted(
+                (dict(row) for row in conn.execute(select(sink_effects_table).where(sink_effects_table.c.run_id == run_id)).mappings()),
+                key=lambda row: str(row["effect_id"]),
+            )
+        )
+        effect_ids = tuple(str(effect["effect_id"]) for effect in effects)
+        attempts = (
+            tuple(
+                sorted(
+                    (
+                        dict(row)
+                        for row in conn.execute(
+                            select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.effect_id.in_(effect_ids))
+                        ).mappings()
+                    ),
+                    key=lambda row: str(row["attempt_id"]),
+                )
+            )
+            if effect_ids
+            else ()
+        )
+        members = (
+            tuple(
+                sorted(
+                    (
+                        dict(row)
+                        for row in conn.execute(
+                            select(sink_effect_members_table).where(sink_effect_members_table.c.effect_id.in_(effect_ids))
+                        ).mappings()
+                    ),
+                    key=lambda row: (str(row["effect_id"]), int(row["ordinal"])),
+                )
+            )
+            if effect_ids
+            else ()
+        )
+        artifacts = tuple(
+            sorted(
+                (dict(row) for row in conn.execute(select(artifacts_table).where(artifacts_table.c.run_id == run_id)).mappings()),
+                key=lambda row: str(row["artifact_id"]),
+            )
+        )
+    return effects, attempts, members, artifacts
+
+
+def _parallel_sink_finalization_recovery_case(
+    scenario: ScenarioSpec,
+    case: HarnessCaseSpec,
+    tmp_path: Path,
+) -> ScenarioRunEvidence:
+    db_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    payload_root = tmp_path / "payloads"
+    initial_rendered = render_settings(case, tmp_path)
+    if tuple(initial_rendered.settings.sinks) != ("left", "right"):
+        raise AssertionError("parallel sink-finalization recovery requires declared sink order ('left', 'right')")
+    initial_built = build_scenario(initial_rendered)
+    if (initial_built.graph_evidence.node_count, initial_built.graph_evidence.edge_count) != (6, 8):
+        raise AssertionError("parallel sink-finalization recovery requires the exact six-node/eight-edge graph")
+    initial_store = FilesystemPayloadStore(payload_root)
+    initial_db = LandscapeDB(db_url)
+    initial_checkpoint_manager = CheckpointManager(initial_db)
+    checkpoint_config = RuntimeCheckpointConfig.from_settings(initial_rendered.settings.checkpoint)
+    observed_seams: list[SinkEffectExecutionSeam] = []
+
+    def fail_after_first_finalize(_coordinator: SinkEffectCoordinator, seam: SinkEffectExecutionSeam) -> None:
+        observed_seams.append(seam)
+        if seam is SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE:
+            raise SinkEffectInjectedFault(seam)
+
+    try:
+        catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
+        with patch.object(SinkEffectCoordinator, "_fault", new=fail_after_first_finalize):
+            try:
+                Orchestrator(
+                    initial_db,
+                    checkpoint_manager=initial_checkpoint_manager,
+                    checkpoint_config=checkpoint_config,
+                ).run(
+                    initial_built.config,
+                    graph=initial_built.graph,
+                    settings=initial_rendered.settings,
+                    payload_store=initial_store,
+                    openrouter_catalog_sha256=catalog_sha256,
+                    openrouter_catalog_source=catalog_source,
+                )
+            except SinkEffectInjectedFault as exc:
+                if exc.seam is not SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE:
+                    raise AssertionError(f"parallel sink-finalization recovery reached the wrong fault seam: {exc.seam.value}") from exc
+            else:
+                raise AssertionError("parallel sink-finalization recovery did not inject the first-sink finalization fault")
+        expected_seams = (
+            SinkEffectExecutionSeam.BEFORE_EFFECT,
+            SinkEffectExecutionSeam.AFTER_EFFECT_BEFORE_RETURN,
+            SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE,
+            SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE,
+        )
+        if tuple(observed_seams) != expected_seams:
+            raise AssertionError(f"parallel sink-finalization recovery reached unexpected seams: {observed_seams!r}")
+        finalize_fault_count = observed_seams.count(SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE)
+        if finalize_fault_count != 1:
+            raise AssertionError(f"parallel sink-finalization recovery reached the finalization fault {finalize_fault_count} times")
+
+        initial_repositories = RecorderFactory.read_only(initial_db, payload_store=initial_store)
+        runs = initial_repositories.run_lifecycle.list_runs()
+        if len(runs) != 1 or runs[0].status is not RunStatus.FAILED:
+            raise AssertionError(f"parallel sink-finalization recovery expected one failed run, got {runs!r}")
+        run_id = runs[0].run_id
+        source_records = initial_repositories.run_lifecycle.get_run_source_lifecycle_records(run_id)
+        if not source_records or any(record.lifecycle_state != "exhausted" for record in source_records.values()):
+            raise AssertionError(f"parallel sink-finalization recovery source was not exhausted: {source_records!r}")
+        checkpoint = initial_checkpoint_manager.get_latest_checkpoint(run_id)
+        if checkpoint is None or checkpoint.upstream_topology_hash != initial_built.graph_evidence.topology_hash:
+            raise AssertionError("parallel sink-finalization recovery did not preserve its exact topology checkpoint")
+        checkpoint_id = checkpoint.checkpoint_id
+        checkpoint_sequence = checkpoint.sequence_number
+        checkpoint_topology_hash = checkpoint.upstream_topology_hash
+
+        sink_ids = {str(name): str(node_id) for name, node_id in initial_built.graph.get_sink_id_map().items()}
+        coalesce_ids = {str(node_id) for node_id in initial_built.graph.get_coalesce_id_map().values()}
+        if tuple(sink_ids) != ("left", "right") or len(coalesce_ids) != 2:
+            raise AssertionError(f"parallel sink-finalization recovery graph identity is wrong: {sink_ids!r}, {coalesce_ids!r}")
+        with initial_db.connection() as conn:
+            row_count = conn.execute(select(rows_table.c.row_id).where(rows_table.c.run_id == run_id)).scalars().all()
+            token_count = conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id)).scalars().all()
+            parent_count = (
+                conn.execute(select(token_parents_table.c.token_id).where(token_parents_table.c.run_id == run_id)).scalars().all()
+            )
+            coalesce_states = (
+                conn.execute(
+                    select(node_states_table.c.node_id, node_states_table.c.status).where(
+                        node_states_table.c.run_id == run_id,
+                        node_states_table.c.node_id.in_(coalesce_ids),
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            sink_states = (
+                conn.execute(
+                    select(node_states_table.c.node_id, node_states_table.c.status).where(
+                        node_states_table.c.run_id == run_id,
+                        node_states_table.c.node_id.in_(tuple(sink_ids.values())),
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        if (len(row_count), len(token_count), len(parent_count)) != (3, 21, 24):
+            raise AssertionError(
+                "parallel sink-finalization recovery requires 3 rows/21 tokens/24 parents before resume: "
+                f"{len(row_count)}/{len(token_count)}/{len(parent_count)}"
+            )
+        if {str(state["node_id"]) for state in coalesce_states} != coalesce_ids or any(
+            state["status"] != "completed" for state in coalesce_states
+        ):
+            raise AssertionError(f"parallel sink-finalization recovery did not complete both coalesces: {coalesce_states!r}")
+        if len(sink_states) != 3 or any(state["node_id"] != sink_ids["left"] or state["status"] != "completed" for state in sink_states):
+            raise AssertionError(f"parallel sink-finalization recovery reached the wrong pre-resume sink states: {sink_states!r}")
+
+        before_effects, before_attempts, before_members, before_artifacts = _sink_effect_snapshot(initial_db, run_id=run_id)
+        if len(before_effects) != 1 or before_effects[0]["sink_node_id"] != sink_ids["left"]:
+            raise AssertionError(f"parallel sink-finalization recovery expected only the left effect: {before_effects!r}")
+        first_effect_before = before_effects[0]
+        first_effect_id = str(first_effect_before["effect_id"])
+        first_artifact_id = str(first_effect_before["artifact_id"])
+        if (
+            first_effect_before["state"] != "finalized"
+            or first_effect_before["publication_performed"] is not True
+            or first_effect_before["lease_owner"] is not None
+            or len(before_artifacts) != 1
+            or before_artifacts[0]["artifact_id"] != first_artifact_id
+            or before_artifacts[0]["publication_performed"] is not True
+        ):
+            raise AssertionError("parallel sink-finalization recovery did not durably finalize the first artifact")
+        first_attempts_before = tuple(attempt for attempt in before_attempts if attempt["effect_id"] == first_effect_id)
+        first_members_before = tuple(member for member in before_members if member["effect_id"] == first_effect_id)
+        if (
+            {str(attempt["action"]) for attempt in first_attempts_before} != {"inspect", "reconcile", "commit"}
+            or any(attempt["state"] != "returned" for attempt in first_attempts_before)
+            or len(first_members_before) != 3
+            or any(member["member_state"] != "finalized" for member in first_members_before)
+        ):
+            raise AssertionError("parallel sink-finalization recovery first effect is not exactly finalized")
+        left_path = initial_rendered.output_paths["left"]
+        right_path = initial_rendered.output_paths["right"]
+        left_bytes_before = left_path.read_bytes()
+        if len(left_bytes_before.splitlines()) != 3 or right_path.exists():
+            raise AssertionError("parallel sink-finalization recovery published anything beyond the exact first three-row artifact")
+    finally:
+        initial_db.close()
+
+    del initial_repositories, initial_store, runs, source_records, checkpoint
+    del initial_built, initial_rendered
+
+    reopened_db = LandscapeDB.from_url(db_url, create_tables=False)
+    try:
+        reopened_store = FilesystemPayloadStore(payload_root)
+        reopened_checkpoint_manager = CheckpointManager(reopened_db)
+        reopened_checkpoint = reopened_checkpoint_manager.get_latest_checkpoint(run_id)
+        if reopened_checkpoint is None or (
+            reopened_checkpoint.checkpoint_id,
+            reopened_checkpoint.sequence_number,
+            reopened_checkpoint.upstream_topology_hash,
+        ) != (checkpoint_id, checkpoint_sequence, checkpoint_topology_hash):
+            raise AssertionError("parallel sink-finalization recovery checkpoint changed across fresh-object reopen")
+
+        fresh_rendered = render_settings(case, tmp_path)
+        fresh_built = build_scenario(fresh_rendered, purpose=SinkEffectExecutionPurpose.RESUME)
+        if fresh_built.graph_evidence.topology_hash != checkpoint_topology_hash:
+            raise AssertionError("parallel sink-finalization recovery fresh graph changed topology")
+        recovery = RecoveryManager(reopened_db, reopened_checkpoint_manager)
+        resume_check = recovery.can_resume(run_id, fresh_built.graph)
+        if not resume_check.can_resume:
+            raise AssertionError(f"parallel sink-finalization recovery was not immediately resumable: {resume_check.reason}")
+        resume_point = recovery.get_resume_point(run_id, fresh_built.graph)
+        if resume_point is None or resume_point.checkpoint.checkpoint_id != checkpoint_id:
+            raise AssertionError("parallel sink-finalization recovery did not use its public reopened resume point")
+
+        result = Orchestrator(
+            reopened_db,
+            checkpoint_manager=reopened_checkpoint_manager,
+            checkpoint_config=checkpoint_config,
+        ).resume(
+            resume_point,
+            fresh_built.config,
+            fresh_built.graph,
+            payload_store=reopened_store,
+            settings=fresh_rendered.settings,
+        )
+        result_data = result.to_dict()
+        if result.run_id != run_id or (
+            result_data["status"],
+            result_data["rows_processed"],
+            result_data["rows_succeeded"],
+            result_data["rows_failed"],
+        ) != ("completed", 3, 6, 0):
+            raise AssertionError(f"parallel sink-finalization recovery returned the wrong final result: {result_data!r}")
+
+        sink_outputs = _sink_outputs(fresh_rendered)
+        expected_outputs = tuple(
+            SinkOutputProjection(
+                sink_name=sink_name,
+                rows=tuple(
+                    json.dumps(
+                        {
+                            f"{sink_name}_a": {"id": row_id, "value": row_id * 10},
+                            f"{sink_name}_b": {"id": row_id, "value": row_id * 10},
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    for row_id in (1, 2, 3)
+                ),
+            )
+            for sink_name in ("left", "right")
+        )
+        if sink_outputs != expected_outputs:
+            raise AssertionError(f"parallel sink-finalization recovery emitted unexpected outputs: {sink_outputs!r}")
+
+        after_effects, after_attempts, after_members, after_artifacts = _sink_effect_snapshot(reopened_db, run_id=run_id)
+        effects_by_sink = {str(effect["sink_node_id"]): effect for effect in after_effects}
+        artifacts_by_sink = {str(artifact["sink_node_id"]): artifact for artifact in after_artifacts}
+        if (
+            len(after_effects) != 2
+            or len(after_artifacts) != 2
+            or set(effects_by_sink) != set(sink_ids.values())
+            or set(artifacts_by_sink) != set(sink_ids.values())
+        ):
+            raise AssertionError("parallel sink-finalization recovery did not finish exactly two sink effects and artifacts")
+        first_effect_after = effects_by_sink[sink_ids["left"]]
+        first_artifact_after = artifacts_by_sink[sink_ids["left"]]
+        first_attempts_after = tuple(attempt for attempt in after_attempts if attempt["effect_id"] == first_effect_id)
+        first_members_after = tuple(member for member in after_members if member["effect_id"] == first_effect_id)
+        if (
+            first_effect_after != first_effect_before
+            or first_artifact_after != before_artifacts[0]
+            or first_attempts_after != first_attempts_before
+            or first_members_after != first_members_before
+            or fresh_rendered.output_paths["left"].read_bytes() != left_bytes_before
+        ):
+            raise AssertionError("parallel sink-finalization recovery mutated or republished the finalized first effect")
+
+        second_effect = effects_by_sink[sink_ids["right"]]
+        second_effect_id = str(second_effect["effect_id"])
+        second_artifact = artifacts_by_sink[sink_ids["right"]]
+        second_attempts = tuple(attempt for attempt in after_attempts if attempt["effect_id"] == second_effect_id)
+        second_members = tuple(member for member in after_members if member["effect_id"] == second_effect_id)
+        if (
+            second_effect["state"] != "finalized"
+            or second_effect["publication_performed"] is not True
+            or second_effect["lease_owner"] is not None
+            or second_artifact["sink_effect_id"] != second_effect_id
+            or second_artifact["publication_performed"] is not True
+            or {str(attempt["action"]) for attempt in second_attempts} != {"inspect", "reconcile", "commit"}
+            or any(attempt["state"] != "returned" for attempt in second_attempts)
+            or len(second_members) != 3
+            or any(member["member_state"] != "finalized" for member in second_members)
+        ):
+            raise AssertionError("parallel sink-finalization recovery did not drive exactly the absent second effect")
+
+        final_repositories = RecorderFactory.read_only(reopened_db, payload_store=reopened_store)
+        final_run = final_repositories.run_lifecycle.get_run(run_id)
+        final_source_records = final_repositories.run_lifecycle.get_run_source_lifecycle_records(run_id)
+        tokens = final_repositories.query.get_all_tokens_for_run(run_id)
+        outcomes = final_repositories.query.get_all_token_outcomes_for_run(run_id)
+        latest_outcomes = {outcome.token_id: outcome for outcome in outcomes}
+        token_ids = {token.token_id for token in tokens}
+        with reopened_db.connection() as conn:
+            work_statuses = (
+                conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)).scalars().all()
+            )
+            final_row_count = conn.execute(select(rows_table.c.row_id).where(rows_table.c.run_id == run_id)).scalars().all()
+            final_parent_count = (
+                conn.execute(select(token_parents_table.c.token_id).where(token_parents_table.c.run_id == run_id)).scalars().all()
+            )
+            final_state_count = (
+                conn.execute(select(node_states_table.c.state_id).where(node_states_table.c.run_id == run_id)).scalars().all()
+            )
+        if final_run is None or final_run.status is not RunStatus.COMPLETED:
+            raise AssertionError(f"parallel sink-finalization recovery did not complete the run: {final_run!r}")
+        if not final_source_records or any(record.lifecycle_state != "exhausted" for record in final_source_records.values()):
+            raise AssertionError("parallel sink-finalization recovery lost source exhaustion")
+        if (
+            len(final_row_count),
+            len(token_ids),
+            len(final_parent_count),
+            len(final_state_count),
+            len(work_statuses),
+        ) != (3, 21, 24, 24, 21):
+            raise AssertionError("parallel sink-finalization recovery changed exact DAG cardinalities")
+        if (
+            len(outcomes) != len(token_ids)
+            or set(latest_outcomes) != token_ids
+            or not all(outcome.completed and outcome.outcome is not None for outcome in latest_outcomes.values())
+        ):
+            raise AssertionError("parallel sink-finalization recovery left non-terminal token outcomes")
+        if set(work_statuses) != {"terminal"}:
+            raise AssertionError(f"parallel sink-finalization recovery left non-terminal work: {work_statuses!r}")
+        if reopened_checkpoint_manager.get_latest_checkpoint(run_id) is not None:
+            raise AssertionError("parallel sink-finalization recovery retained its checkpoint")
+
+        durable_records = _public_durable_records(reopened_db, run_id=run_id, payload_store=reopened_store)
+        _validate_durable_sink_effect_material(durable_records)
+        durable_projection = _stable_projection(durable_records, source="durable")
+        portable_records = list(LandscapeExporter(reopened_db).export_run(run_id))
+        _validate_portable_material_matches_durable(durable_records, portable_records)
+        _validate_portable_manifest(portable_records)
+        portable_projection = _stable_projection(portable_records, source="portable")
+        if durable_projection != portable_projection:
+            raise AssertionError("parallel sink-finalization recovery durable and portable projections differ")
+        audit = _audit_evidence(portable_records, portable_projection=portable_projection)
+        if audit.source_operation_count != 1:
+            raise AssertionError(f"parallel sink-finalization recovery replayed its source: {audit.source_operation_count}")
+
+        first_attempt_ids_before = tuple(sorted(str(attempt["attempt_id"]) for attempt in first_attempts_before))
+        first_attempt_ids_after = tuple(sorted(str(attempt["attempt_id"]) for attempt in first_attempts_after))
+        second_attempt_ids = tuple(sorted(str(attempt["attempt_id"]) for attempt in second_attempts))
+        return ScenarioRunEvidence(
+            schema_version=2,
+            scenario_id=scenario.id,
+            case_id=case.id,
+            fixture_sha256=fresh_rendered.fixture_sha256,
+            config=ConfigEvidence(loaded=True, settings_sha256=fresh_rendered.settings_sha256),
+            graph=fresh_built.graph_evidence,
+            runtime=RuntimeEvidence(
+                attempted=True,
+                run_id=run_id,
+                status=str(result_data["status"]),
+                rows_processed=result_data["rows_processed"],
+                rows_succeeded=result_data["rows_succeeded"],
+                rows_failed=result_data["rows_failed"],
+                output_rows=sum(len(output.rows) for output in sink_outputs),
+                sink_outputs=sink_outputs,
+                durable_projection=durable_projection,
+            ),
+            audit=audit,
+            recovery=RecoveryEvidence(
+                attempted=True,
+                database_reopened=True,
+                checkpoint_id=checkpoint_id,
+                checkpoint_sequence=checkpoint_sequence,
+                can_resume=True,
+                source_replayed=False,
+                checkpoint_removed=True,
+                sink_finalization=ParallelSinkFinalizationRecoveryEvidence(
+                    fault_seam="after_finalize_before_response",
+                    fault_count=1,
+                    first_sink="left",
+                    second_sink="right",
+                    source_exhausted_before=True,
+                    completed_coalesces_before=2,
+                    first_sink_rows_before=3,
+                    first_effect_id_before=first_effect_id,
+                    first_effect_id_after=str(first_effect_after["effect_id"]),
+                    first_artifact_id_before=first_artifact_id,
+                    first_artifact_id_after=str(first_artifact_after["artifact_id"]),
+                    first_attempt_ids_before=first_attempt_ids_before,
+                    first_attempt_ids_after=first_attempt_ids_after,
+                    first_effect_unchanged=True,
+                    first_artifact_unchanged=True,
+                    first_attempts_unchanged=True,
+                    first_sink_republished=False,
+                    second_effect_absent_before=True,
+                    second_artifact_absent_before=True,
+                    second_attempt_count_before=0,
+                    second_effect_id_after=second_effect_id,
+                    second_artifact_id_after=str(second_artifact["artifact_id"]),
+                    second_attempt_ids_after=second_attempt_ids,
+                    final_output_rows=6,
+                    durable_export_parity=True,
+                    held_barrier_proven=False,
+                ),
+            ),
+            completed_stages=("config", "build", "runtime", "audit", "recovery"),
+        )
+    finally:
+        reopened_db.close()
+
+
 def run_scenario_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
     """Execute a declared case through the workflow implemented for this task."""
 
@@ -1871,4 +2319,8 @@ def run_scenario_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: P
         return _build_case(scenario, case, tmp_path)
     if case.workflow == "run":
         return _run_case(scenario, case, tmp_path)
-    return _recovery_case(scenario, case, tmp_path)
+    if case.recovery_kind == "eof_aggregation":
+        return _eof_aggregation_recovery_case(scenario, case, tmp_path)
+    if case.recovery_kind == "parallel_sink_finalization":
+        return _parallel_sink_finalization_recovery_case(scenario, case, tmp_path)
+    raise AssertionError(f"unsupported recovery kind: {case.recovery_kind!r}")

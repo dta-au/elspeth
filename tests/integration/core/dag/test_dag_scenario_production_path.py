@@ -1881,7 +1881,10 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         (declared_scenario.id, declared_case.id)
         for declared_scenario, declared_case in iter_harness_cases(MANIFEST)
         if declared_case.workflow == "recovery"
-    ) == (("checkpoint-deterministic-resume", "reopen-resume"),)
+    ) == (
+        ("parallel-coalesces", "resume-after-left-finalize"),
+        ("checkpoint-deterministic-resume", "reopen-resume"),
+    )
 
     production_run = inspect.unwrap(Orchestrator.run)
     production_resume = inspect.unwrap(Orchestrator.resume)
@@ -1918,6 +1921,65 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         {"value": 60, "count": 3}
     ]
     assert (tmp_path / "fault-triggered.marker").is_file()
+
+
+def test_parallel_coalesces_recovery_reuses_finalized_first_sink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("parallel-coalesces", "resume-after-left-finalize")
+    assert case.workflow == "recovery"
+    assert case.recovery_kind == "parallel_sink_finalization"
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    _assert_declared_recovery_evidence(scenario, case, evidence)
+    assert evidence.graph.node_count == 6
+    assert evidence.graph.edge_count == 8
+    assert (evidence.runtime.rows_processed, evidence.runtime.rows_succeeded, evidence.runtime.rows_failed) == (3, 6, 0)
+    assert tuple((output.sink_name, len(output.rows)) for output in evidence.runtime.sink_outputs) == (
+        ("left", 3),
+        ("right", 3),
+    )
+    recovery = evidence.recovery.sink_finalization
+    assert recovery is not None
+    assert recovery.model_dump() == {
+        "fault_seam": "after_finalize_before_response",
+        "fault_count": 1,
+        "first_sink": "left",
+        "second_sink": "right",
+        "source_exhausted_before": True,
+        "completed_coalesces_before": 2,
+        "first_sink_rows_before": 3,
+        "first_effect_id_before": recovery.first_effect_id_after,
+        "first_effect_id_after": recovery.first_effect_id_after,
+        "first_artifact_id_before": recovery.first_artifact_id_after,
+        "first_artifact_id_after": recovery.first_artifact_id_after,
+        "first_attempt_ids_before": recovery.first_attempt_ids_after,
+        "first_attempt_ids_after": recovery.first_attempt_ids_after,
+        "first_effect_unchanged": True,
+        "first_artifact_unchanged": True,
+        "first_attempts_unchanged": True,
+        "first_sink_republished": False,
+        "second_effect_absent_before": True,
+        "second_artifact_absent_before": True,
+        "second_attempt_count_before": 0,
+        "second_effect_id_after": recovery.second_effect_id_after,
+        "second_artifact_id_after": recovery.second_artifact_id_after,
+        "second_attempt_ids_after": recovery.second_attempt_ids_after,
+        "final_output_rows": 6,
+        "durable_export_parity": True,
+        "held_barrier_proven": False,
+    }
+    assert len(recovery.first_effect_id_after) == 64
+    assert len(recovery.first_artifact_id_after) == 64
+    assert len(recovery.second_effect_id_after) == 64
+    assert len(recovery.second_artifact_id_after) == 64
+    assert len(recovery.first_attempt_ids_after) == 3
+    assert len(recovery.second_attempt_ids_after) == 3
+    assert recovery.first_effect_id_after != recovery.second_effect_id_after
+    assert recovery.first_artifact_id_after != recovery.second_artifact_id_after
 
 
 def test_recovery_verifier_rejects_checkpoint_marker_on_initial_attempt(
