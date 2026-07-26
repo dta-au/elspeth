@@ -14,7 +14,7 @@ name: enforce-telemetry-backfill-trailer
 
 on:
   pull_request:
-    branches: [main, master, "RC*"]
+    branches: [main, master, "RC*", "release/**"]
 
 jobs:
   check:

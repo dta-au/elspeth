@@ -12,9 +12,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master, "RC*"]
+    branches: [main, master, "RC*", "release/**"]
   pull_request:
-    branches: [main, master, "RC*"]
+    branches: [main, master, "RC*", "release/**"]
 
 # Cancel in-progress runs when a new commit is pushed
 concurrency:
@@ -28,9 +28,9 @@ env:
 permissions:
   contents: read
 
-# Public-repository guardrail: self-hosted runners execute arbitrary workflow
-# code on our infrastructure, so fork PRs stay on GitHub-hosted runners.
-# Trusted pushes and same-repository PRs use the nyx runner.
+# Public-repository guardrail: pull_request workflows execute code from
+# unmerged branches, so all PRs stay on GitHub-hosted runners.
+# Trusted push workflows use the nyx runner.
 #
 # GitHub's runs-on expression accepts either a runner label string or a JSON
 # array of labels. Keep this expression identical across jobs so the aggregate
@@ -40,7 +40,7 @@ permissions:
 # default workspace. Every checkout below uses a per-run, per-job path so stale
 # workspace siblings cannot break actions/checkout before project commands run.
 #
-#   ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+#   ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
 
 jobs:
   # ===========================================================================
@@ -48,7 +48,7 @@ jobs:
   # ===========================================================================
   static-analysis:
     name: Static analysis
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:3.13-bookworm
     env:
@@ -102,8 +102,8 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: uv sync --frozen --all-extras
 
-      - name: Reject unverified fork PR signed allowlist edits
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      - name: Reject unverified PR signed allowlist edits
+        if: ${{ github.event_name == 'pull_request' }}
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
@@ -208,8 +208,8 @@ jobs:
       - name: Run trust-tier elspeth-lints rule
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'shape-only-when-key-missing' || 'required' }}
+          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
+          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           set +e
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
@@ -225,8 +225,8 @@ jobs:
       - name: Run trust-boundary honesty-gate elspeth-lints rules
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'shape-only-when-key-missing' || 'required' }}
+          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
+          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules trust_boundary.tests,trust_boundary.scope,trust_boundary.tier \
@@ -374,8 +374,8 @@ jobs:
         if: always()
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'shape-only-when-key-missing' || 'required' }}
+          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
+          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           set +e
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
@@ -418,7 +418,7 @@ jobs:
   # ===========================================================================
   test:
     name: Test (Python ${{ matrix.python-version }})
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:${{ matrix.python-version }}-bookworm
     env:
@@ -518,11 +518,11 @@ jobs:
   # ===========================================================================
   integration:
     name: Integration Tests
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:3.13-bookworm
     needs: [test]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-integration
     steps:
@@ -609,7 +609,7 @@ jobs:
   # ===========================================================================
   supply-chain-audit:
     name: Dependency and License Audit
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:3.13-bookworm
     needs: [static-analysis]
@@ -693,7 +693,7 @@ jobs:
   # browser journey blocks merge instead of being waved through.
   e2e-frontend:
     name: Frontend E2E (Playwright)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-e2e-frontend
     steps:
@@ -790,7 +790,7 @@ jobs:
   # blocks merge.
   frontend-unit:
     name: Frontend unit (vitest + typecheck)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-frontend-unit
     steps:
@@ -825,7 +825,7 @@ jobs:
   # ===========================================================================
   ci-success:
     name: CI Success
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     needs:
       - static-analysis
       - test

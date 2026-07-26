@@ -20,7 +20,7 @@ name: composer-redaction-gate
 
 on:
   pull_request:
-    branches: [main, master, "RC*"]
+    branches: [main, master, "RC*", "release/**"]
 
 jobs:
   redaction-gate:
