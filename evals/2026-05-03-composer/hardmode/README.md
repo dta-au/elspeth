@@ -154,7 +154,7 @@ This run produced real on-disk output at `data/outputs/q3_{fraud_security_flags,
 Three bash scripts that drive the harness. Each is independently runnable:
 
 ### `harness.sh <scenario_id>`
-Bootstrap. Reads `scenarios/<scenario_id>_*.json`, logs in fresh, creates a composer session, uploads the CSV blob if the scenario has one. Writes `session.json`, `sid.txt`, `jwt.txt`, `blob.json` (if applicable) into `results/<scenario_id>/`. Does not send any messages.
+Bootstrap. Reads `scenarios/<scenario_id>_*.json`, logs in fresh using `ELSPETH_EVAL_USER` / `ELSPETH_EVAL_PASS` from the operator environment or an untracked env file, creates a composer session, uploads the CSV blob if the scenario has one. Writes `session.json`, `sid.txt`, `jwt.txt`, `blob.json` (if applicable) into `results/<scenario_id>/`. Does not send any messages.
 
 ### `post_message.sh <scenario_id> <turn_index> <user_message_file>`
 Per-turn driver. Captures state-before, posts the user message to `/messages`, captures composer response, captures state-after, captures `/composer-progress` events, computes per-turn metrics. Writes `msg.t{N}.{req,resp,curl_meta}`, `state.{before,after}.t{N}.json`, `progress.t{N}.json`, `metrics.t{N}.json`.

@@ -22,48 +22,39 @@
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SID_FILE=""
-JWT_FILE=""
+EVALS_SCRIPT_DIR="$ROOT"
+# shellcheck source=../../lib/common.sh
+source "$ROOT/../../lib/common.sh"
 
 scenario_id="${1:-}"
-if [[ -z "$scenario_id" ]]; then echo "usage: $0 <scenario_id>"; exit 1; fi
+if [[ -z "$scenario_id" ]]; then evals_die 64 "usage: $0 <scenario_id>"; fi
 
-scen=$ROOT/scenarios/${scenario_id}_*.json
-scen=$(ls $scen 2>/dev/null | head -1)
-if [[ -z "$scen" ]]; then echo "scenario not found: $scenario_id"; exit 1; fi
+evals_require_tools
+: "${ELSPETH_EVAL_BASE_URL:=https://elspeth.foundryside.dev}"
+evals_load_env --require-creds
 
-out=$ROOT/results/$scenario_id
-mkdir -p $out
-cp "$scen" $out/scenario.json
+scen=$(evals_resolve_scenario "$ROOT/scenarios" "$scenario_id")
+
+out="$ROOT/results/$scenario_id"
+mkdir -p "$out"
+cp "$scen" "$out/scenario.json"
+export EVALS_OUT_DIR="$out"
+export EVALS_JWT_FILE="$out/jwt.txt"
 
 # --- step 1: login fresh ---
-curl -fsS -X POST https://elspeth.foundryside.dev/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"dta_user","password":"dta_pass"}' \
-  | jq -r '.access_token' > $out/jwt.txt
-J=$(cat $out/jwt.txt)
-[[ -n "$J" ]] || { echo "login failed"; exit 2; }
+evals_login
 
 # --- step 2: create session ---
-title=$(jq -r '.task_summary' $out/scenario.json)
-curl -fsS -X POST https://elspeth.foundryside.dev/api/sessions \
-  -H "Authorization: Bearer $J" -H 'Content-Type: application/json' \
-  -d "$(jq -n --arg t "hardmode/$scenario_id $title" '{title:$t}')" \
-  -o $out/session.json
-sid=$(jq -r '.id' $out/session.json)
-echo "$sid" > $out/sid.txt
+title=$(jq -r '.task_summary' "$out/scenario.json")
+sid=$(evals_create_session "hardmode/$scenario_id $title")
 
 # --- step 3: upload blob if scenario has one ---
-csv_filename=$(jq -r '.csv_filename // empty' $out/scenario.json)
+csv_filename=$(jq -r '.csv_filename // empty' "$out/scenario.json")
 if [[ -n "$csv_filename" ]]; then
-  jq -n \
-    --arg fn "$csv_filename" \
-    --rawfile body <(jq -r '.csv_content' $out/scenario.json) \
-    '{filename:$fn, mime_type:"text/csv", content:$body}' \
-    > $out/blob.req.json
-  curl -fsS -X POST "https://elspeth.foundryside.dev/api/sessions/$sid/blobs/inline" \
-    -H "Authorization: Bearer $J" -H 'Content-Type: application/json' \
-    --data @$out/blob.req.json -o $out/blob.json
+  csv_content_file=$(mktemp)
+  trap 'rm -f "$csv_content_file"' EXIT
+  jq -r '.csv_content' "$out/scenario.json" > "$csv_content_file"
+  evals_upload_blob "$sid" "$csv_filename" "text/csv" "$csv_content_file"
 fi
 
 echo "Scaffold ready: $out (sid=$sid)"

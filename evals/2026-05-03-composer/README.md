@@ -116,8 +116,9 @@ rerun-mode pass against staging using those IDs.
 These files were captured from a live evaluation run against the staging deploy at `https://elspeth.foundryside.dev` on 2026-05-03 (HEAD `f3137ae8`).
 
 **Redacted before commit**:
-- `jwt*.txt` files in every scenario directory — the original short-lived `dta_user` JWTs are replaced with placeholder text. Tokens were already expired (1-hour TTL) but credential-shaped strings shouldn't land in git regardless.
+- `jwt*.txt` files in every scenario directory — the original short-lived JWTs are replaced with placeholder text. Tokens were already expired (1-hour TTL) but credential-shaped strings shouldn't land in git regardless.
 - `login.json`, `login2.json` — wrapped access/refresh tokens, replaced with `{"redacted": ...}` placeholders.
+- Reusable local-auth passwords are not committed. Harnesses require `ELSPETH_EVAL_USER` / `ELSPETH_EVAL_PASS` from the operator environment or an untracked env file.
 
 **Not redacted (and intentionally preserved for audit-trail integrity)**:
 - Session IDs, blob IDs, run IDs — these are non-sensitive identifiers traceable through the staging audit DB.

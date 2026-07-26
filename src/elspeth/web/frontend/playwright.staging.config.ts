@@ -14,7 +14,7 @@
 //
 // Invocation:
 //   STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//   STAGING_USERNAME=dta_user STAGING_PASSWORD=dta_pass \
+//   STAGING_USERNAME=<staging-user> STAGING_PASSWORD=<staging-password> \
 //   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
 //   npx playwright test --config=playwright.staging.config.ts composer-preferences
 
