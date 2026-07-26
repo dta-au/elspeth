@@ -572,8 +572,10 @@ class TestAWSS3SourceRegistrationAndParsing:
 
         from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
         from elspeth.web.config import WebSettings
+        from elspeth.web.dependencies import create_catalog_service
         from elspeth.web.execution.protocol import YamlGenerator
-        from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
+        from elspeth.web.execution.validation import validate_pipeline
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
         state = CompositionState(
             source=SourceSpec(
@@ -602,7 +604,27 @@ class TestAWSS3SourceRegistrationAndParsing:
             patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as load_settings,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as instantiate,
         ):
-            result = validate_pipeline_for_trained_operator(state, settings, yaml_generator)
+            catalog = create_catalog_service()
+            unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+            snapshot = PluginAvailabilitySnapshot.create(
+                policy_hash="test-web-policy",
+                principal_scope="local:test-user",
+                available=unrestricted.available,
+                unavailable=(),
+                selected=unrestricted.selected,
+                usable_profile_aliases=(),
+                selected_profile_aliases=(),
+                binding_generation_fingerprint="test-web-policy-generation",
+            )
+            result = validate_pipeline(
+                state,
+                settings,
+                yaml_generator,
+                plugin_snapshot=snapshot,
+                profile_registry=None,
+                catalog=catalog,
+                session_id="test-session",
+            )
         check = next(check for check in result.checks if check.name == "aws_s3_endpoint_url_policy")
         assert check.passed is False
         assert result.errors[0].error_code == "aws_s3_endpoint_url_not_allowed"
