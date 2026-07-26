@@ -638,6 +638,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     });
     const action: GuidedRespondAction = {
       chosen: ["csv"],
+      source_blob_id: "00000000-0000-4000-8000-000000000821",
       edited_values: null,
       custom_inputs: null,
       proposal_id: null,
@@ -659,6 +660,8 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(retryRequest.operation_id).toBe(firstRequest.operation_id);
     expect(retryRequest.turn_token).toBe(firstRequest.turn_token);
     expect(retryRequest.turn_token).toBe(sampleNextTurn.turn_token);
+    expect(retryRequest.source_blob_id).toBe(action.source_blob_id);
+    expect(retryRequest).toEqual(firstRequest);
   });
 
   it("respondGuided: suppresses a concurrent duplicate component action", async () => {

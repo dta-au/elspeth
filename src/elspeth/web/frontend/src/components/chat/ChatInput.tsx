@@ -16,6 +16,7 @@ import {
   COMPOSE_CONNECTING_MESSAGE,
   COMPOSE_UNAVAILABLE_MESSAGE,
 } from "@/config/composer";
+import type { BlobMetadata } from "@/types/api";
 
 interface ChatInputProps {
   onSend: (content: string) => void;
@@ -25,6 +26,8 @@ interface ChatInputProps {
   onToggleBlobManager?: () => void;
   showBlobManager?: boolean;
   onOpenSecrets?: () => void;
+  /** Successful upload metadata, retained by guided mode for exact source binding. */
+  onBlobUploaded?: (blob: BlobMetadata) => void;
   /** Controlled mode: external value (use with onChange) */
   value?: string;
   /** Controlled mode: callback when value changes */
@@ -77,6 +80,7 @@ export function ChatInput({
   onToggleBlobManager,
   showBlobManager,
   onOpenSecrets,
+  onBlobUploaded,
   value: controlledValue,
   onChange: controlledOnChange,
   maxLength,
@@ -223,6 +227,7 @@ export function ChatInput({
     setUploadStatus(null);
     try {
       const blob = await uploadBlob(activeSessionId, file);
+      onBlobUploaded?.(blob);
       // Use ref to get current text (user may have typed during async upload)
       const currentText = textRef.current;
       const newText =

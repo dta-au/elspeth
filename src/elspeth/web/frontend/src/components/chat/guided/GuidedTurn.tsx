@@ -20,6 +20,7 @@ import type {
   TurnPayload,
   GuidedProposalReviewState,
   GuidedRespondAction,
+  GuidedSourceBlobCandidate,
 } from "@/types/guided";
 import { SingleSelectTurn } from "./SingleSelectTurn";
 import { InspectAndConfirmTurn } from "./InspectAndConfirmTurn";
@@ -32,6 +33,8 @@ import { ComponentReviewTurn } from "./ComponentReviewTurn";
 interface GuidedTurnProps {
   turn: TurnPayload;
   onSubmit: (body: GuidedRespondAction) => void;
+  /** Ready uploads associated with this exact Step-1 single-select turn. */
+  sourceBlobCandidates?: readonly GuidedSourceBlobCandidate[];
   disabled?: boolean;
   /** Tutorial mode — forwarded to leaf widgets that surface worked-example
    * teaching copy (e.g. SchemaFormTurn's on_validation_failure caveat). */
@@ -51,12 +54,13 @@ interface GuidedTurnProps {
 }
 
 function guidedTurnInstanceKey(turn: TurnPayload): string {
-  return JSON.stringify([turn.step_index, turn.type, turn.payload]);
+  return JSON.stringify([turn.step_index, turn.type, turn.turn_token, turn.payload]);
 }
 
 export function GuidedTurn({
   turn,
   onSubmit,
+  sourceBlobCandidates,
   disabled = false,
   isTutorial = false,
   wirePendingAcknowledgements,
@@ -89,6 +93,7 @@ export function GuidedTurn({
           key={turnInstanceKey}
           payload={turn.payload}
           onSubmit={guardedSubmit}
+          sourceBlobCandidates={sourceBlobCandidates}
           disabled={disabled}
           isTutorial={isTutorial}
         />

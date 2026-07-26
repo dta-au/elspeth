@@ -17,6 +17,7 @@ import { GUIDED_EXPLAIN_MESSAGE } from "./guided/explainPrompt";
 import { useSessionStore } from "@/stores/sessionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useInlineSourceStore } from "@/stores/inlineSourceStore";
+import { useBlobStore } from "@/stores/blobStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
@@ -59,6 +60,10 @@ vi.mock("@/api/client", async (importOriginal) => {
     fetchSystemStatus: vi.fn(),
   };
 });
+
+const mockedChatInputUpload = vi.hoisted(() => ({
+  blob: null as BlobMetadata | null,
+}));
 
 vi.mock("./MessageBubble", () => ({
   MessageBubble: ({
@@ -104,6 +109,7 @@ vi.mock("./ChatInput", () => ({
     maxLength,
     value,
     readOnly,
+    onBlobUploaded,
   }: {
     placeholder?: string;
     onSend?: (content: string) => void;
@@ -112,20 +118,40 @@ vi.mock("./ChatInput", () => ({
     maxLength?: number;
     value?: string;
     readOnly?: boolean;
+    onBlobUploaded?: (blob: BlobMetadata) => void;
   }) => (
-    <button
-      type="button"
-      data-testid="chat-input"
-      data-placeholder={placeholder ?? ""}
-      data-disabled={disabled ? "true" : "false"}
-      data-has-cancel={onCancel ? "true" : "false"}
-      data-max-length={maxLength ?? ""}
-      data-value={value ?? ""}
-      data-read-only={readOnly ? "true" : "false"}
-      onClick={() => onSend?.("test-chat-message")}
-    >
-      {placeholder ?? ""}
-    </button>
+    <>
+      <button
+        type="button"
+        data-testid="chat-input"
+        data-placeholder={placeholder ?? ""}
+        data-disabled={disabled ? "true" : "false"}
+        data-has-cancel={onCancel ? "true" : "false"}
+        data-max-length={maxLength ?? ""}
+        data-value={value ?? ""}
+        data-read-only={readOnly ? "true" : "false"}
+        onClick={() => onSend?.("test-chat-message")}
+      >
+        {placeholder ?? ""}
+      </button>
+      <button
+        type="button"
+        data-testid="chat-input-upload"
+        onClick={() => {
+          if (mockedChatInputUpload.blob !== null) {
+            useBlobStore.setState((state) => ({
+              blobs: [
+                mockedChatInputUpload.blob!,
+                ...state.blobs.filter((blob) => blob.id !== mockedChatInputUpload.blob!.id),
+              ],
+            }));
+            onBlobUploaded?.(mockedChatInputUpload.blob);
+          }
+        }}
+      >
+        simulate upload
+      </button>
+    </>
   ),
 }));
 
@@ -142,6 +168,7 @@ describe("ChatPanel", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    resetStore(useBlobStore);
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
       retryMessage: vi.fn(),
@@ -408,11 +435,13 @@ describe("ChatPanel mode discriminator", () => {
     // Slice C: the verification-panel tests seed validationResult; reset the
     // execution store so a seeded result does not leak into sibling tests.
     resetStore(useExecutionStore);
+    resetStore(useBlobStore);
     // Post-boot: the backend wall clock has landed, so the compose-timeout
     // readiness gate is open and guided sends (sendGuidedChat →
     // runComposeWithTimeout) proceed. resetStore clears it to the fail-closed
     // false default; the per-test setState calls merge over this.
     useSessionStore.setState({ composeTimeoutReady: true });
+    mockedChatInputUpload.blob = null;
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
       retryMessage: vi.fn(),
@@ -440,7 +469,7 @@ describe("ChatPanel mode discriminator", () => {
     };
   }
 
-  function singleSelectTurn(): TurnPayload {
+  function singleSelectTurn(turnToken = "a".repeat(64)): TurnPayload {
     const payload: SingleSelectPayload = {
       question: "Which source plugin should we use?",
       options: [
@@ -449,8 +478,178 @@ describe("ChatPanel mode discriminator", () => {
       ],
       allow_custom: false,
     };
-    return { type: "single_select", step_index: 0, turn_token: "a".repeat(64), payload };
+    return { type: "single_select", step_index: 0, turn_token: turnToken, payload };
   }
+
+  function uploadedSource(id: string, filename: string): BlobMetadata {
+    return {
+      id,
+      session_id: "session-guided",
+      filename,
+      mime_type: "text/csv",
+      size_bytes: 16,
+      content_hash: "f".repeat(64),
+      created_at: "2026-07-26T09:00:00Z",
+      created_by: "user",
+      source_description: null,
+      status: "ready",
+      creation_modality: "verbatim",
+      created_from_message_id: null,
+      creating_model_identifier: null,
+      creating_model_version: null,
+      creating_provider: null,
+      creating_composer_skill_hash: null,
+      creating_arguments_hash: null,
+    };
+  }
+
+  it("requires an explicit earlier-file choice when two uploads belong to one Step-1 turn", async () => {
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const earlierId = "00000000-0000-4000-8000-000000000801";
+    const newerId = "00000000-0000-4000-8000-000000000802";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn("a".repeat(64)),
+      respondGuided: respondGuidedSpy,
+    });
+    mockedChatInputUpload.blob = uploadedSource(earlierId, "earlier.csv");
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    mockedChatInputUpload.blob = uploadedSource(newerId, "newer.csv");
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+
+    const sourceChooser = screen.getByRole("combobox", { name: "Source file" });
+    expect(sourceChooser).toHaveValue("");
+    expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
+    fireEvent.change(sourceChooser, { target: { value: earlierId } });
+    expect(sourceChooser).toHaveValue(earlierId);
+    await act(async () => {
+      screen.getByRole("button", { name: "CSV" }).click();
+    });
+    expect(respondGuidedSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ chosen: ["csv"], source_blob_id: earlierId }),
+    );
+
+    act(() => {
+      useSessionStore.setState({
+        guidedNextTurn: singleSelectTurn("b".repeat(64)),
+      });
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "API" }).click();
+    });
+    expect(respondGuidedSpy.mock.calls[1][0]).not.toHaveProperty("source_blob_id");
+    expect(respondGuidedSpy.mock.calls[0][0].source_blob_id).toBe(earlierId);
+  });
+
+  it("distinguishes duplicate source filenames and submits the intended exact blob", async () => {
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const earlierId = "00000000-0000-4000-8000-000000000801";
+    const newerId = "00000000-0000-4000-8000-000000000802";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+      respondGuided: respondGuidedSpy,
+    });
+    mockedChatInputUpload.blob = uploadedSource(earlierId, "duplicate.csv");
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    mockedChatInputUpload.blob = uploadedSource(newerId, "duplicate.csv");
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+
+    const sourceChooser = screen.getByRole("combobox", { name: "Source file" });
+    const earlierOption = screen.getByRole("option", {
+      name: "duplicate.csv — 16 B — ID 00000801",
+    });
+    const newerOption = screen.getByRole("option", {
+      name: "duplicate.csv — 16 B — ID 00000802",
+    });
+    expect(earlierOption).toHaveValue(earlierId);
+    expect(newerOption).toHaveValue(newerId);
+
+    fireEvent.change(sourceChooser, { target: { value: earlierId } });
+    await act(async () => {
+      screen.getByRole("button", { name: "CSV" }).click();
+    });
+
+    expect(respondGuidedSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ chosen: ["csv"], source_blob_id: earlierId }),
+    );
+  });
+
+  it("invalidates selected files that stop being ready or are deleted", async () => {
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const selectedId = "00000000-0000-4000-8000-000000000811";
+    const remainingId = "00000000-0000-4000-8000-000000000812";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+      respondGuided: respondGuidedSpy,
+    });
+    mockedChatInputUpload.blob = uploadedSource(selectedId, "selected.csv");
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    mockedChatInputUpload.blob = uploadedSource(remainingId, "remaining.csv");
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Source file" }), {
+      target: { value: selectedId },
+    });
+
+    act(() => {
+      useBlobStore.setState((state) => ({
+        blobs: state.blobs.map((blob) =>
+          blob.id === selectedId ? { ...blob, status: "pending" } : blob,
+        ),
+      }));
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("combobox", { name: "Source file" }),
+      ).not.toBeInTheDocument();
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "CSV" }).click();
+    });
+    expect(respondGuidedSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ source_blob_id: remainingId }),
+    );
+
+    act(() => {
+      useBlobStore.setState((state) => ({
+        blobs: state.blobs.filter((blob) => blob.id !== remainingId),
+      }));
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "API" }).click();
+    });
+    expect(respondGuidedSpy.mock.calls[1][0]).not.toHaveProperty("source_blob_id");
+  });
 
   const proposalId = "00000000-0000-4000-8000-000000000701";
   const proposalHash = "f".repeat(64);

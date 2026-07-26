@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 
 import { useRef, useState, type RefObject } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatInput } from "./ChatInput";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -292,6 +292,54 @@ describe("ChatInput composing cancel", () => {
     await user.click(screen.getByRole("button", { name: "Stop composing" }));
 
     expect(onCancel).toHaveBeenCalledOnce();
+  });
+});
+
+describe("ChatInput upload identity", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  it("reports the exact uploaded blob metadata to the owning guided turn", async () => {
+    const sessionId = "00000000-0000-4000-8000-000000000811";
+    const uploaded = {
+      id: "00000000-0000-4000-8000-000000000812",
+      session_id: sessionId,
+      filename: "intended.csv",
+      mime_type: "text/csv",
+      size_bytes: 12,
+      content_hash: "f".repeat(64),
+      created_at: "2026-07-26T09:00:00Z",
+      created_by: "user" as const,
+      source_description: null,
+      status: "ready" as const,
+      creation_modality: "verbatim" as const,
+      created_from_message_id: null,
+      creating_model_identifier: null,
+      creating_model_version: null,
+      creating_provider: null,
+      creating_composer_skill_hash: null,
+      creating_arguments_hash: null,
+    };
+    useSessionStore.setState({ activeSessionId: sessionId });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockResolvedValue(uploaded) });
+    const onBlobUploaded = vi.fn();
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+        onBlobUploaded={onBlobUploaded}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+
+    await userEvent.upload(fileInput!, new File(["id\n1\n"], "intended.csv", { type: "text/csv" }));
+
+    await waitFor(() => expect(onBlobUploaded).toHaveBeenCalledWith(uploaded));
   });
 });
 

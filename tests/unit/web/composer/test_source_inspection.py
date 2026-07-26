@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import pytest
 
+from elspeth.web.composer import source_inspection
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     _declared_field_is_required,
@@ -593,6 +594,46 @@ class TestBoundedReads:
         assert f.byte_range_inspected[1] <= 8 * 1024
         # byte_size in identity reflects the *real* size, not the truncated one.
         assert int(f.redacted_identity["byte_size"]) == len(big)
+
+
+class TestSelectedBlobIdentity:
+    def test_explicit_selection_wins_over_newer_ready_blob(self) -> None:
+        earlier = uuid4()
+        newer = uuid4()
+
+        selected = source_inspection.resolve_source_inspection_blob_id(
+            selected_blob_id=earlier,
+            ready_blob_ids=(newer, earlier),
+        )
+
+        assert selected == earlier
+
+    def test_multiple_ready_blobs_without_selection_are_ambiguous(self) -> None:
+        assert (
+            source_inspection.resolve_source_inspection_blob_id(
+                selected_blob_id=None,
+                ready_blob_ids=(uuid4(), uuid4()),
+            )
+            is None
+        )
+
+    def test_one_ready_blob_resolves_without_temporal_choice(self) -> None:
+        only = uuid4()
+
+        assert (
+            source_inspection.resolve_source_inspection_blob_id(
+                selected_blob_id=None,
+                ready_blob_ids=(only,),
+            )
+            == only
+        )
+
+    def test_explicit_selection_must_name_a_ready_session_blob(self) -> None:
+        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
+            source_inspection.resolve_source_inspection_blob_id(
+                selected_blob_id=uuid4(),
+                ready_blob_ids=(uuid4(),),
+            )
 
 
 # --------------------------------------------------------------------------

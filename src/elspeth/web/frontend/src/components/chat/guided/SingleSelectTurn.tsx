@@ -20,11 +20,48 @@
 // pipeline-proposal turns establish their own structures.
 
 import { useId, useState } from "react";
-import type { GuidedRespondAction, SingleSelectPayload } from "@/types/guided";
+import type {
+  GuidedRespondAction,
+  GuidedSourceBlobCandidate,
+  SingleSelectPayload,
+} from "@/types/guided";
+
+const NO_SOURCE_BLOB_CANDIDATES: readonly GuidedSourceBlobCandidate[] = [];
+
+function formatCandidateBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function distinguishingBlobIdSuffix(
+  candidate: GuidedSourceBlobCandidate,
+  duplicates: readonly GuidedSourceBlobCandidate[],
+): string {
+  const compactIds = duplicates.map((item) => item.id.replace(/-/g, ""));
+  const candidateId = candidate.id.replace(/-/g, "");
+  for (let length = 8; length < candidateId.length; length += 4) {
+    if (new Set(compactIds.map((id) => id.slice(-length))).size === compactIds.length) {
+      return candidateId.slice(-length);
+    }
+  }
+  return candidateId;
+}
+
+function sourceBlobCandidateLabel(
+  candidate: GuidedSourceBlobCandidate,
+  candidates: readonly GuidedSourceBlobCandidate[],
+): string {
+  const duplicates = candidates.filter((item) => item.filename === candidate.filename);
+  if (duplicates.length === 1) return candidate.filename;
+  return `${candidate.filename} — ${formatCandidateBytes(candidate.sizeBytes)} — ID ${distinguishingBlobIdSuffix(candidate, duplicates)}`;
+}
 
 interface SingleSelectTurnProps {
   payload: SingleSelectPayload;
   onSubmit: (body: GuidedRespondAction) => void;
+  /** Ready uploads associated with the exact owning Step-1 source turn. */
+  sourceBlobCandidates?: readonly GuidedSourceBlobCandidate[];
   disabled?: boolean;
   /**
    * Tutorial mode is passive — the per-stage prompt is built by pressing Send,
@@ -38,10 +75,12 @@ interface SingleSelectTurnProps {
 export function SingleSelectTurn({
   payload,
   onSubmit,
+  sourceBlobCandidates = NO_SOURCE_BLOB_CANDIDATES,
   disabled = false,
   isTutorial = false,
 }: SingleSelectTurnProps) {
   const [customText, setCustomText] = useState("");
+  const [selectedSourceBlobId, setSelectedSourceBlobId] = useState("");
 
   // useId scopes DOM IDs per-instance so multiple SingleSelectTurns rendered
   // simultaneously (e.g. active turn + GuidedHistory replay in Task 7.9) don't
@@ -49,11 +88,25 @@ export function SingleSelectTurn({
   const reactId = useId();
   const customInputId = `${reactId}-custom-input`;
   const instructionId = `${reactId}-instruction`;
+  const sourceFileSelectId = `${reactId}-source-file`;
+  const sourceFileHintId = `${reactId}-source-file-hint`;
   const hintIdFor = (optionId: string) => `${reactId}-hint-${optionId}`;
+
+  const validSelectedSourceBlobId = sourceBlobCandidates.some(
+    (candidate) => candidate.id === selectedSourceBlobId,
+  )
+    ? selectedSourceBlobId
+    : "";
+  const sourceBlobId =
+    sourceBlobCandidates.length === 1
+      ? sourceBlobCandidates[0].id
+      : validSelectedSourceBlobId || undefined;
+  const sourceFileChoiceRequired = sourceBlobCandidates.length > 1 && sourceBlobId === undefined;
 
   function handleOptionClick(optionId: string) {
     onSubmit({
       chosen: [optionId],
+      ...(sourceBlobId === undefined ? {} : { source_blob_id: sourceBlobId }),
       edited_values: null,
       custom_inputs: null,
       proposal_id: null,
@@ -79,6 +132,31 @@ export function SingleSelectTurn({
 
   return (
     <div className="guided-turn guided-single-select">
+      {sourceBlobCandidates.length > 1 && (
+        <div className="guided-source-file-choice">
+          <label htmlFor={sourceFileSelectId} className="guided-custom-label">
+            Source file
+          </label>
+          <select
+            id={sourceFileSelectId}
+            className="guided-custom-input"
+            value={validSelectedSourceBlobId}
+            disabled={disabled}
+            aria-describedby={sourceFileHintId}
+            onChange={(event) => setSelectedSourceBlobId(event.target.value)}
+          >
+            <option value="">Choose an uploaded file…</option>
+            {sourceBlobCandidates.map((candidate) => (
+              <option key={candidate.id} value={candidate.id}>
+                {sourceBlobCandidateLabel(candidate, sourceBlobCandidates)}
+              </option>
+            ))}
+          </select>
+          <p id={sourceFileHintId} className="guided-chip-hint">
+            Choose which uploaded file this source should inspect.
+          </p>
+        </div>
+      )}
       <fieldset
         className="guided-chip-fieldset"
         // Tutorial is passive: pressing Send builds the step. Suppress the
@@ -107,7 +185,7 @@ export function SingleSelectTurn({
                   className="guided-chip-btn"
                   onClick={() => handleOptionClick(option.id)}
                   aria-describedby={hintId}
-                  disabled={disabled}
+                  disabled={disabled || sourceFileChoiceRequired}
                 >
                   {option.label}
                 </button>

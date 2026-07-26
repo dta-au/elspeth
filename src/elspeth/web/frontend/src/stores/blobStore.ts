@@ -23,13 +23,50 @@ const initialState = {
 };
 
 let blobLoadRequestSeq = 0;
+let blobOwnerSessionId: string | null = null;
+let blobOwnerEpoch = 0;
+
+interface BlobMutationOwnership {
+  sessionId: string;
+  ownerEpoch: number;
+  ownsStore: boolean;
+}
+
+function beginBlobMutation(sessionId: string): BlobMutationOwnership {
+  if (blobOwnerSessionId === null) {
+    blobOwnerSessionId = sessionId;
+    blobOwnerEpoch++;
+  }
+  return {
+    sessionId,
+    ownerEpoch: blobOwnerEpoch,
+    ownsStore: blobOwnerSessionId === sessionId,
+  };
+}
+
+function mutationStillOwnsStore(ownership: BlobMutationOwnership): boolean {
+  return (
+    ownership.ownsStore &&
+    blobOwnerSessionId === ownership.sessionId &&
+    blobOwnerEpoch === ownership.ownerEpoch
+  );
+}
 
 export const useBlobStore = create<BlobState>((set) => ({
   ...initialState,
 
   async loadBlobs(sessionId: string) {
+    const sessionChanged = blobOwnerSessionId !== sessionId;
+    if (sessionChanged) {
+      blobOwnerSessionId = sessionId;
+      blobOwnerEpoch++;
+    }
     const requestSeq = ++blobLoadRequestSeq;
-    set({ isLoading: true, error: null });
+    set({
+      ...(sessionChanged ? { blobs: [] } : {}),
+      isLoading: true,
+      error: null,
+    });
     try {
       const blobs = await api.listBlobs(sessionId);
       if (requestSeq !== blobLoadRequestSeq) {
@@ -45,10 +82,20 @@ export const useBlobStore = create<BlobState>((set) => ({
   },
 
   async uploadBlob(sessionId: string, file: File) {
-    set({ error: null });
+    const ownership = beginBlobMutation(sessionId);
+    if (ownership.ownsStore) {
+      set({ error: null });
+    }
     try {
       const blob = await api.uploadBlob(sessionId, file);
-      set((state) => ({ blobs: [blob, ...state.blobs] }));
+      if (!mutationStillOwnsStore(ownership)) {
+        return blob;
+      }
+      blobLoadRequestSeq++;
+      set((state) => ({
+        blobs: [blob, ...state.blobs],
+        isLoading: false,
+      }));
       return blob;
     } catch (err) {
       const detail =
@@ -57,23 +104,33 @@ export const useBlobStore = create<BlobState>((set) => ({
           : (err as { status?: number }).status === 415
             ? "Unsupported file type. Please use CSV, JSON, JSONL, or plain text."
             : "Upload failed. Please try again.";
-      set({ error: detail });
+      if (mutationStillOwnsStore(ownership)) {
+        set({ error: detail });
+      }
       throw err;
     }
   },
 
   async deleteBlob(sessionId: string, blobId: string) {
+    const ownership = beginBlobMutation(sessionId);
     try {
       await api.deleteBlob(sessionId, blobId);
+      if (!mutationStillOwnsStore(ownership)) {
+        return;
+      }
+      blobLoadRequestSeq++;
       set((state) => ({
         blobs: state.blobs.filter((b) => b.id !== blobId),
+        isLoading: false,
       }));
     } catch (err) {
       const detail =
         (err as { status?: number }).status === 409
           ? "Cannot delete — file is linked to an active run."
           : "Failed to delete file.";
-      set({ error: detail });
+      if (mutationStillOwnsStore(ownership)) {
+        set({ error: detail });
+      }
     }
   },
 
@@ -98,11 +155,15 @@ export const useBlobStore = create<BlobState>((set) => ({
   },
 
   clearBlobs() {
+    blobOwnerSessionId = null;
+    blobOwnerEpoch++;
     blobLoadRequestSeq++;
-    set({ blobs: [], error: null });
+    set({ blobs: [], isLoading: false, error: null });
   },
 
   reset() {
+    blobOwnerSessionId = null;
+    blobOwnerEpoch++;
     blobLoadRequestSeq++;
     set(initialState);
   },

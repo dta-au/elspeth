@@ -125,6 +125,42 @@ describe("SingleSelectTurn — allow_custom=true", () => {
       ...nullResponse(),
     });
   });
+
+  it("does not attach source identity to a custom submission", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const sourceBlobCandidates = [
+      {
+        id: "00000000-0000-4000-8000-000000000821",
+        filename: "first.csv",
+        sizeBytes: 16,
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000822",
+        filename: "second.csv",
+        sizeBytes: 24,
+      },
+    ];
+    render(
+      <SingleSelectTurn
+        payload={PAYLOAD_WITH_CUSTOM}
+        onSubmit={onSubmit}
+        sourceBlobCandidates={sourceBlobCandidates}
+      />,
+    );
+
+    await user.type(
+      screen.getByRole("textbox", { name: /custom/i }),
+      "my custom source",
+    );
+    const submit = screen.getByRole("button", { name: /submit custom/i });
+    expect(submit).toBeEnabled();
+    await user.click(submit);
+
+    const body = onSubmit.mock.calls[0][0];
+    expect(body.custom_inputs).toEqual(["my custom source"]);
+    expect(body).not.toHaveProperty("source_blob_id");
+  });
 });
 
 describe("SingleSelectTurn — hint rendering", () => {
