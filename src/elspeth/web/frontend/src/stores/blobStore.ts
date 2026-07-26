@@ -18,6 +18,11 @@ interface BlobState {
   activationEpoch: number;
 
   activateSession: (sessionId: string | null) => void;
+  invalidateBlobForEpoch: (
+    sessionId: string,
+    activationEpoch: number,
+    blobId: string,
+  ) => boolean;
   loadBlobs: (sessionId: string) => Promise<void>;
   uploadBlob: (
     sessionId: string,
@@ -60,6 +65,28 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       activeSessionId: sessionId,
       activationEpoch: state.activationEpoch + 1,
     });
+  },
+
+  invalidateBlobForEpoch(
+    sessionId: string,
+    activationEpoch: number,
+    blobId: string,
+  ) {
+    const state = get();
+    if (
+      state.activeSessionId !== sessionId ||
+      state.activationEpoch !== activationEpoch
+    ) {
+      return false;
+    }
+    // Cancel any older list publication that could restore the invalidated
+    // row. A subsequent authoritative load claims a newer request sequence.
+    blobLoadRequestSeq++;
+    set((current) => ({
+      blobs: current.blobs.filter((blob) => blob.id !== blobId),
+      isLoading: false,
+    }));
+    return true;
   },
 
   async loadBlobs(sessionId: string) {

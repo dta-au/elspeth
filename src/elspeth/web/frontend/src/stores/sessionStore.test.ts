@@ -40,6 +40,8 @@ vi.mock("@/api/client", () => ({
   archiveSession: vi.fn(),
   renameSession: vi.fn(),
   getGuided: vi.fn(),
+  respondGuided: vi.fn(),
+  GuidedResponseReceiptError: class extends Error {},
   // Phase 1B — sessionStore.createSession calls resolveDefaultMode() on the
   // preferencesStore, which falls back to fetchUserComposerPreferences()
   // when the prefs store hasn't been bootstrapped. The default mock returns
@@ -2613,6 +2615,100 @@ describe("sessionStore", () => {
       const state = useSessionStore.getState();
       expect(state.activeSessionId).toBe("fresh-session");
       expect(state.messages).toHaveLength(1);
+    });
+  });
+
+  describe("guided source lifecycle rejection", () => {
+    it("removes the rejected exact UUID even when authoritative blob refresh fails", async () => {
+      const sessionId = "00000000-0000-4000-8000-000000000101";
+      const rejectedId = "00000000-0000-4000-8000-000000000901";
+      const otherId = "00000000-0000-4000-8000-000000000902";
+      const detail =
+        "Selected source blob is no longer a ready upload for this session.";
+      const apiMod = await import("@/api/client");
+      (apiMod.respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 400,
+        detail,
+      });
+      (apiMod.listBlobs as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error("authoritative refresh failed"),
+      );
+      useBlobStore.getState().reset();
+      useBlobStore.getState().activateSession(sessionId);
+      const blobFixture = {
+        id: rejectedId,
+        session_id: sessionId,
+        filename: "rejected.csv",
+        mime_type: "text/csv",
+        size_bytes: 16,
+        content_hash: "a".repeat(64),
+        created_at: "2026-07-27T00:00:00Z",
+        created_by: "user",
+        source_description: null,
+        status: "ready",
+        creation_modality: "verbatim",
+        created_from_message_id: null,
+        creating_model_identifier: null,
+        creating_model_version: null,
+        creating_provider: null,
+        creating_composer_skill_hash: null,
+        creating_arguments_hash: null,
+      } satisfies BlobMetadata;
+      useBlobStore.setState({
+        blobs: [
+          blobFixture,
+          {
+            ...blobFixture,
+            id: otherId,
+            filename: "other.csv",
+            content_hash: "b".repeat(64),
+          },
+        ],
+      });
+      useSessionStore.setState({
+        activeSessionId: sessionId,
+        guidedSession: {
+          step: "step_1_source",
+          history: [],
+          terminal: null,
+          chat_history: [],
+          chat_turn_seq: 0,
+          profile: null,
+        },
+        guidedNextTurn: {
+          type: "single_select",
+          step_index: 0,
+          turn_token: "a".repeat(64),
+          payload: {
+            question: "Choose a source",
+            options: [{ id: "csv", label: "CSV", hint: null }],
+            allow_custom: false,
+          },
+        },
+      });
+
+      const outcome = await useSessionStore.getState().respondGuided({
+        chosen: ["csv"],
+        source_blob_id: rejectedId,
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      });
+
+      expect(apiMod.listBlobs).toHaveBeenCalledWith(sessionId);
+      expect(useBlobStore.getState().blobs.map((blob) => blob.id)).toEqual([
+        otherId,
+      ]);
+      expect(useBlobStore.getState().error).toBe("Failed to load files.");
+      expect(outcome).toEqual({
+        status: "not_applied",
+        reason: "rejected",
+        message: detail,
+      });
+      expect(useSessionStore.getState().error).toBe(detail);
     });
   });
 

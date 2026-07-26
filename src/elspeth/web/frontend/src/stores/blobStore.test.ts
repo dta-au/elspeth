@@ -71,6 +71,83 @@ describe("blobStore", () => {
     expect(useBlobStore.getState().activationEpoch).toBe(initialEpoch + 2);
   });
 
+  describe("invalidateBlobForEpoch", () => {
+    it("removes only the exact UUID under matching session ownership", () => {
+      const rejected = makeBlob({ id: "blob-rejected" });
+      const retained = makeBlob({ id: "blob-retained" });
+      useBlobStore.getState().activateSession("session-1");
+      useBlobStore.setState({ blobs: [rejected, retained] });
+      const epoch = useBlobStore.getState().activationEpoch;
+
+      expect(
+        useBlobStore
+          .getState()
+          .invalidateBlobForEpoch("session-1", epoch, rejected.id),
+      ).toBe(true);
+      expect(useBlobStore.getState().blobs).toEqual([retained]);
+    });
+
+    it("prevents an older overlapping list from restoring the rejected UUID", async () => {
+      const olderList = deferred<BlobMetadata[]>();
+      const rejected = makeBlob({ id: "blob-rejected" });
+      const { listBlobs } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockReturnValue(olderList.promise);
+      useBlobStore.getState().activateSession("session-1");
+      useBlobStore.setState({ blobs: [rejected] });
+      const epoch = useBlobStore.getState().activationEpoch;
+      const load = useBlobStore.getState().loadBlobs("session-1");
+
+      expect(
+        useBlobStore
+          .getState()
+          .invalidateBlobForEpoch("session-1", epoch, rejected.id),
+      ).toBe(true);
+      olderList.resolve([rejected]);
+      await load;
+
+      expect(useBlobStore.getState().blobs).toEqual([]);
+      expect(useBlobStore.getState().isLoading).toBe(false);
+    });
+
+    it("does not remove a same-UUID row after an A-to-B-to-A activation cycle", () => {
+      const fresh = makeBlob({
+        id: "blob-same-uuid",
+        session_id: "session-a",
+      });
+      useBlobStore.getState().activateSession("session-a");
+      const oldEpoch = useBlobStore.getState().activationEpoch;
+      useBlobStore.getState().activateSession("session-b");
+      useBlobStore.getState().activateSession("session-a");
+      useBlobStore.setState({ blobs: [fresh] });
+
+      expect(
+        useBlobStore
+          .getState()
+          .invalidateBlobForEpoch("session-a", oldEpoch, fresh.id),
+      ).toBe(false);
+      expect(useBlobStore.getState().blobs).toEqual([fresh]);
+    });
+
+    it("allows a current authoritative refresh to restore a ready UUID", async () => {
+      const rejected = makeBlob({ id: "blob-rejected" });
+      const { listBlobs } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockResolvedValue([rejected]);
+      useBlobStore.getState().activateSession("session-1");
+      useBlobStore.setState({ blobs: [rejected] });
+      const epoch = useBlobStore.getState().activationEpoch;
+
+      expect(
+        useBlobStore
+          .getState()
+          .invalidateBlobForEpoch("session-1", epoch, rejected.id),
+      ).toBe(true);
+      expect(useBlobStore.getState().blobs).toEqual([]);
+      await useBlobStore.getState().loadBlobs("session-1");
+
+      expect(useBlobStore.getState().blobs).toEqual([rejected]);
+    });
+  });
+
   describe("loadBlobs", () => {
     it("fetches blobs and sets them in state", async () => {
       const blobs = [makeBlob(), makeBlob({ id: "blob-2", filename: "other.json" })];
