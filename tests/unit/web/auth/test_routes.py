@@ -74,6 +74,7 @@ class _FakeAuthProvider:
     authenticate_error: AuthenticationError | None = None
     profile_result: UserProfile = field(default_factory=lambda: UserProfile(user_id="alice", username="alice"))
     profile_error: AuthenticationError | None = None
+    refresh_error: AuthenticationError | None = None
     authenticate_calls: int = 0
     get_user_info_calls: int = 0
     login_calls: int = 0
@@ -98,6 +99,8 @@ class _FakeAuthProvider:
     async def refresh(self, _user_id: str, _username: str, *, original_iat: int) -> str:
         _ = original_iat
         self.refresh_calls += 1
+        if self.refresh_error is not None:
+            raise self.refresh_error
         raise AssertionError("refresh should not be called")
 
 
@@ -171,6 +174,65 @@ def _assert_token_response_uncacheable(response: Response) -> None:
     """Token responses carry bearer credentials and must not be cacheable."""
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Pragma"] == "no-cache"
+
+
+def _token_bearing_401_case(case: str, tmp_path):
+    """Build one route-owned token failure without triggering middleware ownership."""
+    sensitive_exception = "SENSITIVE_EXCEPTION_DETAIL"
+    if case == "invalid_verification_token":
+        sensitive_token = "SENSITIVE_VERIFICATION_TOKEN"
+        local_provider = LocalAuthProvider(
+            db_path=tmp_path / "auth.db",
+            secret_key="test-key-that-is-at-least-32-bytes",
+        )
+        app = _create_test_app(local_provider, registration_mode="email_verified")
+        return (
+            app,
+            "/api/auth/verify-email",
+            {"json": {"token": sensitive_token}},
+            (sensitive_token, sensitive_exception, "SENSITIVE_IAT_VALUE"),
+        )
+
+    claims: dict[str, object]
+    refresh_error = None
+    if case == "unparseable_refresh_claims":
+        sensitive_token = "SENSITIVE_UNPARSEABLE_REFRESH_TOKEN"
+    else:
+        claims = {
+            "sub": "alice",
+            "username": "alice",
+            "exp": 9_999_999_999,
+        }
+        if case == "non_integer_refresh_iat":
+            claims["iat"] = "SENSITIVE_IAT_VALUE"
+        elif case == "provider_refresh_error":
+            claims["iat"] = 1
+            refresh_error = AuthenticationError(f"Token refresh rejected: {sensitive_exception}")
+        elif case != "missing_refresh_iat":
+            raise AssertionError(f"unknown token-bearing failure case: {case}")
+        sensitive_token = pyjwt.encode(
+            claims,
+            "test-key-that-is-at-least-32-bytes",
+            algorithm="HS256",
+        )
+
+    fake_provider = _FakeAuthProvider(refresh_error=refresh_error)
+    app = _create_test_app(fake_provider)
+    return (
+        app,
+        "/api/auth/token",
+        {"headers": {"Authorization": f"Bearer {sensitive_token}"}},
+        (sensitive_token, sensitive_exception, "SENSITIVE_IAT_VALUE"),
+    )
+
+
+_ROUTE_OWNED_TOKEN_FAILURES = [
+    ("invalid_verification_token", "invalid_token", "verify_email", None, "AuthenticationError"),
+    ("unparseable_refresh_claims", "claims_invalid", "refresh_claims", "alice", None),
+    ("missing_refresh_iat", "claims_invalid", "refresh_claims", "alice", None),
+    ("non_integer_refresh_iat", "claims_invalid", "refresh_claims", "alice", None),
+    ("provider_refresh_error", "authentication_error", "refresh", "alice", "AuthenticationError"),
+]
 
 
 @pytest.mark.asyncio
@@ -940,6 +1002,84 @@ class TestTokenRefreshEndpoint:
                 headers={"Authorization": "Bearer garbage"},
             )
         assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+class TestRouteOwnedTokenFailureAudit:
+    """Every token-bearing 401 not owned by middleware must emit one safe row."""
+
+    @pytest.mark.parametrize(
+        ("case", "expected_category", "expected_stage", "expected_user_id", "expected_exception_class"),
+        _ROUTE_OWNED_TOKEN_FAILURES,
+    )
+    async def test_records_exactly_one_categorized_redacted_auth_failure(
+        self,
+        tmp_path,
+        case: str,
+        expected_category: str,
+        expected_stage: str,
+        expected_user_id: str | None,
+        expected_exception_class: str | None,
+    ) -> None:
+        audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
+        app, path, request_kwargs, sensitive_values = _token_bearing_401_case(case, tmp_path)
+        app.state.auth_audit_recorder = AuthAuditRecorder(
+            landscape_url=audit_url,
+            landscape_passphrase=None,
+            create_tables=True,
+        )
+
+        async with _client_for(app) as client:
+            response = await client.post(
+                path,
+                headers={"x-request-id": f"{case}-request", **request_kwargs.pop("headers", {})},
+                **request_kwargs,
+            )
+
+        assert response.status_code == 401
+        rows = _read_auth_event_rows(audit_url)
+        assert len(rows) == 1
+        event = _only_auth_event(rows, "auth_failure")
+        metadata = json.loads(event.metadata_json)
+        assert event.outcome == "failure"
+        assert event.provider == "local"
+        assert event.failure_category == expected_category
+        assert event.user_id == expected_user_id
+        assert event.username == expected_user_id
+        assert event.request_id == f"{case}-request"
+        assert metadata["failure_stage"] == expected_stage
+        assert metadata["exception_class"] == expected_exception_class
+        serialized = repr(dict(event._mapping))
+        for sensitive_value in sensitive_values:
+            assert sensitive_value not in serialized
+
+    @pytest.mark.parametrize(
+        ("case", "expected_category", "expected_stage", "_expected_user_id", "_expected_exception_class"),
+        _ROUTE_OWNED_TOKEN_FAILURES,
+    )
+    async def test_audit_write_failure_propagates_after_exactly_one_attempt(
+        self,
+        tmp_path,
+        case: str,
+        expected_category: str,
+        expected_stage: str,
+        _expected_user_id: str | None,
+        _expected_exception_class: str | None,
+    ) -> None:
+        app, path, request_kwargs, sensitive_values = _token_bearing_401_case(case, tmp_path)
+        recorder = _RaisingAuthAuditRecorder()
+        app.state.auth_audit_recorder = recorder
+
+        async with _client_for(app) as client:
+            with pytest.raises(_AuditWriteFailure):
+                await client.post(path, **request_kwargs)
+
+        assert len(recorder.failures) == 1
+        assert recorder.failures[0]["failure_category"] == expected_category
+        assert recorder.failures[0]["failure_stage"] == expected_stage
+        serialized = repr(recorder.failures)
+        for sensitive_value in sensitive_values:
+            assert sensitive_value not in serialized
 
 
 @pytest.mark.asyncio

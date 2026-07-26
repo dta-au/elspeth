@@ -153,6 +153,29 @@ def _auth_audit_recorder(request: Request) -> AuthAuditWriter:
     return cast(AuthAuditWriter, request.app.state.auth_audit_recorder)
 
 
+def _route_auth_failure(
+    request: Request,
+    *,
+    detail: str,
+    failure_category: str,
+    failure_stage: str,
+    user: UserIdentity | None = None,
+    exc: AuthenticationError | None = None,
+) -> HTTPException:
+    """Record one route-owned auth failure before constructing its 401."""
+    settings: WebSettings = request.app.state.settings
+    _auth_audit_recorder(request).record_auth_failure(
+        request,
+        provider=settings.auth_provider,
+        failure_category=failure_category,
+        failure_stage=failure_stage,
+        user_id=None if user is None else user.user_id,
+        username=None if user is None else user.username,
+        exception_class=None if exc is None else type(exc).__name__,
+    )
+    return HTTPException(status_code=401, detail=detail)
+
+
 @trust_boundary(
     tier=3,
     source="browser-supplied Origin request header",
@@ -356,7 +379,13 @@ def create_auth_router() -> APIRouter:
                 record_token_issued=record_verification_token,
             )
         except AuthenticationError as exc:
-            raise HTTPException(status_code=401, detail=exc.detail) from exc
+            raise _route_auth_failure(
+                request,
+                detail=exc.detail,
+                failure_category="invalid_token",
+                failure_stage="verify_email",
+                exc=exc,
+            ) from exc
         _mark_sensitive_auth_response_uncacheable(response)
         return TokenResponse(access_token=token)
 
@@ -385,18 +414,43 @@ def create_auth_router() -> APIRouter:
         # the refresh — we cannot enforce chain lifetime without iat.
         claims = request.state.auth_claims
         if claims is None:
-            raise HTTPException(status_code=401, detail="Token claims could not be parsed — re-authenticate")
+            raise _route_auth_failure(
+                request,
+                detail="Token claims could not be parsed — re-authenticate",
+                failure_category="claims_invalid",
+                failure_stage="refresh_claims",
+                user=user,
+            )
         if "iat" not in claims:
-            raise HTTPException(status_code=401, detail="Token missing required iat claim — re-authenticate")
+            raise _route_auth_failure(
+                request,
+                detail="Token missing required iat claim — re-authenticate",
+                failure_category="claims_invalid",
+                failure_stage="refresh_claims",
+                user=user,
+            )
         original_iat = claims["iat"]
         if type(original_iat) is not int:
-            raise HTTPException(status_code=401, detail="Token missing required iat claim — re-authenticate")
+            raise _route_auth_failure(
+                request,
+                detail="Token missing required iat claim — re-authenticate",
+                failure_category="claims_invalid",
+                failure_stage="refresh_claims",
+                user=user,
+            )
 
         provider: CredentialAuthProvider = request.app.state.auth_provider
         try:
             new_token = await provider.refresh(user.user_id, user.username, original_iat=original_iat)
         except AuthenticationError as exc:
-            raise HTTPException(status_code=401, detail=exc.detail) from exc
+            raise _route_auth_failure(
+                request,
+                detail=exc.detail,
+                failure_category=classify_authentication_failure(exc),
+                failure_stage="refresh",
+                user=user,
+                exc=exc,
+            ) from exc
         recorder = _auth_audit_recorder(request)
         recorder.record_token_issued(
             request,
