@@ -169,6 +169,7 @@ class StableTokenProjection(ClosedModel):
     key: NonEmpty
     row_key: NonEmpty
     parents: tuple[NonEmpty, ...]
+    branch_name: NonEmpty | None = None
 
     @field_validator("parents")
     @classmethod
@@ -354,6 +355,183 @@ def _validate_projected_token_parent_graph(
         raise ValueError("transient fork_parent token must reach a terminal descendant")
 
 
+def _validate_completed_coalesce_lineage(
+    tokens: tuple[StableTokenProjection, ...],
+    node_states: tuple[StableNodeStateProjection, ...],
+    dispositions: tuple[StableTerminalDisposition, ...],
+    audit_records: tuple[StableAuditRecordProjection, ...],
+) -> None:
+    """Tie completed barrier evidence to the exact consumed-parent lineage."""
+    import json
+
+    token_by_key = {token.key: token for token in tokens}
+    disposition_by_token = {disposition.token_key: disposition for disposition in dispositions}
+    audit_by_key = {record.key: record for record in audit_records}
+    completed_groups: dict[tuple[str, str], list[StableNodeStateProjection]] = {}
+    for state in node_states:
+        if state.status != "completed" or not state.node_key.startswith("coalesce:"):
+            continue
+        token = token_by_key[state.token_key]
+        completed_groups.setdefault((state.node_key, token.row_key), []).append(state)
+
+    claimed_merged_tokens: set[str] = set()
+    for (node_key, row_key), states in completed_groups.items():
+        contexts = {state.context_after for state in states}
+        if None in contexts or len(contexts) != 1:
+            raise ValueError("completed coalesce token states must share one exact context_after")
+        context_after = next(iter(contexts))
+        assert context_after is not None
+        context = json.loads(context_after)
+        branches_arrived = context.get("branches_arrived")
+        expected_branches = context.get("expected_branches")
+        arrival_order = context.get("arrival_order")
+        branches_lost = context.get("branches_lost")
+        if (
+            not isinstance(branches_arrived, list)
+            or not all(isinstance(branch, str) and branch for branch in branches_arrived)
+            or len(set(branches_arrived)) != len(branches_arrived)
+        ):
+            raise ValueError("completed coalesce context must declare unique branches_arrived")
+        if (
+            not isinstance(expected_branches, list)
+            or not all(isinstance(branch, str) and branch for branch in expected_branches)
+            or len(set(expected_branches)) != len(expected_branches)
+            or not set(branches_arrived).issubset(expected_branches)
+        ):
+            raise ValueError("completed coalesce context must declare valid expected_branches")
+        if (
+            not isinstance(arrival_order, list)
+            or any(
+                not isinstance(arrival, dict) or arrival.get("branch") != branch
+                for arrival, branch in zip(arrival_order, branches_arrived, strict=False)
+            )
+            or len(arrival_order) != len(branches_arrived)
+        ):
+            raise ValueError("completed coalesce arrival_order must exactly match branches_arrived")
+        if not isinstance(branches_lost, dict) or not set(branches_lost).issubset(set(expected_branches) - set(branches_arrived)):
+            raise ValueError("completed coalesce branches_lost must be non-arrived expected branches")
+
+        consumed_token_keys = tuple(sorted(state.token_key for state in states))
+        if len(branches_arrived) != len(consumed_token_keys):
+            raise ValueError("completed coalesce branches_arrived must exactly cover consumed token states")
+        consumed_branch_names = tuple(token_by_key[token_key].branch_name for token_key in consumed_token_keys)
+        if (
+            any(branch_name is None for branch_name in consumed_branch_names)
+            or len(set(consumed_branch_names)) != len(consumed_branch_names)
+            or set(consumed_branch_names) != set(branches_arrived)
+        ):
+            raise ValueError("completed coalesce arrived branches must bind exactly to consumed upstream tokens")
+        if any(
+            (
+                disposition_by_token[token_key].outcome,
+                disposition_by_token[token_key].path,
+                disposition_by_token[token_key].sink_name,
+            )
+            != ("success", "coalesced", None)
+            for token_key in consumed_token_keys
+        ):
+            raise ValueError("completed coalesce consumed tokens must be internal successful coalesced dispositions")
+        merged_tokens = tuple(token for token in tokens if token.row_key == row_key and token.parents == consumed_token_keys)
+        if len(merged_tokens) != 1:
+            raise ValueError(f"completed coalesce {node_key} consumed token set must exactly parent one merged token")
+        merged_token = merged_tokens[0]
+        if merged_token.key in claimed_merged_tokens:
+            raise ValueError("one merged token cannot satisfy multiple completed coalesce groups")
+        claimed_merged_tokens.add(merged_token.key)
+        merged_disposition = disposition_by_token[merged_token.key]
+        if (merged_disposition.outcome, merged_disposition.path) != ("success", "coalesced"):
+            raise ValueError("completed coalesce merged token must have a successful coalesced disposition")
+
+        node_record = audit_by_key.get(f"node|{node_key}")
+        if node_record is None or node_record.record_type != "node":
+            raise ValueError("completed coalesce requires its exact stable node audit record")
+        node_material = json.loads(node_record.material)
+        config = node_material.get("config")
+        if not isinstance(config, dict) or not isinstance(config.get("branches"), dict):
+            raise ValueError("completed coalesce node audit record requires exact branch config")
+        configured_branches = config["branches"]
+        if tuple(expected_branches) != tuple(sorted(configured_branches)):
+            raise ValueError("completed coalesce expected_branches must exactly match node config")
+        policy = context.get("policy")
+        merge_strategy = context.get("merge_strategy")
+        if policy != config.get("policy") or merge_strategy != config.get("merge"):
+            raise ValueError("completed coalesce policy and merge strategy must exactly match node config")
+        if policy == "require_all" and set(branches_arrived) != set(expected_branches):
+            raise ValueError("completed require_all coalesce requires every expected branch")
+        if policy == "first" and len(branches_arrived) != 1:
+            raise ValueError("completed first coalesce requires exactly one arrived branch")
+        if policy == "quorum":
+            quorum_count = config.get("quorum_count")
+            if isinstance(quorum_count, bool) or not isinstance(quorum_count, int) or len(branches_arrived) < quorum_count:
+                raise ValueError("completed quorum coalesce must meet its configured quorum_count")
+        if policy == "best_effort" and not branches_arrived:
+            raise ValueError("completed best_effort coalesce requires at least one arrived branch")
+        if policy not in ("require_all", "first", "quorum", "best_effort"):
+            raise ValueError("completed coalesce has unsupported policy evidence")
+        if policy in ("require_all", "quorum", "best_effort") and set(branches_lost) != set(expected_branches) - set(branches_arrived):
+            raise ValueError("completed coalesce branches_lost must exactly complement arrived branches")
+        if merge_strategy == "select" and config.get("select_branch") not in branches_arrived:
+            raise ValueError("completed select coalesce requires its selected branch to have arrived")
+        arrived_set = set(branches_arrived)
+        origins = context.get("union_field_origins")
+        if origins is not None and (
+            not isinstance(origins, dict) or not all(isinstance(branch, str) and branch in arrived_set for branch in origins.values())
+        ):
+            raise ValueError("completed union provenance origins must reference arrived branches")
+        collisions = context.get("union_field_collisions")
+        if collisions is not None and (
+            not isinstance(collisions, dict)
+            or not all(
+                isinstance(branches, list)
+                and bool(branches)
+                and all(isinstance(branch, str) and branch in arrived_set for branch in branches)
+                and len(set(branches)) == len(branches)
+                for branches in collisions.values()
+            )
+        ):
+            raise ValueError("completed union collision provenance must reference unique arrived branches")
+        collision_values = context.get("union_field_collision_values")
+        if collision_values is not None and (
+            not isinstance(collision_values, dict)
+            or not all(
+                isinstance(values, list)
+                and bool(values)
+                and all(
+                    isinstance(value, list)
+                    and len(value) == 2
+                    and isinstance(value[0], str)
+                    and value[0] in arrived_set
+                    and isinstance(value[1], dict)
+                    for value in values
+                )
+                and len({value[0] for value in values}) == len(values)
+                for values in collision_values.values()
+            )
+        ):
+            raise ValueError("completed union collision values must reference unique arrived branches")
+
+
+def _derive_projected_terminal_counts(projection: StableRunProjection) -> tuple[int, int, int]:
+    """Mirror the production run-counter projection from exact token outcomes.
+
+    Processing is counted once per source-row identity that reaches any terminal
+    outcome. Success is likewise row-aware so fork/coalesce bookkeeping tokens
+    cannot multiply one source row; consumed coalesce inputs do not independently
+    count as successes. Failure remains a per-terminal-token tally, matching the
+    production coalesce failure accounting.
+    """
+    row_key_by_token = {token.key: token.row_key for token in projection.tokens}
+    terminal = tuple(disposition for disposition in projection.terminal_dispositions if disposition.outcome in ("success", "failure"))
+    processed_rows = {row_key_by_token[disposition.token_key] for disposition in terminal}
+    successful_rows = {
+        row_key_by_token[disposition.token_key]
+        for disposition in terminal
+        if disposition.outcome == "success" and not (disposition.path == "coalesced" and disposition.sink_name is None)
+    }
+    failed_tokens = sum(disposition.outcome == "failure" for disposition in terminal)
+    return len(processed_rows), len(successful_rows), failed_tokens
+
+
 class StableRunProjection(ClosedModel):
     rows: tuple[StableRowProjection, ...]
     tokens: tuple[StableTokenProjection, ...]
@@ -389,6 +567,12 @@ class StableRunProjection(ClosedModel):
         if {disposition.token_key for disposition in self.terminal_dispositions} != token_keys:
             raise ValueError("terminal dispositions must exactly cover tokens")
         _validate_projected_token_parent_graph(self.tokens, self.terminal_dispositions)
+        _validate_completed_coalesce_lineage(
+            self.tokens,
+            self.node_states,
+            self.terminal_dispositions,
+            self.audit_records,
+        )
         if any(work.token_key not in token_keys for work in self.scheduler_work):
             raise ValueError("every scheduler work item must reference a projected token")
         return self
@@ -420,8 +604,13 @@ class RunExpectation(ClosedModel):
         record_types = tuple(record.record_type for record in self.audit_record_counts)
         if record_types != tuple(sorted(record_types)) or len(set(record_types)) != len(record_types):
             raise ValueError("audit_record_counts must contain unique sorted record types")
-        if self.rows_processed != len(self.projection.rows):
-            raise ValueError("rows_processed must equal projected row count")
+        projected_processed, projected_succeeded, projected_failed = _derive_projected_terminal_counts(self.projection)
+        if self.rows_processed != projected_processed:
+            raise ValueError("rows_processed must equal distinct projected rows with terminal outcomes")
+        if self.rows_succeeded != projected_succeeded:
+            raise ValueError("rows_succeeded must equal distinct projected rows with counted successful outcomes")
+        if self.rows_failed != projected_failed:
+            raise ValueError("rows_failed must equal projected failed terminal dispositions")
         return self
 
 
@@ -653,6 +842,7 @@ class RuntimeEvidence(ClosedModel):
     output_rows: Count = 0
     sink_outputs: tuple[SinkOutputProjection, ...] = ()
     durable_projection: StableRunProjection | None = None
+    observed_error: ExpectedRunError | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -677,8 +867,12 @@ class RuntimeEvidence(ClosedModel):
             or any(count != 0 for count in (self.rows_processed, self.rows_succeeded, self.rows_failed, self.output_rows))
         ):
             raise ValueError("unattempted runtime forbids run identity, status, and non-zero counters")
-        if (self.durable_projection is None) != (not self.sink_outputs):
-            raise ValueError("runtime sink outputs and durable projection must be declared together")
+        if self.observed_error is not None and self.status != "failed":
+            raise ValueError("observed_error requires status=failed")
+        if self.observed_error is not None and self.kind != "exact":
+            raise ValueError("observed_error requires kind=exact")
+        if self.sink_outputs and self.durable_projection is None:
+            raise ValueError("runtime sink outputs require a durable projection")
         if self.kind == "exact" and self.durable_projection is None:
             raise ValueError("exact runtime kind requires exact projection evidence")
         if self.kind != "exact" and self.durable_projection is not None:
@@ -688,11 +882,16 @@ class RuntimeEvidence(ClosedModel):
             sink_names = tuple(output.sink_name for output in self.sink_outputs)
             if sink_names != tuple(sorted(sink_names)) or len(set(sink_names)) != len(sink_names):
                 raise ValueError("runtime sink outputs must contain unique sorted sink names")
-            if self.rows_processed != len(self.durable_projection.rows):
-                raise ValueError("runtime rows_processed must equal projected row count")
+            projected_processed, projected_succeeded, projected_failed = _derive_projected_terminal_counts(self.durable_projection)
+            if self.rows_processed != projected_processed:
+                raise ValueError("runtime rows_processed must equal distinct projected rows with terminal outcomes")
+            if self.rows_succeeded != projected_succeeded:
+                raise ValueError("runtime rows_succeeded must equal distinct projected rows with counted successful outcomes")
+            if self.rows_failed != projected_failed:
+                raise ValueError("runtime rows_failed must equal projected failed terminal dispositions")
             if self.output_rows != sum(len(output.rows) for output in self.sink_outputs):
                 raise ValueError("runtime output_rows must equal exact sink output row count")
-        if not self.attempted and (self.sink_outputs or self.durable_projection is not None):
+        if not self.attempted and (self.sink_outputs or self.durable_projection is not None or self.observed_error is not None):
             raise ValueError("unattempted runtime forbids exact projection evidence")
         return self
 
@@ -700,25 +899,37 @@ class RuntimeEvidence(ClosedModel):
     def _serialize_runtime(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = cast(dict[str, object], handler(self))
         if self.kind != "exact":
-            for field in ("kind", "sink_outputs", "durable_projection"):
+            for field in ("kind", "sink_outputs", "durable_projection", "observed_error"):
                 data.pop(field)
         return data
 
 
+class PortableExportUnavailableByPolicy(ClosedModel):
+    run_status: Literal["failed"]
+    exception_type: Literal["ValueError"]
+    reason: Literal["Audit export requires an immutable export-terminal run"]
+
+
 class AuditEvidence(ClosedModel):
-    kind: Literal["unattempted", "summary", "exact"] = "summary"
+    kind: Literal["unattempted", "summary", "exact", "unavailable_by_policy"] = "summary"
     attempted: StrictBool
     total_records: Count
     record_counts: tuple[AuditRecordCount, ...]
     source_operation_count: Count
     portable_projection: StableRunProjection | None = None
+    portable_export_unavailable: PortableExportUnavailableByPolicy | None = None
 
     @model_validator(mode="before")
     @classmethod
     def _supply_discriminator(cls, data: object) -> object:
         if isinstance(data, dict) and "kind" not in data:
             data = dict(data)
-            data["kind"] = "exact" if data.get("portable_projection") is not None else "summary" if data.get("attempted") else "unattempted"
+            if data.get("portable_projection") is not None:
+                data["kind"] = "exact"
+            elif data.get("portable_export_unavailable") is not None:
+                data["kind"] = "unavailable_by_policy"
+            else:
+                data["kind"] = "summary" if data.get("attempted") else "unattempted"
         return data
 
     @model_validator(mode="after")
@@ -734,20 +945,30 @@ class AuditEvidence(ClosedModel):
             raise ValueError("audit record counts must contain unique sorted record types")
         if self.total_records != sum(record.count for record in self.record_counts):
             raise ValueError("audit total_records must equal the sum of record counts")
-        if not self.attempted and self.portable_projection is not None:
+        if not self.attempted and (self.portable_projection is not None or self.portable_export_unavailable is not None):
             raise ValueError("unattempted audit forbids exact projection evidence")
         if self.kind == "exact" and self.portable_projection is None:
             raise ValueError("exact audit kind requires exact projection evidence")
         if self.kind != "exact" and self.portable_projection is not None:
             raise ValueError("non-exact audit kind forbids exact projection evidence")
+        if self.kind == "unavailable_by_policy" and self.portable_export_unavailable is None:
+            raise ValueError("unavailable_by_policy audit kind requires exact public-export refusal evidence")
+        if self.kind == "unavailable_by_policy" and self.total_records == 0:
+            raise ValueError("unavailable_by_policy requires non-empty durable audit evidence")
+        if self.kind != "unavailable_by_policy" and self.portable_export_unavailable is not None:
+            raise ValueError("only unavailable_by_policy audit kind accepts public-export refusal evidence")
         return self
 
     @model_serializer(mode="wrap")
     def _serialize_audit(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = cast(dict[str, object], handler(self))
-        if self.kind != "exact":
-            for field in ("kind", "portable_projection"):
+        if self.kind in ("summary", "unattempted"):
+            for field in ("kind", "portable_projection", "portable_export_unavailable"):
                 data.pop(field)
+        elif self.kind == "exact":
+            data.pop("portable_export_unavailable")
+        else:
+            data.pop("portable_projection")
         return data
 
 
@@ -792,10 +1013,46 @@ class ScenarioRunEvidence(ClosedModel):
     @model_validator(mode="after")
     def _validate_exact_views(self) -> Self:
         if self.runtime.kind == "exact":
-            if self.audit.kind != "exact":
-                raise ValueError("exact runtime requires exact audit evidence")
-            if self.runtime.durable_projection != self.audit.portable_projection:
-                raise ValueError("exact durable and portable projections must match")
-        elif self.audit.kind == "exact":
+            assert self.runtime.durable_projection is not None
+            projection = self.runtime.durable_projection
+            expected_record_counts: dict[str, int] = {
+                "row": len(projection.rows),
+                "token": len(projection.tokens),
+                "node_state": len(projection.node_states),
+                "routing_event": len(projection.routes),
+                "token_outcome": len(projection.terminal_dispositions),
+                "token_parent": sum(len(token.parents) for token in projection.tokens),
+                "scheduler_event": sum(len(work.transitions) for work in projection.scheduler_work),
+            }
+            for record in projection.audit_records:
+                expected_record_counts[record.record_type] = expected_record_counts.get(record.record_type, 0) + 1
+            declared_record_counts = {record.record_type: record.count for record in self.audit.record_counts}
+            for record_type, count in expected_record_counts.items():
+                if declared_record_counts.get(record_type, 0) != count:
+                    raise ValueError(f"audit record count for {record_type} must match exact durable projection")
+            source_operation_count = 0
+            for record in projection.audit_records:
+                if record.record_type != "operation":
+                    continue
+                import json
+
+                if json.loads(record.material).get("operation_type") == "source_load":
+                    source_operation_count += 1
+            if self.audit.source_operation_count != source_operation_count:
+                raise ValueError("audit source_operation_count must match exact durable projection")
+            if self.audit.kind == "exact":
+                if self.runtime.observed_error is not None:
+                    raise ValueError("observed expected-error runtime requires portable export unavailable_by_policy")
+                if self.runtime.durable_projection != self.audit.portable_projection:
+                    raise ValueError("exact durable and portable projections must match")
+            elif self.audit.kind == "unavailable_by_policy":
+                if self.runtime.status != "failed" or self.runtime.observed_error is None:
+                    raise ValueError("portable export unavailable_by_policy requires failed runtime with observed error")
+                assert self.audit.portable_export_unavailable is not None
+                if self.audit.portable_export_unavailable.run_status != self.runtime.status:
+                    raise ValueError("portable export refusal status must match runtime status")
+            else:
+                raise ValueError("exact runtime requires exact or unavailable_by_policy audit evidence")
+        elif self.audit.kind in ("exact", "unavailable_by_policy"):
             raise ValueError("exact audit evidence requires exact runtime evidence")
         return self

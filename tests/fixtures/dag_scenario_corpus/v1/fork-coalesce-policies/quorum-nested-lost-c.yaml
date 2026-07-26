@@ -22,13 +22,12 @@ transforms:
       schema: {mode: observed}
       operations: [{target: branch_marker, expression: "'a'"}]
   - name: lose_c
-    plugin: value_transform
+    plugin: dag_corpus_branch_loss
     input: path_c
     on_success: merge_c
     on_error: discard
     options:
       schema: {mode: observed}
-      operations: [{target: branch_marker, expression: "row['missing_branch_marker']"}]
   - name: mark_b
     plugin: value_transform
     input: path_b

@@ -39,9 +39,9 @@ transforms:
 coalesce:
   - name: merge_paths
     branches: {path_a: merge_a, path_b: merge_b, path_c: merge_c}
-    policy: best_effort
-    timeout_seconds: 60
-    merge: union
+    policy: quorum
+    quorum_count: 3
+    merge: nested
     on_success: output
 sinks:
   output:

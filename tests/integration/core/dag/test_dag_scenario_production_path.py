@@ -69,6 +69,20 @@ B2_COALESCE_POSITIVE_CASES = tuple(
     )
 )
 
+B2_COALESCE_FAILURE_AND_COLLISION_CASES = tuple(
+    ("fork-coalesce-policies", case_id)
+    for case_id in (
+        "require-all-lost-c",
+        "quorum-impossible-lost-c",
+        "best-effort-all-lost",
+        "first-all-lost",
+        "union-collision-last-wins",
+        "union-collision-first-wins",
+        "union-collision-fail",
+    )
+)
+B2_COALESCE_ALL_CASES = B2_COALESCE_POSITIVE_CASES + B2_COALESCE_FAILURE_AND_COLLISION_CASES
+
 
 def _declared_case(scenario_id: str, case_id: str) -> tuple[ScenarioSpec, HarnessCaseSpec]:
     return next((scenario, case) for scenario, case in iter_harness_cases(MANIFEST) if (scenario.id, case.id) == (scenario_id, case_id))
@@ -110,8 +124,12 @@ def test_b2_coalesce_positive_matrix_declares_exact_run_oracle(
     assert coalesce.select_branch == ("path_a" if merge == "select" else None)
     transforms_by_input = {transform.input: transform for transform in rendered.settings.transforms}
     assert tuple(transforms_by_input) == ("path_a", "path_c", "path_b")
-    path_c_expression = transforms_by_input["path_c"].options["operations"][0]["expression"]
-    assert path_c_expression == ("row['missing_branch_marker']" if loses_path_c else "'c'")
+    if loses_path_c:
+        assert transforms_by_input["path_c"].plugin == "dag_corpus_branch_loss"
+        assert "operations" not in transforms_by_input["path_c"].options
+    else:
+        assert transforms_by_input["path_c"].plugin == "value_transform"
+        assert transforms_by_input["path_c"].options["operations"][0]["expression"] == "'c'"
 
     expected = case.expected
     expected_status = "completed" if policy == "require_all" else "completed_with_failures"
@@ -156,7 +174,7 @@ def test_b2_coalesce_positive_matrix_declares_exact_run_oracle(
     assert context["wait_duration_ms"] == "$DURATION_MS"
     if loses_path_c:
         assert tuple(context["branches_lost"]) == ("path_c",)
-        assert context["lost_branch_expected_fields"] == {"path_c": ["branch_marker"]}
+        assert context["lost_branch_expected_fields"] == {"path_c": []}
     elif policy == "first":
         failed_states = tuple(state for state in coalesce_states if state.status == "failed")
         assert len(failed_states) == 2
@@ -164,6 +182,120 @@ def test_b2_coalesce_positive_matrix_declares_exact_run_oracle(
         assert {json.loads(state.error or "null")["failure_reason"] for state in failed_states} == {"late_arrival_after_merge"}
     else:
         assert context["branches_lost"] == {}
+
+
+@pytest.mark.parametrize(("scenario_id", "case_id"), B2_COALESCE_FAILURE_AND_COLLISION_CASES)
+def test_b2_coalesce_failure_and_collision_cases_declare_exact_run_oracles(
+    scenario_id: str,
+    case_id: str,
+) -> None:
+    _scenario, case = _declared_case(scenario_id, case_id)
+
+    assert case.workflow == "run"
+    assert isinstance(case.expected, RunExpectation)
+    if case_id == "union-collision-fail":
+        assert case.expected.status == "failed"
+        assert case.expected.expected_error is not None
+        assert case.expected.expected_error.exception_type == "CoalesceCollisionError"
+    else:
+        assert case.expected.expected_error is None
+
+
+def test_b2_coalesce_full_matrix_declares_exact_contracts(tmp_path: Path) -> None:
+    declared = tuple((scenario.id, case.id) for scenario, case in iter_harness_cases(MANIFEST) if scenario.id == "fork-coalesce-policies")
+    assert declared == B2_COALESCE_ALL_CASES
+
+    for scenario_id, case_id in declared:
+        _scenario, case = _declared_case(scenario_id, case_id)
+        assert isinstance(case.expected, RunExpectation)
+        assert resolve_fixture_path(case.input_fixtures["primary"]).read_bytes() == b"id,value\n1,10\n"
+        case_root = tmp_path / case_id
+        case_root.mkdir()
+        rendered = render_settings(case, case_root)
+        gate = rendered.settings.gates[0]
+        coalesce = rendered.settings.coalesce[0]
+        projection = case.expected.projection
+
+        assert gate.fork_to == ["path_a", "path_c", "path_b"]
+        assert tuple(coalesce.branches) == ("path_a", "path_b", "path_c")
+        assert projection.routes[0].label == "path_a"
+        assert tuple(route.label for route in projection.routes) == ("path_a", "path_c", "path_b")
+
+        if case_id.endswith("-lost-c"):
+            transforms_by_input = {transform.input: transform for transform in rendered.settings.transforms}
+            assert transforms_by_input["path_c"].plugin == "dag_corpus_branch_loss"
+            assert "operations" not in transforms_by_input["path_c"].options
+
+        if (scenario_id, case_id) in B2_COALESCE_POSITIVE_CASES:
+            assert case.expected.expected_error is None
+            assert case.expected.rows_processed == 1
+            assert case.expected.rows_succeeded == 1
+            assert any(state.status == "completed" and state.node_key.startswith("coalesce:") for state in projection.node_states)
+        elif case_id in {
+            "require-all-lost-c",
+            "quorum-impossible-lost-c",
+            "best-effort-all-lost",
+            "first-all-lost",
+        }:
+            assert (case.expected.status, case.expected.rows_processed, case.expected.rows_succeeded, case.expected.rows_failed) == (
+                "completed_with_failures",
+                1,
+                0,
+                3,
+            )
+            assert case.expected.sink_outputs == ()
+            assert case.output_artifacts["output"].presence == "absent"
+            coalesce_states = tuple(state for state in projection.node_states if state.node_key.startswith("coalesce:"))
+            if case_id.endswith("all-lost"):
+                assert coalesce_states == ()
+                assert {transform.plugin for transform in rendered.settings.transforms} == {"dag_corpus_always_error"}
+                branch_dispositions = projection.terminal_dispositions[1:]
+                assert all(
+                    (disposition.outcome, disposition.path, disposition.sink_name) == ("failure", "quarantined_at_source", None)
+                    for disposition in branch_dispositions
+                )
+            else:
+                transforms_by_input = {transform.input: transform for transform in rendered.settings.transforms}
+                assert transforms_by_input["path_c"].plugin == "dag_corpus_branch_loss"
+                reasons = tuple(
+                    json.loads(state.error or "null")["failure_reason"] for state in coalesce_states if state.status == "failed"
+                )
+                primary_reason = "branch_lost:path_c" if case_id == "require-all-lost-c" else "quorum_impossible:need=3,max_possible=2"
+                assert reasons == (primary_reason, "late_arrival_after_merge")
+        else:
+            collision_policy = {
+                "union-collision-last-wins": "last_wins",
+                "union-collision-first-wins": "first_wins",
+                "union-collision-fail": "fail",
+            }[case_id]
+            assert (coalesce.policy, coalesce.merge, coalesce.union_collision_policy) == (
+                "require_all",
+                "union",
+                collision_policy,
+            )
+            if collision_policy == "fail":
+                assert case.expected.status == "failed"
+                assert case.expected.expected_error is not None
+                assert case.expected.expected_error.exception_type == "CoalesceCollisionError"
+                assert case.expected.sink_outputs == ()
+                assert all(work.final_status == "blocked" for work in projection.scheduler_work[1:])
+            else:
+                assert (case.expected.status, case.expected.rows_succeeded, case.expected.rows_failed) == ("completed", 1, 0)
+                output = json.loads(case.expected.sink_outputs[0].rows[0])
+                expected_branch = "c" if collision_policy == "last_wins" else "a"
+                assert output["branch_marker"] == expected_branch
+                contexts = {
+                    state.context_after
+                    for state in projection.node_states
+                    if state.status == "completed" and state.node_key.startswith("coalesce:")
+                }
+                assert len(contexts) == 1
+                context = json.loads(next(iter(contexts)) or "null")
+                assert context["union_field_origins"] == {
+                    "branch_marker": f"path_{expected_branch}",
+                    "id": f"path_{expected_branch}",
+                    "value": f"path_{expected_branch}",
+                }
 
 
 @pytest.mark.parametrize(("scenario_id", "case_id"), B1_RUNTIME_CASES)
@@ -473,6 +605,7 @@ def _assert_declared_run_evidence(
     assert evidence.runtime.rows_failed == case.expected.rows_failed
     assert evidence.runtime.sink_outputs == case.expected.sink_outputs
     assert evidence.runtime.durable_projection == case.expected.projection
+    assert evidence.runtime.observed_error == case.expected.expected_error
 
     assert evidence.audit.attempted is True
     assert evidence.audit.total_records > 0
@@ -481,7 +614,19 @@ def _assert_declared_run_evidence(
     assert record_types == tuple(sorted(record_types))
     assert evidence.audit.record_counts == case.expected.audit_record_counts
     assert evidence.audit.source_operation_count == case.expected.source_operation_count
-    assert evidence.audit.portable_projection == case.expected.projection
+    if case.expected.expected_error is None:
+        assert evidence.audit.kind == "exact"
+        assert evidence.audit.portable_projection == case.expected.projection
+        assert evidence.audit.portable_export_unavailable is None
+    else:
+        assert evidence.audit.kind == "unavailable_by_policy"
+        assert evidence.audit.portable_projection is None
+        assert evidence.audit.portable_export_unavailable is not None
+        assert evidence.audit.portable_export_unavailable.model_dump() == {
+            "run_status": "failed",
+            "exception_type": "ValueError",
+            "reason": "Audit export requires an immutable export-terminal run",
+        }
 
     assert evidence.recovery.model_dump() == {
         "attempted": False,

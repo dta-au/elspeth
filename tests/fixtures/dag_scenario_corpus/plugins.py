@@ -54,6 +54,26 @@ class CorpusAlwaysErrorTransform(BaseTransform):
         )
 
 
+class CorpusBranchLossTransform(BaseTransform):
+    """Deterministic observed-schema branch loss for coalesce corpus cases."""
+
+    name = "dag_corpus_branch_loss"
+    determinism = Determinism.DETERMINISTIC
+    input_schema = CorpusInputSchema
+    output_schema = None  # type: ignore[assignment]
+    on_error = "discard"
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        del row, ctx
+        return TransformResult.error(
+            {
+                "reason": "invalid_input",
+                "error": "injected DAG corpus branch loss",
+            },
+            retryable=False,
+        )
+
+
 class CorpusAlwaysFailSink(JSONSink):
     """Corpus JSON sink that deterministically diverts every member."""
 
@@ -147,7 +167,7 @@ def make_corpus_plugin_manager() -> PluginManager:
     manager.register_builtin_plugins()
     manager.register(
         create_dynamic_hookimpl(
-            [CorpusAlwaysErrorTransform, CorpusFailOnceEOFBatchTransform],
+            [CorpusAlwaysErrorTransform, CorpusBranchLossTransform, CorpusFailOnceEOFBatchTransform],
             "elspeth_get_transforms",
         )
     )

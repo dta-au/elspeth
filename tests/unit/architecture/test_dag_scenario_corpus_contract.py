@@ -27,6 +27,7 @@ from tests.fixtures.dag_scenario_corpus.loader import (
 from tests.fixtures.dag_scenario_corpus.plugins import (
     CorpusAlwaysErrorTransform,
     CorpusAlwaysFailSink,
+    CorpusBranchLossTransform,
     CorpusFailOnceEOFBatchTransform,
     CorpusInputSchema,
     CorpusOutputSchema,
@@ -162,7 +163,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "partial",
-        "partial",
+        "pass",
         "partial",
         "partial",
         "partial",
@@ -360,6 +361,9 @@ EXPECTED_ASSESSMENT_LOCATORS = {
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b1_conditional_routing_rejects_missing_boolean_gate_destination",
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b1_conditional_routing_rejects_invalid_gate_destination_during_production_build",
     ),
+    "coalesce-policy-merge-contract-matrix": (
+        "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_coalesce_full_matrix_declares_exact_contracts",
+    ),
 }
 
 EXPECTED_ASSESSMENT_EVIDENCE = tuple(
@@ -370,8 +374,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "9cb97457e987c4b0e775f935718f809b92f99c0129f746c3945e7cbe6f648bf1"
-EXPECTED_CASE_REGISTRY_SHA256 = "e5f08c4d8ab239f28365fb35f827bbc1b98343bfcb5144dc4be2b23b557b5b3a"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "e985400ea6f0a18435cc1ec135c38537dcb3f1310daed539ebec1195a035d332"
+EXPECTED_CASE_REGISTRY_SHA256 = "2309f9da90d149c530c9cddbed2a290daa292b60b2fedef8ccb32fd89c259539"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -386,6 +390,16 @@ B2_COALESCE_POSITIVE_CASE_IDS = (
     "best-effort-nested-lost-c",
     "best-effort-select-lost-c",
 )
+B2_COALESCE_NEGATIVE_CASE_IDS = (
+    "require-all-lost-c",
+    "quorum-impossible-lost-c",
+    "best-effort-all-lost",
+    "first-all-lost",
+    "union-collision-last-wins",
+    "union-collision-first-wins",
+    "union-collision-fail",
+)
+B2_COALESCE_CASE_IDS = B2_COALESCE_POSITIVE_CASE_IDS + B2_COALESCE_NEGATIVE_CASE_IDS
 EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
@@ -399,12 +413,19 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "fork-coalesce-policies:first-union": "f032d03c31c3c02366cbbbbff3fdd37c6d70739954b9487f05e5945d974b1f91",
     "fork-coalesce-policies:first-nested": "1e46bd2315844ddc82e8af6063c20c4b9b72cb55c5c363049961bd46a3c06e3d",
     "fork-coalesce-policies:first-select": "9403ceeeb06be9888a744790d008b34508519df1d5c9b53af1dd9e34b796c310",
-    "fork-coalesce-policies:quorum-union-lost-c": "ef7aa36884c5d5aa66f544314aeeb215749c52c33121c55ccbf23cf31950c877",
-    "fork-coalesce-policies:quorum-nested-lost-c": "c19c07e3c8d78f6d71f0207ede2663816ae64ef08e941ace0a8600cc1d4e47d9",
-    "fork-coalesce-policies:quorum-select-lost-c": "25a82695e485cccaba750d8e3cc7ed95088fa94dea744f1a3ff48f0b56262b2d",
-    "fork-coalesce-policies:best-effort-union-lost-c": "6c62a5bcdc3c8f644da07c129e3997411025871a54ca115aec706715d1425371",
-    "fork-coalesce-policies:best-effort-nested-lost-c": "d74f58cfb67154d9e300f3f08ad9fcafeddabad63955ffec3693227e26f738eb",
-    "fork-coalesce-policies:best-effort-select-lost-c": "2e0e251cb0ade41c828c1388a946c1ee456b96a7ffd9d049ac11aa95d66c3bf9",
+    "fork-coalesce-policies:quorum-union-lost-c": "5ee4b0a931384f6b5d154b58d25b072a2da87e8efb930e64b63f807d9f11f43c",
+    "fork-coalesce-policies:quorum-nested-lost-c": "5de0b560220f2a164885154339cfc4077e7a964eb5f88a0c6be0b075eabfaf24",
+    "fork-coalesce-policies:quorum-select-lost-c": "0e8e60c5b080e26dbcc62a8e4c13d8ad4573b1aa710c6836a2355e0d0160997a",
+    "fork-coalesce-policies:best-effort-union-lost-c": "5a3fa6474d61f68f69cc95ad42cec2afac1c4b7e77c61c56fb1434af47d80805",
+    "fork-coalesce-policies:best-effort-nested-lost-c": "c71d40f53eed56b2c71a68a613001174dd47cb0d9301114e8de98b14aab4043c",
+    "fork-coalesce-policies:best-effort-select-lost-c": "4dce6f4213b8e9e600d687fd54d023744369d52e42c5e796c807e02474846af7",
+    "fork-coalesce-policies:require-all-lost-c": "afc049b9cef368104d733c9cd26ad2d380948280eb96660fe80defdcb690c6f1",
+    "fork-coalesce-policies:quorum-impossible-lost-c": "287dd6b0c9f4f0fea2e2d6ac5c1736663d4ec254278057eb2312db30718bbed2",
+    "fork-coalesce-policies:best-effort-all-lost": "d8d42b88e86263c89cf48bbca8f27bcd02dc3f9a54244726ca53165afdf8ad14",
+    "fork-coalesce-policies:first-all-lost": "36d4b7a025847dd3a5ad0f7c066e9f260e7a16c1267a3010f329995ce730fb1e",
+    "fork-coalesce-policies:union-collision-last-wins": "986df56cc9ca6ceeab7ccd5472f0c5605e296d48054112487d72b05174d2a6dd",
+    "fork-coalesce-policies:union-collision-first-wins": "8a20e5eceb01859427ac5e60d0e370f8ba100a7b9ce0903b2ca6e28f288073c7",
+    "fork-coalesce-policies:union-collision-fail": "973269df09a38f4beabc778c2b06365a10363444229530974e71888f98a4d57f",
     "checkpoint-deterministic-resume:reopen-resume": "ce62216ce20210600f1a9c20e362aaf299c7538e6c4d3bd0e97627563dc813e6",
 }
 
@@ -450,7 +471,7 @@ EXPECTED_HARNESS_EVIDENCE = (
             f"fork-coalesce-policies:{case_id}",
             ("config", "build", "runtime", "audit"),
         )
-        for case_id in B2_COALESCE_POSITIVE_CASE_IDS
+        for case_id in B2_COALESCE_CASE_IDS
     ),
 )
 
@@ -715,13 +736,13 @@ transforms:
       schema: {mode: observed}
       operations: [{target: branch_marker, expression: "'a'"}]
   - name: __PATH_C_NAME__
-    plugin: value_transform
+    plugin: __PATH_C_PLUGIN__
     input: path_c
     on_success: merge_c
     on_error: discard
     options:
       schema: {mode: observed}
-      operations: [{target: branch_marker, expression: "__PATH_C_EXPRESSION__"}]
+__PATH_C_OPERATION__
   - name: mark_b
     plugin: value_transform
     input: path_b
@@ -746,13 +767,101 @@ sinks:
 """
     return (
         template.replace("__PATH_C_NAME__", "lose_c" if loses_path_c else "mark_c")
-        .replace("__PATH_C_EXPRESSION__", "row['missing_branch_marker']" if loses_path_c else "'c'")
+        .replace("__PATH_C_PLUGIN__", "dag_corpus_branch_loss" if loses_path_c else "value_transform")
+        .replace(
+            "__PATH_C_OPERATION__\n",
+            "" if loses_path_c else "      operations: [{target: branch_marker, expression: \"'c'\"}]\n",
+        )
         .replace("__POLICY_OPTIONS__\n", policy_options)
         .encode()
     )
 
 
 EXPECTED_COALESCE_MATRIX_YAMLS = {case_id: _expected_coalesce_matrix_yaml(case_id) for case_id in B2_COALESCE_POSITIVE_CASE_IDS}
+
+
+def _expected_all_lost_coalesce_yaml(policy: str) -> bytes:
+    policy_options = f"    policy: {policy}\n"
+    if policy == "best_effort":
+        policy_options += "    timeout_seconds: 60\n"
+    policy_options += "    merge: nested\n"
+    template = """sources:
+  primary:
+    plugin: csv
+    on_success: fork_input
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: fork_gate
+    input: fork_input
+    condition: "True"
+    routes: {"true": fork, "false": discard}
+    fork_to: [path_a, path_c, path_b]
+transforms:
+  - name: lose_a
+    plugin: dag_corpus_always_error
+    input: path_a
+    on_success: merge_a
+    on_error: discard
+    options:
+      schema: {mode: observed}
+  - name: lose_c
+    plugin: dag_corpus_always_error
+    input: path_c
+    on_success: merge_c
+    on_error: discard
+    options:
+      schema: {mode: observed}
+  - name: lose_b
+    plugin: dag_corpus_always_error
+    input: path_b
+    on_success: merge_b
+    on_error: discard
+    options:
+      schema: {mode: observed}
+coalesce:
+  - name: merge_paths
+    branches: {path_a: merge_a, path_b: merge_b, path_c: merge_c}
+__POLICY_OPTIONS__
+    on_success: output
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_output}
+      format: jsonl
+      schema: {mode: observed}
+"""
+    return template.replace("__POLICY_OPTIONS__\n", policy_options).encode()
+
+
+_EXPECTED_PARTIAL_LOSS_NESTED = _expected_coalesce_matrix_yaml("quorum-nested-lost-c")
+_EXPECTED_COLLISION_UNION = _expected_coalesce_matrix_yaml("require-all-union")
+EXPECTED_COALESCE_NEGATIVE_YAMLS = {
+    "require-all-lost-c": _EXPECTED_PARTIAL_LOSS_NESTED.replace(
+        b"    policy: quorum\n    quorum_count: 2\n",
+        b"    policy: require_all\n",
+    ),
+    "quorum-impossible-lost-c": _EXPECTED_PARTIAL_LOSS_NESTED.replace(b"    quorum_count: 2\n", b"    quorum_count: 3\n"),
+    "best-effort-all-lost": _expected_all_lost_coalesce_yaml("best_effort"),
+    "first-all-lost": _expected_all_lost_coalesce_yaml("first"),
+    "union-collision-last-wins": _EXPECTED_COLLISION_UNION.replace(
+        b"    merge: union\n",
+        b"    merge: union\n    union_collision_policy: last_wins\n",
+    ),
+    "union-collision-first-wins": _EXPECTED_COLLISION_UNION.replace(
+        b"    merge: union\n",
+        b"    merge: union\n    union_collision_policy: first_wins\n",
+    ),
+    "union-collision-fail": _EXPECTED_COLLISION_UNION.replace(
+        b"    merge: union\n",
+        b"    merge: union\n    union_collision_policy: fail\n",
+    ),
+}
+EXPECTED_COALESCE_YAMLS = EXPECTED_COALESCE_MATRIX_YAMLS | EXPECTED_COALESCE_NEGATIVE_YAMLS
 
 
 def _markdown_link_targets(path: Path) -> tuple[str, ...]:
@@ -1176,6 +1285,73 @@ def _exact_runtime_evidence_values(projection: dict[str, object]) -> dict[str, o
     }
 
 
+def _exact_audit_evidence_values(projection: dict[str, object]) -> dict[str, object]:
+    return {
+        "kind": "exact",
+        "attempted": True,
+        "total_records": 7,
+        "record_counts": (
+            {"record_type": "node_state", "count": 1},
+            {"record_type": "row", "count": 1},
+            {"record_type": "run", "count": 1},
+            {"record_type": "scheduler_event", "count": 2},
+            {"record_type": "token", "count": 1},
+            {"record_type": "token_outcome", "count": 1},
+        ),
+        "source_operation_count": 0,
+        "portable_projection": projection,
+    }
+
+
+def _failed_runtime_projection_values() -> dict[str, object]:
+    projection = _exact_runtime_projection_values()
+    projection["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "failure",
+            "path": "unrouted",
+            "sink_name": None,
+        },
+    )
+    return projection
+
+
+def _scenario_exact_evidence_values(
+    *,
+    runtime: dict[str, object],
+    audit: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "scenario_id": "fork-coalesce-policies",
+        "case_id": "union-collision-fail",
+        "fixture_sha256": "fixture-sha",
+        "config": {"loaded": True, "settings_sha256": "settings-sha"},
+        "graph": {
+            "accepted": True,
+            "node_count": 2,
+            "edge_count": 1,
+            "node_type_counts": (
+                {"node_type": "sink", "count": 1},
+                {"node_type": "source", "count": 1},
+            ),
+            "edge_labels": ("on_success",),
+            "topology_hash": "topology-sha",
+        },
+        "runtime": runtime,
+        "audit": audit,
+        "recovery": {
+            "attempted": False,
+            "database_reopened": False,
+            "can_resume": False,
+            "source_replayed": False,
+            "checkpoint_removed": False,
+        },
+        "completed_stages": ("config", "build", "runtime", "audit"),
+    }
+
+
 def _projection_with_disconnected_terminal(*, cyclic: bool) -> dict[str, object]:
     projection = _exact_runtime_projection_values()
     projection["tokens"] = (
@@ -1271,6 +1447,110 @@ def test_exact_coalesce_counters_count_distinct_rows_not_consumed_branch_tokens(
     assert runtime.rows_succeeded == 1
 
 
+@pytest.mark.parametrize(
+    "case_id",
+    (
+        "require-all-union",
+        "first-union",
+        "quorum-union-lost-c",
+        "best-effort-union-lost-c",
+    ),
+)
+def test_completed_coalesce_projection_ties_arrivals_to_exact_merged_parents(case_id: str) -> None:
+    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
+    case = next(item for item in scenario.cases if item.id == case_id)
+    assert isinstance(case.expected, RunExpectation)
+
+    projection = corpus_schema.StableRunProjection.model_validate(case.expected.projection.model_dump(mode="python"))
+
+    completed_coalesce_states = tuple(
+        state for state in projection.node_states if state.status == "completed" and state.node_key.startswith("coalesce:")
+    )
+    assert completed_coalesce_states
+
+
+def test_completed_coalesce_projection_rejects_merged_token_missing_consumed_parent() -> None:
+    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
+    case = next(item for item in scenario.cases if item.id == "require-all-union")
+    assert isinstance(case.expected, RunExpectation)
+    values = case.expected.projection.model_dump(mode="python")
+    tokens = cast(list[dict[str, object]], values["tokens"])
+    merged_token = next(token for token in tokens if len(cast(tuple[str, ...], token["parents"])) == 3)
+    merged_token["parents"] = cast(tuple[str, ...], merged_token["parents"])[:-1]
+
+    with pytest.raises(
+        ValidationError,
+        match=r"completed coalesce .* consumed token set must exactly parent one merged token",
+    ):
+        corpus_schema.StableRunProjection.model_validate(values)
+
+
+def test_completed_coalesce_projection_rejects_arrived_branch_not_bound_to_consumed_token() -> None:
+    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
+    case = next(item for item in scenario.cases if item.id == "quorum-union-lost-c")
+    assert isinstance(case.expected, RunExpectation)
+    values = case.expected.projection.model_dump(mode="python")
+    states = cast(tuple[dict[str, object], ...], values["node_states"])
+    for state in states:
+        if state["status"] != "completed" or not cast(str, state["node_key"]).startswith("coalesce:"):
+            continue
+        context = json.loads(cast(str, state["context_after"]))
+        context["arrival_order"][1]["branch"] = "path_c"
+        context["branches_arrived"] = ["path_a", "path_c"]
+        context["branches_lost"] = {"path_b": context["branches_lost"]["path_c"]}
+        context["lost_branch_expected_fields"] = {"path_b": ["branch_marker"]}
+        state["context_after"] = json.dumps(context, sort_keys=True, separators=(",", ":"))
+
+    with pytest.raises(ValidationError, match="arrived branches must bind exactly to consumed upstream tokens"):
+        corpus_schema.StableRunProjection.model_validate(values)
+
+
+def test_completed_coalesce_projection_requires_exact_lost_branch_complement() -> None:
+    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
+    case = next(item for item in scenario.cases if item.id == "quorum-union-lost-c")
+    assert isinstance(case.expected, RunExpectation)
+    values = case.expected.projection.model_dump(mode="python")
+    states = cast(tuple[dict[str, object], ...], values["node_states"])
+    for state in states:
+        if state["status"] != "completed" or not cast(str, state["node_key"]).startswith("coalesce:"):
+            continue
+        context = json.loads(cast(str, state["context_after"]))
+        context["branches_lost"] = {}
+        state["context_after"] = json.dumps(context, sort_keys=True, separators=(",", ":"))
+
+    with pytest.raises(ValidationError, match="branches_lost must exactly complement arrived branches"):
+        corpus_schema.StableRunProjection.model_validate(values)
+
+
+def test_completed_union_projection_rejects_provenance_from_lost_branch() -> None:
+    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
+    case = next(item for item in scenario.cases if item.id == "quorum-union-lost-c")
+    assert isinstance(case.expected, RunExpectation)
+    values = case.expected.projection.model_dump(mode="python")
+    states = cast(tuple[dict[str, object], ...], values["node_states"])
+    for state in states:
+        if state["status"] != "completed" or not cast(str, state["node_key"]).startswith("coalesce:"):
+            continue
+        context = json.loads(cast(str, state["context_after"]))
+        context["union_field_origins"]["id"] = "path_c"
+        state["context_after"] = json.dumps(context, sort_keys=True, separators=(",", ":"))
+
+    with pytest.raises(ValidationError, match="union provenance origins must reference arrived branches"):
+        corpus_schema.StableRunProjection.model_validate(values)
+
+
+def test_exact_runtime_evidence_allows_intentionally_absent_sink_artifacts() -> None:
+    values = _exact_runtime_evidence_values(_exact_runtime_projection_values())
+    values["output_rows"] = 0
+    values["sink_outputs"] = ()
+
+    runtime = RuntimeEvidence.model_validate(values)
+
+    assert runtime.durable_projection is not None
+    assert runtime.sink_outputs == ()
+    assert runtime.output_rows == 0
+
+
 def test_exact_failed_run_expectation_declares_exact_production_exception() -> None:
     values = _exact_run_expectation_values()
     values["status"] = "failed"
@@ -1289,6 +1569,166 @@ def test_expected_run_error_is_forbidden_for_nonfailed_status() -> None:
 
     with pytest.raises(ValidationError, match="expected_error requires status=failed"):
         RunExpectation.model_validate(values)
+
+
+def test_observed_run_error_is_forbidden_for_completed_runtime() -> None:
+    values = _exact_runtime_evidence_values(_exact_runtime_projection_values())
+    values["observed_error"] = {"exception_type": "CoalesceCollisionError"}
+
+    with pytest.raises(ValidationError, match="observed_error requires status=failed"):
+        RuntimeEvidence.model_validate(values)
+
+
+def test_observed_run_error_is_forbidden_for_summary_runtime() -> None:
+    values = {
+        "kind": "summary",
+        "attempted": True,
+        "run_id": "run-1",
+        "status": "failed",
+        "observed_error": {"exception_type": "CoalesceCollisionError"},
+    }
+
+    with pytest.raises(ValidationError, match="observed_error requires kind=exact"):
+        RuntimeEvidence.model_validate(values)
+
+
+def test_failed_expected_error_evidence_types_portable_export_unavailable_by_policy() -> None:
+    projection = _failed_runtime_projection_values()
+    runtime = _exact_runtime_evidence_values(projection)
+    runtime.update(
+        status="failed",
+        rows_succeeded=0,
+        rows_failed=1,
+        output_rows=0,
+        sink_outputs=(),
+        observed_error={"exception_type": "CoalesceCollisionError"},
+    )
+    audit = _exact_audit_evidence_values(projection)
+    audit.update(
+        kind="unavailable_by_policy",
+        portable_projection=None,
+        portable_export_unavailable={
+            "run_status": "failed",
+            "exception_type": "ValueError",
+            "reason": "Audit export requires an immutable export-terminal run",
+        },
+    )
+
+    evidence = ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
+
+    assert evidence.runtime.observed_error is not None
+    assert evidence.audit.kind == "unavailable_by_policy"
+    assert evidence.audit.portable_export_unavailable is not None
+
+
+def test_portable_export_unavailable_by_policy_rejects_completed_terminal() -> None:
+    values = {
+        "kind": "unavailable_by_policy",
+        "attempted": True,
+        "total_records": 1,
+        "record_counts": ({"record_type": "run", "count": 1},),
+        "source_operation_count": 1,
+        "portable_export_unavailable": {
+            "run_status": "completed",
+            "exception_type": "ValueError",
+            "reason": "Audit export requires an immutable export-terminal run",
+        },
+    }
+
+    with pytest.raises(ValidationError, match="run_status"):
+        AuditEvidence.model_validate(values)
+
+
+def test_portable_export_unavailable_by_policy_rejects_empty_audit_evidence() -> None:
+    values = {
+        "kind": "unavailable_by_policy",
+        "attempted": True,
+        "total_records": 0,
+        "record_counts": (),
+        "source_operation_count": 0,
+        "portable_export_unavailable": {
+            "run_status": "failed",
+            "exception_type": "ValueError",
+            "reason": "Audit export requires an immutable export-terminal run",
+        },
+    }
+
+    with pytest.raises(ValidationError, match="unavailable_by_policy requires non-empty durable audit evidence"):
+        AuditEvidence.model_validate(values)
+
+
+def test_unavailable_export_audit_counts_must_match_exact_durable_projection() -> None:
+    projection = _failed_runtime_projection_values()
+    runtime = _exact_runtime_evidence_values(projection)
+    runtime.update(
+        status="failed",
+        rows_succeeded=0,
+        rows_failed=1,
+        output_rows=0,
+        sink_outputs=(),
+        observed_error={"exception_type": "CoalesceCollisionError"},
+    )
+    audit = _exact_audit_evidence_values(projection)
+    audit.update(
+        kind="unavailable_by_policy",
+        portable_projection=None,
+        portable_export_unavailable={
+            "run_status": "failed",
+            "exception_type": "ValueError",
+            "reason": "Audit export requires an immutable export-terminal run",
+        },
+    )
+    counts = [dict(record) for record in cast(tuple[dict[str, object], ...], audit["record_counts"])]
+    next(record for record in counts if record["record_type"] == "row")["count"] = 2
+    audit["record_counts"] = tuple(counts)
+    audit["total_records"] = cast(int, audit["total_records"]) + 1
+
+    with pytest.raises(ValidationError, match="audit record count for row must match exact durable projection"):
+        ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
+
+
+def test_unavailable_export_source_operation_count_must_match_exact_durable_projection() -> None:
+    projection = _failed_runtime_projection_values()
+    runtime = _exact_runtime_evidence_values(projection)
+    runtime.update(
+        status="failed",
+        rows_succeeded=0,
+        rows_failed=1,
+        output_rows=0,
+        sink_outputs=(),
+        observed_error={"exception_type": "CoalesceCollisionError"},
+    )
+    audit = _exact_audit_evidence_values(projection)
+    audit.update(
+        kind="unavailable_by_policy",
+        source_operation_count=1,
+        portable_projection=None,
+        portable_export_unavailable={
+            "run_status": "failed",
+            "exception_type": "ValueError",
+            "reason": "Audit export requires an immutable export-terminal run",
+        },
+    )
+
+    with pytest.raises(ValidationError, match="audit source_operation_count must match exact durable projection"):
+        ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
+
+
+def test_expected_error_runtime_rejects_exportable_exact_audit() -> None:
+    projection = _failed_runtime_projection_values()
+    runtime = _exact_runtime_evidence_values(projection)
+    runtime.update(
+        status="failed",
+        rows_succeeded=0,
+        rows_failed=1,
+        output_rows=0,
+        sink_outputs=(),
+        observed_error={"exception_type": "CoalesceCollisionError"},
+    )
+    audit = _exact_audit_evidence_values(projection)
+
+    with pytest.raises(ValidationError, match="observed expected-error runtime requires portable export unavailable_by_policy"):
+        ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
 
 
 def test_stable_node_state_preserves_canonical_context_and_error_json() -> None:
@@ -1371,8 +1811,40 @@ def test_exact_runtime_projection_rejects_count_and_output_mismatches() -> None:
     values = _exact_run_expectation_values()
     values["rows_processed"] = 2
 
-    with pytest.raises(ValidationError, match="rows_processed must equal projected row count"):
+    with pytest.raises(ValidationError, match="rows_processed must equal distinct projected rows with terminal outcomes"):
         RunExpectation.model_validate(values)
+
+
+@pytest.mark.parametrize("container", ("expectation", "runtime"))
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        (
+            "rows_succeeded",
+            0,
+            "rows_succeeded must equal distinct projected rows with counted successful outcomes",
+        ),
+        ("rows_failed", 1, "rows_failed must equal projected failed terminal dispositions"),
+    ),
+)
+def test_exact_projection_rejects_contradictory_terminal_counters(
+    container: str,
+    field: str,
+    value: int,
+    message: str,
+) -> None:
+    projection = _exact_runtime_projection_values()
+    validator: type[RunExpectation] | type[RuntimeEvidence]
+    if container == "expectation":
+        values = _exact_run_expectation_values()
+        validator = RunExpectation
+    else:
+        values = _exact_runtime_evidence_values(projection)
+        validator = RuntimeEvidence
+    values[field] = value
+
+    with pytest.raises(ValidationError, match=message):
+        validator.model_validate(values)
 
 
 def test_run_expectation_rejects_unjustified_transient_fork_parent() -> None:
@@ -2123,7 +2595,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
-        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_POSITIVE_CASE_IDS),
+        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     assert manifest.verdict == "not_complete"
@@ -2138,11 +2610,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 72
-    assert len(assessment_evidence) == 53
-    assert len(harness_evidence) == 19
-    assert len({reference.id for reference in manifest.evidence}) == 72
-    assert len({reference.locator for reference in manifest.evidence}) == 72
+    assert len(manifest.evidence) == 80
+    assert len(assessment_evidence) == 54
+    assert len(harness_evidence) == 26
+    assert len({reference.id for reference in manifest.evidence}) == 80
+    assert len({reference.locator for reference in manifest.evidence}) == 80
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -2161,7 +2633,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
-        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_POSITIVE_CASE_IDS),
+        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     normalized_cases = json.dumps(cases, sort_keys=True, separators=(",", ":")).encode()
@@ -2220,7 +2692,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
                 ("fork-coalesce-policies", "runtime"),
                 ("fork-coalesce-policies", "audit"),
             )
-            for case_id in B2_COALESCE_POSITIVE_CASE_IDS
+            for case_id in B2_COALESCE_CASE_IDS
         },
         "harness-checkpoint-deterministic-resume-reopen-resume": (
             ("checkpoint-deterministic-resume", "runtime"),
@@ -2272,23 +2744,27 @@ def test_corpus_plugin_manager_exposes_builtins_and_custom_through_public_instan
         {"fault_marker_path": str(tmp_path / "fault.marker")},
     )
     always_error = manager.create_transform("dag_corpus_always_error", {"schema": {"mode": "observed"}})
+    branch_loss = manager.create_transform("dag_corpus_branch_loss", {"schema": {"mode": "observed"}})
     always_fail = manager.create_sink(
         "dag_corpus_always_fail_sink",
         {"path": str(tmp_path / "failing.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
     )
 
-    assert (csv_source.name, passthrough.name, json_sink.name, custom.name, always_error.name, always_fail.name) == (
+    assert (csv_source.name, passthrough.name, json_sink.name, custom.name, always_error.name, branch_loss.name, always_fail.name) == (
         "csv",
         "passthrough",
         "json",
         "dag_corpus_fail_once_eof_batch",
         "dag_corpus_always_error",
+        "dag_corpus_branch_loss",
         "dag_corpus_always_fail_sink",
     )
     registered_transform: object = manager.get_transform_by_name("dag_corpus_fail_once_eof_batch")
     assert registered_transform is CorpusFailOnceEOFBatchTransform
     registered_always_error: object = manager.get_transform_by_name("dag_corpus_always_error")
     assert registered_always_error is CorpusAlwaysErrorTransform
+    registered_branch_loss: object = manager.get_transform_by_name("dag_corpus_branch_loss")
+    assert registered_branch_loss is CorpusBranchLossTransform
     registered_always_fail: object = manager.get_sink_by_name("dag_corpus_always_fail_sink")
     assert registered_always_fail is CorpusAlwaysFailSink
     assert manager_module.get_shared_plugin_manager() is manager
@@ -2312,6 +2788,11 @@ def test_corpus_transform_declares_exact_schema_and_runtime_contract() -> None:
     assert CorpusAlwaysErrorTransform.input_schema is CorpusInputSchema
     assert CorpusAlwaysErrorTransform.output_schema is CorpusInputSchema
     assert CorpusAlwaysErrorTransform.on_error == "discard"
+    assert CorpusBranchLossTransform.name == "dag_corpus_branch_loss"
+    assert CorpusBranchLossTransform.determinism is Determinism.DETERMINISTIC
+    assert CorpusBranchLossTransform.input_schema is CorpusInputSchema
+    assert CorpusBranchLossTransform.output_schema is None
+    assert CorpusBranchLossTransform.on_error == "discard"
 
 
 def test_corpus_always_error_transform_returns_stable_non_retryable_error() -> None:
@@ -2321,6 +2802,17 @@ def test_corpus_always_error_transform_returns_stable_non_retryable_error() -> N
     assert result.reason == {
         "reason": "invalid_input",
         "error": "injected DAG corpus routed error",
+    }
+    assert result.retryable is False
+
+
+def test_corpus_branch_loss_transform_returns_stable_non_retryable_error() -> None:
+    result = CorpusBranchLossTransform({"schema": {"mode": "observed"}}).process(_corpus_rows()[0], object())
+
+    assert result.status == "error"
+    assert result.reason == {
+        "reason": "invalid_input",
+        "error": "injected DAG corpus branch loss",
     }
     assert result.retryable is False
 
@@ -2383,7 +2875,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         "conditional-routing/input.csv": EXPECTED_INPUT_CSV,
         "fork-multiple-terminals-partial-failure/one-terminal-fails.yaml": EXPECTED_ONE_TERMINAL_FAILS_YAML,
         "fork-multiple-terminals-partial-failure/input.csv": EXPECTED_INPUT_CSV,
-        **{f"fork-coalesce-policies/{case_id}.yaml": expected for case_id, expected in EXPECTED_COALESCE_MATRIX_YAMLS.items()},
+        **{f"fork-coalesce-policies/{case_id}.yaml": expected for case_id, expected in EXPECTED_COALESCE_YAMLS.items()},
         "fork-coalesce-policies/matrix-input.csv": b"id,value\n1,10\n",
         "fork-coalesce-policies/input.csv": EXPECTED_INPUT_CSV,
         "checkpoint-deterministic-resume/reopen-resume.yaml": EXPECTED_REOPEN_RESUME_YAML,
@@ -2431,7 +2923,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
-        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_POSITIVE_CASE_IDS),
+        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     ],
 )
@@ -2523,6 +3015,8 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-7cf763da7c"
             elif dimension == "scale":
                 expected_owner = "elspeth-cb1053fe46"
+            elif scenario.id == "fork-coalesce-policies" and dimension in ("contracts", "audit"):
+                expected_owner = "elspeth-b1f23d8d83"
             else:
                 expected_owner = "elspeth-ef29ef6ba4"
             assert cell.owner_issue == expected_owner

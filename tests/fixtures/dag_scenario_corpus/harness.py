@@ -25,6 +25,7 @@ from elspeth.contracts.audit_export import (
     derive_audit_export_bundle,
 )
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.errors import CoalesceCollisionError
 from elspeth.contracts.hashing import canonical_json as contract_canonical_json
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
@@ -44,6 +45,7 @@ from elspeth.engine.orchestrator.preflight import (
     sink_effect_modes_from_runtime_bindings,
     validate_pipeline_sink_effect_capabilities,
 )
+from elspeth.engine.orchestrator.run_status import derive_terminal_status_from_audit
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle, instantiate_plugins_from_config
 from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog_snapshot_id
 from tests.fixtures.dag_scenario_corpus.loader import resolve_fixture_path
@@ -56,7 +58,9 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     GraphNodeTypeCount,
     HarnessCaseSpec,
     OutputArtifactExpectation,
+    PortableExportUnavailableByPolicy,
     RecoveryEvidence,
+    RunExpectation,
     RuntimeEvidence,
     ScenarioRunEvidence,
     ScenarioSpec,
@@ -72,6 +76,8 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     StableTokenProjection,
     normalize_template_name,
 )
+
+EXPECTED_RUN_ERROR_TYPES: Mapping[str, type[BaseException]] = MappingProxyType({"CoalesceCollisionError": CoalesceCollisionError})
 
 
 @dataclass(frozen=True, slots=True)
@@ -813,6 +819,7 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
             parents=tuple(
                 sorted(token_keys[parent_id] for _ordinal, parent_id in parents_by_token[str(record["token_id"])]),
             ),
+            branch_name=str(record["branch_name"]) if record.get("branch_name") is not None else None,
         )
         for record in (record for record in records if record.get("record_type") == "token")
         for stable_key in (token_keys[str(record["token_id"])],)
@@ -1353,7 +1360,12 @@ def _sink_outputs(rendered: RenderedScenario) -> tuple[SinkOutputProjection, ...
     return tuple(outputs)
 
 
-def _audit_evidence(records: list[dict[str, Any]], *, portable_projection: StableRunProjection | None = None) -> AuditEvidence:
+def _audit_evidence(
+    records: list[dict[str, Any]],
+    *,
+    portable_projection: StableRunProjection | None = None,
+    portable_export_unavailable: PortableExportUnavailableByPolicy | None = None,
+) -> AuditEvidence:
     counts = Counter(str(record["record_type"]) for record in records)
     return AuditEvidence(
         attempted=True,
@@ -1363,10 +1375,107 @@ def _audit_evidence(records: list[dict[str, Any]], *, portable_projection: Stabl
             1 for record in records if record.get("record_type") == "operation" and record.get("operation_type") == "source_load"
         ),
         portable_projection=portable_projection,
+        portable_export_unavailable=portable_export_unavailable,
     )
 
 
+def _run_expected_error_case(
+    scenario: ScenarioSpec,
+    case: HarnessCaseSpec,
+    tmp_path: Path,
+) -> ScenarioRunEvidence:
+    expected = case.expected
+    if not isinstance(expected, RunExpectation) or expected.expected_error is None:
+        raise AssertionError("expected-error runner requires an exact run expectation with expected_error")
+    expected_type = EXPECTED_RUN_ERROR_TYPES[expected.expected_error.exception_type]
+    rendered = render_settings(case, tmp_path)
+    built = build_scenario(rendered)
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        try:
+            Orchestrator(db).run(
+                built.config,
+                graph=built.graph,
+                settings=built.rendered.settings,
+                payload_store=payload_store,
+                openrouter_catalog_sha256=catalog_sha256,
+                openrouter_catalog_source=catalog_source,
+            )
+        except expected_type as exc:
+            if type(exc) is not expected_type:
+                raise AssertionError(f"DAG corpus expected exact {expected_type.__name__}, got subclass {type(exc).__name__}") from exc
+        else:
+            raise AssertionError(f"DAG corpus expected exact {expected_type.__name__}, but production run returned")
+
+        sink_outputs = _sink_outputs(rendered)
+        repositories = RecorderFactory.read_only(db, payload_store=payload_store)
+        runs = repositories.run_lifecycle.list_runs()
+        if len(runs) != 1:
+            raise AssertionError(f"DAG expected-error corpus expected exactly one persisted run, got {len(runs)}")
+        failed_run = runs[0]
+        if failed_run.status is not RunStatus.FAILED:
+            raise AssertionError(f"DAG expected-error corpus expected failed run, got {failed_run.status.value!r}")
+
+        counter_factory = RecorderFactory(db, payload_store=payload_store)
+        _derived_status, counters = derive_terminal_status_from_audit(counter_factory, failed_run.run_id)
+        durable_records = _public_durable_records(db, run_id=failed_run.run_id, payload_store=payload_store)
+        _validate_durable_sink_effect_material(durable_records)
+        durable_projection = _stable_projection(durable_records, source="durable")
+
+        export_reason = "Audit export requires an immutable export-terminal run"
+        try:
+            list(LandscapeExporter(db).export_run(failed_run.run_id))
+        except ValueError as export_exc:
+            if type(export_exc) is not ValueError or str(export_exc) != export_reason:
+                raise
+        else:
+            raise AssertionError("DAG expected-error corpus failed run unexpectedly allowed portable export")
+        audit = _audit_evidence(
+            durable_records,
+            portable_export_unavailable=PortableExportUnavailableByPolicy(
+                run_status="failed",
+                exception_type="ValueError",
+                reason=export_reason,
+            ),
+        )
+        return ScenarioRunEvidence(
+            schema_version=1,
+            scenario_id=scenario.id,
+            case_id=case.id,
+            fixture_sha256=rendered.fixture_sha256,
+            config=ConfigEvidence(loaded=True, settings_sha256=rendered.settings_sha256),
+            graph=built.graph_evidence,
+            runtime=RuntimeEvidence(
+                attempted=True,
+                run_id=failed_run.run_id,
+                status=failed_run.status.value,
+                rows_processed=counters.rows_processed,
+                rows_succeeded=counters.rows_succeeded,
+                rows_failed=counters.rows_failed,
+                output_rows=sum(len(output.rows) for output in sink_outputs),
+                sink_outputs=sink_outputs,
+                durable_projection=durable_projection,
+                observed_error=expected.expected_error,
+            ),
+            audit=audit,
+            recovery=RecoveryEvidence(
+                attempted=False,
+                database_reopened=False,
+                can_resume=False,
+                source_replayed=False,
+                checkpoint_removed=False,
+            ),
+            completed_stages=("config", "build", "runtime", "audit"),
+        )
+    finally:
+        db.close()
+
+
 def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
+    if isinstance(case.expected, RunExpectation) and case.expected.expected_error is not None:
+        return _run_expected_error_case(scenario, case, tmp_path)
     rendered = render_settings(case, tmp_path)
     built = build_scenario(rendered)
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
