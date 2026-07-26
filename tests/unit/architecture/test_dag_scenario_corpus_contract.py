@@ -275,8 +275,8 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "partial",
-        "partial",
-        "partial",
+        "pass",
+        "pass",
         "partial",
         "unknown",
         "not_applicable",
@@ -397,8 +397,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "1594707f9f2092d2403f7a4d492e2bb36840895048188ec410c6000f8c9e9770"
-EXPECTED_CASE_REGISTRY_SHA256 = "baafac2ebaab18c6936505f061d0b85485330cd9a99fbca52a96beb262a50d38"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "e2c6979bda59dab98fd99466265abda19d2312412f776236af4331516305f3c2"
+EXPECTED_CASE_REGISTRY_SHA256 = "37ff02b145850dbab3341491efa215b189629f66cf527b3d9837901696978905"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -1533,6 +1533,92 @@ def _valid_aggregation_eof_recovery() -> AggregationEOFRecoveryEvidence:
         final_output_rows=1,
         final_output_json='{"count":3,"value":60}',
         durable_export_parity=True,
+        provisional_until_deferred_platform_rebase=True,
+    )
+
+
+def _valid_terminal_equivalence_projection() -> dict[str, object]:
+    return {
+        "rows": (
+            {
+                "key": "primary:0",
+                "source_name": "primary",
+                "source_row_index": 0,
+                "ingest_sequence": 0,
+                "source_data_hash": "a" * 64,
+            },
+        ),
+        "tokens": (
+            {
+                "key": "primary:0#0",
+                "row_key": "primary:0",
+                "parent_set": (),
+                "branch_name": None,
+            },
+        ),
+        "terminal_node_states": (
+            {
+                "key": "primary:0#0|source:primary@stable|0",
+                "token_key": "primary:0#0",
+                "node_key": "source:primary@stable",
+                "step_index": 0,
+                "status": "completed",
+                "context_after": None,
+            },
+        ),
+        "routes": (),
+        "terminal_dispositions": (
+            {
+                "key": "primary:0#0",
+                "token_key": "primary:0#0",
+                "outcome": "success",
+                "path": "default_flow",
+                "sink_name": "output",
+                "error_hash": None,
+            },
+        ),
+        "terminal_scheduler_work": (
+            {
+                "key": "primary:0#0|sink:output@stable",
+                "token_key": "primary:0#0",
+                "node_key": "sink:output@stable",
+                "final_status": "terminal",
+            },
+        ),
+        "sink_outputs": ({"sink_name": "output", "rows": ('{"count":3,"value":60}',)},),
+        "rows_processed": 1,
+        "rows_succeeded": 1,
+        "rows_failed": 0,
+        "output_rows": 1,
+    }
+
+
+def _valid_terminal_resume_idempotence() -> BaseModel:
+    projection = _valid_terminal_equivalence_projection()
+    return corpus_schema.TerminalResumeIdempotenceEvidence(
+        fault_seam="eof_flush_before_transform_result",
+        fault_count=1,
+        source_exhausted_before=True,
+        resumed_run_id="run-resumed",
+        control_terminal_projection=projection,
+        resumed_terminal_projection=projection,
+        terminal_projection_equal=True,
+        fresh_object_lifetimes=4,
+        resumed_full_projection_sha256="b" * 64,
+        second_resume_error_type="NonResumableRunError",
+        second_resume_error_run_id="run-resumed",
+        second_resume_error_reason="Run is terminal (status 'completed'); successful terminal runs are immutable",
+        database_sha256_before="c" * 64,
+        database_sha256_after="c" * 64,
+        durable_records_sha256_before="d" * 64,
+        durable_records_sha256_after="d" * 64,
+        portable_export_sha256_before="e" * 64,
+        portable_export_sha256_after="e" * 64,
+        output_tree_sha256_before="f" * 64,
+        output_tree_sha256_after="f" * 64,
+        artifact_digests_before=({"path": "output.jsonl", "sha256": "1" * 64},),
+        artifact_digests_after=({"path": "output.jsonl", "sha256": "1" * 64},),
+        zero_mutation=True,
         provisional_until_deferred_platform_rebase=True,
     )
 
@@ -3238,6 +3324,7 @@ def test_closed_vocabularies_are_exact() -> None:
         "expansion_child_enqueue",
         "parallel_sink_finalization",
         "pending_sink_redrive",
+        "terminal_resume_idempotence",
     )
 
 
@@ -3895,6 +3982,110 @@ def test_eof_aggregation_recovery_rejects_invalid_final_batch_evidence(mutation:
         AggregationEOFRecoveryEvidence.model_validate(values)
 
 
+def test_terminal_resume_idempotence_pins_terminal_equivalence_and_every_no_mutation_view() -> None:
+    proof = _valid_terminal_resume_idempotence()
+    values = _valid_recovery().model_dump(mode="json")
+    values["terminal_resume_idempotence"] = proof.model_dump(mode="json")
+
+    evidence = RecoveryEvidence.model_validate(values)
+
+    assert evidence.terminal_resume_idempotence == proof
+    assert proof.control_terminal_projection == proof.resumed_terminal_projection
+    assert proof.fresh_object_lifetimes == 4
+    assert proof.database_sha256_before == proof.database_sha256_after
+    assert proof.durable_records_sha256_before == proof.durable_records_sha256_after
+    assert proof.portable_export_sha256_before == proof.portable_export_sha256_after
+    assert proof.output_tree_sha256_before == proof.output_tree_sha256_after
+    assert proof.artifact_digests_before == proof.artifact_digests_after
+
+
+def test_terminal_resume_case_requires_manifest_pinned_full_history_hash() -> None:
+    manifest = load_manifest()
+    case = next(
+        case
+        for scenario in manifest.scenarios
+        if scenario.id == "checkpoint-deterministic-resume"
+        for case in scenario.cases
+        if case.id == "reopen-resume"
+    )
+    values = case.model_dump(mode="json")
+    expected = cast(dict[str, object], values["expected"])
+    expected.pop("resumed_full_projection_sha256", None)
+
+    with pytest.raises(ValidationError, match="terminal-resume recovery requires a pinned full-history hash"):
+        HarnessCaseSpec.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("second_resume_error_run_id", "run-other", "same completed run"),
+        ("database_sha256_after", "2" * 64, "database bytes"),
+        ("durable_records_sha256_after", "2" * 64, "durable records"),
+        ("portable_export_sha256_after", "2" * 64, "portable export"),
+        ("output_tree_sha256_after", "2" * 64, "output tree"),
+        ("artifact_digests_after", ({"path": "output.jsonl", "sha256": "2" * 64},), "artifact bytes"),
+        ("zero_mutation", False, "Input should be True"),
+    ),
+)
+def test_terminal_resume_idempotence_rejects_identity_and_no_mutation_drift(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    values = _valid_terminal_resume_idempotence().model_dump(mode="json")
+    values[field] = value
+
+    with pytest.raises(ValidationError, match=message):
+        corpus_schema.TerminalResumeIdempotenceEvidence.model_validate(values)
+
+
+def test_terminal_resume_idempotence_rejects_semantic_terminal_drift() -> None:
+    values = _valid_terminal_resume_idempotence().model_dump(mode="json")
+    resumed = cast(dict[str, object], values["resumed_terminal_projection"])
+    sink_outputs = cast(list[dict[str, object]], resumed["sink_outputs"])
+    sink_outputs[0]["rows"] = ('{"count":2,"value":60}',)
+
+    with pytest.raises(ValidationError, match="terminal projections must be exactly equal"):
+        corpus_schema.TerminalResumeIdempotenceEvidence.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_key", "message"),
+    (
+        ("terminal_node_states", "node-key-drift", "terminal node-state key"),
+        ("terminal_scheduler_work", "work-key-drift", "terminal scheduler-work key"),
+    ),
+)
+def test_terminal_equivalence_projection_rejects_derived_key_drift(
+    field: str,
+    bad_key: str,
+    message: str,
+) -> None:
+    values = _valid_terminal_equivalence_projection()
+    records = cast(tuple[dict[str, object], ...], values[field])
+    records[0]["key"] = bad_key
+
+    with pytest.raises(ValidationError, match=message):
+        corpus_schema.TerminalEquivalenceProjection.model_validate(values)
+
+
+def test_terminal_equivalence_projection_rejects_completed_batch_key_drift() -> None:
+    values = _valid_terminal_equivalence_projection()
+    values["completed_batches"] = (
+        {
+            "key": "batch-key-drift",
+            "aggregation_node_key": "aggregation:eof_sum@stable",
+            "trigger_type": "end_of_source",
+            "trigger_reason": None,
+            "member_token_keys": ("primary:0#0",),
+        },
+    )
+
+    with pytest.raises(ValidationError, match="terminal batch key"):
+        corpus_schema.TerminalEquivalenceProjection.model_validate(values)
+
+
 @pytest.mark.parametrize(
     "field",
     (
@@ -3995,10 +4186,20 @@ def test_expansion_recovery_rejects_inexact_partition_cardinality_and_shape(muta
         ("sink_finalization", "aggregation_eof"),
         ("sink_finalization", "expansion_child_enqueue"),
         ("sink_finalization", "pending_sink_redrive"),
+        ("sink_finalization", "terminal_resume_idempotence"),
         ("aggregation_eof", "expansion_child_enqueue"),
         ("aggregation_eof", "pending_sink_redrive"),
+        ("aggregation_eof", "terminal_resume_idempotence"),
         ("expansion_child_enqueue", "pending_sink_redrive"),
-        ("sink_finalization", "aggregation_eof", "expansion_child_enqueue", "pending_sink_redrive"),
+        ("expansion_child_enqueue", "terminal_resume_idempotence"),
+        ("pending_sink_redrive", "terminal_resume_idempotence"),
+        (
+            "sink_finalization",
+            "aggregation_eof",
+            "expansion_child_enqueue",
+            "pending_sink_redrive",
+            "terminal_resume_idempotence",
+        ),
     ),
 )
 def test_recovery_evidence_rejects_multiple_seam_specific_proofs(seams: tuple[str, ...]) -> None:
@@ -4007,6 +4208,7 @@ def test_recovery_evidence_rejects_multiple_seam_specific_proofs(seams: tuple[st
         "aggregation_eof": _valid_aggregation_eof_recovery(),
         "expansion_child_enqueue": _valid_expansion_child_enqueue_recovery(),
         "pending_sink_redrive": _valid_pending_sink_redrive_recovery(),
+        "terminal_resume_idempotence": _valid_terminal_resume_idempotence(),
     }
     values = _valid_recovery().model_dump(mode="json")
     for seam in seams:
@@ -4023,6 +4225,7 @@ def test_recovery_evidence_rejects_multiple_seam_specific_proofs(seams: tuple[st
         ("aggregation_eof", _valid_aggregation_eof_recovery()),
         ("expansion_child_enqueue", _valid_expansion_child_enqueue_recovery()),
         ("pending_sink_redrive", _valid_pending_sink_redrive_recovery()),
+        ("terminal_resume_idempotence", _valid_terminal_resume_idempotence()),
     ),
 )
 @pytest.mark.parametrize(
@@ -4055,6 +4258,7 @@ def test_seam_specific_recovery_rejects_contradictory_public_resume_flags(
         ("aggregation_eof", _valid_aggregation_eof_recovery()),
         ("expansion_child_enqueue", _valid_expansion_child_enqueue_recovery()),
         ("pending_sink_redrive", _valid_pending_sink_redrive_recovery()),
+        ("terminal_resume_idempotence", _valid_terminal_resume_idempotence()),
     ),
 )
 def test_unattempted_recovery_forbids_seam_specific_proof(field: str, proof: BaseModel) -> None:
@@ -4740,6 +4944,10 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-6f6bbbec00"
             elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "audit":
                 expected_owner = "elspeth-2e66723070"
+            elif scenario.id == "checkpoint-deterministic-resume" and dimension == "contracts":
+                expected_owner = "elspeth-f321e3ff21"
+            elif scenario.id == "checkpoint-deterministic-resume" and dimension == "recovery":
+                expected_owner = "elspeth-245b21351b"
             elif dimension == "guided":
                 expected_owner = "elspeth-7e2dd67275"
             elif dimension == "round_trip":

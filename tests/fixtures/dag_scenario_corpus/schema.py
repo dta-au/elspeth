@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Literal, Self, cast
@@ -26,6 +26,7 @@ NonEmpty = Annotated[str, StringConstraints(strict=True, strip_whitespace=True, 
 IssueId = Annotated[str, StringConstraints(strict=True, pattern=r"^elspeth-[0-9a-f]{10}$")]
 Count = Annotated[int, Field(strict=True, ge=0)]
 PositiveCount = Annotated[int, Field(strict=True, ge=1)]
+Sha256 = Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
 
 CellStatus = Literal["pass", "partial", "fail", "unknown", "not_applicable"]
 Dimension = Literal[
@@ -49,6 +50,7 @@ RecoveryKind = Literal[
     "expansion_child_enqueue",
     "parallel_sink_finalization",
     "pending_sink_redrive",
+    "terminal_resume_idempotence",
 ]
 GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "sink", "source", "transform"]
 
@@ -136,6 +138,7 @@ class SummaryRunExpectation(ClosedModel):
     status: Literal["completed", "completed_with_failures", "empty"]
     output_rows: Count
     required_audit_record_types: tuple[NonEmpty, ...]
+    resumed_full_projection_sha256: Sha256 | None = None
 
 
 class AuditRecordCount(ClosedModel):
@@ -471,7 +474,14 @@ class StableAuditRecordProjection(ClosedModel):
 
 def _require_unique_sorted_keys(
     label: str,
-    values: tuple[StableKeyedProjection | StableAuditRecordProjection | SemanticTokenProjection, ...],
+    values: Sequence[
+        StableKeyedProjection
+        | StableAuditRecordProjection
+        | SemanticTokenProjection
+        | TerminalNodeStateProjection
+        | TerminalSchedulerWorkProjection
+        | TerminalBatchProjection
+    ],
 ) -> None:
     keys = tuple(value.key for value in values)
     if keys != tuple(sorted(keys)) or len(set(keys)) != len(keys):
@@ -944,6 +954,145 @@ class SemanticRuntimeProjection(ClosedModel):
         return self
 
 
+class TerminalNodeStateProjection(ClosedModel):
+    """Final semantic node state with retry-attempt history removed."""
+
+    key: NonEmpty
+    token_key: NonEmpty
+    node_key: NonEmpty
+    step_index: Count
+    status: Literal["completed"]
+    context_after: NonEmpty | None = None
+
+    @field_validator("context_after")
+    @classmethod
+    def _require_canonical_context(cls, value: str | None, info: ValidationInfo) -> str | None:
+        return _require_canonical_json_object_or_none(value, info)
+
+    @model_validator(mode="after")
+    def _validate_key(self) -> Self:
+        if self.key != f"{self.token_key}|{self.node_key}|{self.step_index}":
+            raise ValueError("terminal node-state key must exactly encode token, node, and step")
+        return self
+
+
+class TerminalSchedulerWorkProjection(ClosedModel):
+    """Final semantic scheduler state with transition history removed."""
+
+    key: NonEmpty
+    token_key: NonEmpty
+    node_key: NonEmpty
+    final_status: Literal["terminal"]
+
+    @model_validator(mode="after")
+    def _validate_key(self) -> Self:
+        if self.key != f"{self.token_key}|{self.node_key}":
+            raise ValueError("terminal scheduler-work key must exactly encode token and node")
+        return self
+
+
+class TerminalBatchProjection(ClosedModel):
+    """Completed batch semantics independent of failed/retried batch identity."""
+
+    key: NonEmpty
+    aggregation_node_key: NonEmpty
+    trigger_type: Literal["count", "timeout", "condition", "end_of_source"]
+    trigger_reason: NonEmpty | None
+    member_token_keys: tuple[NonEmpty, ...]
+
+    @model_validator(mode="after")
+    def _validate_members(self) -> Self:
+        if not self.member_token_keys or len(self.member_token_keys) != len(set(self.member_token_keys)):
+            raise ValueError("terminal batch member tokens must be non-empty and unique")
+        expected_key = "|".join(
+            (
+                self.aggregation_node_key,
+                self.trigger_type,
+                str(self.trigger_reason),
+                *self.member_token_keys,
+            )
+        )
+        if self.key != expected_key:
+            raise ValueError("terminal batch key must exactly encode aggregation, trigger, and member sequence")
+        return self
+
+
+class TerminalEquivalenceProjection(ClosedModel):
+    """Terminal runtime meaning, deliberately excluding retry/audit history."""
+
+    rows: tuple[StableRowProjection, ...]
+    tokens: tuple[SemanticTokenProjection, ...]
+    terminal_node_states: tuple[TerminalNodeStateProjection, ...]
+    routes: tuple[StableRouteProjection, ...]
+    terminal_dispositions: tuple[StableTerminalDisposition, ...]
+    terminal_scheduler_work: tuple[TerminalSchedulerWorkProjection, ...]
+    completed_batches: tuple[TerminalBatchProjection, ...] = ()
+    sink_outputs: tuple[SinkOutputProjection, ...]
+    rows_processed: Count
+    rows_succeeded: Count
+    rows_failed: Count
+    output_rows: Count
+
+    @model_validator(mode="after")
+    def _validate_terminal_projection(self) -> Self:
+        for label, values in (
+            ("rows", self.rows),
+            ("tokens", self.tokens),
+            ("terminal node states", self.terminal_node_states),
+            ("routes", self.routes),
+            ("terminal dispositions", self.terminal_dispositions),
+            ("terminal scheduler work", self.terminal_scheduler_work),
+            ("completed batches", self.completed_batches),
+        ):
+            _require_unique_sorted_keys(label, values)
+        sink_names = tuple(output.sink_name for output in self.sink_outputs)
+        if sink_names != tuple(sorted(sink_names)) or len(sink_names) != len(set(sink_names)):
+            raise ValueError("terminal sink outputs must contain unique sorted sink names")
+
+        row_keys = {row.key for row in self.rows}
+        token_keys = {token.key for token in self.tokens}
+        if any(token.row_key not in row_keys for token in self.tokens):
+            raise ValueError("terminal tokens must reference projected rows")
+        if any(parent not in token_keys or parent == token.key for token in self.tokens for parent in token.parent_set):
+            raise ValueError("terminal token parent_set must reference distinct projected tokens")
+        disposition_token_keys = tuple(disposition.token_key for disposition in self.terminal_dispositions)
+        if len(disposition_token_keys) != len(token_keys) or set(disposition_token_keys) != token_keys:
+            raise ValueError("terminal dispositions must exactly cover terminal tokens one-to-one")
+        semantic_as_raw = tuple(
+            StableTokenProjection(
+                key=token.key,
+                row_key=token.row_key,
+                parents=tuple(
+                    StableParentProjection(ordinal=ordinal, parent_key=parent_key) for ordinal, parent_key in enumerate(token.parent_set)
+                ),
+                branch_name=token.branch_name,
+            )
+            for token in self.tokens
+        )
+        _validate_projected_token_parent_graph(semantic_as_raw, self.terminal_dispositions)
+        for values in (self.terminal_node_states, self.routes, self.terminal_scheduler_work):
+            if any(value.token_key not in token_keys for value in values):
+                raise ValueError("terminal runtime records must reference projected tokens")
+        if any(member not in token_keys for batch in self.completed_batches for member in batch.member_token_keys):
+            raise ValueError("terminal batch members must reference projected tokens")
+
+        row_key_by_token = {token.key: token.row_key for token in self.tokens}
+        terminal = tuple(disposition for disposition in self.terminal_dispositions if disposition.outcome in ("success", "failure"))
+        processed_rows = {row_key_by_token[disposition.token_key] for disposition in terminal}
+        processed_rows.update(row_key_by_token[token_key] for batch in self.completed_batches for token_key in batch.member_token_keys)
+        succeeded = sum(
+            1
+            for disposition in terminal
+            if disposition.outcome == "success" and not (disposition.path == "coalesced" and disposition.sink_name is None)
+        )
+        failed = sum(disposition.outcome == "failure" for disposition in terminal)
+        if (self.rows_processed, self.rows_succeeded, self.rows_failed) != (len(processed_rows), succeeded, failed):
+            raise ValueError("terminal counters must match projected terminal behavior")
+        if self.output_rows != sum(len(output.rows) for output in self.sink_outputs):
+            raise ValueError("terminal output_rows must equal exact sink output row count")
+        return self
+
+
 class ExpectedRunError(ClosedModel):
     exception_type: Literal["CoalesceCollisionError"]
 
@@ -1162,6 +1311,11 @@ class HarnessCaseSpec(ClosedModel):
             raise ValueError("recovery workflow requires recovery_kind")
         if self.workflow != "recovery" and self.recovery_kind is not None:
             raise ValueError("recovery_kind is valid only for the recovery workflow")
+        if self.recovery_kind == "terminal_resume_idempotence":
+            if not isinstance(self.expected, SummaryRunExpectation) or self.expected.resumed_full_projection_sha256 is None:
+                raise ValueError("terminal-resume recovery requires a pinned full-history hash")
+        elif isinstance(self.expected, SummaryRunExpectation) and self.expected.resumed_full_projection_sha256 is not None:
+            raise ValueError("resumed full-history hash is valid only for terminal-resume recovery")
         if self.workflow == "build":
             if not isinstance(self.expected, BuildExpectation):
                 raise ValueError("build workflow requires BuildExpectation")
@@ -1504,6 +1658,60 @@ class AggregationEOFRecoveryEvidence(ClosedModel):
         return self
 
 
+class ArtifactByteDigest(ClosedModel):
+    path: NonEmpty
+    sha256: Sha256
+
+
+class TerminalResumeIdempotenceEvidence(ClosedModel):
+    """Exact terminal equivalence and zero-mutation refusal of a second resume."""
+
+    fault_seam: Literal["eof_flush_before_transform_result"]
+    fault_count: Literal[1]
+    source_exhausted_before: Literal[True]
+    resumed_run_id: NonEmpty
+    control_terminal_projection: TerminalEquivalenceProjection
+    resumed_terminal_projection: TerminalEquivalenceProjection
+    terminal_projection_equal: Literal[True]
+    fresh_object_lifetimes: Literal[4]
+    resumed_full_projection_sha256: Sha256
+    second_resume_error_type: Literal["NonResumableRunError"]
+    second_resume_error_run_id: NonEmpty
+    second_resume_error_reason: Literal["Run is terminal (status 'completed'); successful terminal runs are immutable"]
+    database_sha256_before: Sha256
+    database_sha256_after: Sha256
+    durable_records_sha256_before: Sha256
+    durable_records_sha256_after: Sha256
+    portable_export_sha256_before: Sha256
+    portable_export_sha256_after: Sha256
+    output_tree_sha256_before: Sha256
+    output_tree_sha256_after: Sha256
+    artifact_digests_before: tuple[ArtifactByteDigest, ...]
+    artifact_digests_after: tuple[ArtifactByteDigest, ...]
+    zero_mutation: Literal[True]
+    provisional_until_deferred_platform_rebase: Literal[True]
+
+    @model_validator(mode="after")
+    def _validate_equivalence_and_no_mutation(self) -> Self:
+        if self.control_terminal_projection != self.resumed_terminal_projection:
+            raise ValueError("control and resumed terminal projections must be exactly equal")
+        if self.second_resume_error_run_id != self.resumed_run_id:
+            raise ValueError("second resume refusal must identify the same completed run")
+        for before, after, label in (
+            (self.database_sha256_before, self.database_sha256_after, "database bytes"),
+            (self.durable_records_sha256_before, self.durable_records_sha256_after, "durable records"),
+            (self.portable_export_sha256_before, self.portable_export_sha256_after, "portable export"),
+            (self.output_tree_sha256_before, self.output_tree_sha256_after, "output tree"),
+            (self.artifact_digests_before, self.artifact_digests_after, "artifact bytes"),
+        ):
+            if before != after:
+                raise ValueError(f"second resume refusal must preserve byte-identical {label}")
+        paths = tuple(digest.path for digest in self.artifact_digests_before)
+        if not paths or paths != tuple(sorted(set(paths))):
+            raise ValueError("artifact byte digests must contain unique sorted paths")
+        return self
+
+
 class ExpansionChildEnqueueRecoveryEvidence(ClosedModel):
     """Exact expansion identity after durable child handoff and public resume."""
 
@@ -1690,10 +1898,20 @@ class RecoveryEvidence(ClosedModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    terminal_resume_idempotence: TerminalResumeIdempotenceEvidence | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_recovery_shape(self) -> Self:
-        seam_proofs = (self.sink_finalization, self.aggregation_eof, self.expansion_child_enqueue, self.pending_sink_redrive)
+        seam_proofs = (
+            self.sink_finalization,
+            self.aggregation_eof,
+            self.expansion_child_enqueue,
+            self.pending_sink_redrive,
+            self.terminal_resume_idempotence,
+        )
         if sum(proof is not None for proof in seam_proofs) > 1:
             raise ValueError("recovery evidence permits at most one seam-specific proof")
         if self.attempted:
@@ -1710,6 +1928,7 @@ class RecoveryEvidence(ClosedModel):
             or self.aggregation_eof is not None
             or self.expansion_child_enqueue is not None
             or self.pending_sink_redrive is not None
+            or self.terminal_resume_idempotence is not None
         ):
             raise ValueError("unattempted recovery forbids checkpoint identity and true result flags")
         if any(proof is not None for proof in seam_proofs) and not (

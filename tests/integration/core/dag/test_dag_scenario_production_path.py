@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.dag import GraphValidationError
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter
 from elspeth.core.landscape.data_flow import tokens as data_flow_tokens
@@ -2089,22 +2090,157 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
     evidence = corpus_harness.run_scenario_case(scenario, case, tmp_path)
     _assert_declared_recovery_evidence(scenario, case, evidence)
 
-    assert len(built_objects) == 2
-    initial, fresh = built_objects
-    assert initial is not fresh
-    assert initial.rendered.settings is not fresh.rendered.settings
-    assert initial.bundle is not fresh.bundle
-    assert initial.graph is not fresh.graph
-    assert initial.config is not fresh.config
+    assert len(built_objects) == 4
+    assert len({id(built) for built in built_objects}) == 4
+    assert len({id(built.rendered) for built in built_objects}) == 4
+    assert len({id(built.rendered.settings) for built in built_objects}) == 4
+    assert len({id(built.bundle) for built in built_objects}) == 4
+    assert len({id(built.graph) for built in built_objects}) == 4
+    assert len({id(built.config) for built in built_objects}) == 4
     assert evidence.runtime.rows_processed == 3
     # Three source rows are consumed into one terminal aggregation output.
     assert evidence.runtime.rows_succeeded == 1
     assert evidence.runtime.rows_failed == 0
     assert evidence.audit.source_operation_count == 1
-    assert [json.loads(line) for line in (tmp_path / "output.jsonl").read_text(encoding="utf-8").splitlines()] == [
+    assert [json.loads(line) for line in (tmp_path / "artifacts/output.jsonl").read_text(encoding="utf-8").splitlines()] == [
         {"value": 60, "count": 3}
     ]
     assert (tmp_path / "fault-triggered.marker").is_file()
+    proof = evidence.recovery.terminal_resume_idempotence
+    assert proof is not None
+    assert proof.control_terminal_projection == proof.resumed_terminal_projection
+    assert proof.fresh_object_lifetimes == 4
+    assert proof.second_resume_error_type == "NonResumableRunError"
+    assert proof.second_resume_error_run_id == evidence.runtime.run_id
+    assert proof.second_resume_error_reason == ("Run is terminal (status 'completed'); successful terminal runs are immutable")
+    assert proof.database_sha256_before == proof.database_sha256_after
+    assert proof.durable_records_sha256_before == proof.durable_records_sha256_after
+    assert proof.portable_export_sha256_before == proof.portable_export_sha256_after
+    assert proof.output_tree_sha256_before == proof.output_tree_sha256_after
+    assert proof.artifact_digests_before == proof.artifact_digests_after
+    assert evidence.runtime.durable_projection is not None
+    rendered = corpus_harness.render_settings(case, tmp_path)
+    assert proof.resumed_full_projection_sha256 == corpus_harness.stable_run_projection_sha256(
+        evidence.runtime.durable_projection,
+        runtime_root=tmp_path,
+        settings=rendered.settings,
+    )
+
+
+def test_checkpoint_terminal_refusal_rejects_non_exact_error_subclass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DerivedNonResumableRunError(NonResumableRunError):
+        pass
+
+    scenario, case = _declared_case("checkpoint-deterministic-resume", "reopen-resume")
+    production_resume = inspect.unwrap(Orchestrator.resume)
+    resume_calls = 0
+
+    def subclass_on_second_resume(self: Orchestrator, resume_point: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal resume_calls
+        resume_calls += 1
+        if resume_calls == 1:
+            return production_resume(self, resume_point, *args, **kwargs)
+        raise DerivedNonResumableRunError(
+            resume_point.checkpoint.run_id,
+            "Run is terminal (status 'completed'); successful terminal runs are immutable",
+        )
+
+    monkeypatch.setattr(Orchestrator, "run", inspect.unwrap(Orchestrator.run))
+    monkeypatch.setattr(Orchestrator, "resume", subclass_on_second_resume)
+    install_corpus_plugin_manager(monkeypatch)
+
+    with pytest.raises(AssertionError, match="exact NonResumableRunError"):
+        corpus_harness.run_scenario_case(scenario, case, tmp_path)
+
+
+def test_checkpoint_terminal_refusal_detects_undeclared_output_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("checkpoint-deterministic-resume", "reopen-resume")
+    production_resume = inspect.unwrap(Orchestrator.resume)
+    resume_calls = 0
+
+    def add_sidecar_on_second_resume(self: Orchestrator, resume_point: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal resume_calls
+        resume_calls += 1
+        if resume_calls == 2:
+            output_root = tmp_path / "artifacts"
+            (output_root / "unexpected-sidecar.tmp").write_bytes(b"unexpected")
+        return production_resume(self, resume_point, *args, **kwargs)
+
+    monkeypatch.setattr(Orchestrator, "run", inspect.unwrap(Orchestrator.run))
+    monkeypatch.setattr(Orchestrator, "resume", add_sidecar_on_second_resume)
+    install_corpus_plugin_manager(monkeypatch)
+
+    with pytest.raises(ValidationError, match="output tree"):
+        corpus_harness.run_scenario_case(scenario, case, tmp_path)
+
+
+def test_checkpoint_full_history_pin_rejects_observed_semantic_settings_hash_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("checkpoint-deterministic-resume", "reopen-resume")
+    install_corpus_plugin_manager(monkeypatch)
+    evidence = corpus_harness.run_scenario_case(scenario, case, tmp_path)
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    mutated_records = []
+    for record in projection.audit_records:
+        if record.record_type != "run":
+            mutated_records.append(record)
+            continue
+        material = json.loads(record.material)
+        material["semantic_settings_sha256"] = "f" * 64
+        mutated_records.append(record.model_copy(update={"material": json.dumps(material, sort_keys=True, separators=(",", ":"))}))
+    mutated_projection = projection.model_copy(update={"audit_records": tuple(mutated_records)})
+    rendered = corpus_harness.render_settings(case, tmp_path)
+
+    with pytest.raises(AssertionError, match="observed semantic settings hash"):
+        corpus_harness.stable_run_projection_sha256(
+            mutated_projection,
+            runtime_root=tmp_path,
+            settings=rendered.settings,
+        )
+
+
+def test_checkpoint_full_history_pin_rejects_consistent_node_identity_suffix_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("checkpoint-deterministic-resume", "reopen-resume")
+    install_corpus_plugin_manager(monkeypatch)
+    evidence = corpus_harness.run_scenario_case(scenario, case, tmp_path)
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    aggregation_record = next(
+        record for record in projection.audit_records if record.record_type == "node" and "node|aggregation:eof_sum@" in record.key
+    )
+    original_node_key = aggregation_record.key.removeprefix("node|")
+    mutated_node_key = f"{original_node_key.rsplit('@', maxsplit=1)[0]}@ffffffffffff"
+
+    def replace_node_key(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: replace_node_key(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace_node_key(item) for item in value]
+        if isinstance(value, str):
+            return value.replace(original_node_key, mutated_node_key)
+        return value
+
+    mutated_projection = type(projection).model_validate(replace_node_key(projection.model_dump(mode="json")))
+    rendered = corpus_harness.render_settings(case, tmp_path)
+
+    with pytest.raises(AssertionError, match="observed node identity suffix"):
+        corpus_harness.stable_run_projection_sha256(
+            mutated_projection,
+            runtime_root=tmp_path,
+            settings=rendered.settings,
+        )
 
 
 def test_eof_aggregation_recovery_preserves_failed_batch_and_member_identity(

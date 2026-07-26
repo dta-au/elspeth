@@ -283,7 +283,7 @@ evidence:
   - id: harness-checkpoint-deterministic-resume-reopen-resume
     kind: harness
     locator: checkpoint-deterministic-resume:reopen-resume
-    claim: The deterministic-resume corpus case exercises production restart and recovery with fresh objects.
+    claim: The deterministic-resume corpus case uses a real fail-once EOF crash, proves exact control/resume terminal equivalence while retaining the full resumed audit history under a manifest-pinned digest that normalizes only the ephemeral runtime root, then proves a second fresh public resume is refused with the exact NonResumableRunError and leaves the database, durable records, public export, complete isolated artifact tree, and declared artifact bytes unchanged; evidence is provisional pending the deferred-platform rebase.
     stages: [config, build, runtime, audit, recovery]
   - id: harness-multiple-independent-sources-independent-roots
     kind: harness
@@ -3956,7 +3956,7 @@ scenarios:
     cases:
       - id: reopen-resume
         workflow: recovery
-        recovery_kind: eof_aggregation
+        recovery_kind: terminal_resume_idempotence
         fixture: checkpoint-deterministic-resume/reopen-resume.yaml
         input_fixtures:
           primary: checkpoint-deterministic-resume/input.csv
@@ -3967,32 +3967,27 @@ scenarios:
           status: completed
           output_rows: 1
           required_audit_record_types: [run]
+          resumed_full_projection_sha256: 69ab3c8b59a4e285f699cd401720468190900703efaf1550362e0597d777be24
     dimensions:
       config: *config_pass
       build: *build_pass
-      contracts: &contracts_partial
+      contracts:
         status: partial
-        reason: Contract evidence does not cover every completion policy and merge strategy composition.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus contract matrix passes every declared completion policy and merge strategy assertion.
+        reason: The terminal-equivalence oracle is exact for this case, but the resume compatibility hash still omits implementation identity while the audit model records it.
+        owner_issue: elspeth-f321e3ff21
+        exit_gate: The compatibility hash includes implementation identity and this exact fresh-object corpus case passes unchanged.
       runtime:
-        status: partial
+        status: pass
         evidence: [harness-checkpoint-deterministic-resume-reopen-resume]
-        reason: Existing runtime evidence does not execute every required production disposition for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes exact production runtime result and disposition assertions.
       audit:
-        status: partial
+        status: pass
         evidence: [harness-checkpoint-deterministic-resume-reopen-resume]
-        reason: Existing audit evidence does not prove every required durable record and portable export for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes exact durable audit-state and exported-record assertions.
       recovery:
         status: partial
         evidence: [harness-checkpoint-deterministic-resume-reopen-resume]
-        reason: Selected restart seams pass, but the complete scenario recovery path is not executable evidence.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
+        reason: Fresh-object resume and terminal refusal are exact here, but resume payload restoration can still bypass cleanup after leadership acquisition; evidence also remains provisional pending the deferred-platform rebase.
+        owner_issue: elspeth-245b21351b
+        exit_gate: Resume payload restoration cannot bypass cleanup after leadership acquisition, and this exact case plus the serial corpus gate pass again after the deferred-platform rebase.
       concurrency: *concurrency_unknown
       freeform: &checkpoint_authoring_not_applicable
         status: not_applicable
@@ -4010,7 +4005,11 @@ scenarios:
         status: not_applicable
         reason: Worker multiplicity is deployment/runtime configuration, not DAG authoring.
       build: *build_pass
-      contracts: *contracts_partial
+      contracts:
+        status: partial
+        reason: Contract evidence does not cover every completion policy and merge strategy composition.
+        owner_issue: elspeth-ef29ef6ba4
+        exit_gate: The scenario corpus contract matrix passes every declared completion policy and merge strategy assertion.
       runtime:
         status: partial
         evidence:

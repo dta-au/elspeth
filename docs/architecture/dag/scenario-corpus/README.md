@@ -108,6 +108,29 @@ cleanup, no source replay, and durable/export parity. All three recovery
 proofs remain provisional until they are rerun after the deferred-platform
 rebase.
 
+The checkpoint case adds a separate terminal-resume idempotence proof rather
+than treating the resumed audit history as identical to a fresh run. A fresh
+control and the fail-once EOF crash/resume path are reduced to a typed terminal
+projection: stable rows and lineage, final completed node and scheduler state,
+completed batch membership, terminal dispositions, counters, and canonical
+sink bytes. Those terminal projections must be exactly equal. The resumed
+run's complete durable projection remains independently retained in the
+runtime/audit evidence, including its legitimate failed and successful attempt
+history. Its separate digest is pinned in the manifest after normalizing only
+the ephemeral corpus runtime-root string and deterministically remapping the
+node identities derived from that string; the remaining history stays in the
+digest. A third fresh settings/plugin/graph/config/runtime lifetime
+then calls the public resume API with the stale resume point and must receive
+the exact terminal `NonResumableRunError`. Before and after that refusal the
+harness requires identical SQLite file bytes, durable-record and public-export
+hashes, every entry in the isolated artifact-root tree, and per-declared-artifact
+byte digests. This is an in-process
+fresh-object proof, not an OS-process or multi-process claim. It promotes only
+the checkpoint runtime and audit cells: contracts remain partial under
+`elspeth-f321e3ff21`, recovery remains partial under `elspeth-245b21351b`,
+concurrency and scale remain unchanged, and the evidence is provisional until
+the deferred-platform rebase.
+
 The manifest does not replace the criteria, and a dated assessment does not
 replace the live manifest. Documentary evidence can explain a cell, but only
 executable `harness` or `pytest` evidence can support `pass`.

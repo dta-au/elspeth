@@ -32,6 +32,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
+from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter, RecorderFactory
@@ -75,6 +76,7 @@ from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog
 from tests.fixtures.dag_scenario_corpus.loader import resolve_fixture_path
 from tests.fixtures.dag_scenario_corpus.schema import (
     AggregationEOFRecoveryEvidence,
+    ArtifactByteDigest,
     AuditEvidence,
     AuditRecordCount,
     ConfigEvidence,
@@ -113,6 +115,12 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     StableTokenProjection,
     StableTransformErrorProjection,
     StableValidationErrorProjection,
+    SummaryRunExpectation,
+    TerminalBatchProjection,
+    TerminalEquivalenceProjection,
+    TerminalNodeStateProjection,
+    TerminalResumeIdempotenceEvidence,
+    TerminalSchedulerWorkProjection,
     normalize_template_name,
 )
 
@@ -211,7 +219,8 @@ def render_settings(case: HarnessCaseSpec, tmp_path: Path) -> RenderedScenario:
     )
 
     input_paths = {name: resolve_fixture_path(path) for name, path in case.input_fixtures.items()}
-    output_paths = {name: tmp_path / artifact.filename for name, artifact in case.output_artifacts.items()}
+    output_root = tmp_path / "artifacts" if case.recovery_kind == "terminal_resume_idempotence" else tmp_path
+    output_paths = {name: output_root / artifact.filename for name, artifact in case.output_artifacts.items()}
     runtime_root = tmp_path.resolve()
     for sink_name, output_path in output_paths.items():
         resolved_output = output_path.resolve()
@@ -221,6 +230,7 @@ def render_settings(case: HarnessCaseSpec, tmp_path: Path) -> RenderedScenario:
             raise ValueError(
                 f"DAG scenario sink {sink_name!r} artifact must resolve beneath runtime root {runtime_root}: {resolved_output}"
             ) from exc
+        output_path.parent.mkdir(parents=True, exist_ok=True)
     fault_marker = tmp_path / "fault-triggered.marker"
     substitutions = {
         **{f"input_{normalize_template_name(name)}": json.dumps(str(path)) for name, path in input_paths.items()},
@@ -1213,6 +1223,89 @@ def semantic_runtime_projection_sha256(projection: SemanticRuntimeProjection) ->
     return hashlib.sha256(contract_canonical_json(projection.model_dump(mode="json")).encode("utf-8")).hexdigest()
 
 
+def stable_run_projection_sha256(
+    projection: StableRunProjection,
+    *,
+    runtime_root: Path,
+    settings: ElspethSettings,
+) -> str:
+    """Bind complete durable history after normalizing only the ephemeral runtime root."""
+
+    root_text = str(runtime_root.resolve())
+    runtime_token = "$DAG_CORPUS_RUNTIME_ROOT"
+
+    def normalize_root(value: object) -> object:
+        if isinstance(value, dict):
+            return {str(key): normalize_root(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [normalize_root(item) for item in value]
+        if isinstance(value, str):
+            return value.replace(root_text, runtime_token)
+        return value
+
+    node_key_replacements: dict[str, str] = {}
+    for record in projection.audit_records:
+        if record.record_type != "node" or not record.key.startswith("node|"):
+            continue
+        raw_node_key = record.key.removeprefix("node|")
+        prefix, separator, observed_suffix = raw_node_key.rpartition("@")
+        node_material = json.loads(record.material)
+        node_config = node_material.get("config") if isinstance(node_material, dict) else None
+        if not separator or not prefix or not isinstance(node_config, dict):
+            raise AssertionError(f"full-history pin cannot validate observed node identity: {raw_node_key!r}")
+        expected_suffix = hashlib.sha256(_canonical_json(node_config).encode()).hexdigest()[:12]
+        if observed_suffix != expected_suffix:
+            raise AssertionError(
+                "observed node identity suffix differs from its pre-normalization semantic config identity: "
+                f"node={raw_node_key!r}, expected={expected_suffix!r}, observed={observed_suffix!r}"
+            )
+        if root_text not in _canonical_json(node_config):
+            continue
+        normalized_config = normalize_root(node_config)
+        normalized_suffix = hashlib.sha256(_canonical_json(normalized_config).encode()).hexdigest()[:12]
+        node_key_replacements[raw_node_key] = f"{prefix}@{normalized_suffix}"
+
+    persisted_settings_shape = json.loads(contract_canonical_json(settings.model_dump(mode="json")))
+    semantic_settings = _semantic_run_settings(persisted_settings_shape)
+    expected_observed_semantic_settings = hashlib.sha256(_canonical_json(semantic_settings).encode()).hexdigest()
+    run_audit_records = tuple(record for record in projection.audit_records if record.record_type == "run")
+    if len(run_audit_records) != 1:
+        raise AssertionError(f"full-history pin requires exactly one run audit record: {len(run_audit_records)}")
+    run_material = json.loads(run_audit_records[0].material)
+    observed_semantic_settings = run_material.get("semantic_settings_sha256") if isinstance(run_material, dict) else None
+    if observed_semantic_settings != expected_observed_semantic_settings:
+        raise AssertionError(
+            "observed semantic settings hash differs from the fresh settings supplied for full-history normalization: "
+            f"expected={expected_observed_semantic_settings!r}, observed={observed_semantic_settings!r}"
+        )
+
+    normalized_semantic_settings = hashlib.sha256(_canonical_json(normalize_root(semantic_settings)).encode()).hexdigest()
+
+    def normalize(value: object) -> object:
+        if isinstance(value, dict):
+            return {str(key): normalize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        if not isinstance(value, str):
+            return value
+        normalized = value.replace(root_text, runtime_token)
+        for raw_node_key, normalized_node_key in sorted(node_key_replacements.items(), key=lambda item: len(item[0]), reverse=True):
+            normalized = normalized.replace(raw_node_key, normalized_node_key)
+        if normalized.startswith("{"):
+            try:
+                material = json.loads(normalized)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(material, dict) and "semantic_settings_sha256" in material:
+                    material["semantic_settings_sha256"] = normalized_semantic_settings
+                    normalized = contract_canonical_json(material)
+        return normalized
+
+    normalized_projection = normalize(projection.model_dump(mode="json"))
+    return hashlib.sha256(contract_canonical_json(normalized_projection).encode("utf-8")).hexdigest()
+
+
 def semantic_runtime_projection_counts(projection: SemanticRuntimeProjection) -> SemanticProjectionCounts:
     return SemanticProjectionCounts(
         rows=len(projection.rows),
@@ -1230,6 +1323,139 @@ def semantic_runtime_projection_counts(projection: SemanticRuntimeProjection) ->
         validation_errors=len(projection.validation_errors),
         transform_errors=len(projection.transform_errors),
     )
+
+
+def terminal_equivalence_projection(
+    projection: StableRunProjection,
+    *,
+    sink_outputs: tuple[SinkOutputProjection, ...],
+    rows_processed: int,
+    rows_succeeded: int,
+    rows_failed: int,
+) -> TerminalEquivalenceProjection:
+    """Project terminal meaning while retaining the full history separately."""
+
+    semantic = semantic_runtime_projection(projection)
+    terminal_states: dict[str, StableNodeStateProjection] = {}
+    for state in semantic.node_states:
+        if state.status != "completed":
+            continue
+        key = f"{state.token_key}|{state.node_key}|{state.step_index}"
+        current = terminal_states.get(key)
+        if current is None or state.attempt > current.attempt:
+            terminal_states[key] = state
+
+    terminal_work: dict[str, StableSchedulerWorkProjection] = {}
+    for work in semantic.scheduler_work:
+        if work.final_status != "terminal":
+            raise AssertionError(f"terminal equivalence cannot hide non-terminal scheduler work: {work!r}")
+        key = f"{work.token_key}|{work.node_key}"
+        terminal_work[key] = work
+
+    completed_batches = tuple(
+        sorted(
+            (
+                TerminalBatchProjection(
+                    key="|".join(
+                        (
+                            batch.aggregation_node_key,
+                            str(batch.trigger_type),
+                            str(batch.trigger_reason),
+                            *tuple(member.token_key for member in batch.members),
+                        )
+                    ),
+                    aggregation_node_key=batch.aggregation_node_key,
+                    trigger_type=cast(Any, batch.trigger_type),
+                    trigger_reason=batch.trigger_reason,
+                    member_token_keys=tuple(member.token_key for member in batch.members),
+                )
+                for batch in semantic.batches
+                if batch.status == "completed"
+            ),
+            key=lambda batch: batch.key,
+        )
+    )
+    if not completed_batches and semantic.batches:
+        raise AssertionError("terminal equivalence requires a completed batch whenever batch history exists")
+
+    return TerminalEquivalenceProjection(
+        rows=semantic.rows,
+        tokens=semantic.tokens,
+        terminal_node_states=tuple(
+            TerminalNodeStateProjection(
+                key=key,
+                token_key=state.token_key,
+                node_key=state.node_key,
+                step_index=state.step_index,
+                status="completed",
+                context_after=state.context_after,
+            )
+            for key, state in sorted(terminal_states.items())
+        ),
+        routes=semantic.routes,
+        terminal_dispositions=semantic.terminal_dispositions,
+        terminal_scheduler_work=tuple(
+            TerminalSchedulerWorkProjection(
+                key=key,
+                token_key=work.token_key,
+                node_key=work.node_key,
+                final_status="terminal",
+            )
+            for key, work in sorted(terminal_work.items())
+        ),
+        completed_batches=completed_batches,
+        sink_outputs=sink_outputs,
+        rows_processed=rows_processed,
+        rows_succeeded=rows_succeeded,
+        rows_failed=rows_failed,
+        output_rows=sum(len(output.rows) for output in sink_outputs),
+    )
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(contract_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _artifact_byte_digests(rendered: RenderedScenario) -> tuple[ArtifactByteDigest, ...]:
+    digests = tuple(
+        ArtifactByteDigest(
+            path=rendered.output_expectations[sink_name].filename,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for sink_name, path in sorted(rendered.output_paths.items())
+    )
+    paths = tuple(digest.path for digest in digests)
+    if paths != tuple(sorted(set(paths))):
+        raise AssertionError(f"DAG corpus output artifact paths must be unique and sorted: {paths!r}")
+    return digests
+
+
+def _output_tree_sha256(rendered: RenderedScenario) -> str:
+    roots = {path.parent.resolve() for path in rendered.output_paths.values()}
+    if len(roots) != 1:
+        raise AssertionError(f"terminal-resume outputs must share one designated artifact root: {sorted(map(str, roots))!r}")
+    root = next(iter(roots))
+    if not root.is_dir():
+        raise AssertionError(f"terminal-resume artifact root is missing: {root}")
+    material: list[dict[str, object]] = []
+    for path in sorted(root.rglob("*"), key=lambda candidate: candidate.relative_to(root).as_posix()):
+        relative_path = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise AssertionError(f"terminal-resume artifact tree forbids symlinks: {relative_path}")
+        if path.is_dir():
+            material.append({"kind": "directory", "path": relative_path})
+        elif path.is_file():
+            material.append(
+                {
+                    "kind": "file",
+                    "path": relative_path,
+                    "size_bytes": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            )
+        else:
+            raise AssertionError(f"terminal-resume artifact tree contains an unsupported entry: {relative_path}")
+    return _canonical_sha256(material)
 
 
 def _ordered_scheduler_events(
@@ -2179,6 +2405,54 @@ def _partition_expansion_work(
 
 
 def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
+    prove_terminal_idempotence = case.recovery_kind == "terminal_resume_idempotence"
+    control_terminal_projection: TerminalEquivalenceProjection | None = None
+    if prove_terminal_idempotence:
+        control_root = tmp_path / "control"
+        control_root.mkdir()
+        control_rendered = render_settings(case, tmp_path)
+        control_rendered.fault_marker.parent.mkdir(parents=True, exist_ok=True)
+        control_rendered.fault_marker.touch(exist_ok=False)
+        control_built = build_scenario(control_rendered)
+        control_store = FilesystemPayloadStore(control_root / "payloads")
+        control_db = LandscapeDB(f"sqlite:///{control_root / 'audit.db'}")
+        control_checkpoint_manager = CheckpointManager(control_db)
+        control_checkpoint_config = RuntimeCheckpointConfig.from_settings(control_rendered.settings.checkpoint)
+        try:
+            control_catalog_sha256, control_catalog_source = read_openrouter_catalog_snapshot_id()
+            control_result = Orchestrator(
+                control_db,
+                checkpoint_manager=control_checkpoint_manager,
+                checkpoint_config=control_checkpoint_config,
+            ).run(
+                control_built.config,
+                graph=control_built.graph,
+                settings=control_rendered.settings,
+                payload_store=control_store,
+                openrouter_catalog_sha256=control_catalog_sha256,
+                openrouter_catalog_source=control_catalog_source,
+            )
+            control_projection, control_audit = _exact_recovery_views(
+                control_db,
+                run_id=control_result.run_id,
+                payload_store=control_store,
+            )
+            if control_audit.source_operation_count != 1:
+                raise AssertionError(f"terminal-equivalence control must load its source once: {control_audit.source_operation_count}")
+            control_result_data = control_result.to_dict()
+            control_terminal_projection = terminal_equivalence_projection(
+                control_projection,
+                sink_outputs=_sink_outputs(control_rendered),
+                rows_processed=control_result_data["rows_processed"],
+                rows_succeeded=control_result_data["rows_succeeded"],
+                rows_failed=control_result_data["rows_failed"],
+            )
+        finally:
+            control_db.close()
+        for output_path in control_rendered.output_paths.values():
+            output_path.unlink()
+        control_rendered.fault_marker.unlink()
+
     db_url = f"sqlite:///{tmp_path / 'audit.db'}"
     payload_root = tmp_path / "payloads"
     initial_rendered = render_settings(case, tmp_path)
@@ -2336,6 +2610,157 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
             raise AssertionError("DAG recovery corpus fault marker is missing after resume")
 
         result_data = result.to_dict()
+        terminal_idempotence: TerminalResumeIdempotenceEvidence | None = None
+        aggregation_eof: AggregationEOFRecoveryEvidence | None = None
+        if prove_terminal_idempotence:
+            if control_terminal_projection is None:
+                raise AssertionError("terminal-resume proof lost its fresh-run control projection")
+            resumed_terminal_projection = terminal_equivalence_projection(
+                durable_projection,
+                sink_outputs=sink_outputs,
+                rows_processed=result_data["rows_processed"],
+                rows_succeeded=result_data["rows_succeeded"],
+                rows_failed=result_data["rows_failed"],
+            )
+            if control_terminal_projection != resumed_terminal_projection:
+                raise AssertionError(
+                    "fresh control and resumed terminal behavior differ: "
+                    f"control={control_terminal_projection.model_dump(mode='json')!r}, "
+                    f"resumed={resumed_terminal_projection.model_dump(mode='json')!r}"
+                )
+
+            durable_records_before = _public_durable_records(
+                reopened_db,
+                run_id=run_id,
+                payload_store=reopened_store,
+            )
+            portable_records_before = list(LandscapeExporter(reopened_db).export_run(run_id))
+            durable_records_sha256_before = _canonical_sha256(durable_records_before)
+            portable_export_sha256_before = _canonical_sha256(portable_records_before)
+            output_tree_sha256_before = _output_tree_sha256(fresh_rendered)
+            artifact_digests_before = _artifact_byte_digests(fresh_rendered)
+            resumed_full_projection_sha256 = stable_run_projection_sha256(
+                durable_projection,
+                runtime_root=tmp_path,
+                settings=fresh_rendered.settings,
+            )
+            if not isinstance(case.expected, SummaryRunExpectation) or case.expected.resumed_full_projection_sha256 is None:
+                raise AssertionError("terminal-resume case lost its manifest-pinned full-history hash")
+            if resumed_full_projection_sha256 != case.expected.resumed_full_projection_sha256:
+                raise AssertionError(
+                    "resumed full durable history differs from the manifest pin: "
+                    f"expected={case.expected.resumed_full_projection_sha256}, observed={resumed_full_projection_sha256}"
+                )
+
+            reopened_db.close()
+            database_path = tmp_path / "audit.db"
+            database_sha256_before = hashlib.sha256(database_path.read_bytes()).hexdigest()
+
+            second_rendered = render_settings(case, tmp_path)
+            second_built = build_scenario(second_rendered, purpose=SinkEffectExecutionPurpose.RESUME)
+            if second_built.graph_evidence.topology_hash != checkpoint_topology_hash:
+                raise AssertionError("second fresh resume graph does not match the persisted checkpoint topology")
+            second_db = LandscapeDB.from_url(db_url, create_tables=False)
+            second_store = FilesystemPayloadStore(payload_root)
+            second_checkpoint_manager = CheckpointManager(second_db)
+            second_checkpoint_config = RuntimeCheckpointConfig.from_settings(second_rendered.settings.checkpoint)
+            try:
+                try:
+                    Orchestrator(
+                        second_db,
+                        checkpoint_manager=second_checkpoint_manager,
+                        checkpoint_config=second_checkpoint_config,
+                    ).resume(
+                        resume_point,
+                        second_built.config,
+                        second_built.graph,
+                        payload_store=second_store,
+                        settings=second_rendered.settings,
+                    )
+                except NonResumableRunError as exc:
+                    if type(exc) is not NonResumableRunError:
+                        raise AssertionError(
+                            f"second public resume must raise the exact NonResumableRunError type; observed={type(exc).__qualname__}"
+                        ) from exc
+                    second_resume_error = exc
+                else:
+                    raise AssertionError("second public resume unexpectedly admitted a completed run")
+            finally:
+                second_db.close()
+
+            database_sha256_after = hashlib.sha256(database_path.read_bytes()).hexdigest()
+            output_tree_sha256_after = _output_tree_sha256(second_rendered)
+            artifact_digests_after = _artifact_byte_digests(second_rendered)
+            after_db = LandscapeDB.from_url(db_url, create_tables=False)
+            try:
+                durable_records_after = _public_durable_records(
+                    after_db,
+                    run_id=run_id,
+                    payload_store=second_store,
+                )
+                portable_records_after = list(LandscapeExporter(after_db).export_run(run_id))
+                after_audit = _audit_evidence(
+                    portable_records_after,
+                    portable_projection=_stable_projection(portable_records_after, source="post-refusal portable export"),
+                )
+            finally:
+                after_db.close()
+            if after_audit.source_operation_count != 1:
+                raise AssertionError(f"second public resume replayed the source: source_load count={after_audit.source_operation_count}")
+
+            expected_terminal_reason = "Run is terminal (status 'completed'); successful terminal runs are immutable"
+            if second_resume_error.reason != expected_terminal_reason:
+                raise AssertionError(
+                    "second public resume returned an unexpected terminal refusal reason: "
+                    f"expected={expected_terminal_reason!r}, observed={second_resume_error.reason!r}"
+                )
+            terminal_idempotence = TerminalResumeIdempotenceEvidence(
+                fault_seam="eof_flush_before_transform_result",
+                fault_count=1,
+                source_exhausted_before=True,
+                resumed_run_id=run_id,
+                control_terminal_projection=control_terminal_projection,
+                resumed_terminal_projection=resumed_terminal_projection,
+                terminal_projection_equal=True,
+                fresh_object_lifetimes=4,
+                resumed_full_projection_sha256=resumed_full_projection_sha256,
+                second_resume_error_type="NonResumableRunError",
+                second_resume_error_run_id=second_resume_error.run_id,
+                second_resume_error_reason="Run is terminal (status 'completed'); successful terminal runs are immutable",
+                database_sha256_before=database_sha256_before,
+                database_sha256_after=database_sha256_after,
+                durable_records_sha256_before=durable_records_sha256_before,
+                durable_records_sha256_after=_canonical_sha256(durable_records_after),
+                portable_export_sha256_before=portable_export_sha256_before,
+                portable_export_sha256_after=_canonical_sha256(portable_records_after),
+                output_tree_sha256_before=output_tree_sha256_before,
+                output_tree_sha256_after=output_tree_sha256_after,
+                artifact_digests_before=artifact_digests_before,
+                artifact_digests_after=artifact_digests_after,
+                zero_mutation=True,
+                provisional_until_deferred_platform_rebase=True,
+            )
+        else:
+            aggregation_eof = AggregationEOFRecoveryEvidence(
+                fault_seam="eof_flush_before_transform_result",
+                fault_count=1,
+                source_exhausted_before=True,
+                original_batch_id_before=original_batch_id_before,
+                original_batch_id_after=original_batch_id_after,
+                recovery_batch_id_after=recovery_batch_id_after,
+                member_token_ids_before=member_token_ids_before,
+                member_token_ids_after=member_token_ids_after,
+                original_batch_identity_preserved=True,
+                member_identity_reused=True,
+                membership_unchanged=True,
+                result_token_absent_before=True,
+                sink_effect_absent_before=True,
+                final_batches=final_batches,
+                final_output_rows=1,
+                final_output_json='{"count":3,"value":60}',
+                durable_export_parity=True,
+                provisional_until_deferred_platform_rebase=True,
+            )
         return ScenarioRunEvidence(
             schema_version=2,
             scenario_id=scenario.id,
@@ -2363,26 +2788,8 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
                 can_resume=True,
                 source_replayed=False,
                 checkpoint_removed=True,
-                aggregation_eof=AggregationEOFRecoveryEvidence(
-                    fault_seam="eof_flush_before_transform_result",
-                    fault_count=1,
-                    source_exhausted_before=True,
-                    original_batch_id_before=original_batch_id_before,
-                    original_batch_id_after=original_batch_id_after,
-                    recovery_batch_id_after=recovery_batch_id_after,
-                    member_token_ids_before=member_token_ids_before,
-                    member_token_ids_after=member_token_ids_after,
-                    original_batch_identity_preserved=True,
-                    member_identity_reused=True,
-                    membership_unchanged=True,
-                    result_token_absent_before=True,
-                    sink_effect_absent_before=True,
-                    final_batches=final_batches,
-                    final_output_rows=1,
-                    final_output_json='{"count":3,"value":60}',
-                    durable_export_parity=True,
-                    provisional_until_deferred_platform_rebase=True,
-                ),
+                aggregation_eof=aggregation_eof,
+                terminal_resume_idempotence=terminal_idempotence,
             ),
             completed_stages=("config", "build", "runtime", "audit", "recovery"),
         )
@@ -3568,4 +3975,6 @@ def run_scenario_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: P
         return _parallel_sink_finalization_recovery_case(scenario, case, tmp_path)
     if case.recovery_kind == "pending_sink_redrive":
         return _pending_sink_redrive_recovery_case(scenario, case, tmp_path)
+    if case.recovery_kind == "terminal_resume_idempotence":
+        return _eof_aggregation_recovery_case(scenario, case, tmp_path)
     raise AssertionError(f"unsupported recovery kind: {case.recovery_kind!r}")
