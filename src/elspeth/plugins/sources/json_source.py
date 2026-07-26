@@ -18,7 +18,7 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
-from elspeth.contracts.contract_builder import ContractBuilder
+from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
@@ -533,10 +533,20 @@ class JSONSource(BaseSource):
                 # audit recording.
                 if self._field_resolution is None:
                     raise ValueError("field_resolution must be established before sparse-field contract inference")
-                contract = self._contract_builder.process_sparse_fields(
-                    validated_row,
-                    self._field_resolution.resolution_mapping,
-                )
+                try:
+                    contract = self._contract_builder.process_sparse_fields(
+                        validated_row,
+                        self._field_resolution.resolution_mapping,
+                    )
+                except ContractFieldLimitExceeded as exc:
+                    quarantined = self._record_validation_failure(
+                        ctx=ctx,
+                        row=validated_row,
+                        error_msg=str(exc),
+                    )
+                    if quarantined is not None:
+                        yield quarantined
+                    return
                 self.set_schema_contract(contract)
 
             if contract.locked:

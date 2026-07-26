@@ -16,6 +16,10 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.type_normalization import UNSUPPORTED_CONTRACT_TYPE, normalize_type_for_contract
 
 
+class ContractFieldLimitExceeded(ValueError):
+    """Raised when sparse post-lock inference would exceed the contract field limit."""
+
+
 class ContractBuilder:
     """Manages contract state through first-row inference.
 
@@ -30,6 +34,14 @@ class ContractBuilder:
 
     Attributes:
         contract: Current contract state (may be locked or unlocked)
+    """
+
+    MAX_LOCKED_CONTRACT_FIELDS = 1024
+    """Maximum fields retained by post-lock sparse inference.
+
+    First-row inference keeps legacy behavior, but sparse fields that first
+    appear after the contract is locked are capped so compact JSON streams
+    cannot force unbounded contract growth or quadratic validation work.
     """
 
     def __init__(self, contract: SchemaContract) -> None:
@@ -166,7 +178,18 @@ class ContractBuilder:
         present in the first valid row. A valid emitted field still needs schema
         contract custody for audit/header restoration. The field's first
         observation locks its type exactly as first-row inference does.
+
+        Post-lock inference is bounded to prevent compact sparse inputs from
+        growing the contract without limit and making later validation scan an
+        attacker-controlled number of inferred fields.
         """
         if self._contract.mode == "FIXED":
             return self._contract
+
+        new_field_names = [normalized_name for normalized_name in row if self._contract.find_name(normalized_name) is None]
+        if len(self._contract.fields) + len(new_field_names) > self.MAX_LOCKED_CONTRACT_FIELDS:
+            raise ContractFieldLimitExceeded(
+                f"Sparse JSON field inference exceeded the maximum locked contract field count ({self.MAX_LOCKED_CONTRACT_FIELDS})"
+            )
+
         return self._infer_missing_fields(row, field_resolution)

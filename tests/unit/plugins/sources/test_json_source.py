@@ -1581,6 +1581,35 @@ class TestJSONSourceKeyNormalization:
         assert {field.normalized_name for field in second_contract.fields} == {"a", "b"}
         assert second_contract.get_field("b").original_name == "b"
 
+    def test_sparse_field_contract_growth_is_capped(self, tmp_path: Path, ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Post-lock sparse inference is bounded to avoid unbounded contract growth."""
+        from elspeth.contracts.contract_builder import ContractBuilder
+        from elspeth.plugins.sources.json_source import JSONSource
+
+        monkeypatch.setattr(ContractBuilder, "MAX_LOCKED_CONTRACT_FIELDS", 2)
+
+        json_file = tmp_path / "data.json"
+        json_file.write_text(json.dumps([{"a": 1}, {"b": 2}, {"c": 3}]))
+
+        source = JSONSource(
+            {
+                "path": str(json_file),
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "quarantine",
+            }
+        )
+
+        rows = list(source.load(ctx))
+
+        assert len(rows) == 3
+        assert [row.is_quarantined for row in rows] == [False, False, True]
+        assert rows[2].quarantine_error is not None
+        assert "maximum locked contract field count" in rows[2].quarantine_error
+
+        contract = source.get_schema_contract()
+        assert contract is not None
+        assert {field.normalized_name for field in contract.fields} == {"a", "b"}
+
     def test_first_row_quarantined_key_rebuild(self, tmp_path: Path, ctx: PluginContext) -> None:
         """When first row is quarantined and second row has different keys, resolution rebuilds.
 
