@@ -1346,7 +1346,7 @@ class TestExportNodeRegistrationIdempotence:
                 plugin_name="imposter",
             )
             settings = _make_settings()
-            _sink, sink_factory = _make_sink_and_factory(source_file_hash="sha256:" + "0" * 16)
+            sink, sink_factory = _make_sink_and_factory(source_file_hash="sha256:" + "0" * 16)
 
             with (
                 patch("elspeth.core.landscape.factory.RecorderFactory", _RealRecorderFactory),
@@ -1360,6 +1360,7 @@ class TestExportNodeRegistrationIdempotence:
                 export_landscape(db, run_id, settings, sink_factory)
 
             execute.assert_not_called()
+            sink.close.assert_called_once()
         finally:
             db.close()
 
@@ -1397,7 +1398,7 @@ class TestExportNodeRegistrationIdempotence:
                 source_file_hash=registered_sink.source_file_hash,
             )
             settings = _make_settings()
-            _retry_sink, sink_factory = _make_sink_and_factory(**{"source_file_hash": valid_source_hash, **retry_overrides})
+            retry_sink, sink_factory = _make_sink_and_factory(**{"source_file_hash": valid_source_hash, **retry_overrides})
 
             with (
                 patch("elspeth.core.landscape.factory.RecorderFactory", _RealRecorderFactory),
@@ -1411,5 +1412,6 @@ class TestExportNodeRegistrationIdempotence:
                 export_landscape(db, run_id, settings, sink_factory)
 
             execute.assert_not_called()
+            retry_sink.close.assert_called_once()
         finally:
             db.close()

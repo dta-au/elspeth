@@ -235,41 +235,41 @@ def export_landscape(
     # closed if the registered provenance is not exactly what this attempt
     # would register. A partial identity match would let a changed retry run
     # under stale audit attribution.
-    existing_node = factory.data_flow.get_node(sink.node_id, run_id)
-    if existing_node is None:
-        factory.data_flow.register_node(
-            run_id=run_id,
-            node_id=sink.node_id,
-            plugin_name=sink.name,
-            node_type=NodeType.SINK,
-            plugin_version=sink.plugin_version,
-            config=dict(sink.config),
-            schema_config=SchemaConfig.from_dict({"mode": "observed"}),
-            determinism=Determinism.IO_WRITE,
-            source_file_hash=sink.source_file_hash,
-        )
-    else:
-        audit_safe_config = sanitize_node_config_for_audit(dict(sink.config), plugin_name=sink.name)
-        expected_provenance = {
-            "plugin_name": sink.name,
-            "node_type": NodeType.SINK,
-            "plugin_version": sink.plugin_version,
-            "determinism": Determinism.IO_WRITE,
-            "config_hash": stable_hash(audit_safe_config),
-            "config_json": canonical_json(audit_safe_config),
-            "source_file_hash": sink.source_file_hash,
-            "schema_hash": None,
-            "sequence_in_pipeline": None,
-            "schema_mode": "observed",
-            "schema_fields": None,
-        }
-        divergent_fields = [field for field, expected in expected_provenance.items() if getattr(existing_node, field) != expected]
-        if divergent_fields:
-            raise AuditIntegrityError(
-                f"audit export node {sink.node_id!r} for run {run_id!r} is already registered "
-                f"with divergent provenance fields {divergent_fields!r}; refusing to reuse it for export sink {sink.name!r}"
-            )
     try:
+        existing_node = factory.data_flow.get_node(sink.node_id, run_id)
+        if existing_node is None:
+            factory.data_flow.register_node(
+                run_id=run_id,
+                node_id=sink.node_id,
+                plugin_name=sink.name,
+                node_type=NodeType.SINK,
+                plugin_version=sink.plugin_version,
+                config=dict(sink.config),
+                schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+                determinism=Determinism.IO_WRITE,
+                source_file_hash=sink.source_file_hash,
+            )
+        else:
+            audit_safe_config = sanitize_node_config_for_audit(dict(sink.config), plugin_name=sink.name)
+            expected_provenance = {
+                "plugin_name": sink.name,
+                "node_type": NodeType.SINK,
+                "plugin_version": sink.plugin_version,
+                "determinism": Determinism.IO_WRITE,
+                "config_hash": stable_hash(audit_safe_config),
+                "config_json": canonical_json(audit_safe_config),
+                "source_file_hash": sink.source_file_hash,
+                "schema_hash": None,
+                "sequence_in_pipeline": None,
+                "schema_mode": "observed",
+                "schema_fields": None,
+            }
+            divergent_fields = [field for field, expected in expected_provenance.items() if getattr(existing_node, field) != expected]
+            if divergent_fields:
+                raise AuditIntegrityError(
+                    f"audit export node {sink.node_id!r} for run {run_id!r} is already registered "
+                    f"with divergent provenance fields {divergent_fields!r}; refusing to reuse it for export sink {sink.name!r}"
+                )
         execute_audit_export_effect(
             factory=factory,
             snapshot=snapshot,
