@@ -30,6 +30,7 @@ from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.orchestrator.preflight import validate_sink_effect_capability
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.sinks import _local_file_effects as local_effects
+from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribution
 from elspeth.plugins.sinks.csv_sink import CSVSink
 from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.sinks.text_sink import TextSink
@@ -594,6 +595,39 @@ def test_no_publication_uses_exact_virtual_and_inherited_descriptors(tmp_path: P
     assert inherited.expected_descriptor == predecessor
     assert target.read_bytes() == b"existing\n"
     assert not _stage_path(inherited).exists()
+
+
+def test_no_publication_does_not_inherit_undeclared_existing_target(tmp_path: Path) -> None:
+    target = tmp_path / "shared-output.txt"
+    target.write_bytes(b"another run's bytes\n")
+    inspection = local_effects.inspect_local_effect(
+        target_path=target,
+        request=SinkEffectInspectionRequest(effect_id="a3" * 32, target="{}", predecessor_descriptor=None),
+    )
+
+    plan = local_effects.prepare_local_effect(
+        effect_id="a3" * 32,
+        input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        inspection=inspection,
+        chunks=(),
+        row_count=1,
+        accepted_ordinals=(),
+        diverted_ordinals=(0,),
+        diversion_attribution=(build_diversion_attribution(ordinal=0, reason="test diversion"),),
+        encoding="utf-8",
+        format_name="text",
+        stream_sequence=0,
+    )
+
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert plan.safe_evidence["predecessor_exists"] is True
+    assert plan.safe_evidence["predecessor_declared"] is False
+    assert plan.safe_evidence["publication_kind"] == "virtual"
+    assert plan.expected_descriptor is not None
+    assert plan.expected_descriptor.content_hash == sha256(b"").hexdigest()
+    assert plan.expected_descriptor.size_bytes == 0
+    assert target.read_bytes() == b"another run's bytes\n"
+    assert not _stage_path(plan).exists()
 
 
 def test_effect_streaming_preserves_stateful_text_encodings(tmp_path: Path) -> None:
