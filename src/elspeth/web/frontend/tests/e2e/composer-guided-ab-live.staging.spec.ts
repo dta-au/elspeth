@@ -50,7 +50,8 @@
 // Invocation (dev/staging server):
 //   STAGING_BASE_URL=https://elspeth.foundryside.dev \
 //   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
-//   STAGING_USERNAME=dta_user STAGING_PASSWORD=dta_pass \
+//   STAGING_USERNAME="${STAGING_USERNAME:?set STAGING_USERNAME in the environment}" \
+//   STAGING_PASSWORD="${STAGING_PASSWORD:?set STAGING_PASSWORD in the environment}" \
 //   ELSPETH_RUN_COMPOSER_LIVE=1 \
 //   ELSPETH_LIVE_OUTPUTS_DIR=<server data_dir>/outputs \
 //   npx playwright test --config=playwright.staging.config.ts composer-guided-ab-live --retries=0
