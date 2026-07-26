@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Literal
+from typing import Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -26,6 +26,13 @@ _LOOPBACK_ALLOWED_RANGES = (
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("::1/128"),
 )
+
+
+class _ChromaHTTPClientArgs(TypedDict):
+    host: str
+    port: int
+    ssl: bool
+    headers: dict[str, str]
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -66,6 +73,33 @@ def _validate_chroma_http_target(host: str, port: int, *, ssl: bool) -> SSRFSafe
     if _is_loopback_host(host) and not ipaddress.ip_address(safe_target.resolved_ip).is_loopback:
         raise ValueError(f"ChromaDB loopback host {host!r} resolved outside the loopback ranges")
     return safe_target
+
+
+def _validated_chroma_http_client_args(host: str, port: int, *, ssl: bool) -> _ChromaHTTPClientArgs:
+    """Build Chroma SDK arguments that cannot re-resolve an operator hostname.
+
+    Chroma 1.5.5 does not expose an HTTP transport hook that can connect to a
+    validated IP while setting a distinct TLS SNI hostname. DNS-named HTTPS
+    targets therefore fail closed; literal-IP TLS remains available when the
+    server certificate has a matching IP subject alternative name.
+    """
+    safe_target = _validate_chroma_http_target(host, port, ssl=ssl)
+    if ssl:
+        try:
+            ipaddress.ip_address(safe_target.sni_hostname)
+        except ValueError as exc:
+            raise ValueError(
+                "ChromaDB TLS hostname targets are blocked because chromadb.HttpClient "
+                "cannot use a validated IP while preserving TLS SNI; configure a literal IP "
+                "with a matching certificate IP SAN, or use persistent mode"
+            ) from exc
+    sdk_host = f"[{safe_target.resolved_ip}]" if ":" in safe_target.resolved_ip else safe_target.resolved_ip
+    return {
+        "host": sdk_host,
+        "port": port,
+        "ssl": ssl,
+        "headers": {"Host": safe_target.host_header},
+    }
 
 
 class ChromaConnectionConfig(BaseModel):

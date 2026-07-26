@@ -9,7 +9,10 @@ from pydantic import ValidationError
 
 from elspeth.contracts.probes import CollectionProbe, CollectionReadinessResult
 from elspeth.core.dependency_config import CollectionProbeConfig
-from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionConfig
+from elspeth.plugins.infrastructure.clients.retrieval.connection import (
+    ChromaConnectionConfig,
+    _validated_chroma_http_client_args,
+)
 
 
 class _Closeable(Protocol):
@@ -66,9 +69,11 @@ class ChromaCollectionProbe:
                 # host guaranteed non-None by validate_mode_fields
                 assert self._conn.host is not None
                 client = chromadb.HttpClient(
-                    host=self._conn.host,
-                    port=self._conn.port,
-                    ssl=self._conn.ssl,
+                    **_validated_chroma_http_client_args(
+                        self._conn.host,
+                        self._conn.port,
+                        ssl=self._conn.ssl,
+                    )
                 )
 
             collection = client.get_collection(self.collection_name)

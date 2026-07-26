@@ -11,18 +11,21 @@ name to prevent cross-test interference.
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 chromadb = pytest.importorskip("chromadb")
 
 from elspeth.contracts.enums import CallStatus, CallType  # noqa: E402
+from elspeth.core.security.web import SSRFSafeRequest  # noqa: E402
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError  # noqa: E402
 from elspeth.plugins.infrastructure.clients.retrieval.chroma import (  # noqa: E402
     ChromaSearchProvider,
     ChromaSearchProviderConfig,
 )
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk  # noqa: E402
+from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode  # noqa: E402
 
 
 @dataclass
@@ -178,6 +181,48 @@ class TestToConnectionConfig:
 
 class TestChromaSearchProvider:
     """Tests using real ephemeral ChromaDB — no mocks."""
+
+    def test_client_mode_passes_validated_ip_not_original_hostname_to_sdk(self) -> None:
+        with plugin_preflight_mode(True):
+            config = ChromaSearchProviderConfig(
+                collection="remote-collection",
+                mode="client",
+                host="localhost",
+                port=8000,
+                ssl=False,
+            )
+        safe_target = SSRFSafeRequest(
+            original_url="http://localhost:8000/",
+            resolved_ip="127.0.0.1",
+            host_header="localhost:8000",
+            port=8000,
+            path="/",
+            scheme="http",
+            bare_hostname="localhost",
+        )
+        fake_collection = MagicMock()
+        fake_collection.metadata = {"hnsw:space": "cosine"}
+        fake_client = MagicMock()
+        fake_client.get_collection.return_value = fake_collection
+
+        with (
+            patch(
+                "elspeth.plugins.infrastructure.clients.retrieval.connection.validate_url_for_ssrf",
+                return_value=safe_target,
+            ),
+            patch(
+                "elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.HttpClient",
+                return_value=fake_client,
+            ) as mock_http_client,
+        ):
+            ChromaSearchProvider(config=config, execution=_fake_execution(), run_id="test-run")
+
+        mock_http_client.assert_called_once_with(
+            host="127.0.0.1",
+            port=8000,
+            ssl=False,
+            headers={"Host": "localhost:8000"},
+        )
 
     def _make_provider(self, documents: list[dict[str, str]] | None = None, distance_function: str = "cosine") -> ChromaSearchProvider:
         # Use unique collection name: chromadb.Client() shares a global in-memory
