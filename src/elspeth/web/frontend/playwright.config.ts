@@ -124,12 +124,14 @@ export default defineConfig({
   webServer: [
     {
       command:
+        "npm --prefix src/elspeth/web/frontend run build && " +
         "uv run --extra webui python -m uvicorn elspeth.web.app:create_app --factory " +
         `--host 127.0.0.1 --port ${BACKEND_PORT}`,
       cwd: REPO_ROOT_FROM_FRONTEND,
       url: BACKEND_HEALTH_URL,
-      // The backend must be the Playwright-managed process so
-      // composerSettingsEnv controls auth policy and .e2e-data isolation.
+      // Build before startup so this process serves the production SPA as
+      // well as the API. Browser-security specs exercise that document path;
+      // composerSettingsEnv still controls auth policy and .e2e-data isolation.
       reuseExistingServer: false,
       timeout: 60_000,
       stdout: "pipe",

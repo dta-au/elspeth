@@ -734,6 +734,18 @@ class TestBrowserDocumentHeaders:
     """The SPA response carries callback secrecy and exact runtime CSP."""
 
     @staticmethod
+    def _csp_directives(response: httpx.Response) -> dict[str, tuple[str, ...]]:
+        directives: dict[str, tuple[str, ...]] = {}
+        for raw_directive in response.headers["Content-Security-Policy"].split(";"):
+            parts = raw_directive.split()
+            if not parts:
+                continue
+            name, *sources = parts
+            assert name not in directives, f"duplicate CSP directive: {name}"
+            directives[name] = tuple(sources)
+        return directives
+
+    @staticmethod
     def _app(token_endpoint: str | None) -> FastAPI:
         app = FastAPI()
         app.state.oidc_token_endpoint = token_endpoint
@@ -750,16 +762,61 @@ class TestBrowserDocumentHeaders:
             response = client.get("/?code=secret&state=state")
         assert response.headers["Referrer-Policy"] == "no-referrer"
         assert response.headers["Cache-Control"] == "no-store"
-        assert response.headers["Content-Security-Policy"].endswith("connect-src 'self' ws://localhost:* wss://localhost:*")
+        assert response.headers["X-Frame-Options"] == "DENY"
+        assert self._csp_directives(response) == {
+            "default-src": ("'self'",),
+            "script-src": ("'self'",),
+            "style-src": ("'self'", "'unsafe-inline'"),
+            "font-src": ("'self'",),
+            "img-src": ("'self'", "data:"),
+            "connect-src": ("'self'", "ws://localhost:*", "wss://localhost:*"),
+            "frame-ancestors": ("'none'",),
+        }
 
     def test_csp_adds_only_exact_validated_cross_origin_token_origin(self) -> None:
         endpoint = "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token"
         with TestClient(self._app(endpoint)) as client:
             response = client.get("/")
-        csp = response.headers["Content-Security-Policy"]
-        assert csp.endswith("connect-src 'self' ws://localhost:* wss://localhost:* https://example.auth.ap-southeast-2.amazoncognito.com")
-        assert "https:" not in csp.replace("https://example.auth.ap-southeast-2.amazoncognito.com", "")
-        assert "*" not in csp.replace("ws://localhost:*", "").replace("wss://localhost:*", "")
+        directives = self._csp_directives(response)
+        assert directives["connect-src"] == (
+            "'self'",
+            "ws://localhost:*",
+            "wss://localhost:*",
+            "https://example.auth.ap-southeast-2.amazoncognito.com",
+        )
+        assert directives["frame-ancestors"] == ("'none'",)
+        assert "https:" not in response.headers["Content-Security-Policy"].replace(
+            "https://example.auth.ap-southeast-2.amazoncognito.com", ""
+        )
+        assert "*" not in response.headers["Content-Security-Policy"].replace("ws://localhost:*", "").replace("wss://localhost:*", "")
+
+    def test_static_spa_callback_and_hash_document_is_protected_without_mislabeling_api(self, tmp_path: Path) -> None:
+        from starlette.staticfiles import StaticFiles
+
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<html><body>SPA</body></html>", encoding="utf-8")
+
+        app = FastAPI()
+        app.state.oidc_token_endpoint = None
+        app.add_middleware(_BrowserDocumentHeadersMiddleware)
+
+        @app.get("/api/status")
+        def status() -> dict[str, bool]:
+            return {"ok": True}
+
+        app.mount("/", StaticFiles(directory=dist, html=True), name="spa")
+
+        with TestClient(app) as client:
+            document = client.get("/?code=secret&state=state#/session-id")
+            api = client.get("/api/status")
+
+        assert document.status_code == 200
+        assert document.text == "<html><body>SPA</body></html>"
+        assert self._csp_directives(document)["frame-ancestors"] == ("'none'",)
+        assert document.headers["X-Frame-Options"] == "DENY"
+        assert "Content-Security-Policy" not in api.headers
+        assert "X-Frame-Options" not in api.headers
 
     def test_source_index_has_no_static_csp_meta(self) -> None:
         index = (Path(__file__).parents[3] / "src/elspeth/web/frontend/index.html").read_text(encoding="utf-8")

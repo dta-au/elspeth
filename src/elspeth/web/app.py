@@ -764,7 +764,7 @@ _SPA_CSP_PREFIX = (
 
 
 class _BrowserDocumentHeadersMiddleware(BaseHTTPMiddleware):
-    """Apply callback secrecy headers and the runtime OIDC connect policy."""
+    """Apply callback secrecy, framing denial, and runtime OIDC policy."""
 
     async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[no-untyped-def]
         response = await call_next(request)
@@ -785,7 +785,9 @@ class _BrowserDocumentHeadersMiddleware(BaseHTTPMiddleware):
             if token_origin != request_origin:
                 connect_origin = token_origin
 
-        response.headers["Content-Security-Policy"] = _SPA_CSP_PREFIX if connect_origin is None else f"{_SPA_CSP_PREFIX} {connect_origin}"
+        connect_policy = _SPA_CSP_PREFIX if connect_origin is None else f"{_SPA_CSP_PREFIX} {connect_origin}"
+        response.headers["Content-Security-Policy"] = f"{connect_policy}; frame-ancestors 'none'"
+        response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
         return response
