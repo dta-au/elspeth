@@ -37,6 +37,22 @@ from elspeth.web.sessions.protocol import AuthoritativePipelineProposal
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
+def _reject_duplicate_json_object_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    restored: dict[str, object] = {}
+    for key, value in pairs:
+        if key in restored:
+            raise AuditIntegrityError(f"persisted pipeline dispatch canonical payload has duplicate JSON object key {key!r}")
+        restored[key] = value
+    return restored
+
+
+def _load_exact_canonical_json(payload: str) -> Any:
+    restored = json.loads(payload, object_pairs_hook=_reject_duplicate_json_object_keys)
+    if canonical_json(restored) != payload:
+        raise AuditIntegrityError("persisted pipeline dispatch canonical payload is not the exact canonical representation")
+    return restored
+
+
 @dataclass(frozen=True, slots=True)
 class PipelineDispatchAuditBinding:
     """Smallest durable binding exposed by the current redacted audit store."""
@@ -91,8 +107,8 @@ class PipelineDispatchAuditBinding:
         if type(raw_status) is not str or type(tool_call_id) is not str or type(tool_name) is not str:
             raise AuditIntegrityError("persisted pipeline dispatch scalar fields are malformed")
         try:
-            arguments_hash = stable_hash(json.loads(arguments_canonical))
-            result_hash = stable_hash(json.loads(result_canonical))
+            arguments_hash = stable_hash(_load_exact_canonical_json(arguments_canonical))
+            result_hash = stable_hash(_load_exact_canonical_json(result_canonical))
             status = ComposerToolStatus(raw_status)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AuditIntegrityError("persisted pipeline dispatch payload is malformed") from exc

@@ -282,6 +282,17 @@ def _latest_audit_envelope(service: SessionServiceImpl) -> dict[str, object]:
     return envelope
 
 
+def _replace_latest_audit_envelope(service: SessionServiceImpl, envelope: dict[str, object]) -> None:
+    with service._engine.begin() as conn:
+        audit_row = conn.execute(
+            select(chat_messages_table.c.id)
+            .where(chat_messages_table.c.role == "audit")
+            .order_by(chat_messages_table.c.created_at.desc())
+            .limit(1)
+        ).one()
+        conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=[envelope]))
+
+
 async def _persist_cloned_audit_envelope(
     service: SessionServiceImpl,
     session_id: UUID,
@@ -694,6 +705,59 @@ async def test_settlement_rejects_malformed_or_mismatched_success_for_same_call_
 
     with pytest.raises(AuditIntegrityError):
         await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dispatch_recovery_rejects_noncanonical_json_representation(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    await _persist_dispatch(service, session_id)
+    envelope = _latest_audit_envelope(service)
+    invocation = envelope["invocation"]
+    assert type(invocation) is dict
+    result_canonical = invocation["result_canonical"]
+    assert type(result_canonical) is str
+    invocation["result_canonical"] = f" {result_canonical}"
+    _replace_latest_audit_envelope(service, envelope)
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+
+    with pytest.raises(AuditIntegrityError, match="canonical representation"):
+        await service.get_pipeline_dispatch_recovery(authority=authority)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dispatch_recovery_rejects_duplicate_json_object_key(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    await _persist_dispatch(service, session_id)
+    envelope = _latest_audit_envelope(service)
+    invocation = envelope["invocation"]
+    assert type(invocation) is dict
+    arguments_canonical = invocation["arguments_canonical"]
+    assert type(arguments_canonical) is str
+    assert arguments_canonical.count('"sources":{}') == 1
+    invocation["arguments_canonical"] = arguments_canonical.replace(
+        '"sources":{}',
+        '"sources":{},"sources":{}',
+        1,
+    )
+    _replace_latest_audit_envelope(service, envelope)
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+
+    with pytest.raises(AuditIntegrityError, match="duplicate JSON object key"):
+        await service.get_pipeline_dispatch_recovery(authority=authority)
 
 
 @pytest.mark.asyncio
