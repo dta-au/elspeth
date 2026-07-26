@@ -203,15 +203,29 @@ def _validate_evidence_references(manifest: ScenarioManifest) -> None:
             if unknown_ids:
                 raise ValueError(f"DAG scenario {scenario.id}.{dimension} references unknown evidence id(s): {', '.join(unknown_ids)}")
             required_stage = _LIFECYCLE_STAGE_BY_DIMENSION.get(dimension)
-            if required_stage is not None:
-                for evidence_id in cell.evidence:
-                    reference = evidence_by_id[evidence_id]
-                    if reference.kind == "harness" and required_stage not in reference.stages:
-                        raise ValueError(
-                            f"DAG scenario harness evidence {reference.id!r} at {reference.locator!r} is attached to "
-                            f"{scenario.id}.{dimension}, but its validated stages {reference.stages!r} omit required "
-                            f"stage {required_stage!r}"
-                        )
+            for evidence_id in cell.evidence:
+                reference = evidence_by_id[evidence_id]
+                if reference.kind != "harness":
+                    continue
+                locator_scenario_id = reference.locator.partition(":")[0]
+                if locator_scenario_id != scenario.id:
+                    raise ValueError(
+                        f"DAG scenario harness evidence {reference.id!r} at {reference.locator!r} has locator scenario "
+                        f"{locator_scenario_id!r}, which does not match containing cell {scenario.id}.{dimension}"
+                    )
+                case = registered_cases_by_locator[reference.locator]
+                validated_stages = _EXACT_HARNESS_STAGES_BY_WORKFLOW[case.workflow]
+                if required_stage is None or required_stage not in validated_stages:
+                    unsupported_dimension = (
+                        f"required stage {required_stage!r} for dimension {dimension!r}"
+                        if required_stage is not None
+                        else f"non-lifecycle dimension {dimension!r}"
+                    )
+                    raise ValueError(
+                        f"DAG scenario harness evidence {reference.id!r} at {reference.locator!r} is attached to "
+                        f"{scenario.id}.{dimension}, but its {case.workflow} workflow has validated lifecycle stages "
+                        f"{validated_stages!r} and cannot support {unsupported_dimension}"
+                    )
             if cell.status == "pass":
                 executable_evidence = tuple(
                     evidence_by_id[evidence_id] for evidence_id in cell.evidence if evidence_by_id[evidence_id].executable

@@ -2162,6 +2162,39 @@ def test_manifest_rejects_harness_attached_beyond_its_workflow_even_with_other_e
         load_manifest(write_manifest(tmp_path, raw))
 
 
+@pytest.mark.parametrize("dimension", ["concurrency", "guided", "scale"])
+def test_manifest_rejects_build_harness_attached_to_non_lifecycle_dimension(tmp_path: Path, dimension: str) -> None:
+    raw = valid_manifest_dict()
+    independent_sources = next(scenario for scenario in _raw_scenarios(raw) if scenario["id"] == "multiple-independent-sources")
+    cell = deepcopy(_raw_dimensions(independent_sources)[dimension])
+    cell["evidence"] = ["harness-multiple-independent-sources-independent-roots"]
+    _raw_dimensions(independent_sources)[dimension] = cell
+
+    with pytest.raises(
+        ValueError,
+        match=rf"harness evidence.*independent-roots.*multiple-independent-sources\.{dimension}.*build workflow.*validated lifecycle",
+    ):
+        load_manifest(write_manifest(tmp_path, raw))
+
+
+@pytest.mark.parametrize("dimension", ["config", "build"])
+def test_manifest_rejects_harness_attached_to_another_scenario(tmp_path: Path, dimension: str) -> None:
+    raw = valid_manifest_dict()
+    linear = next(scenario for scenario in _raw_scenarios(raw) if scenario["id"] == "linear")
+    cell = deepcopy(_raw_dimensions(linear)[dimension])
+    cell["evidence"] = [
+        *cast(list[str], cell.get("evidence", [])),
+        "harness-multiple-independent-sources-independent-roots",
+    ]
+    _raw_dimensions(linear)[dimension] = cell
+
+    with pytest.raises(
+        ValueError,
+        match=rf"harness evidence.*independent-roots.*locator scenario.*multiple-independent-sources.*linear\.{dimension}",
+    ):
+        load_manifest(write_manifest(tmp_path, raw))
+
+
 def test_manifest_rejects_duplicate_case_ids(tmp_path: Path) -> None:
     raw = valid_manifest_dict()
     case = _case_dict()
