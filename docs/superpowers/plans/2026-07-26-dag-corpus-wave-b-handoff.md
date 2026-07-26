@@ -23,68 +23,64 @@ APIs, PostgreSQL/SQLite, Filigree, Loomweave, Warpline, Ruff, and mypy.
 
 ---
 
-## Final pre-platform snapshot
+## Current pre-platform snapshot
 
-Recorded on 2026-07-27. Refresh all volatile facts before executing this
-handoff.
+Refreshed on 2026-07-27 after Wave B integration and the four resulting P1
+correctness fixes. Refresh volatile platform and tracker facts before executing
+the remaining handoff.
 
 | Surface | Exact recorded fact |
 | --- | --- |
-| Wave B worktree | `/home/john/elspeth/.worktrees/dag-corpus-wave-b` |
+| Wave B worktree | Retired after integration |
 | Wave B implementation/evidence head | `210a92d544dbb10d5d0b438351f123e05da19f5d` (immutable evidence boundary) |
-| Wave B integration tip | Capture `codex/dag-corpus-wave-b^{commit}` at execution; it must pass the allowed-tail checks below |
-| Recorded release head (volatile) | `release/0.7.2@ad7f1e277e2ecab75e33bdda6d82c0342d418600` |
-| Release/Wave B merge base | `5308e8c8867c6c6c26964a82eaf1081e2d1327d0` |
-| Divergence at the implementation/evidence head | 35 release-only commits and 20 Wave-B-only commits |
-| Expected divergence after this two-file handoff commit | 35 release-only commits and 21 Wave-B-only commits; verify dynamically rather than pinning the future commit ID |
+| Wave B integration tip | `ca65ecab32f77c8cbd2b33ce8685c381011078e0` |
+| Combined Wave B merge | `2b47c25428ed0e978443df953e0fd587860aeed8` |
+| Current reviewed production/evidence floor | `release/0.7.2@2def32c356030949539387ff1c395a8988745a91` |
+| Future platform replay anchor | Capture the exact reviewed `release/0.7.2` tip after the bug-fix/corpus sprint; require it to descend from the recorded floor |
+| Coordination-doc refresh | The commit containing this refresh is documentation-only and does not create new production evidence |
 | Paused platform worktree | `/home/john/elspeth/.worktrees/deferred-platform-completion` |
-| Recorded paused-platform head (volatile) | `codex/deferred-platform-completion@132bd53232ea6b3885250675c361d3c057b19ac5` |
+| Recorded paused-platform head | `codex/deferred-platform-completion@132bd53232ea6b3885250675c361d3c057b19ac5` |
 | Platform replay base | `696b3d1414ed7a6789c8f25bf5cbdc5450385bdd` |
-| Recorded platform replay range | 13 commits in `696b3d1414ed7a6789c8f25bf5cbdc5450385bdd..132bd53232ea6b3885250675c361d3c057b19ac5`; refresh the tip at execution |
+| Recorded platform replay range | 13 commits in `696b3d1414ed7a6789c8f25bf5cbdc5450385bdd..132bd53232ea6b3885250675c361d3c057b19ac5` |
 | Platform progress | Clean and paused after Task 5 of the live deferred-platform plan |
-| Focused corpus gate | 541 passed, 2 expected xfailed, 3 known quorum warnings |
-| Static gate | Focused Ruff check, Ruff format check, mypy, and `git diff --check` green |
-| Parent issue | `elspeth-ef29ef6ba4`, open and `in_progress` |
+| Focused corpus gate | 545 passed, 0 xfailed, 3 known quorum warnings |
+| Static gate | Focused Ruff check, Ruff format check, and mypy green at the source floor; this two-file handoff diff passes `git diff --check` |
+| Code-index state | Loomweave refreshed and fresh at the production/evidence floor |
+| Parent issue | `elspeth-ef29ef6ba4`, open and `in_progress`; leave unassigned between bounded packets |
 
-Wave B is **not** based on the current release head. Never describe
-`210a92d544dbb10d5d0b438351f123e05da19f5d` as the final Wave B branch head,
-a combined commit, or a release-ready commit. It is the immutable
-implementation/evidence boundary. The handoff commit itself is part of Wave B
-and must be included in integration through the dynamically captured
-`WAVE_B_INTEGRATION_TIP`.
+Wave B is already integrated. Do not recreate the merge, recover the retired
+worktree, or rebase the platform branch onto the historical Wave B head.
+`210a92d544dbb10d5d0b438351f123e05da19f5d` remains the immutable Wave B
+implementation/evidence boundary, while
+`2def32c356030949539387ff1c395a8988745a91` is the reviewed production/evidence
+floor after integration and the four P1 fixes. The commit containing this
+documentation refresh changes no production or corpus source. At the eventual
+platform rebase, capture the exact reviewed `release/0.7.2` tip so later
+bug-fix/corpus commits, including `elspeth-168c26e22e`, are not omitted.
 
-After the single final two-file handoff commit, exactly one commit may follow
-the implementation/evidence head, and that commit may change only these files:
-
-- `docs/superpowers/plans/2026-07-26-dag-corpus-wave-b-handoff.md`
-- `docs/superpowers/plans/2026-07-26-dag-corpus-wave-b-preplatform-sprint.md`
-
-At execution, capture and validate the tip instead of comparing the branch to
-a stale recorded SHA:
+At execution, capture and validate the source and platform boundaries:
 
 ```bash
-wave_b_worktree=/home/john/elspeth/.worktrees/dag-corpus-wave-b
-wave_b_implementation_head=210a92d544dbb10d5d0b438351f123e05da19f5d
-wave_b_integration_tip=$(git -C "$wave_b_worktree" \
-  rev-parse codex/dag-corpus-wave-b^{commit})
-git -C "$wave_b_worktree" merge-base --is-ancestor \
-  "$wave_b_implementation_head" "$wave_b_integration_tip"
-test "$(git -C "$wave_b_worktree" rev-list --count \
-  "$wave_b_implementation_head..$wave_b_integration_tip")" -eq 1
-test "$(git -C "$wave_b_worktree" diff --name-only \
-  "$wave_b_implementation_head..$wave_b_integration_tip" | sort)" = \
-  "$(printf '%s\n' \
-    docs/superpowers/plans/2026-07-26-dag-corpus-wave-b-handoff.md \
-    docs/superpowers/plans/2026-07-26-dag-corpus-wave-b-preplatform-sprint.md \
-    | sort)"
-git -C "$wave_b_worktree" diff --check \
-  "$wave_b_implementation_head..$wave_b_integration_tip"
+release_worktree=/home/john/elspeth
+platform_worktree=/home/john/elspeth/.worktrees/deferred-platform-completion
+recorded_source_floor=2def32c356030949539387ff1c395a8988745a91
+source_anchor=$(git -C "$release_worktree" \
+  rev-parse release/0.7.2^{commit})
+platform_replay_base=696b3d1414ed7a6789c8f25bf5cbdc5450385bdd
+platform_tip=$(git -C "$platform_worktree" rev-parse HEAD^{commit})
+test "$(git -C "$release_worktree" rev-parse "$source_anchor"^{commit})" = \
+  "$source_anchor"
+git -C "$release_worktree" merge-base --is-ancestor \
+  "$recorded_source_floor" "$source_anchor"
+test -z "$(git -C "$platform_worktree" status --short)"
+test "$(git -C "$platform_worktree" merge-base \
+  "$source_anchor" "$platform_tip")" = "$platform_replay_base"
 ```
 
-Review that one-commit documentation diff before integration. If the allowed
-tail is absent, longer than one commit, or touches another path, stop and
-reconcile it explicitly. The next durable combined source boundary must
-contain the refreshed release tip and this validated Wave B integration tip.
+The release checkout currently has six unrelated modified tier-model YAML
+files. They are outside this handoff and must remain untouched. The captured
+source commit makes the platform replay independent of those working-tree
+changes.
 
 The active deferred-platform plan is the complete file in the paused platform
 worktree:
@@ -93,10 +89,10 @@ worktree:
 
 Read it in full after every rebase. This handoff does not replace that plan.
 
-The release-branch coordination reference
-`docs/superpowers/plans/2026-07-26-p1-work-bucket-coordination-reference.md`
-is absent from this Wave B branch. Refresh its stale R2/R3 facts only after the
-branches are reconciled; do not manufacture a Wave B copy.
+The release-branch coordination reference is
+`docs/superpowers/plans/2026-07-26-p1-work-bucket-coordination-reference.md`.
+Treat this current handoff and live tracker state as authoritative when older
+R2/R3 facts in that historical reference disagree.
 
 ## What Wave B accepted
 
@@ -114,40 +110,38 @@ runtime/audit promotion is provisional until post-rebase reacceptance.
 
 ### Final manifest ledger
 
-The schema-v2 manifest contains 15 scenarios, 39 registered cases, 99 evidence
+The schema-v2 manifest contains 15 scenarios, 39 registered cases, 100 evidence
 references, and 165 cells. Its verdict remains `not_complete`.
 
 | Dimension | Pass | Partial | Fail | Unknown | N/A | Applicable non-pass |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `config` | 13 | 0 | 1 | 0 | 1 | 1 |
 | `build` | 14 | 0 | 1 | 0 | 0 | 1 |
-| `contracts` | 10 | 4 | 1 | 0 | 0 | 5 |
+| `contracts` | 11 | 3 | 1 | 0 | 0 | 4 |
 | `runtime` | 12 | 2 | 1 | 0 | 0 | 3 |
-| `audit` | 9 | 5 | 0 | 0 | 1 | 5 |
+| `audit` | 12 | 2 | 0 | 0 | 1 | 2 |
 | `recovery` | 3 | 6 | 0 | 5 | 1 | 11 |
 | `concurrency` | 0 | 4 | 0 | 10 | 1 | 14 |
 | `freeform` | 12 | 0 | 1 | 0 | 2 | 1 |
 | `guided` | 0 | 2 | 11 | 0 | 2 | 13 |
 | `round_trip` | 0 | 7 | 0 | 5 | 3 | 12 |
 | `scale` | 0 | 1 | 0 | 13 | 1 | 14 |
-| **Total** | **73** | **31** | **16** | **33** | **12** | **80** |
+| **Total** | **77** | **27** | **16** | **33** | **12** | **76** |
 
-Current ownership encoded in the 80 applicable non-pass cells:
+Current ownership encoded in the 76 applicable non-pass cells:
 
 | Owner issue | Partial | Fail | Unknown | Total |
 | --- | ---: | ---: | ---: | ---: |
 | `elspeth-ef29ef6ba4` | 12 | 0 | 15 | 27 |
+| `elspeth-cb1053fe46` | 1 | 0 | 13 | 14 |
 | `elspeth-7cf763da7c` | 7 | 0 | 5 | 12 |
 | `elspeth-7e2dd67275` | 2 | 10 | 0 | 12 |
-| `elspeth-cb1053fe46` | 1 | 0 | 13 | 14 |
 | `elspeth-a5b86149d4` | 0 | 6 | 0 | 6 |
-| `elspeth-3a6fa9141f` | 3 | 0 | 0 | 3 |
-| `elspeth-b1f23d8d83` | 1 | 0 | 0 | 1 |
 | `elspeth-f321e3ff21` | 1 | 0 | 0 | 1 |
 | `elspeth-245b21351b` | 1 | 0 | 0 | 1 |
 | `elspeth-2e66723070` | 1 | 0 | 0 | 1 |
-| `elspeth-6f6bbbec00` | 1 | 0 | 0 | 1 |
 | `elspeth-67b44040ee` | 1 | 0 | 0 | 1 |
+| `elspeth-6f6bbbec00` | 1 | 0 | 0 | 1 |
 
 Do not promote cells from aggregate counts, neighbouring scenarios, or a clean
 rebase. Recompute this ledger mechanically after every manifest change.
@@ -169,29 +163,39 @@ rebase. Recompute this ledger mechanically after every manifest change.
 | Wave B child | `elspeth-272a236fc8` | B3 aggregation/expansion recovery | `e4d71d392d9a1d10596615e5a61af9213525ce0a` |
 | Authoritative external task | `elspeth-76bb92bc7d` | Full sink bundle/redrive | `7b2563c51871b992f7bba79b5fd9ecc25cf58520` |
 | Wave B child | `elspeth-8a6f52b2f6` | B4-A terminal resume idempotence | `210a92d544dbb10d5d0b438351f123e05da19f5d` |
+| Post-integration P1 fix | `elspeth-3a6fa9141f` | Canonical coalesce parent identity | `229e2245d84e1195dc6693cf6ab55684190bcf9b` |
+| Post-integration P1 fix | `elspeth-b1f23d8d83` | Union collision policy identity | `8c124889e7275eadb0b99242d9617a2c3601b727` |
+| Post-integration P1 fix | `elspeth-d3960e8463` | Residual pending-sink resume | `c8f6094a7a5b60c995a7c5e0f3e500ec4d5c45b3` |
+| Post-integration P1 fix | `elspeth-0b0eaa63df` | Fixed-any schema reconstruction | `a3838611cd7931eb71b9d42a6e9e2bd2e78d14b9` |
 
-The implementation/evidence range is the 20 commits after
+The Wave B implementation/evidence range is the 20 commits after
 `5308e8c8867c6c6c26964a82eaf1081e2d1327d0` through
-`210a92d544dbb10d5d0b438351f123e05da19f5d`. The integration range extends
-through the validated dynamic `WAVE_B_INTEGRATION_TIP`, including the one
-expected two-file handoff commit. Preserve that entire range; do not reduce the
-ledger to close commits alone because supporting schema, fixture,
-documentation, review, and handoff repairs are separate commits.
+`210a92d544dbb10d5d0b438351f123e05da19f5d`. The integrated Wave B tip is
+`ca65ecab32f77c8cbd2b33ce8685c381011078e0`, incorporated by merge
+`2b47c25428ed0e978443df953e0fd587860aeed8`. Preserve that entire history; do
+not reduce the ledger to close commits alone because supporting schema,
+fixture, documentation, review, and handoff repairs are separate commits.
+
+The current reviewed production/evidence floor is
+`2def32c356030949539387ff1c395a8988745a91`. It adds the scheduler-quiescence
+impact-audit follow-up to `elspeth-d3960e8463` after all four P1 close commits.
+Refresh the replay anchor after every later reviewed production or corpus
+commit.
 
 ## Honest open blockers
 
-### Expected xfails
+### Resolved post-Wave-B findings
 
-The focused gate is not a zero-nonpass suite. It has two expected xfails:
+The two former coalesce identity xfails are now ordinary passing tests.
+`elspeth-3a6fa9141f` canonicalized coalesce parents before lineage and
+sink-effect derivation at `229e2245d84e1195dc6693cf6ab55684190bcf9b`.
+`elspeth-b1f23d8d83` bound union collision policy into canonical node and audit
+identity at `8c124889e7275eadb0b99242d9617a2c3601b727`.
 
-- `test_b2_composed_coalesces_raw_identity_converges_across_equivalent_runs[sequential-nested-fork-coalesce-two-sequential-require-all]`
-- `test_b2_composed_coalesces_raw_identity_converges_across_equivalent_runs[parallel-coalesces-two-parallel-require-all]`
-
-Both cite `elspeth-3a6fa9141f`. Equivalent require-all executions still derive
-durable parent ordinals, lineage, and sink-effect identity from arrival order.
-Keep the three affected audit cells partial. A report that says only “541
-passed” is false; preserve `541 passed, 2 xfailed, 3 warnings` until the bug is
-fixed and the xfails are removed.
+The resume findings `elspeth-d3960e8463` and `elspeth-0b0eaa63df` are also
+closed at `c8f6094a7a5b60c995a7c5e0f3e500ec4d5c45b3` and
+`a3838611cd7931eb71b9d42a6e9e2bd2e78d14b9`. The current exact corpus result is
+`545 passed, 0 xfailed, 3 warnings`.
 
 ### Blocked recovery children
 
@@ -210,13 +214,8 @@ because adjacent recovery cases pass.
 
 ### Product and platform blockers
 
-- `elspeth-b1f23d8d83`: union collision policy is absent from canonical
-  coalesce node and audit identity.
-- `elspeth-3a6fa9141f`: coalesce parent order is arrival-dependent; owns the
-  two xfails and three partial audit cells.
-- `elspeth-d3960e8463`: public resume can skip residual `PENDING_SINK` work.
-- `elspeth-0b0eaa63df`: fixed-schema `any` fields cannot be reconstructed from
-  persisted JSON Schema. The bounded observed-schema proof does not close it.
+- `elspeth-168c26e22e`: recovery durable/export parity still shares a serializer;
+  this is the next independent, ready corpus P2.
 - `elspeth-f321e3ff21` and `elspeth-245b21351b`: checkpoint compatibility and
   post-leadership cleanup remain on the paused platform branch.
 - `elspeth-9a52eb80f9`: registered independent-process orchestration and sink
@@ -231,30 +230,25 @@ Reconcile that dependency before scale execution, normally by removing the
 parent-as-blocker edge while keeping both issues open. Do not weaken either
 acceptance contract merely to break the cycle.
 
-## Required combine, rebase, and reacceptance sequence
+## Required platform rebase and reacceptance sequence
 
-This snapshot is still before deferred-platform Task 21, so use the
-pre-freeze sequence unless live state proves Task 21 or later has begun.
+The release/Wave B combination and its four immediate correctness fixes are
+complete. The remaining sequence starts from the reviewed source floor and is
+still before deferred-platform Task 21.
 
-1. **Refresh and freeze inputs.** Require clean worktrees. Capture the current
-   release and platform tips as volatile execution inputs; do not require them
-   to equal the recorded snapshot. Capture `WAVE_B_INTEGRATION_TIP` and require
-   the implementation-head ancestry, one-commit allowed tail, exact two-file
-   path set, and clean diff shown above. Refresh the parent, all blocker
-   issues, the release task, Docker task, and operator P0. An active or
-   human-owned claim is not available work.
-2. **Create one combined release/Wave B commit.** Start an isolated integration
-   branch from the refreshed `release/0.7.2` tip, merge or replay through
-   `WAVE_B_INTEGRATION_TIP`, resolve conflicts semantically, and run the
-   focused/static floor below. Require both the refreshed release tip and
-   `WAVE_B_INTEGRATION_TIP` to be ancestors of the result. Record the resulting
-   full `COMBINED_SHA`. Do not merge directly into the release checkout before
-   review.
-3. **Rebase the refreshed paused-platform replay range.** After review of the
-   combined source, capture the live platform tip. Require the recorded replay
+1. **Refresh and freeze inputs.** Keep the platform worktree clean. Capture its
+   current tip, verify that the replay base remains its ancestor, and capture
+   the exact reviewed `release/0.7.2` tip as `source_anchor`. Require
+   `2def32c356030949539387ff1c395a8988745a91` to be its ancestor so the four
+   closed P1 fixes remain included. Preserve the six
+   unrelated tier-model YAML changes in the release checkout. Refresh the
+   parent, all blocker issues, the release task, Docker task, and operator P0.
+   An active or human-owned claim is not available work.
+2. **Rebase the refreshed paused-platform replay range.** Capture the live
+   platform tip. Require the recorded replay
    base to remain its ancestor, review any commits after the recorded
    `132bd53232ea6b3885250675c361d3c057b19ac5` snapshot, and replay through the
-   captured tip onto the reviewed `COMBINED_SHA`. Replay the captured commit,
+   captured tip onto the reviewed source anchor. Replay the captured commit,
    not a moving branch ref, then update the platform branch with a compare-and-
    swap so a concurrent branch move fails closed:
 
@@ -265,7 +259,9 @@ pre-freeze sequence unless live state proves Task 21 or later has begun.
    platform_worktree=/home/john/elspeth/.worktrees/deferred-platform-completion
    platform_branch=codex/deferred-platform-completion
    platform_replay_base=696b3d1414ed7a6789c8f25bf5cbdc5450385bdd
-   combined_sha=2b47c25428ed0e978443df953e0fd587860aeed8
+   recorded_source_floor=2def32c356030949539387ff1c395a8988745a91
+   source_anchor=$(git -C /home/john/elspeth \
+     rev-parse release/0.7.2^{commit})
    test -z "$(git -C "$platform_worktree" status --short)"
    test "$(git -C "$platform_worktree" branch --show-current)" = \
      "$platform_branch"
@@ -273,18 +269,18 @@ pre-freeze sequence unless live state proves Task 21 or later has begun.
    test "$(git -C "$platform_worktree" rev-parse \
      "$platform_branch"^{commit})" = "$platform_integration_tip"
    test "$(git -C /home/john/elspeth rev-parse \
-     "$combined_sha"^{commit})" = "$combined_sha"
+     "$source_anchor"^{commit})" = "$source_anchor"
    git -C /home/john/elspeth merge-base --is-ancestor \
-     "$combined_sha" release/0.7.2
+     "$recorded_source_floor" "$source_anchor"
    git -C "$platform_worktree" merge-base --is-ancestor \
      "$platform_replay_base" "$platform_integration_tip"
    test "$(git -C "$platform_worktree" merge-base \
-     "$combined_sha" "$platform_integration_tip")" = "$platform_replay_base"
+     "$source_anchor" "$platform_integration_tip")" = "$platform_replay_base"
    test -z "$(git -C "$platform_worktree" rev-list --merges \
      "$platform_replay_base..$platform_integration_tip")"
    git -C "$platform_worktree" switch --detach "$platform_integration_tip"
    git -C "$platform_worktree" rebase --onto \
-     "$combined_sha" "$platform_replay_base" \
+     "$source_anchor" "$platform_replay_base" \
      "$platform_integration_tip"
    rebased_platform_tip=$(git -C "$platform_worktree" rev-parse HEAD^{commit})
    git -C "$platform_worktree" update-ref \
@@ -298,29 +294,29 @@ pre-freeze sequence unless live state proves Task 21 or later has begun.
    reviewed later platform commits. If the compare-and-swap fails, stop: the
    platform branch moved after capture and the detached replay is not authority.
    A textually clean rebase is not acceptance.
-4. **Invalidate pre-platform evidence immediately.** Treat every B1-X, B2-X,
+3. **Invalidate pre-platform evidence immediately.** Treat every B1-X, B2-X,
    B3-X, and
    B4-A recovery/runtime/audit proof as provisional at its recorded Wave B
    commit. Do not carry forward an evidence locator, fixture hash,
    compatibility/topology hash, acceptance hash, or cell status solely because
    the rebase applied cleanly.
-5. **Resume platform implementation through its source-stable boundary.**
+4. **Resume platform implementation through its source-stable boundary.**
    Reverify the affected authority suites from already-landed Tasks 3 through
    5, then continue the live deferred-platform plan from Task 6 through Task
    13. Do not begin Task 14's provider packaging while the corpus remains
    invalidated.
-6. **Implement B4-B only on the real distributed harness.** Once platform Task
+5. **Implement B4-B only on the real distributed harness.** Once platform Task
    13's independent-process PostgreSQL/registered-worker matrix is green,
    execute scenario 15 with real Landscape claim epochs, lease expiry, reclaim,
    stale-worker fencing, and late-completion refusal. Scenario 15 cannot
    promote another scenario's concurrency cell by analogy.
-7. **Reaccept the corpus before Task 14.** Regenerate topology and compatibility
+6. **Reaccept the corpus before Task 14.** Regenerate topology and compatibility
    evidence, rerun every registered recovery case and seam-specific verifier,
    rerun the full corpus/static floor, and re-audit every promoted
    recovery/runtime/audit cell against the post-Task-13 production behavior.
    If Tasks 14 through 20 later touch a corpus-sensitive production seam,
    invalidate and rerun the affected evidence again before Task 21.
-8. **Run candidate acceptance once on the combined tree.** Complete
+7. **Run candidate acceptance once on the combined tree.** Complete
    deferred-platform Tasks 21 through 27 only after source and evidence are
    stable. If Task 21 or later had already started, explicitly invalidate the
    candidate, image, live ACA/Azure Files evidence, and receipt, then restart
@@ -333,8 +329,8 @@ baseline, bypass signature verification, or reuse operator credentials.
 
 ## Exact verification floor
 
-Run these commands on Wave B now, on the combined integration branch, and
-again after the platform rebase.
+Run these commands at the current source anchor and again after the platform
+rebase.
 
 ```bash
 env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
@@ -352,17 +348,16 @@ env -u VIRTUAL_ENV uv run --frozen ruff format --check \
   tests/integration/core/dag/test_dag_scenario_production_path.py
 
 env -u VIRTUAL_ENV uv run --frozen mypy \
-  tests/fixtures/dag_scenario_corpus \
-  tests/unit/architecture/test_dag_scenario_corpus_contract.py \
-  tests/integration/core/dag/test_dag_scenario_production_path.py
+  src/ elspeth-lints/src/
 
 git diff --check
 git status --short --branch
 ```
 
-The current pre-platform expected result is exactly `541 passed, 2 xfailed, 3
-warnings`. Investigate any collection shrink, new skip/xfail, unexpected xpass,
-or warning change.
+The current pre-platform expected result is exactly `545 passed, 0 xfailed, 3
+warnings`. Investigate any collection shrink, skip/xfail, or warning change.
+The project-supported strict mypy surface is `src/ elspeth-lints/src/`;
+`tests/` and `scripts/` are deliberately outside that gate.
 
 After the platform rebase, run the complete two-file gate above and at least
 these registered/seam-specific recovery node IDs:
@@ -402,12 +397,13 @@ combined source.
 
 ## Tracker handoff and closure rule
 
-`elspeth-ef29ef6ba4` remains open. Eighty applicable cells are still non-pass,
-seven recovery children are blocked, the two xfails remain, distributed B4-B
-is absent, and the scale dependency is unresolved.
+`elspeth-ef29ef6ba4` remains open. Seventy-six applicable cells are still
+non-pass, seven recovery children are blocked, independent durable/export
+parity remains open as `elspeth-168c26e22e`, distributed B4-B is absent, and
+the scale dependency is unresolved.
 
 After this handoff is added to the parent issue, release the
-`codex-dag-wave-b-coordinator` claim without reverting workflow status. Do not
+`codex-dag-corpus-refresh` claim without reverting workflow status. Do not
 close the parent. Future workers claim bounded children or authoritative
 external issues; they do not hold the umbrella for the duration of the
 backlog.
@@ -421,17 +417,16 @@ ownership.
 
 Stop and return to coordination when:
 
-- a worktree is dirty, a captured execution tip changes during integration,
-  or the refreshed release/platform ancestry cannot be explained and reviewed;
-- `210a92d544dbb10d5d0b438351f123e05da19f5d` is not an ancestor of the Wave B
-  integration tip, more or fewer than one commit follows it, or that tail
-  changes anything outside the two allowed handoff files;
-- the combined commit does not contain both the refreshed release tip and the
-  validated Wave B integration tip;
+- the platform worktree is dirty, its captured tip changes during replay, or
+  the refreshed release/platform ancestry cannot be explained and reviewed;
+- `2def32c356030949539387ff1c395a8988745a91` is not an ancestor of the captured
+  source anchor, a later production/corpus commit has not been reviewed and
+  reverified, or the platform/source merge base is no longer the recorded replay
+  base;
 - a conflict is resolved by accepting one whole side without reviewing the
   production authority and corpus contract together;
-- the two expected xfails are omitted from a result, change unexpectedly, or a
-  new skip/xfail appears;
+- the 545-test collection shrinks, any skip/xfail appears, or a warning changes
+  without review;
 - a cell would be promoted from analogy, aggregate counts, or pre-rebase
   evidence;
 - platform Task 21 or later has begun without invalidating and restarting

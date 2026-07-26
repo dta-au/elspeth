@@ -51,35 +51,38 @@ APIs, Filigree, Loomweave, Warpline, Ruff, and mypy.
   mandatory because recovery lanes share harness and integration-test hot
   files even when their fixture directories are independent.
 
-## Final execution checkpoint
+## Post-integration execution checkpoint
 
-Recorded on 2026-07-27 at immutable implementation/evidence head
-`210a92d544dbb10d5d0b438351f123e05da19f5d`. This is not the final Wave B
-branch head, a current-release commit, or a combined commit. The single final
-two-file handoff commit must follow it and must be included in integration
-through the dynamically captured Wave B tip.
+Refreshed on 2026-07-27 after Wave B integration and the resulting P1
+correctness wave. The immutable Wave B implementation/evidence head remains
+`210a92d544dbb10d5d0b438351f123e05da19f5d`; Wave B was integrated at
+`2b47c25428ed0e978443df953e0fd587860aeed8`. The current reviewed
+production/evidence floor is
+`release/0.7.2@2def32c356030949539387ff1c395a8988745a91`. The commit containing
+this documentation refresh is coordination-only and is not the platform
+production replay anchor. Capture the exact reviewed release tip after later
+bug-fix/corpus commits before the platform rebase.
 
-The recorded, refreshable `release/0.7.2` snapshot is
-`ad7f1e277e2ecab75e33bdda6d82c0342d418600`. At the implementation/evidence
-head, the branches share merge base
-`5308e8c8867c6c6c26964a82eaf1081e2d1327d0` and diverge by 35 release-only
-and 20 Wave-B-only commits. After the one expected docs commit, the recorded
-shape becomes 35/21. Execution must capture the current release and Wave B
-tips, require `210a92d544dbb10d5d0b438351f123e05da19f5d` as a Wave B ancestor, and
-require exactly one following commit whose changed paths are the two handoff
-documents. The integration range ends at that dynamic tip, not at `210a92d5`.
-
-The focused final gate reports `541 passed, 2 expected xfailed, 3 known quorum
+The focused final gate reports `545 passed, 0 xfailed, 3 known quorum
 warnings`. Focused Ruff check/format, mypy, and `git diff --check` are green.
-The xfails remain a real stop condition owned by `elspeth-3a6fa9141f`; this
-plan does not convert them into passing evidence.
+The former coalesce identity xfails now pass after `elspeth-3a6fa9141f` closed
+at `229e2245d84e1195dc6693cf6ab55684190bcf9b`.
 
-The final schema-v2 manifest has 15 scenarios, 39 cases, 99 evidence
-references, and 165 cells: 73 `pass`, 31 `partial`, 16 `fail`, 33 `unknown`,
-and 12 `not_applicable`. Eighty applicable cells remain non-pass. B4-A closed
-at `210a92d544dbb10d5d0b438351f123e05da19f5d` and promoted only checkpoint
+The current schema-v2 manifest has 15 scenarios, 39 cases, 100 evidence
+references, and 165 cells: 77 `pass`, 27 `partial`, 16 `fail`, 33 `unknown`,
+and 12 `not_applicable`. Seventy-six applicable cells remain non-pass. B4-A
+closed at `210a92d544dbb10d5d0b438351f123e05da19f5d` and promoted only checkpoint
 runtime/audit. Its single-process, fresh-object proof remains provisional
 pending the deferred-platform rebase.
+
+Four P1 findings from the combined corpus are closed:
+`elspeth-3a6fa9141f` at `229e2245d84e1195dc6693cf6ab55684190bcf9b`,
+`elspeth-b1f23d8d83` at `8c124889e7275eadb0b99242d9617a2c3601b727`,
+`elspeth-d3960e8463` at `c8f6094a7a5b60c995a7c5e0f3e500ec4d5c45b3`,
+and `elspeth-0b0eaa63df` at
+`a3838611cd7931eb71b9d42a6e9e2bd2e78d14b9`. The next ready independent corpus
+P2 is `elspeth-168c26e22e`, which must make durable/export parity independent
+of the shared serializer.
 
 The sprint did not complete B1-X or B2-X. Seven P2 recovery children remain
 open behind P3 `elspeth-7dcc6554e7`: `elspeth-1805aec2a6`,
@@ -650,26 +653,30 @@ provisional.
 - [x] **Step 2: Record the combined release/Wave B SHA and all packet commits,
   tests, reviews, and open blockers.**
 
-  Local `release/0.7.2` now contains the reviewed combined commit
+  Local `release/0.7.2` contains the reviewed combined commit
   `2b47c25428ed0e978443df953e0fd587860aeed8`, with release parent
   `ad7f1e277e2ecab75e33bdda6d82c0342d418600` and Wave B parent
   `ca65ecab32f77c8cbd2b33ce8685c381011078e0`. The immutable Wave B
   implementation/evidence head is `210a92d544dbb10d5d0b438351f123e05da19f5d`;
   the only later Wave B commit changes this plan and the handoff document.
-  Exact-current merge and quality reviews approved the integration. The
-  release checkout gate passed with 541 tests, 2 expected xfails owned by
-  `elspeth-3a6fa9141f`, and 3 warnings; Ruff, formatting, mypy, and diff checks
-  also passed. Deferred platform work remains paused at
+  Exact-current merge and quality reviews approved the integration. Four
+  post-integration P1 fixes now lead to production/evidence floor
+  `2def32c356030949539387ff1c395a8988745a91`. The release checkout gate passes
+  545 tests with zero xfails and 3 warnings; Ruff, formatting, mypy, and diff
+  checks also pass. Deferred platform work remains paused at
   `132bd53232ea6b3885250675c361d3c057b19ac5`. Independent recovery/export
   parity remains open as `elspeth-168c26e22e`; distributed and scale evidence
   remain incomplete as recorded in the final ledger.
 
 - [x] **Step 3: Give the paused platform branch an exact rebase instruction.**
 
-  Rebase `codex/deferred-platform-completion` onto the final combined
-  `release/0.7.2`/Wave B integration commit, rerun its impacted authority
-  suites, then implement B4-B using its real independent-process PostgreSQL
-  harness. Do not retain any pre-rebase acceptance hash.
+  At execution, capture the exact reviewed `release/0.7.2` tip and require it to
+  descend from the current production/evidence floor
+  `2def32c356030949539387ff1c395a8988745a91`. Rebase
+  `codex/deferred-platform-completion` onto that captured tip, rerun its
+  impacted authority suites, then implement B4-B using its real
+  independent-process PostgreSQL harness. Do not retain any pre-rebase
+  acceptance hash.
 
   B4-B must launch independent registered production orchestrator/scheduler
   workers against shared PostgreSQL, assert Landscape claim epochs and
@@ -690,8 +697,13 @@ provisional.
 - [x] **Step 5: Record the paused branch merge base and exact replay range in
   the handoff.**
 
-- [ ] **Step 6: Run final corpus/static/Warpline review and release the parent
-  claim without closing the incomplete umbrella.**
+- [x] **Step 6: Refresh the post-fix corpus/static acceptance record and release
+  the parent claim without closing the incomplete umbrella.**
+
+  The post-fix refresh pins the zero-xfail gate, current manifest ledger, exact
+  platform replay anchor, closed P1 lineage, and open P2 ownership in this plan
+  and the handoff. Warpline reverification remains part of the post-platform
+  reacceptance gate whenever production authority changes.
 
 ## Per-child verification floor
 
@@ -713,9 +725,7 @@ env -u VIRTUAL_ENV uv run --frozen ruff format --check \
   tests/integration/core/dag/test_dag_scenario_production_path.py
 
 env -u VIRTUAL_ENV uv run --frozen mypy \
-  tests/fixtures/dag_scenario_corpus \
-  tests/unit/architecture/test_dag_scenario_corpus_contract.py \
-  tests/integration/core/dag/test_dag_scenario_production_path.py
+  src/ elspeth-lints/src/
 
 git diff --check
 git status --short --branch
@@ -723,6 +733,8 @@ git status --short --branch
 
 Run additional scenario-specific recovery suites and every Warpline
 reverification item affected by that child. Scale is outside this sprint.
+The project-supported strict mypy surface is `src/ elspeth-lints/src/`;
+`tests/` and `scripts/` are deliberately outside that gate.
 
 The full repository gate is reserved for the final combined milestone and is
 the local equivalent of the required CI lanes:
