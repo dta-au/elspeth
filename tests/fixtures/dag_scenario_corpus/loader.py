@@ -21,6 +21,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     HarnessCaseSpec,
     ScenarioManifest,
     ScenarioSpec,
+    SemanticRunExpectation,
     Stage,
     Workflow,
 )
@@ -44,6 +45,12 @@ _EXACT_HARNESS_STAGES_BY_WORKFLOW: dict[Workflow, tuple[Stage, ...]] = {
     "run": ("config", "build", "runtime", "audit"),
     "recovery": ("config", "build", "runtime", "audit", "recovery"),
 }
+
+
+def _exact_harness_stages(case: HarnessCaseSpec) -> tuple[Stage, ...]:
+    if isinstance(case.expected, SemanticRunExpectation):
+        return ("config", "build", "runtime")
+    return _EXACT_HARNESS_STAGES_BY_WORKFLOW[case.workflow]
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -78,15 +85,15 @@ def _load_yaml_without_duplicate_keys(path: Path) -> object:
 
 
 def load_manifest(path: Path = DEFAULT_MANIFEST_PATH) -> ScenarioManifest:
-    """Load the v1 manifest and fail closed on schema or semantic drift."""
+    """Load the corpus manifest schema v2 and fail closed on semantic drift."""
 
     raw = _load_yaml_without_duplicate_keys(path)
     if not isinstance(raw, dict):
         raise ValueError(f"DAG scenario manifest must be a YAML mapping: {path}")
     schema_version = raw.get("schema_version")
     # An isinstance check would admit bool because bool subclasses int.
-    if type(schema_version) is not int or schema_version != 1:
-        raise ValueError(f"DAG scenario manifest schema_version must be exactly integer 1: {path}")
+    if type(schema_version) is not int or schema_version != 2:
+        raise ValueError(f"DAG scenario manifest schema_version must be exactly integer 2: {path}")
     manifest = ScenarioManifest.model_validate(raw)
     _validate_exact_inventory(manifest)
     _validate_evidence_references(manifest)
@@ -188,7 +195,7 @@ def _validate_evidence_references(manifest: ScenarioManifest) -> None:
         if reference.kind != "harness":
             continue
         case = registered_cases_by_locator[reference.locator]
-        exact_stages = _EXACT_HARNESS_STAGES_BY_WORKFLOW[case.workflow]
+        exact_stages = _exact_harness_stages(case)
         if reference.stages != exact_stages:
             raise ValueError(
                 f"DAG scenario harness evidence {reference.id!r} at {reference.locator!r} for {case.workflow} workflow "
@@ -214,7 +221,7 @@ def _validate_evidence_references(manifest: ScenarioManifest) -> None:
                         f"{locator_scenario_id!r}, which does not match containing cell {scenario.id}.{dimension}"
                     )
                 case = registered_cases_by_locator[reference.locator]
-                validated_stages = _EXACT_HARNESS_STAGES_BY_WORKFLOW[case.workflow]
+                validated_stages = _exact_harness_stages(case)
                 if required_stage is None or required_stage not in validated_stages:
                     unsupported_dimension = (
                         f"required stage {required_stage!r} for dimension {dimension!r}"
@@ -328,8 +335,16 @@ def _validate_document_locator(locator: str) -> None:
 
 def _validate_case_paths(manifest: ScenarioManifest) -> None:
     for scenario, case in iter_harness_cases(manifest):
-        for field_name, relative_path in (("fixture", case.fixture), ("input_fixture", case.input_fixture)):
+        try:
+            resolve_fixture_path(case.fixture)
+        except ValueError as exc:
+            raise ValueError(f"DAG scenario case {scenario.id}:{case.id} has invalid fixture: {exc}") from exc
+
+        resolved_inputs: list[Path] = []
+        for source_name, relative_path in case.input_fixtures.items():
             try:
-                resolve_fixture_path(relative_path)
+                resolved_inputs.append(resolve_fixture_path(relative_path))
             except ValueError as exc:
-                raise ValueError(f"DAG scenario case {scenario.id}:{case.id} has invalid {field_name}: {exc}") from exc
+                raise ValueError(f"DAG scenario case {scenario.id}:{case.id} has invalid input_fixtures[{source_name!r}]: {exc}") from exc
+        if len(set(resolved_inputs)) != len(resolved_inputs):
+            raise ValueError(f"DAG scenario case {scenario.id}:{case.id} input_fixtures resolve to duplicated paths")

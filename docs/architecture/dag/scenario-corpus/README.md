@@ -4,9 +4,12 @@ This directory holds the evergreen, executable inventory used to answer a
 specific question: which parts of Elspeth's mandatory directed acyclic graph
 (DAG) lifecycle have current production-path evidence?
 
-Start with the [v1 manifest](v1/manifest.yaml). It contains all 15 mandatory
+Start with the [v1 corpus manifest](v1/manifest.yaml). It contains all 15 mandatory
 scenarios, all 11 assessment dimensions, the evidence registry, owned gaps,
 observable exit gates, and the cases that the production-path harness runs.
+The `v1/` directory names the corpus revision; the manifest's serialized
+`schema_version` is independently versioned and is currently `2`. Schema v2
+preserves each durable token parent as an explicit ordinal/key pair.
 The [DAG information hub](../README.md) supplies the broader completeness
 assessment and remediation context.
 
@@ -40,8 +43,93 @@ records that exact graph shape plus a separately computed topology hash.
 It does not create an audit database or an orchestrator, and its runtime,
 audit, and recovery evidence remains explicitly unattempted. A `build` case is
 therefore executable evidence only for `config` and `build`; it cannot support
-runtime, audit, or recovery cells. The `run` and `recovery` workflows continue
-to use `RunExpectation` and cross their declared later lifecycle stages.
+runtime, audit, or recovery cells. A `run` or `recovery` case may use the
+exact-audit `RunExpectation` or the narrower `SummaryRunExpectation`, which
+pins only overall status, output count, and required audit record types. A
+summary expectation cannot by itself establish exact runtime, audit, or
+recovery completeness. A `run` case may instead use
+`SemanticRunExpectation` when scheduler ordering prevents a stable raw
+identity oracle. That expectation pins exact outputs, counters, record counts,
+and an order-insensitive runtime projection, but deliberately excludes raw
+audit identity. Its harness evidence is therefore limited to exactly
+`[config, build, runtime]` and cannot support an audit or recovery pass.
+
+Exact projections preserve stateful runtime records as typed evidence rather
+than collapsing them into record counts. Aggregation cases include immutable
+batch membership and a separate `intermediate_outcomes` collection for
+non-terminal `BUFFERED` history; `terminal_dispositions` remains exactly one
+terminal record per token. Expansion cases include stable parent identity,
+expected child count, dense child ordinals, and durable parent links. Source
+validation and transform failures retain their typed error records, while
+sink-effect audit material pins publication and inspect/reconcile/commit
+attempts. This lets the B3 cases prove exact runtime and portable-audit parity
+without broadening terminal semantics or inferring omitted material.
+
+The current B3 set is deliberately bounded: EOF immutable aggregation, JSON
+parent/child expansion, retry success, source quarantine, transform discard,
+transform error routing, and one ordinary write-once sink. The ordinary cases
+provide runtime/audit evidence. Three dedicated fresh-object cases also
+provide recovery evidence at the EOF aggregation, expansion child-handoff,
+and pending-sink redrive seams. The pending-sink case deliberately spans three
+fresh runtime/object lifetimes within one process: the initial run durably
+reaches `PENDING_SINK` after source exhaustion, the first public resume claims
+that exact work item and faults before sink-effect reservation, and the second
+public resume uses an injected clock to expire and recover that lease before
+publishing. These cases do not promote concurrency or scale, whose gaps remain
+independently owned in the manifest.
+The disposition scenario also keeps runtime and audit partial until the
+authoritative scheduler-disposition and follower-drain work tracked by
+`elspeth-2e66723070` and `elspeth-6f6bbbec00` is integrated; the local exact
+cases remain evidence without substituting for those authorities.
+
+Every `recovery` case also declares a closed `recovery_kind`, so the shared
+harness cannot silently apply one topology's restart assertions to another.
+The `parallel_sink_finalization` evidence records exact before/after sink
+effect, artifact, and attempt identities while fixing `held_barrier_proven` to
+false: terminal-arm asymmetry is useful partial evidence, not proof that one
+parallel coalesce barrier remained held. The `eof_aggregation` case injects one
+fail-once fault before an EOF transform result, then proves that public resume
+retains the original failed batch, creates one distinct completed retry batch,
+and reuses the same ordered three-member token set. The
+`expansion_child_enqueue` case faults after the source is durably exhausted and
+all children are enqueued but before sink flush, then proves exact 3-parent,
+6-child, 3-group, and 9-work-item identity across public resume. That case uses
+the supported observed-schema JSON source contract; fixed-schema `any` resume
+reconstruction remains separately owned by P1 `elspeth-0b0eaa63df`. Both cases
+also require terminal token/work state, checkpoint removal, no source replay,
+canonical outputs, and exact durable/export parity. The
+`pending_sink_redrive` case proves the same work, token, row, payload, sink,
+outcome, path, error, and scheduler-attempt bundle survives expiry. It requires
+one exact sink-specific `RECOVER_EXPIRED_LEASE` transition that clears the old
+owner before a fresh claim, no effect or artifact before recovery, and exactly
+one final sink effect, member, artifact, and publication with the expected
+three public sink-effect attempts. It also proves terminal state, checkpoint
+cleanup, no source replay, and durable/export parity. All three recovery
+proofs remain provisional until they are rerun after the deferred-platform
+rebase.
+
+The checkpoint case adds a separate terminal-resume idempotence proof rather
+than treating the resumed audit history as identical to a fresh run. A fresh
+control and the fail-once EOF crash/resume path are reduced to a typed terminal
+projection: stable rows and lineage, final completed node and scheduler state,
+completed batch membership, terminal dispositions, counters, and canonical
+sink bytes. Those terminal projections must be exactly equal. The resumed
+run's complete durable projection remains independently retained in the
+runtime/audit evidence, including its legitimate failed and successful attempt
+history. Its separate digest is pinned in the manifest after normalizing only
+the ephemeral corpus runtime-root string and deterministically remapping the
+node identities derived from that string; the remaining history stays in the
+digest. A third fresh settings/plugin/graph/config/runtime lifetime
+then calls the public resume API with the stale resume point and must receive
+the exact terminal `NonResumableRunError`. Before and after that refusal the
+harness requires identical SQLite file bytes, durable-record and public-export
+hashes, every entry in the isolated artifact-root tree, and per-declared-artifact
+byte digests. This is an in-process
+fresh-object proof, not an OS-process or multi-process claim. It promotes only
+the checkpoint runtime and audit cells: contracts remain partial under
+`elspeth-f321e3ff21`, recovery remains partial under `elspeth-245b21351b`,
+concurrency and scale remain unchanged, and the evidence is provisional until
+the deferred-platform rebase.
 
 The manifest does not replace the criteria, and a dated assessment does not
 replace the live manifest. Documentary evidence can explain a cell, but only
@@ -75,12 +163,15 @@ For a corpus harness case:
 2. Add a case beneath that scenario's `cases` list. Its locator is
    `<scenario-id>:<case-id>`.
 3. Select the narrowest honest workflow: `build` with an exact
-   `BuildExpectation`, `run` with a `RunExpectation`, or `recovery` with a
-   `RunExpectation`. The schema rejects mismatched workflow and expectation
-   kinds.
+   `BuildExpectation`; `run` with an exact-audit `RunExpectation`, a
+   runtime-only `SemanticRunExpectation`, or a `SummaryRunExpectation`; or
+   `recovery` with an exact-audit `RunExpectation` or
+   `SummaryRunExpectation`. The schema rejects build expectations on later
+   workflows and semantic-runtime expectations on recovery.
 4. Add one top-level evidence record with `kind: harness`, the same locator,
    a precise claim, and only the stages it proves. Build-only evidence must use
-   exactly `[config, build]`.
+   exactly `[config, build]`; semantic-runtime evidence must use exactly
+   `[config, build, runtime]`.
 5. Reference that evidence ID only from cells its assertions actually prove.
 6. Extend the table-driven assertions in the
    [production-path integration test](../../../../tests/integration/core/dag/test_dag_scenario_production_path.py)

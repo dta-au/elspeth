@@ -21,14 +21,13 @@ transforms:
     options:
       schema: {mode: observed}
       operations: [{target: branch_marker, expression: "'a'"}]
-  - name: mark_c
-    plugin: value_transform
+  - name: lose_c
+    plugin: dag_corpus_branch_loss
     input: path_c
     on_success: merge_c
     on_error: discard
     options:
       schema: {mode: observed}
-      operations: [{target: branch_marker, expression: "'c'"}]
   - name: mark_b
     plugin: value_transform
     input: path_b
@@ -40,8 +39,10 @@ transforms:
 coalesce:
   - name: merge_paths
     branches: {path_a: merge_a, path_b: merge_b, path_c: merge_c}
-    policy: require_all
-    merge: nested
+    policy: quorum
+    quorum_count: 2
+    merge: select
+    select_branch: path_a
     on_success: output
 sinks:
   output:

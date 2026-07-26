@@ -1,22 +1,22 @@
 sources:
   primary:
-    plugin: csv
-    on_success: batch_in
+    plugin: json
+    on_success: source_out
     options:
       path: ${input_primary}
       on_validation_failure: discard
-      schema: {mode: fixed, fields: ["id: int", "value: int"]}
-aggregations:
-  - name: eof_sum
-    plugin: dag_corpus_fail_once_eof_batch
-    input: batch_in
+      schema: {mode: fixed, fields: ["order_id: int", "items: any"]}
+transforms:
+  - name: explode_items
+    plugin: json_explode
+    input: source_out
     on_success: output
     on_error: discard
-    trigger: {count: 100}
-    output_mode: transform
     options:
+      array_field: items
+      output_field: item
+      include_index: true
       schema: {mode: observed}
-      fault_marker_path: ${fault_marker}
 sinks:
   output:
     plugin: json

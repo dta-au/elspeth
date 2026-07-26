@@ -1,22 +1,19 @@
 sources:
   primary:
     plugin: csv
-    on_success: batch_in
+    on_success: retry_in
     options:
       path: ${input_primary}
       on_validation_failure: discard
       schema: {mode: fixed, fields: ["id: int", "value: int"]}
-aggregations:
-  - name: eof_sum
-    plugin: dag_corpus_fail_once_eof_batch
-    input: batch_in
+transforms:
+  - name: retry_once
+    plugin: dag_corpus_retry_once
+    input: retry_in
     on_success: output
     on_error: discard
-    trigger: {count: 100}
-    output_mode: transform
     options:
       schema: {mode: observed}
-      fault_marker_path: ${fault_marker}
 sinks:
   output:
     plugin: json
@@ -25,3 +22,7 @@ sinks:
       path: ${output_output}
       format: jsonl
       schema: {mode: observed}
+retry:
+  max_attempts: 2
+  initial_delay_seconds: 0.01
+  max_delay_seconds: 0.1

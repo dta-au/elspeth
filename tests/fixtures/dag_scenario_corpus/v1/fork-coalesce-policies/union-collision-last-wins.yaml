@@ -41,7 +41,8 @@ coalesce:
   - name: merge_paths
     branches: {path_a: merge_a, path_b: merge_b, path_c: merge_c}
     policy: require_all
-    merge: nested
+    merge: union
+    union_collision_policy: last_wins
     on_success: output
 sinks:
   output:

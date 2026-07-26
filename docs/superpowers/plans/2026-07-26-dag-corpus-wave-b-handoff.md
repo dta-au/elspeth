@@ -1,417 +1,309 @@
-# DAG Corpus Wave B Autonomy Handoff
+# DAG Corpus Wave B Integration and Resume Handoff
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use
-> `superpowers:subagent-driven-development` for each bounded packet and
-> `superpowers:verification-before-completion` before every tracker close or
-> integration. Use the project-local Filigree, Loomweave, and Warpline
-> workflows at their normal gates. Keep one coordinator as the sole manifest
-> integrator.
+> **For agentic workers:** Use `superpowers:subagent-driven-development` for
+> bounded implementation packets and `superpowers:verification-before-completion`
+> before closing a tracker issue or accepting an integration. Use the
+> project-local Filigree, Loomweave, and Warpline workflows at their normal
+> gates. Keep one coordinator as the sole manifest integrator.
 
-**Goal:** Resume the maintained DAG scenario corpus from the verified Wave A
-boundary, integrate it with the finalized deferred-platform runtime, and close
-the remaining 109 applicable non-pass cells with executable production-path
-evidence or an honest tested rejection contract.
+**Goal:** Preserve the verified pre-platform Wave B corpus, combine it with the
+current release, rebase the paused deferred-platform work onto that combined
+source, and reaccept every provisional recovery/runtime/audit claim before
+candidate freeze.
 
-**Architecture:** Wave A remains the typed configuration-to-production-build
-foundation. Wave B adds production runtime, audit, recovery, checkpoint, and
-multi-worker evidence only after the deferred-platform implementation boundary
-and full two-process matrix are stable. The preferred lane integrates before
-candidate review/freeze; any later integration invalidates and repeats the
-complete acceptance sequence. Independent authoring and product-capability
-packets remain separate so they cannot silently weaken runtime or tracker
-ownership boundaries.
+**Architecture:** Wave B deliberately proves only the current single-process
+production path. The deferred-platform branch remains the owner of distributed
+session, run, lease, epoch, reclaim, and late-completion authority. Combining
+the two branches is therefore a staged invalidation and reacceptance exercise,
+not a textual merge followed by assumed acceptance.
 
-**Tech Stack:** Python 3.12/3.13, Pydantic v2, PyYAML, pytest, Elspeth's
-production DAG builder, Orchestrator, Landscape, PostgreSQL/SQLite, Filigree,
-Loomweave, Warpline, Ruff, and mypy.
+**Tech stack:** Python 3.13, Pydantic v2, PyYAML, pytest, SQLAlchemy, Elspeth's
+production `ExecutionGraph`, `Orchestrator`, `LandscapeDB`, checkpoint/recovery
+APIs, PostgreSQL/SQLite, Filigree, Loomweave, Warpline, Ruff, and mypy.
 
 ---
 
-## Current status
+## Final pre-platform snapshot
 
-This handoff is operational guidance, not release evidence or an approval
-receipt. Refresh every volatile fact before acting.
+Recorded on 2026-07-27. Refresh all volatile facts before executing this
+handoff.
 
-Recorded on 2026-07-26:
-
-- Wave A branch: `codex/dag-corpus-wave-a`
-- Wave A base: `release/0.7.2@2a3452e3452581008b5fb61b1e75ad0b8f03fb2f`
-- Wave A implementation/evidence head:
-  `f6920ea9a43e99953a9b5e9efa7dec463f1851a3`
-- Focused corpus gate: `191 passed`
-- Full branch head: refresh with `git rev-parse codex/dag-corpus-wave-a`;
-  handoff-only commits follow the implementation/evidence head
-- Manifest verdict: `not_complete`
-- Parent: `elspeth-ef29ef6ba4`, open and `in_progress`
-- Closed Wave A children:
-  - `elspeth-e8acea2a55` at
-    `5e799c06605ae8ddcd896a338189b5669672bc06`
-  - `elspeth-d88d0e45c0` at
-    `90e218f2bbe117e69157e4cd70238f238d179bf5`
-  - `elspeth-a77a50d44d` at
-    `be5f183aa7735adb3b5e3291709855056b54a68f`
-
-The deferred-platform worktree is **not complete** and continues to advance.
-Do not record one of its transient commits as the Wave B trigger. Until that
-branch is integrated, the live plan authority is the file in
-`/home/john/elspeth/.worktrees/deferred-platform-completion` on branch
-`codex/deferred-platform-completion`:
-
-```bash
-PLATFORM_WORKTREE=/home/john/elspeth/.worktrees/deferred-platform-completion
-git -C "$PLATFORM_WORKTREE" status --short --branch
-git -C "$PLATFORM_WORKTREE" rev-parse HEAD
-sed -n '1,$p' \
-  "$PLATFORM_WORKTREE/docs/superpowers/plans/2026-07-26-finish-deferred-deployment-platforms.md"
-```
-
-Read the entire live file before choosing an integration lane. The relative
-[deferred-platform plan copy](2026-07-26-finish-deferred-deployment-platforms.md)
-on this Wave A branch ends at Task 17 and is stale, historical, and
-non-authoritative. After rebasing onto an implementation or release commit
-that contains the active plan, reread the merged copy from that combined
-worktree before executing it.
-
-Authoritative inputs:
-
-- [Wave A design](../specs/2026-07-26-dag-corpus-wave-a-design.md)
-- [Wave A implementation plan](2026-07-26-dag-corpus-wave-a.md)
-- Active deferred-platform plan in the worktree and branch named above; the
-  relative Wave A copy is retained only for history
-- [Maintained corpus manifest](../../architecture/dag/scenario-corpus/v1/manifest.yaml)
-- [DAG completeness criteria](../../architecture/dag/completeness-criteria.md)
-
-## Integration lanes and start boundary
-
-Choose exactly one lane from current live state. Both lanes require the active
-plan's complete two-process acceptance matrix. Neither lane treats a transient
-Task commit as a durable trigger.
-
-### Lane A — preferred pre-freeze integration
-
-Pause the platform branch after every implementation and candidate-boundary
-task through Task 20 is committed and verified, including the full
-two-process failure, cancellation, and race matrix, but **before Task 21
-review/freeze begins**. At that clean boundary, capture the implementation SHA
-for this integration session, rebase Wave A, complete the Wave B packets, and
-merge the combined corpus into `codex/deferred-platform-completion`. Then run
-Tasks 21 through 27 once on the combined source tree.
-
-The boundary SHA is valid only when those predicates are true. Confirm them
-from the live plan and branch history before recording it:
-
-```bash
-PLATFORM_WORKTREE=/home/john/elspeth/.worktrees/deferred-platform-completion
-test -z "$(git -C "$PLATFORM_WORKTREE" status --short)"
-PLATFORM_IMPLEMENTATION_SHA=$(git -C "$PLATFORM_WORKTREE" rev-parse HEAD)
-git -C "$PLATFORM_WORKTREE" show --no-patch --format=fuller \
-  "$PLATFORM_IMPLEMENTATION_SHA"
-```
-
-This is the preferred autonomy lane because corpus changes enter before the
-candidate review, source freeze, immutable image build, live Azure Container
-Apps (ACA) and Azure Files acceptance, and receipt binding.
-
-### Lane B — invalidate and repeat post-freeze acceptance
-
-Use this lane if Task 21 or any later candidate-acceptance step has begun. It
-is mandatory when the platform task has already completed Task 27 before
-corpus integration.
-
-If Task 27 is complete, capture its verified `release/0.7.2` merge commit as
-the historical platform base. Branch from that commit, integrate Wave A and
-all intended Wave B packets, and explicitly invalidate the prior frozen
-candidate, immutable image, live acceptance, and receipt. The prior artifacts
-remain historical platform evidence only; they do not accept the changed
-combined source tree.
-
-Restart at Task 21 on the combined branch and rerun the full active-plan
-sequence:
-
-1. Task 21 independent review, repair, and complete candidate gates.
-2. Task 22 source freeze and a new immutable image build.
-3. Task 23 live ACA and Azure Files acceptance for that new image.
-4. Task 24 receipt rebinding and claim promotion from the new evidence.
-5. Task 25 post-binding verifier and complete gates.
-6. Task 26 final independent review; any bound-input repair returns to Task 21.
-7. Task 27 merge and post-merge release gates on the combined tree.
-
-Local corpus tests, a Docker smoke, or an operator P0 pass cannot restore the
-invalidated provider acceptance by themselves.
-
-## What Wave A delivered
-
-### Commit ledger
-
-| Commit | Result |
+| Surface | Exact recorded fact |
 | --- | --- |
-| `fb93fedfe2ae4f53efea56058360eb18236659c9` | Defines the bounded Wave A design and implementation plan. |
-| `3d5b793ef6107c76ad66f45ecfee9bd58a36a31a` | Adds the first runtime-consumed input attribution repair. |
-| `5e799c06605ae8ddcd896a338189b5669672bc06` | Rejects absent, comment-only, decoy, and mismatched source fixture paths. |
-| `90e218f2bbe117e69157e4cd70238f238d179bf5` | Contains decoded repository-relative documentation links inside the repository. |
-| `0e45845cb4a0f0e7e0a14a87619c4330f57e507a` | Adds the typed build workflow and four bounded production-build cases. |
-| `65613e479ca56d8c022434d2fe0f7a30f52bd5ec` | Clarifies that build evidence stops before runtime, audit, and recovery. |
-| `be5f183aa7735adb3b5e3291709855056b54a68f` | Closes schema/loader evidence-integrity findings from independent review. |
-| `f6920ea9a43e99953a9b5e9efa7dec463f1851a3` | Requires harness evidence to stay within its locator scenario and validated lifecycle stages, including rejection from non-lifecycle cells. |
+| Wave B worktree | `/home/john/elspeth/.worktrees/dag-corpus-wave-b` |
+| Wave B implementation/evidence head | `210a92d544dbb10d5d0b438351f123e05da19f5d` (immutable evidence boundary) |
+| Wave B integration tip | Capture `codex/dag-corpus-wave-b^{commit}` at execution; it must pass the allowed-tail checks below |
+| Recorded release head (volatile) | `release/0.7.2@ad7f1e277e2ecab75e33bdda6d82c0342d418600` |
+| Release/Wave B merge base | `5308e8c8867c6c6c26964a82eaf1081e2d1327d0` |
+| Divergence at the implementation/evidence head | 35 release-only commits and 20 Wave-B-only commits |
+| Expected divergence after this two-file handoff commit | 35 release-only commits and 21 Wave-B-only commits; verify dynamically rather than pinning the future commit ID |
+| Paused platform worktree | `/home/john/elspeth/.worktrees/deferred-platform-completion` |
+| Recorded paused-platform head (volatile) | `codex/deferred-platform-completion@132bd53232ea6b3885250675c361d3c057b19ac5` |
+| Platform replay base | `696b3d1414ed7a6789c8f25bf5cbdc5450385bdd` |
+| Recorded platform replay range | 13 commits in `696b3d1414ed7a6789c8f25bf5cbdc5450385bdd..132bd53232ea6b3885250675c361d3c057b19ac5`; refresh the tip at execution |
+| Platform progress | Clean and paused after Task 5 of the live deferred-platform plan |
+| Focused corpus gate | 541 passed, 2 expected xfailed, 3 known quorum warnings |
+| Static gate | Focused Ruff check, Ruff format check, mypy, and `git diff --check` green |
+| Parent issue | `elspeth-ef29ef6ba4`, open and `in_progress` |
 
-The manifest now has 57 evidence records: 51 `pytest` and 6 `harness`.
-It registers six executable cases: four `build`, one `run`, and one
-`recovery`.
+Wave B is **not** based on the current release head. Never describe
+`210a92d544dbb10d5d0b438351f123e05da19f5d` as the final Wave B branch head,
+a combined commit, or a release-ready commit. It is the immutable
+implementation/evidence boundary. The handoff commit itself is part of Wave B
+and must be included in integration through the dynamically captured
+`WAVE_B_INTEGRATION_TIP`.
 
-### Exact Wave A graph facts
+After the single final two-file handoff commit, exactly one commit may follow
+the implementation/evidence head, and that commit may change only these files:
 
-| Case | Nodes | Edges | Typed node counts | Sorted edge labels |
-| --- | ---: | ---: | --- | --- |
-| `multiple-independent-sources:independent-roots` | 3 | 2 | `source=2`, `sink=1` | `on_success`, `on_success` |
-| `multi-source-queue-fan-in:queued-fan-in` | 5 | 4 | `source=2`, `queue=1`, `transform=1`, `sink=1` | `continue`, `continue`, `continue`, `on_success` |
-| `conditional-routing:two-way-gate` | 4 | 3 | `source=1`, `gate=1`, `sink=2` | `continue`, `false`, `true` |
-| `fork-coalesce-policies:require-all-nested` | 4 | 4 | `source=1`, `gate=1`, `coalesce=1`, `sink=1` | `continue`, `on_success`, `path_a`, `path_b` |
+- `docs/superpowers/plans/2026-07-26-dag-corpus-wave-b-handoff.md`
+- `docs/superpowers/plans/2026-07-26-dag-corpus-wave-b-preplatform-sprint.md`
 
-Each case crosses real YAML loading, plugin instantiation in preflight mode,
-`ExecutionGraph.from_plugin_instances`, graph and edge validation, and
-production pipeline-config assembly. The declared expectation and observed
-evidence require the same exact node count, edge count, node-type counts, and
-sorted labels. Duplicate edge labels remain significant.
+At execution, capture and validate the tip instead of comparing the branch to
+a stale recorded SHA:
 
-### Evidence boundary
+```bash
+wave_b_worktree=/home/john/elspeth/.worktrees/dag-corpus-wave-b
+wave_b_implementation_head=210a92d544dbb10d5d0b438351f123e05da19f5d
+wave_b_integration_tip=$(git -C "$wave_b_worktree" \
+  rev-parse codex/dag-corpus-wave-b^{commit})
+git -C "$wave_b_worktree" merge-base --is-ancestor \
+  "$wave_b_implementation_head" "$wave_b_integration_tip"
+test "$(git -C "$wave_b_worktree" rev-list --count \
+  "$wave_b_implementation_head..$wave_b_integration_tip")" -eq 1
+test "$(git -C "$wave_b_worktree" diff --name-only \
+  "$wave_b_implementation_head..$wave_b_integration_tip" | sort)" = \
+  "$(printf '%s\n' \
+    docs/superpowers/plans/2026-07-26-dag-corpus-wave-b-handoff.md \
+    docs/superpowers/plans/2026-07-26-dag-corpus-wave-b-preplatform-sprint.md \
+    | sort)"
+git -C "$wave_b_worktree" diff --check \
+  "$wave_b_implementation_head..$wave_b_integration_tip"
+```
 
-Wave A proves:
+Review that one-commit documentation diff before integration. If the allowed
+tail is absent, longer than one commit, or touches another path, stop and
+reconcile it explicitly. The next durable combined source boundary must
+contain the refreshed release tip and this validated Wave B integration tip.
 
-- strict manifest, fixture, evidence-locator, and documentation-link contracts;
-- the declared input fixture is the input every configured source consumes;
-- production configuration loading and plugin preflight instantiation;
-- production graph construction and validation;
-- production pipeline-config assembly; and
-- exact build graph evidence for the four cases above.
+The active deferred-platform plan is the complete file in the paused platform
+worktree:
 
-Wave A does **not** prove:
+`/home/john/elspeth/.worktrees/deferred-platform-completion/docs/superpowers/plans/2026-07-26-finish-deferred-deployment-platforms.md`
 
-- Orchestrator traversal or output disposition for those four build cases;
-- Landscape audit records or audit-first ordering;
-- restart, checkpoint, resume, redrive, or crash recovery;
-- lease expiry, reclaim, late-completion refusal, or multi-worker races;
-- guided authoring or semantic round-trip completeness; or
-- release, Docker, Kubernetes, Azure, trust-tier, or fingerprint acceptance.
+Read it in full after every rebase. This handoff does not replace that plan.
 
-The four build cases deliberately report only completed stages `config` and
-`build`. Runtime, audit, and recovery remain explicit unattempted zero-value
-evidence. Do not promote later cells by analogy.
+The release-branch coordination reference
+`docs/superpowers/plans/2026-07-26-p1-work-bucket-coordination-reference.md`
+is absent from this Wave B branch. Refresh its stale R2/R3 facts only after the
+branches are reconciled; do not manufacture a Wave B copy.
 
-## Live remaining-cell ledger
+## What Wave B accepted
 
-The current manifest has 15 scenarios and 165 cells. Exactly 44 are `pass`,
-55 `partial`, 16 `fail`, 38 `unknown`, and 12 `not_applicable`. Excluding
-`pass` and `not_applicable`, 109 applicable cells remain.
+The final B4-A commit is
+`210a92d544dbb10d5d0b438351f123e05da19f5d` (`test(dag): prove terminal
+resume idempotence`). It closed `elspeth-8a6f52b2f6` and promoted only
+`checkpoint-deterministic-resume.runtime` and
+`checkpoint-deterministic-resume.audit`.
+
+B4-A proves a single-process, fresh-object control-versus-reopen/resume path,
+including terminal second-resume refusal with zero durable or output mutation.
+It does not prove distributed ownership, checkpoint compatibility across the
+deferred-platform rebase, or the complete checkpoint recovery contract. Its
+runtime/audit promotion is provisional until post-rebase reacceptance.
+
+### Final manifest ledger
+
+The schema-v2 manifest contains 15 scenarios, 39 registered cases, 99 evidence
+references, and 165 cells. Its verdict remains `not_complete`.
 
 | Dimension | Pass | Partial | Fail | Unknown | N/A | Applicable non-pass |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `config` | 13 | 0 | 1 | 0 | 1 | 1 |
-| `build` | 13 | 1 | 1 | 0 | 0 | 2 |
-| `contracts` | 6 | 8 | 1 | 0 | 0 | 9 |
-| `runtime` | 0 | 12 | 1 | 2 | 0 | 15 |
-| `audit` | 0 | 12 | 0 | 2 | 1 | 14 |
-| `recovery` | 0 | 8 | 0 | 6 | 1 | 14 |
+| `build` | 14 | 0 | 1 | 0 | 0 | 1 |
+| `contracts` | 10 | 4 | 1 | 0 | 0 | 5 |
+| `runtime` | 12 | 2 | 1 | 0 | 0 | 3 |
+| `audit` | 9 | 5 | 0 | 0 | 1 | 5 |
+| `recovery` | 3 | 6 | 0 | 5 | 1 | 11 |
 | `concurrency` | 0 | 4 | 0 | 10 | 1 | 14 |
 | `freeform` | 12 | 0 | 1 | 0 | 2 | 1 |
 | `guided` | 0 | 2 | 11 | 0 | 2 | 13 |
 | `round_trip` | 0 | 7 | 0 | 5 | 3 | 12 |
 | `scale` | 0 | 1 | 0 | 13 | 1 | 14 |
-| **Total** | **44** | **55** | **16** | **38** | **12** | **109** |
+| **Total** | **73** | **31** | **16** | **33** | **12** | **80** |
 
-Current ownership encoded in those 109 cells:
+Current ownership encoded in the 80 applicable non-pass cells:
 
-| Owner issue | Cells | Guidance |
-| --- | ---: | --- |
-| `elspeth-ef29ef6ba4` | 78 | Keep as the corpus umbrella; create bounded children rather than one long-lived implementation claim. |
-| `elspeth-7cf763da7c` | 12 | Playwright semantic round-trip lane; currently open and unclaimed. Reconcile before creating a corpus child. |
-| `elspeth-7e2dd67275` | 12 | Guided gate capability; currently held by John Morrissey. Do not steal or duplicate it. |
-| `elspeth-a5b86149d4` | 6 | Row-union product capability; currently held by John Morrissey. Prove current rejection without inventing the capability. |
-| `elspeth-7cdc4da434` | 1 | Closed state-engine issue still owns `row-expansion-parent-child-recovery.recovery:partial`; reconcile that stale owner before promoting or reassigning the cell. |
+| Owner issue | Partial | Fail | Unknown | Total |
+| --- | ---: | ---: | ---: | ---: |
+| `elspeth-ef29ef6ba4` | 12 | 0 | 15 | 27 |
+| `elspeth-7cf763da7c` | 7 | 0 | 5 | 12 |
+| `elspeth-7e2dd67275` | 2 | 10 | 0 | 12 |
+| `elspeth-cb1053fe46` | 1 | 0 | 13 | 14 |
+| `elspeth-a5b86149d4` | 0 | 6 | 0 | 6 |
+| `elspeth-3a6fa9141f` | 3 | 0 | 0 | 3 |
+| `elspeth-b1f23d8d83` | 1 | 0 | 0 | 1 |
+| `elspeth-f321e3ff21` | 1 | 0 | 0 | 1 |
+| `elspeth-245b21351b` | 1 | 0 | 0 | 1 |
+| `elspeth-2e66723070` | 1 | 0 | 0 | 1 |
+| `elspeth-6f6bbbec00` | 1 | 0 | 0 | 1 |
+| `elspeth-67b44040ee` | 1 | 0 | 0 | 1 |
 
-## Independently executable packets
+Do not promote cells from aggregate counts, neighbouring scenarios, or a clean
+rebase. Recompute this ledger mechanically after every manifest change.
 
-The packets partition all 109 applicable non-pass cells exactly. A packet is a
-test/evidence boundary, not permission to claim the external capability issue
-named by a cell.
+## Integrated issue and commit ledger
 
-| Packet | Scenarios and dimensions | Cells | Platform posture |
-| --- | --- | ---: | --- |
-| B1 — source, fan-in, and routing runtime | `linear`, `multiple-independent-sources`, `multi-source-queue-fan-in`, `conditional-routing`; runtime/audit/recovery/concurrency/scale | 20 | Start from Lane A's verified implementation boundary or Lane B's explicitly invalidated prior-acceptance base. |
-| B2 — fork, coalesce, and parallel runtime | `fork-multiple-terminals-partial-failure`, `fork-coalesce-policies`, `sequential-nested-fork-coalesce`, `parallel-coalesces`; remaining build/contracts plus runtime/audit/recovery/concurrency/scale | 24 | Start from Lane A's verified implementation boundary or Lane B's explicitly invalidated prior-acceptance base. |
-| B3 — stateful data and disposition runtime | `aggregation-immutable-batch`, `row-expansion-parent-child-recovery`, `retry-quarantine-discard-routed-errors`, `sink-write-pending-redrive`; contracts/runtime/audit/recovery/concurrency/scale | 23 | Use the selected lane's base; rehome the stale closed owner before changing row-expansion recovery. |
-| B4 — checkpoint and distributed ownership | `checkpoint-deterministic-resume`, `multi-worker-lease-reclaim-late-completion`; contracts/runtime/audit/recovery/concurrency/scale | 12 | Most platform-coupled packet. Reuse the active plan's landed session/run/Landscape authority and full two-process harness; do not build a parallel lease model. |
-| C1 — authoring and semantic round-trip | Guided and `round_trip` cells for the 12 applicable scenarios from `linear` through `sink-write-pending-redrive`, excluding `row-union-interleave` | 24 | Independent of platform runtime, but gated by live ownership and product behavior in `elspeth-7e2dd67275` and `elspeth-7cf763da7c`. |
-| C2 — row-union decision boundary | `row-union-interleave` config/build/contracts/runtime/freeform/guided | 6 | Independent product lane. Until `elspeth-a5b86149d4` lands, add executable fail-closed rejection evidence and retain honest `fail` statuses. |
+| Relationship | Issue | Scope | Integrated close commit |
+| --- | --- | --- | --- |
+| Wave A child | `elspeth-e8acea2a55` | Runtime-consumed input evidence integrity | `5e799c06605ae8ddcd896a338189b5669672bc06` |
+| Wave A child | `elspeth-d88d0e45c0` | Repository-relative link containment | `90e218f2bbe117e69157e4cd70238f238d179bf5` |
+| Wave A child | `elspeth-a77a50d44d` | Bounded config/build graph cases | `be5f183aa7735adb3b5e3291709855056b54a68f` |
+| Wave B child | `elspeth-e107732f81` | F0 exact evidence contracts | `0ae4bbfd4ce733b38934dcef3471586185420b8b` |
+| Wave B child | `elspeth-d80523e188` | B1 runtime/audit | `8242fd4e5d1568fd286542375b9ee8d33c88440e` |
+| Wave B child | `elspeth-6c1b21df32` | B2-5 partial terminal failure | `649d7bd667a79b57ea215334636cdd73428e8fd9` |
+| Wave B child | `elspeth-e6a48f671b` | B2-6 coalesce matrix | `11153a0ac0b71ed620367e14b995510e480ea788` |
+| Wave B child | `elspeth-dacc3c9e1f` | B2-7/8 composed coalesces | `4c929bbea396d04fcb3fba090c59d9b425a40764` |
+| Wave B child | `elspeth-a19d62ab4c` | Parallel coalesce recovery | `906c6915dd4935a871fac3e34175b2633ba2cebe` |
+| Wave B child | `elspeth-208c060cad` | B3 runtime/audit | `016bba6059b8e1815e147decf6d3fde01c68e290` |
+| Wave B child | `elspeth-272a236fc8` | B3 aggregation/expansion recovery | `e4d71d392d9a1d10596615e5a61af9213525ce0a` |
+| Authoritative external task | `elspeth-76bb92bc7d` | Full sink bundle/redrive | `7b2563c51871b992f7bba79b5fd9ecc25cf58520` |
+| Wave B child | `elspeth-8a6f52b2f6` | B4-A terminal resume idempotence | `210a92d544dbb10d5d0b438351f123e05da19f5d` |
 
-B1 through B4 may run in parallel only in isolated worktrees with distinct
-fixture directories and packet-specific test modules. They all need the
-manifest, loader, and common harness, so one coordinator must integrate them
-serially and rerun the full corpus gate after every packet. C1 and C2 can
-remain independent of the platform trigger, but integrating them after the
-Wave A rebase avoids a second collision round.
+The implementation/evidence range is the 20 commits after
+`5308e8c8867c6c6c26964a82eaf1081e2d1327d0` through
+`210a92d544dbb10d5d0b438351f123e05da19f5d`. The integration range extends
+through the validated dynamic `WAVE_B_INTEGRATION_TIP`, including the one
+expected two-file handoff commit. Preserve that entire range; do not reduce the
+ledger to close commits alone because supporting schema, fixture,
+documentation, review, and handoff repairs are separate commits.
 
-## Rebase and integration order
+## Honest open blockers
 
-- [ ] **Step 1: Refresh live state and plan authority.** Read the parent, all
-  cell-owner issues, deferred-platform issues, release task, Docker task, and
-  operator P0. Check active worktrees and claims. Read the full plan from the
-  active platform worktree. A stale lease is not permission to steal a
-  human-owned or advancing task.
-- [ ] **Step 2: Choose Lane A or Lane B.** Use Lane A only while Tasks 1 through
-  20 are complete and Task 21 has not begun. If Task 21 has begun, any corpus
-  source/evidence integration uses Lane B and invalidates current candidate
-  acceptance.
+### Expected xfails
 
-### Lane A procedure — integrate before Task 21
+The focused gate is not a zero-nonpass suite. It has two expected xfails:
 
-- [ ] **A1: Capture the clean implementation boundary.** Keep the platform
-  worktree paused after Task 20 and set `PLATFORM_IMPLEMENTATION_SHA` with the
-  Lane A command above. Record why the live plan's implementation and full
-  two-process gates are complete at that commit.
-- [ ] **A2: Rebase Wave A onto that boundary.** In one shell:
+- `test_b2_composed_coalesces_raw_identity_converges_across_equivalent_runs[sequential-nested-fork-coalesce-two-sequential-require-all]`
+- `test_b2_composed_coalesces_raw_identity_converges_across_equivalent_runs[parallel-coalesces-two-parallel-require-all]`
 
-  ```bash
-  PLATFORM_WORKTREE=/home/john/elspeth/.worktrees/deferred-platform-completion
-  WAVE_A_WORKTREE=/home/john/elspeth/.worktrees/dag-corpus-wave-a
-  PLATFORM_IMPLEMENTATION_SHA=$(git -C "$PLATFORM_WORKTREE" rev-parse HEAD)
-  test -z "$(git -C "$PLATFORM_WORKTREE" status --short)"
-  test -z "$(git -C "$WAVE_A_WORKTREE" status --short)"
-  git -C "$WAVE_A_WORKTREE" rebase --onto \
-    "$PLATFORM_IMPLEMENTATION_SHA" \
-    2a3452e3452581008b5fb61b1e75ad0b8f03fb2f \
-    codex/dag-corpus-wave-a
-  ```
+Both cite `elspeth-3a6fa9141f`. Equivalent require-all executions still derive
+durable parent ordinals, lineage, and sink-effect identity from arrival order.
+Keep the three affected audit cells partial. A report that says only “541
+passed” is false; preserve `541 passed, 2 xfailed, 3 warnings` until the bug is
+fixed and the xfails are removed.
 
-  Do not resolve conflicts by choosing one whole side. Keep the platform
-  runtime/session/Landscape authority and reapply the Wave A typed
-  manifest/schema/harness contracts around that production path. The rebase
-  must bring in the active 27-task plan; reread that merged copy before
-  continuing.
-- [ ] **A3: Reverify Wave A and recompute the ledger.** The focused gate must
-  collect the same 191 tests unless an intentional reviewed packet changes the
-  inventory. Static checks and `git diff --check` must pass.
-- [ ] **A4: Execute and integrate the packets.** Create one child issue and
-  isolated branch per packet. Base every packet on the same verified
-  platform-plus-Wave-A tip. Integrate B1, B2, B3, B4, C1, then C2 serially into
-  `codex/dag-corpus-wave-a`, rerunning the full corpus gate after each packet.
-  Recompute the manifest ledger in the same commit as each evidence/status
-  change.
-- [ ] **A5: Merge the complete corpus into the paused platform branch.** With
-  both worktrees clean:
+### Blocked recovery children
 
-  ```bash
-  PLATFORM_WORKTREE=/home/john/elspeth/.worktrees/deferred-platform-completion
-  git -C "$PLATFORM_WORKTREE" merge --no-ff codex/dag-corpus-wave-a \
-    -m "merge: integrate DAG corpus before candidate freeze"
-  git -C "$PLATFORM_WORKTREE" status --short --branch
-  ```
+Seven P2 children remain open and blocked by P3
+`elspeth-7dcc6554e7` (bounded TTL wait for `SinkEffectLeaseHeld`):
 
-  Rerun the corpus and implementation gates on this combined branch. This
-  merge is before Task 21, so no candidate image or receipt exists to preserve.
-- [ ] **A6: Execute Tasks 21 through 27 once on the combined branch.** Reread
-  the active plan from the platform worktree, then perform independent review,
-  freeze, immutable build, live provider acceptance, receipt binding,
-  post-binding verification, final review, merge, and post-merge release gates
-  in their documented order.
-
-### Lane B procedure — invalidate and repeat acceptance
-
-- [ ] **B1: Capture the accepted platform base.** If Task 27 already
-  completed, require a clean `release/0.7.2` worktree and record its full SHA:
-
-  ```bash
-  RELEASE_WORKTREE=/home/john/elspeth
-  test "$(git -C "$RELEASE_WORKTREE" branch --show-current)" = "release/0.7.2"
-  test -z "$(git -C "$RELEASE_WORKTREE" status --short)"
-  PRIOR_ACCEPTANCE_BASE_SHA=$(git -C "$RELEASE_WORKTREE" \
-    rev-parse release/0.7.2^{commit})
-  git -C "$RELEASE_WORKTREE" show --no-patch --format=fuller \
-    "$PRIOR_ACCEPTANCE_BASE_SHA"
-  ```
-
-  If Task 21 has begun but Task 27 has not completed, use the clean current
-  candidate branch commit instead and assign its full commit ID to
-  `PRIOR_ACCEPTANCE_BASE_SHA`. In either case, call it a prior acceptance base,
-  not the final combined release.
-- [ ] **B2: Rebase Wave A and execute all intended packets.** Rebase the clean
-  Wave A branch onto the prior acceptance base using the same `rebase --onto`
-  shape as Lane A, with `PRIOR_ACCEPTANCE_BASE_SHA` as the new base. Reread
-  the now-current merged 27-task plan. Reverify 191 tests, then integrate B1
-  through C2 serially and recompute the ledger after each packet.
-- [ ] **B3: Record invalidation before making release claims.** The corpus
-  diff changes source/evidence paths outside Task 24's closed post-acceptance
-  allowlist. Preserve the earlier image and receipt as historical evidence,
-  but do not reuse their accepted status, hashes, or provider claims for the
-  combined branch.
-- [ ] **B4: Create a fresh combined acceptance branch/worktree.** For example:
-
-  ```bash
-  RELEASE_WORKTREE=/home/john/elspeth
-  COMBINED_BRANCH=codex/dag-corpus-post-platform-acceptance
-  COMBINED_WORKTREE=/home/john/elspeth/.worktrees/dag-corpus-post-platform-acceptance
-  git -C "$RELEASE_WORKTREE" branch "$COMBINED_BRANCH" \
-    codex/dag-corpus-wave-a
-  git -C "$RELEASE_WORKTREE" worktree add \
-    "$COMBINED_WORKTREE" "$COMBINED_BRANCH"
-  sed -n '1,$p' \
-    "$COMBINED_WORKTREE/docs/superpowers/plans/2026-07-26-finish-deferred-deployment-platforms.md"
-  ```
-
-  Use a different explicit branch/worktree name if either already exists; do
-  not overwrite or reuse an active worktree.
-- [ ] **B5: Restart at Task 21.** Run full independent review and candidate
-  gates, freeze the combined source, build a new immutable image, repeat live
-  ACA and Azure Files acceptance, bind a new receipt, run the post-binding
-  verifier, and conduct final independent review. Any bound-input repair
-  invalidates the new evidence and returns execution to Task 21.
-- [ ] **B6: Run Task 27 for the new candidate.** Merge the actual
-  `COMBINED_BRANCH` rather than the old completed platform branch, then run the
-  binding verifier and both post-merge release-gate modes on `release/0.7.2`.
-  Only this new combined acceptance can become final release evidence.
-
-## Collision and coordination map
-
-| Surface | Collision rule |
+| Packet | Open children |
 | --- | --- |
-| `tests/fixtures/dag_scenario_corpus/harness.py` | One packet at a time may change common dispatch or evidence shapes. Prefer packet-specific adapters before expanding the shared harness. |
-| `docs/architecture/dag/scenario-corpus/v1/manifest.yaml` | Coordinator-owned during integration. Workers may prepare packet-local manifest patches, but the coordinator reapplies and validates them serially. |
-| Orchestrator | Use the landed production entry point and run-admission authority. Never add a corpus-only execution shortcut or bypass a permit/fence to make evidence pass. |
-| Landscape | Use the landed audit-first, run-ownership, checkpoint, and finalization contracts. Every late or stale worker assertion must prove refusal before durable mutation. |
-| Sessions and blob authority | Do not reuse pre-platform process-local locks. Resolve session operation fences, blob version domains, and cleanup authority from the merged platform implementation. |
-| Checkpoint/recovery | Share production checkpoint compatibility and resume admission. Do not mock away implementation identity, sink-effect safety, or incomplete-source checks. |
-| Multi-worker/lease/concurrency | Reuse the active plan's verified independent-process PostgreSQL harness and exact lease/epoch semantics. A thread-only or single-process imitation is not evidence. |
-| Guided/Playwright authoring | Coordinate with the current owners of `elspeth-7e2dd67275` and `elspeth-7cf763da7c`; do not edit their active worktrees or convert product gaps into corpus-only behavior. |
-| Row union | Preserve the tested unsupported/rejection contract until the product issue lands. Queue and coalesce are not substitutes for a row-union barrier. |
-| CI and release files | Packet workers do not edit version, Docker, deployment, trust-tier, fingerprint, or release-gate surfaces. Escalate any required gate change to the release coordinator. |
+| B1-X | `elspeth-1805aec2a6`, `elspeth-3ae349b761`, `elspeth-9e74843418`, `elspeth-7729c0beb5` |
+| B2-X | `elspeth-d09414a1a0`, `elspeth-e7a8fb1547`, `elspeth-cd09538cd0` |
 
-## Packet execution discipline
+This is a priority inversion: a P3 blocks seven P2 children and contributes to
+an unfinished P1 umbrella. Reconcile the dependency and priority before
+dispatch. Do not close the children or promote their recovery cells merely
+because adjacent recovery cases pass.
 
-For each packet:
+### Product and platform blockers
 
-1. Refresh the parent and external owner issues. Create a child under
-   `elspeth-ef29ef6ba4` with exact scenarios, dimensions, files, and done
-   definition.
-2. Atomically use `start-work --advance` on that child with a packet-specific
-   assignee. On `CONFLICT`, stop; do not clear another assignee.
-3. Resolve current production owners through Loomweave before broad source
-   navigation. Use Warpline on the completed diff to derive the re-verification
-   worklist; unavailable enrichment is not a clean result.
-4. Write the failing production-path assertion first. A skip, xfail, direct
-   graph construction, documentary reference, or plan citation is not
-   executable corpus evidence.
-5. Implement the smallest complete fixture/harness change. Defects discovered
-   in the packet's correctness boundary belong to the packet; do not hide them
-   in an expiring observation.
-6. Obtain fresh specification-compliance and quality reviews. Repair every
-   valid finding and rerun the exact regression plus the full corpus gate.
-7. Commit the packet, add exact verification and commit evidence to its child,
-   close only that child, and release any umbrella claim. Keep the parent open
-   until the complete manifest acceptance is actually satisfied.
+- `elspeth-b1f23d8d83`: union collision policy is absent from canonical
+  coalesce node and audit identity.
+- `elspeth-3a6fa9141f`: coalesce parent order is arrival-dependent; owns the
+  two xfails and three partial audit cells.
+- `elspeth-d3960e8463`: public resume can skip residual `PENDING_SINK` work.
+- `elspeth-0b0eaa63df`: fixed-schema `any` fields cannot be reconstructed from
+  persisted JSON Schema. The bounded observed-schema proof does not close it.
+- `elspeth-f321e3ff21` and `elspeth-245b21351b`: checkpoint compatibility and
+  post-leadership cleanup remain on the paused platform branch.
+- `elspeth-9a52eb80f9`: registered independent-process orchestration and sink
+  redrive remains the authority for B4-B.
 
-## Verification commands
+### Scale dependency deadlock
 
-Run these from the combined corpus worktree after the rebase and after every
-packet integration:
+All 14 applicable scale cells point to `elspeth-cb1053fe46`, but that issue is
+blocked by `elspeth-ef29ef6ba4`. The parent cannot satisfy its manifest-based
+completion contract while its scale owner waits for the parent to close.
+Reconcile that dependency before scale execution, normally by removing the
+parent-as-blocker edge while keeping both issues open. Do not weaken either
+acceptance contract merely to break the cycle.
+
+## Required combine, rebase, and reacceptance sequence
+
+This snapshot is still before deferred-platform Task 21, so use the
+pre-freeze sequence unless live state proves Task 21 or later has begun.
+
+1. **Refresh and freeze inputs.** Require clean worktrees. Capture the current
+   release and platform tips as volatile execution inputs; do not require them
+   to equal the recorded snapshot. Capture `WAVE_B_INTEGRATION_TIP` and require
+   the implementation-head ancestry, one-commit allowed tail, exact two-file
+   path set, and clean diff shown above. Refresh the parent, all blocker
+   issues, the release task, Docker task, and operator P0. An active or
+   human-owned claim is not available work.
+2. **Create one combined release/Wave B commit.** Start an isolated integration
+   branch from the refreshed `release/0.7.2` tip, merge or replay through
+   `WAVE_B_INTEGRATION_TIP`, resolve conflicts semantically, and run the
+   focused/static floor below. Require both the refreshed release tip and
+   `WAVE_B_INTEGRATION_TIP` to be ancestors of the result. Record the resulting
+   full `COMBINED_SHA`. Do not merge directly into the release checkout before
+   review.
+3. **Rebase the refreshed paused-platform replay range.** After review of the
+   combined source, capture the live platform tip. Require the recorded replay
+   base to remain its ancestor, review any commits after the recorded
+   `132bd53232ea6b3885250675c361d3c057b19ac5` snapshot, and replay through the
+   captured tip onto `COMBINED_SHA`:
+
+   ```bash
+   platform_worktree=/home/john/elspeth/.worktrees/deferred-platform-completion
+   platform_replay_base=696b3d1414ed7a6789c8f25bf5cbdc5450385bdd
+   platform_integration_tip=$(git -C "$platform_worktree" \
+     rev-parse codex/deferred-platform-completion^{commit})
+   combined_sha=<full-reviewed-release-plus-wave-b-sha>
+   test -z "$(git -C "$platform_worktree" status --short)"
+   git -C "$platform_worktree" merge-base --is-ancestor \
+     "$platform_replay_base" "$platform_integration_tip"
+   git -C "$platform_worktree" rebase --onto \
+     "$combined_sha" "$platform_replay_base" \
+     codex/deferred-platform-completion
+   ```
+
+   Review each conflict, the recorded 13-commit range, and any explicitly
+   reviewed later platform commits. A textually clean rebase is not acceptance.
+4. **Rerun the affected platform authority suites.** Reverify Tasks 3 through
+   5 from the now-current deferred-platform plan, then continue the plan from
+   Task 6. Do not skip to provider or release work.
+5. **Invalidate pre-platform evidence.** Treat every B1-X, B2-X, B3-X, and
+   B4-A recovery/runtime/audit proof as provisional at its recorded Wave B
+   commit. Do not carry forward an evidence locator, fixture hash,
+   compatibility/topology hash, acceptance hash, or cell status solely because
+   the rebase applied cleanly.
+6. **Reaccept the corpus.** Regenerate topology and compatibility evidence,
+   rerun every registered recovery case and seam-specific verifier, rerun the
+   full corpus/static floor, and re-audit every promoted recovery/runtime/audit
+   cell against the rebased production behavior.
+7. **Implement B4-B only on the real distributed harness.** After the live
+   platform plan lands its independent-process PostgreSQL/registered-worker
+   matrix, execute scenario 15 with real Landscape claim epochs, lease expiry,
+   reclaim, stale-worker fencing, and late-completion refusal. Scenario 15
+   cannot promote another scenario's concurrency cell by analogy.
+8. **Run candidate acceptance once on the combined tree.** Complete
+   deferred-platform Tasks 21 through 27 only after source and evidence are
+   stable. If Task 21 or later had already started, explicitly invalidate the
+   candidate, image, live ACA/Azure Files evidence, and receipt, then restart
+   at Task 21.
+
+The operator P0 may continue diagnosis or staging in parallel. Its final
+signature and fingerprint-baseline result must bind the frozen combined tree;
+an earlier result is historical and must be repeated. Never hand-edit the
+baseline, bypass signature verification, or reuse operator credentials.
+
+## Exact verification floor
+
+Run these commands on Wave B now, on the combined integration branch, and
+again after the platform rebase.
 
 ```bash
 env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
@@ -437,74 +329,87 @@ git diff --check
 git status --short --branch
 ```
 
-For B4, also rerun the exact per-file and repeated combined PostgreSQL
-multi-instance commands from the live deferred-platform plan. In the active
-27-task plan this is the full two-process failure/cancellation/race task; do not
-substitute the differently numbered task in the stale Wave A plan copy. Copy
-the commands from the current combined worktree after integration rather than
-preserving a duplicate here. Run every additional test Warpline identifies.
-Before final release closeout, run the repository-owned local release gates in
-both agent and operator modes on the combined tree.
+The current pre-platform expected result is exactly `541 passed, 2 xfailed, 3
+warnings`. Investigate any collection shrink, new skip/xfail, unexpected xpass,
+or warning change.
 
-## Final release, Docker, and P0 rule
+After the platform rebase, run the complete two-file gate above and at least
+these registered/seam-specific recovery node IDs:
 
-Platform-only or corpus-only proof is not final release proof.
+```bash
+env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+  tests/integration/core/dag/test_dag_scenario_production_path.py::test_declared_recovery_case_reopens_and_resumes_publicly \
+  tests/integration/core/dag/test_dag_scenario_production_path.py::test_b3_recovery_rebuilds_fresh_settings_plugins_graph_and_config \
+  tests/integration/core/dag/test_dag_scenario_production_path.py::test_checkpoint_reopen_resume_has_exact_restart_evidence \
+  tests/integration/core/dag/test_dag_scenario_production_path.py::test_eof_aggregation_recovery_preserves_failed_batch_and_member_identity \
+  tests/integration/core/dag/test_dag_scenario_production_path.py::test_expansion_recovery_preserves_parent_child_group_and_scheduler_identity \
+  tests/integration/core/dag/test_dag_scenario_production_path.py::test_pending_sink_redrive_recovery_preserves_complete_bundle_and_exactly_once_publication \
+  tests/integration/core/dag/test_dag_scenario_production_path.py::test_parallel_coalesces_recovery_reuses_finalized_first_sink \
+  tests/unit/architecture/test_dag_scenario_corpus_contract.py::test_terminal_resume_idempotence_pins_terminal_equivalence_and_every_no_mutation_view
+```
 
-- In Lane A, Tasks 21 through 27 run once after corpus integration.
-- In Lane B, corpus integration invalidates any earlier Task 21 through 27
-  result. Repeat Tasks 21 through 26 on the combined branch and Task 27 on the
-  new merge. Do not try to repair acceptance with a narrow closeout.
+Copy the exact Task 13 PostgreSQL/testcontainer commands from the live
+deferred-platform plan after rebase; do not preserve a second, drift-prone copy
+here. Run every additional Warpline reverification item.
 
-The final combined acceptance must include all of these facts:
+Before final candidate freeze, run the repository gate:
 
-1. Task 21 independently reviews the complete platform-plus-corpus tree and
-   runs both release-gate modes. Resolve every source/evidence repair before
-   the candidate source freeze.
-2. The operator P0 trust-tier signing and supported fingerprint-baseline
-   regeneration apply to that exact combined candidate tree. If the P0 ran for
-   a platform-only tree, its result is historical and must be repeated. Never
-   hand-edit the baseline, bypass signature verification, or repurpose operator
-   credentials.
-3. Task 22 freezes that reviewed source and builds a new immutable image. Its
-   Docker checks must reconfirm startup, readiness, runtime UID/filesystem
-   behavior, and the documented external PostgreSQL/web contract. An earlier
-   RC or local Docker smoke cannot certify the changed image.
-4. Tasks 23 through 26 repeat live ACA and Azure Files acceptance, bind a new
-   receipt, run the post-binding verifier, and complete final independent
-   review. Local Docker and P0 success do not replace these provider facts.
-5. Task 27 produces the final combined `release/0.7.2` merge SHA and reruns the
-   binding verifier plus both release-gate modes on that merge. Record the full
-   SHA only after those post-merge checks pass. Any later source, test,
-   manifest, image-input, trust-tier, or receipt-input change invalidates the
-   result and returns execution to Task 21.
+```bash
+env -u VIRTUAL_ENV uv run --frozen ruff check \
+  src/ tests/ scripts/ examples/ elspeth-lints/src/
+env -u VIRTUAL_ENV uv run --frozen ruff format --check \
+  src/ tests/ scripts/ examples/ elspeth-lints/src/
+env -u VIRTUAL_ENV uv run --frozen mypy src/ elspeth-lints/src/
+env -u VIRTUAL_ENV uv run --frozen pytest tests/ -v \
+  -m "not slow and not stress and not performance and not testcontainer"
+```
 
-Do not close release/Docker work on platform-only evidence. If those issues
-were already closed by a completed platform-only Task 27, record new combined
-acceptance work under the live tracker workflow before calling the release
-final. Keep `elspeth-ef29ef6ba4` open until every applicable manifest cell is
-executable and passing, or an unsupported capability has an explicit,
-executable, fail-closed rejection contract with live ownership for the
-remaining product work.
+Tasks 21, 25, and 27 additionally run the exact agent/operator local release
+gates required by the live deferred-platform plan. Provider acceptance,
+receipt binding, signatures, and image facts must all refer to the same frozen
+combined source.
+
+## Tracker handoff and closure rule
+
+`elspeth-ef29ef6ba4` remains open. Eighty applicable cells are still non-pass,
+seven recovery children are blocked, the two xfails remain, distributed B4-B
+is absent, and the scale dependency is unresolved.
+
+After this handoff is added to the parent issue, release the
+`codex-dag-wave-b-coordinator` claim without reverting workflow status. Do not
+close the parent. Future workers claim bounded children or authoritative
+external issues; they do not hold the umbrella for the duration of the
+backlog.
+
+Close the parent only when every applicable manifest cell has executable
+passing evidence, or an unsupported capability has an explicit executable
+fail-closed rejection contract and the remaining product work has honest live
+ownership.
 
 ## Stop conditions
 
-Stop the affected packet and return to coordination when any of these occurs:
+Stop and return to coordination when:
 
-- the worker has not read the active 27-task plan from the live or combined
-  worktree;
-- Lane A's Task 1-through-20 boundary is not clean and fully verified, or Task
-  21 has already begun without switching to Lane B;
-- a captured implementation or prior-acceptance SHA changes during packet
-  setup;
-- someone proposes a corpus or other source/evidence edit after Task 21 while
-  retaining the existing image, live provider acceptance, or receipt;
-- Lane B does not schedule the complete Task 21-through-27 repeat after
-  invalidation;
-- a worker encounters an active claim or human-owned capability issue;
-- a production path requires bypassing a session, run, Landscape, checkpoint,
-  lease, or signature authority;
-- a manifest status would be promoted without complete executable evidence;
-- the full corpus collection shrinks unexpectedly or introduces a skip/xfail;
-  or
-- any source change occurs after the final release SHA is accepted without
-  returning to Task 21.
+- a worktree is dirty, a captured execution tip changes during integration,
+  or the refreshed release/platform ancestry cannot be explained and reviewed;
+- `210a92d544dbb10d5d0b438351f123e05da19f5d` is not an ancestor of the Wave B
+  integration tip, more or fewer than one commit follows it, or that tail
+  changes anything outside the two allowed handoff files;
+- the combined commit does not contain both the refreshed release tip and the
+  validated Wave B integration tip;
+- a conflict is resolved by accepting one whole side without reviewing the
+  production authority and corpus contract together;
+- the two expected xfails are omitted from a result, change unexpectedly, or a
+  new skip/xfail appears;
+- a cell would be promoted from analogy, aggregate counts, or pre-rebase
+  evidence;
+- platform Task 21 or later has begun without invalidating and restarting
+  combined acceptance;
+- B4-B uses threads, one process, web-session ownership, or a corpus-only lease
+  model instead of registered production workers against shared PostgreSQL;
+- the scale dependency cycle remains while either issue is proposed for
+  closure;
+- operator authority, provider acceptance, signing, or release publication is
+  missing; or
+- any source, manifest, image input, trust input, or receipt input changes
+  after final acceptance without returning to Task 21.

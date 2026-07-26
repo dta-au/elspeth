@@ -3,14 +3,14 @@ sources:
     plugin: csv
     on_success: output
     options:
-      path: ${input_csv}
+      path: ${input_orders}
       on_validation_failure: discard
       schema: {mode: fixed, fields: ["id: int", "value: int"]}
   refunds:
     plugin: csv
     on_success: output
     options:
-      path: ${input_csv}
+      path: ${input_refunds}
       on_validation_failure: discard
       schema: {mode: fixed, fields: ["id: int", "value: int"]}
 sinks:
@@ -18,6 +18,6 @@ sinks:
     plugin: json
     on_write_failure: discard
     options:
-      path: ${output_jsonl}
+      path: ${output_output}
       format: jsonl
       schema: {mode: observed}

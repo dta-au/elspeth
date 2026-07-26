@@ -8,7 +8,7 @@ sources:
       schema: {mode: fixed, fields: ["id: int", "value: int"]}
 aggregations:
   - name: eof_sum
-    plugin: dag_corpus_fail_once_eof_batch
+    plugin: dag_corpus_eof_batch_sum
     input: batch_in
     on_success: output
     on_error: discard
@@ -16,7 +16,6 @@ aggregations:
     output_mode: transform
     options:
       schema: {mode: observed}
-      fault_marker_path: ${fault_marker}
 sinks:
   output:
     plugin: json

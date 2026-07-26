@@ -1,0 +1,42 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: fork_input
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+concurrency:
+  max_workers: 1
+gates:
+  - name: parallel_fork
+    input: fork_input
+    condition: "True"
+    routes: {"true": fork, "false": left}
+    fork_to: [left_a, left_b, right_a, right_b]
+coalesce:
+  - name: merge_left
+    branches: {left_a: left_a, left_b: left_b}
+    policy: require_all
+    merge: nested
+    on_success: left
+  - name: merge_right
+    branches: {right_a: right_a, right_b: right_b}
+    policy: require_all
+    merge: nested
+    on_success: right
+sinks:
+  left:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_left}
+      format: jsonl
+      schema: {mode: observed}
+  right:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_right}
+      format: jsonl
+      schema: {mode: observed}
