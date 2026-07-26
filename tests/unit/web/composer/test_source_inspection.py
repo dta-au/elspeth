@@ -297,15 +297,24 @@ class TestCsvInspection:
         f = inspect_blob_content(content=body, filename="x.csv", mime_type="text/csv")
         assert f.sample_row_count <= 100
 
-    def test_duplicate_headers_emits_warning(self) -> None:
-        """Duplicate CSV headers silently collapse downstream — surface the
-        duplication so the operator can rename or use field_mapping."""
-        body = b"id,name,name,city\n1,Alice,Smith,NYC\n"
+    def test_duplicate_headers_warning_exposes_only_structural_facts(self) -> None:
+        """Duplicate values may be row content, so warnings must redact them."""
+        sentinel = "ELSPETH_DUPLICATE_HEADER_SENTINEL_7F3A"
+        body = f"id,{sentinel},{sentinel},city\n1,Alice,Smith,NYC\n".encode()
         f = inspect_blob_content(content=body, filename="x.csv", mime_type="text/csv")
         msgs = [w for w in f.warnings if "csv_duplicate_headers" in w]
         assert msgs, f.warnings
-        # Duplicate name surfaced; the warning lists the offending header.
-        assert any("'name'" in w for w in msgs), msgs
+        durable_warnings = json.dumps(facts_to_dict(f)["warnings"])
+        assert sentinel not in durable_warnings
+        assert "1 duplicate header value class(es)" in durable_warnings
+        assert "2 column position(s) [2, 3] of 4" in durable_warnings
+        assert "header values redacted" in durable_warnings
+        assert "field_mapping" not in durable_warnings
+        assert "quarantine" not in durable_warnings
+        assert "correct" in durable_warnings
+        assert "re-upload" in durable_warnings
+        assert "headerless" in durable_warnings
+        assert "explicit unique columns" in durable_warnings
 
     def test_jagged_rows_emits_warning(self) -> None:
         """Rows with cell counts that don't match the header length must

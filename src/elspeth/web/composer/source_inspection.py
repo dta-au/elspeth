@@ -595,14 +595,23 @@ def _inspect_csv(
 
     # CSV duplicate headers: pandas / csv.DictReader collapse duplicates
     # silently (last-write-wins), which fabricates a single column from
-    # multiple source columns. Surface the duplicates as a warning so the
-    # operator can rename or use field_mapping; do not fabricate a
+    # multiple source columns. Surface only the duplicate equivalence-class
+    # count and affected positions: a malformed or headerless CSV can make
+    # the first data row look like headers, so the raw values must not cross
+    # the blob metadata-only boundary in a warning copied to model diagnostics
+    # or persisted in durable guided inspection state. Do not fabricate a
     # disambiguated key here.
     if len(set(headers)) < len(headers):
         counts = Counter(headers)
-        dupes = sorted(name for name, count in counts.items() if count > 1)
+        duplicate_values = {name for name, count in counts.items() if count > 1}
+        duplicate_positions = [index for index, name in enumerate(headers, start=1) if name in duplicate_values]
         warnings.append(
-            f"csv_duplicate_headers: header(s) {dupes} appear multiple times — downstream consumers may collapse them; rename or use field_mapping"
+            f"csv_duplicate_headers: {len(duplicate_values)} duplicate header value class(es) "
+            f"across {len(duplicate_positions)} column position(s) {duplicate_positions} of "
+            f"{len(headers)}; header values redacted — downstream consumers may collapse "
+            "them; for a genuine header row, correct the source so every header is unique "
+            "and re-upload it. If the source is genuinely headerless and its first data "
+            "row was misclassified as headers, declare explicit unique columns instead"
         )
 
     # If the first row looks like data (every cell parseable as int/float/bool),

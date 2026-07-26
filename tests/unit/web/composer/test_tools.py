@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -13282,6 +13283,7 @@ class TestPreviewProofStep:
         schema_mode: str = "fixed",
         fields: tuple[object, ...] = (),
         on_validation_failure: str = "discard",
+        columns: tuple[str, ...] | None = None,
     ):
         """Build a state with a CSV blob source via the composer tool API."""
         schema: dict[str, object] = {"mode": schema_mode}
@@ -13292,13 +13294,16 @@ class TestPreviewProofStep:
         catalog = _mock_catalog()
         # Wire source via set_source_from_blob — this is the canonical way to
         # produce a state with source.options.blob_ref set.
+        source_options: dict[str, object] = {"schema": schema}
+        if columns is not None:
+            source_options["columns"] = list(columns)
         result = execute_tool(
             "set_source_from_blob",
             {
                 "blob_id": self.csv_blob_id,
                 "on_success": "rows",
                 "on_validation_failure": on_validation_failure,
-                "options": {"schema": schema},
+                "options": source_options,
             },
             state,
             catalog,
@@ -13610,7 +13615,7 @@ class TestPreviewProofStep:
     # violation and must force the repair loop, not pass through as
     # advisory info.
 
-    def _replace_csv_blob_with_duplicate_headers(self) -> None:
+    def _replace_csv_blob_with_duplicate_headers(self, *, headerless: bool = False) -> str:
         """Overwrite the seeded CSV blob's bytes + content_hash so it has
         duplicate headers. Must update content_hash to match the new bytes
         or the proof step's BlobIntegrityError check will fire instead.
@@ -13620,7 +13625,11 @@ class TestPreviewProofStep:
         from elspeth.web.blobs.service import content_hash as _content_hash
         from elspeth.web.sessions.models import blobs_table
 
-        new_bytes = b"order_id,name,name,price\nO-1,Alice,Smith,49.95\nO-2,Bob,Jones,150.00\n"
+        sentinel = "ELSPETH_DUPLICATE_HEADER_SENTINEL_7F3A"
+        if headerless:
+            new_bytes = (f"O-1,{sentinel},{sentinel},49.95\nO-2,Bob,Jones,150.00\n").encode()
+        else:
+            new_bytes = (f"order_id,{sentinel},{sentinel},price\nO-1,Alice,Smith,49.95\nO-2,Bob,Jones,150.00\n").encode()
         self.csv_storage_path.write_bytes(new_bytes)
         with self.engine.begin() as conn:
             conn.execute(
@@ -13631,10 +13640,11 @@ class TestPreviewProofStep:
                     content_hash=_content_hash(new_bytes),
                 )
             )
+        return sentinel
 
     def test_csv_duplicate_headers_blocks(self) -> None:
         """Duplicate CSV headers must surface as a blocking proof diagnostic."""
-        self._replace_csv_blob_with_duplicate_headers()
+        sentinel = self._replace_csv_blob_with_duplicate_headers()
         state = self._state_with_csv_source(schema_mode="observed")
         result = execute_tool(
             "preview_pipeline",
@@ -13653,11 +13663,83 @@ class TestPreviewProofStep:
         # Must carry an actionable suggested_repair string (not None) so the
         # forced-repair loop has a concrete remedy to relay to the LLM.
         assert isinstance(dup["suggested_repair"], str) and dup["suggested_repair"], dup
-        # The warning text must reach the LLM verbatim — it names the
-        # offending header(s).
-        assert "name" in dup["message"], dup
+        model_visible_payload = json.dumps(deep_thaw(diagnostics), sort_keys=True)
+        assert sentinel not in model_visible_payload
+        assert "1 duplicate header value class(es)" in dup["message"]
+        assert "2 duplicate column position(s)" in dup["message"]
+        assert dup["evidence_locator"]["observed_header_count"] == 4
+        assert dup["evidence_locator"]["duplicate_header_class_count"] == 1
+        assert dup["evidence_locator"]["duplicate_header_column_count"] == 2
+        assert tuple(dup["evidence_locator"]["duplicate_header_positions"]) == (2, 3)
+        assert dup["evidence_locator"]["header_values_redacted"] is True
+        repair = dup["suggested_repair"]
+        assert "field_mapping" not in repair
+        assert "on_validation_failure" not in repair
+        assert "quarantine" not in repair
+        assert "correct" in repair
+        assert "re-upload" in repair
+        assert "headerless" in repair
+        assert "explicit unique `columns`" in repair
         # is_valid is forced False by the blocking proof diagnostic.
         assert result.data["is_valid"] is False
+
+    def test_explicit_unique_columns_clear_duplicate_warning_for_headerless_input(self) -> None:
+        self._replace_csv_blob_with_duplicate_headers(headerless=True)
+        state = self._state_with_csv_source(
+            schema_mode="observed",
+            columns=("order_id", "given_name", "family_name", "price"),
+        )
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        codes = [d["code"] for d in result.data["proof_diagnostics"]]
+        assert "csv_duplicate_headers" not in codes
+
+    def test_preview_redacts_regressed_duplicate_warning_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Generation must not trust even a regressed source warning string."""
+        import elspeth.web.composer.tools.generation as generation_module
+        from elspeth.web.composer.source_inspection import SourceInspectionFacts
+
+        raw_warning_sentinel = "RAW_GENERATION_SENTINEL_91D2"
+        raw_facts = SourceInspectionFacts(
+            source_kind="csv",
+            redacted_identity={"filename": "orders.csv", "mime_type": "text/csv", "byte_size": "1"},
+            byte_range_inspected=(0, 1),
+            sample_row_count=1,
+            observed_headers=("order_id", "repeated", "repeated", "price"),
+            inferred_types=None,
+            url_candidates=(),
+            warnings=(f"csv_duplicate_headers: {raw_warning_sentinel}",),
+        )
+        monkeypatch.setattr(generation_module, "inspect_csv_source_content", lambda **_kwargs: raw_facts)
+        state = self._state_with_csv_source(schema_mode="observed")
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        diagnostics = result.data["proof_diagnostics"]
+        serialized = json.dumps(deep_thaw(diagnostics), sort_keys=True)
+        duplicate = next(d for d in diagnostics if d["code"] == "csv_duplicate_headers")
+        assert raw_warning_sentinel not in serialized
+        assert duplicate["severity"] == "blocking"
+        assert duplicate["evidence_locator"]["duplicate_header_class_count"] == 1
+        assert duplicate["evidence_locator"]["duplicate_header_column_count"] == 2
+        assert tuple(duplicate["evidence_locator"]["duplicate_header_positions"]) == (2, 3)
+        assert duplicate["evidence_locator"]["header_values_redacted"] is True
+        assert "re-upload" in duplicate["suggested_repair"]
 
     def test_csv_without_duplicate_headers_does_not_block(self) -> None:
         """Clean headers must not produce a csv_duplicate_headers diagnostic."""

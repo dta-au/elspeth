@@ -23,6 +23,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -6359,10 +6360,20 @@ class TestAttemptProofRepair:
             session_engine=engine,
         )
 
-    def _state_with_blocking_csv(self):
-        """Build a state whose preview emits csv_fixed_schema_omits_observed_columns."""
+    def _replace_blob_content(self, body: bytes) -> None:
+        from elspeth.web.blobs.service import content_hash as _content_hash
+
+        self.storage_path.write_bytes(body)
+        with self.engine.begin() as conn:
+            conn.execute(
+                blobs_table.update().where(blobs_table.c.id == self.blob_id).values(size_bytes=len(body), content_hash=_content_hash(body))
+            )
+
+    def _state_with_blocking_csv(self, *, schema: dict[str, Any] | None = None):
+        """Build a blob-backed CSV state; the default schema emits the fixed-schema blocker."""
         state = _empty_state()
         catalog = _mock_catalog()
+        source_schema = schema if schema is not None else {"mode": "fixed", "fields": ["order_id: str"]}
         # Wire the source via set_source_from_blob (canonical path).
         result = _execute_tool(
             "set_source_from_blob",
@@ -6370,7 +6381,7 @@ class TestAttemptProofRepair:
                 "blob_id": self.blob_id,
                 "on_success": "rows",
                 "on_validation_failure": "discard",
-                "options": {"schema": {"mode": "fixed", "fields": ["order_id: str"]}},
+                "options": {"schema": source_schema},
             },
             state,
             catalog,
@@ -6478,6 +6489,77 @@ class TestAttemptProofRepair:
         assert "preview_pipeline" in msg["content"]
         # Budget note acknowledges the cap
         assert "forced repair turn 1 of 2" in msg["content"]
+
+    def test_duplicate_header_repair_payload_withholds_raw_header_values(self) -> None:
+        sentinel = "ELSPETH_DUPLICATE_HEADER_SENTINEL_7F3A"
+        self._replace_blob_content((f"order_id,{sentinel},{sentinel},price\nO-1,Alice,Smith,49.95\n").encode())
+        state = self._state_with_blocking_csv(schema={"mode": "observed"})
+        messages: list[dict[str, Any]] = []
+
+        outcome = self.service._attempt_proof_repair(
+            state=state,
+            llm_messages=messages,
+            session_id=self.session_id,
+            repair_turns_used=0,
+        )
+
+        assert outcome.action == "repair_injected"
+        assert any(d["code"] == "csv_duplicate_headers" for d in outcome.blocking_diagnostics)
+        provider_payload = messages[0]["content"]
+        durable_diagnostics = repr(outcome.blocking_diagnostics)
+        assert sentinel not in provider_payload
+        assert sentinel not in durable_diagnostics
+        assert "csv_duplicate_headers" in provider_payload
+        assert "duplicate header" in provider_payload
+        assert "field_mapping" not in provider_payload
+        assert "on_validation_failure" not in provider_payload
+        assert "quarantine" not in provider_payload
+        assert "correct" in provider_payload
+        assert "re-upload" in provider_payload
+        assert "headerless" in provider_payload
+
+    def test_duplicate_header_raw_warning_is_not_relayed_to_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import elspeth.web.composer.tools.generation as generation_module
+        from elspeth.web.composer.source_inspection import SourceInspectionFacts
+
+        raw_warning_sentinel = "RAW_GENERATION_SENTINEL_91D2"
+        raw_facts = SourceInspectionFacts(
+            source_kind="csv",
+            redacted_identity={"filename": "orders.csv", "mime_type": "text/csv", "byte_size": "1"},
+            byte_range_inspected=(0, 1),
+            sample_row_count=1,
+            observed_headers=("order_id", "repeated", "repeated", "price"),
+            inferred_types=None,
+            url_candidates=(),
+            warnings=(f"csv_duplicate_headers: {raw_warning_sentinel}",),
+        )
+        monkeypatch.setattr(generation_module, "inspect_csv_source_content", lambda **_kwargs: raw_facts)
+        state = self._state_with_blocking_csv(schema={"mode": "observed"})
+        messages: list[dict[str, Any]] = []
+
+        outcome = self.service._attempt_proof_repair(
+            state=state,
+            llm_messages=messages,
+            session_id=self.session_id,
+            repair_turns_used=0,
+        )
+
+        duplicate = next(d for d in outcome.blocking_diagnostics if d["code"] == "csv_duplicate_headers")
+        serialized_provider_content = json.dumps(
+            {
+                "blocking_diagnostic": deep_thaw(duplicate),
+                "provider_message": messages[0],
+            },
+            sort_keys=True,
+        )
+        assert outcome.action == "repair_injected"
+        assert raw_warning_sentinel not in serialized_provider_content
+        assert duplicate["evidence_locator"]["duplicate_header_class_count"] == 1
+        assert duplicate["evidence_locator"]["duplicate_header_column_count"] == 2
+        assert tuple(duplicate["evidence_locator"]["duplicate_header_positions"]) == (2, 3)
+        assert duplicate["evidence_locator"]["header_values_redacted"] is True
+        assert "re-upload" in messages[0]["content"]
+        assert "field_mapping" not in messages[0]["content"]
 
     def test_second_repair_message_increments_turn_counter_in_text(self) -> None:
         state = self._state_with_blocking_csv()
