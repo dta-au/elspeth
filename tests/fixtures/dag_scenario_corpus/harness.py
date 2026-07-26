@@ -17,7 +17,16 @@ import yaml
 from sqlalchemy import select
 
 from elspeth.contracts import RunStatus
+from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_MAX_CHUNK_BYTES,
+    AUDIT_EXPORT_MAX_CHUNK_RECORDS,
+    AUDIT_EXPORT_SERIALIZATION_VERSION,
+    AuditExportDerivationConfig,
+    derive_audit_export_bundle,
+)
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.hashing import canonical_json as contract_canonical_json
+from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
@@ -894,10 +903,281 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
     )
 
 
+def _record_index(
+    records: list[dict[str, Any]],
+    *,
+    record_type: str,
+    key_fields: tuple[str, ...],
+    source: str,
+) -> dict[tuple[object, ...], dict[str, Any]]:
+    indexed: dict[tuple[object, ...], dict[str, Any]] = {}
+    for record in records:
+        if record.get("record_type") != record_type:
+            continue
+        key = tuple(record.get(field) for field in key_fields)
+        if key in indexed:
+            raise AssertionError(f"DAG corpus {source} {record_type} integrity: duplicate key {key!r}")
+        indexed[key] = record
+    return indexed
+
+
+def _require_material_equal(*, source: str, record_type: str, field: str, actual: object, expected: object) -> None:
+    if actual != expected:
+        raise AssertionError(f"DAG corpus {source} {record_type} integrity: {field} differs from authoritative material")
+
+
+def _sink_effect_member_id(effect_id: str, ordinal: int) -> str:
+    payload = {"payload": {"effect_id": effect_id, "ordinal": ordinal}, "schema": "sink-effect-member-v1"}
+    return hashlib.sha256(contract_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _validate_durable_sink_effect_material(records: list[dict[str, Any]]) -> None:
+    """Validate stored sink-effect hashes before portable normalization.
+
+    Request payloads are deliberately absent from both the public durable read
+    model and portable export. Their hashes therefore have only the exact
+    attempt-to-operation-call equality witness checked below; unlike the other
+    families here, shared request-hash corruption cannot be recomputed from
+    public data.
+    """
+
+    source = "durable"
+    effects = _record_index(records, record_type="sink_effect", key_fields=("effect_id",), source=source)
+    artifacts = _record_index(records, record_type="artifact", key_fields=("artifact_id",), source=source)
+    streams = _record_index(records, record_type="sink_effect_stream", key_fields=("stream_id",), source=source)
+    members = _record_index(records, record_type="sink_effect_member", key_fields=("effect_id", "ordinal"), source=source)
+    attempts = _record_index(records, record_type="sink_effect_attempt", key_fields=("effect_id", "attempt_index"), source=source)
+    operations = _record_index(records, record_type="operation", key_fields=("operation_id",), source=source)
+    calls = _record_index(records, record_type="call", key_fields=("operation_id", "call_index"), source=source)
+
+    operation_by_effect = {
+        str(operation["sink_effect_id"]): operation for operation in operations.values() if operation.get("sink_effect_id") is not None
+    }
+    for (effect_id_value,), effect in effects.items():
+        effect_id = str(effect_id_value)
+        raw_plan = effect.get("_plan_json")
+        if not isinstance(raw_plan, str):
+            raise AssertionError(f"DAG corpus durable sink_effect integrity: {effect_id} lacks public plan material")
+        try:
+            plan = json.loads(raw_plan)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"DAG corpus durable sink_effect integrity: {effect_id} plan is invalid JSON") from exc
+        if not isinstance(plan, dict):
+            raise AssertionError(f"DAG corpus durable sink_effect integrity: {effect_id} plan is not an object")
+        for field in ("effect_id", "input_kind", "plan_hash", "descriptor_mode", "protocol_version"):
+            _require_material_equal(
+                source=source,
+                record_type="sink_effect",
+                field=field,
+                actual=effect.get(field),
+                expected=plan.get(field),
+            )
+
+        descriptor = plan.get("expected_descriptor")
+        if descriptor is not None:
+            if not isinstance(descriptor, dict):
+                raise AssertionError(f"DAG corpus durable sink_effect integrity: {effect_id} expected_descriptor is not an object")
+            _require_material_equal(
+                source=source,
+                record_type="sink_effect",
+                field="expected_descriptor_hash",
+                actual=effect.get("expected_descriptor_hash"),
+                expected=stable_hash(descriptor),
+            )
+            artifact = artifacts.get((effect.get("artifact_id"),))
+            if artifact is None:
+                raise AssertionError(f"DAG corpus durable sink_effect integrity: {effect_id} references unknown artifact")
+            for field in ("artifact_type", "content_hash", "path_or_uri", "size_bytes"):
+                _require_material_equal(
+                    source=source,
+                    record_type="sink_effect",
+                    field=f"artifact.{field}",
+                    actual=artifact.get(field),
+                    expected=descriptor.get(field),
+                )
+
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect",
+            field="precondition_hash",
+            actual=effect.get("precondition_hash"),
+            expected=stable_hash(
+                {
+                    "inspection_attempt_id": effect.get("inspection_attempt_id"),
+                    "safe_evidence": plan.get("safe_evidence"),
+                }
+            ),
+        )
+        if effect.get("expected_descriptor_hash") is not None:
+            _require_material_equal(
+                source=source,
+                record_type="sink_effect",
+                field="result_descriptor_hash",
+                actual=effect.get("result_descriptor_hash"),
+                expected=effect.get("expected_descriptor_hash"),
+            )
+
+        stream_id = effect.get("stream_id")
+        stream = streams.get((stream_id,))
+        if stream is None:
+            raise AssertionError(f"DAG corpus durable sink_effect integrity: {effect_id} references unknown stream")
+        if stream.get("head_effect_id") == effect_id:
+            _require_material_equal(
+                source=source,
+                record_type="sink_effect",
+                field="stream.head_descriptor_hash",
+                actual=stream.get("head_descriptor_hash"),
+                expected=effect.get("result_descriptor_hash"),
+            )
+
+    for (effect_id_value, ordinal_value), member in members.items():
+        effect_id = str(effect_id_value)
+        ordinal = int(cast(int, ordinal_value))
+        expected_member_id = _sink_effect_member_id(effect_id, ordinal)
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_member",
+            field="member_effect_id",
+            actual=member.get("member_effect_id"),
+            expected=expected_member_id,
+        )
+        member_effect = effects.get((effect_id,))
+        if member_effect is None:
+            raise AssertionError(f"DAG corpus durable sink_effect_member integrity: {effect_id} references unknown effect")
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_member",
+            field="descriptor_hash",
+            actual=member.get("descriptor_hash"),
+            expected=member_effect.get("result_descriptor_hash"),
+        )
+
+    for (effect_id_value, attempt_index_value), attempt in attempts.items():
+        effect_id = str(effect_id_value)
+        raw_evidence = attempt.get("_evidence_json")
+        expected_evidence_hash = None
+        if raw_evidence is not None:
+            if not isinstance(raw_evidence, str):
+                raise AssertionError(f"DAG corpus durable sink_effect_attempt integrity: {effect_id} evidence is not JSON text")
+            expected_evidence_hash = hashlib.sha256(raw_evidence.encode("utf-8")).hexdigest()
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="evidence_hash",
+            actual=attempt.get("evidence_hash"),
+            expected=expected_evidence_hash,
+        )
+        operation = operation_by_effect.get(effect_id)
+        if operation is None:
+            raise AssertionError(f"DAG corpus durable sink_effect_attempt integrity: {effect_id} has no sink-effect operation")
+        call = calls.get((operation.get("operation_id"), attempt_index_value))
+        if call is None:
+            raise AssertionError(f"DAG corpus durable sink_effect_attempt integrity: {effect_id} has no matching operation call")
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="request_hash",
+            actual=attempt.get("request_hash"),
+            expected=call.get("request_hash"),
+        )
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="evidence_hash/call.response_hash",
+            actual=attempt.get("evidence_hash"),
+            expected=call.get("response_hash"),
+        )
+
+
+def _validate_portable_material_matches_durable(durable_records: list[dict[str, Any]], portable_records: list[dict[str, Any]]) -> None:
+    field_groups = (
+        (
+            "sink_effect",
+            ("effect_id",),
+            ("artifact_id", "expected_descriptor_hash", "result_descriptor_hash", "precondition_hash"),
+        ),
+        ("sink_effect_member", ("effect_id", "ordinal"), ("descriptor_hash", "member_effect_id")),
+        ("sink_effect_attempt", ("effect_id", "attempt_index"), ("request_hash", "evidence_hash")),
+        ("call", ("call_id",), ("request_hash", "response_hash")),
+    )
+    for record_type, key_fields, fields in field_groups:
+        durable = _record_index(durable_records, record_type=record_type, key_fields=key_fields, source="durable")
+        portable = _record_index(portable_records, record_type=record_type, key_fields=key_fields, source="portable")
+        if durable.keys() != portable.keys():
+            raise AssertionError(f"DAG corpus portable {record_type} integrity: record identities differ from durable data")
+        for key, durable_record in durable.items():
+            portable_record = portable[key]
+            for field in fields:
+                _require_material_equal(
+                    source="portable",
+                    record_type=record_type,
+                    field=field,
+                    actual=portable_record.get(field),
+                    expected=durable_record.get(field),
+                )
+
+
+def _validate_portable_manifest(records: list[dict[str, Any]]) -> None:
+    manifests = [record for record in records if record.get("record_type") == "manifest"]
+    if len(manifests) != 1:
+        raise AssertionError("DAG corpus portable manifest integrity: expected exactly one manifest")
+    manifest = manifests[0]
+    run_records = [record for record in records if record.get("record_type") == "run"]
+    if len(run_records) != 1:
+        raise AssertionError("DAG corpus portable manifest integrity: expected exactly one run")
+    run = run_records[0]
+    expected_completed_at = f"{run['completed_at']}Z"
+    for field, expected in (
+        ("run_id", run.get("run_id")),
+        ("source_status", run.get("status")),
+        ("source_completed_at", expected_completed_at),
+        ("export_format", "json"),
+        ("signature_algorithm", "unsigned"),
+        ("signature_key_id", "UNSIGNED"),
+    ):
+        _require_material_equal(
+            source="portable",
+            record_type="manifest",
+            field=field,
+            actual=manifest.get(field),
+            expected=expected,
+        )
+    config = AuditExportDerivationConfig(
+        source_run_id=str(run["run_id"]),
+        source_status=str(run["status"]),
+        source_completed_at=expected_completed_at,
+        export_format="json",
+        exporter_version="landscape-exporter-v1",
+        serialization_version=AUDIT_EXPORT_SERIALIZATION_VERSION,
+        chunking_algorithm_version="record-framing-v1",
+        include_raw_error_rows=False,
+        per_chunk_byte_limit=AUDIT_EXPORT_MAX_CHUNK_BYTES,
+        per_chunk_record_limit=AUDIT_EXPORT_MAX_CHUNK_RECORDS,
+        signing_mode="unsigned",
+        signer_key_id="UNSIGNED",
+        signing_key=None,
+    )
+    expected_manifest = dict(
+        derive_audit_export_bundle(
+            (record for record in records if record.get("record_type") != "manifest"),
+            config,
+        ).final_manifest
+    )
+    if manifest != expected_manifest:
+        mismatches = sorted(
+            field for field in manifest.keys() | expected_manifest.keys() if manifest.get(field) != expected_manifest.get(field)
+        )
+        raise AssertionError(f"DAG corpus portable manifest integrity: fields differ from canonical derivation: {', '.join(mismatches)}")
+
+
 def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: FilesystemPayloadStore) -> list[dict[str, Any]]:
     repositories = RecorderFactory.read_only(db, payload_store=payload_store)
     with open_export_read_transaction(db.engine) as read_model:
         unsigned_records = list(LandscapeExporter(db, read_model=read_model).iter_unsigned_run_records(run_id))
+        effect_plan_json = {effect.effect_id: effect.plan_json for effect in read_model.get_sink_effects_for_run(run_id)}
+        attempt_evidence_json = {
+            attempt.attempt_id: attempt.evidence_json for attempt in read_model.get_sink_effect_attempts_for_run(run_id)
+        }
     audit_types = {
         "artifact",
         "call",
@@ -911,6 +1191,11 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
         "sink_effect_stream",
     }
     records = [dict(record) for record in unsigned_records if record["record_type"] in audit_types]
+    for record in records:
+        if record["record_type"] == "sink_effect":
+            record["_plan_json"] = effect_plan_json[str(record["effect_id"])]
+        elif record["record_type"] == "sink_effect_attempt":
+            record["_evidence_json"] = attempt_evidence_json[str(record["attempt_id"])]
     run = next(record for record in records if record["record_type"] == "run")
     records.append(
         {
@@ -1051,11 +1336,15 @@ def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> 
             openrouter_catalog_source=catalog_source,
         )
         sink_outputs = _sink_outputs(rendered)
+        durable_records = _public_durable_records(db, run_id=result.run_id, payload_store=payload_store)
+        _validate_durable_sink_effect_material(durable_records)
         durable_projection = _stable_projection(
-            _public_durable_records(db, run_id=result.run_id, payload_store=payload_store),
+            durable_records,
             source="durable",
         )
         records = list(LandscapeExporter(db).export_run(result.run_id))
+        _validate_portable_material_matches_durable(durable_records, records)
+        _validate_portable_manifest(records)
         portable_projection = _stable_projection(records, source="portable")
         if durable_projection != portable_projection:
             raise AssertionError("DAG corpus public durable query and portable export projections differ")

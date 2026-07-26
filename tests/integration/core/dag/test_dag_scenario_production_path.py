@@ -274,6 +274,115 @@ def test_exact_runtime_projection_rejects_corrupted_portable_sink_effect_artifac
         run_scenario_case(scenario, case, tmp_path)
 
 
+def _mutate_portable_export(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    record_type: str,
+    field: str,
+    value: object,
+) -> None:
+    export_run = LandscapeExporter.export_run
+
+    def export_run_with_corrupted_material(self: LandscapeExporter, run_id: str) -> Any:
+        for record in export_run(self, run_id):
+            if record["record_type"] == record_type:
+                yield {**record, field: value}
+            else:
+                yield record
+
+    monkeypatch.setattr(LandscapeExporter, "export_run", export_run_with_corrupted_material)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("expected_descriptor_hash", "result_descriptor_hash", "precondition_hash"),
+)
+def test_exact_runtime_projection_rejects_corrupted_portable_sink_effect_hash(
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    _mutate_portable_export(monkeypatch, record_type="sink_effect", field=field, value="0" * 64)
+    install_corpus_plugin_manager(monkeypatch)
+
+    with pytest.raises(AssertionError, match=r"portable sink_effect integrity"):
+        run_scenario_case(scenario, case, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("descriptor_hash", "0" * 64), ("member_effect_id", "CORRUPTED")),
+)
+def test_exact_runtime_projection_rejects_corrupted_portable_sink_effect_member_material(
+    field: str,
+    value: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    _mutate_portable_export(monkeypatch, record_type="sink_effect_member", field=field, value=value)
+    install_corpus_plugin_manager(monkeypatch)
+
+    with pytest.raises(AssertionError, match=r"portable sink_effect_member integrity"):
+        run_scenario_case(scenario, case, tmp_path)
+
+
+@pytest.mark.parametrize("field", ("request_hash", "evidence_hash"))
+def test_exact_runtime_projection_rejects_corrupted_portable_sink_effect_attempt_hash(
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    _mutate_portable_export(monkeypatch, record_type="sink_effect_attempt", field=field, value="0" * 64)
+    install_corpus_plugin_manager(monkeypatch)
+
+    with pytest.raises(AssertionError, match=r"portable sink_effect_attempt integrity"):
+        run_scenario_case(scenario, case, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "final_hash",
+        "last_chunk_seal_hash",
+        "manifest_hash",
+        "registry_key_hash",
+        "snapshot_hash",
+        "snapshot_id",
+        "snapshot_seal_hash",
+        "signature",
+    ),
+)
+def test_exact_runtime_projection_rejects_corrupted_portable_manifest_material(
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    value = "CORRUPTED" if field == "signature" else "0" * 64
+    _mutate_portable_export(monkeypatch, record_type="manifest", field=field, value=value)
+    install_corpus_plugin_manager(monkeypatch)
+
+    with pytest.raises(AssertionError, match=r"portable manifest integrity"):
+        run_scenario_case(scenario, case, tmp_path)
+
+
+@pytest.mark.parametrize("field", ("request_hash", "response_hash"))
+def test_exact_runtime_projection_rejects_corrupted_portable_sink_effect_call_hash(
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    _mutate_portable_export(monkeypatch, record_type="call", field=field, value="0" * 64)
+    install_corpus_plugin_manager(monkeypatch)
+
+    with pytest.raises(AssertionError, match=r"portable call integrity"):
+        run_scenario_case(scenario, case, tmp_path)
+
+
 def test_exact_runtime_projection_preserves_same_name_semantic_config_difference() -> None:
     first = {
         "node_id": "sink_shared_aaaaaaaaaaaa",
