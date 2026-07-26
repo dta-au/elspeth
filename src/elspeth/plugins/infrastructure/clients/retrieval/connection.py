@@ -13,7 +13,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from elspeth.core.security.web import NetworkError, SSRFBlockedError, validate_url_for_ssrf
+from elspeth.core.security.web import (
+    NetworkError,
+    SSRFBlockedError,
+    SSRFSafeRequest,
+    validate_url_for_ssrf,
+)
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode_enabled
 
 _LOOPBACK_HOSTS = {"localhost"}
@@ -46,19 +51,21 @@ def _host_url(host: str, port: int, *, ssl: bool) -> str:
     return f"{scheme}://{url_host}:{port}/"
 
 
-def _validate_chroma_http_target(host: str, port: int, *, ssl: bool) -> None:
-    """Apply the project SSRF policy before handing the target to Chroma SDK.
+def _validate_chroma_http_target(host: str, port: int, *, ssl: bool) -> SSRFSafeRequest:
+    """Validate and resolve a Chroma target for a pinned-IP SDK connection.
 
-    The SDK owns the actual HTTP transport, so we cannot use
-    AuditedHTTPClient's pinned-IP request path here. This preflight still
-    enforces the same host/IP blocklist for user-authored Chroma targets and
-    keeps loopback-only local development explicitly bounded.
+    Callers must pass ``resolved_ip`` to the Chroma SDK. Merely validating and
+    then passing ``host`` would let the SDK resolve the hostname again, which
+    reopens the DNS-rebinding window that ``SSRFSafeRequest`` closes.
     """
     allowed_ranges = _LOOPBACK_ALLOWED_RANGES if _is_loopback_host(host) else ()
     try:
-        validate_url_for_ssrf(_host_url(host, port, ssl=ssl), allowed_ranges=allowed_ranges)
+        safe_target = validate_url_for_ssrf(_host_url(host, port, ssl=ssl), allowed_ranges=allowed_ranges)
     except (SSRFBlockedError, NetworkError) as exc:
         raise ValueError(f"ChromaDB host {host!r} is blocked by the SSRF policy: {exc}") from exc
+    if _is_loopback_host(host) and not ipaddress.ip_address(safe_target.resolved_ip).is_loopback:
+        raise ValueError(f"ChromaDB loopback host {host!r} resolved outside the loopback ranges")
+    return safe_target
 
 
 class ChromaConnectionConfig(BaseModel):

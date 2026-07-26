@@ -489,7 +489,7 @@ def prepare_local_effect(
     descriptor_size = staged.size_bytes
     if input_kind is SinkEffectInputKind.PIPELINE_MEMBERS and not accepted:
         descriptor_mode = SinkEffectDescriptorMode.NO_PUBLICATION
-        if predecessor.exists:
+        if predecessor.exists and predecessor_declared:
             if predecessor.content_hash is None or predecessor.size_bytes is None:
                 _remove_exact_staging(staging, staged)
                 raise LocalFilePreconditionError("existing no-publication predecessor has incomplete descriptor evidence")
