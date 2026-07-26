@@ -1,0 +1,28 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: retry_in
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+transforms:
+  - name: retry_once
+    plugin: dag_corpus_retry_once
+    input: retry_in
+    on_success: output
+    on_error: discard
+    options:
+      schema: {mode: observed}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_output}
+      format: jsonl
+      schema: {mode: observed}
+retry:
+  max_attempts: 2
+  initial_delay_seconds: 0.01
+  max_delay_seconds: 0.1

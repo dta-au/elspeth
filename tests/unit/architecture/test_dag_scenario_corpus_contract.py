@@ -16,8 +16,8 @@ import tests.fixtures.dag_scenario_corpus.loader as loader_module
 import tests.fixtures.dag_scenario_corpus.schema as corpus_schema
 import yaml
 from markdown_it import MarkdownIt
-from pydantic import ValidationError
-from tests.fixtures.dag_scenario_corpus.harness import compute_fixture_sha256, render_settings
+from pydantic import BaseModel, ValidationError
+from tests.fixtures.dag_scenario_corpus.harness import compute_fixture_sha256, render_settings, semantic_runtime_projection
 from tests.fixtures.dag_scenario_corpus.loader import (
     DEFAULT_MANIFEST_PATH,
     REPOSITORY_ROOT,
@@ -29,9 +29,11 @@ from tests.fixtures.dag_scenario_corpus.plugins import (
     CorpusAlwaysErrorTransform,
     CorpusAlwaysFailSink,
     CorpusBranchLossTransform,
+    CorpusEOFBatchSumTransform,
     CorpusFailOnceEOFBatchTransform,
     CorpusInputSchema,
     CorpusOutputSchema,
+    CorpusRetryOnceTransform,
     install_corpus_plugin_manager,
 )
 from tests.fixtures.dag_scenario_corpus.schema import (
@@ -204,9 +206,9 @@ EXPECTED_STATUS_MATRIX = {
     "aggregation-immutable-batch": (
         "pass",
         "pass",
-        "partial",
-        "partial",
-        "partial",
+        "pass",
+        "pass",
+        "pass",
         "partial",
         "unknown",
         "pass",
@@ -217,9 +219,9 @@ EXPECTED_STATUS_MATRIX = {
     "row-expansion-parent-child-recovery": (
         "pass",
         "pass",
-        "partial",
-        "partial",
-        "partial",
+        "pass",
+        "pass",
+        "pass",
         "partial",
         "partial",
         "pass",
@@ -257,8 +259,8 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
-        "partial",
+        "pass",
+        "pass",
         "partial",
         "partial",
         "pass",
@@ -379,6 +381,9 @@ EXPECTED_ASSESSMENT_LOCATORS = {
     "composed-coalesces-repeat-run-boundary": (
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_composed_coalesces_repeat_run_semantic_boundary",
     ),
+    "b3-stateful-runtime-exact-contracts": (
+        "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b3_stateful_runtime_cases_pin_exact_contracts",
+    ),
 }
 
 EXPECTED_ASSESSMENT_EVIDENCE = tuple(
@@ -389,8 +394,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "67379e4d8933c14c460891c64c8e66937dcf285e135f421c49469d164d863e57"
-EXPECTED_CASE_REGISTRY_SHA256 = "c6e4e174121303e3e499638649df9732eaed7ce9549d04814009c1f90ed37185"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "fc8821a8c92c517ab5a520745c13237fb3fad194f99f440016643b82647cfd57"
+EXPECTED_CASE_REGISTRY_SHA256 = "1c11627573be66296294b278ac0df8e300cf57244e3b80e747a4ef20587cf337"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -444,6 +449,13 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "sequential-nested-fork-coalesce:two-sequential-require-all": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
     "parallel-coalesces:two-parallel-require-all": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
     "parallel-coalesces:resume-after-left-finalize": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
+    "aggregation-immutable-batch:eof-immutable-membership": "0a6a82b9fbe15356ccf0437bf34b72e3324b6884b8990752c05943e0179fb9cb",
+    "row-expansion-parent-child-recovery:json-explode-parent-child": "bf40f9a9fd913518566c36bd27a0530d6edaed40dde67b69642eabacc48716ed",
+    "retry-quarantine-discard-routed-errors:retry-then-success": "add6f84b856bf06915c6275a005bfb4aef5ad50068f7c93038b6b7d99970ab90",
+    "retry-quarantine-discard-routed-errors:source-quarantine-routed": "286d04abef045d70a846b65bfc348792ff6242aff237451f30050565d8e5e639",
+    "retry-quarantine-discard-routed-errors:transform-discard": "fb4d0c91d4612e6dcb0d9903f097db8b3e50310386811ddaee15d1749de23948",
+    "retry-quarantine-discard-routed-errors:transform-error-route": "d4321f033f305d215563d2bfb62cb190df8a3eff87e10d8ac9805e9e9b45ca71",
+    "sink-write-pending-redrive:write-once": "e8344036a8baf85bba035264683e47f3502d17336db55bef5174c87d468577de",
     "checkpoint-deterministic-resume:reopen-resume": "ce62216ce20210600f1a9c20e362aaf299c7538e6c4d3bd0e97627563dc813e6",
 }
 
@@ -505,6 +517,29 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-parallel-coalesces-resume-after-left-finalize",
         "parallel-coalesces:resume-after-left-finalize",
         ("config", "build", "runtime", "audit", "recovery"),
+    ),
+    (
+        "harness-aggregation-immutable-batch-eof-immutable-membership",
+        "aggregation-immutable-batch:eof-immutable-membership",
+        ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-row-expansion-parent-child-recovery-json-explode-parent-child",
+        "row-expansion-parent-child-recovery:json-explode-parent-child",
+        ("config", "build", "runtime", "audit"),
+    ),
+    *(
+        (
+            f"harness-retry-quarantine-discard-routed-errors-{case_id}",
+            f"retry-quarantine-discard-routed-errors:{case_id}",
+            ("config", "build", "runtime", "audit"),
+        )
+        for case_id in ("retry-then-success", "source-quarantine-routed", "transform-discard", "transform-error-route")
+    ),
+    (
+        "harness-sink-write-pending-redrive-write-once",
+        "sink-write-pending-redrive:write-once",
+        ("config", "build", "runtime", "audit"),
     ),
 )
 
@@ -1419,6 +1454,217 @@ def _exact_runtime_projection_values() -> dict[str, object]:
             },
         ),
     }
+
+
+def test_b3_batch_projection_requires_dense_immutable_member_ordinals() -> None:
+    batch = corpus_schema.StableBatchProjection(
+        key="aggregation:eof_sum@stable|0",
+        aggregation_node_key="aggregation:eof_sum@stable",
+        attempt=0,
+        status="completed",
+        trigger_type="end_of_source",
+        trigger_reason="source_exhausted",
+        members=(
+            {"ordinal": 0, "token_key": "primary:0#0"},
+            {"ordinal": 1, "token_key": "primary:1#0"},
+            {"ordinal": 2, "token_key": "primary:2#0"},
+        ),
+    )
+
+    assert tuple((member.ordinal, member.token_key) for member in batch.members) == (
+        (0, "primary:0#0"),
+        (1, "primary:1#0"),
+        (2, "primary:2#0"),
+    )
+    with pytest.raises(ValidationError, match="batch member ordinals must be dense from zero"):
+        corpus_schema.StableBatchProjection(
+            key="aggregation:eof_sum@stable|0",
+            aggregation_node_key="aggregation:eof_sum@stable",
+            attempt=0,
+            status="completed",
+            trigger_type="end_of_source",
+            trigger_reason="source_exhausted",
+            members=(
+                {"ordinal": 0, "token_key": "primary:0#0"},
+                {"ordinal": 2, "token_key": "primary:1#0"},
+            ),
+        )
+
+
+def test_b3_intermediate_outcome_projection_is_separate_from_terminal_disposition() -> None:
+    outcome = corpus_schema.StableIntermediateOutcomeProjection(
+        key="primary:0#0|buffered|00000000",
+        token_key="primary:0#0",
+        ordinal=0,
+        path="buffered",
+        batch_key="aggregation:eof_sum@stable|0",
+    )
+
+    assert outcome.path == "buffered"
+    assert outcome.batch_key == "aggregation:eof_sum@stable|0"
+
+
+def test_b3_expansion_projection_binds_dense_children_to_parent_and_expected_count() -> None:
+    expansion = corpus_schema.StableExpansionProjection(
+        key="expand|primary:0#0",
+        parent_token_key="primary:0#0",
+        expected_child_count=2,
+        children=(
+            {"ordinal": 0, "token_key": "primary:0#1"},
+            {"ordinal": 1, "token_key": "primary:0#2"},
+        ),
+    )
+
+    assert expansion.expected_child_count == len(expansion.children) == 2
+    with pytest.raises(ValidationError, match="expansion children must exactly match expected_child_count"):
+        expansion.model_copy(update={"expected_child_count": 3}, deep=True).__class__.model_validate(
+            {**expansion.model_dump(mode="python"), "expected_child_count": 3}
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "field"),
+    (
+        (corpus_schema.StableValidationErrorProjection, "row_data"),
+        (corpus_schema.StableTransformErrorProjection, "error_details"),
+    ),
+)
+def test_b3_error_projections_require_canonical_json(model: type[BaseModel], field: str) -> None:
+    values: dict[str, object]
+    if model is corpus_schema.StableValidationErrorProjection:
+        values = {
+            "key": "primary:0|source:primary@stable|0",
+            "node_key": "source:primary@stable",
+            "row_key": "primary:0",
+            "row_hash": "a" * 64,
+            "row_data": '{"id":"bad"}',
+            "error": "Input should be a valid integer",
+            "schema_mode": "fixed",
+            "destination": "quarantine",
+            "violation_type": "type_mismatch",
+            "original_field_name": "id",
+            "normalized_field_name": "id",
+            "expected_type": "int",
+            "actual_type": "str",
+        }
+    else:
+        values = {
+            "key": "primary:0#0|transform:fail@stable",
+            "token_key": "primary:0#0",
+            "transform_node_key": "transform:fail@stable",
+            "row_hash": "b" * 64,
+            "row_data": '{"id":1}',
+            "error_details": '{"error":"boom","reason":"invalid_input"}',
+            "destination": "discard",
+        }
+    parsed = model.model_validate(values)
+    assert getattr(parsed, field).startswith("{")
+    values[field] = '{"z":1, "a":2}'
+    with pytest.raises(ValidationError, match=f"{field} must use canonical JSON"):
+        model.model_validate(values)
+
+
+def test_b3_stable_projection_rejects_batch_and_expansion_cross_reference_drift() -> None:
+    values = _exact_runtime_projection_values()
+    values["batches"] = (
+        {
+            "key": "aggregation:eof_sum@stable|0",
+            "aggregation_node_key": "aggregation:eof_sum@stable",
+            "attempt": 0,
+            "status": "completed",
+            "trigger_type": "end_of_source",
+            "trigger_reason": "source_exhausted",
+            "members": ({"ordinal": 0, "token_key": "missing"},),
+        },
+    )
+
+    with pytest.raises(ValidationError, match="batch members must reference projected tokens"):
+        corpus_schema.StableRunProjection.model_validate(values)
+
+    values = _exact_runtime_projection_values()
+    values["intermediate_outcomes"] = (
+        {
+            "key": "primary:0#0|buffered|00000000",
+            "token_key": "primary:0#0",
+            "ordinal": 0,
+            "path": "buffered",
+            "batch_key": "aggregation:eof_sum@missing|0",
+        },
+    )
+
+    with pytest.raises(ValidationError, match="intermediate outcomes must reference projected batches"):
+        corpus_schema.StableRunProjection.model_validate(values)
+
+
+def test_b3_exact_counter_projection_counts_every_immutable_batch_member_row() -> None:
+    values = _exact_run_expectation_values()
+    values["rows_processed"] = 3
+    projection = cast(dict[str, object], values["projection"])
+    projection["rows"] = tuple(
+        {
+            "key": f"primary:{ordinal}",
+            "source_name": "primary",
+            "source_row_index": ordinal,
+            "ingest_sequence": ordinal,
+            "source_data_hash": chr(ord("a") + ordinal) * 64,
+        }
+        for ordinal in range(3)
+    )
+    projection["tokens"] = (
+        {"key": "primary:0#0", "row_key": "primary:0", "parents": ()},
+        {
+            "key": "primary:0#1",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 0, "parent_key": "primary:0#0"},),
+        },
+        {"key": "primary:1#0", "row_key": "primary:1", "parents": ()},
+        {"key": "primary:2#0", "row_key": "primary:2", "parents": ()},
+    )
+    projection["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "batch_consumed",
+            "sink_name": None,
+        },
+        {
+            "key": "primary:0#1",
+            "token_key": "primary:0#1",
+            "outcome": "success",
+            "path": "default_flow",
+            "sink_name": "output",
+        },
+        {
+            "key": "primary:1#0",
+            "token_key": "primary:1#0",
+            "outcome": "transient",
+            "path": "batch_consumed",
+            "sink_name": None,
+        },
+        {
+            "key": "primary:2#0",
+            "token_key": "primary:2#0",
+            "outcome": "transient",
+            "path": "batch_consumed",
+            "sink_name": None,
+        },
+    )
+    projection["batches"] = (
+        {
+            "key": "aggregation:eof_sum@stable|0",
+            "aggregation_node_key": "aggregation:eof_sum@stable",
+            "attempt": 0,
+            "status": "completed",
+            "trigger_type": "end_of_source",
+            "trigger_reason": "source_exhausted",
+            "members": tuple({"ordinal": ordinal, "token_key": f"primary:{ordinal}#0"} for ordinal in range(3)),
+        },
+    )
+
+    expectation = RunExpectation.model_validate(values)
+
+    assert expectation.rows_processed == 3
 
 
 def test_stable_token_projection_preserves_durable_parent_ordinal_sequence() -> None:
@@ -2371,6 +2617,162 @@ def test_stable_node_state_rejects_noncanonical_context_and_error_json() -> None
             corpus_schema.StableRunProjection.model_validate(values)
 
 
+def test_absent_optional_audit_hash_preserves_pre_b3_serialization_shape() -> None:
+    disposition = corpus_schema.StableTerminalDisposition(
+        key="primary:0#0",
+        token_key="primary:0#0",
+        outcome="success",
+        path="default_flow",
+        sink_name="output",
+    )
+
+    assert disposition.model_dump(mode="json") == {
+        "key": "primary:0#0",
+        "token_key": "primary:0#0",
+        "outcome": "success",
+        "path": "default_flow",
+        "sink_name": "output",
+    }
+
+
+def test_semantic_projection_excludes_only_audit_error_hash_while_raw_projection_retains_it() -> None:
+    values = _exact_runtime_projection_values()
+    dispositions = cast(tuple[dict[str, object], ...], values["terminal_dispositions"])
+    dispositions[0]["error_hash"] = "a" * 16
+    raw = corpus_schema.StableRunProjection.model_validate(values)
+    without_hash = raw.model_copy(
+        update={
+            "terminal_dispositions": tuple(disposition.model_copy(update={"error_hash": None}) for disposition in raw.terminal_dispositions)
+        }
+    )
+
+    assert raw.terminal_dispositions[0].error_hash == "a" * 16
+    assert "error_hash" in raw.terminal_dispositions[0].model_dump(mode="json")
+    assert semantic_runtime_projection(raw) == semantic_runtime_projection(without_hash)
+    assert semantic_runtime_projection(raw).node_states == raw.node_states
+
+
+def test_empty_stateful_families_preserve_pre_b3_semantic_shape_and_hash() -> None:
+    raw = corpus_schema.StableRunProjection.model_validate(_exact_runtime_projection_values())
+    semantic = semantic_runtime_projection(raw)
+
+    assert tuple(semantic.model_dump(mode="json")) == (
+        "rows",
+        "tokens",
+        "node_states",
+        "routes",
+        "terminal_dispositions",
+        "scheduler_work",
+    )
+    assert corpus_harness.semantic_runtime_projection_sha256(semantic) == (
+        "c5c717143eb397468f065d99ee7ef9464305f349c154f211867202e2e9d1a02d"
+    )
+    assert corpus_harness.semantic_runtime_projection_counts(semantic).model_dump(mode="json") == {
+        "rows": 1,
+        "tokens": 1,
+        "parent_links": 0,
+        "node_states": 1,
+        "routes": 0,
+        "terminal_dispositions": 1,
+        "scheduler_work": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "case_id", "family", "count_field"),
+    (
+        ("aggregation-immutable-batch", "eof-immutable-membership", "intermediate_outcomes", "intermediate_outcomes"),
+        ("aggregation-immutable-batch", "eof-immutable-membership", "batches", "batches"),
+        ("row-expansion-parent-child-recovery", "json-explode-parent-child", "expansions", "expansions"),
+        ("retry-quarantine-discard-routed-errors", "source-quarantine-routed", "validation_errors", "validation_errors"),
+        ("retry-quarantine-discard-routed-errors", "transform-discard", "transform_errors", "transform_errors"),
+    ),
+)
+def test_nonempty_stateful_family_changes_semantic_projection_and_hash(
+    scenario_id: str,
+    case_id: str,
+    family: str,
+    count_field: str,
+) -> None:
+    manifest = load_manifest()
+    case = next(case for scenario, case in iter_harness_cases(manifest) if (scenario.id, case.id) == (scenario_id, case_id))
+    assert isinstance(case.expected, RunExpectation)
+    raw = case.expected.projection
+    semantic = semantic_runtime_projection(raw)
+
+    assert getattr(semantic, family) == getattr(raw, family)
+    assert getattr(corpus_harness.semantic_runtime_projection_counts(semantic), count_field) > 0
+    if family == "batches":
+        first_batch, *remaining = semantic.batches
+        mutated_value = (
+            first_batch.model_copy(update={"trigger_reason": "semantic-mutation"}),
+            *remaining,
+        )
+    else:
+        mutated_value = ()
+    mutated = semantic.model_copy(update={family: mutated_value})
+
+    assert corpus_harness.semantic_runtime_projection_sha256(mutated) != (corpus_harness.semantic_runtime_projection_sha256(semantic))
+
+
+def test_exact_failure_evidence_requires_typed_node_transform_and_validation_errors() -> None:
+    projection = _exact_runtime_projection_values()
+    states = cast(tuple[dict[str, object], ...], projection["node_states"])
+    states[0]["error"] = '{"error":"boom","reason":"invalid_input"}'
+    projection["validation_errors"] = (
+        {
+            "key": "primary:0|source:primary@stable|0",
+            "node_key": "source:primary@stable",
+            "row_key": "primary:0",
+            "row_hash": "b" * 64,
+            "row_data": None,
+            "error": "invalid source row",
+            "schema_mode": "fixed",
+            "destination": "quarantine",
+            "violation_type": None,
+            "original_field_name": None,
+            "normalized_field_name": None,
+            "expected_type": None,
+            "actual_type": None,
+        },
+    )
+    projection["transform_errors"] = (
+        {
+            "key": "primary:0#0|transform:fail@stable",
+            "token_key": "primary:0#0",
+            "transform_node_key": "transform:fail@stable",
+            "row_hash": "c" * 64,
+            "row_data": None,
+            "error_details": '{"error":"boom","reason":"invalid_input"}',
+            "destination": "discard",
+        },
+    )
+    runtime = _exact_runtime_evidence_values(projection)
+    audit = _exact_audit_evidence_values(projection)
+    counts = list(cast(tuple[dict[str, object], ...], audit["record_counts"]))
+    counts.extend(
+        (
+            {"record_type": "transform_error", "count": 1},
+            {"record_type": "validation_error", "count": 1},
+        )
+    )
+    audit["record_counts"] = tuple(sorted(counts, key=lambda record: cast(str, record["record_type"])))
+    audit["total_records"] = cast(int, audit["total_records"]) + 2
+
+    evidence = ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
+    assert evidence.runtime.durable_projection is not None
+    assert evidence.runtime.durable_projection.node_states[0].error == states[0]["error"]
+    assert len(evidence.runtime.durable_projection.transform_errors) == 1
+    assert len(evidence.runtime.durable_projection.validation_errors) == 1
+
+    incomplete = deepcopy(projection)
+    incomplete["transform_errors"] = ()
+    incomplete_runtime = _exact_runtime_evidence_values(incomplete)
+    incomplete_audit = dict(audit, portable_projection=incomplete)
+    with pytest.raises(ValidationError, match="audit record count for transform_error must match exact durable projection"):
+        ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=incomplete_runtime, audit=incomplete_audit))
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -3267,6 +3669,13 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
         ("parallel-coalesces", "resume-after-left-finalize"),
+        ("aggregation-immutable-batch", "eof-immutable-membership"),
+        ("row-expansion-parent-child-recovery", "json-explode-parent-child"),
+        ("retry-quarantine-discard-routed-errors", "retry-then-success"),
+        ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
+        ("retry-quarantine-discard-routed-errors", "transform-discard"),
+        ("retry-quarantine-discard-routed-errors", "transform-error-route"),
+        ("sink-write-pending-redrive", "write-once"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     assert manifest.verdict == "not_complete"
@@ -3281,11 +3690,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 88
-    assert len(assessment_evidence) == 58
-    assert len(harness_evidence) == 29
-    assert len({reference.id for reference in manifest.evidence}) == 88
-    assert len({reference.locator for reference in manifest.evidence}) == 88
+    assert len(manifest.evidence) == 96
+    assert len(assessment_evidence) == 59
+    assert len(harness_evidence) == 36
+    assert len({reference.id for reference in manifest.evidence}) == 96
+    assert len({reference.locator for reference in manifest.evidence}) == 96
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -3308,6 +3717,13 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
         ("parallel-coalesces", "resume-after-left-finalize"),
+        ("aggregation-immutable-batch", "eof-immutable-membership"),
+        ("row-expansion-parent-child-recovery", "json-explode-parent-child"),
+        ("retry-quarantine-discard-routed-errors", "retry-then-success"),
+        ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
+        ("retry-quarantine-discard-routed-errors", "transform-discard"),
+        ("retry-quarantine-discard-routed-errors", "transform-error-route"),
+        ("sink-write-pending-redrive", "write-once"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     normalized_cases = json.dumps(cases, sort_keys=True, separators=(",", ":")).encode()
@@ -3385,6 +3801,25 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("parallel-coalesces", "runtime"),
         ),
         "harness-parallel-coalesces-resume-after-left-finalize": (("parallel-coalesces", "recovery"),),
+        "harness-aggregation-immutable-batch-eof-immutable-membership": (
+            ("aggregation-immutable-batch", "runtime"),
+            ("aggregation-immutable-batch", "audit"),
+        ),
+        "harness-row-expansion-parent-child-recovery-json-explode-parent-child": (
+            ("row-expansion-parent-child-recovery", "runtime"),
+            ("row-expansion-parent-child-recovery", "audit"),
+        ),
+        **{
+            f"harness-retry-quarantine-discard-routed-errors-{case_id}": (
+                ("retry-quarantine-discard-routed-errors", "runtime"),
+                ("retry-quarantine-discard-routed-errors", "audit"),
+            )
+            for case_id in ("retry-then-success", "source-quarantine-routed", "transform-discard", "transform-error-route")
+        },
+        "harness-sink-write-pending-redrive-write-once": (
+            ("sink-write-pending-redrive", "runtime"),
+            ("sink-write-pending-redrive", "audit"),
+        ),
         "harness-checkpoint-deterministic-resume-reopen-resume": (
             ("checkpoint-deterministic-resume", "runtime"),
             ("checkpoint-deterministic-resume", "audit"),
@@ -3543,6 +3978,50 @@ def test_corpus_transform_first_atomic_batch_crashes_then_fresh_instance_succeed
     assert result.row is not None
     assert result.row.to_dict() == {"value": 60, "count": 3}
     assert result.row.contract == expected_contract
+
+
+def test_b3_eof_batch_sum_transform_produces_exact_fresh_result() -> None:
+    transform = CorpusEOFBatchSumTransform({"schema": {"mode": "observed"}})
+    rows = _corpus_rows()
+
+    buffered = transform.process(rows[0], object())
+    result = transform.process(rows, object())
+
+    assert buffered.row is rows[0]
+    assert buffered.success_reason == {"action": "buffer"}
+    assert result.row is not None
+    assert result.row.to_dict() == {"value": 60, "count": 3}
+    assert result.success_reason == {"action": "batch_sum"}
+
+
+def test_b3_retry_once_transform_raises_transiently_then_returns_same_row() -> None:
+    transform = CorpusRetryOnceTransform({"schema": {"mode": "observed"}})
+    row = _corpus_rows()[0]
+
+    with pytest.raises(ConnectionError, match="injected DAG corpus retryable failure"):
+        transform.process(row, object())
+    second = transform.process(row, object())
+
+    assert second.status == "success"
+    assert second.row is row
+    assert second.success_reason == {"action": "retry_recovered"}
+
+
+def test_b3_routed_transform_error_fixture_keeps_one_exportable_control_disposition() -> None:
+    fixture = yaml.safe_load(
+        resolve_fixture_path("retry-quarantine-discard-routed-errors/transform-error-route.yaml").read_text(encoding="utf-8")
+    )
+
+    assert fixture["sources"]["primary"]["on_success"] == "select_error"
+    assert fixture["gates"] == [
+        {
+            "name": "select_error",
+            "input": "select_error",
+            "condition": "row['id'] == 1",
+            "routes": {"true": "error_in", "false": "discard"},
+        }
+    ]
+    assert fixture["transforms"][0]["on_success"] == fixture["transforms"][0]["on_error"] == "error_output"
 
 
 @pytest.mark.parametrize("marker", [None, "", 0, False])
@@ -3704,6 +4183,12 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-a5b86149d4"
             elif scenario.id == "row-expansion-parent-child-recovery" and dimension == "recovery":
                 expected_owner = "elspeth-7cdc4da434"
+            elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "contracts":
+                expected_owner = "elspeth-67b44040ee"
+            elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "runtime":
+                expected_owner = "elspeth-6f6bbbec00"
+            elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "audit":
+                expected_owner = "elspeth-2e66723070"
             elif dimension == "guided":
                 expected_owner = "elspeth-7e2dd67275"
             elif dimension == "round_trip":
@@ -3766,6 +4251,7 @@ def test_row_expansion_delta_is_backed_by_repaired_cross_backend_evidence() -> N
             "cardinality-identity-09",
             "cardinality-identity-10",
             "cardinality-identity-11",
+            "b3-stateful-runtime-exact-contracts",
         ),
         "runtime": (
             "cardinality-identity-04",
@@ -3775,6 +4261,8 @@ def test_row_expansion_delta_is_backed_by_repaired_cross_backend_evidence() -> N
             "cardinality-identity-09",
             "cardinality-identity-10",
             "cardinality-identity-11",
+            "harness-row-expansion-parent-child-recovery-json-explode-parent-child",
+            "b3-stateful-runtime-exact-contracts",
         ),
         "audit": (
             "cardinality-identity-02",
@@ -3785,6 +4273,8 @@ def test_row_expansion_delta_is_backed_by_repaired_cross_backend_evidence() -> N
             "cardinality-identity-09",
             "cardinality-identity-10",
             "cardinality-identity-11",
+            "harness-row-expansion-parent-child-recovery-json-explode-parent-child",
+            "b3-stateful-runtime-exact-contracts",
         ),
         "recovery": ("cardinality-identity-07",),
         "concurrency": ("cardinality-identity-10",),
@@ -3793,8 +4283,10 @@ def test_row_expansion_delta_is_backed_by_repaired_cross_backend_evidence() -> N
     assert scenario.dimensions["recovery"].owner_issue == "elspeth-7cdc4da434"
     assert scenario.dimensions["recovery"].evidence == ("cardinality-identity-07",)
     assert scenario.dimensions["concurrency"].status == "partial"
-    for dimension in ("contracts", "runtime", "audit", "concurrency"):
-        assert scenario.dimensions[dimension].owner_issue == "elspeth-ef29ef6ba4"
+    for dimension in ("contracts", "runtime", "audit"):
+        assert scenario.dimensions[dimension].status == "pass"
+        assert scenario.dimensions[dimension].owner_issue is None
+    assert scenario.dimensions["concurrency"].owner_issue == "elspeth-ef29ef6ba4"
     assert all(cell.owner_issue != "elspeth-a25e9c009e" for cell in scenario.dimensions.values())
 
 

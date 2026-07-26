@@ -36,6 +36,81 @@ class CorpusOutputSchema(PluginSchema):
     count: int
 
 
+def _eof_batch_sum_result(rows: list[PipelineRow]) -> TransformResult:
+    total = sum(int(member["value"]) for member in rows)
+    contract = SchemaContract(
+        mode="OBSERVED",
+        fields=(
+            FieldContract(
+                normalized_name="value",
+                original_name="value",
+                python_type=int,
+                required=False,
+                source="inferred",
+            ),
+            FieldContract(
+                normalized_name="count",
+                original_name="count",
+                python_type=int,
+                required=False,
+                source="inferred",
+            ),
+        ),
+        locked=True,
+    )
+    return TransformResult.success(
+        PipelineRow({"value": total, "count": len(rows)}, contract),
+        success_reason=cast(TransformSuccessReason, {"action": "batch_sum"}),
+    )
+
+
+class CorpusEOFBatchSumTransform(BaseTransform):
+    """Deterministic fresh-run EOF aggregation used by the B3 runtime corpus."""
+
+    name = "dag_corpus_eof_batch_sum"
+    determinism = Determinism.DETERMINISTIC
+    input_schema = CorpusInputSchema
+    output_schema = CorpusOutputSchema
+    is_batch_aware = True
+    on_error = "discard"
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        del ctx
+        if not isinstance(row, list):
+            return TransformResult.success(
+                row,
+                success_reason=cast(TransformSuccessReason, {"action": "buffer"}),
+            )
+        return _eof_batch_sum_result(row)
+
+
+class CorpusRetryOnceTransform(BaseTransform):
+    """Fail once per source row, then succeed through the production retry path."""
+
+    name = "dag_corpus_retry_once"
+    determinism = Determinism.DETERMINISTIC
+    input_schema = CorpusInputSchema
+    output_schema = CorpusInputSchema
+    on_error = "discard"
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        self._failed_row_ids: set[int] = set()
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        del ctx
+        if isinstance(row, list):
+            raise TypeError("dag_corpus_retry_once requires scalar input")
+        row_id = int(row["id"])
+        if row_id not in self._failed_row_ids:
+            self._failed_row_ids.add(row_id)
+            raise ConnectionError("injected DAG corpus retryable failure")
+        return TransformResult.success(
+            row,
+            success_reason=cast(TransformSuccessReason, {"action": "retry_recovered"}),
+        )
+
+
 class CorpusAlwaysErrorTransform(BaseTransform):
     name = "dag_corpus_always_error"
     determinism = Determinism.DETERMINISTIC
@@ -135,31 +210,7 @@ class CorpusFailOnceEOFBatchTransform(BaseTransform):
         else:
             raise RuntimeError("injected DAG corpus EOF flush crash")
 
-        total = sum(int(member["value"]) for member in row)
-        contract = SchemaContract(
-            mode="OBSERVED",
-            fields=(
-                FieldContract(
-                    normalized_name="value",
-                    original_name="value",
-                    python_type=int,
-                    required=False,
-                    source="inferred",
-                ),
-                FieldContract(
-                    normalized_name="count",
-                    original_name="count",
-                    python_type=int,
-                    required=False,
-                    source="inferred",
-                ),
-            ),
-            locked=True,
-        )
-        return TransformResult.success(
-            PipelineRow({"value": total, "count": len(row)}, contract),
-            success_reason=cast(TransformSuccessReason, {"action": "batch_sum"}),
-        )
+        return _eof_batch_sum_result(row)
 
 
 def make_corpus_plugin_manager() -> PluginManager:
@@ -167,7 +218,13 @@ def make_corpus_plugin_manager() -> PluginManager:
     manager.register_builtin_plugins()
     manager.register(
         create_dynamic_hookimpl(
-            [CorpusAlwaysErrorTransform, CorpusBranchLossTransform, CorpusFailOnceEOFBatchTransform],
+            [
+                CorpusAlwaysErrorTransform,
+                CorpusBranchLossTransform,
+                CorpusEOFBatchSumTransform,
+                CorpusFailOnceEOFBatchTransform,
+                CorpusRetryOnceTransform,
+            ],
             "elspeth_get_transforms",
         )
     )

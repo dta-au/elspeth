@@ -54,6 +54,27 @@ and an order-insensitive runtime projection, but deliberately excludes raw
 audit identity. Its harness evidence is therefore limited to exactly
 `[config, build, runtime]` and cannot support an audit or recovery pass.
 
+Exact projections preserve stateful runtime records as typed evidence rather
+than collapsing them into record counts. Aggregation cases include immutable
+batch membership and a separate `intermediate_outcomes` collection for
+non-terminal `BUFFERED` history; `terminal_dispositions` remains exactly one
+terminal record per token. Expansion cases include stable parent identity,
+expected child count, dense child ordinals, and durable parent links. Source
+validation and transform failures retain their typed error records, while
+sink-effect audit material pins publication and inspect/reconcile/commit
+attempts. This lets the B3 cases prove exact runtime and portable-audit parity
+without broadening terminal semantics or inferring omitted material.
+
+The current B3 runtime set is deliberately bounded: EOF immutable aggregation,
+JSON parent/child expansion, retry success, source quarantine, transform
+discard, transform error routing, and one ordinary write-once sink. These are
+runtime/audit cases only. They do not promote recovery, concurrency, or scale;
+those dimensions remain owned by their named manifest gaps.
+The disposition scenario also keeps runtime and audit partial until the
+authoritative scheduler-disposition and follower-drain work tracked by
+`elspeth-2e66723070` and `elspeth-6f6bbbec00` is integrated; the local exact
+cases remain evidence without substituting for those authorities.
+
 Every `recovery` case also declares a closed `recovery_kind`, so the shared
 harness cannot silently apply one topology's restart assertions to another.
 The `parallel_sink_finalization` evidence records exact before/after sink

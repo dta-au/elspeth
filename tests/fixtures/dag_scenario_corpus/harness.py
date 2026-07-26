@@ -87,6 +87,11 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     SinkOutputProjection,
     StableAuditRecordProjection,
     StableAuditRecordType,
+    StableBatchMemberProjection,
+    StableBatchProjection,
+    StableExpansionChildProjection,
+    StableExpansionProjection,
+    StableIntermediateOutcomeProjection,
     StableNodeStateProjection,
     StableParentProjection,
     StableRouteProjection,
@@ -95,6 +100,8 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     StableSchedulerWorkProjection,
     StableTerminalDisposition,
     StableTokenProjection,
+    StableTransformErrorProjection,
+    StableValidationErrorProjection,
     normalize_template_name,
 )
 
@@ -827,29 +834,51 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
     token_records_by_row: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in (record for record in records if record.get("record_type") == "token"):
         token_records_by_row[str(record["row_id"])].append(record)
+    parents_by_token: defaultdict[str, list[tuple[int, str]]] = defaultdict(list)
+    for record in (record for record in records if record.get("record_type") == "token_parent"):
+        parents_by_token[str(record["token_id"])].append((int(record["ordinal"]), str(record["parent_token_id"])))
     token_keys: dict[str, str] = {}
     for row_id, token_records in token_records_by_row.items():
-        token_records.sort(
-            key=lambda record: (
-                str(record.get("branch_name") or ""),
-                int(record.get("step_in_pipeline") or 0),
-            )
-        )
-        signatures = [
+        base_signatures = [
             (
                 record.get("branch_name"),
                 record.get("step_in_pipeline"),
             )
             for record in token_records
         ]
-        if len(signatures) != len(set(signatures)):
-            raise AssertionError(f"DAG corpus tokens lack a stable ordering for row {rows_by_id[row_id]!r}")
+        if len(base_signatures) == len(set(base_signatures)):
+            token_records.sort(
+                key=lambda record: (
+                    str(record.get("branch_name") or ""),
+                    int(record.get("step_in_pipeline") or 0),
+                )
+            )
+        else:
+
+            def expansion_aware_signature(
+                record: Mapping[str, Any],
+                row_key: str = rows_by_id[row_id],
+            ) -> tuple[object, ...]:
+                links = parents_by_token.get(str(record["token_id"]), ())
+                if record.get("expand_group_id") is None:
+                    expansion_ordinal = -1
+                elif len(links) == 1:
+                    expansion_ordinal = links[0][0]
+                else:
+                    raise AssertionError(f"DAG corpus expanded token lacks one stable parent ordinal for row {row_key!r}")
+                return (
+                    str(record.get("branch_name") or ""),
+                    int(record.get("step_in_pipeline") or 0),
+                    expansion_ordinal,
+                )
+
+            signatures = [expansion_aware_signature(record) for record in token_records]
+            if len(signatures) != len(set(signatures)):
+                raise AssertionError(f"DAG corpus tokens lack a stable ordering for row {rows_by_id[row_id]!r}")
+            token_records.sort(key=expansion_aware_signature)
         for ordinal, record in enumerate(token_records):
             token_keys[str(record["token_id"])] = f"{rows_by_id[row_id]}#{ordinal}"
 
-    parents_by_token: defaultdict[str, list[tuple[int, str]]] = defaultdict(list)
-    for record in (record for record in records if record.get("record_type") == "token_parent"):
-        parents_by_token[str(record["token_id"])].append((int(record["ordinal"]), str(record["parent_token_id"])))
     ordered_parents_by_token = {
         token_id: _ordered_parent_links(token_id, parent_links, token_keys) for token_id, parent_links in parents_by_token.items()
     }
@@ -883,9 +912,7 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
                 else None
             ),
             error=(
-                _normalize_node_state_json(record.get("error_json"), field="error_json")
-                if node_keys[str(record["node_id"])].startswith("coalesce:")
-                else None
+                _normalize_node_state_json(record.get("error_json"), field="error_json") if record.get("error_json") is not None else None
             ),
         )
         for record in state_records
@@ -931,6 +958,7 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
                 outcome=str(outcome["outcome"]),
                 path=str(outcome["path"]),
                 sink_name=cast(str | None, outcome.get("sink_name")),
+                error_hash=cast(str | None, outcome.get("error_hash")),
             )
         )
 
@@ -970,13 +998,157 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
             )
         )
 
+    batch_member_records: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in (record for record in records if record.get("record_type") == "batch_member"):
+        batch_member_records[str(record["batch_id"])].append(record)
+    batch_key_by_id = {
+        str(record["batch_id"]): f"{node_keys[str(record['aggregation_node_id'])]}|{int(record['attempt'])}"
+        for record in (record for record in records if record.get("record_type") == "batch")
+    }
+    batches = tuple(
+        StableBatchProjection(
+            key=batch_key_by_id[str(record["batch_id"])],
+            aggregation_node_key=node_keys[str(record["aggregation_node_id"])],
+            attempt=int(record["attempt"]),
+            status=str(record["status"]),
+            trigger_type=cast(str | None, record.get("trigger_type")),
+            trigger_reason=cast(str | None, record.get("trigger_reason")),
+            members=tuple(
+                StableBatchMemberProjection(
+                    ordinal=int(member["ordinal"]),
+                    token_key=token_keys[str(member["token_id"])],
+                )
+                for member in sorted(batch_member_records[str(record["batch_id"])], key=lambda member: int(member["ordinal"]))
+            ),
+        )
+        for record in (record for record in records if record.get("record_type") == "batch")
+    )
+
+    intermediate_counts: defaultdict[str, int] = defaultdict(int)
+    intermediate_outcomes: list[StableIntermediateOutcomeProjection] = []
+    for record in (record for record in records if record.get("record_type") == "token_outcome"):
+        if bool(record["completed"]):
+            continue
+        token_key = token_keys[str(record["token_id"])]
+        batch_id = record.get("batch_id")
+        if (
+            record.get("outcome") is not None
+            or record.get("path") != "buffered"
+            or record.get("sink_name") is not None
+            or not isinstance(batch_id, str)
+            or batch_id not in batch_key_by_id
+            or record.get("expand_group_id") is not None
+            or record.get("expected_branches_json") is not None
+            or record.get("error_hash") is not None
+        ):
+            raise AssertionError("DAG corpus non-terminal outcome is not an exact batch BUFFERED record")
+        ordinal = intermediate_counts[token_key]
+        intermediate_counts[token_key] += 1
+        intermediate_outcomes.append(
+            StableIntermediateOutcomeProjection(
+                key=f"{token_key}|buffered|{ordinal:08d}",
+                token_key=token_key,
+                ordinal=ordinal,
+                path="buffered",
+                batch_key=batch_key_by_id[batch_id],
+            )
+        )
+
+    token_records_by_id = {str(record["token_id"]): record for record in records if record.get("record_type") == "token"}
+    expansions: list[StableExpansionProjection] = []
+    for outcome in (record for record in records if record.get("record_type") == "token_outcome"):
+        if outcome.get("path") != "expand_parent" or not bool(outcome.get("completed")):
+            continue
+        parent_token_id = str(outcome["token_id"])
+        expand_group_id = outcome.get("expand_group_id")
+        expected_raw = outcome.get("expected_branches_json")
+        if not isinstance(expand_group_id, str) or not expand_group_id or not isinstance(expected_raw, str):
+            raise AssertionError("DAG corpus expand_parent outcome lacks durable group and expected count")
+        try:
+            expected = json.loads(expected_raw)
+        except json.JSONDecodeError as exc:
+            raise AssertionError("DAG corpus expand_parent expected count must be valid JSON") from exc
+        if not isinstance(expected, dict) or isinstance(expected.get("count"), bool) or not isinstance(expected.get("count"), int):
+            raise AssertionError("DAG corpus expand_parent expected count must be an integer object field")
+        children: list[StableExpansionChildProjection] = []
+        for child_id, child_record in token_records_by_id.items():
+            if child_record.get("expand_group_id") != expand_group_id:
+                continue
+            links = sorted(parents_by_token[child_id])
+            if len(links) != 1 or links[0][1] != parent_token_id:
+                raise AssertionError("DAG corpus expanded child lacks exact durable parent linkage")
+            children.append(StableExpansionChildProjection(ordinal=links[0][0], token_key=token_keys[child_id]))
+        parent_key = token_keys[parent_token_id]
+        expansions.append(
+            StableExpansionProjection(
+                key=f"expand|{parent_key}",
+                parent_token_key=parent_key,
+                expected_child_count=int(expected["count"]),
+                children=tuple(sorted(children, key=lambda child: child.ordinal)),
+            )
+        )
+
+    validation_error_groups: defaultdict[tuple[str, str], int] = defaultdict(int)
+    validation_errors: list[StableValidationErrorProjection] = []
+    for record in (record for record in records if record.get("record_type") == "validation_error"):
+        raw_node_id = record.get("node_id")
+        node_key = node_keys[str(raw_node_id)] if raw_node_id is not None else "source:unbound"
+        raw_row_id = record.get("row_id")
+        row_key = rows_by_id.get(str(raw_row_id)) if raw_row_id is not None else None
+        group = (row_key or "unbound", node_key)
+        attempt = validation_error_groups[group]
+        validation_error_groups[group] += 1
+        row_data = record.get("row_data_json")
+        validation_errors.append(
+            StableValidationErrorProjection(
+                key=f"{group[0]}|{node_key}|{attempt}",
+                node_key=node_key,
+                row_key=row_key,
+                row_hash=str(record["row_hash"]),
+                row_data=_normalize_node_state_json(row_data, field="row_data") if row_data is not None else None,
+                error=str(record["error"]),
+                schema_mode=str(record["schema_mode"]),
+                destination=str(record["destination"]),
+                violation_type=cast(str | None, record.get("violation_type")),
+                original_field_name=cast(str | None, record.get("original_field_name")),
+                normalized_field_name=cast(str | None, record.get("normalized_field_name")),
+                expected_type=cast(str | None, record.get("expected_type")),
+                actual_type=cast(str | None, record.get("actual_type")),
+            )
+        )
+
+    transform_errors: list[StableTransformErrorProjection] = []
+    for record in (record for record in records if record.get("record_type") == "transform_error"):
+        token_key = token_keys[str(record["token_id"])]
+        transform_node_key = node_keys[str(record["transform_id"])]
+        error_details = record.get("error_details_json")
+        if not isinstance(error_details, str):
+            raise AssertionError("DAG corpus transform error lacks canonical error details")
+        row_data = record.get("row_data_json")
+        transform_errors.append(
+            StableTransformErrorProjection(
+                key=f"{token_key}|{transform_node_key}",
+                token_key=token_key,
+                transform_node_key=transform_node_key,
+                row_hash=str(record["row_hash"]),
+                row_data=_normalize_node_state_json(row_data, field="row_data") if row_data is not None else None,
+                error_details=_normalize_node_state_json(error_details, field="error_details"),
+                destination=str(record["destination"]),
+            )
+        )
+
     return StableRunProjection(
         rows=tuple(sorted(rows, key=lambda row: row.key)),
         tokens=tuple(sorted(tokens, key=lambda token: token.key)),
         node_states=tuple(sorted(node_states, key=lambda state: state.key)),
         routes=tuple(sorted(routes, key=lambda route: route.key)),
         terminal_dispositions=tuple(sorted(terminal_dispositions, key=lambda disposition: disposition.key)),
+        intermediate_outcomes=tuple(sorted(intermediate_outcomes, key=lambda outcome: outcome.key)),
         scheduler_work=tuple(sorted(scheduler_work, key=lambda work: work.key)),
+        batches=tuple(sorted(batches, key=lambda batch: batch.key)),
+        expansions=tuple(sorted(expansions, key=lambda expansion: expansion.key)),
+        validation_errors=tuple(sorted(validation_errors, key=lambda error: error.key)),
+        transform_errors=tuple(sorted(transform_errors, key=lambda error: error.key)),
         audit_records=_stable_audit_records(
             records,
             source=source,
@@ -1022,8 +1194,15 @@ def semantic_runtime_projection(projection: StableRunProjection) -> SemanticRunt
         ),
         node_states=tuple(semantic_states),
         routes=projection.routes,
-        terminal_dispositions=projection.terminal_dispositions,
+        terminal_dispositions=tuple(
+            disposition.model_copy(update={"error_hash": None}) for disposition in projection.terminal_dispositions
+        ),
         scheduler_work=projection.scheduler_work,
+        intermediate_outcomes=projection.intermediate_outcomes,
+        batches=projection.batches,
+        expansions=projection.expansions,
+        validation_errors=projection.validation_errors,
+        transform_errors=projection.transform_errors,
     )
 
 
@@ -1042,6 +1221,13 @@ def semantic_runtime_projection_counts(projection: SemanticRuntimeProjection) ->
         routes=len(projection.routes),
         terminal_dispositions=len(projection.terminal_dispositions),
         scheduler_work=len(projection.scheduler_work),
+        intermediate_outcomes=len(projection.intermediate_outcomes),
+        batches=len(projection.batches),
+        batch_members=sum(len(batch.members) for batch in projection.batches),
+        expansions=len(projection.expansions),
+        expansion_children=sum(len(expansion.children) for expansion in projection.expansions),
+        validation_errors=len(projection.validation_errors),
+        transform_errors=len(projection.transform_errors),
     )
 
 
@@ -1322,6 +1508,8 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
         }
     audit_types = {
         "artifact",
+        "batch",
+        "batch_member",
         "call",
         "edge",
         "node",
@@ -1331,6 +1519,8 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
         "sink_effect_attempt",
         "sink_effect_member",
         "sink_effect_stream",
+        "transform_error",
+        "validation_error",
     }
     records = [dict(record) for record in unsigned_records if record["record_type"] in audit_types]
     for record in records:
@@ -1421,6 +1611,10 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
                 "path": outcome.path.value,
                 "completed": outcome.completed,
                 "sink_name": outcome.sink_name,
+                "batch_id": outcome.batch_id,
+                "expand_group_id": outcome.expand_group_id,
+                "expected_branches_json": outcome.expected_branches_json,
+                "error_hash": outcome.error_hash,
             }
         )
     for scheduler_event in repositories.query.get_scheduler_events(run_id=run_id):

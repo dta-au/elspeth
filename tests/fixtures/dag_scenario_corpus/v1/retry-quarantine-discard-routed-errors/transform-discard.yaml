@@ -1,0 +1,24 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: error_in
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+transforms:
+  - name: discard_error
+    plugin: dag_corpus_always_error
+    input: error_in
+    on_success: output
+    on_error: discard
+    options:
+      schema: {mode: observed}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_output}
+      format: jsonl
+      schema: {mode: observed}

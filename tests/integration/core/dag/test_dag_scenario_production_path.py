@@ -68,6 +68,16 @@ B2_PARTIAL_TERMINAL_FAILURE_CASE = (
     "one-terminal-fails",
 )
 
+B3_RUNTIME_CASES = (
+    ("aggregation-immutable-batch", "eof-immutable-membership"),
+    ("row-expansion-parent-child-recovery", "json-explode-parent-child"),
+    ("retry-quarantine-discard-routed-errors", "retry-then-success"),
+    ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
+    ("retry-quarantine-discard-routed-errors", "transform-discard"),
+    ("retry-quarantine-discard-routed-errors", "transform-error-route"),
+    ("sink-write-pending-redrive", "write-once"),
+)
+
 B2_COALESCE_POSITIVE_CASES = tuple(
     ("fork-coalesce-policies", case_id)
     for case_id in (
@@ -673,6 +683,7 @@ def test_b2_coalesce_positive_matrix_declares_exact_run_oracle(
         assert output_row["branch_marker"] == expected_marker
 
     expected_parent_links = 6 if policy == "require_all" else 4 if policy == "first" else 5
+    assert expected.projection_counts.transform_errors == (1 if loses_path_c else 0)
     assert expected.projection_counts.model_dump() == {
         "rows": 1,
         "tokens": 5,
@@ -681,6 +692,7 @@ def test_b2_coalesce_positive_matrix_declares_exact_run_oracle(
         "routes": 3,
         "terminal_dispositions": 5,
         "scheduler_work": 5,
+        **({"transform_errors": 1} if loses_path_c else {}),
     }
 
 
@@ -1797,6 +1809,110 @@ def test_declared_run_case_uses_complete_production_path(
     evidence = run_scenario_case(scenario, case, tmp_path)
 
     _assert_declared_run_evidence(scenario, case, evidence)
+
+
+def test_b3_stateful_runtime_cases_pin_exact_contracts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert (
+        tuple((scenario.id, case.id) for scenario, case in iter_harness_cases(MANIFEST) if (scenario.id, case.id) in B3_RUNTIME_CASES)
+        == B3_RUNTIME_CASES
+    )
+    install_corpus_plugin_manager(monkeypatch)
+    observed: dict[tuple[str, str], ScenarioRunEvidence] = {}
+    for scenario_id, case_id in B3_RUNTIME_CASES:
+        scenario, case = _declared_case(scenario_id, case_id)
+        assert isinstance(case.expected, RunExpectation)
+        case_root = tmp_path / case_id
+        case_root.mkdir()
+        evidence = run_scenario_case(scenario, case, case_root)
+        _assert_declared_run_evidence(scenario, case, evidence)
+        assert evidence.audit.portable_projection == evidence.runtime.durable_projection
+        observed[(scenario_id, case_id)] = evidence
+
+    aggregation = observed[("aggregation-immutable-batch", "eof-immutable-membership")]
+    aggregation_projection = aggregation.runtime.durable_projection
+    assert aggregation_projection is not None
+    assert aggregation.runtime.sink_outputs[0].rows == ('{"count":3,"value":60}',)
+    assert [
+        (batch.status, batch.trigger_type, batch.trigger_reason, tuple((member.ordinal, member.token_key) for member in batch.members))
+        for batch in aggregation_projection.batches
+    ] == [
+        (
+            "completed",
+            "end_of_source",
+            None,
+            ((0, "primary:0#0"), (1, "primary:1#0"), (2, "primary:2#0")),
+        )
+    ]
+    assert [(outcome.token_key, outcome.path, outcome.ordinal) for outcome in aggregation_projection.intermediate_outcomes] == [
+        ("primary:0#0", "buffered", 0),
+        ("primary:1#0", "buffered", 0),
+        ("primary:2#0", "buffered", 0),
+    ]
+
+    expansion = observed[("row-expansion-parent-child-recovery", "json-explode-parent-child")]
+    expansion_projection = expansion.runtime.durable_projection
+    assert expansion_projection is not None
+    assert (len(expansion_projection.rows), len(expansion_projection.tokens), expansion.runtime.rows_succeeded) == (3, 9, 6)
+    assert [
+        (item.parent_token_key, item.expected_child_count, tuple((child.ordinal, child.token_key) for child in item.children))
+        for item in expansion_projection.expansions
+    ] == [
+        ("primary:0#0", 2, ((0, "primary:0#1"), (1, "primary:0#2"))),
+        ("primary:1#0", 1, ((0, "primary:1#1"),)),
+        ("primary:2#0", 3, ((0, "primary:2#1"), (1, "primary:2#2"), (2, "primary:2#3"))),
+    ]
+
+    retry = observed[("retry-quarantine-discard-routed-errors", "retry-then-success")]
+    retry_projection = retry.runtime.durable_projection
+    assert retry_projection is not None
+    retry_states = [state for state in retry_projection.node_states if state.node_key.startswith("transform:retry_once@")]
+    assert [(state.attempt, state.status, state.error) for state in retry_states] == [
+        (0, "failed", '{"exception":"injected DAG corpus retryable failure","type":"ConnectionError"}'),
+        (1, "completed", None),
+    ]
+
+    quarantine = observed[("retry-quarantine-discard-routed-errors", "source-quarantine-routed")]
+    quarantine_projection = quarantine.runtime.durable_projection
+    assert quarantine_projection is not None
+    assert [(route.label, route.mode) for route in quarantine_projection.routes] == [("__quarantine__", "divert")]
+    assert [
+        (error.row_hash, error.row_data, error.schema_mode, error.destination) for error in quarantine_projection.validation_errors
+    ] == [("5a3fdc1573df66d8628620d1457e81eedea5b6fb5ad7aeabda743bc219ba1cc0", None, "fixed", "quarantine")]
+
+    discard = observed[("retry-quarantine-discard-routed-errors", "transform-discard")]
+    discard_projection = discard.runtime.durable_projection
+    assert discard_projection is not None
+    assert discard_projection.routes == ()
+    assert [(error.destination, error.error_details) for error in discard_projection.transform_errors] == [
+        ("discard", '{"error":"injected DAG corpus routed error","reason":"invalid_input"}')
+    ]
+    assert [(item.outcome, item.path, item.sink_name) for item in discard_projection.terminal_dispositions] == [
+        ("failure", "quarantined_at_source", None)
+    ]
+
+    error_route = observed[("retry-quarantine-discard-routed-errors", "transform-error-route")]
+    error_route_projection = error_route.runtime.durable_projection
+    assert error_route_projection is not None
+    assert [(route.label, route.mode) for route in error_route_projection.routes] == [
+        ("true", "move"),
+        ("__error_routed_error__", "divert"),
+    ]
+    assert [(item.outcome, item.path, item.sink_name) for item in error_route_projection.terminal_dispositions] == [
+        ("failure", "on_error_routed", "error_output"),
+        ("success", "gate_discarded", None),
+    ]
+
+    write_once = observed[("sink-write-pending-redrive", "write-once")]
+    write_once_projection = write_once.runtime.durable_projection
+    assert write_once_projection is not None
+    effect_records = [record for record in write_once_projection.audit_records if record.record_type == "sink_effect"]
+    attempt_records = [record for record in write_once_projection.audit_records if record.record_type == "sink_effect_attempt"]
+    assert len(effect_records) == 1
+    assert json.loads(effect_records[0].material)["publication_performed"] is True
+    assert [json.loads(record.material)["action"] for record in attempt_records] == ["inspect", "reconcile", "commit"]
 
 
 def test_linear_happy_path_has_exact_production_evidence(

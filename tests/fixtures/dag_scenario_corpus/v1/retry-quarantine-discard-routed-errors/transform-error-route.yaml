@@ -1,0 +1,29 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: select_error
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: select_error
+    input: select_error
+    condition: "row['id'] == 1"
+    routes: {"true": error_in, "false": discard}
+transforms:
+  - name: routed_error
+    plugin: dag_corpus_always_error
+    input: error_in
+    on_success: error_output
+    on_error: error_output
+    options:
+      schema: {mode: observed}
+sinks:
+  error_output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_error_output}
+      format: jsonl
+      schema: {mode: observed}

@@ -269,6 +269,26 @@ class StableTerminalDisposition(ClosedModel):
         "batch_consumed",
     ]
     sink_name: NonEmpty | None
+    error_hash: Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{16}$")] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+
+class StableIntermediateOutcomeProjection(ClosedModel):
+    """One durable non-terminal BUFFERED outcome, separate from token terminality."""
+
+    key: NonEmpty
+    token_key: NonEmpty
+    ordinal: Count
+    path: Literal["buffered"]
+    batch_key: NonEmpty
+
+    @model_validator(mode="after")
+    def _validate_stable_key(self) -> Self:
+        if self.key != f"{self.token_key}|buffered|{self.ordinal:08d}":
+            raise ValueError("intermediate outcome key must exactly encode token, path, and ordinal")
+        return self
 
 
 class StableSchedulerWorkProjection(ClosedModel):
@@ -279,13 +299,122 @@ class StableSchedulerWorkProjection(ClosedModel):
     final_status: Literal["ready", "leased", "blocked", "pending_sink", "terminal", "failed"]
 
 
+class StableBatchMemberProjection(ClosedModel):
+    ordinal: Count
+    token_key: NonEmpty
+
+
+class StableBatchProjection(ClosedModel):
+    """One terminal aggregation batch with its immutable ordered membership."""
+
+    key: NonEmpty
+    aggregation_node_key: NonEmpty
+    attempt: Count
+    status: Literal["draft", "executing", "completed", "failed"]
+    trigger_type: Literal["count", "timeout", "condition", "end_of_source"] | None
+    trigger_reason: NonEmpty | None
+    members: tuple[StableBatchMemberProjection, ...]
+
+    @model_validator(mode="after")
+    def _validate_members(self) -> Self:
+        ordinals = tuple(member.ordinal for member in self.members)
+        token_keys = tuple(member.token_key for member in self.members)
+        if ordinals != tuple(range(len(self.members))):
+            raise ValueError("batch member ordinals must be dense from zero")
+        if len(token_keys) != len(set(token_keys)):
+            raise ValueError("batch member token keys must be unique")
+        if self.status in ("completed", "failed") and not self.members:
+            raise ValueError("terminal batch projection requires immutable members")
+        if self.trigger_type is None and self.trigger_reason is not None:
+            raise ValueError("batch trigger_reason requires trigger_type")
+        return self
+
+
+class StableExpansionChildProjection(ClosedModel):
+    ordinal: Count
+    token_key: NonEmpty
+
+
+class StableExpansionProjection(ClosedModel):
+    """Stable expansion identity derived from one durable parent and child set."""
+
+    key: NonEmpty
+    parent_token_key: NonEmpty
+    expected_child_count: PositiveCount
+    children: tuple[StableExpansionChildProjection, ...]
+
+    @model_validator(mode="after")
+    def _validate_children(self) -> Self:
+        if len(self.children) != self.expected_child_count:
+            raise ValueError("expansion children must exactly match expected_child_count")
+        ordinals = tuple(child.ordinal for child in self.children)
+        token_keys = tuple(child.token_key for child in self.children)
+        if ordinals != tuple(range(self.expected_child_count)):
+            raise ValueError("expansion child ordinals must be dense from zero")
+        if len(token_keys) != len(set(token_keys)):
+            raise ValueError("expansion child token keys must be unique")
+        return self
+
+
+def _require_canonical_json_object_or_none(value: str | None, info: ValidationInfo) -> str | None:
+    import json
+
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{info.field_name} must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{info.field_name} must be a JSON object")
+    if json.dumps(parsed, sort_keys=True, separators=(",", ":")) != value:
+        raise ValueError(f"{info.field_name} must use canonical JSON")
+    return value
+
+
+class StableValidationErrorProjection(ClosedModel):
+    key: NonEmpty
+    node_key: NonEmpty
+    row_key: NonEmpty | None
+    row_hash: Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
+    row_data: NonEmpty | None
+    error: NonEmpty
+    schema_mode: Literal["fixed", "flexible", "observed", "parse"]
+    destination: NonEmpty
+    violation_type: NonEmpty | None
+    original_field_name: NonEmpty | None
+    normalized_field_name: NonEmpty | None
+    expected_type: NonEmpty | None
+    actual_type: NonEmpty | None
+
+    _canonical_row_data = field_validator("row_data")(_require_canonical_json_object_or_none)
+
+
+class StableTransformErrorProjection(ClosedModel):
+    key: NonEmpty
+    token_key: NonEmpty
+    transform_node_key: NonEmpty
+    row_hash: Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
+    row_data: NonEmpty | None
+    error_details: NonEmpty
+    destination: NonEmpty
+
+    _canonical_row_data = field_validator("row_data")(_require_canonical_json_object_or_none)
+    _canonical_error_details = field_validator("error_details")(_require_canonical_json_object_or_none)
+
+
 StableKeyedProjection = (
     StableRowProjection
     | StableTokenProjection
     | StableNodeStateProjection
     | StableRouteProjection
     | StableTerminalDisposition
+    | StableIntermediateOutcomeProjection
     | StableSchedulerWorkProjection
+    | StableBatchProjection
+    | StableExpansionProjection
+    | StableValidationErrorProjection
+    | StableTransformErrorProjection
 )
 
 
@@ -567,6 +696,7 @@ def _derive_projected_terminal_counts(projection: StableRunProjection | Semantic
     row_key_by_token = {token.key: token.row_key for token in projection.tokens}
     terminal = tuple(disposition for disposition in projection.terminal_dispositions if disposition.outcome in ("success", "failure"))
     processed_rows = {row_key_by_token[disposition.token_key] for disposition in terminal}
+    processed_rows.update(row_key_by_token[member.token_key] for batch in projection.batches for member in batch.members)
     successful_terminals = sum(
         1
         for disposition in terminal
@@ -582,7 +712,12 @@ class StableRunProjection(ClosedModel):
     node_states: tuple[StableNodeStateProjection, ...]
     routes: tuple[StableRouteProjection, ...]
     terminal_dispositions: tuple[StableTerminalDisposition, ...]
+    intermediate_outcomes: tuple[StableIntermediateOutcomeProjection, ...] = ()
     scheduler_work: tuple[StableSchedulerWorkProjection, ...]
+    batches: tuple[StableBatchProjection, ...] = ()
+    expansions: tuple[StableExpansionProjection, ...] = ()
+    validation_errors: tuple[StableValidationErrorProjection, ...] = ()
+    transform_errors: tuple[StableTransformErrorProjection, ...] = ()
     audit_records: tuple[StableAuditRecordProjection, ...]
 
     @model_validator(mode="after")
@@ -593,7 +728,12 @@ class StableRunProjection(ClosedModel):
             ("node states", self.node_states),
             ("routes", self.routes),
             ("terminal dispositions", self.terminal_dispositions),
+            ("intermediate outcomes", self.intermediate_outcomes),
             ("scheduler work", self.scheduler_work),
+            ("batches", self.batches),
+            ("expansions", self.expansions),
+            ("validation errors", self.validation_errors),
+            ("transform errors", self.transform_errors),
             ("audit records", self.audit_records),
         ):
             _require_unique_sorted_keys(label, values)
@@ -620,6 +760,61 @@ class StableRunProjection(ClosedModel):
         )
         if any(work.token_key not in token_keys for work in self.scheduler_work):
             raise ValueError("every scheduler work item must reference a projected token")
+        if any(outcome.token_key not in token_keys for outcome in self.intermediate_outcomes):
+            raise ValueError("intermediate outcomes must reference projected tokens")
+        if any(member.token_key not in token_keys for batch in self.batches for member in batch.members):
+            raise ValueError("batch members must reference projected tokens")
+        batch_by_key = {batch.key: batch for batch in self.batches}
+        if any(outcome.batch_key not in batch_by_key for outcome in self.intermediate_outcomes):
+            raise ValueError("intermediate outcomes must reference projected batches")
+        intermediate_by_token: dict[str, list[StableIntermediateOutcomeProjection]] = {}
+        for outcome in self.intermediate_outcomes:
+            intermediate_by_token.setdefault(outcome.token_key, []).append(outcome)
+            member_keys = {member.token_key for member in batch_by_key[outcome.batch_key].members}
+            if outcome.token_key not in member_keys:
+                raise ValueError("intermediate outcome token must belong to its projected batch")
+        if any(
+            tuple(outcome.ordinal for outcome in outcomes) != tuple(range(len(outcomes))) for outcomes in intermediate_by_token.values()
+        ):
+            raise ValueError("intermediate outcome ordinals must be dense from zero per token")
+        disposition_by_token = {disposition.token_key: disposition for disposition in self.terminal_dispositions}
+        for batch in self.batches:
+            if batch.status != "completed":
+                continue
+            if any(
+                (
+                    disposition_by_token[member.token_key].outcome,
+                    disposition_by_token[member.token_key].path,
+                    disposition_by_token[member.token_key].sink_name,
+                )
+                != ("transient", "batch_consumed", None)
+                for member in batch.members
+            ):
+                raise ValueError("completed batch members must have exact transient batch_consumed dispositions")
+        token_by_key = {token.key: token for token in self.tokens}
+        expansion_children: set[str] = set()
+        for expansion in self.expansions:
+            if expansion.parent_token_key not in token_keys:
+                raise ValueError("expansion parent must reference a projected token")
+            parent_disposition = disposition_by_token[expansion.parent_token_key]
+            if (parent_disposition.outcome, parent_disposition.path, parent_disposition.sink_name) != (
+                "transient",
+                "expand_parent",
+                None,
+            ):
+                raise ValueError("expansion parent must have exact transient expand_parent disposition")
+            for child in expansion.children:
+                if child.token_key not in token_keys or child.token_key in expansion_children:
+                    raise ValueError("expansion children must reference distinct projected tokens")
+                expansion_children.add(child.token_key)
+                token = token_by_key[child.token_key]
+                if tuple((parent.ordinal, parent.parent_key) for parent in token.parents) != ((child.ordinal, expansion.parent_token_key),):
+                    raise ValueError("expansion child lineage must exactly bind parent and ordinal")
+        row_keys_with_none = row_keys | {None}
+        if any(error.row_key not in row_keys_with_none for error in self.validation_errors):
+            raise ValueError("validation errors must reference projected rows when row identity is present")
+        if any(error.token_key not in token_keys for error in self.transform_errors):
+            raise ValueError("transform errors must reference projected tokens")
         return self
 
 
@@ -637,6 +832,11 @@ class SemanticRuntimeProjection(ClosedModel):
     routes: tuple[StableRouteProjection, ...]
     terminal_dispositions: tuple[StableTerminalDisposition, ...]
     scheduler_work: tuple[StableSchedulerWorkProjection, ...]
+    intermediate_outcomes: tuple[StableIntermediateOutcomeProjection, ...] = Field(default=(), exclude_if=lambda value: not value)
+    batches: tuple[StableBatchProjection, ...] = Field(default=(), exclude_if=lambda value: not value)
+    expansions: tuple[StableExpansionProjection, ...] = Field(default=(), exclude_if=lambda value: not value)
+    validation_errors: tuple[StableValidationErrorProjection, ...] = Field(default=(), exclude_if=lambda value: not value)
+    transform_errors: tuple[StableTransformErrorProjection, ...] = Field(default=(), exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def _validate_projection(self) -> Self:
@@ -647,6 +847,11 @@ class SemanticRuntimeProjection(ClosedModel):
             ("routes", self.routes),
             ("terminal dispositions", self.terminal_dispositions),
             ("scheduler work", self.scheduler_work),
+            ("intermediate outcomes", self.intermediate_outcomes),
+            ("batches", self.batches),
+            ("expansions", self.expansions),
+            ("validation errors", self.validation_errors),
+            ("transform errors", self.transform_errors),
         ):
             _require_unique_sorted_keys(label, values)
 
@@ -677,6 +882,60 @@ class SemanticRuntimeProjection(ClosedModel):
             raise ValueError("every semantic route must reference a projected token")
         if any(work.token_key not in token_keys for work in self.scheduler_work):
             raise ValueError("every semantic scheduler work item must reference a projected token")
+        if any(outcome.token_key not in token_keys for outcome in self.intermediate_outcomes):
+            raise ValueError("semantic intermediate outcomes must reference projected tokens")
+        if any(member.token_key not in token_keys for batch in self.batches for member in batch.members):
+            raise ValueError("semantic batch members must reference projected tokens")
+        batch_by_key = {batch.key: batch for batch in self.batches}
+        if any(outcome.batch_key not in batch_by_key for outcome in self.intermediate_outcomes):
+            raise ValueError("semantic intermediate outcomes must reference projected batches")
+        intermediate_by_token: dict[str, list[StableIntermediateOutcomeProjection]] = {}
+        for outcome in self.intermediate_outcomes:
+            intermediate_by_token.setdefault(outcome.token_key, []).append(outcome)
+            member_keys = {member.token_key for member in batch_by_key[outcome.batch_key].members}
+            if outcome.token_key not in member_keys:
+                raise ValueError("semantic intermediate outcome token must belong to its projected batch")
+        if any(
+            tuple(outcome.ordinal for outcome in outcomes) != tuple(range(len(outcomes))) for outcomes in intermediate_by_token.values()
+        ):
+            raise ValueError("semantic intermediate outcome ordinals must be dense from zero per token")
+        disposition_by_token = {disposition.token_key: disposition for disposition in self.terminal_dispositions}
+        for batch in self.batches:
+            if batch.status != "completed":
+                continue
+            if any(
+                (
+                    disposition_by_token[member.token_key].outcome,
+                    disposition_by_token[member.token_key].path,
+                    disposition_by_token[member.token_key].sink_name,
+                )
+                != ("transient", "batch_consumed", None)
+                for member in batch.members
+            ):
+                raise ValueError("semantic completed batch members must have exact transient batch_consumed dispositions")
+        token_by_key = {token.key: token for token in self.tokens}
+        expansion_children: set[str] = set()
+        for expansion in self.expansions:
+            if expansion.parent_token_key not in token_keys:
+                raise ValueError("semantic expansion parent must reference a projected token")
+            parent_disposition = disposition_by_token[expansion.parent_token_key]
+            if (parent_disposition.outcome, parent_disposition.path, parent_disposition.sink_name) != (
+                "transient",
+                "expand_parent",
+                None,
+            ):
+                raise ValueError("semantic expansion parent must have exact transient expand_parent disposition")
+            for child in expansion.children:
+                if child.token_key not in token_keys or child.token_key in expansion_children:
+                    raise ValueError("semantic expansion children must reference distinct projected tokens")
+                expansion_children.add(child.token_key)
+                if token_by_key[child.token_key].parent_set != (expansion.parent_token_key,):
+                    raise ValueError("semantic expansion child lineage must exactly bind its parent")
+        row_keys_with_none = row_keys | {None}
+        if any(error.row_key not in row_keys_with_none for error in self.validation_errors):
+            raise ValueError("semantic validation errors must reference projected rows when row identity is present")
+        if any(error.token_key not in token_keys for error in self.transform_errors):
+            raise ValueError("semantic transform errors must reference projected tokens")
         return self
 
 
@@ -724,6 +983,13 @@ class SemanticProjectionCounts(ClosedModel):
     routes: Count
     terminal_dispositions: Count
     scheduler_work: Count
+    intermediate_outcomes: Count = Field(default=0, exclude_if=lambda value: value == 0)
+    batches: Count = Field(default=0, exclude_if=lambda value: value == 0)
+    batch_members: Count = Field(default=0, exclude_if=lambda value: value == 0)
+    expansions: Count = Field(default=0, exclude_if=lambda value: value == 0)
+    expansion_children: Count = Field(default=0, exclude_if=lambda value: value == 0)
+    validation_errors: Count = Field(default=0, exclude_if=lambda value: value == 0)
+    transform_errors: Count = Field(default=0, exclude_if=lambda value: value == 0)
 
 
 class SemanticRunExpectation(ClosedModel):
@@ -1244,9 +1510,13 @@ class ScenarioRunEvidence(ClosedModel):
                 "token": len(projection.tokens),
                 "node_state": len(projection.node_states),
                 "routing_event": len(projection.routes),
-                "token_outcome": len(projection.terminal_dispositions),
+                "token_outcome": len(projection.terminal_dispositions) + len(projection.intermediate_outcomes),
                 "token_parent": sum(len(token.parents) for token in projection.tokens),
                 "scheduler_event": sum(len(work.transitions) for work in projection.scheduler_work),
+                "batch": len(projection.batches),
+                "batch_member": sum(len(batch.members) for batch in projection.batches),
+                "validation_error": len(projection.validation_errors),
+                "transform_error": len(projection.transform_errors),
             }
             for record in projection.audit_records:
                 expected_record_counts[record.record_type] = expected_record_counts.get(record.record_type, 0) + 1
