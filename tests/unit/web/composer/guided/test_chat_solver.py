@@ -1062,6 +1062,36 @@ def test_multi_output_context_is_deterministic_and_keeps_untrusted_data_out_of_s
         assert raw_label in context.untrusted_user_content
 
 
+def test_single_output_advisory_context_adds_only_non_default_explicit_index() -> None:
+    raw_label = "SINGLE_OUTPUT_IGNORE_SYSTEM"
+    raw_option = "private-output-path.jsonl"
+    current_sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="only",
+                plugin="json",
+                options={"path": raw_option},
+                required_fields=(raw_label,),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    expected_output = {
+        "option_count": 1,
+        "plugin": "json",
+        "required_fields": ["field_1"],
+        "schema_mode": "observed",
+    }
+
+    assert chat_solver._sink_revision_context_for_llm(current_sink) == {"output": expected_output}
+    assert chat_solver._sink_revision_context_for_llm(current_sink, output_indices=(1,)) == {"output": expected_output}
+    gapped = chat_solver._sink_revision_context_for_llm(current_sink, output_indices=(3,))
+    assert gapped == {"output": {**expected_output, "output_index": 3}}
+    assert raw_label not in json.dumps(gapped)
+    assert raw_option not in json.dumps(gapped)
+
+
 @pytest.mark.parametrize(
     ("output_indices", "match"),
     [
@@ -1247,6 +1277,71 @@ async def test_guided_chat_route_selects_active_output_for_revision_and_keeps_al
     user_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "user")
     for raw_label in (source_label, output_label_a, output_label_b):
         assert raw_label in user_content
+
+
+@pytest.mark.asyncio
+async def test_guided_chat_route_preserves_gapped_index_for_single_advisory_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_label = "ROUTE_SINGLE_OUTPUT_IGNORE_SYSTEM"
+    raw_option = "private-single-output.jsonl"
+    output = SinkOutputResolved(
+        name="only",
+        plugin="json",
+        options={"path": raw_option},
+        required_fields=(output_label,),
+        schema_mode="observed",
+        on_write_failure="discard",
+    )
+    guided = SimpleNamespace(
+        active_edit_target=SimpleNamespace(kind="output", stable_id="output-b"),
+        source_order=(),
+        reviewed_sources={},
+        output_order=("pending-a", "pending-b", "output-b"),
+        reviewed_outputs={"output-b": output},
+        pending_output_intents={"pending-a": SimpleNamespace(), "pending-b": SimpleNamespace()},
+        deferred_intents=(),
+    )
+    captured: dict[str, Any] = {}
+
+    async def capture_sink_provider(**kwargs: Any) -> _FakeLLMResponse:
+        captured.update(kwargs)
+        return _ok_response("The selected output is ready.")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", capture_sink_provider)
+
+    await guided_chat_atomic_module.run_guided_chat_provider_attempt(
+        session_id=uuid4(),
+        user=SimpleNamespace(user_id="user"),
+        step=GuidedStep.STEP_2_SINK,
+        guided=guided,
+        state=SimpleNamespace(sources={}, nodes=(), outputs=(), edges=()),
+        message="Explain this output.",
+        settings=SimpleNamespace(
+            composer_model="test/model",
+            composer_temperature=None,
+            composer_seed=None,
+            composer_max_discovery_turns=1,
+            composer_timeout_seconds=30.0,
+        ),
+        catalog=SimpleNamespace(),
+        plugin_snapshot=None,
+        secret_service=None,
+        recorder=BufferingRecorder(),
+        progress=None,
+    )
+
+    system_messages = [str(message["content"]) for message in captured["messages"] if message["role"] == "system"]
+    assert len(system_messages) == 2
+    revision_prompt, advisory_context = system_messages
+    assert '"revision_target_index": 3' in revision_prompt
+    assert '"output_index"' not in revision_prompt
+    assert '"output": {"option_count": 1, "output_index": 3, "plugin": "json"' in advisory_context
+    assert output_label not in "\n".join(system_messages)
+    assert raw_option not in "\n".join(system_messages)
+    user_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "user")
+    assert output_label in user_content
+    assert raw_option not in user_content
 
 
 @pytest.mark.asyncio

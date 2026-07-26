@@ -1001,6 +1001,13 @@ def _sink_revision_context_for_llm(
     field_aliases: Mapping[str, str] | None = None,
     output_indices: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
+    """Serialize sink structure, preserving only non-default explicit singleton identity.
+
+    The legacy singleton shape stays ``{"output": ...}`` for omitted indices
+    and explicit dense index 1. An advisory singleton at a later original
+    position carries that identity as ``output.output_index``. Plural outputs
+    always carry their validated indices on each output projection.
+    """
     aliases = _sink_field_aliases(current_sink, field_aliases=field_aliases)
     if output_indices is None:
         effective_output_indices = tuple(range(1, len(current_sink.outputs) + 1))
@@ -1027,7 +1034,14 @@ def _sink_revision_context_for_llm(
         }
 
     if len(current_sink.outputs) == 1:
-        return {"output": serialize_output(current_sink.outputs[0])}
+        output_projection = serialize_output(current_sink.outputs[0])
+        if output_indices is not None and effective_output_indices[0] != 1:
+            indexed_output_projection: _IndexedSinkRevisionOutputProjection = {
+                **output_projection,
+                "output_index": effective_output_indices[0],
+            }
+            return {"output": indexed_output_projection}
+        return {"output": output_projection}
     if not current_sink.outputs:
         raise InvariantError("Step 2 chat requires at least one current output")
 
