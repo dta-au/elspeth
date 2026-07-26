@@ -2028,6 +2028,8 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-7e2dd67275"
             elif dimension == "round_trip":
                 expected_owner = "elspeth-7cf763da7c"
+            elif dimension == "scale":
+                expected_owner = "elspeth-cb1053fe46"
             else:
                 expected_owner = "elspeth-ef29ef6ba4"
             assert cell.owner_issue == expected_owner

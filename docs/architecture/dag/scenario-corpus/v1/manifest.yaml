@@ -450,7 +450,7 @@ scenarios:
       scale: &scale_partial
         status: partial
         reason: Functional scale slices pass without a declared supported threshold for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
+        owner_issue: elspeth-cb1053fe46
         exit_gate: The scenario corpus scale case passes its declared supported threshold in the required CI gate.
 
   - id: multiple-independent-sources
@@ -518,7 +518,7 @@ scenarios:
       scale: &scale_unknown
         status: unknown
         reason: No supported scale envelope has been executed for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
+        owner_issue: elspeth-cb1053fe46
         exit_gate: The scenario corpus scale case passes its declared supported threshold in the required CI gate.
 
   - id: multi-source-queue-fan-in
