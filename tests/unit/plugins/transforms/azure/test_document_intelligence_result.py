@@ -66,6 +66,15 @@ def test_host_match_accepts_explicit_default_port() -> None:
     assert operation_location_host_matches("https://di.cognitiveservices.azure.com:443/analyzeResults/abc", _ENDPOINT)
 
 
+@pytest.mark.parametrize("port", ["invalid", "65536"])
+def test_host_match_rejects_malformed_operation_port(port: str) -> None:
+    assert not operation_location_host_matches(f"https://di.cognitiveservices.azure.com:{port}/analyzeResults/abc", _ENDPOINT)
+
+
+def test_host_match_rejects_malformed_endpoint_port() -> None:
+    assert not operation_location_host_matches(_OP, "https://di.cognitiveservices.azure.com:invalid")
+
+
 def test_host_match_rejects_garbage() -> None:
     assert not operation_location_host_matches("not a url", _ENDPOINT)
 
