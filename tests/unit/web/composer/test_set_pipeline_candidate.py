@@ -2168,6 +2168,21 @@ def test_parent_traversal_sink_path_still_rejected(tmp_path: Path) -> None:
     assert ".." in ((candidate.result.data or {}).get("error") or "")
 
 
+@pytest.mark.parametrize("path", [".", "./"])
+def test_current_directory_sink_path_returns_validation_failure(tmp_path: Path, path: str) -> None:
+    args = _ab_multi_query_args(tmp_path)
+    args["outputs"][0]["options"]["path"] = path
+    (tmp_path / "outputs").mkdir(exist_ok=True)
+    context = _operator_profile_view(tmp_path)
+
+    candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+    assert candidate.acceptable is False
+    assert candidate.result.success is False
+    assert (candidate.result.data or {}).get("error_code") == "plugin_options_invalid"
+    assert "current directory" in ((candidate.result.data or {}).get("error") or "")
+
+
 def _scrape_cleanup_args(tmp_path: Path) -> dict[str, Any]:
     """web_scrape -> field_mapper(select_only) chain that DROPS the raw fields
     without staging the drop_raw_html_fields review requirement."""

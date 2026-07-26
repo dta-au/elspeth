@@ -1115,6 +1115,8 @@ def canonical_sink_local_paths(options: Mapping[str, Any]) -> dict[str, JsonValu
         if type(value) is not str or not value or value.startswith(BLOB_REF_PATH_PREFIX):
             continue
         raw = PurePosixPath(value)
+        if not raw.parts:
+            raise ValueError(f"option {key!r} must name a path, not the current directory")
         if ".." in raw.parts:
             raise ValueError(
                 f"option {key!r} must not contain '..' path segments; give a path like 'results.json' or 'reports/results.json'"
