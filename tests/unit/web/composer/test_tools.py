@@ -14594,7 +14594,7 @@ class TestStructuralNodeTypeProbedAsPlugin:
         )
 
         assert result.success is False
-        assert result.data["error_code"] == "not_installed"
+        assert result.data["error_code"] == "plugin_not_installed"
 
 
 class TestExplainGateRouteLabels:

@@ -1313,10 +1313,15 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
 def _validate_plugin_name(
     context: ToolContext,
     plugin_type: PluginKind,
-    name: str,
+    name: object,
 ) -> PluginPolicyViolation | None:
     """Validate a new plugin selection against one request policy view."""
-    if isinstance(name, str) and plugin_type == "transform" and name in _STRUCTURAL_NODE_TYPE_GUIDANCE:
+    if not isinstance(name, str):
+        return PluginPolicyViolation(
+            error_code=PluginUnavailableReason.NOT_INSTALLED,
+            message=_plugin_unavailable_message(plugin_type, PluginUnavailableReason.NOT_INSTALLED),
+        )
+    if plugin_type == "transform" and name in _STRUCTURAL_NODE_TYPE_GUIDANCE:
         return PluginPolicyViolation(
             error_code=PluginUnavailableReason.NOT_INSTALLED,
             message=_STRUCTURAL_NODE_TYPE_GUIDANCE[name],
