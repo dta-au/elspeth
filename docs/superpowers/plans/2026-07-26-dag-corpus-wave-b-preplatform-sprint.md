@@ -27,29 +27,75 @@ APIs, Filigree, Loomweave, Warpline, Ruff, and mypy.
 
 - [x] Wave A is fast-forwarded into `release/0.7.2` at
   `5308e8c8867c6c6c26964a82eaf1081e2d1327d0`.
-- [x] The merged release and the isolated Wave B worktree each pass the
-  191-test corpus baseline.
+- [x] At sprint start, the merged release and isolated Wave B worktree each
+  passed the historical 191-test corpus baseline.
 - [x] Deferred platform is paused, clean, and unmerged at
   `132bd53232ea6b3885250675c361d3c057b19ac5`.
-- [ ] Keep `codex/deferred-platform-completion` read-only during this sprint.
-- [ ] Keep all multi-process ownership, lease expiry, reclaim,
+- [x] Keep `codex/deferred-platform-completion` read-only during this sprint.
+- [x] Keep all multi-process ownership, lease expiry, reclaim,
   late-completion, peer-cancellation, and distributed-finalization cells
   non-pass until that branch is rebased and resumed.
-- [ ] Keep the parent `elspeth-ef29ef6ba4` open. Corpus-only implementation
+- [x] Keep the parent `elspeth-ef29ef6ba4` open. Corpus-only implementation
   units receive bounded children unless the live tracker already has an
   authoritative issue for that exact proof boundary.
-- [ ] The coordinator is the sole committer/integrator of
+- [x] The coordinator is the sole committer/integrator of
   `docs/architecture/dag/scenario-corpus/v1/manifest.yaml`. Except for the
   serialized F0 migration, worker branches change fixtures, harness/plugins,
   and focused tests only; they return the exact intended YAML delta for the
   coordinator to apply after integration and verification.
-- [ ] Start every packet from the latest integrated Wave B SHA. Before work,
+- [x] Start every packet from the latest integrated Wave B SHA. Before work,
   verify its fixed tracker ID, status, merge ancestry, and evidence IDs; if it
   is already integrated, reverify and skip rather than duplicating it.
 - [ ] Immediately before final review/integration, rebase each worker branch
   onto the latest integrated Wave B SHA and rerun its focused gate. This is
   mandatory because recovery lanes share harness and integration-test hot
   files even when their fixture directories are independent.
+
+## Final execution checkpoint
+
+Recorded on 2026-07-27 at immutable implementation/evidence head
+`210a92d544dbb10d5d0b438351f123e05da19f5d`. This is not the final Wave B
+branch head, a current-release commit, or a combined commit. The single final
+two-file handoff commit must follow it and must be included in integration
+through the dynamically captured Wave B tip.
+
+The recorded, refreshable `release/0.7.2` snapshot is
+`ad7f1e277e2ecab75e33bdda6d82c0342d418600`. At the implementation/evidence
+head, the branches share merge base
+`5308e8c8867c6c6c26964a82eaf1081e2d1327d0` and diverge by 35 release-only
+and 20 Wave-B-only commits. After the one expected docs commit, the recorded
+shape becomes 35/21. Execution must capture the current release and Wave B
+tips, require `210a92d544dbb10d5d0b438351f123e05da19f5d` as a Wave B ancestor, and
+require exactly one following commit whose changed paths are the two handoff
+documents. The integration range ends at that dynamic tip, not at `210a92d5`.
+
+The focused final gate reports `541 passed, 2 expected xfailed, 3 known quorum
+warnings`. Focused Ruff check/format, mypy, and `git diff --check` are green.
+The xfails remain a real stop condition owned by `elspeth-3a6fa9141f`; this
+plan does not convert them into passing evidence.
+
+The final schema-v2 manifest has 15 scenarios, 39 cases, 99 evidence
+references, and 165 cells: 73 `pass`, 31 `partial`, 16 `fail`, 33 `unknown`,
+and 12 `not_applicable`. Eighty applicable cells remain non-pass. B4-A closed
+at `210a92d544dbb10d5d0b438351f123e05da19f5d` and promoted only checkpoint
+runtime/audit. Its single-process, fresh-object proof remains provisional
+pending the deferred-platform rebase.
+
+The sprint did not complete B1-X or B2-X. Seven P2 recovery children remain
+open behind P3 `elspeth-7dcc6554e7`: `elspeth-1805aec2a6`,
+`elspeth-3ae349b761`, `elspeth-9e74843418`, `elspeth-7729c0beb5`,
+`elspeth-d09414a1a0`, `elspeth-e7a8fb1547`, and `elspeth-cd09538cd0`.
+The scale issue `elspeth-cb1053fe46` also remains blocked by the parent whose
+acceptance depends on those scale cells; reconcile that dependency cycle
+before scale execution.
+
+The recorded, refreshable paused-platform snapshot is clean at
+`132bd53232ea6b3885250675c361d3c057b19ac5`, through Task 5. Its recorded
+replay base is `696b3d1414ed7a6789c8f25bf5cbdc5450385bdd`, so the later rebase must
+refresh its live tip and review/reaccept the recorded 13-commit replay range
+plus any explicitly reviewed later platform commits. See
+[the current handoff](2026-07-26-dag-corpus-wave-b-handoff.md) for the combine,
+rebase, invalidation, and verification sequence.
 
 ## Required common invariants
 
@@ -159,7 +205,7 @@ the following blocking corrections were incorporated:
 F0 is a serialized, coordinator-owned migration barrier. No later packet may
 start until its commit is integrated and verified.
 
-- [ ] **Step 1: Write RED model tests for exact plural input attribution.**
+- [x] **Step 1: Write RED model tests for exact plural input attribution.**
 
   Replace `HarnessCaseSpec.input_fixture` with an immutable, sorted
   `input_fixtures: Mapping[source_name, repository_relative_fixture]` contract,
@@ -174,7 +220,7 @@ start until its commit is integrated and verified.
   reject missing/extra sink names, input/output token-name collisions, and any
   sink path that differs from its declared binding.
 
-- [ ] **Step 2: Run the focused attribution tests and capture the expected
+- [x] **Step 2: Run the focused attribution tests and capture the expected
   failures before changing schema/loader/harness code.**
 
   Run:
@@ -195,7 +241,7 @@ start until its commit is integrated and verified.
   non-zero collection count, and then record the expected failures before any
   implementation change.
 
-- [ ] **Step 3: Implement exact source-name binding and deterministic hashing.**
+- [x] **Step 3: Implement exact source-name binding and deterministic hashing.**
 
   `render_settings()` must substitute deterministic trusted tokens
   `input_<normalized_source_name>` and `output_<normalized_sink_name>`, with
@@ -212,7 +258,7 @@ start until its commit is integrated and verified.
   Distinct orders/refunds fixtures must be introduced here so the multi-source
   binding itself is proved before B1 runtime promotion.
 
-- [ ] **Step 4: Write RED typed-expectation tests for multiple sink artifacts,
+- [x] **Step 4: Write RED typed-expectation tests for multiple sink artifacts,
   exact runtime outcomes/dispositions, and exact audit counts.**
 
   Add an explicitly discriminated immutable run expectation/evidence model
@@ -232,7 +278,7 @@ start until its commit is integrated and verified.
   mismatches, runtime facts on unattempted evidence, and expectation/workflow
   mismatches.
 
-- [ ] **Step 5: Implement the minimal typed models and evidence extraction.**
+- [x] **Step 5: Implement the minimal typed models and evidence extraction.**
 
   Use the existing linear run as the end-to-end tracer bullet, then prove the
   plural-source and conditional multi-output bindings through focused cases.
@@ -241,15 +287,15 @@ start until its commit is integrated and verified.
   not query private tables when a public repository/query method exists. Keep
   the existing Wave A build evidence shape unchanged.
 
-- [ ] **Step 6: Re-run the focused RED tests, then the full corpus gate and
+- [x] **Step 6: Re-run the focused RED tests, then the full corpus gate and
   static checks.**
 
-  Expected result: all existing 191 tests plus the new contract tests pass.
-  Also require zero remaining singular `input_fixture:` declarations, zero
+  F0 closed with 239 focused corpus tests passing. Also require zero remaining
+  singular `input_fixture:` declarations, zero
   `${input_csv}` tokens in registered YAML, no sink path using
   `${fault_marker}`, and exact evidence-registry digest parity.
 
-- [ ] **Step 7: Obtain independent spec and quality review, repair findings,
+- [x] **Step 7: Obtain independent spec and quality review, repair findings,
   commit, comment, and close the F0 child.**
 
 ## Task 2: B1-R — source, fan-in, and routing runtime/audit
@@ -265,7 +311,7 @@ start until its commit is integrated and verified.
   `multiple-independent-sources/`, `multi-source-queue-fan-in/`, and
   `conditional-routing/`
 
-- [ ] **Step 1: Write the exact B1 runtime table first.**
+- [x] **Step 1: Write the exact B1 runtime table first.**
 
   Cases:
 
@@ -277,26 +323,26 @@ start until its commit is integrated and verified.
   - `conditional-routing:two-way-gate`: exact accepted/rejected artifacts,
     2/1 split, route labels, dispositions, and audit facts.
 
-- [ ] **Step 2: Run the B1 table RED.**
+- [x] **Step 2: Run the B1 table RED.**
 
   It must fail because the build-only cases do not yet produce runtime/audit
   evidence or the exact plural-source/output facts.
 
-- [ ] **Step 3: Retain `linear:happy-path` as `run`, convert the other three
+- [x] **Step 3: Retain `linear:happy-path` as `run`, convert the other three
   build cases to `run`, update fixtures, and implement the minimum
   case-independent harness support.**
 
-- [ ] **Step 4: Add production-builder negatives for missing and invalid gate
+- [x] **Step 4: Add production-builder negatives for missing and invalid gate
   destinations.**
 
   These pytest references may support config/build/contracts only. They do not
   support runtime by analogy.
 
-- [ ] **Step 5: Promote exactly the four B1 runtime and four audit cells.**
+- [x] **Step 5: Promote exactly the four B1 runtime and four audit cells.**
 
   Leave B1 recovery, concurrency, and scale cells unchanged in this commit.
 
-- [ ] **Step 6: Run focused B1 tests, full corpus, static checks, Warpline,
+- [x] **Step 6: Run focused B1 tests, full corpus, static checks, Warpline,
   reviews, commit, and close B1-R.**
 
 ## Task 3: B1-X — independently stoppable topology recovery packets
@@ -342,6 +388,9 @@ start until its commit is integrated and verified.
   Recovery evidence remains provisional at its recorded Wave B SHA until the
   post-platform invalidation and rerun described in Task 12.
 
+**Final status:** deferred. All four children remain open behind
+`elspeth-7dcc6554e7`; no B1 recovery cell was promoted to pass.
+
 ## Task 4: Scale boundary — consume the dedicated issue, do not duplicate it
 
 **Files:**
@@ -352,10 +401,10 @@ start until its commit is integrated and verified.
 - No status or evidence promotion and no production/test-harness implementation
 - Existing owner: `elspeth-cb1053fe46`
 
-- [ ] **Step 1: Verify `elspeth-cb1053fe46` remains the authoritative scale
+- [x] **Step 1: Verify `elspeth-cb1053fe46` remains the authoritative scale
   task and record it on every unchanged scale cell.**
 
-- [ ] **Step 2: Do not create B1-S/B2-S children and do not promote scale in
+- [x] **Step 2: Do not create B1-S/B2-S children and do not promote scale in
   this sprint.**
 
   The existing task requires the repository-standard
@@ -364,7 +413,7 @@ start until its commit is integrated and verified.
   per repetition, warmup/sample count, retained raw results, a deterministic
   threshold with margin, and safe above-envelope failure behavior.
 
-- [ ] **Step 3: Leave all scale cells honest and incomplete for the later
+- [x] **Step 3: Leave all scale cells honest and incomplete for the later
   dedicated issue.**
 
 ## Task 5: B2-5 — partial terminal failure
@@ -378,20 +427,20 @@ start until its commit is integrated and verified.
   `tests/fixtures/dag_scenario_corpus/v1/fork-multiple-terminals-partial-failure/`
 - Modify the corpus integration and contract tests
 
-- [ ] **Step 1: RED the `one-terminal-fails` production case.**
+- [x] **Step 1: RED the `one-terminal-fails` production case.**
 
   Require `completed_with_failures`, the surviving artifact, the failed
   terminal disposition, exact parent links, no orphan tokens, and exact audit
   export.
 
-- [ ] **Step 2: Add a deterministic failing sink through the public corpus
+- [x] **Step 2: Add a deterministic failing sink through the public corpus
   plugin manager and the canonical YAML fixture.**
 
-- [ ] **Step 3: Promote only the facts proved by the runtime/audit case.**
+- [x] **Step 3: Promote only the facts proved by the runtime/audit case.**
 
   Recovery, concurrency, and scale remain for their own packets.
 
-- [ ] **Step 4: Review, gate, commit, and close B2-5.**
+- [x] **Step 4: Review, gate, commit, and close B2-5.**
 
 ## Task 6: B2-6 — coalesce policy and merge-strategy matrix
 
@@ -402,23 +451,23 @@ start until its commit is integrated and verified.
 - Add fixtures under:
   `tests/fixtures/dag_scenario_corpus/v1/fork-coalesce-policies/`
 
-- [ ] **Step 1: RED the exact 4 x 3 positive matrix.**
+- [x] **Step 1: RED the exact 4 x 3 positive matrix.**
 
   Cover `require_all`, `first`, `quorum`, and `best_effort` crossed with
   `union`, `nested`, and `select`. Quorum/best-effort inputs must actually lose
   a branch; select must choose an arrived branch.
 
-- [ ] **Step 2: RED four failure cases and union-collision policy cases.**
+- [x] **Step 2: RED four failure cases and union-collision policy cases.**
 
   Required failures: `require-all-lost-branch`, `quorum-impossible`,
   `best-effort-all-lost`, and `first-all-lost`. Require stable reasons and
   dispositions. Cover `last_wins`, `first_wins`, and `fail` collisions through
   production-path pytest evidence.
 
-- [ ] **Step 3: Implement deterministic branch failure only in the public
+- [x] **Step 3: Implement deterministic branch failure only in the public
   corpus plugin manager; add fixtures and exact evidence.**
 
-- [ ] **Step 4: Promote only S6 contracts/runtime/audit facts proved by the
+- [x] **Step 4: Promote only S6 contracts/runtime/audit facts proved by the
   matrix, then review, gate, commit, and close B2-6.**
 
 ## Task 7: B2-78 — sequential and parallel coalesces
@@ -430,22 +479,22 @@ start until its commit is integrated and verified.
 - Modify corpus tests; coordinator applies the manifest delta after child
   integration
 
-- [ ] **Step 1: RED `two-sequential-require-all`.**
+- [x] **Step 1: RED `two-sequential-require-all`.**
 
   Require exact output, 3 processed/3 outputs, 21 tokens, 9 edges, schema
   propagation through the second merge, and a negative incompatible-schema
   build case.
 
-- [ ] **Step 2: RED `two-parallel-require-all`.**
+- [x] **Step 2: RED `two-parallel-require-all`.**
 
   Require 3 inputs/6 terminal outputs, 21 tokens, exact dual artifacts, and
   graph shape: 6 nodes, 8 edges; source=1, gate=1, coalesce=2, sink=2. Add a
   negative proving branch names cannot cross or be reused between coalesces.
 
-- [ ] **Step 3: Implement fixtures, exact evidence, and only the manifest
+- [x] **Step 3: Implement fixtures, exact evidence, and only the manifest
   promotions those cases prove.**
 
-- [ ] **Step 4: Review, gate, commit, and close B2-78.**
+- [x] **Step 4: Review, gate, commit, and close B2-78.**
 
 ## Task 8: B2-X — independently stoppable topology recovery packets
 
@@ -467,12 +516,18 @@ start until its commit is integrated and verified.
 - [ ] **Step 2: Promote one B2 recovery cell only after its topology child is
   integrated and independently reviewed.**
 
-- [ ] **Step 3: Mark each recovery evidence set provisional at its exact Wave B
+- [x] **Step 3: Mark each integrated recovery evidence set provisional at its exact Wave B
   SHA pending the post-platform invalidation/rerun.**
 
-- [ ] **Step 4: Keep all eight B1/B2 concurrency cells non-pass and owned by
+- [x] **Step 4: Keep all eight B1/B2 concurrency cells non-pass and owned by
   the later platform-rebase packet; keep all scale cells non-pass under
   `elspeth-cb1053fe46`.**
+
+**Final status:** partial. The parallel-coalesce child
+`elspeth-a19d62ab4c` closed at
+`906c6915dd4935a871fac3e34175b2633ba2cebe`; the other three B2-X children
+remain open behind `elspeth-7dcc6554e7`. The integrated proof remains
+provisional.
 
 ## Task 9: B3-R — stateful runtime and audit
 
@@ -483,14 +538,14 @@ start until its commit is integrated and verified.
 - Modify plugins/corpus tests; coordinator applies the manifest delta after
   child integration
 
-- [ ] **Step 1: RED exact aggregation and expansion cases.**
+- [x] **Step 1: RED exact aggregation and expansion cases.**
 
   `eof-immutable-membership` produces exactly `{value: 60, count: 3}` with
   immutable membership and stable ordinals. `json-explode-parent-child`
   produces exactly six children from three parents with exact identities,
   groups, outcomes, and lineage.
 
-- [ ] **Step 2: RED four separate disposition cases.**
+- [x] **Step 2: RED four separate disposition cases.**
 
   `retry-then-success`, `source-quarantine-routed`, `transform-discard`, and
   `transform-error-route` each require exact attempts, route, artifact,
@@ -500,9 +555,9 @@ start until its commit is integrated and verified.
   consume their already integrated verification or record explicit
   dependencies and leave affected cells unchanged.
 
-- [ ] **Step 3: RED sink `write-once` and implement the minimum fixtures.**
+- [x] **Step 3: RED sink `write-once` and implement the minimum fixtures.**
 
-- [ ] **Step 4: Apply the exact per-scenario ceiling, review, gate, commit, and
+- [x] **Step 4: Apply the exact per-scenario ceiling, review, gate, commit, and
   close B3-R.**
 
   - `aggregation-immutable-batch`: contracts/runtime/audit may pass;
@@ -520,17 +575,17 @@ start until its commit is integrated and verified.
   child integration
 - Reuse public recovery and sink-effect query surfaces
 
-- [ ] **Step 1: Create a bounded aggregation/expansion corpus child and retain
+- [x] **Step 1: Create a bounded aggregation/expansion corpus child and retain
   the closed `elspeth-7cdc4da434` evidence as historical input, never as the
   active owner.**
 
-- [ ] **Step 2: RED aggregation and expansion reopen/resume cases.**
+- [x] **Step 2: RED aggregation and expansion reopen/resume cases.**
 
   Cover EOF/post-barrier immutable aggregation recovery and the
   child-enqueue/parent-disposition expansion seam. Require no remint/replay and
   exact terminal state.
 
-- [ ] **Step 3: Claim and close, do not duplicate, `elspeth-76bb92bc7d` for
+- [x] **Step 3: Claim and close, do not duplicate, `elspeth-76bb92bc7d` for
   `pending-redrive-reopen`.**
 
   The case must prove payload, sink, outcome, path, error hash/message,
@@ -538,10 +593,10 @@ start until its commit is integrated and verified.
   publication, and no source replay. Do not promote sink recovery until that
   authoritative task is integrated, verified, and closed.
 
-- [ ] **Step 4: Keep multi-process sink redrive owned by
+- [x] **Step 4: Keep multi-process sink redrive owned by
   `elspeth-9a52eb80f9` and keep B3 scale/concurrency non-pass.**
 
-- [ ] **Step 5: Review, gate, commit, and close only evidence-complete children.**
+- [x] **Step 5: Review, gate, commit, and close only evidence-complete children.**
 
   Aggregation, expansion, and sink recovery evidence remains provisional at
   its recorded Wave B SHA pending the post-platform invalidation/rerun.
@@ -553,14 +608,14 @@ start until its commit is integrated and verified.
 - Modify checkpoint fixture, harness, and corpus tests; coordinator applies the
   manifest delta after child integration
 
-- [ ] **Step 1: RED `control-vs-reopen-resume`.**
+- [x] **Step 1: RED `control-vs-reopen-resume`.**
 
   Run an uninterrupted control and a faulted copy in separate databases.
   Destroy runtime objects, reopen, rebuild, and resume publicly. Compare
   canonical outputs and stable durable/audit projections while excluding only
   declared volatile IDs/timestamps.
 
-- [ ] **Step 2: Require one source load, one effective sink output, terminal
+- [x] **Step 2: Require one source load, one effective sink output, terminal
   work/outcomes, resume marker, checkpoint removal, and exact
   `NonResumableRunError` refusal on a second resume attempt.**
 
@@ -568,14 +623,18 @@ start until its commit is integrated and verified.
   after the refused second resume and require byte-for-byte canonical equality
   so the refusal proves zero mutation.
 
-- [ ] **Step 3: Promote checkpoint runtime and audit only.**
+- [x] **Step 3: Promote checkpoint runtime and audit only.**
 
   Keep contracts/recovery partial while `elspeth-f321e3ff21` and
   `elspeth-245b21351b` remain open. Keep concurrency and scale unknown.
   Runtime/audit evidence is provisional at its recorded Wave B SHA pending the
   post-platform invalidation/rerun.
 
-- [ ] **Step 4: Review, gate, commit, and close B4-A.**
+- [x] **Step 4: Review, gate, commit, and close B4-A.**
+
+  Closed `elspeth-8a6f52b2f6` at
+  `210a92d544dbb10d5d0b438351f123e05da19f5d`. The accepted proof is
+  single-process, fresh-object, and provisional pending platform rebase.
 
 ## Task 12: Deferred-platform rebase handoff
 
@@ -585,13 +644,13 @@ start until its commit is integrated and verified.
 - Modify: this plan with final completed/deferred ledger
 - Modify manifest reasons/owners only when live tracker state supports it
 
-- [ ] **Step 1: Recompute the exact live manifest ledger and list every
+- [x] **Step 1: Recompute the exact live manifest ledger and list every
   remaining concurrency/distributed-authority cell.**
 
 - [ ] **Step 2: Record the combined release/Wave B SHA and all packet commits,
   tests, reviews, and open blockers.**
 
-- [ ] **Step 3: Give the paused platform branch an exact rebase instruction.**
+- [x] **Step 3: Give the paused platform branch an exact rebase instruction.**
 
   Rebase `codex/deferred-platform-completion` onto the final combined
   `release/0.7.2`/Wave B integration commit, rerun its impacted authority
@@ -614,7 +673,7 @@ start until its commit is integrated and verified.
   acceptance hash, or cell status is copied forward merely because the rebase
   is textually clean.
 
-- [ ] **Step 5: Record the paused branch merge base and exact replay range in
+- [x] **Step 5: Record the paused branch merge base and exact replay range in
   the handoff.**
 
 - [ ] **Step 6: Run final corpus/static/Warpline review and release the parent
