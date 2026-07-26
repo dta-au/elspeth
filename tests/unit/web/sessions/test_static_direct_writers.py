@@ -1240,6 +1240,20 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "the production tool handlers."
         ),
     ),
+    # ------ test_schema.py — epoch-37 coordination schema fixture ------
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_schema.py",
+        enclosing_symbol="_seed_session_state",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "epoch-37 coordination schema fixture: seeds the parent "
+            "composition_states row required by runs_table's composite FK so "
+            "direct negative inserts can isolate the new coordination CHECK "
+            "constraints. The test owns the in-memory SQLite engine and is "
+            "pinning DDL behaviour, not bypassing the production session writer."
+        ),
+    ),
     # ------ tests/unit/web/sessions/* — targeted chat transcript fixtures ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_blob_inline_resolutions_schema.py",
