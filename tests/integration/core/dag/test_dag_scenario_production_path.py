@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from elspeth.core.dag import GraphValidationError
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter
 from elspeth.core.landscape.schema import node_states_table
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -44,9 +45,207 @@ BUILD_CASES = [
     pytest.param("fork-coalesce-policies", "require-all-nested", id="fork-coalesce-policies:require-all-nested"),
 ]
 
+B1_RUNTIME_CASES = (
+    ("linear", "happy-path"),
+    ("multiple-independent-sources", "independent-roots"),
+    ("multi-source-queue-fan-in", "queued-fan-in"),
+    ("conditional-routing", "two-way-gate"),
+)
+
+B1_RUNTIME_ORACLE_FIXTURES = {
+    ("multiple-independent-sources", "independent-roots"): "multiple-independent-sources/runtime-expected.json",
+    ("multi-source-queue-fan-in", "queued-fan-in"): "multi-source-queue-fan-in/runtime-expected.json",
+    ("conditional-routing", "two-way-gate"): "conditional-routing/runtime-expected.json",
+}
+
 
 def _declared_case(scenario_id: str, case_id: str) -> tuple[ScenarioSpec, HarnessCaseSpec]:
     return next((scenario, case) for scenario, case in iter_harness_cases(MANIFEST) if (scenario.id, case.id) == (scenario_id, case_id))
+
+
+def _proposed_b1_runtime_case(scenario_id: str, case_id: str) -> tuple[ScenarioSpec, HarnessCaseSpec]:
+    scenario, declared_case = _declared_case(scenario_id, case_id)
+    oracle_fixture = B1_RUNTIME_ORACLE_FIXTURES.get((scenario_id, case_id))
+    if oracle_fixture is None:
+        return scenario, declared_case
+    values = declared_case.model_dump(mode="json")
+    values["workflow"] = "run"
+    values["expected"] = json.loads(resolve_fixture_path(oracle_fixture).read_text(encoding="utf-8"))
+    return scenario, HarnessCaseSpec.model_validate(values)
+
+
+@pytest.mark.parametrize(("scenario_id", "case_id"), B1_RUNTIME_CASES)
+def test_b1_runtime_table_declares_exact_run_oracle(
+    scenario_id: str,
+    case_id: str,
+) -> None:
+    _scenario, case = _proposed_b1_runtime_case(scenario_id, case_id)
+
+    assert case.workflow == "run"
+    assert isinstance(case.expected, RunExpectation)
+
+
+@pytest.mark.parametrize(("scenario_id", "case_id"), B1_RUNTIME_CASES)
+def test_b1_runtime_table_executes_exact_production_oracle(
+    scenario_id: str,
+    case_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _proposed_b1_runtime_case(scenario_id, case_id)
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    _assert_declared_run_evidence(scenario, case, evidence)
+
+
+def test_b1_multiple_independent_sources_preserves_exact_source_identity_and_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _proposed_b1_runtime_case("multiple-independent-sources", "independent-roots")
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+
+    assert tuple(row.source_name for row in projection.rows) == (
+        "orders",
+        "orders",
+        "orders",
+        "refunds",
+        "refunds",
+        "refunds",
+    )
+    assert tuple(row.ingest_sequence for row in projection.rows) == tuple(range(6))
+    assert evidence.runtime.sink_outputs[0].rows == (
+        '{"id":1,"value":10}',
+        '{"id":2,"value":20}',
+        '{"id":3,"value":30}',
+        '{"id":101,"value":-5}',
+        '{"id":102,"value":-10}',
+        '{"id":103,"value":-15}',
+    )
+    assert evidence.audit.source_operation_count == 2
+
+
+def test_b1_multi_source_queue_fan_in_proves_queue_traversal_and_canonical_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _proposed_b1_runtime_case("multi-source-queue-fan-in", "queued-fan-in")
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    assert tuple(row.source_name for row in projection.rows) == (
+        "orders",
+        "orders",
+        "orders",
+        "refunds",
+        "refunds",
+        "refunds",
+    )
+    assert tuple(row.ingest_sequence for row in projection.rows) == tuple(range(6))
+    assert evidence.runtime.sink_outputs[0].rows == (
+        '{"id":1,"value":10}',
+        '{"id":2,"value":20}',
+        '{"id":3,"value":30}',
+        '{"id":101,"value":-5}',
+        '{"id":102,"value":-10}',
+        '{"id":103,"value":-15}',
+    )
+    transform_states = tuple(state for state in projection.node_states if state.node_key.startswith("transform:normalize_rows@"))
+    assert len(transform_states) == 6
+    assert {state.token_key for state in transform_states} == {token.key for token in projection.tokens}
+    assert {state.step_index for state in transform_states} == {2}
+    audit_keys = {record.key for record in projection.audit_records}
+    assert any(key.startswith("node|queue:inbound@") for key in audit_keys)
+    assert sum("|continue|move|queue:inbound@" in key for key in audit_keys) == 2
+    assert sum(key.startswith("edge|queue:inbound@") and "|continue|move|transform:normalize_rows@" in key for key in audit_keys) == 1
+    assert evidence.audit.source_operation_count == 2
+
+
+def test_b1_conditional_routing_proves_exact_artifacts_routes_and_dispositions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _proposed_b1_runtime_case("conditional-routing", "two-way-gate")
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+
+    assert [(output.sink_name, output.rows) for output in evidence.runtime.sink_outputs] == [
+        ("accepted", ('{"id":2,"value":20}', '{"id":3,"value":30}')),
+        ("rejected", ('{"id":1,"value":10}',)),
+    ]
+    assert [(route.token_key, route.label, route.mode) for route in projection.routes] == [
+        ("primary:0#0", "false", "move"),
+        ("primary:1#0", "true", "move"),
+        ("primary:2#0", "true", "move"),
+    ]
+    assert [
+        (disposition.token_key, disposition.outcome, disposition.path, disposition.sink_name)
+        for disposition in projection.terminal_dispositions
+    ] == [
+        ("primary:0#0", "success", "gate_routed", "rejected"),
+        ("primary:1#0", "success", "gate_routed", "accepted"),
+        ("primary:2#0", "success", "gate_routed", "accepted"),
+    ]
+
+
+def _copy_conditional_routing_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[HarnessCaseSpec, Path]:
+    _scenario, case = _declared_case("conditional-routing", "two-way-gate")
+    fixture_root = tmp_path / "fixtures"
+    copied_yaml = fixture_root / case.fixture
+    copied_input = fixture_root / case.input_fixtures["primary"]
+    copied_yaml.parent.mkdir(parents=True)
+    copied_yaml.write_bytes(resolve_fixture_path(case.fixture).read_bytes())
+    copied_input.write_bytes(resolve_fixture_path(case.input_fixtures["primary"]).read_bytes())
+    monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
+    return case, copied_yaml
+
+
+def test_b1_conditional_routing_rejects_missing_boolean_gate_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case, copied_yaml = _copy_conditional_routing_fixture(tmp_path, monkeypatch)
+    copied_yaml.write_text(
+        copied_yaml.read_text(encoding="utf-8").replace(
+            'routes: {"true": accepted, "false": rejected}',
+            'routes: {"true": accepted}',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match=r"Missing required labels.*false"):
+        render_settings(case, tmp_path / "runtime")
+
+
+def test_b1_conditional_routing_rejects_invalid_gate_destination_during_production_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case, copied_yaml = _copy_conditional_routing_fixture(tmp_path, monkeypatch)
+    copied_yaml.write_text(
+        copied_yaml.read_text(encoding="utf-8").replace(
+            'routes: {"true": accepted, "false": rejected}',
+            'routes: {"true": accepted, "false": missing_sink}',
+        ),
+        encoding="utf-8",
+    )
+    rendered = render_settings(case, tmp_path / "runtime")
+    install_corpus_plugin_manager(monkeypatch)
+
+    with pytest.raises(GraphValidationError, match=r"missing_sink"):
+        build_scenario(rendered)
 
 
 def _assert_declared_run_evidence(
