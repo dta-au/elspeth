@@ -117,6 +117,27 @@ class TestPayloadStore:
     def test_payload_store_defaults_to_none(self, factory: RecorderFactory) -> None:
         assert factory.payload_store is None
 
+    def test_read_repositories_expose_only_read_payload_operations(self) -> None:
+        db = LandscapeDB.in_memory()
+        payload_store = MockPayloadStore()
+        payload_ref = payload_store.store(b"audit evidence")
+
+        read_payloads = RecorderFactory(db, payload_store=payload_store).read_repositories().payload_store
+
+        assert read_payloads is not None
+        assert read_payloads.exists(payload_ref)
+        assert read_payloads.retrieve(payload_ref) == b"audit evidence"
+        assert not hasattr(read_payloads, "store")
+        assert not hasattr(read_payloads, "delete")
+
+    def test_write_repositories_retain_mutable_payload_store(self) -> None:
+        db = LandscapeDB.in_memory()
+        payload_store = MockPayloadStore()
+
+        write_repositories = RecorderFactory(db, payload_store=payload_store).write_repositories()
+
+        assert write_repositories.payload_store is payload_store
+
 
 class TestPluginAuditWriter:
     """Verify plugin_audit_writer() returns the adapter."""

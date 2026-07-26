@@ -40,6 +40,19 @@ class PayloadNotFoundError(Exception):
 
 
 @runtime_checkable
+class PayloadReader(Protocol):
+    """Read-only access to content-addressable payload storage."""
+
+    def retrieve(self, content_hash: str) -> bytes:
+        """Retrieve content by hash with integrity verification."""
+        ...
+
+    def exists(self, content_hash: str) -> bool:
+        """Return whether content exists for the supplied hash."""
+        ...
+
+
+@runtime_checkable
 class PayloadStore(Protocol):
     """Protocol for payload storage backends.
 
