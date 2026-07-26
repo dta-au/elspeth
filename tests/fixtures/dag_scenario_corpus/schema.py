@@ -15,6 +15,7 @@ from pydantic import (
     SerializerFunctionWrapHandler,
     StrictBool,
     StringConstraints,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_serializer,
@@ -184,6 +185,26 @@ class StableNodeStateProjection(ClosedModel):
     step_index: Count
     attempt: Count
     status: Literal["open", "pending", "completed", "failed"]
+    context_after: NonEmpty | None = None
+    error: NonEmpty | None = None
+
+    @field_validator("context_after", "error")
+    @classmethod
+    def _require_canonical_json_object(cls, value: str | None, info: ValidationInfo) -> str | None:
+        import json
+
+        if value is None:
+            return None
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{info.field_name} must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{info.field_name} must be a JSON object")
+        canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+        if canonical != value:
+            raise ValueError(f"{info.field_name} must use canonical JSON")
+        return value
 
 
 class StableRouteProjection(ClosedModel):
@@ -373,9 +394,14 @@ class StableRunProjection(ClosedModel):
         return self
 
 
+class ExpectedRunError(ClosedModel):
+    exception_type: Literal["CoalesceCollisionError"]
+
+
 class RunExpectation(ClosedModel):
     kind: Literal["exact"]
-    status: Literal["completed", "completed_with_failures", "empty"]
+    status: Literal["completed", "completed_with_failures", "empty", "failed"]
+    expected_error: ExpectedRunError | None = None
     sink_outputs: tuple[SinkOutputProjection, ...]
     rows_processed: Count
     rows_succeeded: Count
@@ -386,6 +412,8 @@ class RunExpectation(ClosedModel):
 
     @model_validator(mode="after")
     def _validate_exact_counts(self) -> Self:
+        if self.expected_error is not None and self.status != "failed":
+            raise ValueError("expected_error requires status=failed")
         sink_names = tuple(output.sink_name for output in self.sink_outputs)
         if sink_names != tuple(sorted(sink_names)) or len(set(sink_names)) != len(sink_names):
             raise ValueError("sink_outputs must contain unique sorted sink names")
@@ -449,6 +477,19 @@ class BuildExpectation(ClosedModel):
         return self
 
 
+class OutputArtifactExpectation(ClosedModel):
+    filename: NonEmpty
+    presence: Literal["required", "absent"] = "required"
+
+    @field_validator("filename")
+    @classmethod
+    def _require_safe_relative_leaf(cls, filename: str) -> str:
+        path = Path(filename)
+        if path.is_absolute() or len(path.parts) != 1 or path.name != filename or filename in (".", ".."):
+            raise ValueError(f"output artifact must be a safe relative leaf filename: {filename!r}")
+        return filename
+
+
 def normalize_template_name(name: str) -> str:
     """Return the deterministic token component for one declared node name."""
 
@@ -463,7 +504,7 @@ class HarnessCaseSpec(ClosedModel):
     workflow: Workflow
     fixture: NonEmpty
     input_fixtures: Mapping[NonEmpty, NonEmpty]
-    output_artifacts: Mapping[NonEmpty, NonEmpty]
+    output_artifacts: Mapping[NonEmpty, OutputArtifactExpectation]
     expected: DeclaredRunExpectation | BuildExpectation
 
     @field_validator("input_fixtures")
@@ -482,25 +523,40 @@ class HarnessCaseSpec(ClosedModel):
     def _serialize_input_fixtures(self, fixtures: Mapping[str, str]) -> dict[str, str]:
         return dict(fixtures)
 
-    @field_validator("output_artifacts")
+    @field_validator("output_artifacts", mode="before")
     @classmethod
-    def _freeze_output_artifacts(cls, artifacts: Mapping[str, str]) -> Mapping[str, str]:
+    def _normalize_output_artifacts(cls, artifacts: object) -> dict[str, OutputArtifactExpectation]:
+        if not isinstance(artifacts, Mapping):
+            raise ValueError("output_artifacts must be a mapping")
         items = tuple(artifacts.items())
         if not items:
             raise ValueError("output_artifacts must not be empty")
         if items != tuple(sorted(items)):
             raise ValueError("output_artifacts must be sorted by sink name")
-        if len({filename for _name, filename in items}) != len(items):
+        normalized = {
+            str(name): OutputArtifactExpectation.model_validate(
+                {"filename": value, "presence": "required"} if isinstance(value, str) else value
+            )
+            for name, value in items
+        }
+        if len({artifact.filename for artifact in normalized.values()}) != len(items):
             raise ValueError("output_artifacts must use unique filenames")
-        for _sink_name, filename in items:
-            path = Path(filename)
-            if path.is_absolute() or len(path.parts) != 1 or path.name != filename or filename in (".", ".."):
-                raise ValueError(f"output artifact must be a safe relative leaf filename: {filename!r}")
-        return MappingProxyType(dict(items))
+        return normalized
+
+    @field_validator("output_artifacts")
+    @classmethod
+    def _freeze_output_artifacts(
+        cls,
+        artifacts: Mapping[str, OutputArtifactExpectation],
+    ) -> Mapping[str, OutputArtifactExpectation]:
+        return MappingProxyType(dict(artifacts))
 
     @field_serializer("output_artifacts")
-    def _serialize_output_artifacts(self, artifacts: Mapping[str, str]) -> dict[str, str]:
-        return dict(artifacts)
+    def _serialize_output_artifacts(
+        self,
+        artifacts: Mapping[str, OutputArtifactExpectation],
+    ) -> dict[str, dict[str, str]]:
+        return {name: {"filename": artifact.filename, "presence": artifact.presence} for name, artifact in artifacts.items()}
 
     @model_validator(mode="after")
     def _validate_workflow_expectation(self) -> Self:

@@ -55,6 +55,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     GraphNodeType,
     GraphNodeTypeCount,
     HarnessCaseSpec,
+    OutputArtifactExpectation,
     RecoveryEvidence,
     RuntimeEvidence,
     ScenarioRunEvidence,
@@ -81,6 +82,7 @@ class RenderedScenario:
     fixture_sha256: str
     input_paths: Mapping[str, Path]
     output_paths: Mapping[str, Path]
+    output_expectations: Mapping[str, OutputArtifactExpectation]
     fault_marker: Path
 
     @property
@@ -164,7 +166,7 @@ def render_settings(case: HarnessCaseSpec, tmp_path: Path) -> RenderedScenario:
     )
 
     input_paths = {name: resolve_fixture_path(path) for name, path in case.input_fixtures.items()}
-    output_paths = {name: tmp_path / filename for name, filename in case.output_artifacts.items()}
+    output_paths = {name: tmp_path / artifact.filename for name, artifact in case.output_artifacts.items()}
     runtime_root = tmp_path.resolve()
     for sink_name, output_path in output_paths.items():
         resolved_output = output_path.resolve()
@@ -218,6 +220,7 @@ def render_settings(case: HarnessCaseSpec, tmp_path: Path) -> RenderedScenario:
         fixture_sha256=compute_fixture_sha256(case),
         input_paths=MappingProxyType(input_paths),
         output_paths=MappingProxyType(output_paths),
+        output_expectations=MappingProxyType(dict(case.output_artifacts)),
         fault_marker=fault_marker,
     )
 
@@ -303,6 +306,30 @@ def _stable_node_key(record: Mapping[str, Any]) -> str:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _normalize_node_state_json(raw: object, *, field: str) -> str | None:
+    """Canonicalize semantic node-state JSON while masking duration-only noise."""
+
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise AssertionError(f"DAG corpus {field} must be JSON text or null")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"DAG corpus {field} must be valid JSON") from exc
+    if not isinstance(value, dict):
+        raise AssertionError(f"DAG corpus {field} must be a JSON object")
+    if field == "context_after_json":
+        if "wait_duration_ms" in value:
+            value["wait_duration_ms"] = "$DURATION_MS"
+        arrival_order = value.get("arrival_order")
+        if isinstance(arrival_order, list):
+            for entry in arrival_order:
+                if isinstance(entry, dict) and "arrival_offset_ms" in entry:
+                    entry["arrival_offset_ms"] = "$DURATION_MS"
+    return _canonical_json(value)
 
 
 def _semantic_node_config(record: Mapping[str, Any]) -> dict[str, object]:
@@ -802,6 +829,16 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
             step_index=int(record["step_index"]),
             attempt=int(record["attempt"]),
             status=str(record["status"]),
+            context_after=(
+                _normalize_node_state_json(record.get("context_after_json"), field="context_after_json")
+                if node_keys[str(record["node_id"])].startswith("coalesce:")
+                else None
+            ),
+            error=(
+                _normalize_node_state_json(record.get("error_json"), field="error_json")
+                if node_keys[str(record["node_id"])].startswith("coalesce:")
+                else None
+            ),
         )
         for record in state_records
     )
@@ -1256,6 +1293,8 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
                 "step_index": state.step_index,
                 "attempt": state.attempt,
                 "status": state.status.value,
+                "context_after_json": getattr(state, "context_after_json", None),
+                "error_json": getattr(state, "error_json", None),
             }
         )
     for route_event in repositories.query.get_all_routing_events_for_run(run_id):
@@ -1297,10 +1336,13 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
 def _sink_outputs(rendered: RenderedScenario) -> tuple[SinkOutputProjection, ...]:
     outputs: list[SinkOutputProjection] = []
     for sink_name, output_path in rendered.output_paths.items():
+        expectation = rendered.output_expectations[sink_name]
         if not output_path.is_file():
-            if rendered.settings.sinks[sink_name].plugin != "dag_corpus_always_fail_sink":
+            if expectation.presence == "required":
                 raise AssertionError(f"DAG corpus sink {sink_name!r} did not produce {output_path.name!r}")
             continue
+        if expectation.presence == "absent":
+            raise AssertionError(f"DAG corpus sink {sink_name!r} produced intentionally absent artifact {output_path.name!r}")
         rows = tuple(
             json.dumps(json.loads(line), sort_keys=True, separators=(",", ":"))
             for line in output_path.read_text(encoding="utf-8").splitlines()

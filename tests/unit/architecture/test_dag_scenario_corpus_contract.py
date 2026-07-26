@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 import tests.fixtures.dag_scenario_corpus.loader as loader_module
+import tests.fixtures.dag_scenario_corpus.schema as corpus_schema
 import yaml
 from markdown_it import MarkdownIt
 from pydantic import ValidationError
@@ -370,7 +371,7 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for index, locator in enumerate(locators, start=1)
 )
 EXPECTED_EVIDENCE_REGISTRY_SHA256 = "b9e8fb59e549b8d0fa111936eb561b09d321a3162351983f973792babc251fac"
-EXPECTED_CASE_REGISTRY_SHA256 = "4a7ff396d8a71d93df5f9105a3fec53922e750a9ccb2fd165b16b97e69636d99"
+EXPECTED_CASE_REGISTRY_SHA256 = "e82d7daba5b69a6431322b0595f34ea2e570ae69b4bcaa0532ed6b694bad3c0c"
 EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
@@ -899,15 +900,34 @@ def test_per_sink_artifact_binding_is_sorted_immutable_and_exact() -> None:
     case = HarnessCaseSpec.model_validate(values)
 
     assert tuple(case.output_artifacts.items()) == (
-        ("accepted", "accepted.jsonl"),
-        ("rejected", "rejected.jsonl"),
+        ("accepted", corpus_schema.OutputArtifactExpectation(filename="accepted.jsonl", presence="required")),
+        ("rejected", corpus_schema.OutputArtifactExpectation(filename="rejected.jsonl", presence="required")),
     )
     assert case.model_dump(mode="json")["output_artifacts"] == {
-        "accepted": "accepted.jsonl",
-        "rejected": "rejected.jsonl",
+        "accepted": {"filename": "accepted.jsonl", "presence": "required"},
+        "rejected": {"filename": "rejected.jsonl", "presence": "required"},
     }
     with pytest.raises(TypeError):
         case.output_artifacts["accepted"] = "decoy.jsonl"  # type: ignore[index]
+
+
+def test_per_sink_artifact_binding_normalizes_required_and_absent_expectations() -> None:
+    values = _plural_binding_case_values()
+    values["output_artifacts"] = {
+        "absent": {"filename": "absent.jsonl", "presence": "absent"},
+        "required": "required.jsonl",
+    }
+
+    case = HarnessCaseSpec.model_validate(values)
+
+    assert case.output_artifacts["absent"].filename == "absent.jsonl"
+    assert case.output_artifacts["absent"].presence == "absent"
+    assert case.output_artifacts["required"].filename == "required.jsonl"
+    assert case.output_artifacts["required"].presence == "required"
+    assert case.model_dump(mode="json")["output_artifacts"] == {
+        "absent": {"filename": "absent.jsonl", "presence": "absent"},
+        "required": {"filename": "required.jsonl", "presence": "required"},
+    }
 
 
 @pytest.mark.parametrize(
@@ -1117,6 +1137,50 @@ def test_exact_runtime_projection_expectation_is_discriminated_immutable_and_can
     assert expectation.projection.tokens[0].parents == ()
     with pytest.raises(ValidationError, match="frozen"):
         expectation.__setattr__("rows_processed", 2)
+
+
+def test_exact_failed_run_expectation_declares_exact_production_exception() -> None:
+    values = _exact_run_expectation_values()
+    values["status"] = "failed"
+    values["expected_error"] = {"exception_type": "CoalesceCollisionError"}
+
+    expectation = RunExpectation.model_validate(values)
+
+    assert expectation.status == "failed"
+    assert expectation.expected_error is not None
+    assert expectation.expected_error.exception_type == "CoalesceCollisionError"
+
+
+def test_expected_run_error_is_forbidden_for_nonfailed_status() -> None:
+    values = _exact_run_expectation_values()
+    values["expected_error"] = {"exception_type": "CoalesceCollisionError"}
+
+    with pytest.raises(ValidationError, match="expected_error requires status=failed"):
+        RunExpectation.model_validate(values)
+
+
+def test_stable_node_state_preserves_canonical_context_and_error_json() -> None:
+    values = _exact_runtime_projection_values()
+    states = cast(list[dict[str, object]], values["node_states"])
+    state = states[0]
+    state["context_after"] = '{"branches_arrived":["path_a","path_b"],"wait_duration_ms":"$DURATION_MS"}'
+    state["error"] = '{"failure_reason":"quorum_impossible:need=3,max_possible=2"}'
+
+    projection = corpus_schema.StableRunProjection.model_validate(values)
+
+    assert projection.node_states[0].context_after == state["context_after"]
+    assert projection.node_states[0].error == state["error"]
+
+
+def test_stable_node_state_rejects_noncanonical_context_and_error_json() -> None:
+    for field in ("context_after", "error"):
+        values = _exact_runtime_projection_values()
+        states = cast(list[dict[str, object]], values["node_states"])
+        state = states[0]
+        state[field] = '{"z":1, "a":2}'
+
+        with pytest.raises(ValidationError, match=f"{field} must use canonical JSON"):
+            corpus_schema.StableRunProjection.model_validate(values)
 
 
 @pytest.mark.parametrize(
@@ -1972,7 +2036,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
     assert hashlib.sha256(normalized_cases).hexdigest() == EXPECTED_CASE_REGISTRY_SHA256
     linear_case = cases[0][1]
     assert linear_case["input_fixtures"] == {"primary": "linear/input.csv"}
-    assert linear_case["output_artifacts"] == {"output": "output.jsonl"}
+    assert linear_case["output_artifacts"] == {"output": {"filename": "output.jsonl", "presence": "required"}}
     assert linear_case["expected"]["kind"] == "exact"
     assert cases[-1][1]["expected"]["kind"] == "summary"
     assert all("input_fixture" not in case for _scenario_id, case in cases)

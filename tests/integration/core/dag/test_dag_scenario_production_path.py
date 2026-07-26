@@ -887,6 +887,52 @@ def test_per_sink_artifact_binding_renders_exact_sink_map(
     }
 
 
+def test_intentionally_absent_artifact_is_accepted_only_when_declared(
+    tmp_path: Path,
+) -> None:
+    _scenario, case = _declared_case("linear", "happy-path")
+    values = case.model_dump(mode="json")
+    values["output_artifacts"] = {
+        "output": {"filename": "output.jsonl", "presence": "absent"},
+    }
+    absent_case = HarnessCaseSpec.model_validate(values)
+    rendered = render_settings(absent_case, tmp_path)
+
+    assert corpus_harness._sink_outputs(rendered) == ()
+
+
+def test_intentionally_absent_artifact_rejects_file_leakage(
+    tmp_path: Path,
+) -> None:
+    _scenario, case = _declared_case("linear", "happy-path")
+    values = case.model_dump(mode="json")
+    values["output_artifacts"] = {
+        "output": {"filename": "output.jsonl", "presence": "absent"},
+    }
+    absent_case = HarnessCaseSpec.model_validate(values)
+    rendered = render_settings(absent_case, tmp_path)
+    rendered.output_paths["output"].write_text('{"id":1,"value":10}\n', encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="produced intentionally absent artifact"):
+        corpus_harness._sink_outputs(rendered)
+
+
+def test_required_artifact_cannot_disappear_based_only_on_sink_plugin(
+    tmp_path: Path,
+) -> None:
+    _scenario, case = _declared_case(*B2_PARTIAL_TERMINAL_FAILURE_CASE)
+    values = case.model_dump(mode="json")
+    values["output_artifacts"] = {
+        "failing": {"filename": "failing.jsonl", "presence": "required"},
+        "survivor": {"filename": "survivor.jsonl", "presence": "absent"},
+    }
+    required_case = HarnessCaseSpec.model_validate(values)
+    rendered = render_settings(required_case, tmp_path)
+
+    with pytest.raises(AssertionError, match=r"sink 'failing'.*did not produce"):
+        corpus_harness._sink_outputs(rendered)
+
+
 def test_per_sink_artifact_binding_rejects_existing_symlink_leaf_escape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
