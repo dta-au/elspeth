@@ -810,7 +810,9 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
         StableTokenProjection(
             key=stable_key,
             row_key=rows_by_id[str(record["row_id"])],
-            parents=tuple(token_keys[parent_id] for _ordinal, parent_id in sorted(parents_by_token[str(record["token_id"])])),
+            parents=tuple(
+                sorted(token_keys[parent_id] for _ordinal, parent_id in parents_by_token[str(record["token_id"])]),
+            ),
         )
         for record in (record for record in records if record.get("record_type") == "token")
         for stable_key in (token_keys[str(record["token_id"])],)

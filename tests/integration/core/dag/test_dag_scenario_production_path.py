@@ -38,10 +38,6 @@ RECOVERY_CASES = [
     for scenario, case in iter_harness_cases(MANIFEST)
     if case.workflow == "recovery"
 ]
-BUILD_CASES = [
-    pytest.param("fork-coalesce-policies", "require-all-nested", id="fork-coalesce-policies:require-all-nested"),
-]
-
 B1_RUNTIME_CASES = (
     ("linear", "happy-path"),
     ("multiple-independent-sources", "independent-roots"),
@@ -55,9 +51,119 @@ B2_PARTIAL_TERMINAL_FAILURE_CASE = (
     "one-terminal-fails",
 )
 
+B2_COALESCE_POSITIVE_CASES = tuple(
+    ("fork-coalesce-policies", case_id)
+    for case_id in (
+        "require-all-union",
+        "require-all-nested",
+        "require-all-select",
+        "first-union",
+        "first-nested",
+        "first-select",
+        "quorum-union-lost-c",
+        "quorum-nested-lost-c",
+        "quorum-select-lost-c",
+        "best-effort-union-lost-c",
+        "best-effort-nested-lost-c",
+        "best-effort-select-lost-c",
+    )
+)
+
 
 def _declared_case(scenario_id: str, case_id: str) -> tuple[ScenarioSpec, HarnessCaseSpec]:
     return next((scenario, case) for scenario, case in iter_harness_cases(MANIFEST) if (scenario.id, case.id) == (scenario_id, case_id))
+
+
+@pytest.mark.parametrize(("scenario_id", "case_id"), B2_COALESCE_POSITIVE_CASES)
+def test_b2_coalesce_positive_matrix_declares_exact_run_oracle(
+    scenario_id: str,
+    case_id: str,
+    tmp_path: Path,
+) -> None:
+    _scenario, case = _declared_case(scenario_id, case_id)
+
+    assert case.workflow == "run"
+    assert isinstance(case.expected, RunExpectation)
+    assert resolve_fixture_path(case.input_fixtures["primary"]).read_bytes() == b"id,value\n1,10\n"
+
+    rendered = render_settings(case, tmp_path)
+    policy = next(
+        value
+        for prefix, value in (
+            ("require-all-", "require_all"),
+            ("first-", "first"),
+            ("quorum-", "quorum"),
+            ("best-effort-", "best_effort"),
+        )
+        if case_id.startswith(prefix)
+    )
+    merge = next(value for value in ("union", "nested", "select") if f"-{value}" in case_id)
+    loses_path_c = case_id.endswith("-lost-c")
+    gate = rendered.settings.gates[0]
+    coalesce = rendered.settings.coalesce[0]
+
+    assert gate.fork_to == ["path_a", "path_c", "path_b"]
+    assert tuple(coalesce.branches) == ("path_a", "path_b", "path_c")
+    assert (coalesce.policy, coalesce.merge) == (policy, merge)
+    assert coalesce.quorum_count == (2 if policy == "quorum" else None)
+    assert coalesce.timeout_seconds == (60 if policy == "best_effort" else None)
+    assert coalesce.select_branch == ("path_a" if merge == "select" else None)
+    transforms_by_input = {transform.input: transform for transform in rendered.settings.transforms}
+    assert tuple(transforms_by_input) == ("path_a", "path_c", "path_b")
+    path_c_expression = transforms_by_input["path_c"].options["operations"][0]["expression"]
+    assert path_c_expression == ("row['missing_branch_marker']" if loses_path_c else "'c'")
+
+    expected = case.expected
+    expected_status = "completed" if policy == "require_all" else "completed_with_failures"
+    expected_failures = 0 if policy == "require_all" else 2 if policy == "first" else 1
+    assert (expected.status, expected.rows_processed, expected.rows_succeeded, expected.rows_failed) == (
+        expected_status,
+        1,
+        1,
+        expected_failures,
+    )
+    assert len(expected.sink_outputs) == 1
+    assert len(expected.sink_outputs[0].rows) == 1
+    output_row = json.loads(expected.sink_outputs[0].rows[0])
+    arrived = ("path_a", "path_c", "path_b") if policy == "require_all" else ("path_a",) if policy == "first" else ("path_a", "path_b")
+    if merge == "nested":
+        assert tuple(output_row) == tuple(sorted(arrived))
+    else:
+        expected_marker = "c" if policy == "require_all" and merge == "union" else "b" if loses_path_c and merge == "union" else "a"
+        assert output_row["branch_marker"] == expected_marker
+
+    projection = expected.projection
+    assert [route.label for route in projection.routes] == ["path_a", "path_c", "path_b"]
+    expected_merged_parents = (
+        ("primary:0#2", "primary:0#3", "primary:0#4")
+        if policy == "require_all"
+        else ("primary:0#2",)
+        if policy == "first"
+        else ("primary:0#2", "primary:0#3")
+    )
+    assert projection.tokens[1].parents == expected_merged_parents
+    coalesce_states = tuple(state for state in projection.node_states if state.node_key.startswith("coalesce:"))
+    completed_states = tuple(state for state in coalesce_states if state.status == "completed")
+    assert len(completed_states) == len(arrived)
+    completed_contexts = {state.context_after for state in completed_states}
+    assert len(completed_contexts) == 1
+    context_json = completed_contexts.pop()
+    assert context_json is not None
+    context = json.loads(context_json)
+    assert tuple(context["branches_arrived"]) == arrived
+    assert tuple(context["expected_branches"]) == ("path_a", "path_b", "path_c")
+    assert (context["policy"], context["merge_strategy"]) == (policy, merge)
+    assert context["wait_duration_ms"] == "$DURATION_MS"
+    if loses_path_c:
+        assert tuple(context["branches_lost"]) == ("path_c",)
+        assert context["lost_branch_expected_fields"] == {"path_c": ["branch_marker"]}
+    elif policy == "first":
+        failed_states = tuple(state for state in coalesce_states if state.status == "failed")
+        assert len(failed_states) == 2
+        assert all(state.context_after is None for state in failed_states)
+        assert {json.loads(state.error or "null")["failure_reason"] for state in failed_states} == {"late_arrival_after_merge"}
+    else:
+        assert context["branches_lost"] == {}
 
 
 @pytest.mark.parametrize(("scenario_id", "case_id"), B1_RUNTIME_CASES)
@@ -484,29 +590,6 @@ def _assert_declared_build_evidence(
 
 def test_build_workflow_has_dedicated_dispatcher() -> None:
     assert callable(corpus_harness._build_case)
-
-
-@pytest.mark.parametrize(("scenario_id", "case_id"), BUILD_CASES)
-def test_declared_build_case_uses_complete_production_build_path(
-    scenario_id: str,
-    case_id: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scenario, case = _declared_case(scenario_id, case_id)
-
-    def forbid_runtime_or_audit(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("build-only corpus workflow crossed the runtime/audit boundary")
-
-    monkeypatch.setattr(corpus_harness, "Orchestrator", forbid_runtime_or_audit)
-    monkeypatch.setattr(corpus_harness, "LandscapeDB", forbid_runtime_or_audit)
-    install_corpus_plugin_manager(monkeypatch)
-
-    evidence = run_scenario_case(scenario, case, tmp_path)
-
-    _assert_declared_build_evidence(scenario, case, evidence)
-    assert not (tmp_path / "output.jsonl").exists()
-    assert not (tmp_path / "fault-triggered.marker").exists()
 
 
 def test_run_case_owns_production_preflight_without_pytest_defaults(

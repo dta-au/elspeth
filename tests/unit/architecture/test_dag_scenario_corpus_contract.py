@@ -370,8 +370,22 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "b9e8fb59e549b8d0fa111936eb561b09d321a3162351983f973792babc251fac"
-EXPECTED_CASE_REGISTRY_SHA256 = "e82d7daba5b69a6431322b0595f34ea2e570ae69b4bcaa0532ed6b694bad3c0c"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "9cb97457e987c4b0e775f935718f809b92f99c0129f746c3945e7cbe6f648bf1"
+EXPECTED_CASE_REGISTRY_SHA256 = "e5f08c4d8ab239f28365fb35f827bbc1b98343bfcb5144dc4be2b23b557b5b3a"
+B2_COALESCE_POSITIVE_CASE_IDS = (
+    "require-all-union",
+    "require-all-nested",
+    "require-all-select",
+    "first-union",
+    "first-nested",
+    "first-select",
+    "quorum-union-lost-c",
+    "quorum-nested-lost-c",
+    "quorum-select-lost-c",
+    "best-effort-union-lost-c",
+    "best-effort-nested-lost-c",
+    "best-effort-select-lost-c",
+)
 EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
@@ -379,7 +393,18 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "conditional-routing:two-way-gate": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
     "conditional-routing:error-route-and-discard": "27dbf1f2d1908a6f6f3df8166bff152e56977d93ffc4061c91c48871c26a282b",
     "fork-multiple-terminals-partial-failure:one-terminal-fails": "e0505f84e778047f4d68a47e27f442d82824b898cf58fe5cb084842cfbbdb925",
-    "fork-coalesce-policies:require-all-nested": "55b934bdb55c478ec552209008eda10bc6b211b6a17d8844acbf81609772acd2",
+    "fork-coalesce-policies:require-all-union": "aeb887b17d3f6acc17e1fe71e24d1bad8314f6dbe34649e69930d09ff7b31404",
+    "fork-coalesce-policies:require-all-nested": "98048b43b03a9870f117c8b2705ccd592e9b9c26329cfcc3891554c9b5778545",
+    "fork-coalesce-policies:require-all-select": "254560eaa7db76b9f3303a7dc52cd362421bd6dc0277c95fa6f629445284e3df",
+    "fork-coalesce-policies:first-union": "f032d03c31c3c02366cbbbbff3fdd37c6d70739954b9487f05e5945d974b1f91",
+    "fork-coalesce-policies:first-nested": "1e46bd2315844ddc82e8af6063c20c4b9b72cb55c5c363049961bd46a3c06e3d",
+    "fork-coalesce-policies:first-select": "9403ceeeb06be9888a744790d008b34508519df1d5c9b53af1dd9e34b796c310",
+    "fork-coalesce-policies:quorum-union-lost-c": "ef7aa36884c5d5aa66f544314aeeb215749c52c33121c55ccbf23cf31950c877",
+    "fork-coalesce-policies:quorum-nested-lost-c": "c19c07e3c8d78f6d71f0207ede2663816ae64ef08e941ace0a8600cc1d4e47d9",
+    "fork-coalesce-policies:quorum-select-lost-c": "25a82695e485cccaba750d8e3cc7ed95088fa94dea744f1a3ff48f0b56262b2d",
+    "fork-coalesce-policies:best-effort-union-lost-c": "6c62a5bcdc3c8f644da07c129e3997411025871a54ca115aec706715d1425371",
+    "fork-coalesce-policies:best-effort-nested-lost-c": "d74f58cfb67154d9e300f3f08ad9fcafeddabad63955ffec3693227e26f738eb",
+    "fork-coalesce-policies:best-effort-select-lost-c": "2e0e251cb0ade41c828c1388a946c1ee456b96a7ffd9d049ac11aa95d66c3bf9",
     "checkpoint-deterministic-resume:reopen-resume": "ce62216ce20210600f1a9c20e362aaf299c7538e6c4d3bd0e97627563dc813e6",
 }
 
@@ -419,10 +444,13 @@ EXPECTED_HARNESS_EVIDENCE = (
         "fork-multiple-terminals-partial-failure:one-terminal-fails",
         ("config", "build", "runtime", "audit"),
     ),
-    (
-        "harness-fork-coalesce-policies-require-all-nested",
-        "fork-coalesce-policies:require-all-nested",
-        ("config", "build"),
+    *(
+        (
+            f"harness-fork-coalesce-policies-{case_id}",
+            f"fork-coalesce-policies:{case_id}",
+            ("config", "build", "runtime", "audit"),
+        )
+        for case_id in B2_COALESCE_POSITIVE_CASE_IDS
     ),
 )
 
@@ -640,7 +668,30 @@ sinks:
       schema: {mode: observed}
 """
 
-EXPECTED_REQUIRE_ALL_NESTED_YAML = b"""sources:
+
+def _expected_coalesce_matrix_yaml(case_id: str) -> bytes:
+    policy = next(
+        value
+        for prefix, value in (
+            ("require-all-", "require_all"),
+            ("first-", "first"),
+            ("quorum-", "quorum"),
+            ("best-effort-", "best_effort"),
+        )
+        if case_id.startswith(prefix)
+    )
+    merge = next(value for value in ("union", "nested", "select") if f"-{value}" in case_id)
+    loses_path_c = case_id.endswith("-lost-c")
+    policy_options = f"    policy: {policy}\n"
+    if policy == "quorum":
+        policy_options += "    quorum_count: 2\n"
+    if policy == "best_effort":
+        policy_options += "    timeout_seconds: 60\n"
+    policy_options += f"    merge: {merge}\n"
+    if merge == "select":
+        policy_options += "    select_branch: path_a\n"
+
+    template = """sources:
   primary:
     plugin: csv
     on_success: fork_input
@@ -653,12 +704,36 @@ gates:
     input: fork_input
     condition: "True"
     routes: {"true": fork, "false": discard}
-    fork_to: [path_a, path_b]
+    fork_to: [path_a, path_c, path_b]
+transforms:
+  - name: mark_a
+    plugin: value_transform
+    input: path_a
+    on_success: merge_a
+    on_error: discard
+    options:
+      schema: {mode: observed}
+      operations: [{target: branch_marker, expression: "'a'"}]
+  - name: __PATH_C_NAME__
+    plugin: value_transform
+    input: path_c
+    on_success: merge_c
+    on_error: discard
+    options:
+      schema: {mode: observed}
+      operations: [{target: branch_marker, expression: "__PATH_C_EXPRESSION__"}]
+  - name: mark_b
+    plugin: value_transform
+    input: path_b
+    on_success: merge_b
+    on_error: discard
+    options:
+      schema: {mode: observed}
+      operations: [{target: branch_marker, expression: "'b'"}]
 coalesce:
   - name: merge_paths
-    branches: [path_a, path_b]
-    policy: require_all
-    merge: nested
+    branches: {path_a: merge_a, path_b: merge_b, path_c: merge_c}
+__POLICY_OPTIONS__
     on_success: output
 sinks:
   output:
@@ -669,6 +744,15 @@ sinks:
       format: jsonl
       schema: {mode: observed}
 """
+    return (
+        template.replace("__PATH_C_NAME__", "lose_c" if loses_path_c else "mark_c")
+        .replace("__PATH_C_EXPRESSION__", "row['missing_branch_marker']" if loses_path_c else "'c'")
+        .replace("__POLICY_OPTIONS__\n", policy_options)
+        .encode()
+    )
+
+
+EXPECTED_COALESCE_MATRIX_YAMLS = {case_id: _expected_coalesce_matrix_yaml(case_id) for case_id in B2_COALESCE_POSITIVE_CASE_IDS}
 
 
 def _markdown_link_targets(path: Path) -> tuple[str, ...]:
@@ -1137,6 +1221,54 @@ def test_exact_runtime_projection_expectation_is_discriminated_immutable_and_can
     assert expectation.projection.tokens[0].parents == ()
     with pytest.raises(ValidationError, match="frozen"):
         expectation.__setattr__("rows_processed", 2)
+
+
+def test_exact_coalesce_counters_count_distinct_rows_not_consumed_branch_tokens() -> None:
+    values = _exact_run_expectation_values()
+    projection = cast(dict[str, object], values["projection"])
+    projection["tokens"] = (
+        {"key": "primary:0#0", "row_key": "primary:0", "parents": ()},
+        {
+            "key": "primary:0#1",
+            "row_key": "primary:0",
+            "parents": ("primary:0#2", "primary:0#3", "primary:0#4"),
+        },
+        {"key": "primary:0#2", "row_key": "primary:0", "parents": ("primary:0#0",)},
+        {"key": "primary:0#3", "row_key": "primary:0", "parents": ("primary:0#0",)},
+        {"key": "primary:0#4", "row_key": "primary:0", "parents": ("primary:0#0",)},
+    )
+    projection["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "fork_parent",
+            "sink_name": None,
+        },
+        {
+            "key": "primary:0#1",
+            "token_key": "primary:0#1",
+            "outcome": "success",
+            "path": "coalesced",
+            "sink_name": "output",
+        },
+        *(
+            {
+                "key": f"primary:0#{ordinal}",
+                "token_key": f"primary:0#{ordinal}",
+                "outcome": "success",
+                "path": "coalesced",
+                "sink_name": None,
+            }
+            for ordinal in (2, 3, 4)
+        ),
+    )
+
+    expectation = RunExpectation.model_validate(values)
+    runtime = RuntimeEvidence.model_validate(_exact_runtime_evidence_values(projection))
+
+    assert expectation.rows_succeeded == 1
+    assert runtime.rows_succeeded == 1
 
 
 def test_exact_failed_run_expectation_declares_exact_production_exception() -> None:
@@ -1991,7 +2123,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
-        ("fork-coalesce-policies", "require-all-nested"),
+        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_POSITIVE_CASE_IDS),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     assert manifest.verdict == "not_complete"
@@ -2006,11 +2138,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 61
+    assert len(manifest.evidence) == 72
     assert len(assessment_evidence) == 53
-    assert len(harness_evidence) == 8
-    assert len({reference.id for reference in manifest.evidence}) == 61
-    assert len({reference.locator for reference in manifest.evidence}) == 61
+    assert len(harness_evidence) == 19
+    assert len({reference.id for reference in manifest.evidence}) == 72
+    assert len({reference.locator for reference in manifest.evidence}) == 72
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -2029,7 +2161,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
-        ("fork-coalesce-policies", "require-all-nested"),
+        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_POSITIVE_CASE_IDS),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     normalized_cases = json.dumps(cases, sort_keys=True, separators=(",", ":")).encode()
@@ -2081,10 +2213,15 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("fork-multiple-terminals-partial-failure", "runtime"),
             ("fork-multiple-terminals-partial-failure", "audit"),
         ),
-        "harness-fork-coalesce-policies-require-all-nested": (
-            ("fork-coalesce-policies", "config"),
-            ("fork-coalesce-policies", "build"),
-        ),
+        **{
+            f"harness-fork-coalesce-policies-{case_id}": (
+                ("fork-coalesce-policies", "config"),
+                ("fork-coalesce-policies", "build"),
+                ("fork-coalesce-policies", "runtime"),
+                ("fork-coalesce-policies", "audit"),
+            )
+            for case_id in B2_COALESCE_POSITIVE_CASE_IDS
+        },
         "harness-checkpoint-deterministic-resume-reopen-resume": (
             ("checkpoint-deterministic-resume", "runtime"),
             ("checkpoint-deterministic-resume", "audit"),
@@ -2246,7 +2383,8 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         "conditional-routing/input.csv": EXPECTED_INPUT_CSV,
         "fork-multiple-terminals-partial-failure/one-terminal-fails.yaml": EXPECTED_ONE_TERMINAL_FAILS_YAML,
         "fork-multiple-terminals-partial-failure/input.csv": EXPECTED_INPUT_CSV,
-        "fork-coalesce-policies/require-all-nested.yaml": EXPECTED_REQUIRE_ALL_NESTED_YAML,
+        **{f"fork-coalesce-policies/{case_id}.yaml": expected for case_id, expected in EXPECTED_COALESCE_MATRIX_YAMLS.items()},
+        "fork-coalesce-policies/matrix-input.csv": b"id,value\n1,10\n",
         "fork-coalesce-policies/input.csv": EXPECTED_INPUT_CSV,
         "checkpoint-deterministic-resume/reopen-resume.yaml": EXPECTED_REOPEN_RESUME_YAML,
         "checkpoint-deterministic-resume/input.csv": EXPECTED_INPUT_CSV,
@@ -2293,7 +2431,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
-        ("fork-coalesce-policies", "require-all-nested"),
+        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_POSITIVE_CASE_IDS),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     ],
 )
