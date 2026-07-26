@@ -20,7 +20,7 @@
         "required": false
       },
       {
-        "description": "Azure Document Intelligence endpoint URL (HTTPS).",
+        "description": "Azure Document Intelligence resource endpoint URL (HTTPS, Azure host only).",
         "kind": "text",
         "label": "Endpoint",
         "name": "endpoint",

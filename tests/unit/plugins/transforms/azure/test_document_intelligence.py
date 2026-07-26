@@ -58,6 +58,64 @@ def test_rejects_http_endpoint() -> None:
         _cfg(endpoint="http://di.cognitiveservices.azure.com")
 
 
+def test_rejects_non_azure_document_intelligence_endpoint() -> None:
+    with pytest.raises(PluginConfigError):
+        _cfg(endpoint="https://attacker.example")
+
+
+def test_accepts_sovereign_azure_document_intelligence_endpoint() -> None:
+    assert _cfg(endpoint="https://di.cognitiveservices.azure.us").endpoint == "https://di.cognitiveservices.azure.us"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://australiaeast.api.cognitive.microsoft.com",
+        "https://usgovvirginia.api.cognitive.microsoft.us",
+        "https://chinaeast2.api.cognitive.azure.cn",
+    ],
+)
+def test_accepts_regional_azure_document_intelligence_endpoint(endpoint: str) -> None:
+    assert _cfg(endpoint=endpoint).endpoint == endpoint
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://evilcognitiveservices.azure.com",
+        "https://di.cognitiveservices.azure.com.attacker.example",
+    ],
+)
+def test_rejects_azure_suffix_confusion_endpoint(endpoint: str) -> None:
+    with pytest.raises(PluginConfigError):
+        _cfg(endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://di.cognitiveservices.azure.com:8443",
+        "https://di.cognitiveservices.azure.com/documentintelligence",
+        "https://di.cognitiveservices.azure.com?redirect=https://attacker.example",
+        "https://di.cognitiveservices.azure.com#attacker.example",
+    ],
+)
+def test_rejects_non_origin_azure_document_intelligence_endpoint(endpoint: str) -> None:
+    with pytest.raises(PluginConfigError):
+        _cfg(endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://di.cognitiveservices.azure.com:443",
+        "https://di.cognitiveservices.azure.com/",
+    ],
+)
+def test_accepts_origin_only_https_variants(endpoint: str) -> None:
+    assert _cfg(endpoint=endpoint).endpoint == endpoint
+
+
 def test_rejects_empty_api_key() -> None:
     with pytest.raises(PluginConfigError):
         _cfg(api_key="   ")
