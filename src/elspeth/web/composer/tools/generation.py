@@ -6,6 +6,7 @@ import ast
 import csv
 import io
 import re
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Final, Literal, TypedDict
@@ -2032,24 +2033,48 @@ def compute_proof_diagnostics(
     #    source columns. That is a Tier-1 audit-integrity violation — the
     #    audit trail would silently contain data that "looks single-column"
     #    when the source had two — and must force the repair loop, not pass
-    #    through as advisory. The repair vocabulary is: rename headers,
-    #    declare ``columns`` explicitly, configure ``field_mapping``, or set
-    #    ``on_validation_failure`` to a configured quarantine output.
+    #    through as advisory. A genuine header row must be corrected and
+    #    re-uploaded. Explicit unique ``columns`` are a valid alternative only
+    #    when the repeated first row is data from a genuinely headerless file.
     for warning in facts.warnings:
         if warning.startswith("csv_duplicate_headers:"):
+            # Do not relay the warning verbatim. ``facts`` comes from bounded
+            # source bytes, and a malformed/headerless CSV can make its first
+            # data row look like headers. Recompute only structural facts at
+            # this final model-visible boundary so even a future inspection-
+            # warning regression cannot expose raw header/cell values here.
+            observed_headers = facts.observed_headers or ()
+            header_counts = Counter(observed_headers)
+            duplicate_values = {name for name, count in header_counts.items() if count > 1}
+            duplicate_positions = [index for index, name in enumerate(observed_headers, start=1) if name in duplicate_values]
             diagnostics.append(
                 _blocking_diagnostic(
                     code="csv_duplicate_headers",
-                    message=warning,
-                    suggested_repair=(
-                        "Rename the duplicate header(s) at the source, OR declare "
-                        "explicit `columns` in the source options, OR configure "
-                        "`field_mapping` to disambiguate the collapsed names, OR "
-                        "set `on_validation_failure` to a configured quarantine "
-                        "output so the silent column collapse does not poison the "
-                        "audit trail."
+                    message=(
+                        f"CSV source has {len(duplicate_values)} duplicate header value "
+                        f"class(es) across {len(duplicate_positions)} duplicate column "
+                        f"position(s) out of {len(observed_headers)} total columns. Header "
+                        "values are redacted because malformed or headerless CSV input can "
+                        "make row content look like headers. Downstream consumers may "
+                        "silently collapse these columns."
                     ),
-                    evidence_locator={"source": "blob", "blob_id": str(blob_id)},
+                    suggested_repair=(
+                        "For a genuine header row, correct the source file so every "
+                        "physical header is unique, then re-upload and re-bind the "
+                        "replacement blob. If the file is genuinely headerless and "
+                        "the repeated first row is data rather than headers, declare "
+                        "explicit unique `columns` in the source options, then re-run "
+                        "preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "blob",
+                        "blob_id": str(blob_id),
+                        "observed_header_count": len(observed_headers),
+                        "duplicate_header_class_count": len(duplicate_values),
+                        "duplicate_header_column_count": len(duplicate_positions),
+                        "duplicate_header_positions": duplicate_positions,
+                        "header_values_redacted": True,
+                    },
                 )
             )
             continue

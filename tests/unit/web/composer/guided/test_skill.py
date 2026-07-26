@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
+
 import pytest
 
 from elspeth.web.composer.guided.prompts import _summarize_sample_row, load_step_chat_skill
@@ -50,6 +52,42 @@ def test_sample_row_projection_redacts_values() -> None:
         "<sample:url>",
         "<sample:string:26-chars>",
     }
+    assert tuple(projection) == ("field_1", "field_2", "field_3", "field_4")
+
+
+def test_sample_row_projection_aliases_are_disjoint_from_raw_labels() -> None:
+    projection = _summarize_sample_row({"field_2": "alpha", "customer": "beta"})
+
+    assert tuple(projection) == ("field_1", "field_3")
+
+
+class _CountingAliasMapping(Mapping[str, str]):
+    def __init__(self, values: dict[str, str]) -> None:
+        self._values = values
+        self.iteration_count = 0
+
+    def __getitem__(self, key: str) -> str:
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_count += 1
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
+def test_sample_row_projection_uses_read_only_alias_lookup_and_omits_missing_labels() -> None:
+    aliases = _CountingAliasMapping({"known": "field_1"})
+
+    projection = _summarize_sample_row(
+        {"known": "person@example.test", "MISSING_IGNORE_SYSTEM": "raw sample"},
+        field_aliases=aliases,
+    )
+
+    assert projection == {"field_1": "<sample:email-like>"}
+    assert aliases.iteration_count == 0
+    assert "MISSING_IGNORE_SYSTEM" not in repr(projection)
 
 
 def test_step_3_skill_keeps_fail_closed_mapping_direction_rules() -> None:

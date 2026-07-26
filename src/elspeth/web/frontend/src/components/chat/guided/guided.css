@@ -1086,6 +1086,18 @@
   outline-offset: 2px;
 }
 
+.guided-source-file-choice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-xs) var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
+.guided-source-file-choice .guided-chip-hint {
+  grid-column: 2;
+}
+
 .guided-custom-submit-btn {
   padding: var(--space-sm) var(--space-lg);
   background-color: var(--color-surface-elevated);

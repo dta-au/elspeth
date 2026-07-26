@@ -19,6 +19,7 @@ from pydantic import JsonValue
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.core.canonical import stable_hash
+from elspeth.core.secrets import collect_credential_field_violations
 from elspeth.web.catalog.knob_schema import KnobSchema, validate_knob_schema
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, ControlSignal, GuidedStep, TurnType
@@ -31,6 +32,7 @@ from elspeth.web.composer.guided.resolved import (
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession, SinkIntent, SourceIntent
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_from_dict, facts_to_dict
 from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS
+from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 _PATH_OPTION_NAMES: Final = frozenset({"path", "file"})
 _SOURCE_KIND_PLUGIN: Final = {"csv": "csv", "json": "json", "jsonl": "json", "text": "text"}
@@ -567,6 +569,17 @@ def _validated_merged_options(
     for option_name, option_value in merged.items():
         if option_name not in model_validated or stable_hash(model_validated[option_name]) != stable_hash(option_value):
             raise InvariantError(f"server model validation did not preserve submitted {plugin_kind} option {option_name!r}")
+    credential_fields = tuple(
+        dict.fromkeys(
+            collect_credential_field_violations(
+                model_validated,
+                additional_credential_fields=allowed_secret_ref_fields(plugin_kind, plugin_name),
+            )
+        )
+    )
+    if credential_fields:
+        field_list = ", ".join(credential_fields)
+        raise ValueError(f"literal credential values are not allowed for {plugin_kind} option field(s): {field_list}; use secret_ref")
     return (
         freeze_guided_json_mapping(model_validated, f"{plugin_kind} resolved options"),
         cast(Mapping[str, str], freeze_guided_json_mapping(structural, f"{plugin_kind} structural policies")),

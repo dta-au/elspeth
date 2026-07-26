@@ -21,6 +21,14 @@ const MockGuidedResponseReceiptError = vi.hoisted(() => class extends Error {
   }
 });
 
+const blobStoreMocks = vi.hoisted(() => ({
+  activeSessionId: null as string | null,
+  activationEpoch: 0,
+  activateSession: vi.fn(),
+  invalidateBlobForEpoch: vi.fn(),
+  loadBlobs: vi.fn(),
+}));
+
 // Mock the API client — store tests verify state logic, not HTTP calls.
 // Must include all exports used by sessionStore (not just guided ones).
 vi.mock("@/api/client", () => ({
@@ -65,7 +73,7 @@ vi.mock("./executionStore", () => ({
 // Without this, the real blobStore makes HTTP calls against jsdom.
 vi.mock("./blobStore", () => ({
   useBlobStore: {
-    getState: () => ({ loadBlobs: vi.fn() }),
+    getState: () => blobStoreMocks,
   },
 }));
 
@@ -255,6 +263,8 @@ const sampleExitedGuidedSession: GuidedSession = {
 describe("sessionStore — guided-mode fields and actions", () => {
   beforeEach(async () => {
     vi.resetAllMocks();
+    blobStoreMocks.activeSessionId = null;
+    blobStoreMocks.activationEpoch = 0;
     window.sessionStorage.clear();
     resetStore(useSessionStore);
     // Phase 5b — reseed the listInterpretationEvents mock that
@@ -638,6 +648,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     });
     const action: GuidedRespondAction = {
       chosen: ["csv"],
+      source_blob_id: "00000000-0000-4000-8000-000000000821",
       edited_values: null,
       custom_inputs: null,
       proposal_id: null,
@@ -659,6 +670,8 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(retryRequest.operation_id).toBe(firstRequest.operation_id);
     expect(retryRequest.turn_token).toBe(firstRequest.turn_token);
     expect(retryRequest.turn_token).toBe(sampleNextTurn.turn_token);
+    expect(retryRequest.source_blob_id).toBe(action.source_blob_id);
+    expect(retryRequest).toEqual(firstRequest);
   });
 
   it("respondGuided: suppresses a concurrent duplicate component action", async () => {
@@ -3549,6 +3562,276 @@ describe("sessionStore — guided-mode fields and actions", () => {
   });
 
   describe("respondGuided rejection surfacing (elspeth-3b35abf148 variant 3)", () => {
+    it("keeps a newer same-session submit authoritative when an old A-to-B-to-A rejection arrives", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+      let rejectFirst!: (reason?: unknown) => void;
+      let resolveSecond!: (response: GuidedRespondResponse) => void;
+      respondMock
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((_resolve, reject) => {
+            rejectFirst = reject;
+          }),
+        )
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((resolve) => {
+            resolveSecond = resolve;
+          }),
+        );
+      const action: GuidedRespondAction = {
+        chosen: ["csv"],
+        source_blob_id: "00000000-0000-4000-8000-000000000901",
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      };
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+      blobStoreMocks.activeSessionId = RETRY_SESSION_ID;
+      blobStoreMocks.activationEpoch = 17;
+
+      const first = useSessionStore.getState().respondGuided(action);
+
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_B);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_ID);
+      useSessionStore.setState({
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+      blobStoreMocks.activeSessionId = RETRY_SESSION_ID;
+      blobStoreMocks.activationEpoch = 23;
+      const second = useSessionStore.getState().respondGuided(action);
+
+      expect(respondMock).toHaveBeenCalledTimes(2);
+      expect(useSessionStore.getState().guidedResponsePending).toBe(true);
+
+      rejectFirst({
+        status: 400,
+        detail: "Selected source blob is no longer a ready upload for this session.",
+      });
+      await expect(first).resolves.toMatchObject({
+        status: "not_applied",
+        reason: "stale",
+      });
+
+      expect(blobStoreMocks.invalidateBlobForEpoch).not.toHaveBeenCalled();
+      expect(blobStoreMocks.loadBlobs).not.toHaveBeenCalled();
+      expect(useSessionStore.getState()).toMatchObject({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+        guidedResponsePending: true,
+        error: null,
+      });
+
+      resolveSecond(sampleRespondResponse);
+      await expect(second).resolves.toEqual({ status: "applied" });
+      expect(useSessionStore.getState().guidedResponsePending).toBe(false);
+    });
+
+    it("releases definitive stale retry custody when no newer submit adopted it", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+      let rejectFirst!: (reason?: unknown) => void;
+      respondMock
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((_resolve, reject) => {
+            rejectFirst = reject;
+          }),
+        )
+        .mockResolvedValueOnce(sampleRespondResponse);
+      const firstAction: GuidedRespondAction = {
+        chosen: ["csv"],
+        source_blob_id: "00000000-0000-4000-8000-000000000901",
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      };
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      const first = useSessionStore.getState().respondGuided(firstAction);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_B);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_ID);
+      useSessionStore.setState({
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      rejectFirst({
+        status: 400,
+        detail: "Selected source blob is no longer a ready upload for this session.",
+      });
+      await expect(first).resolves.toMatchObject({
+        status: "not_applied",
+        reason: "stale",
+      });
+
+      const second = await useSessionStore.getState().respondGuided({
+        ...firstAction,
+        source_blob_id: "00000000-0000-4000-8000-000000000902",
+      });
+
+      expect(second).toEqual({ status: "applied" });
+      expect(respondMock).toHaveBeenCalledTimes(2);
+      expect(respondMock.mock.calls[1]?.[1].operation_id).not.toBe(
+        respondMock.mock.calls[0]?.[1].operation_id,
+      );
+    });
+
+    it("does not clear retry custody re-adopted by a newer same-action submit", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+      let rejectFirst!: (reason?: unknown) => void;
+      let rejectSecond!: (reason?: unknown) => void;
+      respondMock
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((_resolve, reject) => {
+            rejectFirst = reject;
+          }),
+        )
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((_resolve, reject) => {
+            rejectSecond = reject;
+          }),
+        )
+        .mockResolvedValueOnce(sampleRespondResponse);
+      const action: GuidedRespondAction = {
+        chosen: ["csv"],
+        source_blob_id: "00000000-0000-4000-8000-000000000901",
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      };
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      const first = useSessionStore.getState().respondGuided(action);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_B);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_ID);
+      useSessionStore.setState({
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+      const second = useSessionStore.getState().respondGuided(action);
+
+      rejectFirst({
+        status: 400,
+        detail: "Selected source blob is no longer a ready upload for this session.",
+      });
+      await expect(first).resolves.toMatchObject({ reason: "stale" });
+
+      rejectSecond(new TypeError("response lost"));
+      await expect(second).resolves.toMatchObject({ reason: "unsettled" });
+      const retry = await useSessionStore.getState().respondGuided(action);
+
+      expect(retry).toEqual({ status: "applied" });
+      expect(respondMock).toHaveBeenCalledTimes(3);
+      expect(respondMock.mock.calls.map((call) => call[1].operation_id)).toEqual([
+        respondMock.mock.calls[0]?.[1].operation_id,
+        respondMock.mock.calls[0]?.[1].operation_id,
+        respondMock.mock.calls[0]?.[1].operation_id,
+      ]);
+    });
+
+    it.each([
+      "Selected source blob is no longer a ready upload for this session.",
+      "Selected source blob is not a ready upload for this session.",
+    ])(
+      "refreshes source candidates while preserving lifecycle rejection: %s",
+      async (detail) => {
+        const { respondGuided } = await import("@/api/client");
+        (respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+          status: 400,
+          detail,
+        });
+        useSessionStore.setState({
+          activeSessionId: RETRY_SESSION_ID,
+          guidedSession: sampleGuidedSession,
+          guidedNextTurn: sampleNextTurn,
+        });
+        blobStoreMocks.activeSessionId = RETRY_SESSION_ID;
+        blobStoreMocks.activationEpoch = 17;
+
+        const outcome = await useSessionStore.getState().respondGuided({
+          chosen: ["csv"],
+          source_blob_id: "00000000-0000-4000-8000-000000000901",
+          edited_values: null,
+          custom_inputs: null,
+          proposal_id: null,
+          draft_hash: null,
+          edit_target: null,
+          control_signal: null,
+        });
+
+        expect(blobStoreMocks.invalidateBlobForEpoch).toHaveBeenCalledWith(
+          RETRY_SESSION_ID,
+          17,
+          "00000000-0000-4000-8000-000000000901",
+        );
+        expect(blobStoreMocks.loadBlobs).toHaveBeenCalledWith(RETRY_SESSION_ID);
+        expect(
+          blobStoreMocks.invalidateBlobForEpoch.mock.invocationCallOrder[0],
+        ).toBeLessThan(blobStoreMocks.loadBlobs.mock.invocationCallOrder[0]);
+        expect(outcome).toEqual({
+          status: "not_applied",
+          reason: "rejected",
+          message: detail,
+        });
+        expect(useSessionStore.getState().error).toBe(detail);
+        expect(useSessionStore.getState().guidedResponsePending).toBe(false);
+      },
+    );
+
+    it("does not refresh blobs for an unrelated guided 400", async () => {
+      const detail = "A different guided validation failed.";
+      const { respondGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 400,
+        detail,
+      });
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+      blobStoreMocks.activeSessionId = RETRY_SESSION_ID;
+      blobStoreMocks.activationEpoch = 23;
+
+      await useSessionStore.getState().respondGuided({
+        chosen: ["csv"],
+        source_blob_id: "00000000-0000-4000-8000-000000000901",
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      });
+
+      expect(blobStoreMocks.invalidateBlobForEpoch).not.toHaveBeenCalled();
+      expect(blobStoreMocks.loadBlobs).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().error).toBe(detail);
+    });
+
     it("surfaces a structured wire_confirm_rejected 409 as error + errorDetails", async () => {
       const { getGuided, respondGuided } = await import("@/api/client");
       (respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({

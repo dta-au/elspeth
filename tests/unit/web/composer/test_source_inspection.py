@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import pytest
 
+from elspeth.web.composer import source_inspection
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     _declared_field_is_required,
@@ -296,15 +297,24 @@ class TestCsvInspection:
         f = inspect_blob_content(content=body, filename="x.csv", mime_type="text/csv")
         assert f.sample_row_count <= 100
 
-    def test_duplicate_headers_emits_warning(self) -> None:
-        """Duplicate CSV headers silently collapse downstream — surface the
-        duplication so the operator can rename or use field_mapping."""
-        body = b"id,name,name,city\n1,Alice,Smith,NYC\n"
+    def test_duplicate_headers_warning_exposes_only_structural_facts(self) -> None:
+        """Duplicate values may be row content, so warnings must redact them."""
+        sentinel = "ELSPETH_DUPLICATE_HEADER_SENTINEL_7F3A"
+        body = f"id,{sentinel},{sentinel},city\n1,Alice,Smith,NYC\n".encode()
         f = inspect_blob_content(content=body, filename="x.csv", mime_type="text/csv")
         msgs = [w for w in f.warnings if "csv_duplicate_headers" in w]
         assert msgs, f.warnings
-        # Duplicate name surfaced; the warning lists the offending header.
-        assert any("'name'" in w for w in msgs), msgs
+        durable_warnings = json.dumps(facts_to_dict(f)["warnings"])
+        assert sentinel not in durable_warnings
+        assert "1 duplicate header value class(es)" in durable_warnings
+        assert "2 column position(s) [2, 3] of 4" in durable_warnings
+        assert "header values redacted" in durable_warnings
+        assert "field_mapping" not in durable_warnings
+        assert "quarantine" not in durable_warnings
+        assert "correct" in durable_warnings
+        assert "re-upload" in durable_warnings
+        assert "headerless" in durable_warnings
+        assert "explicit unique columns" in durable_warnings
 
     def test_jagged_rows_emits_warning(self) -> None:
         """Rows with cell counts that don't match the header length must
@@ -593,6 +603,46 @@ class TestBoundedReads:
         assert f.byte_range_inspected[1] <= 8 * 1024
         # byte_size in identity reflects the *real* size, not the truncated one.
         assert int(f.redacted_identity["byte_size"]) == len(big)
+
+
+class TestSelectedBlobIdentity:
+    def test_explicit_selection_wins_over_newer_ready_blob(self) -> None:
+        earlier = uuid4()
+        newer = uuid4()
+
+        selected = source_inspection.resolve_source_inspection_blob_id(
+            selected_blob_id=earlier,
+            ready_blob_ids=(newer, earlier),
+        )
+
+        assert selected == earlier
+
+    def test_multiple_ready_blobs_without_selection_are_ambiguous(self) -> None:
+        assert (
+            source_inspection.resolve_source_inspection_blob_id(
+                selected_blob_id=None,
+                ready_blob_ids=(uuid4(), uuid4()),
+            )
+            is None
+        )
+
+    def test_one_ready_blob_resolves_without_temporal_choice(self) -> None:
+        only = uuid4()
+
+        assert (
+            source_inspection.resolve_source_inspection_blob_id(
+                selected_blob_id=None,
+                ready_blob_ids=(only,),
+            )
+            == only
+        )
+
+    def test_explicit_selection_must_name_a_ready_session_blob(self) -> None:
+        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
+            source_inspection.resolve_source_inspection_blob_id(
+                selected_blob_id=uuid4(),
+                ready_blob_ids=(uuid4(),),
+            )
 
 
 # --------------------------------------------------------------------------

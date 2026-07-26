@@ -149,7 +149,7 @@ export function useHashRouter(
       if (sessionId && sessionId !== store.activeSessionId) {
         store.selectSession(sessionId);
       } else if (!sessionId && store.activeSessionId) {
-        useSessionStore.setState({ activeSessionId: null });
+        store.unbindMissingSession(store.activeSessionId);
       }
 
       // Fix A: use hasOwnProperty to avoid prototype-chain walk.
@@ -272,7 +272,7 @@ export function useHashRouter(
       if (!exists && state.activeSessionId === sessionId) {
         lastWrittenHash.current = "";
         window.history.replaceState(null, "", window.location.pathname);
-        useSessionStore.setState({ activeSessionId: null });
+        useSessionStore.getState().unbindMissingSession(sessionId);
       }
     });
     return unsub;

@@ -38,7 +38,13 @@ from elspeth.web.composer.guided.stage_transitions import (
 )
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedCorrectionMessageRef
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
-from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
+from elspeth.web.composer.source_inspection import (
+    SOURCE_INSPECTION_INTEGRITY_ERRORS,
+    SourceInspectionBlobLifecycleError,
+    SourceInspectionFacts,
+    inspect_blob_content,
+    inspect_selected_ready_session_blob,
+)
 from elspeth.web.composer.tutorial_sample import (
     resolve_tutorial_sample_urls,
     tutorial_sample_base_url,
@@ -1761,6 +1767,7 @@ def _schema8_prospective_occurrence(
 def _schema8_only_response_fields(body: GuidedRespondRequest, *allowed: str) -> None:
     values = {
         "chosen": body.chosen,
+        "source_blob_id": body.source_blob_id,
         "edited_values": body.edited_values,
         "custom_inputs": body.custom_inputs,
         "control_signal": body.control_signal,
@@ -2014,7 +2021,11 @@ def _schema8_transition(
         raise ValueError("component review turns require component_action")
 
     if turn_type is TurnType.SINGLE_SELECT:
-        _schema8_only_response_fields(body, "chosen")
+        _schema8_only_response_fields(
+            body,
+            "chosen",
+            *(("source_blob_id",) if guided.step is GuidedStep.STEP_1_SOURCE else ()),
+        )
         if body.chosen is None:
             raise ValueError("single_select requires chosen")
         plugin_response = PluginSelectionResponse(chosen=body.chosen)
@@ -2046,7 +2057,10 @@ def _schema8_transition(
             )
         else:
             raise _schema8_unsupported_stage(guided.step)
-        return updated, {"chosen": list(body.chosen)}
+        response_payload: dict[str, object] = {"chosen": list(body.chosen)}
+        if body.source_blob_id is not None:
+            response_payload["source_blob_id"] = str(body.source_blob_id)
+        return updated, response_payload
 
     if turn_type is TurnType.SCHEMA_FORM:
         _schema8_only_response_fields(body, "edited_values")
@@ -2327,6 +2341,13 @@ async def post_guided_respond(
         observed_guided = observed_state.guided_session
         if observed_guided is None:
             raise HTTPException(status_code=400, detail="Session is not in guided mode. Use /api/sessions/{id}/messages.")
+        if body.source_blob_id is not None and (
+            observed_guided.terminal is not None or observed_guided.step is not GuidedStep.STEP_1_SOURCE or body.chosen is None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="source_blob_id is only valid for a Step 1 source selection.",
+            )
         if observed_guided.terminal is not None:
             if not (
                 observed_guided.terminal.kind is TerminalKind.COMPLETED
@@ -2454,10 +2475,30 @@ async def post_guided_respond(
         )
         if body.turn_token != guided_turn_token(prospective):
             raise HTTPException(status_code=409, detail="turn_token does not identify the current unanswered turn.")
+        if body.source_blob_id is not None and current_turn["type"] != TurnType.SINGLE_SELECT.value:
+            raise HTTPException(
+                status_code=400,
+                detail="source_blob_id is only valid for a Step 1 source selection.",
+            )
         inspection_facts: SourceInspectionFacts | None = None
         if observed_guided.step is GuidedStep.STEP_1_SOURCE:
             if current_turn["type"] == TurnType.SINGLE_SELECT.value:
-                inspection_facts = await _inspect_latest_ready_session_blob(request.app.state.blob_service, session_id)
+                try:
+                    inspection_facts = await inspect_selected_ready_session_blob(
+                        request.app.state.blob_service,
+                        session_id,
+                        selected_blob_id=body.source_blob_id,
+                    )
+                except SourceInspectionBlobLifecycleError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Selected source blob is no longer a ready upload for this session.",
+                    ) from exc
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Selected source blob is not a ready upload for this session.",
+                    ) from exc
             elif current_turn["type"] == TurnType.SCHEMA_FORM.value:
                 inspection_facts = await _schema8_active_source_edit_inspection(
                     request.app.state.blob_service,
@@ -2500,7 +2541,7 @@ async def post_guided_respond(
     async def _preflight_or_sanitize(attempt_stable_id: UUID) -> tuple[SourceInspectionFacts | None, bool]:
         try:
             return await _preflight_attempt(attempt_stable_id)
-        except (AuditIntegrityError, InvariantError) as exc:
+        except (AuditIntegrityError, *SOURCE_INSPECTION_INTEGRITY_ERRORS, InvariantError) as exc:
             with contextlib.suppress(Exception):
                 slog.error(
                     "guided.invariant_violated",

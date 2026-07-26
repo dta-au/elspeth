@@ -20,16 +20,26 @@ Contract:
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import io
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
+from elspeth.contracts.blobs import (
+    BlobContentMissingError,
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobServiceProtocol,
+    BlobStateError,
+)
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
@@ -43,6 +53,7 @@ SourceKind = Literal["csv", "jsonl", "json", "text", "unknown"]
 
 InferredType = Literal["int", "float", "bool", "str", "null"]
 DeclaredFieldSpec = str | Mapping[str, Any]
+SOURCE_INSPECTION_INTEGRITY_ERRORS = (BlobContentMissingError, BlobIntegrityError)
 
 
 _URL_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bhttps?://[^\s<>\"']+")
@@ -96,6 +107,75 @@ class SourceInspectionFacts:
             raise ValueError(f"SourceInspectionFacts.byte_range_inspected must satisfy 0 <= start <= end; got ({start}, {end})")
         if self.sample_row_count < 0:
             raise ValueError(f"SourceInspectionFacts.sample_row_count must be non-negative; got {self.sample_row_count}")
+
+
+class SourceInspectionBlobLifecycleError(ValueError):
+    """A selected ready blob changed lifecycle state before inspection."""
+
+
+def resolve_source_inspection_blob_id(
+    *,
+    selected_blob_id: UUID | None,
+    ready_blob_ids: Sequence[UUID],
+) -> UUID | None:
+    """Resolve one immutable ready-blob identity for guided source inspection.
+
+    An explicit selection is authoritative when it names a ready blob in the
+    current session. The legacy no-selection path remains usable only when the
+    ready set contains exactly one blob. Multiple ready blobs are deliberately
+    ambiguous: their order is temporal session state, not source intent.
+    """
+    if selected_blob_id is not None and type(selected_blob_id) is not UUID:
+        raise TypeError("selected_blob_id must be UUID or None")
+    ready = tuple(ready_blob_ids)
+    if any(type(blob_id) is not UUID for blob_id in ready):
+        raise TypeError("ready_blob_ids must contain UUID values")
+    if len(set(ready)) != len(ready):
+        raise InvariantError("ready_blob_ids must contain unique blob identities")
+    if selected_blob_id is not None:
+        if selected_blob_id not in ready:
+            raise ValueError("selected source blob is not ready in this session")
+        return selected_blob_id
+    return ready[0] if len(ready) == 1 else None
+
+
+async def inspect_selected_ready_session_blob(
+    blob_service: BlobServiceProtocol,
+    session_id: UUID,
+    *,
+    selected_blob_id: UUID | None,
+) -> SourceInspectionFacts | None:
+    """Inspect one explicit or unambiguous ready blob owned by a session."""
+
+    records = await blob_service.list_blobs(session_id, limit=None)
+    ready_records = tuple(record for record in records if record.status == "ready")
+    resolved_blob_id = resolve_source_inspection_blob_id(
+        selected_blob_id=selected_blob_id,
+        ready_blob_ids=tuple(record.id for record in ready_records),
+    )
+    if resolved_blob_id is None:
+        return None
+    record = next(record for record in ready_records if record.id == resolved_blob_id)
+    try:
+        content = await blob_service.read_blob_content(resolved_blob_id)
+    except (BlobNotFoundError, BlobStateError) as exc:
+        raise SourceInspectionBlobLifecycleError from exc
+    if record.content_hash is None:
+        raise AuditIntegrityError("ready source-inspection blob has no content hash")
+    actual_hash = hashlib.sha256(content).hexdigest()
+    if not hmac.compare_digest(actual_hash, record.content_hash):
+        raise BlobIntegrityError(
+            str(record.id),
+            expected=record.content_hash,
+            actual=actual_hash,
+        )
+    return inspect_blob_content(
+        content=content,
+        filename=record.filename,
+        mime_type=record.mime_type,
+        blob_id=record.id,
+        content_hash=record.content_hash,
+    )
 
 
 def inspect_blob_content(
@@ -515,14 +595,23 @@ def _inspect_csv(
 
     # CSV duplicate headers: pandas / csv.DictReader collapse duplicates
     # silently (last-write-wins), which fabricates a single column from
-    # multiple source columns. Surface the duplicates as a warning so the
-    # operator can rename or use field_mapping; do not fabricate a
+    # multiple source columns. Surface only the duplicate equivalence-class
+    # count and affected positions: a malformed or headerless CSV can make
+    # the first data row look like headers, so the raw values must not cross
+    # the blob metadata-only boundary in a warning copied to model diagnostics
+    # or persisted in durable guided inspection state. Do not fabricate a
     # disambiguated key here.
     if len(set(headers)) < len(headers):
         counts = Counter(headers)
-        dupes = sorted(name for name, count in counts.items() if count > 1)
+        duplicate_values = {name for name, count in counts.items() if count > 1}
+        duplicate_positions = [index for index, name in enumerate(headers, start=1) if name in duplicate_values]
         warnings.append(
-            f"csv_duplicate_headers: header(s) {dupes} appear multiple times — downstream consumers may collapse them; rename or use field_mapping"
+            f"csv_duplicate_headers: {len(duplicate_values)} duplicate header value class(es) "
+            f"across {len(duplicate_positions)} column position(s) {duplicate_positions} of "
+            f"{len(headers)}; header values redacted — downstream consumers may collapse "
+            "them; for a genuine header row, correct the source so every header is unique "
+            "and re-upload it. If the source is genuinely headerless and its first data "
+            "row was misclassified as headers, declare explicit unique columns instead"
         )
 
     # If the first row looks like data (every cell parseable as int/float/bool),

@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useBlobStore } from "@/stores/blobStore";
 import {
   deriveInlineSourceRowCount,
   projectInlineSourceSummary,
@@ -73,6 +74,7 @@ import type {
 import {
   GUIDED_CHAT_MESSAGE_MAX_LENGTH,
   type ChatTurn as GuidedChatTurn,
+  type GuidedSourceBlobCandidate,
   type GuidedStep,
 } from "@/types/guided";
 
@@ -553,6 +555,36 @@ interface ChatPanelProps {
   lockedChatPrompt?: Partial<Record<GuidedStep, string>>;
 }
 
+interface GuidedSourceBlobCandidateSet {
+  sessionId: string;
+  turnToken: string;
+  candidates: readonly GuidedSourceBlobCandidate[];
+  /**
+   * Sticky consent latch for this exact turn. Once the user has needed to
+   * distinguish files, filtering must not silently turn the remaining file
+   * back into an implicit choice.
+   */
+  requiresExplicitChoice: boolean;
+}
+
+interface GuidedUploadFence {
+  sessionId: string;
+  activationEpoch: number;
+  step: GuidedStep | null;
+  turnToken: string | null;
+  isSourceSingleSelect: boolean;
+}
+
+interface GuidedUploadContext {
+  activeSessionId: string | null;
+  activationEpoch: number;
+  step: GuidedStep | null;
+  turnToken: string | null;
+  isSourceSingleSelect: boolean;
+}
+
+const CANONICAL_BLOB_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 /**
  * Main chat panel combining the message list, composing indicator, and input.
  *
@@ -582,6 +614,8 @@ export function ChatPanel({
     return null;
   }, [chatTurns]);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const blobs = useBlobStore((s) => s.blobs);
+  const blobActivationEpoch = useBlobStore((s) => s.activationEpoch);
   const sessions = useSessionStore((s) => s.sessions);
   const compositionState = useSessionStore((s) => s.compositionState);
   const compositionProposals = useSessionStore((s) => s.compositionProposals);
@@ -791,6 +825,30 @@ export function ChatPanel({
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [showBlobManager, setShowBlobManager] = useState(false);
   const [inputText, setInputText] = useState("");
+  const [guidedSourceBlobCandidateSet, setGuidedSourceBlobCandidateSet] =
+    useState<GuidedSourceBlobCandidateSet | null>(null);
+  const pendingGuidedUploadsRef = useRef(new Map<string, GuidedUploadFence>());
+  const [pendingGuidedUploads, setPendingGuidedUploads] = useState<
+    ReadonlyMap<string, GuidedUploadFence>
+  >(new Map());
+  const guidedUploadContextRef = useRef<GuidedUploadContext>({
+    activeSessionId,
+    activationEpoch: blobActivationEpoch,
+    step: guidedSession?.step ?? null,
+    turnToken: guidedNextTurn?.turn_token ?? null,
+    isSourceSingleSelect:
+      guidedSession?.step === "step_1_source" &&
+      guidedNextTurn?.type === "single_select",
+  });
+  guidedUploadContextRef.current = {
+    activeSessionId,
+    activationEpoch: blobActivationEpoch,
+    step: guidedSession?.step ?? null,
+    turnToken: guidedNextTurn?.turn_token ?? null,
+    isSourceSingleSelect:
+      guidedSession?.step === "step_1_source" &&
+      guidedNextTurn?.type === "single_select",
+  };
   const activeComposerMessage = findActiveComposerMessage(messages);
   const proposalsByToolCallId = useMemo(
     () =>
@@ -864,6 +922,242 @@ export function ChatPanel({
   useEffect(() => {
     setShowScrollButton(false);
   }, [activeSessionId]);
+
+  const readyGuidedSourceBlobs = useMemo(
+    () =>
+      new Map(
+        blobs
+          .filter(
+            (blob) =>
+              blob.session_id === activeSessionId &&
+              blob.status === "ready" &&
+              CANONICAL_BLOB_UUID.test(blob.id),
+          )
+          .map(
+            (blob) =>
+              [
+                blob.id,
+                {
+                  id: blob.id,
+                  filename: blob.filename,
+                  sizeBytes: blob.size_bytes,
+                } satisfies GuidedSourceBlobCandidate,
+              ] as const,
+          ),
+      ),
+    [activeSessionId, blobs],
+  );
+
+  const handleGuidedBlobUploaded = useCallback(
+    (blob: BlobMetadata) => {
+      const turn = guidedNextTurn;
+      if (
+        activeSessionId === null ||
+        blob.session_id !== activeSessionId ||
+        blob.status !== "ready" ||
+        !CANONICAL_BLOB_UUID.test(blob.id) ||
+        guidedSession?.step !== "step_1_source" ||
+        turn?.type !== "single_select"
+      ) {
+        return;
+      }
+      const candidate: GuidedSourceBlobCandidate = {
+        id: blob.id,
+        filename: blob.filename,
+        sizeBytes: blob.size_bytes,
+      };
+      setGuidedSourceBlobCandidateSet((current) => {
+        if (
+          current?.sessionId === activeSessionId &&
+          current.turnToken === turn.turn_token
+        ) {
+          const candidates = [
+            ...current.candidates.filter((item) => item.id !== candidate.id),
+            candidate,
+          ];
+          return {
+            ...current,
+            candidates,
+            requiresExplicitChoice:
+              current.requiresExplicitChoice || candidates.length > 1,
+          };
+        }
+        return {
+          sessionId: activeSessionId,
+          turnToken: turn.turn_token,
+          candidates: [candidate],
+          requiresExplicitChoice: false,
+        };
+      });
+    },
+    [activeSessionId, guidedNextTurn, guidedSession?.step],
+  );
+
+  const handleGuidedBlobUploadStarted = useCallback(
+    (requestId: string, sessionId: string) => {
+      const context = guidedUploadContextRef.current;
+      if (context.activeSessionId !== sessionId) return;
+      pendingGuidedUploadsRef.current.set(requestId, {
+        sessionId,
+        activationEpoch: context.activationEpoch,
+        step: context.step,
+        turnToken: context.turnToken,
+        isSourceSingleSelect: context.isSourceSingleSelect,
+      });
+      setPendingGuidedUploads(new Map(pendingGuidedUploadsRef.current));
+    },
+    [],
+  );
+
+  const isGuidedBlobUploadFenceCurrent = useCallback(
+    (requestId: string, sessionId: string): boolean => {
+      const fence = pendingGuidedUploadsRef.current.get(requestId);
+      const context = guidedUploadContextRef.current;
+      return (
+        fence !== undefined &&
+        fence.sessionId === sessionId &&
+        context.activeSessionId === fence.sessionId &&
+        context.activationEpoch === fence.activationEpoch &&
+        context.step === fence.step &&
+        context.turnToken === fence.turnToken &&
+        context.isSourceSingleSelect === fence.isSourceSingleSelect
+      );
+    },
+    [],
+  );
+
+  const handleGuidedBlobUploadCompleted = useCallback(
+    (requestId: string, sessionId: string, blob: BlobMetadata): boolean => {
+      const fence = pendingGuidedUploadsRef.current.get(requestId);
+      if (
+        fence === undefined ||
+        blob.session_id !== sessionId ||
+        !isGuidedBlobUploadFenceCurrent(requestId, sessionId)
+      ) {
+        return false;
+      }
+      if (fence.isSourceSingleSelect) {
+        handleGuidedBlobUploaded(blob);
+      }
+      return true;
+    },
+    [handleGuidedBlobUploaded, isGuidedBlobUploadFenceCurrent],
+  );
+
+  const handleGuidedBlobUploadRejected = useCallback(
+    (requestId: string, sessionId: string): boolean =>
+      isGuidedBlobUploadFenceCurrent(requestId, sessionId),
+    [isGuidedBlobUploadFenceCurrent],
+  );
+
+  const handleGuidedBlobUploadSettled = useCallback(
+    (requestId: string, sessionId: string) => {
+      const fence = pendingGuidedUploadsRef.current.get(requestId);
+      if (fence === undefined || fence.sessionId !== sessionId) return;
+      pendingGuidedUploadsRef.current.delete(requestId);
+      setPendingGuidedUploads(new Map(pendingGuidedUploadsRef.current));
+    },
+    [],
+  );
+
+  const hasPendingGuidedSourceUpload = useMemo(
+    () =>
+      [...pendingGuidedUploads.values()].some(
+        (fence) =>
+          fence.isSourceSingleSelect &&
+          fence.sessionId === activeSessionId &&
+          fence.activationEpoch === blobActivationEpoch &&
+          fence.step === guidedSession?.step &&
+          fence.turnToken === guidedNextTurn?.turn_token &&
+          guidedNextTurn?.type === "single_select",
+      ),
+    [
+      activeSessionId,
+      blobActivationEpoch,
+      guidedNextTurn,
+      guidedSession?.step,
+      pendingGuidedUploads,
+    ],
+  );
+
+  // Candidate provenance is scoped to one exact guided turn. Session/turn
+  // changes discard the whole set, and the live blob store invalidates files
+  // that were deleted or are no longer ready. The derived list repeats those
+  // checks synchronously so a stale candidate cannot leak during the effect's
+  // cleanup render.
+  useEffect(() => {
+    setGuidedSourceBlobCandidateSet((current) => {
+      if (current === null) return current;
+      if (
+        activeSessionId === null ||
+        guidedSession?.step !== "step_1_source" ||
+        guidedNextTurn?.type !== "single_select" ||
+        current.sessionId !== activeSessionId ||
+        current.turnToken !== guidedNextTurn.turn_token
+      ) {
+        return null;
+      }
+
+      const candidates = current.candidates.flatMap((candidate) => {
+        const readyCandidate = readyGuidedSourceBlobs.get(candidate.id);
+        return readyCandidate === undefined ? [] : [readyCandidate];
+      });
+      const unchanged =
+        candidates.length === current.candidates.length &&
+        candidates.every(
+          (candidate, index) =>
+            candidate.id === current.candidates[index].id &&
+            candidate.filename === current.candidates[index].filename &&
+            candidate.sizeBytes === current.candidates[index].sizeBytes,
+        );
+      if (unchanged) return current;
+      return {
+        ...current,
+        candidates,
+        // A removed candidate invalidates any selection it may have carried.
+        // Keep the turn fail-closed even when filtering leaves one or no files.
+        requiresExplicitChoice:
+          current.requiresExplicitChoice ||
+          candidates.length < current.candidates.length,
+      };
+    });
+  }, [
+    activeSessionId,
+    guidedNextTurn?.turn_token,
+    guidedNextTurn?.type,
+    guidedSession?.step,
+    readyGuidedSourceBlobs,
+  ]);
+
+  const guidedSourceBlobCandidates = useMemo<
+    readonly GuidedSourceBlobCandidate[]
+  >(() => {
+    if (
+      guidedSession?.step !== "step_1_source" ||
+      guidedNextTurn?.type !== "single_select" ||
+      guidedSourceBlobCandidateSet?.sessionId !== activeSessionId ||
+      guidedSourceBlobCandidateSet.turnToken !== guidedNextTurn.turn_token
+    ) {
+      return [];
+    }
+    return guidedSourceBlobCandidateSet.candidates.flatMap((candidate) => {
+      const readyCandidate = readyGuidedSourceBlobs.get(candidate.id);
+      return readyCandidate === undefined ? [] : [readyCandidate];
+    });
+  }, [
+    activeSessionId,
+    guidedNextTurn,
+    guidedSession?.step,
+    guidedSourceBlobCandidateSet,
+    readyGuidedSourceBlobs,
+  ]);
+
+  const guidedSourceBlobChoiceRequired =
+    guidedSession?.step === "step_1_source" &&
+    guidedNextTurn?.type === "single_select" &&
+    guidedSourceBlobCandidateSet?.sessionId === activeSessionId &&
+    guidedSourceBlobCandidateSet.turnToken === guidedNextTurn.turn_token &&
+    guidedSourceBlobCandidateSet.requiresExplicitChoice;
 
   // ── Inline-source projection (Phase 5a Task 3) ─────────────────────────────
   //
@@ -1622,6 +1916,11 @@ export function ChatPanel({
         ) : (
           <ChatInput
             onSend={(content) => void sendGuidedChat(content)}
+            onBlobUploadStarted={handleGuidedBlobUploadStarted}
+            onBlobUploadCompleted={handleGuidedBlobUploadCompleted}
+            onBlobUploadRejected={handleGuidedBlobUploadRejected}
+            onBlobUploadSettled={handleGuidedBlobUploadSettled}
+            uploadDisabled={hasPendingGuidedSourceUpload}
             // Both pendings gate Send. `guidedResponsePending` blocks a chat
             // WHILE a turn-respond is advancing the step — otherwise the chat
             // captures the stale `guidedSession.step` and the backend rejects
@@ -1714,6 +2013,9 @@ export function ChatPanel({
               <GuidedTurn
                 turn={guidedNextTurn}
                 onSubmit={(body) => void respondGuided(body)}
+                sourceBlobCandidates={guidedSourceBlobCandidates}
+                sourceBlobChoiceRequired={guidedSourceBlobChoiceRequired}
+                sourceUploadPending={hasPendingGuidedSourceUpload}
                 // M-10: gate on guidedChatPending too — otherwise a chip/form
                 // widget stays clickable while a /guided/chat is in flight and
                 // can race an in-flight step-respond (mirrors "Explain this
@@ -1777,7 +2079,9 @@ export function ChatPanel({
                   // button (dead-button doctrine) rather than leave a silent
                   // no-op — same as the primary Send.
                   disabled={
-                    guidedChatPending || guidedResponsePending || !composeTimeoutReady
+                    guidedChatPending ||
+                    guidedResponsePending ||
+                    !composeTimeoutReady
                   }
                   title={
                     !guidedChatPending &&

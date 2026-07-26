@@ -653,6 +653,7 @@ class GuidedRespondRequest(_GuidedOperationRequest):
 
     turn_token: str | None = pydantic.Field(min_length=64, max_length=64, pattern=r"[0-9a-f]{64}")
     chosen: list[str] | None = None
+    source_blob_id: UUID | None = None
     edited_values: dict[str, Any] | None = None
     custom_inputs: list[str] | None = None
     control_signal: str | None = None
@@ -664,6 +665,13 @@ class GuidedRespondRequest(_GuidedOperationRequest):
     edit_target: GuidedEditTargetRequest | None = None
     correction_feedback: str | None = pydantic.Field(default=None, min_length=1, max_length=4096)
     component_action: GuidedComponentAction | None = None
+
+    @field_validator("source_blob_id", mode="before")
+    @classmethod
+    def _validate_source_blob_id(cls, value: object) -> UUID | None:
+        if value is None:
+            return None
+        return _parse_canonical_uuid(value, field_name="source_blob_id")
 
     @field_validator("correction_feedback")
     @classmethod
@@ -687,7 +695,11 @@ class GuidedRespondRequest(_GuidedOperationRequest):
         )
         response_fields = (*turn_response_fields, *proposal_fields, self.component_action)
         if self.turn_token is None:
-            if self.control_signal != "exit_to_freeform" or any(value is not None for value in response_fields):
+            if (
+                self.control_signal != "exit_to_freeform"
+                or self.source_blob_id is not None
+                or any(value is not None for value in response_fields)
+            ):
                 raise ValueError("turn_token is required for live-turn actions")
             return self
         if self.component_action is not None:

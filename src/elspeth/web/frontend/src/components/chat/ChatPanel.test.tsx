@@ -17,6 +17,7 @@ import { GUIDED_EXPLAIN_MESSAGE } from "./guided/explainPrompt";
 import { useSessionStore } from "@/stores/sessionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useInlineSourceStore } from "@/stores/inlineSourceStore";
+import { useBlobStore } from "@/stores/blobStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
@@ -59,6 +60,34 @@ vi.mock("@/api/client", async (importOriginal) => {
     fetchSystemStatus: vi.fn(),
   };
 });
+
+const mockedChatInputUpload = vi.hoisted(() => ({
+  blob: null as BlobMetadata | null,
+  requests: [] as Array<{
+    requestId: string;
+    sessionId: string;
+    completion: Promise<BlobMetadata>;
+  }>,
+  completedRequestIds: [] as string[],
+  acceptedRequestIds: [] as string[],
+  settledRequestIds: [] as string[],
+  acceptedFailureRequestIds: [] as string[],
+  immediateRequestSeq: 0,
+}));
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve: (value: T) => void = () => undefined;
+  let reject: (reason?: unknown) => void = () => undefined;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 vi.mock("./MessageBubble", () => ({
   MessageBubble: ({
@@ -103,7 +132,14 @@ vi.mock("./ChatInput", () => ({
     disabled,
     maxLength,
     value,
+    onChange,
     readOnly,
+    onBlobUploaded,
+    onBlobUploadStarted,
+    onBlobUploadCompleted,
+    onBlobUploadRejected,
+    onBlobUploadSettled,
+    uploadDisabled,
   }: {
     placeholder?: string;
     onSend?: (content: string) => void;
@@ -111,21 +147,97 @@ vi.mock("./ChatInput", () => ({
     disabled?: boolean;
     maxLength?: number;
     value?: string;
+    onChange?: (value: string) => void;
     readOnly?: boolean;
+    onBlobUploaded?: (blob: BlobMetadata) => void;
+    onBlobUploadStarted?: (requestId: string, sessionId: string) => void;
+    onBlobUploadCompleted?: (
+      requestId: string,
+      sessionId: string,
+      blob: BlobMetadata,
+    ) => boolean;
+    onBlobUploadRejected?: (requestId: string, sessionId: string) => boolean;
+    onBlobUploadSettled?: (requestId: string, sessionId: string) => void;
+    uploadDisabled?: boolean;
   }) => (
-    <button
-      type="button"
-      data-testid="chat-input"
-      data-placeholder={placeholder ?? ""}
-      data-disabled={disabled ? "true" : "false"}
-      data-has-cancel={onCancel ? "true" : "false"}
-      data-max-length={maxLength ?? ""}
-      data-value={value ?? ""}
-      data-read-only={readOnly ? "true" : "false"}
-      onClick={() => onSend?.("test-chat-message")}
-    >
-      {placeholder ?? ""}
-    </button>
+    <>
+      <button
+        type="button"
+        data-testid="chat-input"
+        data-placeholder={placeholder ?? ""}
+        data-disabled={disabled ? "true" : "false"}
+        data-has-cancel={onCancel ? "true" : "false"}
+        data-max-length={maxLength ?? ""}
+        data-value={value ?? ""}
+        data-read-only={readOnly ? "true" : "false"}
+        onClick={() => onSend?.("test-chat-message")}
+      >
+        {placeholder ?? ""}
+      </button>
+      <button
+        type="button"
+        data-testid="chat-input-upload"
+        disabled={uploadDisabled}
+        onClick={() => {
+          const queuedRequest = mockedChatInputUpload.requests.shift();
+          if (queuedRequest !== undefined) {
+            onBlobUploadStarted?.(queuedRequest.requestId, queuedRequest.sessionId);
+            void queuedRequest.completion.then((blob) => {
+              useBlobStore.setState((state) => ({
+                blobs: [blob, ...state.blobs.filter((item) => item.id !== blob.id)],
+              }));
+              const accepted =
+                onBlobUploadCompleted?.(
+                  queuedRequest.requestId,
+                  queuedRequest.sessionId,
+                  blob,
+                ) ?? true;
+              if (accepted) {
+                mockedChatInputUpload.acceptedRequestIds.push(queuedRequest.requestId);
+                onBlobUploaded?.(blob);
+                onChange?.(
+                  `${value ?? ""}${value ? "\n" : ""}I've uploaded "${blob.filename}"; please use it as the pipeline input.`,
+                );
+              }
+              onBlobUploadSettled?.(queuedRequest.requestId, queuedRequest.sessionId);
+              mockedChatInputUpload.settledRequestIds.push(queuedRequest.requestId);
+              mockedChatInputUpload.completedRequestIds.push(queuedRequest.requestId);
+            }, () => {
+              const accepted =
+                onBlobUploadRejected?.(
+                  queuedRequest.requestId,
+                  queuedRequest.sessionId,
+                ) ?? true;
+              if (accepted) {
+                mockedChatInputUpload.acceptedFailureRequestIds.push(
+                  queuedRequest.requestId,
+                );
+              }
+              onBlobUploadSettled?.(queuedRequest.requestId, queuedRequest.sessionId);
+              mockedChatInputUpload.settledRequestIds.push(queuedRequest.requestId);
+            });
+            return;
+          }
+          if (mockedChatInputUpload.blob !== null) {
+            const blob = mockedChatInputUpload.blob;
+            const requestId = `immediate-${++mockedChatInputUpload.immediateRequestSeq}`;
+            onBlobUploadStarted?.(requestId, blob.session_id);
+            useBlobStore.setState((state) => ({
+              blobs: [
+                blob,
+                ...state.blobs.filter((item) => item.id !== blob.id),
+              ],
+            }));
+            const accepted =
+              onBlobUploadCompleted?.(requestId, blob.session_id, blob) ?? true;
+            if (accepted) onBlobUploaded?.(blob);
+            onBlobUploadSettled?.(requestId, blob.session_id);
+          }
+        }}
+      >
+        simulate upload
+      </button>
+    </>
   ),
 }));
 
@@ -142,6 +254,7 @@ describe("ChatPanel", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    resetStore(useBlobStore);
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
       retryMessage: vi.fn(),
@@ -408,11 +521,19 @@ describe("ChatPanel mode discriminator", () => {
     // Slice C: the verification-panel tests seed validationResult; reset the
     // execution store so a seeded result does not leak into sibling tests.
     resetStore(useExecutionStore);
+    resetStore(useBlobStore);
     // Post-boot: the backend wall clock has landed, so the compose-timeout
     // readiness gate is open and guided sends (sendGuidedChat →
     // runComposeWithTimeout) proceed. resetStore clears it to the fail-closed
     // false default; the per-test setState calls merge over this.
     useSessionStore.setState({ composeTimeoutReady: true });
+    mockedChatInputUpload.blob = null;
+    mockedChatInputUpload.requests = [];
+    mockedChatInputUpload.completedRequestIds = [];
+    mockedChatInputUpload.acceptedRequestIds = [];
+    mockedChatInputUpload.settledRequestIds = [];
+    mockedChatInputUpload.acceptedFailureRequestIds = [];
+    mockedChatInputUpload.immediateRequestSeq = 0;
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
       retryMessage: vi.fn(),
@@ -440,7 +561,7 @@ describe("ChatPanel mode discriminator", () => {
     };
   }
 
-  function singleSelectTurn(): TurnPayload {
+  function singleSelectTurn(turnToken = "a".repeat(64)): TurnPayload {
     const payload: SingleSelectPayload = {
       question: "Which source plugin should we use?",
       options: [
@@ -449,8 +570,540 @@ describe("ChatPanel mode discriminator", () => {
       ],
       allow_custom: false,
     };
-    return { type: "single_select", step_index: 0, turn_token: "a".repeat(64), payload };
+    return { type: "single_select", step_index: 0, turn_token: turnToken, payload };
   }
+
+  function uploadedSource(id: string, filename: string): BlobMetadata {
+    return {
+      id,
+      session_id: "session-guided",
+      filename,
+      mime_type: "text/csv",
+      size_bytes: 16,
+      content_hash: "f".repeat(64),
+      created_at: "2026-07-26T09:00:00Z",
+      created_by: "user",
+      source_description: null,
+      status: "ready",
+      creation_modality: "verbatim",
+      created_from_message_id: null,
+      creating_model_identifier: null,
+      creating_model_version: null,
+      creating_provider: null,
+      creating_composer_skill_hash: null,
+      creating_arguments_hash: null,
+    };
+  }
+
+  it("requires an explicit earlier-file choice when two uploads belong to one Step-1 turn", async () => {
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const earlierId = "00000000-0000-4000-8000-000000000801";
+    const newerId = "00000000-0000-4000-8000-000000000802";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn("a".repeat(64)),
+      respondGuided: respondGuidedSpy,
+    });
+    mockedChatInputUpload.blob = uploadedSource(earlierId, "earlier.csv");
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    mockedChatInputUpload.blob = uploadedSource(newerId, "newer.csv");
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+
+    const sourceChooser = screen.getByRole("combobox", { name: "Source file" });
+    expect(sourceChooser).toHaveValue("");
+    expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
+    fireEvent.change(sourceChooser, { target: { value: earlierId } });
+    expect(sourceChooser).toHaveValue(earlierId);
+    await act(async () => {
+      screen.getByRole("button", { name: "CSV" }).click();
+    });
+    expect(respondGuidedSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ chosen: ["csv"], source_blob_id: earlierId }),
+    );
+
+    act(() => {
+      useSessionStore.setState({
+        guidedNextTurn: singleSelectTurn("b".repeat(64)),
+      });
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "API" }).click();
+    });
+    expect(respondGuidedSpy.mock.calls[1][0]).not.toHaveProperty("source_blob_id");
+    expect(respondGuidedSpy.mock.calls[0][0].source_blob_id).toBe(earlierId);
+  });
+
+  it("distinguishes duplicate source filenames and submits the intended exact blob", async () => {
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const earlierId = "00000000-0000-4000-8000-000000000801";
+    const newerId = "00000000-0000-4000-8000-000000000802";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+      respondGuided: respondGuidedSpy,
+    });
+    mockedChatInputUpload.blob = uploadedSource(earlierId, "duplicate.csv");
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    mockedChatInputUpload.blob = uploadedSource(newerId, "duplicate.csv");
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+
+    const sourceChooser = screen.getByRole("combobox", { name: "Source file" });
+    const earlierOption = screen.getByRole("option", {
+      name: "duplicate.csv — 16 B — ID 00000801",
+    });
+    const newerOption = screen.getByRole("option", {
+      name: "duplicate.csv — 16 B — ID 00000802",
+    });
+    expect(earlierOption).toHaveValue(earlierId);
+    expect(newerOption).toHaveValue(newerId);
+
+    fireEvent.change(sourceChooser, { target: { value: earlierId } });
+    await act(async () => {
+      screen.getByRole("button", { name: "CSV" }).click();
+    });
+
+    expect(respondGuidedSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ chosen: ["csv"], source_blob_id: earlierId }),
+    );
+  });
+
+  it("requires a fresh explicit choice after the selected file stops being ready", async () => {
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const selectedId = "00000000-0000-4000-8000-000000000811";
+    const remainingId = "00000000-0000-4000-8000-000000000812";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+      respondGuided: respondGuidedSpy,
+    });
+    mockedChatInputUpload.blob = uploadedSource(selectedId, "selected.csv");
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    mockedChatInputUpload.blob = uploadedSource(remainingId, "remaining.csv");
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Source file" }), {
+      target: { value: selectedId },
+    });
+
+    act(() => {
+      useBlobStore.setState((state) => ({
+        blobs: state.blobs.map((blob) =>
+          blob.id === selectedId ? { ...blob, status: "pending" } : blob,
+        ),
+      }));
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "Source file" })).toHaveValue("");
+    });
+    expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Source file" }), {
+      target: { value: remainingId },
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "CSV" }).click();
+    });
+    expect(respondGuidedSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ source_blob_id: remainingId }),
+    );
+
+    act(() => {
+      useBlobStore.setState((state) => ({
+        blobs: state.blobs.filter((blob) => blob.id !== remainingId),
+      }));
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "API" })).toBeDisabled();
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "API" }).click();
+    });
+    expect(respondGuidedSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks a Step-1 plugin response while its source upload is pending", async () => {
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const upload = deferred<BlobMetadata>();
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+      respondGuided: respondGuidedSpy,
+    });
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-1",
+        sessionId: "session-guided",
+        completion: upload.promise,
+      },
+    ];
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+
+    expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
+    await act(async () => {
+      screen.getByRole("button", { name: "CSV" }).click();
+    });
+    expect(respondGuidedSpy).not.toHaveBeenCalled();
+  });
+
+  it("scopes a pending Step-1 upload gate to source-bound actions", async () => {
+    const pendingUpload = deferred<BlobMetadata>();
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const firstId = "00000000-0000-4000-8000-000000000821";
+    const secondId = "00000000-0000-4000-8000-000000000822";
+    const turn = singleSelectTurn();
+    if (turn.type !== "single_select") {
+      throw new Error("test fixture must be a single-select turn");
+    }
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: {
+        ...turn,
+        payload: { ...turn.payload, allow_custom: true },
+      },
+      respondGuided: respondGuidedSpy,
+      chatGuided: chatGuidedSpy,
+    });
+    mockedChatInputUpload.blob = uploadedSource(firstId, "first.csv");
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    mockedChatInputUpload.blob = uploadedSource(secondId, "second.csv");
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    mockedChatInputUpload.blob = null;
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-pending-scope",
+        sessionId: "session-guided",
+        completion: pendingUpload.promise,
+      },
+    ];
+    act(() => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+
+    expect(screen.getByTestId("chat-input-upload")).toBeDisabled();
+    expect(
+      screen.getByRole("combobox", { name: "Source file" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
+    expect(screen.getByTestId("chat-input")).toHaveAttribute(
+      "data-disabled",
+      "false",
+    );
+    const customInput = screen.getByRole("textbox", { name: /custom/i });
+    expect(customInput).toBeEnabled();
+    fireEvent.change(customInput, {
+      target: { value: "custom source while upload is pending" },
+    });
+    const submitCustom = screen.getByRole("button", { name: /submit custom/i });
+    expect(submitCustom).toBeEnabled();
+    await act(async () => {
+      submitCustom.click();
+    });
+    expect(respondGuidedSpy).toHaveBeenCalledOnce();
+    expect(respondGuidedSpy.mock.calls[0][0]).toEqual(
+      expect.objectContaining({
+        chosen: null,
+        custom_inputs: ["custom source while upload is pending"],
+      }),
+    );
+    expect(respondGuidedSpy.mock.calls[0][0]).not.toHaveProperty(
+      "source_blob_id",
+    );
+
+    await act(async () => {
+      screen.getByTestId("chat-input").click();
+    });
+    expect(chatGuidedSpy).toHaveBeenCalledWith(
+      "test-chat-message",
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("keeps Step-1 responses blocked until all concurrent uploads settle", async () => {
+    const first = deferred<BlobMetadata>();
+    const second = deferred<BlobMetadata>();
+    const firstBlob = uploadedSource(
+      "00000000-0000-4000-8000-000000000831",
+      "first.csv",
+    );
+    const secondBlob = uploadedSource(
+      "00000000-0000-4000-8000-000000000832",
+      "second.csv",
+    );
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+      respondGuided: vi.fn().mockResolvedValue(undefined),
+    });
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-1",
+        sessionId: "session-guided",
+        completion: first.promise,
+      },
+      {
+        requestId: "upload-2",
+        sessionId: "session-guided",
+        completion: second.promise,
+      },
+    ];
+
+    render(<ChatPanel />);
+    act(() => {
+      screen.getByTestId("chat-input-upload").click();
+      screen.getByTestId("chat-input-upload").click();
+    });
+    expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
+
+    await act(async () => {
+      first.resolve(firstBlob);
+      await first.promise;
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
+    });
+
+    await act(async () => {
+      second.resolve(secondBlob);
+      await second.promise;
+    });
+    const sourceChooser = await screen.findByRole("combobox", {
+      name: "Source file",
+    });
+    expect(sourceChooser).toHaveValue("");
+    expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
+  });
+
+  it("rejects a late upload completion after the guided turn changes", async () => {
+    const upload = deferred<BlobMetadata>();
+    const uploaded = uploadedSource(
+      "00000000-0000-4000-8000-000000000841",
+      "stale.csv",
+    );
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn("a".repeat(64)),
+      respondGuided: vi.fn().mockResolvedValue(undefined),
+    });
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-stale",
+        sessionId: "session-guided",
+        completion: upload.promise,
+      },
+    ];
+
+    render(<ChatPanel />);
+    act(() => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    act(() => {
+      useSessionStore.setState({
+        guidedNextTurn: singleSelectTurn("b".repeat(64)),
+      });
+    });
+    await act(async () => {
+      upload.resolve(uploaded);
+      await upload.promise;
+    });
+
+    await waitFor(() => {
+      expect(mockedChatInputUpload.completedRequestIds).toContain("upload-stale");
+    });
+    expect(mockedChatInputUpload.acceptedRequestIds).not.toContain("upload-stale");
+    expect(screen.getByTestId("chat-input")).toHaveAttribute("data-value", "");
+    expect(
+      screen.queryByRole("combobox", { name: "Source file" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "CSV" })).toBeEnabled();
+  });
+
+  it("rejects a late upload failure after the guided turn changes", async () => {
+    const upload = deferred<BlobMetadata>();
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn("a".repeat(64)),
+      respondGuided: vi.fn().mockResolvedValue(undefined),
+    });
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-fail-turn",
+        sessionId: "session-guided",
+        completion: upload.promise,
+      },
+    ];
+
+    render(<ChatPanel />);
+    act(() => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    act(() => {
+      useSessionStore.setState({
+        guidedNextTurn: singleSelectTurn("b".repeat(64)),
+      });
+    });
+    await act(async () => {
+      upload.reject(new Error("late upload failure"));
+    });
+
+    await waitFor(() => {
+      expect(mockedChatInputUpload.settledRequestIds).toContain(
+        "upload-fail-turn",
+      );
+    });
+    expect(mockedChatInputUpload.acceptedFailureRequestIds).not.toContain(
+      "upload-fail-turn",
+    );
+    expect(screen.getByRole("button", { name: "CSV" })).toBeEnabled();
+  });
+
+  it("rejects a late upload failure after the active session changes", async () => {
+    const upload = deferred<BlobMetadata>();
+    const otherSession = {
+      ...guidedSessionFixture,
+      id: "session-other",
+      title: "Other session",
+    };
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture, otherSession],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+      respondGuided: vi.fn().mockResolvedValue(undefined),
+    });
+    useBlobStore.getState().activateSession("session-guided");
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-fail-session",
+        sessionId: "session-guided",
+        completion: upload.promise,
+      },
+    ];
+
+    render(<ChatPanel />);
+    act(() => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    act(() => {
+      useBlobStore.getState().activateSession("session-other");
+      useSessionStore.setState({
+        activeSessionId: "session-other",
+        guidedSession: null,
+        guidedNextTurn: null,
+      });
+    });
+    await act(async () => {
+      upload.reject(new Error("late session upload failure"));
+    });
+
+    await waitFor(() => {
+      expect(mockedChatInputUpload.settledRequestIds).toContain(
+        "upload-fail-session",
+      );
+    });
+    expect(mockedChatInputUpload.acceptedFailureRequestIds).not.toContain(
+      "upload-fail-session",
+    );
+  });
+
+  it("rejects a late upload completion after an A-to-B-to-A activation cycle", async () => {
+    const upload = deferred<BlobMetadata>();
+    const uploaded = uploadedSource(
+      "00000000-0000-4000-8000-000000000851",
+      "stale-cycle.csv",
+    );
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+      respondGuided: vi.fn().mockResolvedValue(undefined),
+    });
+    useBlobStore.getState().activateSession("session-guided");
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-cycle",
+        sessionId: "session-guided",
+        completion: upload.promise,
+      },
+    ];
+
+    render(<ChatPanel />);
+    act(() => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    act(() => {
+      useBlobStore.getState().activateSession("session-other");
+      useBlobStore.getState().activateSession("session-guided");
+    });
+    await act(async () => {
+      upload.resolve(uploaded);
+      await upload.promise;
+    });
+
+    await waitFor(() => {
+      expect(mockedChatInputUpload.completedRequestIds).toContain("upload-cycle");
+    });
+    expect(mockedChatInputUpload.acceptedRequestIds).not.toContain("upload-cycle");
+    expect(
+      screen.queryByRole("combobox", { name: "Source file" }),
+    ).not.toBeInTheDocument();
+  });
 
   const proposalId = "00000000-0000-4000-8000-000000000701";
   const proposalHash = "f".repeat(64);

@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 
 import { useRef, useState, type RefObject } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatInput } from "./ChatInput";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -23,6 +23,7 @@ import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore
 import { resetStore } from "@/test/store-helpers";
 import { PREFILL_CHAT_INPUT_EVENT } from "@/components/catalog/PluginCard";
 import type { ChatMessage, CompositionState } from "@/types";
+import type { BlobMetadata } from "@/types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
@@ -292,6 +293,195 @@ describe("ChatInput composing cancel", () => {
     await user.click(screen.getByRole("button", { name: "Stop composing" }));
 
     expect(onCancel).toHaveBeenCalledOnce();
+  });
+});
+
+describe("ChatInput upload identity", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  it("reports the exact uploaded blob metadata to the owning guided turn", async () => {
+    const sessionId = "00000000-0000-4000-8000-000000000811";
+    const uploaded = {
+      id: "00000000-0000-4000-8000-000000000812",
+      session_id: sessionId,
+      filename: "intended.csv",
+      mime_type: "text/csv",
+      size_bytes: 12,
+      content_hash: "f".repeat(64),
+      created_at: "2026-07-26T09:00:00Z",
+      created_by: "user" as const,
+      source_description: null,
+      status: "ready" as const,
+      creation_modality: "verbatim" as const,
+      created_from_message_id: null,
+      creating_model_identifier: null,
+      creating_model_version: null,
+      creating_provider: null,
+      creating_composer_skill_hash: null,
+      creating_arguments_hash: null,
+    };
+    useSessionStore.setState({ activeSessionId: sessionId });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockResolvedValue(uploaded) });
+    const onBlobUploaded = vi.fn();
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+        onBlobUploaded={onBlobUploaded}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+
+    await userEvent.upload(fileInput!, new File(["id\n1\n"], "intended.csv", { type: "text/csv" }));
+
+    await waitFor(() => expect(onBlobUploaded).toHaveBeenCalledWith(uploaded));
+  });
+
+  it("does not publish or append a completion rejected by its owner fence", async () => {
+    let resolveUpload: (blob: BlobMetadata) => void = () => undefined;
+    const uploadPromise = new Promise<BlobMetadata>((resolve) => {
+      resolveUpload = resolve;
+    });
+    const sessionId = "00000000-0000-4000-8000-000000000821";
+    const uploaded: BlobMetadata = {
+      id: "00000000-0000-4000-8000-000000000822",
+      session_id: sessionId,
+      filename: "stale.csv",
+      mime_type: "text/csv",
+      size_bytes: 12,
+      content_hash: "f".repeat(64),
+      created_at: "2026-07-26T09:00:00Z",
+      created_by: "user",
+      source_description: null,
+      status: "ready",
+      creation_modality: "verbatim",
+      created_from_message_id: null,
+      creating_model_identifier: null,
+      creating_model_version: null,
+      creating_provider: null,
+      creating_composer_skill_hash: null,
+      creating_arguments_hash: null,
+    };
+    const onBlobUploaded = vi.fn();
+    const onBlobUploadStarted = vi.fn();
+    const onBlobUploadCompleted = vi.fn().mockReturnValue(false);
+    const onBlobUploadSettled = vi.fn();
+    useSessionStore.setState({ activeSessionId: sessionId });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockReturnValue(uploadPromise) });
+
+    function ControlledUploadHarness() {
+      const [value, setValue] = useState("");
+      return (
+        <ChatInput
+          onSend={vi.fn()}
+          disabled={false}
+          inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+          value={value}
+          onChange={setValue}
+          onBlobUploaded={onBlobUploaded}
+          onBlobUploadStarted={onBlobUploadStarted}
+          onBlobUploadCompleted={onBlobUploadCompleted}
+          onBlobUploadSettled={onBlobUploadSettled}
+        />
+      );
+    }
+
+    render(<ControlledUploadHarness />);
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "stale.csv", { type: "text/csv" }),
+    );
+    expect(onBlobUploadStarted).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      resolveUpload(uploaded);
+      await uploadPromise;
+    });
+    await waitFor(() => expect(onBlobUploadSettled).toHaveBeenCalledOnce());
+
+    expect(onBlobUploadCompleted).toHaveBeenCalledOnce();
+    expect(onBlobUploaded).not.toHaveBeenCalled();
+    expect(screen.getByLabelText(/message input/i)).toHaveValue("");
+  });
+
+  it("does not show a late upload failure rejected by its owner fence", async () => {
+    let rejectUpload: (reason?: unknown) => void = () => undefined;
+    const uploadPromise = new Promise<BlobMetadata>((_resolve, reject) => {
+      rejectUpload = reject;
+    });
+    const sessionId = "00000000-0000-4000-8000-000000000831";
+    const onBlobUploadRejected = vi.fn().mockReturnValue(false);
+    const onBlobUploadSettled = vi.fn();
+    useSessionStore.setState({ activeSessionId: sessionId });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockReturnValue(uploadPromise) });
+
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+        onBlobUploadRejected={onBlobUploadRejected}
+        onBlobUploadSettled={onBlobUploadSettled}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "stale.csv", { type: "text/csv" }),
+    );
+
+    await act(async () => {
+      rejectUpload(new Error("late upload failure"));
+    });
+    await waitFor(() => expect(onBlobUploadSettled).toHaveBeenCalledOnce());
+
+    expect(onBlobUploadRejected).toHaveBeenCalledOnce();
+    expect(
+      screen.queryByText("Upload failed. Check the file manager for details."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows a current upload failure accepted by its owner fence", async () => {
+    const uploadError = new Error("current upload failure");
+    const onBlobUploadRejected = vi.fn().mockReturnValue(true);
+    const onBlobUploadSettled = vi.fn();
+    useSessionStore.setState({ activeSessionId: "session-current" });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockRejectedValue(uploadError) });
+
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+        onBlobUploadRejected={onBlobUploadRejected}
+        onBlobUploadSettled={onBlobUploadSettled}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "current.csv", { type: "text/csv" }),
+    );
+
+    await waitFor(() => expect(onBlobUploadSettled).toHaveBeenCalledOnce());
+    expect(onBlobUploadRejected).toHaveBeenCalledOnce();
+    expect(
+      screen.getByText("Upload failed. Check the file manager for details."),
+    ).toBeInTheDocument();
   });
 });
 

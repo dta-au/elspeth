@@ -198,6 +198,13 @@ export interface GuidedComponentTarget {
   stable_id: string;
 }
 
+/** Ready upload identity displayed while selecting a Step-1 source plugin. */
+export interface GuidedSourceBlobCandidate {
+  id: string;
+  filename: string;
+  sizeBytes: number;
+}
+
 export type GuidedComponentAction =
   | { action: "add"; component_kind: GuidedComponentKind }
   | { action: "edit"; target: GuidedComponentTarget }
@@ -213,6 +220,8 @@ export type GuidedComponentAction =
 export type GuidedRespondAction =
   | (UnboundProposalFields & {
       chosen: NonEmptyStringArray;
+      /** Exact ready upload selected for a Step-1 source-plugin turn. */
+      source_blob_id?: string;
       edited_values: null;
       custom_inputs: null;
       control_signal: null;
