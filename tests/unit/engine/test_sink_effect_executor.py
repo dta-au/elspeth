@@ -156,6 +156,47 @@ class _PrepareFailsOnceSink(_CumulativeObservableSink):
         return super().prepare_effect(request, ctx)
 
 
+class _PrecomputedDivertingSink(_CumulativeObservableSink):
+    """Remote-object shape: diversion is fixed durably when the plan binds."""
+
+    def prepare_effect(
+        self,
+        request: SinkEffectPrepareRequest,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectPlan:
+        plan = super().prepare_effect(request, ctx)
+        return SinkEffectPlan(
+            effect_id=plan.effect_id,
+            protocol_version=plan.protocol_version,
+            input_kind=plan.input_kind,
+            descriptor_mode=plan.descriptor_mode,
+            inspection_mode=plan.inspection_mode,
+            target=plan.target,
+            plan_hash=plan.plan_hash,
+            payload_hash=plan.payload_hash,
+            expected_descriptor=plan.expected_descriptor,
+            safe_evidence={
+                **dict(plan.safe_evidence),
+                "accepted_ordinals": [0],
+                "diverted_ordinals": [1],
+            },
+        )
+
+    def commit_effect(self, plan: SinkEffectPlan, ctx: RestrictedSinkEffectContext) -> SinkEffectCommitResult:
+        del ctx
+        self.commit_calls += 1
+        assert plan.expected_descriptor is not None
+        self._target.effect_id = plan.effect_id
+        self._target.descriptor = plan.expected_descriptor
+        self._target.published_rows.append([self._rows_by_effect[plan.effect_id][0]])
+        return SinkEffectCommitResult(
+            descriptor=plan.expected_descriptor,
+            evidence={"effect_id": plan.effect_id},
+            accepted_ordinals=(0,),
+            diverted_ordinals=(1,),
+        )
+
+
 class _ResultDerivedReconciledSink(_CumulativeObservableSink):
     def prepare_effect(
         self,
@@ -620,6 +661,39 @@ def test_same_generation_retry_closes_abandoned_commit_intent_before_new_call() 
         # Generation 1 is consumed by the preparation claim; the execution
         # lease (and thus both commit attempts) run at generation 2.
         assert [(row.generation, row.state) for row in commits] == [(2, "response_lost"), (2, "returned")]
+        assert target.published_rows == [[{"ordinal": 0}]]
+    finally:
+        db.close()
+
+
+def test_precomputed_response_loss_reconciles_with_durable_diversion_partition() -> None:
+    """A remote write is finalized once from its prepared partition after response loss."""
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 2)
+        target = _CumulativeTarget()
+        sink = _PrecomputedDivertingSink(target)
+        request = _execution_request(run_id, sink_id, members)
+
+        def lose_response_after_publication(seam: SinkEffectExecutionSeam) -> None:
+            if seam is SinkEffectExecutionSeam.AFTER_EFFECT_BEFORE_RETURN:
+                raise SinkEffectInjectedFault(seam)
+
+        with pytest.raises(SinkEffectInjectedFault):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="worker-a",
+                fault_hook=lose_response_after_publication,
+            ).execute(request, sink)
+
+        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(request, sink)
+
+        assert result.effect.state.value == "finalized"
+        assert len(result.state_ids) == 1
+        assert len(result.outcome_ids) == 1
+        assert sink.commit_calls == 1
+        assert sink.reconcile_calls == 2
         assert target.published_rows == [[{"ordinal": 0}]]
     finally:
         db.close()
