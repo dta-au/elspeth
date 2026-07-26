@@ -7,15 +7,17 @@ only immutable records/fences, never SQLAlchemy engines or connections.
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, final
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, Connection, Engine, Row, and_, delete, insert, select, update
+from sqlalchemy import ColumnElement, Connection, Engine, Row, Table, and_, delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.sql import visitors
 from sqlalchemy.sql.dml import Delete, Insert, Update
+from sqlalchemy.sql.elements import BindParameter, ColumnClause, TextClause
 from sqlalchemy.sql.selectable import Select
 
 from elspeth.web.coordination.contracts import (
@@ -25,6 +27,7 @@ from elspeth.web.coordination.contracts import (
     SessionOperationKind,
 )
 from elspeth.web.sessions.models import (
+    metadata,
     session_operation_fences_table,
     sessions_table,
     web_instances_table,
@@ -41,6 +44,24 @@ if TYPE_CHECKING:
     from elspeth.contracts.auth import AuthProviderType
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
+
+_PROTECTED_MUTATION_TABLE_NAMES = frozenset(
+    {
+        "audit_access_log",
+        "rate_limit_buckets",
+        "rate_limit_events",
+        "run_start_permits",
+        "schema_identity",
+        "session_operation_fences",
+        "sessions_cleanup_claims",
+        "web_instances",
+    }
+)
+_CANONICAL_SESSION_TABLES: dict[tuple[str | None, str], Table] = {
+    (table.schema, table.name): table
+    for table in metadata.tables.values()
+    if (table is sessions_table or "session_id" in table.c) and table.name not in _PROTECTED_MUTATION_TABLE_NAMES
+}
 
 
 def _new_session_id() -> UUID:
@@ -86,12 +107,13 @@ def _validate_kind(operation_kind: SessionOperationKind) -> None:
 
 @final
 class _RepositoryMutationTransaction:
-    """Short-lived, statement-bounded facade over one private connection."""
+    """Short-lived, session-bound facade over one private connection."""
 
-    __slots__ = ("__active", "__connection")
+    __slots__ = ("__active", "__connection", "__session_id")
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(self, connection: Connection, *, session_id: str) -> None:
         self.__connection = connection
+        self.__session_id = session_id
         self.__active = True
 
     def execute(self, statement: object) -> SessionOperationMutationResult:
@@ -99,17 +121,92 @@ class _RepositoryMutationTransaction:
             raise RuntimeError("session operation mutation transaction is closed")
         if not isinstance(statement, (Select, Insert, Update, Delete)):
             raise TypeError("fenced mutation accepts only Select, Insert, Update, or Delete statements")
-        if isinstance(statement, (Insert, Update, Delete)) and any(
-            statement.table is table for table in (session_operation_fences_table, web_instances_table)
-        ):
-            raise ValueError("fenced mutation callbacks cannot write authority tables")
-        if isinstance(statement, Delete) and statement.table is sessions_table:
-            raise ValueError("physical session deletion requires archive_delete")
-        result = self.__connection.execute(statement)
+        normalized = self._normalize_select(statement) if isinstance(statement, Select) else self._normalize_dml(statement)
+        result = self.__connection.execute(normalized)
         rows: tuple[dict[str, Any], ...] = ()
         if result.returns_rows:
             rows = tuple({str(key): value for key, value in row._mapping.items()} for row in result.fetchall())
         return SessionOperationMutationResult(rowcount=result.rowcount, rows=rows)
+
+    @staticmethod
+    def _target_identity(target: object) -> tuple[str | None, str]:
+        name = getattr(target, "name", None)
+        schema = getattr(target, "schema", None)
+        if not isinstance(name, str) or (schema is not None and not isinstance(schema, str)):
+            raise ValueError("fenced mutations require one named canonical table target")
+        return schema, name
+
+    def _canonical_session_table(self, target: object, *, operation: str) -> Table:
+        identity = self._target_identity(target)
+        _, name = identity
+        if name in _PROTECTED_MUTATION_TABLE_NAMES:
+            raise ValueError("fenced mutation callbacks cannot access protected authority tables or global state")
+        if operation == "insert" and name == sessions_table.name:
+            raise ValueError("session creation requires create_session_with_initial_fence")
+        if operation == "delete" and name == sessions_table.name:
+            raise ValueError("physical session deletion requires archive_delete")
+        canonical = _CANONICAL_SESSION_TABLES.get(identity)
+        if canonical is None:
+            raise ValueError("fenced mutations require a directly session-scoped canonical table")
+        if target is not canonical:
+            raise ValueError("fenced mutations reject reflected, cloned, aliased, or lightweight table targets")
+        return canonical
+
+    @staticmethod
+    def _validate_statement_references(statement: Select[Any] | Insert | Update | Delete, *, target: Table) -> None:
+        if any(getattr(statement, attribute, ()) for attribute in ("_prefixes", "_suffixes", "_hints", "_statement_hints")):
+            raise ValueError("fenced mutations reject raw SQL prefixes, suffixes, and hints")
+        for element in visitors.iterate(statement):
+            if isinstance(element, (Select, Insert, Update, Delete)) and element is not statement:
+                raise ValueError("fenced mutations reject every nested query or data-modification statement")
+            if isinstance(element, TextClause):
+                raise ValueError("fenced mutations reject raw SQL fragments")
+            if isinstance(element, ColumnClause):
+                if element.is_literal or element.table is None:
+                    raise ValueError("fenced mutations require canonical target columns")
+                if element.table is not target:
+                    raise ValueError("fenced mutations reject columns outside the canonical target")
+            if getattr(element, "__visit_name__", None) != "table":
+                continue
+            identity = _RepositoryMutationTransaction._target_identity(element)
+            if identity[1] in _PROTECTED_MUTATION_TABLE_NAMES:
+                raise ValueError("fenced mutations reject protected nested table references")
+            if element is not target:
+                raise ValueError("fenced mutations require every table reference to use the canonical target")
+
+    def _scope_predicate(self, target: Table) -> ColumnElement[bool]:
+        column = target.c.id if target is sessions_table else target.c.session_id
+        return column == self.__session_id
+
+    def _normalize_select(self, statement: Select[Any]) -> Select[Any]:
+        froms = statement.get_final_froms()
+        if len(froms) != 1:
+            raise ValueError("fenced selects require exactly one session-scoped table")
+        target = self._canonical_session_table(froms[0], operation="select")
+        self._validate_statement_references(statement, target=target)
+        return statement.where(self._scope_predicate(target))
+
+    def _normalize_dml(self, statement: Insert | Update | Delete) -> Insert | Update | Delete:
+        operation = "insert" if isinstance(statement, Insert) else "update" if isinstance(statement, Update) else "delete"
+        target = self._canonical_session_table(statement.table, operation=operation)
+        self._validate_statement_references(statement, target=target)
+        if isinstance(statement, Insert):
+            return self._normalize_insert(statement, target=target)
+        return statement.where(self._scope_predicate(target))
+
+    def _normalize_insert(self, statement: Insert, *, target: Table) -> Insert:
+        if statement.select is not None or statement._multi_values:
+            raise ValueError("fenced inserts support one values row only")
+        values = statement._values
+        if values is not None and not isinstance(values, Mapping):
+            raise ValueError("fenced inserts require one explicit values mapping")
+        for key, value in (values or {}).items():
+            key_name = key if isinstance(key, str) else getattr(key, "name", None)
+            if key_name != "session_id":
+                continue
+            if not isinstance(value, BindParameter) or value.value != self.__session_id:
+                raise ValueError("fenced insert session_id does not match the active fence")
+        return statement.values({target.c.session_id: self.__session_id})
 
     def _close(self) -> None:
         self.__active = False
@@ -398,7 +495,7 @@ class _SessionOperationAuthorityRepository:
         with self._locked_transaction(fence.session_id) as conn:
             database_now = self._database_now(conn)
             self._compare_and_swap_on_connection(conn, fence, database_now=database_now)
-            transaction = _RepositoryMutationTransaction(conn)
+            transaction = _RepositoryMutationTransaction(conn, session_id=fence.session_id)
             try:
                 return mutation(transaction)
             finally:

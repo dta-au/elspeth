@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Engine, insert, select, update
+from sqlalchemy import Engine, MetaData, Table, column, delete, insert, literal, select, table, update
 
 from elspeth.web.coordination.contracts import (
     FenceLossReason,
@@ -17,7 +17,13 @@ from elspeth.web.coordination.contracts import (
 )
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import session_operation_fences_table, sessions_table, web_instances_table
+from elspeth.web.sessions.models import (
+    blob_deletion_cleanups_table,
+    chat_messages_table,
+    session_operation_fences_table,
+    sessions_table,
+    web_instances_table,
+)
 from elspeth.web.sessions.schema import initialize_session_schema
 
 pytestmark = pytest.mark.testcontainer
@@ -271,3 +277,299 @@ def test_postgres_archive_delete_is_atomic_update_only_no_registry(postgres_engi
     with pytest.raises(SessionOperationFenceLost) as exc_info:
         repository.archive_delete(fence)
     assert exc_info.value.reason is FenceLossReason.MISSING
+
+
+def _postgres_snapshot_mutation_scope(
+    engine: Engine,
+    *,
+    session_ids: tuple[str, ...],
+    message_ids: tuple[str, ...],
+    cleanup_ids: tuple[str, ...] = (),
+) -> dict[str, tuple[dict, ...]]:
+    with engine.connect() as conn:
+        sessions = tuple(
+            dict(row._mapping)
+            for row in conn.execute(select(sessions_table).where(sessions_table.c.id.in_(session_ids)).order_by(sessions_table.c.id))
+        )
+        fences = tuple(
+            dict(row._mapping)
+            for row in conn.execute(
+                select(session_operation_fences_table)
+                .where(session_operation_fences_table.c.session_id.in_(session_ids))
+                .order_by(session_operation_fences_table.c.session_id)
+            )
+        )
+        messages = tuple(
+            dict(row._mapping)
+            for row in conn.execute(
+                select(chat_messages_table).where(chat_messages_table.c.id.in_(message_ids)).order_by(chat_messages_table.c.id)
+            )
+        )
+        cleanups = tuple(
+            dict(row._mapping)
+            for row in conn.execute(
+                select(blob_deletion_cleanups_table)
+                .where(blob_deletion_cleanups_table.c.blob_id.in_(cleanup_ids))
+                .order_by(blob_deletion_cleanups_table.c.blob_id)
+            )
+        )
+    return {"sessions": sessions, "fences": fences, "messages": messages, "cleanups": cleanups}
+
+
+def _postgres_message_values(*, message_id: str, session_id: str | None = None) -> dict[str, object]:
+    values: dict[str, object] = {
+        "id": message_id,
+        "role": "user",
+        "content": "scoped message",
+        "sequence_no": 1,
+        "writer_principal": "route_user_message",
+        "created_at": datetime.now(UTC),
+    }
+    if session_id is not None:
+        values["session_id"] = session_id
+    return values
+
+
+def _postgres_cleanup_values(*, cleanup_id: str, session_id: str | None = None) -> dict[str, object]:
+    values: dict[str, object] = {
+        "blob_id": cleanup_id,
+        "storage_path": f"{cleanup_id}.blob",
+        "created_at": datetime.now(UTC),
+    }
+    if session_id is not None:
+        values["session_id"] = session_id
+    return values
+
+
+def test_postgres_fenced_mutation_auto_scopes_update_delete_and_select(postgres_engine: Engine) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    session_a = _create(repository, owner=f"creator-{uuid4()}")
+    session_b = _create(repository, owner=f"creator-{uuid4()}")
+    cleanup_b = str(uuid4())
+    with postgres_engine.begin() as conn:
+        conn.execute(
+            insert(blob_deletion_cleanups_table).values(**_postgres_cleanup_values(cleanup_id=cleanup_b, session_id=str(session_b.id)))
+        )
+    fence = repository.acquire(
+        session_id=session_a.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=f"composer-{uuid4()}",
+        lease_seconds=30,
+    )
+    session_ids = (str(session_a.id), str(session_b.id))
+    before = _postgres_snapshot_mutation_scope(
+        postgres_engine,
+        session_ids=session_ids,
+        message_ids=(),
+        cleanup_ids=(cleanup_b,),
+    )
+
+    def attempt_cross_session_access(transaction):
+        changed = transaction.execute(
+            update(sessions_table).where(sessions_table.c.id == str(session_b.id)).values(title="cross-session update")
+        )
+        removed = transaction.execute(delete(blob_deletion_cleanups_table).where(blob_deletion_cleanups_table.c.blob_id == cleanup_b))
+        visible = transaction.execute(select(sessions_table.c.id).order_by(sessions_table.c.id))
+        return changed, removed, visible
+
+    changed, removed, visible = repository.mutate(fence, attempt_cross_session_access)
+
+    assert changed.rowcount == 0
+    assert removed.rowcount == 0
+    assert [row["id"] for row in visible.rows] == [str(session_a.id)]
+    assert (
+        _postgres_snapshot_mutation_scope(
+            postgres_engine,
+            session_ids=session_ids,
+            message_ids=(),
+            cleanup_ids=(cleanup_b,),
+        )
+        == before
+    )
+
+
+def test_postgres_fenced_mutation_supports_same_session_crud(postgres_engine: Engine) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    fence = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=f"composer-{uuid4()}",
+        lease_seconds=30,
+    )
+    cleanup_id = str(uuid4())
+
+    def same_session_crud(transaction):
+        changed = transaction.execute(update(sessions_table).values(title="same-session update"))
+        inserted = transaction.execute(insert(blob_deletion_cleanups_table).values(**_postgres_cleanup_values(cleanup_id=cleanup_id)))
+        visible = transaction.execute(select(blob_deletion_cleanups_table.c.blob_id, blob_deletion_cleanups_table.c.session_id))
+        removed = transaction.execute(delete(blob_deletion_cleanups_table).where(blob_deletion_cleanups_table.c.blob_id == cleanup_id))
+        return changed, inserted, visible, removed
+
+    changed, inserted, visible, removed = repository.mutate(fence, same_session_crud)
+
+    assert changed.rowcount == 1
+    assert inserted.rowcount in {-1, 1}
+    assert visible.rows == ({"blob_id": cleanup_id, "session_id": str(created.id)},)
+    assert removed.rowcount == 1
+    with postgres_engine.connect() as conn:
+        assert conn.execute(select(sessions_table.c.title).where(sessions_table.c.id == str(created.id))).scalar_one() == (
+            "same-session update"
+        )
+        assert (
+            conn.execute(select(blob_deletion_cleanups_table.c.blob_id).where(blob_deletion_cleanups_table.c.blob_id == cleanup_id)).first()
+            is None
+        )
+
+
+@pytest.mark.parametrize(
+    "attack_kind",
+    (
+        "caller_selected_parent_insert",
+        "lightweight_parent_delete",
+        "lightweight_fence_update",
+        "reflected_fence_update",
+        "reflected_sessions_update",
+        "mismatched_child_insert",
+        "multirow_child_insert",
+        "from_select_child_insert",
+        "lightweight_rate_update",
+        "reflected_cleanup_delete",
+        "protected_unscoped_select",
+        "nested_protected_select",
+        "nested_same_table_select",
+        "nested_same_table_dml",
+        "same_table_exists_dml",
+        "raw_select_prefix",
+    ),
+)
+def test_postgres_fenced_mutation_refuses_unsafe_statement_and_rolls_back(
+    postgres_engine: Engine,
+    attack_kind: str,
+) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    session_a = _create(repository, owner=f"creator-{uuid4()}")
+    session_b = _create(repository, owner=f"creator-{uuid4()}")
+    selected_parent_id = str(uuid4())
+    selected_message_id = str(uuid4())
+    second_selected_message_id = str(uuid4())
+    fence = repository.acquire(
+        session_id=session_a.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=f"composer-{uuid4()}",
+        lease_seconds=30,
+    )
+    session_ids = (str(session_a.id), str(session_b.id), selected_parent_id)
+    selected_message_ids = (selected_message_id, second_selected_message_id)
+    before = _postgres_snapshot_mutation_scope(
+        postgres_engine,
+        session_ids=session_ids,
+        message_ids=selected_message_ids,
+    )
+
+    if attack_kind == "caller_selected_parent_insert":
+        statement = insert(sessions_table).values(
+            id=selected_parent_id,
+            user_id="attacker",
+            auth_provider_type="local",
+            title="caller selected",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    elif attack_kind == "lightweight_parent_delete":
+        lightweight_sessions = table("sessions", column("id"))
+        statement = delete(lightweight_sessions).where(lightweight_sessions.c.id == str(session_a.id))
+    elif attack_kind == "lightweight_fence_update":
+        lightweight_fences = table("session_operation_fences", column("session_id"), column("lease_token"))
+        statement = (
+            update(lightweight_fences)
+            .where(lightweight_fences.c.session_id == str(session_a.id))
+            .values(lease_token="forged-lightweight-token")
+        )
+    elif attack_kind == "reflected_fence_update":
+        reflected_fences = Table("session_operation_fences", MetaData(), autoload_with=postgres_engine)
+        statement = (
+            update(reflected_fences)
+            .where(reflected_fences.c.session_id == str(session_a.id))
+            .values(operation_epoch=fence.operation_epoch + 100)
+        )
+    elif attack_kind == "reflected_sessions_update":
+        reflected_sessions = Table("sessions", MetaData(), autoload_with=postgres_engine)
+        statement = (
+            update(reflected_sessions).where(reflected_sessions.c.id == str(session_b.id)).values(title="reflected cross-session update")
+        )
+    elif attack_kind == "mismatched_child_insert":
+        statement = insert(chat_messages_table).values(
+            **_postgres_message_values(message_id=selected_message_id, session_id=str(session_b.id))
+        )
+    elif attack_kind == "multirow_child_insert":
+        statement = insert(chat_messages_table).values(
+            [
+                _postgres_message_values(message_id=selected_message_id, session_id=str(session_b.id)),
+                _postgres_message_values(message_id=second_selected_message_id, session_id=str(session_b.id)),
+            ]
+        )
+    elif attack_kind == "from_select_child_insert":
+        statement = insert(chat_messages_table).from_select(
+            ("id", "session_id", "role", "content", "sequence_no", "writer_principal", "created_at"),
+            select(
+                literal(selected_message_id),
+                literal(str(session_b.id)),
+                literal("user"),
+                literal("from-select"),
+                literal(1),
+                literal("route_user_message"),
+                literal(datetime.now(UTC)),
+            ).where(literal(False)),
+        )
+    elif attack_kind == "lightweight_rate_update":
+        lightweight_rate = table("rate_limit_buckets", column("subject_digest"))
+        statement = update(lightweight_rate).where(lightweight_rate.c.subject_digest == "missing").values(subject_digest="forged-rate-key")
+    elif attack_kind == "reflected_cleanup_delete":
+        reflected_cleanup = Table("sessions_cleanup_claims", MetaData(), autoload_with=postgres_engine)
+        statement = delete(reflected_cleanup)
+    elif attack_kind == "protected_unscoped_select":
+        statement = select(session_operation_fences_table)
+    elif attack_kind == "nested_protected_select":
+        statement = select(
+            sessions_table.c.id,
+            select(session_operation_fences_table.c.operation_id).limit(1).scalar_subquery(),
+        )
+    elif attack_kind == "nested_same_table_select":
+        statement = select(
+            sessions_table.c.id,
+            select(sessions_table.c.title).order_by(sessions_table.c.id).limit(1).scalar_subquery(),
+        )
+    elif attack_kind == "nested_same_table_dml":
+        statement = update(sessions_table).values(
+            title=select(sessions_table.c.title).where(sessions_table.c.id == str(session_b.id)).limit(1).scalar_subquery()
+        )
+    elif attack_kind == "same_table_exists_dml":
+        statement = (
+            update(sessions_table)
+            .where(select(sessions_table.c.id).where(sessions_table.c.id == str(session_b.id)).exists())
+            .values(title="cross-session exists")
+        )
+    else:
+        statement = select(sessions_table.c.id).prefix_with("ALL")
+
+    refused = False
+
+    def mutate_then_attack(transaction) -> None:
+        transaction.execute(update(sessions_table).values(title="must roll back"))
+        transaction.execute(statement)
+
+    try:
+        repository.mutate(fence, mutate_then_attack)
+    except ValueError:
+        refused = True
+
+    assert (
+        _postgres_snapshot_mutation_scope(
+            postgres_engine,
+            session_ids=session_ids,
+            message_ids=selected_message_ids,
+        )
+        == before
+    )
+    assert refused is True

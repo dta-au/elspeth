@@ -2225,11 +2225,13 @@ class SessionOperationMutationResult:
 
 @runtime_checkable
 class SessionOperationMutationTransaction(Protocol):
-    """Bounded statement executor backed by one private authority transaction.
+    """Session-bound statement executor backed by one private transaction.
 
-    Implementations accept SQLAlchemy Select/Insert/Update/Delete statements
-    only, detach all returned rows, and expose no connection, commit, rollback,
-    raw-SQL, or transaction-control surface.
+    Implementations accept normalized SQLAlchemy Select/Insert/Update/Delete
+    statements over canonical, directly session-scoped tables only. They bind
+    every read/write to the active fence's session, detach all returned rows,
+    and expose no connection, commit, rollback, raw-SQL, or transaction-control
+    surface.
     """
 
     def execute(self, statement: object) -> SessionOperationMutationResult: ...
