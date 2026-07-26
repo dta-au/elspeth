@@ -458,6 +458,37 @@ def test_register_verified_candidate_registers_without_content_store_reads() -> 
         db.close()
 
 
+def test_register_verified_candidate_rejects_replaced_carrier() -> None:
+    db = LandscapeDB.in_memory()
+    store = _MemoryContentStore()
+    resolver = AuditExportContentStoreResolver()
+    resolver.register(store)
+    repository = _repository()
+    try:
+        _insert_terminal_run(db)
+        verified = repository.verify_candidate(
+            _candidate(store),
+            content_store_resolver=resolver,
+            limits=AuditExportSnapshotReadLimits(),
+            signed_manifest_verifier=lambda _content, _descriptor: None,
+        )
+        forged_candidate = _forge_chunk_seal(store, verified.candidate)
+        forged_carriers = (
+            replace(verified, candidate=forged_candidate),
+            VerifiedAuditExportCandidate(candidate=forged_candidate, _proof=verified._proof),
+        )
+
+        for forged in forged_carriers:
+            with pytest.raises(TypeError, match="from verify_candidate"), db.engine.begin() as connection:
+                repository.register_verified_candidate(connection, forged)
+
+        with db.engine.connect() as connection:
+            assert connection.scalar(select(func.count()).select_from(audit_export_snapshots_table)) == 0
+            assert connection.scalar(select(func.count()).select_from(audit_export_snapshot_chunks_table)) == 0
+    finally:
+        db.close()
+
+
 def test_registration_rejects_forged_graph_before_registry_insert() -> None:
     db = LandscapeDB.in_memory()
     store = _MemoryContentStore()
