@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -20,6 +21,7 @@ from elspeth.contracts.composer_audit import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json as primitive_canonical_json
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
@@ -35,6 +37,21 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.protocol import AuthoritativePipelineProposal
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _reject_duplicate_json_object_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    restored: dict[str, object] = {}
+    for key, value in pairs:
+        if key in restored:
+            raise AuditIntegrityError(f"persisted pipeline dispatch canonical payload has duplicate JSON object key {key!r}")
+        restored[key] = value
+    return restored
+
+
+def _validate_exact_canonical_json(payload: str) -> None:
+    restored = json.loads(payload, object_pairs_hook=_reject_duplicate_json_object_keys)
+    if primitive_canonical_json(restored) != payload:
+        raise AuditIntegrityError("persisted pipeline dispatch canonical payload is not the exact canonical representation")
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,8 +108,10 @@ class PipelineDispatchAuditBinding:
         if type(raw_status) is not str or type(tool_call_id) is not str or type(tool_name) is not str:
             raise AuditIntegrityError("persisted pipeline dispatch scalar fields are malformed")
         try:
-            arguments_hash = stable_hash(json.loads(arguments_canonical))
-            result_hash = stable_hash(json.loads(result_canonical))
+            _validate_exact_canonical_json(arguments_canonical)
+            _validate_exact_canonical_json(result_canonical)
+            arguments_hash = hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest()
+            result_hash = hashlib.sha256(result_canonical.encode("utf-8")).hexdigest()
             status = ComposerToolStatus(raw_status)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AuditIntegrityError("persisted pipeline dispatch payload is malformed") from exc
@@ -307,7 +326,8 @@ async def prepare_pipeline_proposal_commit(
         composer_provider=authority.row.composer_provider,
         composer_skill_hash=authority.row.composer_skill_hash,
         tool_arguments_hash=authority.row.tool_arguments_hash,
-        reviewed_source_authority=resolve_reviewed_source_authority(
+        reviewed_source_authority=await bounded(
+            resolve_reviewed_source_authority,
             engine=config.session_engine,
             session_id=str(authority.row.session_id),
             user_id=config.user_id,

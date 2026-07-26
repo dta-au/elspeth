@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 import time
 from dataclasses import replace
@@ -16,7 +17,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.core.canonical import stable_hash
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_plugin_crash, finish_success
 from elspeth.web.composer.guided.state_machine import GuidedSession
@@ -280,6 +281,17 @@ def _latest_audit_envelope(service: SessionServiceImpl) -> dict[str, object]:
     envelope = deep_thaw(row.tool_calls[0])
     assert type(envelope) is dict
     return envelope
+
+
+def _replace_latest_audit_envelope(service: SessionServiceImpl, envelope: dict[str, object]) -> None:
+    with service._engine.begin() as conn:
+        audit_row = conn.execute(
+            select(chat_messages_table.c.id)
+            .where(chat_messages_table.c.role == "audit")
+            .order_by(chat_messages_table.c.created_at.desc())
+            .limit(1)
+        ).one()
+        conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=[envelope]))
 
 
 async def _persist_cloned_audit_envelope(
@@ -694,6 +706,98 @@ async def test_settlement_rejects_malformed_or_mismatched_success_for_same_call_
 
     with pytest.raises(AuditIntegrityError):
         await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dispatch_recovery_rejects_noncanonical_json_representation(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    await _persist_dispatch(service, session_id)
+    envelope = _latest_audit_envelope(service)
+    invocation = envelope["invocation"]
+    assert type(invocation) is dict
+    result_canonical = invocation["result_canonical"]
+    assert type(result_canonical) is str
+    invocation["result_canonical"] = f" {result_canonical}"
+    _replace_latest_audit_envelope(service, envelope)
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+
+    with pytest.raises(AuditIntegrityError, match="canonical representation"):
+        await service.get_pipeline_dispatch_recovery(authority=authority)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dispatch_recovery_rejects_duplicate_json_object_key(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    await _persist_dispatch(service, session_id)
+    envelope = _latest_audit_envelope(service)
+    invocation = envelope["invocation"]
+    assert type(invocation) is dict
+    arguments_canonical = invocation["arguments_canonical"]
+    assert type(arguments_canonical) is str
+    assert arguments_canonical.count('"sources":{}') == 1
+    invocation["arguments_canonical"] = arguments_canonical.replace(
+        '"sources":{}',
+        '"sources":{},"sources":{}',
+        1,
+    )
+    _replace_latest_audit_envelope(service, envelope)
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+
+    with pytest.raises(AuditIntegrityError, match="duplicate JSON object key"):
+        await service.get_pipeline_dispatch_recovery(authority=authority)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"__elspeth_canonical_type__": {"literal": True}},
+        {"outer": {"__elspeth_canonical_type__": {"literal": True}}},
+    ],
+    ids=["top_level", "nested"],
+)
+def test_pipeline_dispatch_binding_restores_core_domain_normalized_reserved_mapping(
+    arguments: dict[str, object],
+) -> None:
+    arguments_canonical = canonical_json(arguments)
+    result_canonical = canonical_json({"success": True})
+    assert arguments_canonical.count('"__elspeth_canonical_type__":"mapping"') == 1
+    assert '"entries":[' in arguments_canonical
+    arguments_hash = hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest()
+    result_hash = hashlib.sha256(result_canonical.encode("utf-8")).hexdigest()
+    envelope: dict[str, object] = {
+        "_kind": "audit",
+        "invocation": {
+            "tool_call_id": "reserved-mapping-call",
+            "tool_name": "set_pipeline",
+            "status": ComposerToolStatus.SUCCESS.value,
+            "arguments_canonical": arguments_canonical,
+            "arguments_hash": arguments_hash,
+            "result_canonical": result_canonical,
+            "result_hash": result_hash,
+        },
+    }
+
+    binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
+
+    assert binding.tool_call_id == "reserved-mapping-call"
+    assert binding.tool_name == "set_pipeline"
+    assert binding.status is ComposerToolStatus.SUCCESS
+    assert binding.arguments_hash == arguments_hash
+    assert binding.result_hash == result_hash
 
 
 @pytest.mark.asyncio
@@ -1245,6 +1349,204 @@ async def test_prepare_pipeline_commit_runs_blocking_policy_validation_off_event
     release.set()
 
     await task
+
+
+@pytest.mark.asyncio
+async def test_prepare_pipeline_commit_bounds_reviewed_source_db_without_blocking_event_loop(
+    service: SessionServiceImpl,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority as original_resolver
+
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
+        session_id,
+        "reviewed.csv",
+        b"value\nreviewed\n",
+        "text/csv",
+    )
+    source_options = {
+        "schema": {"fields": ["value: str"], "mode": "flexible"},
+        "path": f"blob:{blob.id}",
+        "delimiter": ",",
+        "encoding": "utf-8",
+    }
+    output_options = {
+        "schema": {"mode": "observed"},
+        "path": "outputs/reviewed.json",
+        "collision_policy": "auto_increment",
+        "mode": "write",
+    }
+    source_stable_id = str(uuid4())
+    reviewed_facts = {
+        "source_order": [source_stable_id],
+        "reviewed_sources": {
+            source_stable_id: {
+                "name": "source",
+                "plugin": "csv",
+                "options": source_options,
+                "observed_columns": ["value"],
+                "sample_rows": [],
+                "on_validation_failure": "discard",
+            }
+        },
+        "output_order": [],
+        "reviewed_outputs": {},
+    }
+    pipeline: dict[str, object] = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": source_options,
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "rows",
+                "plugin": "json",
+                "options": output_options,
+                "on_write_failure": "discard",
+            }
+        ],
+    }
+    plan = PipelinePlanResult(
+        proposal=PipelineProposal.create(
+            pipeline=pipeline,
+            base=AbsentBase(),
+            reviewed_facts=reviewed_facts,
+            surface=PlannerSurface.GUIDED_STAGED,
+            repair_count=0,
+            skill_hash=stable_hash("guided skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+        tool_call_id="reviewed-source-terminal-call",
+        custody_result="not_required",
+        model_identifier="planner-model",
+        model_version="planner-model-v1",
+        provider="test",
+    )
+    row = await service.create_pipeline_composition_proposal(
+        session_id=session_id,
+        plan=plan,
+        summary="Use the reviewed source.",
+        rationale="Requested by the operator.",
+        affects=("source",),
+        arguments_redacted_json=_redacted_pipeline(pipeline),
+        actor="composer-web:user:alice",
+        composer_model_identifier="planner-model",
+        composer_model_version="planner-model-v1",
+        composer_provider="provider",
+    )
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts=reviewed_facts,
+    )
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+
+    import elspeth.web.composer.pipeline_commit as commit_module
+
+    loop = asyncio.get_running_loop()
+    event_loop_thread_id = threading.get_ident()
+    database_entered = asyncio.Event()
+    heartbeat_seen = asyncio.Event()
+    resolver_finished = asyncio.Event()
+    resolver_started = threading.Event()
+    release_database = threading.Event()
+    outer_watchdog_expired = threading.Event()
+    database_thread_ids: list[int] = []
+    original_connect = service._engine.connect
+    outer_failure_watchdog_seconds = 5.0
+
+    def delayed_connect():
+        database_thread_ids.append(threading.get_ident())
+        loop.call_soon_threadsafe(database_entered.set)
+        if not release_database.wait(timeout=outer_failure_watchdog_seconds):
+            outer_watchdog_expired.set()
+            raise AssertionError("outer test watchdog expired before the delayed database connection was released")
+        return original_connect()
+
+    def tracked_resolver(*args, **kwargs):
+        resolver_started.set()
+        try:
+            return original_resolver(*args, **kwargs)
+        finally:
+            loop.call_soon_threadsafe(resolver_finished.set)
+
+    async def heartbeat() -> None:
+        await database_entered.wait()
+        heartbeat_seen.set()
+
+    monkeypatch.setattr(service._engine, "connect", delayed_connect)
+    monkeypatch.setattr(commit_module, "resolve_reviewed_source_authority", tracked_resolver)
+    heartbeat_task = asyncio.create_task(heartbeat())
+    prepare_task = asyncio.create_task(
+        prepare_pipeline_proposal_commit(
+            authority=authority,
+            reviewed_facts=reviewed_facts,
+            current_state=CompositionState(
+                source=None,
+                nodes=(),
+                edges=(),
+                outputs=(),
+                metadata=PipelineMetadata(),
+                version=1,
+            ),
+            current_state_id=None,
+            policy_catalog=policy,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=service._engine,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=0.2,
+            ),
+            recorder=BufferingRecorder(),
+            actor="user:alice",
+            settlement_surface="guided",
+        )
+    )
+    try:
+        await asyncio.wait_for(database_entered.wait(), timeout=outer_failure_watchdog_seconds)
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=outer_failure_watchdog_seconds)
+        await asyncio.wait_for(heartbeat_task, timeout=outer_failure_watchdog_seconds)
+        assert not release_database.is_set()
+        with pytest.raises(PipelineCommitError, match="timed out") as exc_info:
+            await asyncio.wait_for(
+                asyncio.shield(prepare_task),
+                timeout=outer_failure_watchdog_seconds,
+            )
+        assert exc_info.value.code == "TIMEOUT"
+        assert not release_database.is_set()
+    finally:
+        release_database.set()
+        try:
+            if resolver_started.is_set():
+                await asyncio.wait_for(resolver_finished.wait(), timeout=outer_failure_watchdog_seconds)
+        finally:
+            for task in (heartbeat_task, prepare_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(heartbeat_task, prepare_task, return_exceptions=True)
+
+    assert resolver_finished.is_set()
+    assert not outer_watchdog_expired.is_set()
+    assert len(database_thread_ids) == 1
+    assert database_thread_ids[0] != event_loop_thread_id
 
 
 @pytest.mark.asyncio
