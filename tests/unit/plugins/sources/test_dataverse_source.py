@@ -1311,6 +1311,77 @@ class TestDataverseSourceLoadFetchXML:
 class TestSchemaContractLocking:
     """Tests for schema contract locking behavior during load()."""
 
+    @pytest.mark.parametrize("on_validation_failure", ["quarantine", "discard"])
+    def test_first_row_contract_field_cap_is_a_counted_validation_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        on_validation_failure: str,
+    ) -> None:
+        """An over-wide first row must follow Dataverse row-failure policy."""
+        import elspeth.contracts.contract_builder as contract_builder
+
+        monkeypatch.setattr(contract_builder, "_MAX_INFERRED_CONTRACT_FIELDS", 1)
+        pages = [_make_page([{"contactid": "1", "fullname": "Alice"}])]
+        source = _make_source_for_load(
+            pages,
+            _base_config(
+                schema={"mode": "observed"},
+                on_validation_failure=on_validation_failure,
+            ),
+        )
+        ctx = _mock_source_context()
+
+        rows = list(source.load(ctx))
+
+        if on_validation_failure == "quarantine":
+            assert len(rows) == 1
+            assert rows[0].is_quarantined is True
+            assert rows[0].quarantine_destination == "quarantine"
+        else:
+            assert rows == []
+        assert source._first_valid_row_processed is False
+        assert source._quarantine_count == 1
+        ctx.record_validation_error.assert_called_once()
+        error_call = ctx.record_validation_error.call_args.kwargs
+        assert error_call["destination"] == on_validation_failure
+        assert "exceeds maximum inferred schema fields" in error_call["error"]
+
+    @pytest.mark.parametrize("on_validation_failure", ["quarantine", "discard"])
+    def test_sparse_contract_field_cap_is_a_counted_validation_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        on_validation_failure: str,
+    ) -> None:
+        """A later sparse field beyond the cap must be counted and routed."""
+        import elspeth.contracts.contract_builder as contract_builder
+
+        monkeypatch.setattr(contract_builder, "_MAX_INFERRED_CONTRACT_FIELDS", 1)
+        pages = [_make_page([{"contactid": "1"}, {"contactid": "2", "fullname": "Alice"}])]
+        source = _make_source_for_load(
+            pages,
+            _base_config(
+                schema={"mode": "observed"},
+                on_validation_failure=on_validation_failure,
+            ),
+        )
+        ctx = _mock_source_context()
+
+        rows = list(source.load(ctx))
+
+        assert rows[0].is_quarantined is False
+        if on_validation_failure == "quarantine":
+            assert len(rows) == 2
+            assert rows[1].is_quarantined is True
+            assert rows[1].quarantine_destination == "quarantine"
+        else:
+            assert len(rows) == 1
+        assert source._first_valid_row_processed is True
+        assert source._quarantine_count == 1
+        ctx.record_validation_error.assert_called_once()
+        error_call = ctx.record_validation_error.call_args.kwargs
+        assert error_call["destination"] == on_validation_failure
+        assert "exceeds maximum inferred schema fields" in error_call["error"]
+
     def test_contract_locked_after_first_valid_row(self) -> None:
         """Contract builder processes first valid row and sets the flag."""
         pages = [_make_page([{"contactid": "1", "fullname": "Alice"}])]
