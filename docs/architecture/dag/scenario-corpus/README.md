@@ -34,8 +34,9 @@ These files have distinct jobs:
 Harness workflows are deliberately typed by the boundary they cross. `build`
 loads the real YAML, instantiates plugins in preflight mode, constructs and
 validates the production execution graph, and assembles the pipeline config.
-It records exact node counts, node-type counts, edge counts, sorted edge labels
-(including duplicates), and the topology hash through `BuildExpectation`.
+`BuildExpectation` declares exact node and edge counts, typed node-type counts,
+and sorted edge labels with duplicates preserved. The observed `GraphEvidence`
+records that exact graph shape plus a separately computed topology hash.
 It does not create an audit database or an orchestrator, and its runtime,
 audit, and recovery evidence remains explicitly unattempted. A `build` case is
 therefore executable evidence only for `config` and `build`; it cannot support
