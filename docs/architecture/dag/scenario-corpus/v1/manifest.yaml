@@ -445,10 +445,10 @@ evidence:
     locator: tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_composed_coalesces_repeat_run_semantic_boundary
     claim: Equivalent runs match on typed runtime semantics, payload and artifact facts, record counts, and per-run durable/portable parity while raw ordered identity remains visible.
     stages: [runtime, audit]
-  - id: composed-coalesces-audit-identity-p1
-    kind: decision
-    locator: elspeth-3a6fa9141f
-    claim: Require-all coalesce parent ordinals and derived sink-effect lineage currently depend on scheduler arrival order, so raw audit convergence is not promoted.
+  - id: composed-coalesces-canonical-identity
+    kind: pytest
+    locator: tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_composed_coalesces_raw_identity_converges_across_equivalent_runs
+    claim: Equivalent require-all coalesces persist parents and aligned completions in declared branch order, yielding stable lineage, sink-effect, and artifact identity while retaining raw arrival context.
     stages: [audit]
   - id: b3-stateful-runtime-exact-contracts
     kind: pytest
@@ -3532,10 +3532,10 @@ scenarios:
         status: partial
         evidence:
           - harness-fork-coalesce-policies-union-collision-fail
-          - composed-coalesces-audit-identity-p1
-        reason: The failed collision case retains exact durable evidence, but successful coalesces use semantic runtime oracles because scheduler arrival order currently changes durable parent ordinals and derived sink-effect identity; union_collision_policy also remains absent from canonical NodeConfig and stable NodeID.
-        owner_issue: elspeth-3a6fa9141f
-        exit_gate: Require-all coalesces persist parents and aligned completions in declared branch order, union_collision_policy is canonicalized, and all nineteen raw durable and portable corpus audit oracles converge and pass.
+          - composed-coalesces-canonical-identity
+        reason: Parent ordinals and derived sink-effect identity now converge in declared branch order, but union_collision_policy remains absent from canonical NodeConfig and stable NodeID.
+        owner_issue: elspeth-b1f23d8d83
+        exit_gate: union_collision_policy is canonicalized and all nineteen raw durable and portable corpus audit oracles converge and pass.
       recovery:
         status: partial
         evidence: [focused-crash-restart-02]
@@ -3583,13 +3583,10 @@ scenarios:
           - composed-coalesces-exact-contracts
           - composed-coalesces-repeat-run-boundary
       audit:
-        status: partial
+        status: pass
         evidence:
           - composed-coalesces-repeat-run-boundary
-          - composed-coalesces-audit-identity-p1
-        reason: Durable and portable audit views match within every run, but equivalent runs can assign require-all coalesce parent ordinals by scheduler arrival order and therefore derive different sink-effect lineage identity.
-        owner_issue: elspeth-3a6fa9141f
-        exit_gate: Require-all coalesces persist parents and aligned state completions in declared branch order, then equivalent-run corpus raw parent, lineage, and effect identity assertions pass without weakening arrival-order audit context.
+          - composed-coalesces-canonical-identity
       recovery: *recovery_unknown
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
@@ -3643,13 +3640,10 @@ scenarios:
           - composed-coalesces-exact-contracts
           - composed-coalesces-repeat-run-boundary
       audit:
-        status: partial
+        status: pass
         evidence:
           - composed-coalesces-repeat-run-boundary
-          - composed-coalesces-audit-identity-p1
-        reason: Durable and portable audit views match within every run, but equivalent independent require-all coalesces can assign parent ordinals by scheduler arrival order and therefore derive different sink-effect lineage identity.
-        owner_issue: elspeth-3a6fa9141f
-        exit_gate: Require-all coalesces persist parents and aligned state completions in declared branch order, then equivalent-run corpus raw parent, lineage, and effect identity assertions pass without weakening arrival-order audit context.
+          - composed-coalesces-canonical-identity
       recovery:
         status: partial
         evidence:

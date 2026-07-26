@@ -185,7 +185,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
+        "pass",
         "unknown",
         "unknown",
         "pass",
@@ -198,7 +198,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
+        "pass",
         "partial",
         "unknown",
         "pass",
@@ -384,6 +384,9 @@ EXPECTED_ASSESSMENT_LOCATORS = {
     "composed-coalesces-repeat-run-boundary": (
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_composed_coalesces_repeat_run_semantic_boundary",
     ),
+    "composed-coalesces-canonical-identity": (
+        "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_composed_coalesces_raw_identity_converges_across_equivalent_runs",
+    ),
     "b3-stateful-runtime-exact-contracts": (
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b3_stateful_runtime_cases_pin_exact_contracts",
     ),
@@ -397,7 +400,7 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "e2c6979bda59dab98fd99466265abda19d2312412f776236af4331516305f3c2"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0fb6dfe0e3991e1dd9517e5d5682964d2ed5cdef8f312a9e7dabe957b6bb8820"
 EXPECTED_CASE_REGISTRY_SHA256 = "37ff02b145850dbab3341491efa215b189629f66cf527b3d9837901696978905"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
@@ -2209,7 +2212,7 @@ def test_semantic_runtime_harness_evidence_cannot_claim_audit_stage() -> None:
         corpus_schema.ScenarioManifest.model_validate(raw)
 
 
-def test_composed_coalesce_semantic_ledger_is_structured_and_p1_scoped() -> None:
+def test_composed_coalesce_semantic_ledger_is_structured_and_identity_is_regression_guarded() -> None:
     manifest = load_manifest()
     semantic_cases = tuple(
         (scenario, case)
@@ -2218,10 +2221,11 @@ def test_composed_coalesce_semantic_ledger_is_structured_and_p1_scoped() -> None
     )
 
     assert len(semantic_cases) == 20
-    decision = next(reference for reference in manifest.evidence if reference.id == "composed-coalesces-audit-identity-p1")
-    assert (decision.kind, decision.locator, decision.stages) == (
-        "decision",
-        "elspeth-3a6fa9141f",
+    identity_regression = next(reference for reference in manifest.evidence if reference.id == "composed-coalesces-canonical-identity")
+    assert (identity_regression.kind, identity_regression.locator, identity_regression.stages) == (
+        "pytest",
+        "tests/integration/core/dag/test_dag_scenario_production_path.py"
+        "::test_b2_composed_coalesces_raw_identity_converges_across_equivalent_runs",
         ("audit",),
     )
     evidence_by_locator = {reference.locator: reference for reference in manifest.evidence}
@@ -2230,8 +2234,14 @@ def test_composed_coalesce_semantic_ledger_is_structured_and_p1_scoped() -> None
         assert isinstance(expected, corpus_schema.SemanticRunExpectation)
         assert len(expected.projection_sha256) == 64
         assert all(value > 0 for value in expected.projection_counts.model_dump().values())
-        assert scenario.dimensions["audit"].status == "partial"
-        assert scenario.dimensions["audit"].owner_issue == "elspeth-3a6fa9141f"
+        audit = scenario.dimensions["audit"]
+        if scenario.id == "fork-coalesce-policies":
+            assert audit.status == "partial"
+            assert audit.owner_issue == "elspeth-b1f23d8d83"
+        else:
+            assert audit.status == "pass"
+            assert audit.owner_issue is None
+        assert identity_regression.id in audit.evidence
         assert evidence_by_locator[f"{scenario.id}:{case.id}"].stages == (
             "config",
             "build",
@@ -4440,7 +4450,7 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
     assert len(manifest.evidence) == 99
-    assert len(assessment_evidence) == 59
+    assert len(assessment_evidence) == 60
     assert len(harness_evidence) == 39
     assert len({reference.id for reference in manifest.evidence}) == 99
     assert len({reference.locator for reference in manifest.evidence}) == 99
@@ -4954,18 +4964,8 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-7cf763da7c"
             elif dimension == "scale":
                 expected_owner = "elspeth-cb1053fe46"
-            elif scenario.id == "fork-coalesce-policies" and dimension == "contracts":
+            elif scenario.id == "fork-coalesce-policies" and dimension in ("contracts", "audit"):
                 expected_owner = "elspeth-b1f23d8d83"
-            elif (
-                scenario.id
-                in (
-                    "fork-coalesce-policies",
-                    "sequential-nested-fork-coalesce",
-                    "parallel-coalesces",
-                )
-                and dimension == "audit"
-            ):
-                expected_owner = "elspeth-3a6fa9141f"
             else:
                 expected_owner = "elspeth-ef29ef6ba4"
             assert cell.owner_issue == expected_owner

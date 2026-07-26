@@ -424,7 +424,7 @@ def build_coalesce_merge(
 
     return CoalesceMergePlan(
         merged_data=PipelineRow(merged_data_dict, merged_contract),
-        consumed_tokens=tuple(e.token for e in pending.branches.values()),
+        consumed_tokens=tuple(pending.branches[branch_name].token for branch_name in settings.branches if branch_name in pending.branches),
         metadata=coalesce_metadata,
     )
 

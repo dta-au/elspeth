@@ -381,7 +381,7 @@ def _blocked_item(
 
 
 class TestBuildCoalesceMerge:
-    def test_union_first_wins_plan_contains_data_metadata_and_consumed_tokens(self) -> None:
+    def test_union_first_wins_plan_canonicalizes_consumed_tokens_but_preserves_arrival_order(self) -> None:
         settings = _settings(
             branches=["a", "b"],
             merge="union",
@@ -429,7 +429,7 @@ class TestBuildCoalesceMerge:
 
         assert isinstance(plan, CoalesceMergePlan)
         assert plan.merged_data.to_dict() == {"shared": "from_a", "a_only": 1, "b_only": 2}
-        assert plan.consumed_tokens == (token_b, token_a)
+        assert plan.consumed_tokens == (token_a, token_b)
         assert plan.metadata.wait_duration_ms == 5000.0
         assert [entry.branch for entry in plan.metadata.arrival_order] == ["b", "a"]
         assert plan.metadata.union_field_origins == {"shared": "a", "a_only": "a", "b_only": "b"}

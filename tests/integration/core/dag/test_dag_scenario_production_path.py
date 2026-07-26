@@ -385,8 +385,6 @@ def _assert_repeat_run_boundary(
         assert first_lineage == second_lineage
         assert first_effects == second_effects
         assert first_artifacts == second_artifacts
-        assert _coalesce_contexts(first_projection) == _coalesce_contexts(second_projection)
-        assert first_projection == second_projection
         return True
 
     _assert_require_all_parent_order_drift(first_parents, second_parents)
@@ -532,6 +530,12 @@ def test_b2_composed_coalesces_identical_arrival_order_has_identical_raw_identit
     )
 
     assert _assert_repeat_run_boundary(case, *pair)
+    first, second, _first_records, _second_records = pair
+    first_projection = first.runtime.durable_projection
+    second_projection = second.runtime.durable_projection
+    assert first_projection is not None and second_projection is not None
+    assert _coalesce_contexts(first_projection) == _coalesce_contexts(second_projection)
+    assert first_projection == second_projection
 
 
 @pytest.mark.parametrize(("scenario_id", "case_id"), B2_COMPOSED_COALESCE_CASES)
@@ -543,11 +547,13 @@ def test_b2_composed_coalesces_raw_identity_converges_across_equivalent_runs(
 ) -> None:
     scenario, case = _declared_case(scenario_id, case_id)
     pair = _run_repeat_identity_pair(scenario, case, tmp_path, monkeypatch)
-    identity_converged = _assert_repeat_run_boundary(case, *pair)
-
-    if not identity_converged:
-        pytest.xfail("elspeth-3a6fa9141f: require-all durable parent and derived sink-effect identity follows arrival order")
-    assert identity_converged
+    assert _assert_repeat_run_boundary(case, *pair)
+    first, second, _first_records, _second_records = pair
+    first_projection = first.runtime.durable_projection
+    second_projection = second.runtime.durable_projection
+    assert first_projection is not None and second_projection is not None
+    assert _coalesce_contexts(first_projection) != _coalesce_contexts(second_projection)
+    assert first_projection != second_projection
 
 
 def _copy_composed_coalesce_fixture(
