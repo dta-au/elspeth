@@ -39,6 +39,17 @@ from elspeth.web.composer.guided.deferred_intents import (
 )
 from elspeth.web.composer.guided.protocol import TurnType
 from elspeth.web.composer.guided.state_machine import GUIDED_MAX_CHAT_TURNS, ComponentTarget
+from elspeth.web.coordination.contracts import (
+    CancellationSource,
+    CompatibilityKey,
+    InstanceState,
+    RecoveryRequiredReason,
+    RunOwnershipFence,
+    RunSagaState,
+    SessionOperationFence,
+    SessionOperationKind,
+    StartPermitState,
+)
 from elspeth.web.plugin_policy.models import PluginId, PluginUnavailableReason
 
 if TYPE_CHECKING:
@@ -183,6 +194,75 @@ _RUN_COUNTER_FIELDS: tuple[str, ...] = (
     "rows_routed_failure",
     "rows_quarantined",
 )
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class WebInstanceRecord:
+    """Persistent membership projection; database time owns lease validity."""
+
+    instance_id: str
+    deployment_target: str
+    deployment_generation: str
+    compatibility_key: CompatibilityKey
+    image_digest: str
+    revision_label: str
+    state: InstanceState
+    started_at: datetime
+    last_heartbeat_at: datetime
+    lease_expires_at: datetime
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionOperationFenceRecord:
+    """Persistent operation authority, including retained release evidence."""
+
+    fence: SessionOperationFence
+    operation_kind: SessionOperationKind
+    owner_instance_id: str
+    lease_expires_at: datetime
+    released_at: datetime | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RunCoordinationRecord:
+    """Sessions-side run ownership and monotonic saga projection."""
+
+    ownership: RunOwnershipFence | None
+    owner_lease_expires_at: datetime | None
+    saga_state: RunSagaState
+    cancel_requested_at: datetime | None
+    cancellation_source: CancellationSource | None
+    recovery_required_reason: RecoveryRequiredReason | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RunStartPermitRecord:
+    """Durable start-versus-cancel decision and immutable permit subject."""
+
+    run_id: str
+    state: StartPermitState
+    permit_id: str | None
+    permit_epoch: int | None
+    subject_hash: str | None
+    issued_at: datetime | None
+    cancelled_at: datetime | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RunExecutionInputRecord:
+    """Secret-reference-only immutable execution envelope substrate."""
+
+    run_id: str
+    schema_version: int
+    envelope: Mapping[str, Any]
+    compatibility_key: CompatibilityKey
+    deployment_generation: str
+    automatic_recovery_eligible: bool
 
 
 @final

@@ -174,7 +174,8 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   ECS; provider and tool data remain bounded and redacted.
 
 **Operational:** 0.7.2 is a pre-1.0 session-store cutover. The session store moves
-from epoch 35 to 36; guided schema remains at 10, and Landscape remains at epoch 29.
+from epoch 35 to 37 for retryable blob deletion and the compatible-generation
+coordination schema; guided schema remains at 10, and Landscape remains at epoch 29.
 Archive or export evidence as required, stop the old service, recreate a stale
 session store, and install 0.7.2. A Landscape store already at epoch 29 remains
 current. Do not roll older code back over the recreated session database.

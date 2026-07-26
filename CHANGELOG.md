@@ -21,7 +21,10 @@ recovery after committed blob deletion. The notes below intentionally cover
 only major changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 session-schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 36. Guided checkpoints remain at schema 10 and Landscape
+to 37. Epoch 36 makes committed blob-deletion cleanup retryable; epoch 37 adds
+the persistent compatible-generation coordination schema for session-operation
+authority, run-start state, cross-replica handoff, and bounded cleanup. Guided
+checkpoints remain at schema 10 and Landscape
 `SQLITE_SCHEMA_EPOCH` remains at 29. ELSPETH does not migrate the predecessor
 session database in place before 1.0. Archive or export required evidence, stop
 the old service, recreate a stale session store, then install

@@ -1,7 +1,7 @@
 """SQLAlchemy Core table definitions for the session database.
 
-Tables: sessions, chat_messages, composition_states, runs, blobs,
-blob_run_links, blob_inline_resolutions, user_secrets.
+Tables include session content plus epoch-37 web coordination authority,
+run-start, transient handoff, rate-limit, and cleanup state.
 
 Current schema bootstrap lives in ``sessions/schema.py``. Pre-release
 session databases are created from this metadata and stale runtime DBs
@@ -169,7 +169,11 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #   36 -> ``blob_deletion_cleanups`` retains the exact staged filesystem delete
 #        across post-commit unlink/fsync failures. Epoch 35 cannot make those
 #        purges retryable after the ``blobs`` row is gone and is rejected.
-SESSION_SCHEMA_EPOCH = 36
+#   37 -> persistent session-operation authority, compatible-generation
+#        membership/run-start coordination, cross-replica ticket/progress/rate
+#        state, bounded cleanup claims, and monotonic user-secret row versions.
+#        Epoch 36 cannot represent these authorities and is rejected outright.
+SESSION_SCHEMA_EPOCH = 37
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -328,6 +332,75 @@ sessions_table = Table(
     CheckConstraint(
         _AUTH_PROVIDER_TYPE_CHECK,
         name="ck_sessions_auth_provider_type",
+    ),
+)
+
+# One membership row per live web process. SQLite deployments do not use this
+# distributed membership surface, but the table remains part of the recreated
+# schema so both supported database modes share one exact metadata contract.
+web_instances_table = Table(
+    "web_instances",
+    metadata,
+    Column("instance_id", String, primary_key=True),
+    Column("deployment_target", String, nullable=False),
+    Column("deployment_generation", String, nullable=False),
+    Column("session_epoch", Integer, nullable=False),
+    Column("landscape_epoch", Integer, nullable=False),
+    Column("coordination_protocol", Integer, nullable=False),
+    Column("image_digest", String, nullable=False),
+    Column("revision_label", String, nullable=False),
+    Column("state", String, nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("last_heartbeat_at", DateTime(timezone=True), nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
+    CheckConstraint("length(trim(instance_id)) > 0", name="ck_web_instances_instance_id_nonblank"),
+    CheckConstraint("length(trim(deployment_target)) > 0", name="ck_web_instances_target_nonblank"),
+    CheckConstraint("length(trim(deployment_generation)) > 0", name="ck_web_instances_generation_nonblank"),
+    CheckConstraint("length(trim(image_digest)) > 0", name="ck_web_instances_image_digest_nonblank"),
+    CheckConstraint("length(trim(revision_label)) > 0", name="ck_web_instances_revision_label_nonblank"),
+    CheckConstraint(
+        "session_epoch > 0 AND landscape_epoch > 0 AND coordination_protocol > 0",
+        name="ck_web_instances_positive_compatibility",
+    ),
+    CheckConstraint("state IN ('active', 'draining', 'stopped')", name="ck_web_instances_state"),
+)
+Index(
+    "ix_web_instances_compatibility",
+    web_instances_table.c.deployment_generation,
+    web_instances_table.c.session_epoch,
+    web_instances_table.c.landscape_epoch,
+    web_instances_table.c.coordination_protocol,
+)
+
+# Exactly one persistent operation-fence row belongs to each retained session.
+# Release never nulls forensic authority; released_at alone discriminates an
+# inactive row. lease_token is random fencing authority and must not collapse
+# into the diagnostic owner identity.
+session_operation_fences_table = Table(
+    "session_operation_fences",
+    metadata,
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("operation_id", String, nullable=False),
+    Column("lease_token", String, nullable=False),
+    Column("operation_kind", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("released_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint("length(trim(session_id)) > 0", name="ck_session_operation_fences_session_id_nonblank"),
+    CheckConstraint("length(trim(operation_id)) > 0", name="ck_session_operation_fences_operation_id_nonblank"),
+    CheckConstraint("length(trim(lease_token)) > 0", name="ck_session_operation_fences_lease_token_nonblank"),
+    CheckConstraint("length(trim(owner_instance_id)) > 0", name="ck_session_operation_fences_owner_nonblank"),
+    CheckConstraint("lease_token <> owner_instance_id", name="ck_session_operation_fences_token_not_owner"),
+    CheckConstraint("operation_epoch > 0", name="ck_session_operation_fences_positive_epoch"),
+    CheckConstraint(
+        "operation_kind IN ('create', 'compose', 'proposal', 'execute', 'archive', 'progress')",
+        name="ck_session_operation_fences_kind",
     ),
 )
 
@@ -1923,6 +1996,16 @@ runs_table = Table(
     Column("error", Text, nullable=True),
     Column("landscape_run_id", String, nullable=True),
     Column("pipeline_yaml", Text, nullable=True),
+    # Epoch-37 durable run ownership and cross-database saga projection.
+    # Runtime acquisition is wired in later tasks; until then the ownership
+    # tuple is either wholly absent or wholly populated.
+    Column("owner_instance_id", String, nullable=True),
+    Column("owner_epoch", Integer, nullable=True),
+    Column("owner_lease_expires_at", DateTime(timezone=True), nullable=True, index=True),
+    Column("cancel_requested_at", DateTime(timezone=True), nullable=True),
+    Column("cancellation_source", String, nullable=True),
+    Column("saga_state", String, nullable=False, server_default="draft", index=True),
+    Column("recovery_required_reason", String, nullable=True),
     ForeignKeyConstraint(
         ["state_id", "session_id"],
         ["composition_states.id", "composition_states.session_id"],
@@ -1935,6 +2018,27 @@ runs_table = Table(
     CheckConstraint(
         "status IN ('pending', 'running', 'completed', 'completed_with_failures', 'failed', 'empty', 'cancelled')",
         name="ck_runs_status",
+    ),
+    CheckConstraint(
+        "((owner_instance_id IS NULL AND owner_epoch IS NULL AND owner_lease_expires_at IS NULL) OR "
+        "(owner_instance_id IS NOT NULL AND length(trim(owner_instance_id)) > 0 AND "
+        "owner_epoch IS NOT NULL AND owner_epoch > 0 AND owner_lease_expires_at IS NOT NULL))",
+        name="ck_runs_ownership_all_or_none",
+    ),
+    CheckConstraint(
+        "cancellation_source IS NULL OR cancellation_source IN ('user', 'operator', 'shutdown', 'reconciler')",
+        name="ck_runs_cancellation_source",
+    ),
+    CheckConstraint(
+        "saga_state IN ('draft', 'start_intent', 'start_permit_issued', 'baseline_checkpointed', "
+        "'running', 'recovery_required', 'cancel_pending', 'terminal', 'terminal_cancelled')",
+        name="ck_runs_saga_state",
+    ),
+    CheckConstraint(
+        "recovery_required_reason IS NULL OR recovery_required_reason IN "
+        "('implementation_drift', 'generation_drift', 'compatibility_mismatch', 'missing_baseline', "
+        "'incomplete_source', 'secret_version_unavailable', 'unsafe_effect', 'authority_lost', 'unknown')",
+        name="ck_runs_recovery_required_reason",
     ),
 )
 
@@ -1961,6 +2065,205 @@ Index(
     unique=True,
     sqlite_where=runs_table.c.status.in_(["pending", "running"]),
     postgresql_where=runs_table.c.status.in_(["pending", "running"]),
+)
+
+# Sessions-side start-versus-cancel linearization. Pending and
+# cancelled-before-permit rows contain no permit authority; start_permitted
+# rows retain the exact immutable non-secret fence identities and subject.
+_RUN_START_PERMIT_SUBJECT_IS_NULL = (
+    "permit_id IS NULL AND permit_epoch IS NULL AND session_operation_id IS NULL AND "
+    "session_operation_epoch IS NULL AND run_owner_instance_id IS NULL AND run_owner_epoch IS NULL AND "
+    "envelope_hash IS NULL AND topology_hash IS NULL AND source_manifest_hash IS NULL AND "
+    "checkpoint_subject_hash IS NULL AND deployment_generation IS NULL AND session_epoch IS NULL AND "
+    "landscape_epoch IS NULL AND coordination_protocol IS NULL AND permit_subject_hash IS NULL AND issued_at IS NULL"
+)
+run_start_permits_table = Table(
+    "run_start_permits",
+    metadata,
+    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True),
+    Column("start_state", String, nullable=False, server_default="pending"),
+    Column("permit_id", String, nullable=True, unique=True),
+    Column("permit_epoch", Integer, nullable=True),
+    Column("session_operation_id", String, nullable=True),
+    Column("session_operation_epoch", Integer, nullable=True),
+    Column("run_owner_instance_id", String, nullable=True),
+    Column("run_owner_epoch", Integer, nullable=True),
+    Column("envelope_hash", String, nullable=True),
+    Column("topology_hash", String, nullable=True),
+    Column("source_manifest_hash", String, nullable=True),
+    Column("checkpoint_subject_hash", String, nullable=True),
+    Column("deployment_generation", String, nullable=True),
+    Column("session_epoch", Integer, nullable=True),
+    Column("landscape_epoch", Integer, nullable=True),
+    Column("coordination_protocol", Integer, nullable=True),
+    Column("permit_subject_hash", String, nullable=True),
+    Column("issued_at", DateTime(timezone=True), nullable=True),
+    Column("cancelled_at", DateTime(timezone=True), nullable=True),
+    Column("retention_expires_at", DateTime(timezone=True), nullable=True, index=True),
+    CheckConstraint("start_state IN ('pending', 'start_permitted', 'cancelled_before_permit')", name="ck_run_start_permits_state"),
+    CheckConstraint(
+        f"((start_state = 'pending' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NULL) OR "
+        f"(start_state = 'cancelled_before_permit' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NOT NULL) OR "
+        "(start_state = 'start_permitted' AND permit_id IS NOT NULL AND length(trim(permit_id)) > 0 AND "
+        "permit_epoch IS NOT NULL AND permit_epoch > 0 AND "
+        "session_operation_id IS NOT NULL AND length(trim(session_operation_id)) > 0 AND "
+        "session_operation_epoch IS NOT NULL AND session_operation_epoch > 0 AND "
+        "run_owner_instance_id IS NOT NULL AND length(trim(run_owner_instance_id)) > 0 AND "
+        "run_owner_epoch IS NOT NULL AND run_owner_epoch > 0 AND "
+        "envelope_hash IS NOT NULL AND length(envelope_hash) = 64 AND "
+        "topology_hash IS NOT NULL AND length(topology_hash) = 64 AND "
+        "source_manifest_hash IS NOT NULL AND length(source_manifest_hash) = 64 AND "
+        "checkpoint_subject_hash IS NOT NULL AND length(checkpoint_subject_hash) = 64 AND "
+        "deployment_generation IS NOT NULL AND length(trim(deployment_generation)) > 0 AND "
+        "session_epoch IS NOT NULL AND session_epoch > 0 AND landscape_epoch IS NOT NULL AND landscape_epoch > 0 AND "
+        "coordination_protocol IS NOT NULL AND coordination_protocol > 0 AND "
+        "permit_subject_hash IS NOT NULL AND length(permit_subject_hash) = 64 AND "
+        "issued_at IS NOT NULL AND cancelled_at IS NULL))",
+        name="ck_run_start_permits_state_fields",
+    ),
+)
+
+# Immutable, secret-reference-only envelope substrate. Task 8 owns the public
+# serialization and resolver carrier; epoch 37 reserves and constrains its
+# durable shape now so deployment compatibility cannot drift underneath it.
+run_execution_inputs_table = Table(
+    "run_execution_inputs",
+    metadata,
+    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True),
+    Column("schema_version", Integer, nullable=False),
+    Column("envelope", JSON, nullable=False),
+    Column("canonical_input_digest", String, nullable=False),
+    Column("topology_digest", String, nullable=False),
+    Column("source_manifest_digest", String, nullable=False),
+    Column("application_fingerprint", String, nullable=False),
+    Column("plugin_registry_fingerprint", String, nullable=False),
+    Column("configuration_fingerprint", String, nullable=False),
+    Column("graph_fingerprint", String, nullable=False),
+    Column("runtime_fingerprint", String, nullable=False),
+    Column("implementation_fingerprint", String, nullable=False),
+    Column("deployment_generation", String, nullable=False),
+    Column("session_epoch", Integer, nullable=False),
+    Column("landscape_epoch", Integer, nullable=False),
+    Column("coordination_protocol", Integer, nullable=False),
+    Column("automatic_recovery_eligible", Boolean, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("schema_version > 0", name="ck_run_execution_inputs_positive_schema_version"),
+    CheckConstraint(
+        "session_epoch > 0 AND landscape_epoch > 0 AND coordination_protocol > 0",
+        name="ck_run_execution_inputs_positive_compatibility",
+    ),
+)
+
+websocket_tickets_table = Table(
+    "websocket_tickets",
+    metadata,
+    Column("ticket_digest", String, primary_key=True),
+    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("user_id", String, nullable=False),
+    Column("auth_provider_type", String, nullable=False),
+    Column("issued_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("consumed_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint("length(ticket_digest) = 64", name="ck_websocket_tickets_digest_length"),
+    CheckConstraint("length(trim(user_id)) > 0", name="ck_websocket_tickets_user_id_nonblank"),
+    CheckConstraint(_AUTH_PROVIDER_TYPE_CHECK, name="ck_websocket_tickets_auth_provider_type"),
+)
+
+composer_inflight_requests_table = Table(
+    "composer_inflight_requests",
+    metadata,
+    Column("request_id", String, primary_key=True),
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("user_id", String, nullable=False),
+    Column("operation_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True), nullable=True),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    CheckConstraint("length(trim(request_id)) > 0", name="ck_composer_inflight_requests_request_id_nonblank"),
+    CheckConstraint("length(trim(session_id)) > 0", name="ck_composer_inflight_requests_session_id_nonblank"),
+    CheckConstraint("length(trim(user_id)) > 0", name="ck_composer_inflight_requests_user_id_nonblank"),
+    CheckConstraint("length(trim(operation_id)) > 0", name="ck_composer_inflight_requests_operation_id_nonblank"),
+    CheckConstraint("operation_epoch > 0", name="ck_composer_inflight_requests_positive_epoch"),
+)
+
+composer_progress_snapshots_table = Table(
+    "composer_progress_snapshots",
+    metadata,
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True),
+    Column("request_id", String, nullable=True),
+    Column("user_id", String, nullable=False),
+    Column("phase", String, nullable=False),
+    Column("headline", String, nullable=False),
+    Column("evidence", JSON, nullable=False),
+    Column("likely_next", JSON, nullable=True),
+    Column("reason", String, nullable=True),
+    Column("operation_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    CheckConstraint("length(trim(user_id)) > 0", name="ck_composer_progress_snapshots_user_id_nonblank"),
+    CheckConstraint("length(trim(operation_id)) > 0", name="ck_composer_progress_snapshots_operation_id_nonblank"),
+    CheckConstraint("operation_epoch > 0", name="ck_composer_progress_snapshots_positive_epoch"),
+    CheckConstraint(
+        "phase IN ('idle', 'starting', 'calling_model', 'using_tools', 'validating', 'saving', 'complete', 'failed', 'cancelled')",
+        name="ck_composer_progress_snapshots_phase",
+    ),
+)
+
+rate_limit_buckets_table = Table(
+    "rate_limit_buckets",
+    metadata,
+    Column("subject_digest", String, primary_key=True),
+    Column("window_seconds", Integer, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    CheckConstraint("length(subject_digest) = 64", name="ck_rate_limit_buckets_digest_length"),
+    CheckConstraint("window_seconds > 0", name="ck_rate_limit_buckets_positive_window"),
+)
+
+rate_limit_events_table = Table(
+    "rate_limit_events",
+    metadata,
+    Column("event_id", String, primary_key=True),
+    Column(
+        "subject_digest",
+        String,
+        ForeignKey("rate_limit_buckets.subject_digest", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("occurred_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    CheckConstraint("length(trim(event_id)) > 0", name="ck_rate_limit_events_event_id_nonblank"),
+    CheckConstraint("length(subject_digest) = 64", name="ck_rate_limit_events_digest_length"),
+)
+Index("ix_rate_limit_events_subject_occurred", rate_limit_events_table.c.subject_digest, rate_limit_events_table.c.occurred_at)
+
+sessions_cleanup_claims_table = Table(
+    "sessions_cleanup_claims",
+    metadata,
+    Column("claim_name", String, primary_key=True),
+    Column("claim_token", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("claim_epoch", Integer, nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("renewal_count", Integer, nullable=False),
+    Column("batch_count", Integer, nullable=False),
+    Column("max_renewals", Integer, nullable=False),
+    Column("max_batches", Integer, nullable=False),
+    Column("acquired_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("length(trim(claim_name)) > 0", name="ck_sessions_cleanup_claims_name_nonblank"),
+    CheckConstraint("length(trim(claim_token)) > 0", name="ck_sessions_cleanup_claims_token_nonblank"),
+    CheckConstraint("length(trim(owner_instance_id)) > 0", name="ck_sessions_cleanup_claims_owner_nonblank"),
+    CheckConstraint("claim_token <> owner_instance_id", name="ck_sessions_cleanup_claims_token_not_owner"),
+    CheckConstraint("claim_epoch > 0", name="ck_sessions_cleanup_claims_positive_epoch"),
+    CheckConstraint(
+        "renewal_count >= 0 AND batch_count >= 0 AND max_renewals > 0 AND max_batches > 0 "
+        "AND renewal_count <= max_renewals AND batch_count <= max_batches",
+        name="ck_sessions_cleanup_claims_bounded_counts",
+    ),
 )
 
 blobs_table = Table(
@@ -2248,6 +2551,7 @@ user_secrets_table = Table(
     Column("auth_provider_type", String, nullable=False),
     Column("encrypted_value", LargeBinary, nullable=False),
     Column("salt", LargeBinary, nullable=False),
+    Column("version", Integer, nullable=False, server_default="1"),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     UniqueConstraint("name", "user_id", "auth_provider_type", name="uq_user_secret_name_user_provider"),
@@ -2255,6 +2559,7 @@ user_secrets_table = Table(
         _AUTH_PROVIDER_TYPE_CHECK,
         name="ck_user_secrets_auth_provider_type",
     ),
+    CheckConstraint("version > 0", name="ck_user_secrets_positive_version"),
 )
 Index("ix_user_secrets_user_provider", user_secrets_table.c.user_id, user_secrets_table.c.auth_provider_type)
 

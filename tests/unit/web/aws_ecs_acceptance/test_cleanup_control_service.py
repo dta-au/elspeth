@@ -82,7 +82,7 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
                 "landscape_epoch": 29,
                 "run_web_plugin_policy_present": True,
             },
-            "structural_changes": "session_epoch_35_to_36_blob_deletion_cleanup_state",
+            "structural_changes": "session_epoch_35_to_37_coordination_schema",
             "semantics_only_changes": "none",
             "archive_export_decision": "required_before_forward_migration",
             "destructive_reset_required": False,
@@ -141,7 +141,7 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
         (("schema_facts", "previous", "session_epoch"), 34),
         (
             ("schema_facts", "structural_changes"),
-            "session_epoch_34_to_36_blob_deletion_cleanup_state",
+            "session_epoch_34_to_37_coordination_schema",
         ),
     ):
         mutated = json.loads(json.dumps(record))

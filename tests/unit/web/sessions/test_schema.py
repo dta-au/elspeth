@@ -12,7 +12,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import QueuePool
 
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, metadata, sessions_table
+from elspeth.web.sessions.models import (
+    SESSION_SCHEMA_EPOCH,
+    blobs_table,
+    metadata,
+    sessions_table,
+)
 from elspeth.web.sessions.schema import (
     SessionSchemaError,
     _stamp_schema_sentinels,
@@ -100,6 +105,76 @@ def test_initialize_session_schema_creates_current_schema_without_alembic_table(
         "tombstone_path",
         "created_at",
     }
+
+
+def test_epoch_37_coordination_tables_and_expiry_indexes_are_exact() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    inspector = inspect(eng)
+
+    assert SESSION_SCHEMA_EPOCH == 37
+    assert {
+        "web_instances",
+        "session_operation_fences",
+        "run_start_permits",
+        "run_execution_inputs",
+        "websocket_tickets",
+        "composer_inflight_requests",
+        "composer_progress_snapshots",
+        "rate_limit_buckets",
+        "rate_limit_events",
+        "sessions_cleanup_claims",
+    } <= set(inspector.get_table_names())
+    assert not any("deleted" in table and "session" in table for table in inspector.get_table_names())
+
+    expected_expiry_indexes = {
+        "web_instances": "ix_web_instances_lease_expires_at",
+        "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
+        "run_start_permits": "ix_run_start_permits_retention_expires_at",
+        "websocket_tickets": "ix_websocket_tickets_expires_at",
+        "composer_inflight_requests": "ix_composer_inflight_requests_expires_at",
+        "composer_progress_snapshots": "ix_composer_progress_snapshots_expires_at",
+        "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
+        "rate_limit_events": "ix_rate_limit_events_expires_at",
+        "sessions_cleanup_claims": "ix_sessions_cleanup_claims_lease_expires_at",
+    }
+    for table_name, index_name in expected_expiry_indexes.items():
+        assert index_name in {index["name"] for index in inspector.get_indexes(table_name)}, table_name
+
+
+def test_session_operation_authority_shape_retains_exact_nonnull_fields() -> None:
+    from elspeth.web.sessions import models as session_models
+
+    session_operation_fences_table = getattr(session_models, "session_operation_fences_table", None)
+    assert session_operation_fences_table is not None
+    columns = {column.name: column for column in session_operation_fences_table.columns}
+
+    assert tuple(columns) == (
+        "session_id",
+        "operation_id",
+        "lease_token",
+        "operation_kind",
+        "owner_instance_id",
+        "operation_epoch",
+        "lease_expires_at",
+        "released_at",
+    )
+    assert all(not columns[name].nullable for name in columns if name != "released_at")
+    assert session_operation_fences_table.primary_key.columns.keys() == ["session_id"]
+
+
+def test_epoch_36_database_is_rejected_by_epoch_37_runtime() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    with eng.begin() as conn:
+        conn.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 36 WHERE store_kind = 'session'"))
+        conn.execute(text("PRAGMA user_version = 36"))
+
+    with pytest.raises(
+        SessionSchemaError,
+        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=37.*Delete the session DB file and restart",
+    ):
+        initialize_session_schema(eng)
 
 
 def test_postgres_schema_emits_native_audit_trigger_ddl() -> None:
@@ -290,7 +365,7 @@ def test_initialize_session_schema_rejects_epoch_35_database() -> None:
     assert probe_current_schema(eng) is False
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=36.*Delete the session DB file and restart",
+        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=37.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
 
@@ -330,7 +405,7 @@ def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=36.*"
+        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=37.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)

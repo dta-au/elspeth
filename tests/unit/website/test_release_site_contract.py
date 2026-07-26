@@ -44,12 +44,13 @@ def test_changelog_describes_release_boundaries_precisely() -> None:
     assert "sink-effect-v1" not in release
 
 
-def test_changelog_keeps_071_historical_and_assigns_epoch_36_to_072() -> None:
+def test_changelog_keeps_071_historical_and_assigns_epoch_37_to_072() -> None:
     changelog = _text(ROOT / "CHANGELOG.md")
     release_072 = changelog.split("## 0.7.2", maxsplit=1)[1].split("## 0.7.1", maxsplit=1)[0]
     release_071 = changelog.split("## 0.7.1", maxsplit=1)[1].split("## 0.7.0", maxsplit=1)[0]
 
-    assert "SESSION_SCHEMA_EPOCH` advances from 35\nto 36" in release_072
+    assert "SESSION_SCHEMA_EPOCH` advances from 35\nto 37" in release_072
+    assert "coordination schema" in release_072
     assert "retryable" in release_072 and "blob deletion" in release_072.lower()
     assert "install\n0.7.2" in release_072
 
@@ -145,7 +146,7 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert "npm install" in html and "npm run build" in html
     assert "ELSPETH_WEB__SECRET_KEY" in html
     assert "elspeth composer users add" in html and "--password" in html
-    assert "SESSION_SCHEMA_EPOCH" in html and "35 → 36" in html
+    assert "SESSION_SCHEMA_EPOCH" in html and "35 → 37" in html
     assert "guided schema remains at 10" in html
     assert "SQLITE_SCHEMA_EPOCH" in html and "remains at 29" in html
     assert "aws-ecs-deployment.md" in html

@@ -31,6 +31,19 @@ from elspeth.web.sessions.models import (
 _SQLITE_INTERNAL_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
 _SESSION_METADATA_CREATE_LOCK = Lock()
 
+_EPOCH_37_COORDINATION_EXPIRY_INDEXES: dict[str, str] = {
+    "web_instances": "ix_web_instances_lease_expires_at",
+    "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
+    "run_start_permits": "ix_run_start_permits_retention_expires_at",
+    "websocket_tickets": "ix_websocket_tickets_expires_at",
+    "composer_inflight_requests": "ix_composer_inflight_requests_expires_at",
+    "composer_progress_snapshots": "ix_composer_progress_snapshots_expires_at",
+    "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
+    "rate_limit_events": "ix_rate_limit_events_expires_at",
+    "sessions_cleanup_claims": "ix_sessions_cleanup_claims_lease_expires_at",
+}
+_EPOCH_37_COORDINATION_TABLES: frozenset[str] = frozenset({*_EPOCH_37_COORDINATION_EXPIRY_INDEXES, "run_execution_inputs"})
+
 # Required audit triggers. Both supported database dialects install these
 # stable trigger names to enforce invariants
 # that cannot be expressed as table CHECK constraints:
@@ -321,6 +334,7 @@ def _validate_current_schema(bind: Engine | Connection) -> None:
     # collector now also compares each live index predicate: a one-sided
     # sqlite_where/postgresql_where declaration cannot be discovered by
     # inspecting only the current runtime dialect.
+    _validate_epoch_37_coordination_metadata()
     _validate_partial_index_dialect_symmetry()
 
     inspector = inspect(bind)
@@ -344,6 +358,39 @@ def _validate_current_schema(bind: Engine | Connection) -> None:
         _schema_error(first.subject, expected=first.expected, actual=first.actual)
 
     _validate_required_triggers(bind)
+
+
+def _validate_epoch_37_coordination_metadata() -> None:
+    """Pin the hard-cut authority tables independently of reflected shape.
+
+    The generic metadata/live-schema comparison catches deployment drift, but
+    cannot catch an accidental edit that removes the same table or expiry index
+    from the declared metadata. Epoch 37 names this exact coordination
+    substrate, so startup also verifies the model-side release contract.
+    """
+
+    if SESSION_SCHEMA_EPOCH != 37:
+        _schema_error("coordination schema epoch mismatch", expected=37, actual=SESSION_SCHEMA_EPOCH)
+    missing_tables = _EPOCH_37_COORDINATION_TABLES - set(metadata.tables)
+    if missing_tables:
+        _schema_error(
+            "epoch-37 coordination table set mismatch",
+            expected=sorted(_EPOCH_37_COORDINATION_TABLES),
+            actual=sorted(_EPOCH_37_COORDINATION_TABLES - missing_tables),
+        )
+    deleted_identity_tables = sorted(name for name in metadata.tables if "deleted" in name and "session" in name)
+    if deleted_identity_tables:
+        _schema_error("deleted-session registry is forbidden", expected=[], actual=deleted_identity_tables)
+
+    for table_name, expiry_index_name in _EPOCH_37_COORDINATION_EXPIRY_INDEXES.items():
+        table = metadata.tables[table_name]
+        index_names = {index.name for index in table.indexes}
+        if expiry_index_name not in index_names:
+            _schema_error(
+                f"{table_name} expiry index mismatch",
+                expected=expiry_index_name,
+                actual=sorted(name for name in index_names if name is not None),
+            )
 
 
 def _validate_required_triggers(bind: Engine | Connection) -> None:

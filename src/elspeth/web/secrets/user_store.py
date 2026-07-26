@@ -105,9 +105,12 @@ def _secret_binary_to_bytes(name: str, field_name: str, value: object) -> bytes:
 _UpsertBuilder = Callable[[sa.Table, dict[str, Any]], Any]
 
 
-def _upsert_update_mapping(insert_namespace: Any) -> dict[str, Any]:
+def _upsert_update_mapping(table: sa.Table, insert_namespace: Any) -> dict[str, Any]:
     """Build the per-column update mapping for dialect-specific upsert clauses."""
-    return {column: getattr(insert_namespace, column) for column in _USER_SECRET_UPSERT_UPDATE_COLUMNS}
+    return {
+        **{column: getattr(insert_namespace, column) for column in _USER_SECRET_UPSERT_UPDATE_COLUMNS},
+        "version": table.c.version + 1,
+    }
 
 
 def _resolve_upsert_builder(engine: Engine) -> _UpsertBuilder:
@@ -126,7 +129,7 @@ def _resolve_upsert_builder(engine: Engine) -> _UpsertBuilder:
             stmt = _sqlite_insert(table).values(**values)
             return stmt.on_conflict_do_update(
                 index_elements=list(_USER_SECRET_CONFLICT_COLUMNS),
-                set_=_upsert_update_mapping(stmt.excluded),
+                set_=_upsert_update_mapping(table, stmt.excluded),
             )
 
         return _sqlite_upsert
@@ -137,7 +140,7 @@ def _resolve_upsert_builder(engine: Engine) -> _UpsertBuilder:
             stmt = _pg_insert(table).values(**values)
             return stmt.on_conflict_do_update(
                 index_elements=list(_USER_SECRET_CONFLICT_COLUMNS),
-                set_=_upsert_update_mapping(stmt.excluded),
+                set_=_upsert_update_mapping(table, stmt.excluded),
             )
 
         return _pg_upsert
@@ -146,7 +149,7 @@ def _resolve_upsert_builder(engine: Engine) -> _UpsertBuilder:
 
         def _mysql_upsert(table: sa.Table, values: dict[str, Any]) -> Any:
             stmt = _mysql_insert(table).values(**values)
-            return stmt.on_duplicate_key_update(**_upsert_update_mapping(stmt.inserted))
+            return stmt.on_duplicate_key_update(**_upsert_update_mapping(table, stmt.inserted))
 
         return _mysql_upsert
     raise NotImplementedError(
@@ -279,6 +282,7 @@ class UserSecretStore:
             "auth_provider_type": auth_provider_type,
             "encrypted_value": encrypted,
             "salt": salt,
+            "version": 1,
             "created_at": now,
             "updated_at": now,
         }

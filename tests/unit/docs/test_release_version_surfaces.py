@@ -73,7 +73,7 @@ def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
 
     sharing = _text("docs/guides/sharing-pipelines.md")
     assert "For 0.7.2" in sharing
-    assert "SESSION_SCHEMA_EPOCH=36" in sharing
+    assert "SESSION_SCHEMA_EPOCH=37" in sharing
     assert "SQLITE_SCHEMA_EPOCH=29" in sharing
 
     aws = _text("docs/runbooks/aws-ecs-deployment.md")
@@ -81,3 +81,4 @@ def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
     assert '"candidate_package_version": "0.7.2"' in aws
     assert '"previous_package_version": "0.7.1"' in aws
     assert '"previous": {"session_epoch": 35, "landscape_epoch": 29' in aws
+    assert '"structural_changes": "session_epoch_35_to_37_coordination_schema"' in aws
