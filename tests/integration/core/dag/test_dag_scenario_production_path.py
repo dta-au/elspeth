@@ -50,6 +50,11 @@ B1_RUNTIME_CASES = (
     ("conditional-routing", "error-route-and-discard"),
 )
 
+B2_PARTIAL_TERMINAL_FAILURE_CASE = (
+    "fork-multiple-terminals-partial-failure",
+    "one-terminal-fails",
+)
+
 
 def _declared_case(scenario_id: str, case_id: str) -> tuple[ScenarioSpec, HarnessCaseSpec]:
     return next((scenario, case) for scenario, case in iter_harness_cases(MANIFEST) if (scenario.id, case.id) == (scenario_id, case_id))
@@ -77,7 +82,6 @@ def test_b1_runtime_table_executes_exact_production_oracle(
     install_corpus_plugin_manager(monkeypatch)
 
     evidence = run_scenario_case(scenario, case, tmp_path)
-
     _assert_declared_run_evidence(scenario, case, evidence)
 
 
@@ -213,6 +217,71 @@ def test_b1_conditional_routing_proves_error_route_discard_and_audit_parity(
         ("primary:1#0", "failure", "on_error_routed", "errors"),
         ("primary:2#0", "failure", "on_error_routed", "errors"),
     ]
+
+
+def test_b2_partial_terminal_failure_executes_exact_production_oracle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case(*B2_PARTIAL_TERMINAL_FAILURE_CASE)
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    _assert_declared_run_evidence(scenario, case, evidence)
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    assert evidence.runtime.status == "completed_with_failures"
+    assert [(output.sink_name, output.rows) for output in evidence.runtime.sink_outputs] == [
+        (
+            "survivor",
+            (
+                '{"id":1,"value":10}',
+                '{"id":2,"value":20}',
+                '{"id":3,"value":30}',
+            ),
+        ),
+    ]
+    assert [
+        (disposition.token_key, disposition.outcome, disposition.path, disposition.sink_name)
+        for disposition in projection.terminal_dispositions
+    ] == [
+        ("primary:0#0", "transient", "fork_parent", None),
+        ("primary:0#1", "failure", "sink_discarded", "__discard__"),
+        ("primary:0#2", "success", "default_flow", "survivor"),
+        ("primary:1#0", "transient", "fork_parent", None),
+        ("primary:1#1", "failure", "sink_discarded", "__discard__"),
+        ("primary:1#2", "success", "default_flow", "survivor"),
+        ("primary:2#0", "transient", "fork_parent", None),
+        ("primary:2#1", "failure", "sink_discarded", "__discard__"),
+        ("primary:2#2", "success", "default_flow", "survivor"),
+    ]
+    assert [token.key for token in projection.tokens] == [
+        "primary:0#0",
+        "primary:0#1",
+        "primary:0#2",
+        "primary:1#0",
+        "primary:1#1",
+        "primary:1#2",
+        "primary:2#0",
+        "primary:2#1",
+        "primary:2#2",
+    ]
+    assert [token.parents for token in projection.tokens] == [
+        (),
+        ("primary:0#0",),
+        ("primary:0#0",),
+        (),
+        ("primary:1#0",),
+        ("primary:1#0",),
+        (),
+        ("primary:2#0",),
+        ("primary:2#0",),
+    ]
+    assert tuple(work.token_key for work in projection.scheduler_work) == tuple(token.key for token in projection.tokens)
+    assert all(work.final_status == "terminal" for work in projection.scheduler_work)
+    assert not (tmp_path / "failing.jsonl").exists()
+    assert evidence.audit.portable_projection == projection
 
 
 def _copy_conditional_routing_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[HarnessCaseSpec, Path]:

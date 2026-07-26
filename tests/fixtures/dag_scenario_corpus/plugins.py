@@ -9,11 +9,21 @@ import pytest
 
 from elspeth.contracts import Determinism, PipelineRow, PluginSchema
 from elspeth.contracts.errors import TransformSuccessReason
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+from elspeth.contracts.sink_effects import (
+    RestrictedSinkEffectContext,
+    SinkEffectPipelineMembersInput,
+    SinkEffectPlan,
+    SinkEffectPrepareRequest,
+)
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribution
+from elspeth.plugins.sinks._local_file_effects import prepare_local_effect
+from elspeth.plugins.sinks.json_sink import JSONSink
 
 
 class CorpusInputSchema(PluginSchema):
@@ -41,6 +51,36 @@ class CorpusAlwaysErrorTransform(BaseTransform):
                 "error": "injected DAG corpus routed error",
             },
             retryable=False,
+        )
+
+
+class CorpusAlwaysFailSink(JSONSink):
+    """Corpus JSON sink that deterministically diverts every member."""
+
+    name = "dag_corpus_always_fail_sink"
+    determinism = Determinism.IO_WRITE
+
+    def prepare_effect(self, request: SinkEffectPrepareRequest, ctx: RestrictedSinkEffectContext) -> SinkEffectPlan:
+        if type(request.effect_input) is not SinkEffectPipelineMembersInput:
+            return super().prepare_effect(request, ctx)
+        del ctx
+        reason = "injected DAG corpus terminal sink failure"
+        members = request.effect_input.members
+        diverted = tuple(member.ordinal for member in members)
+        for member in members:
+            self._divert_row(deep_thaw(member.row), row_index=member.ordinal, reason=reason)
+        return prepare_local_effect(
+            effect_id=request.effect_id,
+            input_kind=request.input_kind,
+            inspection=request.inspection,
+            chunks=(),
+            row_count=len(members),
+            accepted_ordinals=(),
+            diverted_ordinals=diverted,
+            encoding="utf-8",
+            format_name="jsonl",
+            stream_sequence=0,
+            diversion_attribution=tuple(build_diversion_attribution(ordinal=ordinal, reason=reason) for ordinal in diverted),
         )
 
 
@@ -109,6 +149,12 @@ def make_corpus_plugin_manager() -> PluginManager:
         create_dynamic_hookimpl(
             [CorpusAlwaysErrorTransform, CorpusFailOnceEOFBatchTransform],
             "elspeth_get_transforms",
+        )
+    )
+    manager.register(
+        create_dynamic_hookimpl(
+            [CorpusAlwaysFailSink],
+            "elspeth_get_sinks",
         )
     )
     return manager

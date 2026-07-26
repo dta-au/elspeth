@@ -1298,7 +1298,9 @@ def _sink_outputs(rendered: RenderedScenario) -> tuple[SinkOutputProjection, ...
     outputs: list[SinkOutputProjection] = []
     for sink_name, output_path in rendered.output_paths.items():
         if not output_path.is_file():
-            raise AssertionError(f"DAG corpus sink {sink_name!r} did not produce {output_path.name!r}")
+            if rendered.settings.sinks[sink_name].plugin != "dag_corpus_always_fail_sink":
+                raise AssertionError(f"DAG corpus sink {sink_name!r} did not produce {output_path.name!r}")
+            continue
         rows = tuple(
             json.dumps(json.loads(line), sort_keys=True, separators=(",", ":"))
             for line in output_path.read_text(encoding="utf-8").splitlines()

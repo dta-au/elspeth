@@ -25,6 +25,7 @@ from tests.fixtures.dag_scenario_corpus.loader import (
 )
 from tests.fixtures.dag_scenario_corpus.plugins import (
     CorpusAlwaysErrorTransform,
+    CorpusAlwaysFailSink,
     CorpusFailOnceEOFBatchTransform,
     CorpusInputSchema,
     CorpusOutputSchema,
@@ -147,8 +148,8 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
-        "partial",
+        "pass",
+        "pass",
         "unknown",
         "unknown",
         "pass",
@@ -368,14 +369,15 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "3e83fcff25bcb570bb16f8deb37b01fc8b9f542678f3dad9a548178f0dcfde50"
-EXPECTED_CASE_REGISTRY_SHA256 = "252aa85fd1129859168092e8e1488c9237ae9c8ea91a784f369923c375e55cd6"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "b9e8fb59e549b8d0fa111936eb561b09d321a3162351983f973792babc251fac"
+EXPECTED_CASE_REGISTRY_SHA256 = "4a7ff396d8a71d93df5f9105a3fec53922e750a9ccb2fd165b16b97e69636d99"
 EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
     "multi-source-queue-fan-in:queued-fan-in": "ccff919ce91062633679fcbe577194b4ce3c852a90c1f8f97622ac371b377c4e",
     "conditional-routing:two-way-gate": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
     "conditional-routing:error-route-and-discard": "27dbf1f2d1908a6f6f3df8166bff152e56977d93ffc4061c91c48871c26a282b",
+    "fork-multiple-terminals-partial-failure:one-terminal-fails": "e0505f84e778047f4d68a47e27f442d82824b898cf58fe5cb084842cfbbdb925",
     "fork-coalesce-policies:require-all-nested": "55b934bdb55c478ec552209008eda10bc6b211b6a17d8844acbf81609772acd2",
     "checkpoint-deterministic-resume:reopen-resume": "ce62216ce20210600f1a9c20e362aaf299c7538e6c4d3bd0e97627563dc813e6",
 }
@@ -409,6 +411,11 @@ EXPECTED_HARNESS_EVIDENCE = (
     (
         "harness-conditional-routing-error-route-and-discard",
         "conditional-routing:error-route-and-discard",
+        ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-fork-multiple-terminals-partial-failure-one-terminal-fails",
+        "fork-multiple-terminals-partial-failure:one-terminal-fails",
         ("config", "build", "runtime", "audit"),
     ),
     (
@@ -598,6 +605,36 @@ sinks:
     on_write_failure: discard
     options:
       path: ${output_errors}
+      format: jsonl
+      schema: {mode: observed}
+"""
+
+EXPECTED_ONE_TERMINAL_FAILS_YAML = b"""sources:
+  primary:
+    plugin: csv
+    on_success: fork_input
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: fork_terminals
+    input: fork_input
+    condition: "True"
+    routes: {"true": fork, "false": discard}
+    fork_to: [failing, survivor]
+sinks:
+  failing:
+    plugin: dag_corpus_always_fail_sink
+    on_write_failure: discard
+    options:
+      path: ${output_failing}
+      schema: {mode: observed}
+  survivor:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_survivor}
       format: jsonl
       schema: {mode: observed}
 """
@@ -1730,6 +1767,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
+        ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-coalesce-policies", "require-all-nested"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
@@ -1745,11 +1783,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 60
+    assert len(manifest.evidence) == 61
     assert len(assessment_evidence) == 53
-    assert len(harness_evidence) == 7
-    assert len({reference.id for reference in manifest.evidence}) == 60
-    assert len({reference.locator for reference in manifest.evidence}) == 60
+    assert len(harness_evidence) == 8
+    assert len({reference.id for reference in manifest.evidence}) == 61
+    assert len({reference.locator for reference in manifest.evidence}) == 61
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -1767,6 +1805,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
+        ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-coalesce-policies", "require-all-nested"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
@@ -1814,6 +1853,10 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("conditional-routing", "build"),
             ("conditional-routing", "runtime"),
             ("conditional-routing", "audit"),
+        ),
+        "harness-fork-multiple-terminals-partial-failure-one-terminal-fails": (
+            ("fork-multiple-terminals-partial-failure", "runtime"),
+            ("fork-multiple-terminals-partial-failure", "audit"),
         ),
         "harness-fork-coalesce-policies-require-all-nested": (
             ("fork-coalesce-policies", "config"),
@@ -1869,18 +1912,25 @@ def test_corpus_plugin_manager_exposes_builtins_and_custom_through_public_instan
         {"fault_marker_path": str(tmp_path / "fault.marker")},
     )
     always_error = manager.create_transform("dag_corpus_always_error", {"schema": {"mode": "observed"}})
+    always_fail = manager.create_sink(
+        "dag_corpus_always_fail_sink",
+        {"path": str(tmp_path / "failing.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
+    )
 
-    assert (csv_source.name, passthrough.name, json_sink.name, custom.name, always_error.name) == (
+    assert (csv_source.name, passthrough.name, json_sink.name, custom.name, always_error.name, always_fail.name) == (
         "csv",
         "passthrough",
         "json",
         "dag_corpus_fail_once_eof_batch",
         "dag_corpus_always_error",
+        "dag_corpus_always_fail_sink",
     )
     registered_transform: object = manager.get_transform_by_name("dag_corpus_fail_once_eof_batch")
     assert registered_transform is CorpusFailOnceEOFBatchTransform
     registered_always_error: object = manager.get_transform_by_name("dag_corpus_always_error")
     assert registered_always_error is CorpusAlwaysErrorTransform
+    registered_always_fail: object = manager.get_sink_by_name("dag_corpus_always_fail_sink")
+    assert registered_always_fail is CorpusAlwaysFailSink
     assert manager_module.get_shared_plugin_manager() is manager
 
 
@@ -1971,6 +2021,8 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         "conditional-routing/two-way-gate.yaml": EXPECTED_TWO_WAY_GATE_YAML,
         "conditional-routing/error-route-and-discard.yaml": EXPECTED_ERROR_ROUTE_AND_DISCARD_YAML,
         "conditional-routing/input.csv": EXPECTED_INPUT_CSV,
+        "fork-multiple-terminals-partial-failure/one-terminal-fails.yaml": EXPECTED_ONE_TERMINAL_FAILS_YAML,
+        "fork-multiple-terminals-partial-failure/input.csv": EXPECTED_INPUT_CSV,
         "fork-coalesce-policies/require-all-nested.yaml": EXPECTED_REQUIRE_ALL_NESTED_YAML,
         "fork-coalesce-policies/input.csv": EXPECTED_INPUT_CSV,
         "checkpoint-deterministic-resume/reopen-resume.yaml": EXPECTED_REOPEN_RESUME_YAML,
@@ -2017,6 +2069,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
+        ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-coalesce-policies", "require-all-nested"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     ],

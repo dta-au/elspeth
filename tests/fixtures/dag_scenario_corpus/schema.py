@@ -351,8 +351,11 @@ class RunExpectation(ClosedModel):
             raise ValueError("audit_record_counts must contain unique sorted record types")
         if self.rows_processed != len(self.projection.rows):
             raise ValueError("rows_processed must equal projected row count")
-        if self.rows_succeeded + self.rows_failed != self.rows_processed:
-            raise ValueError("rows_succeeded plus rows_failed must equal rows_processed")
+        dispositions = self.projection.terminal_dispositions
+        if self.rows_succeeded != sum(disposition.outcome == "success" for disposition in dispositions):
+            raise ValueError("rows_succeeded must equal projected successful terminal dispositions")
+        if self.rows_failed != sum(disposition.outcome == "failure" for disposition in dispositions):
+            raise ValueError("rows_failed must equal projected failed terminal dispositions")
         return self
 
 
@@ -593,8 +596,11 @@ class RuntimeEvidence(ClosedModel):
                 raise ValueError("runtime sink outputs must contain unique sorted sink names")
             if self.rows_processed != len(self.durable_projection.rows):
                 raise ValueError("runtime rows_processed must equal projected row count")
-            if self.rows_succeeded + self.rows_failed != self.rows_processed:
-                raise ValueError("runtime success and failure counts must equal rows_processed")
+            dispositions = self.durable_projection.terminal_dispositions
+            if self.rows_succeeded != sum(disposition.outcome == "success" for disposition in dispositions):
+                raise ValueError("runtime rows_succeeded must equal projected successful terminal dispositions")
+            if self.rows_failed != sum(disposition.outcome == "failure" for disposition in dispositions):
+                raise ValueError("runtime rows_failed must equal projected failed terminal dispositions")
             if self.output_rows != sum(len(output.rows) for output in self.sink_outputs):
                 raise ValueError("runtime output_rows must equal exact sink output row count")
         if not self.attempted and (self.sink_outputs or self.durable_projection is not None):
