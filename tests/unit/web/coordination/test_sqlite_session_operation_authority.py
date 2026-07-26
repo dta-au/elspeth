@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import MetaData, Table, column, delete, event, insert, literal, select, table, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
@@ -470,6 +471,71 @@ def test_sqlite_fenced_mutation_refuses_unsafe_statement_and_rolls_back(engine, 
         refused = True
 
     assert _snapshot_mutation_scope(engine, session_ids=session_ids, message_ids=selected_message_ids) == before
+    assert refused is True
+
+
+@pytest.mark.parametrize(
+    "assignment_shape",
+    (
+        "child_values_string",
+        "child_values_column_unchanged",
+        "child_ordered_string",
+        "child_ordered_column",
+        "parent_values_id_unchanged",
+        "parent_ordered_id_unchanged",
+        "dialect_upsert",
+    ),
+)
+def test_sqlite_fenced_update_rejects_every_ownership_assignment(engine, assignment_shape: str) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session_a = _created(authority)
+    session_b = _created(authority)
+    cleanup_id = str(uuid4())
+    with engine.begin() as conn:
+        conn.execute(insert(blob_deletion_cleanups_table).values(**_cleanup_values(cleanup_id=cleanup_id, session_id=str(session_a.id))))
+    fence = authority.acquire(
+        session_id=session_a.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    session_ids = (str(session_a.id), str(session_b.id))
+    before = _snapshot_mutation_scope(engine, session_ids=session_ids, message_ids=(), cleanup_ids=(cleanup_id,))
+
+    if assignment_shape == "child_values_string":
+        statement = update(blob_deletion_cleanups_table).values(session_id=str(session_b.id))
+    elif assignment_shape == "child_values_column_unchanged":
+        statement = update(blob_deletion_cleanups_table).values({blob_deletion_cleanups_table.c.session_id: str(session_a.id)})
+    elif assignment_shape == "child_ordered_string":
+        statement = update(blob_deletion_cleanups_table).ordered_values(("session_id", str(session_b.id)))
+    elif assignment_shape == "child_ordered_column":
+        statement = update(blob_deletion_cleanups_table).ordered_values((blob_deletion_cleanups_table.c.session_id, str(session_b.id)))
+    elif assignment_shape == "parent_values_id_unchanged":
+        statement = update(sessions_table).values(id=str(session_a.id))
+    elif assignment_shape == "parent_ordered_id_unchanged":
+        statement = update(sessions_table).ordered_values(("id", str(session_a.id)))
+    else:
+        statement = (
+            sqlite_insert(blob_deletion_cleanups_table)
+            .values(**_cleanup_values(cleanup_id=cleanup_id, session_id=str(session_a.id)))
+            .on_conflict_do_update(
+                index_elements=(blob_deletion_cleanups_table.c.blob_id,),
+                set_={"session_id": str(session_b.id)},
+            )
+        )
+
+    refused = False
+
+    def mutate_then_reassign(transaction) -> None:
+        transaction.execute(update(sessions_table).values(title="must roll back ownership reassignment"))
+        transaction.execute(statement)
+
+    try:
+        authority.mutate(fence, mutate_then_reassign)
+    except ValueError:
+        refused = True
+
+    assert _snapshot_mutation_scope(engine, session_ids=session_ids, message_ids=(), cleanup_ids=(cleanup_id,)) == before
     assert refused is True
 
 

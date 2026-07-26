@@ -192,9 +192,24 @@ class _RepositoryMutationTransaction:
         self._validate_statement_references(statement, target=target)
         if isinstance(statement, Insert):
             return self._normalize_insert(statement, target=target)
+        if isinstance(statement, Update):
+            self._reject_ownership_update(statement, target=target)
         return statement.where(self._scope_predicate(target))
 
+    @staticmethod
+    def _reject_ownership_update(statement: Update, *, target: Table) -> None:
+        ownership_name = "id" if target is sessions_table else "session_id"
+        assignments = statement._ordered_values
+        if assignments is None:
+            assignments = list((statement._values or {}).items())
+        for key, _value in assignments:
+            key_name = key if isinstance(key, str) else getattr(key, "name", None)
+            if key_name == ownership_name:
+                raise ValueError("fenced updates cannot assign the session ownership key")
+
     def _normalize_insert(self, statement: Insert, *, target: Table) -> Insert:
+        if statement._post_values_clause is not None:
+            raise ValueError("fenced inserts reject dialect upsert and conflict modifiers")
         if statement.select is not None or statement._multi_values:
             raise ValueError("fenced inserts support one values row only")
         values = statement._values
