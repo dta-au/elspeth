@@ -4,9 +4,12 @@ This directory holds the evergreen, executable inventory used to answer a
 specific question: which parts of Elspeth's mandatory directed acyclic graph
 (DAG) lifecycle have current production-path evidence?
 
-Start with the [v1 manifest](v1/manifest.yaml). It contains all 15 mandatory
+Start with the [v1 corpus manifest](v1/manifest.yaml). It contains all 15 mandatory
 scenarios, all 11 assessment dimensions, the evidence registry, owned gaps,
 observable exit gates, and the cases that the production-path harness runs.
+The `v1/` directory names the corpus revision; the manifest's serialized
+`schema_version` is independently versioned and is currently `2`. Schema v2
+preserves each durable token parent as an explicit ordinal/key pair.
 The [DAG information hub](../README.md) supplies the broader completeness
 assessment and remediation context.
 
@@ -40,8 +43,16 @@ records that exact graph shape plus a separately computed topology hash.
 It does not create an audit database or an orchestrator, and its runtime,
 audit, and recovery evidence remains explicitly unattempted. A `build` case is
 therefore executable evidence only for `config` and `build`; it cannot support
-runtime, audit, or recovery cells. The `run` and `recovery` workflows continue
-to use `RunExpectation` and cross their declared later lifecycle stages.
+runtime, audit, or recovery cells. A `run` or `recovery` case may use the
+exact-audit `RunExpectation` or the narrower `SummaryRunExpectation`, which
+pins only overall status, output count, and required audit record types. A
+summary expectation cannot by itself establish exact runtime, audit, or
+recovery completeness. A `run` case may instead use
+`SemanticRunExpectation` when scheduler ordering prevents a stable raw
+identity oracle. That expectation pins exact outputs, counters, record counts,
+and an order-insensitive runtime projection, but deliberately excludes raw
+audit identity. Its harness evidence is therefore limited to exactly
+`[config, build, runtime]` and cannot support an audit or recovery pass.
 
 The manifest does not replace the criteria, and a dated assessment does not
 replace the live manifest. Documentary evidence can explain a cell, but only
@@ -75,12 +86,15 @@ For a corpus harness case:
 2. Add a case beneath that scenario's `cases` list. Its locator is
    `<scenario-id>:<case-id>`.
 3. Select the narrowest honest workflow: `build` with an exact
-   `BuildExpectation`, `run` with a `RunExpectation`, or `recovery` with a
-   `RunExpectation`. The schema rejects mismatched workflow and expectation
-   kinds.
+   `BuildExpectation`; `run` with an exact-audit `RunExpectation`, a
+   runtime-only `SemanticRunExpectation`, or a `SummaryRunExpectation`; or
+   `recovery` with an exact-audit `RunExpectation` or
+   `SummaryRunExpectation`. The schema rejects build expectations on later
+   workflows and semantic-runtime expectations on recovery.
 4. Add one top-level evidence record with `kind: harness`, the same locator,
    a precise claim, and only the stages it proves. Build-only evidence must use
-   exactly `[config, build]`.
+   exactly `[config, build]`; semantic-runtime evidence must use exactly
+   `[config, build, runtime]`.
 5. Reference that evidence ID only from cells its assertions actually prove.
 6. Extend the table-driven assertions in the
    [production-path integration test](../../../../tests/integration/core/dag/test_dag_scenario_production_path.py)

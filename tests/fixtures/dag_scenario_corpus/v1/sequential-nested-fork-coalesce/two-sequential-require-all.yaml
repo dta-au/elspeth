@@ -1,0 +1,39 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: first_fork_input
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+concurrency:
+  max_workers: 1
+gates:
+  - name: first_fork
+    input: first_fork_input
+    condition: "True"
+    routes: {"true": fork, "false": output}
+    fork_to: [branch_a1, branch_a2]
+  - name: second_fork
+    input: merge_a
+    condition: "True"
+    routes: {"true": fork, "false": output}
+    fork_to: [branch_b1, branch_b2]
+coalesce:
+  - name: merge_a
+    branches: {branch_a1: branch_a1, branch_a2: branch_a2}
+    policy: require_all
+    merge: nested
+  - name: merge_b
+    branches: {branch_b1: branch_b1, branch_b2: branch_b2}
+    policy: require_all
+    merge: nested
+    on_success: output
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_output}
+      format: jsonl
+      schema: {mode: observed}

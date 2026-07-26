@@ -64,10 +64,14 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     RuntimeEvidence,
     ScenarioRunEvidence,
     ScenarioSpec,
+    SemanticProjectionCounts,
+    SemanticRuntimeProjection,
+    SemanticTokenProjection,
     SinkOutputProjection,
     StableAuditRecordProjection,
     StableAuditRecordType,
     StableNodeStateProjection,
+    StableParentProjection,
     StableRouteProjection,
     StableRowProjection,
     StableRunProjection,
@@ -378,6 +382,23 @@ def _stable_ref(
         return refs[str(raw_ref)]
     except KeyError as exc:
         raise AssertionError(f"DAG corpus {source} {record_type} references unknown {field} {raw_ref!r}") from exc
+
+
+def _ordered_parent_links(
+    token_id: str,
+    parent_links: list[tuple[int, str]],
+    token_keys: Mapping[str, str],
+) -> tuple[StableParentProjection, ...]:
+    """Preserve the exact durable parent ordinals without reindexing them."""
+
+    ordered_links = tuple(sorted(parent_links))
+    ordinals = tuple(ordinal for ordinal, _parent_id in ordered_links)
+    parent_ids = tuple(parent_id for _ordinal, parent_id in ordered_links)
+    if len(ordinals) != len(set(ordinals)):
+        raise AssertionError(f"DAG corpus token {token_id!r} has duplicate durable parent ordinals {ordinals!r}")
+    if len(parent_ids) != len(set(parent_ids)):
+        raise AssertionError(f"DAG corpus token {token_id!r} has duplicate durable parents {parent_ids!r}")
+    return tuple(StableParentProjection(ordinal=ordinal, parent_key=token_keys[parent_id]) for ordinal, parent_id in ordered_links)
 
 
 def _stable_audit_records(
@@ -812,13 +833,14 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
     parents_by_token: defaultdict[str, list[tuple[int, str]]] = defaultdict(list)
     for record in (record for record in records if record.get("record_type") == "token_parent"):
         parents_by_token[str(record["token_id"])].append((int(record["ordinal"]), str(record["parent_token_id"])))
+    ordered_parents_by_token = {
+        token_id: _ordered_parent_links(token_id, parent_links, token_keys) for token_id, parent_links in parents_by_token.items()
+    }
     tokens = tuple(
         StableTokenProjection(
             key=stable_key,
             row_key=rows_by_id[str(record["row_id"])],
-            parents=tuple(
-                sorted(token_keys[parent_id] for _ordinal, parent_id in parents_by_token[str(record["token_id"])]),
-            ),
+            parents=ordered_parents_by_token.get(str(record["token_id"]), ()),
             branch_name=str(record["branch_name"]) if record.get("branch_name") is not None else None,
         )
         for record in (record for record in records if record.get("record_type") == "token")
@@ -946,6 +968,63 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
             token_keys=token_keys,
             state_keys=state_keys,
         ),
+    )
+
+
+def semantic_runtime_projection(projection: StableRunProjection) -> SemanticRuntimeProjection:
+    """Return order-insensitive runtime facts without weakening raw audit identity."""
+
+    semantic_states: list[StableNodeStateProjection] = []
+    for state in projection.node_states:
+        context_after = state.context_after
+        if context_after is not None:
+            context = json.loads(context_after)
+            if context.get("policy") == "require_all":
+                branches_arrived = context.get("branches_arrived")
+                if isinstance(branches_arrived, list):
+                    context["branches_arrived"] = sorted(branches_arrived)
+                arrival_order = context.get("arrival_order")
+                if isinstance(arrival_order, list):
+                    context["arrival_order"] = sorted(
+                        arrival_order,
+                        key=lambda entry: str(entry.get("branch")) if isinstance(entry, dict) else _canonical_json(entry),
+                    )
+                context_after = _canonical_json(context)
+        semantic_states.append(state.model_copy(update={"context_after": context_after}))
+
+    return SemanticRuntimeProjection(
+        rows=projection.rows,
+        tokens=tuple(
+            SemanticTokenProjection(
+                key=token.key,
+                row_key=token.row_key,
+                parent_set=tuple(sorted(parent.parent_key for parent in token.parents)),
+                branch_name=token.branch_name,
+            )
+            for token in projection.tokens
+        ),
+        node_states=tuple(semantic_states),
+        routes=projection.routes,
+        terminal_dispositions=projection.terminal_dispositions,
+        scheduler_work=projection.scheduler_work,
+    )
+
+
+def semantic_runtime_projection_sha256(projection: SemanticRuntimeProjection) -> str:
+    """Bind the complete runtime-only semantic projection."""
+
+    return hashlib.sha256(contract_canonical_json(projection.model_dump(mode="json")).encode("utf-8")).hexdigest()
+
+
+def semantic_runtime_projection_counts(projection: SemanticRuntimeProjection) -> SemanticProjectionCounts:
+    return SemanticProjectionCounts(
+        rows=len(projection.rows),
+        tokens=len(projection.tokens),
+        parent_links=sum(len(token.parent_set) for token in projection.tokens),
+        node_states=len(projection.node_states),
+        routes=len(projection.routes),
+        terminal_dispositions=len(projection.terminal_dispositions),
+        scheduler_work=len(projection.scheduler_work),
     )
 
 
@@ -1441,7 +1520,7 @@ def _run_expected_error_case(
             ),
         )
         return ScenarioRunEvidence(
-            schema_version=1,
+            schema_version=2,
             scenario_id=scenario.id,
             case_id=case.id,
             fixture_sha256=rendered.fixture_sha256,
@@ -1506,7 +1585,7 @@ def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> 
         audit = _audit_evidence(records, portable_projection=portable_projection)
         result_data = result.to_dict()
         return ScenarioRunEvidence(
-            schema_version=1,
+            schema_version=2,
             scenario_id=scenario.id,
             case_id=case.id,
             fixture_sha256=rendered.fixture_sha256,
@@ -1541,7 +1620,7 @@ def _build_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -
     rendered = render_settings(case, tmp_path)
     built = build_scenario(rendered)
     return ScenarioRunEvidence(
-        schema_version=1,
+        schema_version=2,
         scenario_id=scenario.id,
         case_id=case.id,
         fixture_sha256=rendered.fixture_sha256,
@@ -1754,7 +1833,7 @@ def _recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path
 
         result_data = result.to_dict()
         return ScenarioRunEvidence(
-            schema_version=1,
+            schema_version=2,
             scenario_id=scenario.id,
             case_id=case.id,
             fixture_sha256=fresh_rendered.fixture_sha256,

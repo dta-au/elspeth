@@ -11,6 +11,7 @@ from typing import cast, get_args
 from urllib.parse import unquote, urlsplit
 
 import pytest
+import tests.fixtures.dag_scenario_corpus.harness as corpus_harness
 import tests.fixtures.dag_scenario_corpus.loader as loader_module
 import tests.fixtures.dag_scenario_corpus.schema as corpus_schema
 import yaml
@@ -175,9 +176,9 @@ EXPECTED_STATUS_MATRIX = {
     "sequential-nested-fork-coalesce": (
         "pass",
         "pass",
+        "pass",
+        "pass",
         "partial",
-        "unknown",
-        "unknown",
         "unknown",
         "unknown",
         "pass",
@@ -187,10 +188,10 @@ EXPECTED_STATUS_MATRIX = {
     ),
     "parallel-coalesces": (
         "pass",
+        "pass",
+        "pass",
+        "pass",
         "partial",
-        "partial",
-        "unknown",
-        "unknown",
         "unknown",
         "unknown",
         "pass",
@@ -364,6 +365,18 @@ EXPECTED_ASSESSMENT_LOCATORS = {
     "coalesce-policy-merge-contract-matrix": (
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_coalesce_full_matrix_declares_exact_contracts",
     ),
+    "sequential-nested-second-merge-schema-negative": (
+        "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_sequential_nested_rejects_incompatible_second_merge_schema",
+    ),
+    "parallel-coalesces-branch-ownership-negative": (
+        "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_parallel_coalesces_reject_cross_claimed_branch",
+    ),
+    "composed-coalesces-exact-contracts": (
+        "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_composed_coalesces_execute_exact_semantic_production_oracles",
+    ),
+    "composed-coalesces-repeat-run-boundary": (
+        "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_composed_coalesces_repeat_run_semantic_boundary",
+    ),
 }
 
 EXPECTED_ASSESSMENT_EVIDENCE = tuple(
@@ -374,8 +387,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "e985400ea6f0a18435cc1ec135c38537dcb3f1310daed539ebec1195a035d332"
-EXPECTED_CASE_REGISTRY_SHA256 = "2309f9da90d149c530c9cddbed2a290daa292b60b2fedef8ccb32fd89c259539"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ea35aca5d16f200f99df6ff2449b4193242972adf590d3e767aa7bf3c8320f49"
+EXPECTED_CASE_REGISTRY_SHA256 = "7dac26d82d6deffe9cfde48b3c8c5b3d01efe62cfa82c7170dc4e1aa0ed050c4"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -426,6 +439,8 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "fork-coalesce-policies:union-collision-last-wins": "986df56cc9ca6ceeab7ccd5472f0c5605e296d48054112487d72b05174d2a6dd",
     "fork-coalesce-policies:union-collision-first-wins": "8a20e5eceb01859427ac5e60d0e370f8ba100a7b9ce0903b2ca6e28f288073c7",
     "fork-coalesce-policies:union-collision-fail": "973269df09a38f4beabc778c2b06365a10363444229530974e71888f98a4d57f",
+    "sequential-nested-fork-coalesce:two-sequential-require-all": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
+    "parallel-coalesces:two-parallel-require-all": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
     "checkpoint-deterministic-resume:reopen-resume": "ce62216ce20210600f1a9c20e362aaf299c7538e6c4d3bd0e97627563dc813e6",
 }
 
@@ -469,15 +484,108 @@ EXPECTED_HARNESS_EVIDENCE = (
         (
             f"harness-fork-coalesce-policies-{case_id}",
             f"fork-coalesce-policies:{case_id}",
-            ("config", "build", "runtime", "audit"),
+            (("config", "build", "runtime", "audit") if case_id == "union-collision-fail" else ("config", "build", "runtime")),
         )
         for case_id in B2_COALESCE_CASE_IDS
+    ),
+    (
+        "harness-sequential-nested-fork-coalesce-two-sequential-require-all",
+        "sequential-nested-fork-coalesce:two-sequential-require-all",
+        ("config", "build", "runtime"),
+    ),
+    (
+        "harness-parallel-coalesces-two-parallel-require-all",
+        "parallel-coalesces:two-parallel-require-all",
+        ("config", "build", "runtime"),
     ),
 )
 
 EXPECTED_INPUT_CSV = b"id,value\n1,10\n2,20\n3,30\n"
 EXPECTED_ORDERS_CSV = b"id,value\n1,10\n2,20\n3,30\n"
 EXPECTED_REFUNDS_CSV = b"id,value\n101,-5\n102,-10\n103,-15\n"
+EXPECTED_SEQUENTIAL_COALESCE_YAML = b"""sources:
+  primary:
+    plugin: csv
+    on_success: first_fork_input
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+concurrency:
+  max_workers: 1
+gates:
+  - name: first_fork
+    input: first_fork_input
+    condition: "True"
+    routes: {"true": fork, "false": output}
+    fork_to: [branch_a1, branch_a2]
+  - name: second_fork
+    input: merge_a
+    condition: "True"
+    routes: {"true": fork, "false": output}
+    fork_to: [branch_b1, branch_b2]
+coalesce:
+  - name: merge_a
+    branches: {branch_a1: branch_a1, branch_a2: branch_a2}
+    policy: require_all
+    merge: nested
+  - name: merge_b
+    branches: {branch_b1: branch_b1, branch_b2: branch_b2}
+    policy: require_all
+    merge: nested
+    on_success: output
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_output}
+      format: jsonl
+      schema: {mode: observed}
+"""
+EXPECTED_PARALLEL_COALESCE_YAML = b"""sources:
+  primary:
+    plugin: csv
+    on_success: fork_input
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+concurrency:
+  max_workers: 1
+gates:
+  - name: parallel_fork
+    input: fork_input
+    condition: "True"
+    routes: {"true": fork, "false": left}
+    fork_to: [left_a, left_b, right_a, right_b]
+coalesce:
+  - name: merge_left
+    branches: {left_a: left_a, left_b: left_b}
+    policy: require_all
+    merge: nested
+    on_success: left
+  - name: merge_right
+    branches: {right_a: right_a, right_b: right_b}
+    policy: require_all
+    merge: nested
+    on_success: right
+sinks:
+  left:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_left}
+      format: jsonl
+      schema: {mode: observed}
+  right:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_right}
+      format: jsonl
+      schema: {mode: observed}
+"""
 
 DAG_HUB_PATH = REPOSITORY_ROOT / "docs/architecture/dag/README.md"
 CORPUS_README_PATH = REPOSITORY_ROOT / "docs/architecture/dag/scenario-corpus/README.md"
@@ -1164,7 +1272,7 @@ def _scenario(cell: EvidenceCell) -> ScenarioSpec:
 
 def _manifest(*cells: EvidenceCell) -> ScenarioManifest:
     return ScenarioManifest(
-        schema_version=1,
+        schema_version=2,
         criteria_ref="docs/reference/dag-completeness.md",
         evidence=(_reference(),),
         scenarios=tuple(_scenario(cell) for cell in cells),
@@ -1256,6 +1364,246 @@ def _exact_runtime_projection_values() -> dict[str, object]:
     }
 
 
+def test_stable_token_projection_preserves_durable_parent_ordinal_sequence() -> None:
+    token = corpus_schema.StableTokenProjection(
+        key="primary:0#2",
+        row_key="primary:0",
+        parents=(
+            {"ordinal": 1, "parent_key": "primary:0#1"},
+            {"ordinal": 3, "parent_key": "primary:0#0"},
+        ),
+    )
+
+    assert tuple((parent.ordinal, parent.parent_key) for parent in token.parents) == (
+        (1, "primary:0#1"),
+        (3, "primary:0#0"),
+    )
+    with pytest.raises(ValidationError, match="token parent keys must be unique"):
+        corpus_schema.StableTokenProjection(
+            key="primary:0#2",
+            row_key="primary:0",
+            parents=(
+                {"ordinal": 0, "parent_key": "primary:0#0"},
+                {"ordinal": 1, "parent_key": "primary:0#0"},
+            ),
+        )
+    with pytest.raises(ValidationError, match="token parent ordinals must be unique"):
+        corpus_schema.StableTokenProjection(
+            key="primary:0#2",
+            row_key="primary:0",
+            parents=(
+                {"ordinal": 1, "parent_key": "primary:0#0"},
+                {"ordinal": 1, "parent_key": "primary:0#1"},
+            ),
+        )
+    with pytest.raises(ValidationError, match="token parents must be sorted by durable ordinal"):
+        corpus_schema.StableTokenProjection(
+            key="primary:0#2",
+            row_key="primary:0",
+            parents=(
+                {"ordinal": 3, "parent_key": "primary:0#0"},
+                {"ordinal": 1, "parent_key": "primary:0#1"},
+            ),
+        )
+
+
+def test_harness_preserves_sparse_durable_parent_ordinals_before_semantic_set_projection() -> None:
+    token_keys = {"parent-a": "primary:0#1", "parent-b": "primary:0#0"}
+
+    links = corpus_harness._ordered_parent_links(
+        "merged-token",
+        [(3, "parent-a"), (1, "parent-b")],
+        token_keys,
+    )
+
+    assert tuple((link.ordinal, link.parent_key) for link in links) == (
+        (1, "primary:0#0"),
+        (3, "primary:0#1"),
+    )
+    assert tuple(sorted(link.parent_key for link in links)) == (
+        "primary:0#0",
+        "primary:0#1",
+    )
+    with pytest.raises(AssertionError, match="duplicate durable parent ordinals"):
+        corpus_harness._ordered_parent_links(
+            "merged-token",
+            [(1, "parent-a"), (1, "parent-b")],
+            token_keys,
+        )
+
+
+def test_semantic_runtime_token_projection_uses_an_explicit_parent_set() -> None:
+    token = corpus_schema.SemanticTokenProjection(
+        key="primary:0#2",
+        row_key="primary:0",
+        parent_set=("primary:0#0", "primary:0#1"),
+    )
+
+    assert token.parent_set == ("primary:0#0", "primary:0#1")
+    with pytest.raises(ValidationError, match="semantic token parent_set must be unique and sorted"):
+        corpus_schema.SemanticTokenProjection(
+            key="primary:0#2",
+            row_key="primary:0",
+            parent_set=("primary:0#1", "primary:0#0"),
+        )
+
+
+def test_semantic_runtime_projection_rejects_unknown_disposition_token_with_closed_validation_error() -> None:
+    values = _exact_runtime_projection_values()
+    values.pop("audit_records")
+    tokens = cast(tuple[dict[str, object], ...], values["tokens"])
+    values["tokens"] = tuple(
+        {
+            "key": token["key"],
+            "row_key": token["row_key"],
+            "parent_set": tuple(parent["parent_key"] for parent in cast(tuple[dict[str, object], ...], token["parents"])),
+        }
+        for token in tokens
+    )
+    values["terminal_dispositions"] = (
+        {
+            "key": "missing",
+            "token_key": "missing",
+            "outcome": "success",
+            "path": "default_flow",
+            "sink_name": "output",
+        },
+    )
+
+    with pytest.raises(ValidationError, match="semantic terminal dispositions must exactly cover tokens"):
+        corpus_schema.SemanticRuntimeProjection.model_validate(values)
+
+
+def test_semantic_runtime_projection_rejects_duplicate_dispositions_for_one_token() -> None:
+    values = _exact_runtime_projection_values()
+    values.pop("audit_records")
+    tokens = cast(tuple[dict[str, object], ...], values["tokens"])
+    values["tokens"] = tuple(
+        {
+            "key": token["key"],
+            "row_key": token["row_key"],
+            "parent_set": tuple(parent["parent_key"] for parent in cast(tuple[dict[str, object], ...], token["parents"])),
+        }
+        for token in tokens
+    )
+    values["terminal_dispositions"] = (
+        {
+            "key": "outcome-a",
+            "token_key": "primary:0#0",
+            "outcome": "success",
+            "path": "default_flow",
+            "sink_name": "output",
+        },
+        {
+            "key": "outcome-b",
+            "token_key": "primary:0#0",
+            "outcome": "success",
+            "path": "default_flow",
+            "sink_name": "output",
+        },
+    )
+
+    with pytest.raises(ValidationError, match="semantic terminal dispositions must exactly cover tokens one-to-one"):
+        corpus_schema.SemanticRuntimeProjection.model_validate(values)
+
+
+def _semantic_scenario_raw(raw: dict[str, object]) -> dict[str, object]:
+    return next(scenario for scenario in _raw_scenarios(raw) if scenario["id"] == "sequential-nested-fork-coalesce")
+
+
+@pytest.mark.parametrize("workflow", ("build", "recovery"))
+def test_semantic_runtime_expectation_is_run_workflow_only(workflow: str) -> None:
+    raw = valid_manifest_dict()
+    scenario = _semantic_scenario_raw(raw)
+    case = cast(list[dict[str, object]], scenario["cases"])[0]
+    case["workflow"] = workflow
+
+    with pytest.raises(ValidationError, match="semantic_runtime expectation is valid only for the run workflow"):
+        corpus_schema.ScenarioManifest.model_validate(raw)
+
+
+@pytest.mark.parametrize("dimension", ("audit", "recovery"))
+def test_semantic_runtime_expectation_cannot_promote_audit_or_recovery_to_pass(dimension: str) -> None:
+    raw = valid_manifest_dict()
+    scenario = _semantic_scenario_raw(raw)
+    dimensions = _raw_dimensions(scenario)
+    dimensions[dimension] = {
+        "status": "pass",
+        "evidence": ["harness-sequential-nested-fork-coalesce-two-sequential-require-all"],
+    }
+
+    with pytest.raises(ValidationError, match=rf"semantic_runtime expectation cannot satisfy an? {dimension} pass"):
+        corpus_schema.ScenarioManifest.model_validate(raw)
+
+
+def test_semantic_runtime_case_does_not_block_separate_exact_audit_evidence() -> None:
+    raw = valid_manifest_dict()
+    scenario = _semantic_scenario_raw(raw)
+    exact_case = deepcopy(cast(list[dict[str, object]], _raw_scenarios(raw)[0]["cases"])[0])
+    exact_case["id"] = "exact-audit-control"
+    cast(list[dict[str, object]], scenario["cases"]).append(exact_case)
+    _raw_evidence(raw).append(
+        {
+            "id": "harness-sequential-exact-audit-control",
+            "kind": "harness",
+            "locator": "sequential-nested-fork-coalesce:exact-audit-control",
+            "claim": "Separate exact case proves audit identity",
+            "stages": ["config", "build", "runtime", "audit"],
+        }
+    )
+    _raw_dimensions(scenario)["audit"] = {
+        "status": "pass",
+        "evidence": ["harness-sequential-exact-audit-control"],
+    }
+
+    manifest = corpus_schema.ScenarioManifest.model_validate(raw)
+
+    assert manifest.scenarios[6].dimensions["audit"].status == "pass"
+
+
+def test_semantic_runtime_harness_evidence_cannot_claim_audit_stage() -> None:
+    raw = valid_manifest_dict()
+    evidence = next(
+        reference
+        for reference in _raw_evidence(raw)
+        if reference["locator"] == "sequential-nested-fork-coalesce:two-sequential-require-all"
+    )
+    evidence["stages"] = ["config", "build", "runtime", "audit"]
+
+    with pytest.raises(ValidationError, match="semantic_runtime harness evidence cannot claim audit or recovery stages"):
+        corpus_schema.ScenarioManifest.model_validate(raw)
+
+
+def test_composed_coalesce_semantic_ledger_is_structured_and_p1_scoped() -> None:
+    manifest = load_manifest()
+    semantic_cases = tuple(
+        (scenario, case)
+        for scenario, case in iter_harness_cases(manifest)
+        if isinstance(case.expected, corpus_schema.SemanticRunExpectation)
+    )
+
+    assert len(semantic_cases) == 20
+    decision = next(reference for reference in manifest.evidence if reference.id == "composed-coalesces-audit-identity-p1")
+    assert (decision.kind, decision.locator, decision.stages) == (
+        "decision",
+        "elspeth-3a6fa9141f",
+        ("audit",),
+    )
+    evidence_by_locator = {reference.locator: reference for reference in manifest.evidence}
+    for scenario, case in semantic_cases:
+        expected = case.expected
+        assert isinstance(expected, corpus_schema.SemanticRunExpectation)
+        assert len(expected.projection_sha256) == 64
+        assert all(value > 0 for value in expected.projection_counts.model_dump().values())
+        assert scenario.dimensions["audit"].status == "partial"
+        assert scenario.dimensions["audit"].owner_issue == "elspeth-3a6fa9141f"
+        assert evidence_by_locator[f"{scenario.id}:{case.id}"].stages == (
+            "config",
+            "build",
+            "runtime",
+        )
+
+
 def _exact_run_expectation_values() -> dict[str, object]:
     return {
         "kind": "exact",
@@ -1323,7 +1671,7 @@ def _scenario_exact_evidence_values(
     audit: dict[str, object],
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario_id": "fork-coalesce-policies",
         "case_id": "union-collision-fail",
         "fixture_sha256": "fixture-sha",
@@ -1358,9 +1706,13 @@ def _projection_with_disconnected_terminal(*, cyclic: bool) -> dict[str, object]
         {
             "key": "primary:0#0",
             "row_key": "primary:0",
-            "parents": ("primary:0#1",) if cyclic else (),
+            "parents": ({"ordinal": 0, "parent_key": "primary:0#1"},) if cyclic else (),
         },
-        {"key": "primary:0#1", "row_key": "primary:0", "parents": ("primary:0#0",)},
+        {
+            "key": "primary:0#1",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 0, "parent_key": "primary:0#0"},),
+        },
         {"key": "primary:0#2", "row_key": "primary:0", "parents": ()},
     )
     projection["terminal_dispositions"] = (
@@ -1399,7 +1751,7 @@ def test_exact_runtime_projection_expectation_is_discriminated_immutable_and_can
         expectation.__setattr__("rows_processed", 2)
 
 
-def test_exact_coalesce_counters_count_distinct_rows_not_consumed_branch_tokens() -> None:
+def test_exact_coalesce_counters_exclude_consumed_branch_tokens() -> None:
     values = _exact_run_expectation_values()
     projection = cast(dict[str, object], values["projection"])
     projection["tokens"] = (
@@ -1407,11 +1759,27 @@ def test_exact_coalesce_counters_count_distinct_rows_not_consumed_branch_tokens(
         {
             "key": "primary:0#1",
             "row_key": "primary:0",
-            "parents": ("primary:0#2", "primary:0#3", "primary:0#4"),
+            "parents": (
+                {"ordinal": 0, "parent_key": "primary:0#2"},
+                {"ordinal": 1, "parent_key": "primary:0#3"},
+                {"ordinal": 2, "parent_key": "primary:0#4"},
+            ),
         },
-        {"key": "primary:0#2", "row_key": "primary:0", "parents": ("primary:0#0",)},
-        {"key": "primary:0#3", "row_key": "primary:0", "parents": ("primary:0#0",)},
-        {"key": "primary:0#4", "row_key": "primary:0", "parents": ("primary:0#0",)},
+        {
+            "key": "primary:0#2",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 0, "parent_key": "primary:0#0"},),
+        },
+        {
+            "key": "primary:0#3",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 1, "parent_key": "primary:0#0"},),
+        },
+        {
+            "key": "primary:0#4",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 2, "parent_key": "primary:0#0"},),
+        },
     )
     projection["terminal_dispositions"] = (
         {
@@ -1447,21 +1815,186 @@ def test_exact_coalesce_counters_count_distinct_rows_not_consumed_branch_tokens(
     assert runtime.rows_succeeded == 1
 
 
-@pytest.mark.parametrize(
-    "case_id",
-    (
-        "require-all-union",
-        "first-union",
-        "quorum-union-lost-c",
-        "best-effort-union-lost-c",
-    ),
-)
-def test_completed_coalesce_projection_ties_arrivals_to_exact_merged_parents(case_id: str) -> None:
-    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
-    case = next(item for item in scenario.cases if item.id == case_id)
-    assert isinstance(case.expected, RunExpectation)
+def test_exact_projection_counts_distinct_successful_terminal_publications_for_one_row() -> None:
+    values = _exact_run_expectation_values()
+    values["rows_succeeded"] = 2
+    projection = cast(dict[str, object], values["projection"])
+    projection["tokens"] = (
+        {"key": "primary:0#0", "row_key": "primary:0", "parents": ()},
+        {
+            "key": "primary:0#1",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 0, "parent_key": "primary:0#0"},),
+        },
+        {
+            "key": "primary:0#2",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 1, "parent_key": "primary:0#0"},),
+        },
+    )
+    projection["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "fork_parent",
+            "sink_name": None,
+        },
+        {
+            "key": "primary:0#1",
+            "token_key": "primary:0#1",
+            "outcome": "success",
+            "path": "default_flow",
+            "sink_name": "left",
+        },
+        {
+            "key": "primary:0#2",
+            "token_key": "primary:0#2",
+            "outcome": "success",
+            "path": "default_flow",
+            "sink_name": "right",
+        },
+    )
 
-    projection = corpus_schema.StableRunProjection.model_validate(case.expected.projection.model_dump(mode="python"))
+    expectation = RunExpectation.model_validate(values)
+
+    assert expectation.rows_processed == 1
+    assert expectation.rows_succeeded == 2
+
+
+def _completed_coalesce_projection(*, lost_branch: bool = False) -> corpus_schema.StableRunProjection:
+    node_key = "coalesce:merge@stable"
+    expected_branches = ["path_a", "path_b"]
+    if lost_branch:
+        expected_branches.append("path_c")
+    context = {
+        "arrival_order": [{"branch": "path_a"}, {"branch": "path_b"}],
+        "branches_arrived": ["path_a", "path_b"],
+        "branches_lost": {"path_c": {}} if lost_branch else {},
+        "expected_branches": expected_branches,
+        "merge_strategy": "union",
+        "policy": "quorum" if lost_branch else "require_all",
+        "union_field_origins": {"id": "path_a"},
+    }
+    tokens: list[dict[str, object]] = [
+        {"key": "primary:0#0", "row_key": "primary:0", "parents": ()},
+        {
+            "key": "primary:0#1",
+            "row_key": "primary:0",
+            "parents": (
+                {"ordinal": 0, "parent_key": "primary:0#2"},
+                {"ordinal": 1, "parent_key": "primary:0#3"},
+            ),
+        },
+        {
+            "key": "primary:0#2",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 0, "parent_key": "primary:0#0"},),
+            "branch_name": "path_a",
+        },
+        {
+            "key": "primary:0#3",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 1, "parent_key": "primary:0#0"},),
+            "branch_name": "path_b",
+        },
+    ]
+    dispositions: list[dict[str, object]] = [
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "fork_parent",
+            "sink_name": None,
+        },
+        {
+            "key": "primary:0#1",
+            "token_key": "primary:0#1",
+            "outcome": "success",
+            "path": "coalesced",
+            "sink_name": "output",
+        },
+        {
+            "key": "primary:0#2",
+            "token_key": "primary:0#2",
+            "outcome": "success",
+            "path": "coalesced",
+            "sink_name": None,
+        },
+        {
+            "key": "primary:0#3",
+            "token_key": "primary:0#3",
+            "outcome": "success",
+            "path": "coalesced",
+            "sink_name": None,
+        },
+    ]
+    if lost_branch:
+        tokens.append(
+            {
+                "key": "primary:0#4",
+                "row_key": "primary:0",
+                "parents": ({"ordinal": 2, "parent_key": "primary:0#0"},),
+                "branch_name": "path_c",
+            }
+        )
+        dispositions.append(
+            {
+                "key": "primary:0#4",
+                "token_key": "primary:0#4",
+                "outcome": "failure",
+                "path": "unrouted",
+                "sink_name": None,
+            }
+        )
+    node_config: dict[str, object] = {
+        "branches": {branch: f"merge_{branch}" for branch in expected_branches},
+        "merge": "union",
+        "policy": context["policy"],
+    }
+    if lost_branch:
+        node_config["quorum_count"] = 2
+    values = {
+        "rows": (
+            {
+                "key": "primary:0",
+                "source_name": "primary",
+                "source_row_index": 0,
+                "ingest_sequence": 0,
+                "source_data_hash": "a" * 64,
+            },
+        ),
+        "tokens": tuple(tokens),
+        "node_states": tuple(
+            {
+                "key": f"primary:0#{ordinal}|{node_key}|1|0",
+                "token_key": f"primary:0#{ordinal}",
+                "node_key": node_key,
+                "step_index": 1,
+                "attempt": 0,
+                "status": "completed",
+                "context_after": json.dumps(context, sort_keys=True, separators=(",", ":")),
+            }
+            for ordinal in (2, 3)
+        ),
+        "routes": (),
+        "terminal_dispositions": tuple(dispositions),
+        "scheduler_work": (),
+        "audit_records": (
+            {
+                "key": f"node|{node_key}",
+                "record_type": "node",
+                "material": json.dumps({"config": node_config}, sort_keys=True, separators=(",", ":")),
+                "references": (),
+            },
+        ),
+    }
+    return corpus_schema.StableRunProjection.model_validate(values)
+
+
+@pytest.mark.parametrize("lost_branch", (False, True))
+def test_completed_coalesce_projection_ties_arrivals_to_exact_merged_parents(lost_branch: bool) -> None:
+    projection = _completed_coalesce_projection(lost_branch=lost_branch)
 
     completed_coalesce_states = tuple(
         state for state in projection.node_states if state.status == "completed" and state.node_key.startswith("coalesce:")
@@ -1469,14 +2002,49 @@ def test_completed_coalesce_projection_ties_arrivals_to_exact_merged_parents(cas
     assert completed_coalesce_states
 
 
+def test_completed_coalesce_projection_allows_merged_token_to_fork_again() -> None:
+    values = _completed_coalesce_projection().model_dump(mode="python")
+    tokens = list(cast(tuple[dict[str, object], ...], values["tokens"]))
+    dispositions = list(cast(tuple[dict[str, object], ...], values["terminal_dispositions"]))
+    values["tokens"] = tokens
+    values["terminal_dispositions"] = dispositions
+    merged_token = next(token for token in tokens if len(cast(tuple[dict[str, object], ...], token["parents"])) == 2)
+    merged_key = cast(str, merged_token["key"])
+    merged_disposition = next(disposition for disposition in dispositions if disposition["token_key"] == merged_key)
+    merged_disposition.update(outcome="transient", path="fork_parent", sink_name=None)
+    tokens.append(
+        {
+            "key": "primary:0#5",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 0, "parent_key": merged_key},),
+            "branch_name": "next_branch",
+        }
+    )
+    dispositions.append(
+        {
+            "key": "primary:0#5",
+            "token_key": "primary:0#5",
+            "outcome": "success",
+            "path": "default_flow",
+            "sink_name": "output",
+        }
+    )
+
+    projection = corpus_schema.StableRunProjection.model_validate(values)
+
+    projected_merged = next(disposition for disposition in projection.terminal_dispositions if disposition.token_key == merged_key)
+    assert (projected_merged.outcome, projected_merged.path, projected_merged.sink_name) == (
+        "transient",
+        "fork_parent",
+        None,
+    )
+
+
 def test_completed_coalesce_projection_rejects_merged_token_missing_consumed_parent() -> None:
-    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
-    case = next(item for item in scenario.cases if item.id == "require-all-union")
-    assert isinstance(case.expected, RunExpectation)
-    values = case.expected.projection.model_dump(mode="python")
+    values = _completed_coalesce_projection().model_dump(mode="python")
     tokens = cast(list[dict[str, object]], values["tokens"])
-    merged_token = next(token for token in tokens if len(cast(tuple[str, ...], token["parents"])) == 3)
-    merged_token["parents"] = cast(tuple[str, ...], merged_token["parents"])[:-1]
+    merged_token = next(token for token in tokens if len(cast(tuple[dict[str, object], ...], token["parents"])) == 2)
+    merged_token["parents"] = cast(tuple[dict[str, object], ...], merged_token["parents"])[:-1]
 
     with pytest.raises(
         ValidationError,
@@ -1486,10 +2054,7 @@ def test_completed_coalesce_projection_rejects_merged_token_missing_consumed_par
 
 
 def test_completed_coalesce_projection_rejects_arrived_branch_not_bound_to_consumed_token() -> None:
-    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
-    case = next(item for item in scenario.cases if item.id == "quorum-union-lost-c")
-    assert isinstance(case.expected, RunExpectation)
-    values = case.expected.projection.model_dump(mode="python")
+    values = _completed_coalesce_projection(lost_branch=True).model_dump(mode="python")
     states = cast(tuple[dict[str, object], ...], values["node_states"])
     for state in states:
         if state["status"] != "completed" or not cast(str, state["node_key"]).startswith("coalesce:"):
@@ -1506,10 +2071,7 @@ def test_completed_coalesce_projection_rejects_arrived_branch_not_bound_to_consu
 
 
 def test_completed_coalesce_projection_requires_exact_lost_branch_complement() -> None:
-    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
-    case = next(item for item in scenario.cases if item.id == "quorum-union-lost-c")
-    assert isinstance(case.expected, RunExpectation)
-    values = case.expected.projection.model_dump(mode="python")
+    values = _completed_coalesce_projection(lost_branch=True).model_dump(mode="python")
     states = cast(tuple[dict[str, object], ...], values["node_states"])
     for state in states:
         if state["status"] != "completed" or not cast(str, state["node_key"]).startswith("coalesce:"):
@@ -1523,10 +2085,7 @@ def test_completed_coalesce_projection_requires_exact_lost_branch_complement() -
 
 
 def test_completed_union_projection_rejects_provenance_from_lost_branch() -> None:
-    scenario = next(item for item in load_manifest().scenarios if item.id == "fork-coalesce-policies")
-    case = next(item for item in scenario.cases if item.id == "quorum-union-lost-c")
-    assert isinstance(case.expected, RunExpectation)
-    values = case.expected.projection.model_dump(mode="python")
+    values = _completed_coalesce_projection(lost_branch=True).model_dump(mode="python")
     states = cast(tuple[dict[str, object], ...], values["node_states"])
     for state in states:
         if state["status"] != "completed" or not cast(str, state["node_key"]).startswith("coalesce:"):
@@ -1822,7 +2381,7 @@ def test_exact_runtime_projection_rejects_count_and_output_mismatches() -> None:
         (
             "rows_succeeded",
             0,
-            "rows_succeeded must equal distinct projected rows with counted successful outcomes",
+            "rows_succeeded must equal projected successful terminal publications",
         ),
         ("rows_failed", 1, "rows_failed must equal projected failed terminal dispositions"),
     ),
@@ -1899,7 +2458,11 @@ def test_exact_projection_rejects_zero_terminal_outcomes_when_fork_parent_has_ch
     projection = cast(dict[str, object], values["projection"])
     projection["tokens"] = (
         {"key": "primary:0#0", "row_key": "primary:0", "parents": ()},
-        {"key": "primary:0#1", "row_key": "primary:0", "parents": ("primary:0#0",)},
+        {
+            "key": "primary:0#1",
+            "row_key": "primary:0",
+            "parents": ({"ordinal": 0, "parent_key": "primary:0#0"},),
+        },
     )
     projection["terminal_dispositions"] = (
         {
@@ -2460,7 +3023,7 @@ def test_attempted_and_unattempted_recovery_shapes_are_accepted() -> None:
 
 def test_scenario_run_evidence_accepts_the_complete_observed_shape() -> None:
     evidence = ScenarioRunEvidence(
-        schema_version=1,
+        schema_version=2,
         scenario_id="linear",
         case_id="happy-path",
         fixture_sha256="fixture-sha",
@@ -2580,7 +3143,7 @@ def _register_linear_case(raw: dict[str, object], case: dict[str, object]) -> No
 def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> None:
     manifest = load_manifest()
 
-    assert manifest.schema_version == 1
+    assert manifest.schema_version == 2
     assert manifest.criteria_ref == "docs/architecture/dag/completeness-criteria.md"
     assert tuple((scenario.id, scenario.title) for scenario in manifest.scenarios) == EXPECTED_SCENARIOS
     assert tuple(scenario.ordinal for scenario in manifest.scenarios) == tuple(range(1, 16))
@@ -2596,6 +3159,8 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
+        ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
+        ("parallel-coalesces", "two-parallel-require-all"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     assert manifest.verdict == "not_complete"
@@ -2610,11 +3175,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 80
-    assert len(assessment_evidence) == 54
-    assert len(harness_evidence) == 26
-    assert len({reference.id for reference in manifest.evidence}) == 80
-    assert len({reference.locator for reference in manifest.evidence}) == 80
+    assert len(manifest.evidence) == 87
+    assert len(assessment_evidence) == 58
+    assert len(harness_evidence) == 28
+    assert len({reference.id for reference in manifest.evidence}) == 87
+    assert len({reference.locator for reference in manifest.evidence}) == 87
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -2634,6 +3199,8 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
+        ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
+        ("parallel-coalesces", "two-parallel-require-all"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )
     normalized_cases = json.dumps(cases, sort_keys=True, separators=(",", ":")).encode()
@@ -2687,13 +3254,29 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ),
         **{
             f"harness-fork-coalesce-policies-{case_id}": (
-                ("fork-coalesce-policies", "config"),
-                ("fork-coalesce-policies", "build"),
-                ("fork-coalesce-policies", "runtime"),
-                ("fork-coalesce-policies", "audit"),
+                (
+                    ("fork-coalesce-policies", "config"),
+                    ("fork-coalesce-policies", "build"),
+                    ("fork-coalesce-policies", "runtime"),
+                    ("fork-coalesce-policies", "audit"),
+                )
+                if case_id == "union-collision-fail"
+                else (
+                    ("fork-coalesce-policies", "config"),
+                    ("fork-coalesce-policies", "build"),
+                    ("fork-coalesce-policies", "runtime"),
+                )
             )
             for case_id in B2_COALESCE_CASE_IDS
         },
+        "harness-sequential-nested-fork-coalesce-two-sequential-require-all": (
+            ("sequential-nested-fork-coalesce", "build"),
+            ("sequential-nested-fork-coalesce", "runtime"),
+        ),
+        "harness-parallel-coalesces-two-parallel-require-all": (
+            ("parallel-coalesces", "build"),
+            ("parallel-coalesces", "runtime"),
+        ),
         "harness-checkpoint-deterministic-resume-reopen-resume": (
             ("checkpoint-deterministic-resume", "runtime"),
             ("checkpoint-deterministic-resume", "audit"),
@@ -2878,6 +3461,10 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         **{f"fork-coalesce-policies/{case_id}.yaml": expected for case_id, expected in EXPECTED_COALESCE_YAMLS.items()},
         "fork-coalesce-policies/matrix-input.csv": b"id,value\n1,10\n",
         "fork-coalesce-policies/input.csv": EXPECTED_INPUT_CSV,
+        "sequential-nested-fork-coalesce/two-sequential-require-all.yaml": EXPECTED_SEQUENTIAL_COALESCE_YAML,
+        "sequential-nested-fork-coalesce/input.csv": EXPECTED_INPUT_CSV,
+        "parallel-coalesces/two-parallel-require-all.yaml": EXPECTED_PARALLEL_COALESCE_YAML,
+        "parallel-coalesces/input.csv": EXPECTED_INPUT_CSV,
         "checkpoint-deterministic-resume/reopen-resume.yaml": EXPECTED_REOPEN_RESUME_YAML,
         "checkpoint-deterministic-resume/input.csv": EXPECTED_INPUT_CSV,
     }
@@ -3015,8 +3602,18 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-7cf763da7c"
             elif dimension == "scale":
                 expected_owner = "elspeth-cb1053fe46"
-            elif scenario.id == "fork-coalesce-policies" and dimension in ("contracts", "audit"):
+            elif scenario.id == "fork-coalesce-policies" and dimension == "contracts":
                 expected_owner = "elspeth-b1f23d8d83"
+            elif (
+                scenario.id
+                in (
+                    "fork-coalesce-policies",
+                    "sequential-nested-fork-coalesce",
+                    "parallel-coalesces",
+                )
+                and dimension == "audit"
+            ):
+                expected_owner = "elspeth-3a6fa9141f"
             else:
                 expected_owner = "elspeth-ef29ef6ba4"
             assert cell.owner_issue == expected_owner
@@ -3101,10 +3698,10 @@ def test_manifest_rejects_non_mapping_yaml(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "schema_version",
-    [None, 2, True, 1.0, "1"],
+    [None, 1, True, 2.0, "2"],
     ids=("missing", "wrong-integer", "boolean", "float", "string"),
 )
-def test_manifest_rejects_schema_version_that_is_not_exact_integer_one(
+def test_manifest_rejects_schema_version_that_is_not_exact_integer_two(
     tmp_path: Path,
     schema_version: object,
 ) -> None:
@@ -3114,7 +3711,7 @@ def test_manifest_rejects_schema_version_that_is_not_exact_integer_one(
     else:
         raw["schema_version"] = schema_version
 
-    with pytest.raises(ValueError, match="schema_version must be exactly integer 1"):
+    with pytest.raises(ValueError, match="schema_version must be exactly integer 2"):
         load_manifest(write_manifest(tmp_path, raw))
 
 
@@ -3123,15 +3720,15 @@ def test_manifest_rejects_schema_version_that_is_not_exact_integer_one(
     [
         (
             "schema_version",
-            "schema_version: 1\nschema_version: 1\ncriteria_ref: docs/architecture/dag/completeness-criteria.md\n",
+            "schema_version: 2\nschema_version: 2\ncriteria_ref: docs/architecture/dag/completeness-criteria.md\n",
         ),
         (
             "id",
-            "schema_version: 1\ncriteria_ref: docs/architecture/dag/completeness-criteria.md\nevidence: []\nscenarios:\n  - id: linear\n    id: linear\n",
+            "schema_version: 2\ncriteria_ref: docs/architecture/dag/completeness-criteria.md\nevidence: []\nscenarios:\n  - id: linear\n    id: linear\n",
         ),
         (
             "config",
-            "schema_version: 1\ncriteria_ref: docs/architecture/dag/completeness-criteria.md\nevidence: []\nscenarios:\n  - id: linear\n    ordinal: 1\n    title: Linear\n    dimensions:\n      config: {}\n      config: {}\n",
+            "schema_version: 2\ncriteria_ref: docs/architecture/dag/completeness-criteria.md\nevidence: []\nscenarios:\n  - id: linear\n    ordinal: 1\n    title: Linear\n    dimensions:\n      config: {}\n      config: {}\n",
         ),
     ],
     ids=("top-level", "scenario", "dimension"),
@@ -3538,7 +4135,7 @@ def test_iter_harness_cases_flattens_constructed_manifest_in_scenario_order() ->
     )
     second_scenario = first_scenario.model_copy(update={"id": "second-scenario", "cases": (second_case,)})
     manifest = ScenarioManifest(
-        schema_version=1,
+        schema_version=2,
         criteria_ref="docs/architecture/dag/completeness-criteria.md",
         evidence=(_reference(),),
         scenarios=(first_scenario, second_scenario),

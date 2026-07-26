@@ -165,17 +165,47 @@ class StableRowProjection(ClosedModel):
     source_data_hash: Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
 
 
+class StableParentProjection(ClosedModel):
+    ordinal: Count
+    parent_key: NonEmpty
+
+
 class StableTokenProjection(ClosedModel):
     key: NonEmpty
     row_key: NonEmpty
-    parents: tuple[NonEmpty, ...]
+    parents: tuple[StableParentProjection, ...]
     branch_name: NonEmpty | None = None
 
     @field_validator("parents")
     @classmethod
-    def _require_sorted_parents(cls, parents: tuple[str, ...]) -> tuple[str, ...]:
+    def _require_ordered_unique_parents(
+        cls,
+        parents: tuple[StableParentProjection, ...],
+    ) -> tuple[StableParentProjection, ...]:
+        parent_keys = tuple(parent.parent_key for parent in parents)
+        ordinals = tuple(parent.ordinal for parent in parents)
+        if len(parent_keys) != len(set(parent_keys)):
+            raise ValueError("token parent keys must be unique")
+        if len(ordinals) != len(set(ordinals)):
+            raise ValueError("token parent ordinals must be unique")
+        if ordinals != tuple(sorted(ordinals)):
+            raise ValueError("token parents must be sorted by durable ordinal")
+        return parents
+
+
+class SemanticTokenProjection(ClosedModel):
+    """Order-insensitive runtime lineage; never an audit/recovery identity."""
+
+    key: NonEmpty
+    row_key: NonEmpty
+    parent_set: tuple[NonEmpty, ...]
+    branch_name: NonEmpty | None = None
+
+    @field_validator("parent_set")
+    @classmethod
+    def _require_sorted_parent_set(cls, parents: tuple[str, ...]) -> tuple[str, ...]:
         if parents != tuple(sorted(set(parents))):
-            raise ValueError("token parents must be unique and sorted")
+            raise ValueError("semantic token parent_set must be unique and sorted")
         return parents
 
 
@@ -306,7 +336,7 @@ class StableAuditRecordProjection(ClosedModel):
 
 def _require_unique_sorted_keys(
     label: str,
-    values: tuple[StableKeyedProjection | StableAuditRecordProjection, ...],
+    values: tuple[StableKeyedProjection | StableAuditRecordProjection | SemanticTokenProjection, ...],
 ) -> None:
     keys = tuple(value.key for value in values)
     if keys != tuple(sorted(keys)) or len(set(keys)) != len(keys):
@@ -317,12 +347,12 @@ def _validate_projected_token_parent_graph(
     tokens: tuple[StableTokenProjection, ...],
     dispositions: tuple[StableTerminalDisposition, ...],
 ) -> None:
-    parents_by_token = {token.key: token.parents for token in tokens}
+    parents_by_token = {token.key: tuple(parent.parent_key for parent in token.parents) for token in tokens}
     children_by_token: dict[str, list[str]] = {token.key: [] for token in tokens}
     remaining_parents = {token.key: len(token.parents) for token in tokens}
     for token in tokens:
         for parent in token.parents:
-            children_by_token[parent].append(token.key)
+            children_by_token[parent.parent_key].append(token.key)
 
     ready = [token.key for token in tokens if remaining_parents[token.key] == 0]
     visited = 0
@@ -347,10 +377,10 @@ def _validate_projected_token_parent_graph(
     pending = sorted(terminal_reachable, reverse=True)
     while pending:
         token_key = pending.pop()
-        for parent in parents_by_token[token_key]:
-            if parent not in terminal_reachable:
-                terminal_reachable.add(parent)
-                pending.append(parent)
+        for parent_key in parents_by_token[token_key]:
+            if parent_key not in terminal_reachable:
+                terminal_reachable.add(parent_key)
+                pending.append(parent_key)
     if any(token_key not in terminal_reachable for token_key in fork_parent_keys):
         raise ValueError("transient fork_parent token must reach a terminal descendant")
 
@@ -431,7 +461,11 @@ def _validate_completed_coalesce_lineage(
             for token_key in consumed_token_keys
         ):
             raise ValueError("completed coalesce consumed tokens must be internal successful coalesced dispositions")
-        merged_tokens = tuple(token for token in tokens if token.row_key == row_key and token.parents == consumed_token_keys)
+        merged_tokens = tuple(
+            token
+            for token in tokens
+            if token.row_key == row_key and tuple(sorted(parent.parent_key for parent in token.parents)) == consumed_token_keys
+        )
         if len(merged_tokens) != 1:
             raise ValueError(f"completed coalesce {node_key} consumed token set must exactly parent one merged token")
         merged_token = merged_tokens[0]
@@ -439,8 +473,17 @@ def _validate_completed_coalesce_lineage(
             raise ValueError("one merged token cannot satisfy multiple completed coalesce groups")
         claimed_merged_tokens.add(merged_token.key)
         merged_disposition = disposition_by_token[merged_token.key]
-        if (merged_disposition.outcome, merged_disposition.path) != ("success", "coalesced"):
-            raise ValueError("completed coalesce merged token must have a successful coalesced disposition")
+        disposition_shape = (
+            merged_disposition.outcome,
+            merged_disposition.path,
+            merged_disposition.sink_name,
+        )
+        if disposition_shape[:2] != ("success", "coalesced") and disposition_shape != (
+            "transient",
+            "fork_parent",
+            None,
+        ):
+            raise ValueError("completed coalesce merged token must have a successful coalesced disposition or be an internal fork parent")
 
         node_record = audit_by_key.get(f"node|{node_key}")
         if node_record is None or node_record.record_type != "node":
@@ -511,25 +554,25 @@ def _validate_completed_coalesce_lineage(
             raise ValueError("completed union collision values must reference unique arrived branches")
 
 
-def _derive_projected_terminal_counts(projection: StableRunProjection) -> tuple[int, int, int]:
+def _derive_projected_terminal_counts(projection: StableRunProjection | SemanticRuntimeProjection) -> tuple[int, int, int]:
     """Mirror the production run-counter projection from exact token outcomes.
 
     Processing is counted once per source-row identity that reaches any terminal
-    outcome. Success is likewise row-aware so fork/coalesce bookkeeping tokens
-    cannot multiply one source row; consumed coalesce inputs do not independently
+    outcome. Success counts public terminal outcomes so one forked row may publish
+    successfully to more than one sink; consumed coalesce inputs do not independently
     count as successes. Failure remains a per-terminal-token tally, matching the
     production coalesce failure accounting.
     """
     row_key_by_token = {token.key: token.row_key for token in projection.tokens}
     terminal = tuple(disposition for disposition in projection.terminal_dispositions if disposition.outcome in ("success", "failure"))
     processed_rows = {row_key_by_token[disposition.token_key] for disposition in terminal}
-    successful_rows = {
-        row_key_by_token[disposition.token_key]
+    successful_terminals = sum(
+        1
         for disposition in terminal
         if disposition.outcome == "success" and not (disposition.path == "coalesced" and disposition.sink_name is None)
-    }
+    )
     failed_tokens = sum(disposition.outcome == "failure" for disposition in terminal)
-    return len(processed_rows), len(successful_rows), failed_tokens
+    return len(processed_rows), successful_terminals, failed_tokens
 
 
 class StableRunProjection(ClosedModel):
@@ -558,14 +601,15 @@ class StableRunProjection(ClosedModel):
         token_keys = {token.key for token in self.tokens}
         if any(token.row_key not in row_keys for token in self.tokens):
             raise ValueError("every token must reference a projected row")
-        if any(parent not in token_keys or parent == token.key for token in self.tokens for parent in token.parents):
+        if any(parent.parent_key not in token_keys or parent.parent_key == token.key for token in self.tokens for parent in token.parents):
             raise ValueError("token parents must reference distinct projected tokens")
         if any(state.token_key not in token_keys for state in self.node_states):
             raise ValueError("every node state must reference a projected token")
         if any(route.token_key not in token_keys for route in self.routes):
             raise ValueError("every route must reference a projected token")
-        if {disposition.token_key for disposition in self.terminal_dispositions} != token_keys:
-            raise ValueError("terminal dispositions must exactly cover tokens")
+        disposition_token_keys = tuple(disposition.token_key for disposition in self.terminal_dispositions)
+        if len(disposition_token_keys) != len(token_keys) or set(disposition_token_keys) != token_keys:
+            raise ValueError("terminal dispositions must exactly cover tokens one-to-one")
         _validate_projected_token_parent_graph(self.tokens, self.terminal_dispositions)
         _validate_completed_coalesce_lineage(
             self.tokens,
@@ -575,6 +619,63 @@ class StableRunProjection(ClosedModel):
         )
         if any(work.token_key not in token_keys for work in self.scheduler_work):
             raise ValueError("every scheduler work item must reference a projected token")
+        return self
+
+
+class SemanticRuntimeProjection(ClosedModel):
+    """Exact runtime behavior with explicitly order-insensitive parent sets.
+
+    This projection deliberately excludes audit records and therefore cannot
+    establish audit or recovery completeness. Raw ``StableRunProjection``
+    values retain durable parent ordinals and sink-effect lineage identity.
+    """
+
+    rows: tuple[StableRowProjection, ...]
+    tokens: tuple[SemanticTokenProjection, ...]
+    node_states: tuple[StableNodeStateProjection, ...]
+    routes: tuple[StableRouteProjection, ...]
+    terminal_dispositions: tuple[StableTerminalDisposition, ...]
+    scheduler_work: tuple[StableSchedulerWorkProjection, ...]
+
+    @model_validator(mode="after")
+    def _validate_projection(self) -> Self:
+        for label, values in (
+            ("rows", self.rows),
+            ("tokens", self.tokens),
+            ("node states", self.node_states),
+            ("routes", self.routes),
+            ("terminal dispositions", self.terminal_dispositions),
+            ("scheduler work", self.scheduler_work),
+        ):
+            _require_unique_sorted_keys(label, values)
+
+        row_keys = {row.key for row in self.rows}
+        token_keys = {token.key for token in self.tokens}
+        if any(token.row_key not in row_keys for token in self.tokens):
+            raise ValueError("every semantic token must reference a projected row")
+        if any(parent not in token_keys or parent == token.key for token in self.tokens for parent in token.parent_set):
+            raise ValueError("semantic token parent_set must reference distinct projected tokens")
+        disposition_token_keys = tuple(disposition.token_key for disposition in self.terminal_dispositions)
+        if len(disposition_token_keys) != len(token_keys) or set(disposition_token_keys) != token_keys:
+            raise ValueError("semantic terminal dispositions must exactly cover tokens one-to-one")
+        semantic_as_raw = tuple(
+            StableTokenProjection(
+                key=token.key,
+                row_key=token.row_key,
+                parents=tuple(
+                    StableParentProjection(ordinal=ordinal, parent_key=parent_key) for ordinal, parent_key in enumerate(token.parent_set)
+                ),
+                branch_name=token.branch_name,
+            )
+            for token in self.tokens
+        )
+        _validate_projected_token_parent_graph(semantic_as_raw, self.terminal_dispositions)
+        if any(state.token_key not in token_keys for state in self.node_states):
+            raise ValueError("every semantic node state must reference a projected token")
+        if any(route.token_key not in token_keys for route in self.routes):
+            raise ValueError("every semantic route must reference a projected token")
+        if any(work.token_key not in token_keys for work in self.scheduler_work):
+            raise ValueError("every semantic scheduler work item must reference a projected token")
         return self
 
 
@@ -608,13 +709,51 @@ class RunExpectation(ClosedModel):
         if self.rows_processed != projected_processed:
             raise ValueError("rows_processed must equal distinct projected rows with terminal outcomes")
         if self.rows_succeeded != projected_succeeded:
-            raise ValueError("rows_succeeded must equal distinct projected rows with counted successful outcomes")
+            raise ValueError("rows_succeeded must equal projected successful terminal publications")
         if self.rows_failed != projected_failed:
             raise ValueError("rows_failed must equal projected failed terminal dispositions")
         return self
 
 
-DeclaredRunExpectation = Annotated[RunExpectation | SummaryRunExpectation, Field(discriminator="kind")]
+class SemanticProjectionCounts(ClosedModel):
+    rows: Count
+    tokens: Count
+    parent_links: Count
+    node_states: Count
+    routes: Count
+    terminal_dispositions: Count
+    scheduler_work: Count
+
+
+class SemanticRunExpectation(ClosedModel):
+    """Exact runtime oracle that makes no raw audit-identity claim."""
+
+    kind: Literal["semantic_runtime"]
+    status: Literal["completed", "completed_with_failures", "empty"]
+    sink_outputs: tuple[SinkOutputProjection, ...]
+    rows_processed: Count
+    rows_succeeded: Count
+    rows_failed: Count
+    projection_sha256: Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
+    projection_counts: SemanticProjectionCounts
+    audit_record_counts: tuple[AuditRecordCount, ...]
+    source_operation_count: Count
+
+    @model_validator(mode="after")
+    def _validate_exact_counts(self) -> Self:
+        sink_names = tuple(output.sink_name for output in self.sink_outputs)
+        if sink_names != tuple(sorted(sink_names)) or len(set(sink_names)) != len(sink_names):
+            raise ValueError("sink_outputs must contain unique sorted sink names")
+        record_types = tuple(record.record_type for record in self.audit_record_counts)
+        if record_types != tuple(sorted(record_types)) or len(set(record_types)) != len(record_types):
+            raise ValueError("audit_record_counts must contain unique sorted record types")
+        return self
+
+
+DeclaredRunExpectation = Annotated[
+    RunExpectation | SemanticRunExpectation | SummaryRunExpectation,
+    Field(discriminator="kind"),
+]
 
 
 class GraphNodeTypeCount(ClosedModel):
@@ -744,10 +883,12 @@ class HarnessCaseSpec(ClosedModel):
 
     @model_validator(mode="after")
     def _validate_workflow_expectation(self) -> Self:
+        if isinstance(self.expected, SemanticRunExpectation) and self.workflow != "run":
+            raise ValueError("semantic_runtime expectation is valid only for the run workflow")
         if self.workflow == "build":
             if not isinstance(self.expected, BuildExpectation):
                 raise ValueError("build workflow requires BuildExpectation")
-        elif not isinstance(self.expected, (RunExpectation, SummaryRunExpectation)):
+        elif not isinstance(self.expected, (RunExpectation, SemanticRunExpectation, SummaryRunExpectation)):
             raise ValueError(f"{self.workflow} workflow requires a run expectation")
 
         input_tokens = {normalize_template_name(name) for name in self.input_fixtures}
@@ -779,10 +920,29 @@ class ScenarioSpec(ClosedModel):
 
 
 class ScenarioManifest(ClosedModel):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     criteria_ref: NonEmpty
     evidence: tuple[EvidenceReference, ...]
     scenarios: tuple[ScenarioSpec, ...]
+
+    @model_validator(mode="after")
+    def _semantic_runtime_cannot_claim_audit_or_recovery(self) -> Self:
+        evidence_by_id = {reference.id: reference for reference in self.evidence}
+        for scenario in self.scenarios:
+            semantic_locators = {f"{scenario.id}:{case.id}" for case in scenario.cases if isinstance(case.expected, SemanticRunExpectation)}
+            if not semantic_locators:
+                continue
+            semantic_evidence_ids = {reference.id for reference in evidence_by_id.values() if reference.locator in semantic_locators}
+            for dimension in ("audit", "recovery"):
+                cell = scenario.dimensions.get(dimension)
+                if cell is not None and cell.status == "pass" and semantic_evidence_ids.intersection(cell.evidence):
+                    raise ValueError(f"semantic_runtime expectation cannot satisfy an {dimension} pass")
+            for reference in evidence_by_id.values():
+                if reference.locator in semantic_locators and any(
+                    stage not in ("config", "build", "runtime") for stage in reference.stages
+                ):
+                    raise ValueError("semantic_runtime harness evidence cannot claim audit or recovery stages")
+        return self
 
     @property
     def verdict(self) -> Literal["complete", "not_complete"]:
@@ -886,7 +1046,7 @@ class RuntimeEvidence(ClosedModel):
             if self.rows_processed != projected_processed:
                 raise ValueError("runtime rows_processed must equal distinct projected rows with terminal outcomes")
             if self.rows_succeeded != projected_succeeded:
-                raise ValueError("runtime rows_succeeded must equal distinct projected rows with counted successful outcomes")
+                raise ValueError("runtime rows_succeeded must equal projected successful terminal publications")
             if self.rows_failed != projected_failed:
                 raise ValueError("runtime rows_failed must equal projected failed terminal dispositions")
             if self.output_rows != sum(len(output.rows) for output in self.sink_outputs):
@@ -999,7 +1159,7 @@ class RecoveryEvidence(ClosedModel):
 
 
 class ScenarioRunEvidence(ClosedModel):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     scenario_id: NonEmpty
     case_id: NonEmpty
     fixture_sha256: NonEmpty
