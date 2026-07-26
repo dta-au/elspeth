@@ -12,9 +12,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master, "RC*"]
+    branches: [main, master, "RC*", "release/**"]
   pull_request:
-    branches: [main, master, "RC*"]
+    branches: [main, master, "RC*", "release/**"]
 
 # Cancel in-progress runs when a new commit is pushed
 concurrency:
@@ -28,9 +28,9 @@ env:
 permissions:
   contents: read
 
-# Public-repository guardrail: self-hosted runners execute arbitrary workflow
-# code on our infrastructure, so fork PRs stay on GitHub-hosted runners.
-# Trusted pushes and same-repository PRs use the nyx runner.
+# Public-repository guardrail: pull_request workflows execute code from
+# unmerged branches, so all PRs stay on GitHub-hosted runners.
+# Trusted push workflows use the nyx runner.
 #
 # GitHub's runs-on expression accepts either a runner label string or a JSON
 # array of labels. Keep this expression identical across jobs so the aggregate
@@ -40,7 +40,7 @@ permissions:
 # default workspace. Every checkout below uses a per-run, per-job path so stale
 # workspace siblings cannot break actions/checkout before project commands run.
 #
-#   ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+#   ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
 
 jobs:
   # ===========================================================================
@@ -48,14 +48,14 @@ jobs:
   # ===========================================================================
   static-analysis:
     name: Static analysis
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:3.13-bookworm
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-static-analysis
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
@@ -85,9 +85,11 @@ jobs:
           "$tmp_dir/actionlint" -config-file .github/actionlint.yaml .github/workflows/*.yml .github/workflows/*.yaml
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
 
       - name: Use checkout-local uv cache
         run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
@@ -102,8 +104,8 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: uv sync --frozen --all-extras
 
-      - name: Reject unverified fork PR signed allowlist edits
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      - name: Reject unverified PR signed allowlist edits
+        if: ${{ github.event_name == 'pull_request' }}
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
@@ -208,8 +210,8 @@ jobs:
       - name: Run trust-tier elspeth-lints rule
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'shape-only-when-key-missing' || 'required' }}
+          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
+          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           set +e
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
@@ -225,8 +227,8 @@ jobs:
       - name: Run trust-boundary honesty-gate elspeth-lints rules
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'shape-only-when-key-missing' || 'required' }}
+          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
+          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules trust_boundary.tests,trust_boundary.scope,trust_boundary.tier \
@@ -374,8 +376,8 @@ jobs:
         if: always()
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'shape-only-when-key-missing' || 'required' }}
+          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
+          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           set +e
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
@@ -418,7 +420,7 @@ jobs:
   # ===========================================================================
   test:
     name: Test (Python ${{ matrix.python-version }})
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:${{ matrix.python-version }}-bookworm
     env:
@@ -440,14 +442,16 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
 
       - name: Use checkout-local uv cache
         run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
@@ -518,23 +522,25 @@ jobs:
   # ===========================================================================
   integration:
     name: Integration Tests
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:3.13-bookworm
     needs: [test]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-integration
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
 
       - name: Use checkout-local uv cache
         run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
@@ -583,12 +589,14 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
 
       - name: Install system dependencies
         run: |
@@ -609,7 +617,7 @@ jobs:
   # ===========================================================================
   supply-chain-audit:
     name: Dependency and License Audit
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:3.13-bookworm
     needs: [static-analysis]
@@ -617,14 +625,16 @@ jobs:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-supply-chain-audit
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
 
       - name: Use checkout-local uv cache
         run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
@@ -693,24 +703,26 @@ jobs:
   # browser journey blocks merge instead of being waved through.
   e2e-frontend:
     name: Frontend E2E (Playwright)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-e2e-frontend
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
 
       - name: Use checkout-local uv cache
         run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
@@ -730,7 +742,7 @@ jobs:
         run: uv sync --frozen --all-extras
 
       - name: Set up Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "24"
           cache: "npm"
@@ -790,17 +802,17 @@ jobs:
   # blocks merge.
   frontend-unit:
     name: Frontend unit (vitest + typecheck)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-frontend-unit
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "24"
           cache: "npm"
@@ -825,7 +837,7 @@ jobs:
   # ===========================================================================
   ci-success:
     name: CI Success
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     needs:
       - static-analysis
       - test

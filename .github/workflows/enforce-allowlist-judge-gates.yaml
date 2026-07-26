@@ -16,14 +16,14 @@
 #     per_file_rules.
 #
 #   C3 (check-override-rate): on every configured PR and push to
-#     main/master/RC* branches, the rolling-30d OVERRIDDEN_BY_OPERATOR
+#     main/master/RC*/release/* branches, the rolling-30d OVERRIDDEN_BY_OPERATOR
 #     rate is checked against the workflow-pinned --max-rate 0.10
 #     threshold. Insufficient-data windows pass with a notice; the gate
 #     produces stable signal only once the denominator grows past
 #     --min-samples (default 10). Converts the override-rate metric from
 #     informational to enforcing.
 #
-#   VAL (check-judge-quality): in trusted contexts only, run the labelled
+#   VAL (check-judge-quality): on trusted pushes only, run the labelled
 #     judge-quality corpus through the live OpenRouter-backed judge and
 #     require exact verdict/decorator accuracy >= 0.90. This is a prompt/model
 #     REGRESSION TRIPWIRE, not a quality guarantee: the corpus is small (10-30
@@ -54,7 +54,7 @@
 # requiring the individual gate jobs is fragile (a renamed job silently drops
 # the requirement) and GitHub keys protection on one named check. The
 # aggregate fails if C3 is not ``success``; VAL may be ``skipped`` (it is
-# intentionally skipped on untrusted fork PRs, which cannot read the
+# intentionally skipped on every PR so PR-controlled code can never read the
 # OpenRouter secret).
 #
 # Spec: notes/cicd-judge-cli-prototype-plan.md + the convergent-findings
@@ -64,9 +64,9 @@ name: enforce-allowlist-judge-gates
 
 on:
   push:
-    branches: [main, master, "RC*"]
+    branches: [main, master, "RC*", "release/**"]
   pull_request:
-    branches: [main, master, "RC*"]
+    branches: [main, master, "RC*", "release/**"]
 
 # Cancel in-progress judge-gate runs when a new commit updates the same ref.
 concurrency:
@@ -88,14 +88,13 @@ defaults:
   run:
     shell: bash
 
-# Public-repository guardrail mirrors ci.yaml: fork PRs stay on
-# GitHub-hosted runners; trusted pushes and same-repository PRs use
-# nyx. Both gates are I/O-light (no compilation, no tests); a small
-# hosted runner is sufficient if nyx is busy.
+# Public-repository guardrail mirrors ci.yaml: every PR stays on GitHub-hosted
+# runners, while trusted pushes use nyx. Both gates are I/O-light (no
+# compilation, no tests); a small hosted runner is sufficient for PR checks.
 jobs:
   check-judge-quality:
     name: Judge-quality validation corpus (VAL)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name != 'pull_request'
     runs-on: ${{ fromJSON('["self-hosted","Linux","X64","nyx-ci","trusted"]') }}
     # This job makes real OpenRouter calls; keep the corpus bounded and fail
     # quickly on transport/config drift.
@@ -107,14 +106,16 @@ jobs:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           version: "0.5"
+          enable-cache: false
+          prune-cache: true
 
       - name: Use checkout-local uv cache
         run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
@@ -151,7 +152,7 @@ jobs:
 
   check-override-rate:
     name: Override-rate drift gate (C3)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     # Judge gates should fail fast if checkout/dependency/git plumbing hangs.
     timeout-minutes: 15
     container:
@@ -160,15 +161,17 @@ jobs:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-override-rate
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
           # Shallow clone is fine; the gate reads HEAD content only.
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           version: "0.5"
+          enable-cache: false
+          prune-cache: true
 
       - name: Use checkout-local uv cache
         run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
@@ -213,7 +216,7 @@ jobs:
   # mechanical: it fails unless C3 succeeded and VAL succeeded-or-skipped.
   judge-gates-success:
     name: Judge gates success
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     needs:
       - check-judge-quality
       - check-override-rate
@@ -230,8 +233,8 @@ jobs:
             echo "C3 override-rate drift gate did not pass (result: ${{ needs.check-override-rate.result }})"
             exit 1
           fi
-          # VAL (judge-quality) is intentionally skipped on untrusted fork PRs:
-          # it needs the OpenRouter secret, which GitHub withholds from forks.
+          # VAL (judge-quality) is intentionally skipped on every PR: it needs the
+          # OpenRouter secret, which must not be reachable from PR-controlled code.
           # 'skipped' is therefore acceptable here; any other non-success result
           # (failure / cancelled / timed_out) blocks the merge.
           val_result="${{ needs.check-judge-quality.result }}"

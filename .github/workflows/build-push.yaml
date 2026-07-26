@@ -95,7 +95,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.IMAGE_SHA }}
 
@@ -111,10 +111,10 @@ jobs:
             --ruleset-name main
 
       - name: Set up QEMU (for multi-platform builds)
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
 
       # This is the exact lean extras profile used by ECS acceptance builds.
       # Build and exercise it before any registry login/push so dev/all extras
@@ -180,7 +180,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Generate image metadata
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
         with:
           images: |
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
@@ -197,7 +197,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Login to GHCR
         if: steps.registries.outputs.push_ghcr == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -205,7 +205,7 @@ jobs:
 
       - name: Login to ACR
         if: steps.registries.outputs.push_acr == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
         with:
           registry: ${{ secrets.ACR_REGISTRY }}
           username: ${{ secrets.AZURE_CLIENT_ID }}
@@ -217,7 +217,7 @@ jobs:
       - name: Build and push to GHCR
         id: ghcr-push
         if: steps.registries.outputs.push_ghcr == 'true'
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
           context: .
           platforms: ${{ env.PLATFORMS }}
@@ -237,7 +237,7 @@ jobs:
       - name: Build and push to ACR
         id: acr-push
         if: steps.registries.outputs.push_acr == 'true'
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
           context: .
           platforms: ${{ env.PLATFORMS }}
@@ -314,7 +314,7 @@ jobs:
     if: needs.build-push.outputs.push_ghcr == 'true' || needs.build-push.outputs.push_acr == 'true'
     steps:
       - name: Checkout code (for example files)
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.IMAGE_SHA }}
 
@@ -351,7 +351,7 @@ jobs:
 
       - name: Login to GHCR (to pull image)
         if: needs.build-push.outputs.push_ghcr == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -359,7 +359,7 @@ jobs:
 
       - name: Login to ACR (to pull image)
         if: needs.build-push.outputs.push_acr == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
         with:
           registry: ${{ secrets.ACR_REGISTRY }}
           username: ${{ secrets.AZURE_CLIENT_ID }}
@@ -534,14 +534,14 @@ jobs:
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
 
       - name: Login to GHCR for verified promotion
         if: needs.build-push.outputs.push_ghcr == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -549,7 +549,7 @@ jobs:
 
       - name: Login to ACR for verified promotion
         if: needs.build-push.outputs.push_acr == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
         with:
           registry: ${{ secrets.ACR_REGISTRY }}
           username: ${{ secrets.AZURE_CLIENT_ID }}
@@ -576,7 +576,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           generate_release_notes: true
           body: |

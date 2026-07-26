@@ -19,6 +19,13 @@ ACTIONLINT_CONFIG = REPO_ROOT / ".github" / "actionlint.yaml"
 JUDGE_GATES_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "enforce-allowlist-judge-gates.yaml"
 CODEQL_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "codeql.yaml"
 CODEQL_CONFIG = REPO_ROOT / ".github" / "codeql" / "codeql-config.yml"
+PR_WORKFLOWS = (
+    CI_WORKFLOW,
+    CODEQL_WORKFLOW,
+    REPO_ROOT / ".github" / "workflows" / "composer-redaction-gate.yml",
+    JUDGE_GATES_WORKFLOW,
+    REPO_ROOT / ".github" / "workflows" / "enforce-telemetry-backfill-trailer.yaml",
+)
 _SHELL_CONTROL_TOKENS = frozenset({"&&", "||", ";", "|"})
 
 
@@ -226,8 +233,8 @@ def test_override_rate_workflow_surfaces_pass_notice_in_step_summary() -> None:
     assert "Override-rate drift gate" in run
 
 
-def test_integration_job_runs_on_rc_branch_pushes() -> None:
-    """RC branch pushes must not skip the integration lane."""
+def test_integration_job_runs_on_rc_and_release_branch_pushes() -> None:
+    """RC and maintained release pushes must not skip the integration lane."""
     workflow = _ci_workflow()
     integration_job = workflow["jobs"]["integration"]
 
@@ -236,6 +243,7 @@ def test_integration_job_runs_on_rc_branch_pushes() -> None:
     assert "github.event_name == 'push'" in condition
     assert "refs/heads/main" in condition
     assert "startsWith(github.ref, 'refs/heads/RC')" in condition
+    assert "startsWith(github.ref, 'refs/heads/release/')" in condition
 
 
 def test_integration_lane_fails_closed_on_real_test_failures() -> None:
@@ -352,11 +360,46 @@ def test_actionlint_policy_declares_self_hosted_runner_labels() -> None:
     assert {"nyx-ci", "trusted"} <= set(labels)
 
 
-def test_static_analysis_signed_allowlist_steps_handle_trusted_and_fork_prs() -> None:
-    """Signed allowlist loaders verify with secrets when available and degrade for forks."""
+@pytest.mark.parametrize("workflow_path", PR_WORKFLOWS, ids=lambda path: path.name)
+def test_pull_request_workflows_include_release_branches(workflow_path: Path) -> None:
+    """PR checks must run when a change targets a maintained release branch."""
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    pull_request = re.search(r"(?m)^  pull_request:\n    branches: \[(?P<branches>[^]]+)]$", workflow_text)
+
+    assert pull_request is not None, f"{workflow_path.name} must declare pull_request branch filters"
+    assert '"release/**"' in pull_request.group("branches")
+
+
+@pytest.mark.parametrize("workflow_path", (CI_WORKFLOW, CODEQL_WORKFLOW, JUDGE_GATES_WORKFLOW), ids=lambda path: path.name)
+def test_push_workflows_include_release_branches(workflow_path: Path) -> None:
+    """Merged release-branch changes must receive post-merge CI signal."""
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    push = re.search(r"(?m)^  push:\n    branches: \[(?P<branches>[^]]+)]$", workflow_text)
+
+    assert push is not None, f"{workflow_path.name} must declare push branch filters"
+    assert '"release/**"' in push.group("branches")
+
+
+def test_pull_request_jobs_never_use_the_trusted_runner() -> None:
+    """No PR-controlled workflow code may execute on the persistent nyx runner."""
+    for workflow_path in PR_WORKFLOWS:
+        workflow = _workflow(workflow_path)
+        for job_name, job in workflow["jobs"].items():
+            selector = str(job["runs-on"])
+            if "nyx-ci" not in selector:
+                continue
+            condition = str(job.get("if", ""))
+            assert "github.event_name != 'pull_request'" in selector or "github.event_name != 'pull_request'" in condition, (
+                f"{workflow_path.name}:{job_name} can route PR code to nyx"
+            )
+            assert "head.repo.full_name == github.repository" not in selector
+
+
+def test_static_analysis_signed_allowlist_steps_are_keyless_for_every_pr() -> None:
+    """PR code gets shape/binding checks but never receives the operator HMAC key."""
     workflow = _ci_workflow()
     static_analysis = workflow["jobs"]["static-analysis"]
-    expected_secret = "${{ secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY }}"
+    expected_secret = "${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}"
 
     for step_name in (
         "Run trust-tier elspeth-lints rule",
@@ -369,23 +412,19 @@ def test_static_analysis_signed_allowlist_steps_handle_trusted_and_fork_prs() ->
         assert env.get("ELSPETH_JUDGE_METADATA_HMAC_KEY") == expected_secret
         verify_mode = env.get("ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE")
         assert isinstance(verify_mode, str), f"{step_name!r} must define signature verification mode"
-        assert "github.event_name == 'pull_request'" in verify_mode
-        assert "github.event.pull_request.head.repo.full_name != github.repository" in verify_mode
-        assert "shape-only-when-key-missing" in verify_mode
-        assert "required" in verify_mode
+        assert verify_mode == "${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}"
 
 
-def test_static_analysis_fork_prs_reject_unverified_signed_allowlist_edits() -> None:
-    """Fork PRs must not use keyless shape-only CI to forge signed allowlist entries."""
+def test_static_analysis_all_prs_reject_unverified_signed_allowlist_edits() -> None:
+    """No keyless PR may add or mutate signed metadata and claim authority."""
     workflow = _ci_workflow()
     static_analysis = workflow["jobs"]["static-analysis"]
 
-    step = _step(static_analysis, "Reject unverified fork PR signed allowlist edits")
-    assert (
-        step.get("if") == "${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}"
-    )
+    step_name = "Reject unverified PR signed allowlist edits"
+    step = _step(static_analysis, step_name)
+    assert step.get("if") == "${{ github.event_name == 'pull_request' }}"
 
-    run = _step_run(static_analysis, "Reject unverified fork PR signed allowlist edits")
+    run = _step_run(static_analysis, step_name)
     assert "git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}" in run
     assert "check-judge-coverage" in run
     assert "--forbid-unverified-judge-metadata" in run
@@ -393,9 +432,18 @@ def test_static_analysis_fork_prs_reject_unverified_signed_allowlist_edits() -> 
     assert "--allowlist-root config/cicd/enforce_trust_boundary_honesty" in run
     assert "--baseline-ref ${{ github.event.pull_request.base.sha }}" in run
 
-    gate_index = _step_index(static_analysis, "Reject unverified fork PR signed allowlist edits")
+    gate_index = _step_index(static_analysis, step_name)
     assert gate_index < _step_index(static_analysis, "Run trust-tier elspeth-lints rule")
     assert gate_index < _step_index(static_analysis, "Run trust-boundary honesty-gate elspeth-lints rules")
+
+
+def test_judge_quality_never_receives_openrouter_credentials_on_prs() -> None:
+    """The live-judge secret remains push-only; PRs skip the trusted job."""
+    workflow = _workflow(JUDGE_GATES_WORKFLOW)
+    job = workflow["jobs"]["check-judge-quality"]
+
+    assert job["if"] == "github.event_name != 'pull_request'"
+    assert job["env"]["OPENROUTER_API_KEY"] == "${{ secrets.OPENROUTER_API_KEY }}"
 
 
 def test_trust_tier_ci_failure_points_to_signature_diagnosis_command() -> None:
