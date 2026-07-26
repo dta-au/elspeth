@@ -464,7 +464,13 @@ def _repository_relative_link_targets(path: Path) -> tuple[str, ...]:
 
 
 def _missing_repository_relative_link_targets(path: Path) -> tuple[str, ...]:
-    return tuple(target for target in _repository_relative_link_targets(path) if not (path.parent / target).resolve().exists())
+    repository_root = REPOSITORY_ROOT.resolve()
+    missing_targets: list[str] = []
+    for target in _repository_relative_link_targets(path):
+        resolved_target = (path.parent / target).resolve()
+        if not resolved_target.is_relative_to(repository_root) or not resolved_target.exists():
+            missing_targets.append(target)
+    return tuple(missing_targets)
 
 
 @pytest.mark.parametrize(
@@ -494,12 +500,47 @@ def test_markdown_link_target_parser_covers_supported_commonmark_forms(
     assert _repository_relative_link_targets(document) == expected_relative_targets
 
 
-def test_missing_repository_relative_link_target_is_reported(tmp_path: Path) -> None:
-    document = tmp_path / "document.md"
-    (tmp_path / "present.md").touch()
-    document.write_text("[present](present.md) [missing][target]\n\n[target]: missing.md\n", encoding="utf-8")
+def test_existing_repository_relative_link_target_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repository_root = tmp_path / "repository"
+    document = repository_root / "docs/document.md"
+    document.parent.mkdir(parents=True)
+    (document.parent / "present.md").touch()
+    document.write_text("[present](present.md)\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPOSITORY_ROOT", repository_root)
+
+    assert _missing_repository_relative_link_targets(document) == ()
+
+
+def test_missing_repository_relative_link_target_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repository_root = tmp_path / "repository"
+    document = repository_root / "docs/document.md"
+    document.parent.mkdir(parents=True)
+    document.write_text("[missing][target]\n\n[target]: missing.md\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPOSITORY_ROOT", repository_root)
 
     assert _missing_repository_relative_link_targets(document) == ("missing.md",)
+
+
+def test_parent_traversal_to_existing_repository_target_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repository_root = tmp_path / "repository"
+    document = repository_root / "docs/nested/document.md"
+    document.parent.mkdir(parents=True)
+    (repository_root / "docs/present.md").touch()
+    document.write_text("[present](../present.md)\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPOSITORY_ROOT", repository_root)
+
+    assert _missing_repository_relative_link_targets(document) == ()
+
+
+def test_parent_traversal_to_existing_target_outside_repository_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repository_root = tmp_path / "repository"
+    document = repository_root / "docs/document.md"
+    document.parent.mkdir(parents=True)
+    (tmp_path / "outside.md").touch()
+    document.write_text("[outside](../../outside.md)\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPOSITORY_ROOT", repository_root)
+
+    assert _missing_repository_relative_link_targets(document) == ("../../outside.md",)
 
 
 def test_dag_hub_links_the_live_scenario_corpus() -> None:
