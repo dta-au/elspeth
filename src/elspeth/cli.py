@@ -350,7 +350,15 @@ def _ensure_output_directories(
             # mode is still filtered through umask, so normalize only the root
             # this preflight creates instead of weakening validation later.
             payload_path.mkdir(mode=0o700, parents=True, exist_ok=False)
-            os.chmod(payload_path, 0o700)
+            if os.name != "nt":
+                # Bind permission normalization to the directory we created.
+                # O_NOFOLLOW prevents a raced symlink replacement from redirecting
+                # fchmod() to another path owned by this user.
+                payload_fd = os.open(payload_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fchmod(payload_fd, 0o700)
+                finally:
+                    os.close(payload_fd)
         except FileExistsError as e:
             if not payload_path.exists():
                 errors.append(f"Cannot create payload store directory: {payload_path.resolve()}\n  Error: {e}")
