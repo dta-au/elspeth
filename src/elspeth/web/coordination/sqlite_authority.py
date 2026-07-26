@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Connection, Engine
@@ -17,9 +18,10 @@ if TYPE_CHECKING:
 class SQLiteLocalSessionOperationAuthority(_SessionOperationAuthorityRepository):
     """Table-backed exact CAS under the existing process/file session lock.
 
-    SQLite has no membership, peer takeover, or bypass path.  An unreleased
-    row remains conflicting even after its lease expires; the supported local
-    process must renew or release its own authority while it is live.
+    SQLite has no membership or distributed peer-takeover path.  A live lease
+    always conflicts; an expired lease is locally recoverable under the same
+    process/file lock, including after a process restart changes the diagnostic
+    owner identity.
     """
 
     def __init__(self, engine: Engine) -> None:
@@ -31,3 +33,14 @@ class SQLiteLocalSessionOperationAuthority(_SessionOperationAuthorityRepository)
     def _locked_transaction(self, session_id: str) -> Iterator[Connection]:
         with locked_session_transaction(self._engine, session_id) as conn:
             yield conn
+
+    def _expired_owner_allows_takeover(
+        self,
+        conn: Connection,
+        *,
+        owner_instance_id: str,
+        database_now: datetime,
+    ) -> bool:
+        """Permit local expiry recovery without a membership dependency."""
+        del conn, owner_instance_id, database_now
+        return True
