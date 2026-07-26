@@ -2477,6 +2477,49 @@ def test_expansion_recovery_preserves_parent_child_group_and_scheduler_identity(
     assert evidence.audit.source_operation_count == 1
 
 
+def test_expansion_recovery_reconstructs_fixed_any_schema_without_reminting_children(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh public resume accepts the exact persisted form of fixed ``items:any``."""
+    scenario, case = _declared_case("row-expansion-parent-child-recovery", "resume-after-child-enqueue")
+    fixture_root = tmp_path / "fixed-any-fixtures"
+    copied_yaml = fixture_root / case.fixture
+    copied_yaml.parent.mkdir(parents=True)
+    original_yaml = resolve_fixture_path(case.fixture).read_text(encoding="utf-8")
+    observed_source_schema = "schema: {mode: observed}"
+    fixed_any_source_schema = 'schema: {mode: fixed, fields: ["order_id: int", "items: any"]}'
+    assert original_yaml.count(observed_source_schema) == 3
+    copied_yaml.write_text(
+        original_yaml.replace(observed_source_schema, fixed_any_source_schema, 1),
+        encoding="utf-8",
+    )
+    for relative_input in case.input_fixtures.values():
+        copied_input = fixture_root / relative_input
+        copied_input.parent.mkdir(parents=True, exist_ok=True)
+        copied_input.write_bytes(resolve_fixture_path(relative_input).read_bytes())
+    monkeypatch.setattr(corpus_loader, "FIXTURE_ROOT", fixture_root)
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+
+    recovery = evidence.recovery.expansion_child_enqueue
+    assert recovery is not None
+    assert recovery.parent_token_ids_before == recovery.parent_token_ids_after
+    assert recovery.child_token_ids_before == recovery.child_token_ids_after
+    assert recovery.expand_group_ids_before == recovery.expand_group_ids_after
+    assert recovery.scheduler_work_ids_before == recovery.scheduler_work_ids_after
+    assert len(recovery.parent_token_ids_after) == 3
+    assert len(recovery.child_token_ids_after) == 6
+    assert len(recovery.scheduler_work_ids_after) == 9
+    assert recovery.pending_children_before == 6
+    assert recovery.durable_export_parity is True
+    assert evidence.runtime.rows_processed == 3
+    assert evidence.runtime.rows_succeeded == 6
+    assert evidence.runtime.output_rows == 6
+    assert evidence.audit.source_operation_count == 1
+
+
 def test_pending_sink_redrive_recovery_preserves_complete_bundle_and_exactly_once_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

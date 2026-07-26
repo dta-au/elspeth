@@ -775,6 +775,25 @@ def test_export_module_does_not_define_resume_schema_reconstruction_helpers() ->
 class TestReconstructSchemaBasic:
     """Tests for reconstruct_schema_from_json with basic types."""
 
+    def test_canonical_unconstrained_field_restores_fixed_any_type(self) -> None:
+        """Pydantic's canonical schema for a fixed ``any`` field restores as object."""
+        schema = {
+            "properties": {
+                "items": {"title": "Items"},
+                "order_id": {"title": "Order Id", "type": "integer"},
+            },
+            "required": ["items", "order_id"],
+            "title": "SourceRow",
+            "type": "object",
+        }
+
+        model = reconstruct_schema_from_json(schema)
+
+        assert model.model_fields["items"].annotation is object
+        assert model.model_json_schema()["properties"]["items"] == {"title": "Items"}
+        for value in ([{"sku": "A1"}], {"sku": "A1"}, "A1", 1, None):
+            assert model(items=value, order_id=1).items == value
+
     def test_string_field(self) -> None:
         """String type maps correctly."""
         schema = {
@@ -988,6 +1007,24 @@ class TestReconstructSchemaFormats:
 class TestReconstructSchemaAnyOf:
     """Tests for anyOf patterns (Decimal, nullable)."""
 
+    def test_nullable_fixed_any_pattern(self) -> None:
+        """Pydantic's canonical ``Any | None`` schema restores without broad fallback."""
+        schema = {
+            "properties": {
+                "metadata": {
+                    "anyOf": [{}, {"type": "null"}],
+                    "default": None,
+                    "title": "Metadata",
+                },
+            },
+        }
+
+        model = reconstruct_schema_from_json(schema)
+
+        assert model(metadata={"source": "api"}).metadata == {"source": "api"}
+        assert model(metadata=["arbitrary"]).metadata == ["arbitrary"]
+        assert model(metadata=None).metadata is None
+
     def test_decimal_anyof_pattern(self) -> None:
         """anyOf with number+string maps to Decimal."""
         schema = {
@@ -1132,6 +1169,24 @@ class TestReconstructSchemaErrors:
             "properties": {"x": {"description": "no type here"}},
             "required": ["x"],
         }
+        with pytest.raises(AuditIntegrityError, match="no 'type'"):
+            reconstruct_schema_from_json(schema)
+
+    @pytest.mark.parametrize(
+        "field_info",
+        (
+            {"title": 7},
+            {"title": "Constrained", "minimum": 0},
+        ),
+        ids=("malformed-title", "unsupported-constraint"),
+    )
+    def test_noncanonical_typeless_field_still_fails_closed(self, field_info: dict[str, object]) -> None:
+        """Only the exact producer form for fixed ``any`` may omit ``type``."""
+        schema = {
+            "properties": {"x": field_info},
+            "required": ["x"],
+        }
+
         with pytest.raises(AuditIntegrityError, match="no 'type'"):
             reconstruct_schema_from_json(schema)
 
