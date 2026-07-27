@@ -1,0 +1,28 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: fork_input
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: fork_terminals
+    input: fork_input
+    condition: "True"
+    routes: {"true": fork, "false": discard}
+    fork_to: [failing, survivor]
+sinks:
+  failing:
+    plugin: dag_corpus_always_fail_sink
+    on_write_failure: discard
+    options:
+      path: ${output_failing}
+      schema: {mode: observed}
+  survivor:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_survivor}
+      format: jsonl
+      schema: {mode: observed}
