@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,10 +89,12 @@ def test_sanitize_error_exposes_only_context_and_exception_class() -> None:
     assert "/srv/private" not in detail
 
 
-def test_existing_directory_probe_succeeds_without_named_artifact(tmp_path: Path) -> None:
-    check = probe_directory_writable("payload", tmp_path)
+@pytest.mark.parametrize("label", ["data_dir", "payload_store", "blob"])
+def test_owner_only_trust_root_probe_succeeds_without_named_artifact(tmp_path: Path, label: str) -> None:
+    tmp_path.chmod(0o700)
+    check = probe_directory_writable(label, tmp_path)
 
-    assert check == ContractCheck("payload_writable", True, "payload directory is writable")
+    assert check == ContractCheck(f"{label}_writable", True, f"{label} directory is writable")
     assert list(tmp_path.glob(".doctor-probe-*")) == []
 
 
@@ -249,61 +252,78 @@ def test_payload_symlink_fails_before_active_probe_and_redacts_path(tmp_path: Pa
     # the raw public field shape here so this unit test exercises doctor's own
     # symlink boundary independently of that earlier normalization layer.
     settings = _settings(tmp_path).model_copy(update={"payload_store_path": symlink})
-    probed: list[Path | None] = []
-    real_probe = doctor.probe_directory_writable
+    real_mkstemp = doctor.tempfile.mkstemp
 
-    def spy_probe(label: str, path: Path | None) -> ContractCheck:
-        if label == "payload_store":
-            probed.append(path)
-        return real_probe(label, path)
+    def spy_mkstemp(*, prefix: str, dir: Path) -> tuple[int, str]:
+        if dir in (symlink, target):
+            pytest.fail("symlink must not be probed")
+        return real_mkstemp(prefix=prefix, dir=dir)
 
-    monkeypatch.setattr(doctor, "probe_directory_writable", spy_probe)
+    monkeypatch.setattr(doctor.tempfile, "mkstemp", spy_mkstemp)
 
     check = _by_name(collect_checks(settings))["payload_store_writable"]
 
     assert check.ok is False
-    assert probed == []
     assert str(symlink) not in check.detail
     assert str(target) not in check.detail
 
 
-def test_blob_symlink_fails_before_active_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("label", ["data_dir", "payload_store", "blob"])
+def test_trust_root_symlink_fails_before_active_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+) -> None:
     import elspeth.web.doctor as doctor
 
-    target = tmp_path / "blob-target"
+    target = tmp_path / "target"
     target.mkdir()
-    link = tmp_path / "blob-link"
+    link = tmp_path / "link"
     link.symlink_to(target, target_is_directory=True)
     monkeypatch.setattr(doctor.tempfile, "mkstemp", lambda **_kwargs: pytest.fail("symlink must not be probed"))
 
-    check = probe_directory_writable("blob", link)
+    check = probe_directory_writable(label, link)
 
-    assert check == ContractCheck("blob_writable", False, "blob directory must not be a symlink")
+    assert check == ContractCheck(f"{label}_writable", False, f"{label} directory must not be a symlink")
 
 
-def test_group_or_world_writable_payload_fails_before_active_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("label", "path_for", "check_name"),
+    [
+        ("data_dir", lambda settings: settings.data_dir, "data_dir_writable"),
+        ("payload_store", lambda settings: settings.payload_store_path, "payload_store_writable"),
+        ("blob", lambda settings: settings.data_dir / "blobs", "blob_writable"),
+    ],
+)
+@pytest.mark.parametrize("unsafe_mode", [0o720, 0o702])
+def test_group_or_world_writable_trust_root_fails_before_active_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    path_for: Callable[[WebSettings], Path | None],
+    check_name: str,
+    unsafe_mode: int,
+) -> None:
     import elspeth.web.doctor as doctor
 
-    payload = tmp_path / "insecure-payload"
-    payload.mkdir(mode=0o700)
-    payload.chmod(0o770)
-    settings = _settings(tmp_path, payload_store_path=payload)
-    probed = False
-    real_probe = doctor.probe_directory_writable
+    settings = _settings(tmp_path)
+    insecure_root = path_for(settings)
+    assert insecure_root is not None
+    insecure_root.chmod(unsafe_mode)
+    probed_paths: list[Path] = []
+    real_mkstemp = doctor.tempfile.mkstemp
 
-    def spy_probe(label: str, path: Path | None) -> ContractCheck:
-        nonlocal probed
-        if label == "payload_store":
-            probed = True
-        return real_probe(label, path)
+    def spy_mkstemp(*, prefix: str, dir: Path) -> tuple[int, str]:
+        probed_paths.append(dir)
+        return real_mkstemp(prefix=prefix, dir=dir)
 
-    monkeypatch.setattr(doctor, "probe_directory_writable", spy_probe)
+    monkeypatch.setattr(doctor.tempfile, "mkstemp", spy_mkstemp)
 
-    check = _by_name(collect_checks(settings))["payload_store_writable"]
+    check = _by_name(collect_checks(settings))[check_name]
 
     assert check.ok is False
-    assert probed is False
-    assert str(payload) not in check.detail
+    assert insecure_root not in probed_paths
+    assert str(insecure_root) not in check.detail
     assert "group/world-writable" in check.detail
 
 

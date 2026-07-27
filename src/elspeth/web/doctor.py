@@ -52,7 +52,7 @@ def sanitize_error(context: str, exc: BaseException) -> str:
 
 
 def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
-    """Actively prove an existing directory is writable without a named residue."""
+    """Prove an existing private directory is safe and writable."""
     name = f"{label}_writable"
     if path is None:
         return ContractCheck(name, False, f"{label} directory is required and must already exist")
@@ -62,6 +62,9 @@ def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
             return ContractCheck(name, False, f"{label} directory must not be a symlink")
         if not stat.S_ISDIR(path_stat.st_mode):
             return ContractCheck(name, False, f"{label} directory is required and must already exist")
+        if path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return ContractCheck(name, False, f"{label} group/world-writable directory is not allowed")
+        directory = path.resolve(strict=True)
     except Exception as exc:
         return ContractCheck(name, False, sanitize_error(f"{label} directory validation failed", exc))
 
@@ -71,7 +74,7 @@ def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
     probe_error: Exception | None = None
     cleanup_error: Exception | None = None
     try:
-        fd, probe_name = tempfile.mkstemp(prefix=".doctor-probe-", dir=path)
+        fd, probe_name = tempfile.mkstemp(prefix=".doctor-probe-", dir=directory)
         os.unlink(probe_name)
         unlinked = True
         with os.fdopen(fd, "w+b") as probe:
@@ -106,22 +109,8 @@ def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
 
 
 def _probe_payload_store(path: Path | None) -> ContractCheck:
-    """Apply the payload-store root contract before the active write probe."""
-    name = "payload_store_writable"
-    if path is None:
-        return probe_directory_writable("payload_store", None)
-    try:
-        path_stat = path.lstat()
-        if stat.S_ISLNK(path_stat.st_mode):
-            return ContractCheck(name, False, "payload_store directory must not be a symlink")
-        if not stat.S_ISDIR(path_stat.st_mode):
-            return ContractCheck(name, False, "payload_store path must be an existing directory")
-        if path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            return ContractCheck(name, False, "payload_store group/world-writable directory is not allowed")
-        resolved = path.resolve(strict=True)
-    except Exception as exc:
-        return ContractCheck(name, False, sanitize_error("payload_store directory validation failed", exc))
-    return probe_directory_writable("payload_store", resolved)
+    """Apply the shared private-directory contract to the payload store."""
+    return probe_directory_writable("payload_store", path)
 
 
 def _aws_s3_plugin_check() -> ContractCheck:
