@@ -20,7 +20,14 @@ from elspeth.core.landscape.data_flow import tokens as data_flow_tokens
 from elspeth.core.landscape.scheduler import barrier as scheduler_barrier
 from elspeth.core.landscape.scheduler import queue as scheduler_queue
 from elspeth.core.landscape.scheduler import work_items as scheduler_work_items
-from elspeth.core.landscape.schema import node_states_table
+from elspeth.core.landscape.schema import (
+    node_states_table,
+    routing_events_table,
+    rows_table,
+    token_outcomes_table,
+    token_parents_table,
+    tokens_table,
+)
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine import processor as engine_processor
 from elspeth.engine.orchestrator import Orchestrator
@@ -45,6 +52,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     ScenarioRunEvidence,
     ScenarioSpec,
     SemanticRunExpectation,
+    SinkOutputProjection,
     SummaryRunExpectation,
 )
 
@@ -2159,6 +2167,220 @@ def test_exact_runtime_projection_linear_matches_declared_durable_and_export(
     assert evidence.runtime.durable_projection == evidence.audit.portable_projection
     assert evidence.audit.record_counts == case.expected.audit_record_counts
     assert evidence.audit.source_operation_count == case.expected.source_operation_count
+
+
+def test_linear_sink_boundary_recovery_reopens_and_resumes_without_reminting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, run_case = _declared_case("linear", "happy-path")
+    case_values = run_case.model_dump(mode="json")
+    case_values.update(
+        id="reopen-after-source",
+        workflow="recovery",
+        recovery_kind="sink_boundary",
+        recovery_fault={
+            "kind": "sink_effect",
+            "seam": "before_effect",
+            "sink_name": "output",
+            "occurrence": 1,
+        },
+        expected={
+            "kind": "summary",
+            "status": "completed",
+            "output_rows": 3,
+            "required_audit_record_types": (
+                "artifact",
+                "operation",
+                "row",
+                "run",
+                "scheduler_event",
+                "sink_effect",
+                "sink_effect_member",
+                "token",
+                "token_outcome",
+            ),
+        },
+    )
+    case = HarnessCaseSpec.model_validate(case_values)
+    production_run = inspect.unwrap(Orchestrator.run)
+    production_resume = inspect.unwrap(Orchestrator.resume)
+    monkeypatch.setattr(Orchestrator, "run", production_run)
+    monkeypatch.setattr(Orchestrator, "resume", production_resume)
+    install_corpus_plugin_manager(monkeypatch)
+    built_identity_tuples: list[tuple[int, int, int, int, int, int]] = []
+    production_build = corpus_harness.build_scenario
+
+    def record_fresh_build(*args: Any, **kwargs: Any) -> Any:
+        built = production_build(*args, **kwargs)
+        built_identity_tuples.append(
+            (
+                id(built),
+                id(built.rendered),
+                id(built.rendered.settings),
+                id(built.bundle),
+                id(built.graph),
+                id(built.config),
+            )
+        )
+        return built
+
+    monkeypatch.setattr(corpus_harness, "build_scenario", record_fresh_build)
+
+    interrupted_facts: list[dict[str, object]] = []
+
+    def verify_interrupted_linear_state(context: corpus_harness.SinkBoundaryInterruptedContext) -> None:
+        assert context.scenario is scenario
+        assert context.case is case
+        assert context.rendered is context.built.rendered
+        assert (
+            id(context.built),
+            id(context.rendered),
+            id(context.rendered.settings),
+            id(context.built.bundle),
+            id(context.built.graph),
+            id(context.built.config),
+        ) == built_identity_tuples[0]
+        assert context.source_names_exhausted == ("primary",)
+        assert context.token_ids == tuple(sorted(context.interrupted_effect.member_token_ids))
+        with context.database.connection() as conn:
+            row_ids = tuple(
+                str(row_id)
+                for row_id in conn.execute(
+                    select(rows_table.c.row_id).where(rows_table.c.run_id == context.run_id).order_by(rows_table.c.row_id)
+                ).scalars()
+            )
+            token_lineage = tuple(
+                conn.execute(
+                    select(
+                        tokens_table.c.token_id,
+                        tokens_table.c.row_id,
+                        tokens_table.c.fork_group_id,
+                        tokens_table.c.join_group_id,
+                        tokens_table.c.expand_group_id,
+                        tokens_table.c.branch_name,
+                    )
+                    .where(tokens_table.c.run_id == context.run_id)
+                    .order_by(tokens_table.c.token_id)
+                ).mappings()
+            )
+            parent_links = tuple(
+                conn.execute(
+                    select(token_parents_table.c.token_id, token_parents_table.c.parent_token_id)
+                    .where(token_parents_table.c.run_id == context.run_id)
+                    .order_by(token_parents_table.c.token_id, token_parents_table.c.ordinal)
+                ).mappings()
+            )
+            routes = tuple(
+                conn.execute(
+                    select(routing_events_table.c.event_id)
+                    .where(routing_events_table.c.run_id == context.run_id)
+                    .order_by(routing_events_table.c.event_id)
+                ).scalars()
+            )
+            outcomes = tuple(
+                conn.execute(
+                    select(token_outcomes_table.c.outcome_id)
+                    .where(token_outcomes_table.c.run_id == context.run_id)
+                    .order_by(token_outcomes_table.c.outcome_id)
+                ).scalars()
+            )
+            states = tuple(
+                conn.execute(
+                    select(
+                        node_states_table.c.token_id,
+                        node_states_table.c.node_id,
+                        node_states_table.c.status,
+                        node_states_table.c.attempt,
+                        node_states_table.c.resume_checkpoint_id,
+                    )
+                    .where(node_states_table.c.run_id == context.run_id)
+                    .order_by(node_states_table.c.node_id, node_states_table.c.token_id)
+                ).mappings()
+            )
+        assert len(row_ids) == 3
+        assert tuple(str(token["token_id"]) for token in token_lineage) == context.token_ids
+        assert {str(token["row_id"]) for token in token_lineage} == set(row_ids)
+        assert all(
+            token[key] is None for token in token_lineage for key in ("fork_group_id", "join_group_id", "expand_group_id", "branch_name")
+        )
+        assert parent_links == ()
+        assert routes == ()
+        assert outcomes == ()
+        assert len(states) == 9
+        assert sum(state["status"] == "completed" and state["attempt"] == 0 for state in states) == 6
+        open_states = tuple(state for state in states if state["status"] == "open")
+        assert len(open_states) == 3
+        assert {str(state["token_id"]) for state in open_states} == set(context.token_ids)
+        assert {str(state["node_id"]) for state in open_states} == {context.interrupted_effect.sink_node_id}
+        assert all(state["resume_checkpoint_id"] is None for state in states)
+        interrupted_facts.append(
+            {
+                "row_ids": row_ids,
+                "token_ids": context.token_ids,
+                "parent_link_count": len(parent_links),
+                "route_count": len(routes),
+                "outcome_count": len(outcomes),
+                "completed_node_state_count": sum(state["status"] == "completed" for state in states),
+            }
+        )
+
+    evidence = corpus_harness.run_sink_boundary_recovery_case(
+        scenario,
+        case,
+        tmp_path,
+        before_reopen_verifier=verify_interrupted_linear_state,
+    )
+
+    _assert_declared_recovery_evidence(scenario, case, evidence)
+    assert len(interrupted_facts) == 1
+    assert interrupted_facts[0]["completed_node_state_count"] == 6
+    assert len(built_identity_tuples) == 2
+    assert len(set(built_identity_tuples)) == 2
+    assert evidence.runtime.sink_outputs == (
+        SinkOutputProjection(
+            sink_name="output",
+            rows=('{"id":1,"value":10}', '{"id":2,"value":20}', '{"id":3,"value":30}'),
+        ),
+    )
+    assert evidence.audit.source_operation_count == 1
+    proof = evidence.recovery.sink_boundary
+    assert proof is not None
+    assert proof.fault.model_dump(mode="json") == {
+        "kind": "sink_effect",
+        "seam": "before_effect",
+        "sink_name": "output",
+        "occurrence": 1,
+    }
+    assert proof.fault_count == 1
+    assert proof.initial_run_status == "failed"
+    assert proof.source_names_exhausted_before == ("primary",)
+    assert proof.checkpoint_topology_hash == proof.fresh_topology_hash
+    assert len(proof.token_ids_before) == 3
+    assert proof.token_ids_before == proof.token_ids_after
+    assert len(proof.work_before) == 3
+    assert {item.status for item in proof.work_before} == {"pending_sink"}
+    assert {item.row_payload_state for item in proof.work_before} == {"live"}
+    assert {item.status for item in proof.work_after} == {"terminal"}
+    assert {item.row_payload_state for item in proof.work_after} == {"purged"}
+    assert all(item.row_payload_anchor_sha256 == hashlib.sha256(item.token_id.encode()).hexdigest() for item in proof.work_after)
+    assert proof.effect_count_before == 1
+    assert proof.effect_member_count_before == 3
+    assert proof.artifact_count_before == proof.publication_count_before == 0
+    assert proof.effect_count_after == proof.artifact_count_after == proof.publication_count_after == 1
+    assert proof.resume_marker_count == 1
+    assert proof.resume_marker_event_type == "leader_acquire"
+    assert proof.resume_marker_entry_point == "resume"
+    assert proof.resume_marker_worker_id
+    assert proof.resume_marker_leader_epoch >= 1
+    assert proof.durable_identity_reused is True
+    assert proof.durable_export_parity is True
+    assert proof.provisional_until_deferred_platform_rebase is True
+    assert [json.loads(line) for line in (tmp_path / "output.jsonl").read_text(encoding="utf-8").splitlines()] == [
+        {"id": 1, "value": 10},
+        {"id": 2, "value": 20},
+        {"id": 3, "value": 30},
+    ]
 
 
 def test_recovery_durable_oracle_rejects_shared_serializer_record_family_omission(

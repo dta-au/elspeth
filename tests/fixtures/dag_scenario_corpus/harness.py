@@ -6,8 +6,9 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from string import Template
 from types import MappingProxyType
@@ -50,6 +51,7 @@ from elspeth.core.landscape.schema import (
     operations_table,
     routing_events_table,
     rows_table,
+    run_coordination_events_table,
     runs_table,
     scheduler_events_table,
     sink_effect_attempts_table,
@@ -105,6 +107,9 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     SemanticProjectionCounts,
     SemanticRuntimeProjection,
     SemanticTokenProjection,
+    SinkBoundaryEffectProjection,
+    SinkBoundaryRecoveryEvidence,
+    SinkBoundaryWorkProjection,
     SinkOutputProjection,
     StableAuditRecordProjection,
     StableAuditRecordType,
@@ -162,6 +167,32 @@ class BuiltScenario:
     graph: ExecutionGraph
     config: PipelineConfig
     graph_evidence: GraphEvidence
+
+
+@dataclass(frozen=True, slots=True)
+class SinkBoundaryInterruptedContext:
+    """Ephemeral, read-only verification context for the interrupted database.
+
+    The context is valid only while ``before_reopen_verifier`` is executing.
+    Topology helpers may issue direct-table reads through ``database`` but must
+    not mutate it or retain any runtime object after the callback returns.
+    """
+
+    database: LandscapeDB
+    payload_store: FilesystemPayloadStore
+    scenario: ScenarioSpec
+    case: HarnessCaseSpec
+    rendered: RenderedScenario
+    built: BuiltScenario
+    run_id: str
+    checkpoint_id: str
+    checkpoint_sequence: int
+    checkpoint_topology_hash: str
+    source_names_exhausted: tuple[str, ...]
+    token_ids: tuple[str, ...]
+    work: tuple[SinkBoundaryWorkProjection, ...]
+    effects: tuple[SinkBoundaryEffectProjection, ...]
+    interrupted_effect: SinkBoundaryEffectProjection
 
 
 def _require_exact_template_bindings(
@@ -1547,6 +1578,92 @@ def _sink_effect_member_id(effect_id: str, ordinal: int) -> str:
     return hashlib.sha256(contract_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def _validate_durable_sink_effect_attempt_call_material(
+    *,
+    effect_id: str,
+    attempt: Mapping[str, object],
+    call: Mapping[str, object],
+) -> None:
+    """Validate one attempt against its call and closed semantic evidence."""
+
+    source = "durable"
+    raw_evidence = attempt.get("_evidence_json")
+    expected_evidence_hash = None
+    if raw_evidence is not None:
+        if not isinstance(raw_evidence, str):
+            raise AssertionError(f"DAG corpus durable sink_effect_attempt integrity: {effect_id} evidence is not JSON text")
+        expected_evidence_hash = hashlib.sha256(raw_evidence.encode("utf-8")).hexdigest()
+    _require_material_equal(
+        source=source,
+        record_type="sink_effect_attempt",
+        field="evidence_hash",
+        actual=attempt.get("evidence_hash"),
+        expected=expected_evidence_hash,
+    )
+    _require_material_equal(
+        source=source,
+        record_type="sink_effect_attempt",
+        field="request_hash",
+        actual=attempt.get("request_hash"),
+        expected=call.get("request_hash"),
+    )
+    attempt_state = attempt.get("state")
+    if attempt_state == "returned":
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="returned call.status",
+            actual=call.get("status"),
+            expected="success",
+        )
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="evidence_hash/call.response_hash",
+            actual=attempt.get("evidence_hash"),
+            expected=call.get("response_hash"),
+        )
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="returned call.error_json",
+            actual=call.get("error_json"),
+            expected=None,
+        )
+    elif attempt_state == "response_lost":
+        expected_response_lost_evidence = contract_canonical_json({"classification": "response_lost"})
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="response-lost semantic evidence",
+            actual=raw_evidence,
+            expected=expected_response_lost_evidence,
+        )
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="response-lost call.status",
+            actual=call.get("status"),
+            expected="error",
+        )
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="response-lost call.response_hash",
+            actual=call.get("response_hash"),
+            expected=None,
+        )
+        _require_material_equal(
+            source=source,
+            record_type="sink_effect_attempt",
+            field="response-lost call.error_json",
+            actual=call.get("error_json"),
+            expected=raw_evidence,
+        )
+    else:
+        raise AssertionError(f"DAG corpus durable sink_effect_attempt integrity: unsupported terminal state {attempt_state!r}")
+
+
 def _validate_durable_sink_effect_material(records: list[dict[str, Any]]) -> None:
     """Validate stored sink-effect hashes before portable normalization.
 
@@ -1670,38 +1787,16 @@ def _validate_durable_sink_effect_material(records: list[dict[str, Any]]) -> Non
 
     for (effect_id_value, attempt_index_value), attempt in attempts.items():
         effect_id = str(effect_id_value)
-        raw_evidence = attempt.get("_evidence_json")
-        expected_evidence_hash = None
-        if raw_evidence is not None:
-            if not isinstance(raw_evidence, str):
-                raise AssertionError(f"DAG corpus durable sink_effect_attempt integrity: {effect_id} evidence is not JSON text")
-            expected_evidence_hash = hashlib.sha256(raw_evidence.encode("utf-8")).hexdigest()
-        _require_material_equal(
-            source=source,
-            record_type="sink_effect_attempt",
-            field="evidence_hash",
-            actual=attempt.get("evidence_hash"),
-            expected=expected_evidence_hash,
-        )
         operation = operation_by_effect.get(effect_id)
         if operation is None:
             raise AssertionError(f"DAG corpus durable sink_effect_attempt integrity: {effect_id} has no sink-effect operation")
         call = calls.get((operation.get("operation_id"), attempt_index_value))
         if call is None:
             raise AssertionError(f"DAG corpus durable sink_effect_attempt integrity: {effect_id} has no matching operation call")
-        _require_material_equal(
-            source=source,
-            record_type="sink_effect_attempt",
-            field="request_hash",
-            actual=attempt.get("request_hash"),
-            expected=call.get("request_hash"),
-        )
-        _require_material_equal(
-            source=source,
-            record_type="sink_effect_attempt",
-            field="evidence_hash/call.response_hash",
-            actual=attempt.get("evidence_hash"),
-            expected=call.get("response_hash"),
+        _validate_durable_sink_effect_attempt_call_material(
+            effect_id=effect_id,
+            attempt=attempt,
+            call=call,
         )
 
 
@@ -2040,7 +2135,7 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
         query = select(*(table.c[field] for field in fields)).where(table.c.run_id == run_id)
         if order_by:
             query = query.order_by(*order_by)
-        return list(connection.execute(query).mappings())
+        return [cast(Mapping[str, Any], row) for row in connection.execute(query).mappings()]
 
     def project(record_type: str, row: Mapping[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
         return {"record_type": record_type, **{field: row[field] for field in fields}}
@@ -2275,16 +2370,16 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
             )
         ).mappings()
         attempt_index_by_effect: defaultdict[str, int] = defaultdict(int)
-        for row in attempt_rows:
-            effect_id = str(row["effect_id"])
+        for attempt_row in attempt_rows:
+            effect_id = str(attempt_row["effect_id"])
             attempt_index = attempt_index_by_effect[effect_id]
             attempt_index_by_effect[effect_id] += 1
             record = {
                 "record_type": "sink_effect_attempt",
                 "run_id": run_id,
-                **{field: row[field] for field in attempt_fields[:-1]},
+                **{field: attempt_row[field] for field in attempt_fields[:-1]},
                 "attempt_index": attempt_index,
-                "_evidence_json": row["evidence_json"],
+                "_evidence_json": attempt_row["evidence_json"],
             }
             records.append(record)
 
@@ -3728,6 +3823,97 @@ def _sink_effect_snapshot(
     return effects, attempts, members, artifacts
 
 
+def _sink_boundary_work_snapshot(
+    db: LandscapeDB,
+    *,
+    run_id: str,
+) -> tuple[SinkBoundaryWorkProjection, ...]:
+    """Project scheduler identity and material without retaining ORM/runtime objects."""
+
+    with db.connection() as conn:
+        rows = tuple(
+            conn.execute(
+                select(token_work_items_table)
+                .where(token_work_items_table.c.run_id == run_id)
+                .order_by(token_work_items_table.c.work_item_id)
+            ).mappings()
+        )
+
+    def optional_text(value: object) -> str | None:
+        return None if value is None else str(value)
+
+    projections: list[SinkBoundaryWorkProjection] = []
+    for row in rows:
+        payload = row["row_payload_json"]
+        if not isinstance(payload, str) or not payload:
+            raise AssertionError("sink-boundary recovery scheduler work lacks a durable row payload")
+        try:
+            decoded_payload = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise AssertionError("sink-boundary recovery scheduler work payload is not valid JSON") from exc
+        if not isinstance(decoded_payload, dict):
+            raise AssertionError("sink-boundary recovery scheduler work payload is not an object")
+        if decoded_payload.get("row_payload") == "purged":
+            if set(decoded_payload) != {"payload_hash", "row_payload"}:
+                raise AssertionError("sink-boundary recovery scheduler purge witness has unexpected fields")
+            row_payload_state = "purged"
+            row_payload_anchor_sha256 = decoded_payload.get("payload_hash")
+        else:
+            if set(decoded_payload) != {"contract", "row"}:
+                raise AssertionError("sink-boundary recovery live scheduler payload lacks row and contract material")
+            row_payload_state = "live"
+            row_payload_anchor_sha256 = None
+        projections.append(
+            SinkBoundaryWorkProjection(
+                work_item_id=str(row["work_item_id"]),
+                token_id=str(row["token_id"]),
+                row_id=str(row["row_id"]),
+                row_payload_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+                row_payload_state=row_payload_state,
+                row_payload_anchor_sha256=row_payload_anchor_sha256,
+                node_id=optional_text(row["node_id"]),
+                attempt=int(row["attempt"]),
+                status=str(row["status"]),
+                pending_sink_name=optional_text(row["pending_sink_name"]),
+                pending_outcome=optional_text(row["pending_outcome"]),
+                pending_path=optional_text(row["pending_path"]),
+                pending_error_hash=optional_text(row["pending_error_hash"]),
+                pending_error_message=optional_text(row["pending_error_message"]),
+            )
+        )
+    return tuple(projections)
+
+
+def _sink_boundary_effect_projection(
+    effects: tuple[dict[str, Any], ...],
+    members: tuple[dict[str, Any], ...],
+    *,
+    sink_names_by_node_id: Mapping[str, str],
+) -> tuple[SinkBoundaryEffectProjection, ...]:
+    """Bind each durable effect to its declared sink and ordered member identities."""
+
+    projections: list[SinkBoundaryEffectProjection] = []
+    for effect in effects:
+        effect_id = str(effect["effect_id"])
+        sink_node_id = str(effect["sink_node_id"])
+        sink_name = sink_names_by_node_id.get(sink_node_id)
+        if sink_name is None:
+            raise AssertionError(f"sink-boundary recovery effect targets an undeclared sink node: {sink_node_id!r}")
+        effect_members = tuple(member for member in members if str(member["effect_id"]) == effect_id)
+        projections.append(
+            SinkBoundaryEffectProjection(
+                effect_id=effect_id,
+                sink_name=sink_name,
+                sink_node_id=sink_node_id,
+                artifact_id=str(effect["artifact_id"]),
+                state=str(effect["state"]),
+                member_token_ids=tuple(str(member["token_id"]) for member in effect_members),
+                member_row_ids=tuple(str(member["row_id"]) for member in effect_members),
+            )
+        )
+    return tuple(projections)
+
+
 def _single_pending_sink_work_snapshot(
     db: LandscapeDB,
     *,
@@ -4565,6 +4751,406 @@ def _parallel_sink_finalization_recovery_case(
         reopened_db.close()
 
 
+def run_sink_boundary_recovery_case(
+    scenario: ScenarioSpec,
+    case: HarnessCaseSpec,
+    tmp_path: Path,
+    *,
+    before_reopen_verifier: Callable[[SinkBoundaryInterruptedContext], None] | None = None,
+) -> ScenarioRunEvidence:
+    """Interrupt one declared sink before publication, then reopen and resume.
+
+    This is the common extension point for topology-specific recovery helpers.
+    The optional verifier receives the still-open interrupted database after
+    common invariants pass and before every initial runtime object is
+    discarded. It can assert exact topology-specific pre-reopen facts without
+    adding central dispatch. Manifest-driven calls use the generic default.
+    """
+
+    if case.workflow != "recovery" or case.recovery_kind != "sink_boundary" or case.recovery_fault is None:
+        raise AssertionError("sink-boundary recovery requires its exact declared workflow, kind, and fault")
+    if not isinstance(case.expected, SummaryRunExpectation):
+        raise AssertionError("sink-boundary recovery requires a summary run expectation")
+
+    fault = case.recovery_fault
+    target_seam = SinkEffectExecutionSeam(fault.seam)
+    database_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    payload_root = tmp_path / "payloads"
+    initial_rendered = render_settings(case, tmp_path)
+    if fault.sink_name not in initial_rendered.settings.sinks:
+        raise AssertionError(f"sink-boundary recovery fault names undeclared sink {fault.sink_name!r}")
+    initial_built = build_scenario(initial_rendered)
+    sink_ids = {str(name): str(node_id) for name, node_id in initial_built.graph.get_sink_id_map().items()}
+    sink_names_by_node_id = {node_id: name for name, node_id in sink_ids.items()}
+    target_sink_node_id = sink_ids.get(fault.sink_name)
+    if target_sink_node_id is None:
+        raise AssertionError(f"sink-boundary recovery graph lacks declared sink {fault.sink_name!r}")
+
+    initial_store = FilesystemPayloadStore(payload_root)
+    initial_database_cell = [LandscapeDB(database_url)]
+
+    def require_initial_database() -> LandscapeDB:
+        if not initial_database_cell:
+            raise AssertionError("sink-boundary recovery initial database was already discarded")
+        return initial_database_cell[0]
+
+    initial_checkpoint_manager = CheckpointManager(require_initial_database())
+    initial_checkpoint_config = RuntimeCheckpointConfig.from_settings(initial_rendered.settings.checkpoint)
+    observed_target_seams: list[SinkEffectExecutionSeam] = []
+    original_coordinator_init = SinkEffectCoordinator.__init__
+    corpus_lease_ttl = timedelta(seconds=3)
+
+    def initialize_with_bounded_corpus_lease(
+        self: SinkEffectCoordinator,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        kwargs.update(lease_ttl=corpus_lease_ttl, poll_interval=0.05)
+        original_coordinator_init(self, *args, **kwargs)
+
+    def inject_declared_fault(
+        _coordinator: SinkEffectCoordinator,
+        seam: SinkEffectExecutionSeam,
+    ) -> None:
+        if seam is not target_seam:
+            return
+        database = require_initial_database()
+        with database.connection() as conn:
+            active_target_effect_ids = tuple(
+                str(effect_id)
+                for effect_id in conn.execute(
+                    select(sink_effects_table.c.effect_id).where(
+                        sink_effects_table.c.state == "in_flight",
+                        sink_effects_table.c.sink_node_id == target_sink_node_id,
+                    )
+                ).scalars()
+            )
+        if not active_target_effect_ids:
+            return
+        if len(active_target_effect_ids) != 1:
+            raise AssertionError(
+                f"sink-boundary recovery cannot identify one target effect at the declared seam: {active_target_effect_ids!r}"
+            )
+        observed_target_seams.append(seam)
+        if len(observed_target_seams) == fault.occurrence:
+            raise SinkEffectInjectedFault(seam)
+
+    try:
+        catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
+        with (
+            patch.object(SinkEffectCoordinator, "__init__", new=initialize_with_bounded_corpus_lease),
+            patch.object(SinkEffectCoordinator, "_fault", new=inject_declared_fault),
+        ):
+            try:
+                Orchestrator(
+                    require_initial_database(),
+                    checkpoint_manager=initial_checkpoint_manager,
+                    checkpoint_config=initial_checkpoint_config,
+                ).run(
+                    initial_built.config,
+                    graph=initial_built.graph,
+                    settings=initial_rendered.settings,
+                    payload_store=initial_store,
+                    openrouter_catalog_sha256=catalog_sha256,
+                    openrouter_catalog_source=catalog_source,
+                )
+            except SinkEffectInjectedFault as exc:
+                if exc.seam is not target_seam:
+                    raise AssertionError(f"sink-boundary recovery reached the wrong fault seam: {exc.seam.value}") from exc
+            else:
+                raise AssertionError("sink-boundary recovery did not inject its declared production fault")
+        if tuple(observed_target_seams) != (target_seam,):
+            raise AssertionError(f"sink-boundary recovery did not reach its declared sink seam exactly once: {observed_target_seams!r}")
+
+        initial_repositories = RecorderFactory.read_only(require_initial_database(), payload_store=initial_store)
+        runs = initial_repositories.run_lifecycle.list_runs()
+        if len(runs) != 1 or runs[0].status is not RunStatus.FAILED:
+            raise AssertionError(f"sink-boundary recovery expected one failed interrupted run, got {runs!r}")
+        run_id = runs[0].run_id
+        source_records = initial_repositories.run_lifecycle.get_run_source_lifecycle_records(run_id)
+        source_names_exhausted_before = tuple(sorted(record.source_name for record in source_records.values()))
+        if source_names_exhausted_before != tuple(sorted(case.input_fixtures)) or any(
+            record.lifecycle_state != "exhausted" for record in source_records.values()
+        ):
+            raise AssertionError(f"sink-boundary recovery sources were not exactly exhausted: {source_records!r}")
+
+        checkpoint = initial_checkpoint_manager.get_latest_checkpoint(run_id)
+        if checkpoint is None or checkpoint.upstream_topology_hash != initial_built.graph_evidence.topology_hash:
+            raise AssertionError("sink-boundary recovery did not retain its exact topology checkpoint")
+        checkpoint_id = checkpoint.checkpoint_id
+        checkpoint_sequence = checkpoint.sequence_number
+        checkpoint_topology_hash = checkpoint.upstream_topology_hash
+        if checkpoint_topology_hash is None:
+            raise AssertionError("sink-boundary recovery checkpoint lacks a topology hash")
+
+        with require_initial_database().connection() as conn:
+            token_ids_before = tuple(
+                conn.execute(
+                    select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id).order_by(tokens_table.c.token_id)
+                ).scalars()
+            )
+        token_ids_before = tuple(str(token_id) for token_id in token_ids_before)
+        work_before = _sink_boundary_work_snapshot(require_initial_database(), run_id=run_id)
+        before_effects, _before_attempts, before_members, before_artifacts = _sink_effect_snapshot(
+            require_initial_database(),
+            run_id=run_id,
+        )
+        effects_before = _sink_boundary_effect_projection(
+            before_effects,
+            before_members,
+            sink_names_by_node_id=sink_names_by_node_id,
+        )
+        interrupted_effects = tuple(
+            effect for effect in effects_before if effect.sink_node_id == target_sink_node_id and effect.state == "in_flight"
+        )
+        if len(interrupted_effects) != 1:
+            raise AssertionError(f"sink-boundary recovery interrupted the wrong durable effect: {effects_before!r}")
+        interrupted_effect = interrupted_effects[0]
+        pending_token_ids = {
+            item.token_id for item in work_before if item.status == "pending_sink" and item.pending_sink_name == fault.sink_name
+        }
+        if set(interrupted_effect.member_token_ids) != pending_token_ids:
+            raise AssertionError("sink-boundary recovery effect members do not equal the declared sink's pending work")
+        publication_count_before = sum(effect["publication_performed"] is True for effect in before_effects)
+        interrupted_artifacts = tuple(
+            artifact for artifact in before_artifacts if str(artifact["sink_effect_id"]) == interrupted_effect.effect_id
+        )
+        interrupted_raw_effect = next(effect for effect in before_effects if str(effect["effect_id"]) == interrupted_effect.effect_id)
+        if interrupted_artifacts or interrupted_raw_effect["publication_performed"] is not None:
+            raise AssertionError("sink-boundary recovery published its declared sink before the fault")
+        if initial_rendered.output_paths[fault.sink_name].exists():
+            raise AssertionError("sink-boundary recovery created the declared sink artifact before reopen")
+        lease_expires_at = interrupted_raw_effect["lease_expires_at"]
+        if not isinstance(lease_expires_at, datetime):
+            raise AssertionError("sink-boundary recovery interrupted effect lacks a live lease")
+        if lease_expires_at.tzinfo is None:
+            lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
+        if lease_expires_at <= datetime.now(UTC):
+            raise AssertionError("sink-boundary recovery interrupted effect lease expired before initial close")
+        if before_reopen_verifier is not None:
+            before_reopen_verifier(
+                SinkBoundaryInterruptedContext(
+                    database=require_initial_database(),
+                    payload_store=initial_store,
+                    scenario=scenario,
+                    case=case,
+                    rendered=initial_rendered,
+                    built=initial_built,
+                    run_id=run_id,
+                    checkpoint_id=checkpoint_id,
+                    checkpoint_sequence=checkpoint_sequence,
+                    checkpoint_topology_hash=checkpoint_topology_hash,
+                    source_names_exhausted=source_names_exhausted_before,
+                    token_ids=token_ids_before,
+                    work=work_before,
+                    effects=effects_before,
+                    interrupted_effect=interrupted_effect,
+                )
+            )
+        with require_initial_database().connection() as conn:
+            lease_expires_at_before_close = conn.execute(
+                select(sink_effects_table.c.lease_expires_at).where(
+                    sink_effects_table.c.effect_id == interrupted_effect.effect_id,
+                )
+            ).scalar_one()
+        if not isinstance(lease_expires_at_before_close, datetime):
+            raise AssertionError("sink-boundary recovery interrupted effect lost its lease before initial close")
+        if lease_expires_at_before_close.tzinfo is None:
+            lease_expires_at_before_close = lease_expires_at_before_close.replace(tzinfo=UTC)
+        if lease_expires_at_before_close <= datetime.now(UTC):
+            raise AssertionError("sink-boundary recovery verifier outlived the interrupted effect's live lease")
+    finally:
+        initial_database = require_initial_database()
+        initial_database.close()
+
+    initial_database_cell.clear()
+    del initial_database
+    del initial_repositories, initial_store, runs, source_records, checkpoint
+    del initial_checkpoint_manager, initial_checkpoint_config, initial_built, initial_rendered
+
+    reopened_db = LandscapeDB.from_url(database_url, create_tables=False)
+    try:
+        reopened_store = FilesystemPayloadStore(payload_root)
+        reopened_checkpoint_manager = CheckpointManager(reopened_db)
+        reopened_checkpoint = reopened_checkpoint_manager.get_latest_checkpoint(run_id)
+        if reopened_checkpoint is None or (
+            reopened_checkpoint.checkpoint_id,
+            reopened_checkpoint.sequence_number,
+            reopened_checkpoint.upstream_topology_hash,
+        ) != (checkpoint_id, checkpoint_sequence, checkpoint_topology_hash):
+            raise AssertionError("sink-boundary recovery checkpoint changed across fresh-object reopen")
+
+        fresh_rendered = render_settings(case, tmp_path)
+        fresh_built = build_scenario(fresh_rendered, purpose=SinkEffectExecutionPurpose.RESUME)
+        if fresh_built.graph_evidence.topology_hash != checkpoint_topology_hash:
+            raise AssertionError("sink-boundary recovery fresh graph changed checkpoint topology")
+        fresh_sink_ids = {str(name): str(node_id) for name, node_id in fresh_built.graph.get_sink_id_map().items()}
+        if fresh_sink_ids != sink_ids:
+            raise AssertionError("sink-boundary recovery fresh graph reminted sink node identity")
+
+        recovery = RecoveryManager(reopened_db, reopened_checkpoint_manager)
+        resume_check = recovery.can_resume(run_id, fresh_built.graph)
+        if not resume_check.can_resume:
+            raise AssertionError(f"sink-boundary recovery was not publicly resumable: {resume_check.reason}")
+        resume_point = recovery.get_resume_point(run_id, fresh_built.graph)
+        if resume_point is None or resume_point.checkpoint.checkpoint_id != checkpoint_id:
+            raise AssertionError("sink-boundary recovery did not use its public reopened resume point")
+
+        fresh_checkpoint_config = RuntimeCheckpointConfig.from_settings(fresh_rendered.settings.checkpoint)
+        with patch.object(SinkEffectCoordinator, "__init__", new=initialize_with_bounded_corpus_lease):
+            result = Orchestrator(
+                reopened_db,
+                checkpoint_manager=reopened_checkpoint_manager,
+                checkpoint_config=fresh_checkpoint_config,
+            ).resume(
+                resume_point,
+                fresh_built.config,
+                fresh_built.graph,
+                payload_store=reopened_store,
+                settings=fresh_rendered.settings,
+            )
+        result_data = result.to_dict()
+        if result.run_id != run_id or result_data["status"] != case.expected.status:
+            raise AssertionError(f"sink-boundary recovery returned the wrong final result: {result_data!r}")
+
+        sink_outputs = _sink_outputs(fresh_rendered)
+        output_rows = sum(len(output.rows) for output in sink_outputs)
+        if output_rows != case.expected.output_rows:
+            raise AssertionError(f"sink-boundary recovery emitted {output_rows} rows, expected {case.expected.output_rows}")
+        _assert_all_tokens_and_work_terminal(
+            reopened_db,
+            run_id=run_id,
+            payload_store=reopened_store,
+        )
+        final_repositories = RecorderFactory.read_only(reopened_db, payload_store=reopened_store)
+        final_source_records = final_repositories.run_lifecycle.get_run_source_lifecycle_records(run_id)
+        if tuple(sorted(record.source_name for record in final_source_records.values())) != tuple(sorted(case.input_fixtures)) or any(
+            record.lifecycle_state != "exhausted" for record in final_source_records.values()
+        ):
+            raise AssertionError("sink-boundary recovery lost exact source exhaustion")
+
+        with reopened_db.connection() as conn:
+            token_ids_after = tuple(
+                str(token_id)
+                for token_id in conn.execute(
+                    select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id).order_by(tokens_table.c.token_id)
+                ).scalars()
+            )
+            coordination_rows = tuple(
+                conn.execute(
+                    select(
+                        run_coordination_events_table.c.event_type,
+                        run_coordination_events_table.c.worker_id,
+                        run_coordination_events_table.c.leader_epoch,
+                        run_coordination_events_table.c.context_json,
+                    )
+                    .where(
+                        run_coordination_events_table.c.run_id == run_id,
+                        run_coordination_events_table.c.event_type == "leader_acquire",
+                    )
+                    .order_by(run_coordination_events_table.c.seq)
+                ).mappings()
+            )
+        resume_markers = tuple(row for row in coordination_rows if json.loads(str(row["context_json"])).get("entry_point") == "resume")
+        if token_ids_after != token_ids_before:
+            raise AssertionError("sink-boundary recovery reminted durable token identity")
+        if len(resume_markers) != 1:
+            raise AssertionError(f"sink-boundary recovery requires exactly one durable resume leadership marker: {resume_markers!r}")
+        resume_marker = resume_markers[0]
+        resume_marker_worker_id = str(resume_marker["worker_id"])
+        resume_marker_leader_epoch = resume_marker["leader_epoch"]
+        if not resume_marker_worker_id or not isinstance(resume_marker_leader_epoch, int) or resume_marker_leader_epoch < 1:
+            raise AssertionError(f"sink-boundary recovery persisted a corrupt resume marker: {resume_marker!r}")
+
+        work_after = _sink_boundary_work_snapshot(reopened_db, run_id=run_id)
+        after_effects, _after_attempts, after_members, after_artifacts = _sink_effect_snapshot(
+            reopened_db,
+            run_id=run_id,
+        )
+        effects_after = _sink_boundary_effect_projection(
+            after_effects,
+            after_members,
+            sink_names_by_node_id=sink_names_by_node_id,
+        )
+        publication_count_after = sum(effect["publication_performed"] is True for effect in after_effects)
+        if reopened_checkpoint_manager.get_latest_checkpoint(run_id) is not None:
+            raise AssertionError("sink-boundary recovery retained its checkpoint after successful resume")
+
+        durable_projection, audit = _exact_recovery_views(
+            reopened_db,
+            run_id=run_id,
+            payload_store=reopened_store,
+        )
+        if audit.source_operation_count != len(case.input_fixtures):
+            raise AssertionError(
+                "sink-boundary recovery replayed or omitted a source load: "
+                f"expected {len(case.input_fixtures)}, got {audit.source_operation_count}"
+            )
+
+        return ScenarioRunEvidence(
+            schema_version=2,
+            scenario_id=scenario.id,
+            case_id=case.id,
+            fixture_sha256=fresh_rendered.fixture_sha256,
+            config=ConfigEvidence(loaded=True, settings_sha256=fresh_rendered.settings_sha256),
+            graph=fresh_built.graph_evidence,
+            runtime=RuntimeEvidence(
+                attempted=True,
+                run_id=run_id,
+                status=str(result_data["status"]),
+                rows_processed=result_data["rows_processed"],
+                rows_succeeded=result_data["rows_succeeded"],
+                rows_failed=result_data["rows_failed"],
+                output_rows=output_rows,
+                sink_outputs=sink_outputs,
+                durable_projection=durable_projection,
+            ),
+            audit=audit,
+            recovery=RecoveryEvidence(
+                attempted=True,
+                database_reopened=True,
+                checkpoint_id=checkpoint_id,
+                checkpoint_sequence=checkpoint_sequence,
+                can_resume=True,
+                source_replayed=False,
+                checkpoint_removed=True,
+                sink_boundary=SinkBoundaryRecoveryEvidence(
+                    fault=fault,
+                    fault_count=1,
+                    initial_run_status="failed",
+                    source_names_exhausted_before=source_names_exhausted_before,
+                    checkpoint_topology_hash=checkpoint_topology_hash,
+                    fresh_topology_hash=fresh_built.graph_evidence.topology_hash,
+                    lease_live_before_close=True,
+                    token_ids_before=token_ids_before,
+                    token_ids_after=token_ids_after,
+                    work_before=work_before,
+                    work_after=work_after,
+                    effects_before=effects_before,
+                    effects_after=effects_after,
+                    effect_count_before=len(effects_before),
+                    effect_member_count_before=len(interrupted_effect.member_token_ids),
+                    artifact_count_before=len(before_artifacts),
+                    publication_count_before=publication_count_before,
+                    effect_count_after=len(effects_after),
+                    artifact_count_after=len(after_artifacts),
+                    publication_count_after=publication_count_after,
+                    resume_marker_count=1,
+                    resume_marker_event_type="leader_acquire",
+                    resume_marker_entry_point="resume",
+                    resume_marker_worker_id=resume_marker_worker_id,
+                    resume_marker_leader_epoch=resume_marker_leader_epoch,
+                    durable_identity_reused=True,
+                    durable_export_parity=True,
+                    provisional_until_deferred_platform_rebase=True,
+                ),
+            ),
+            completed_stages=("config", "build", "runtime", "audit", "recovery"),
+        )
+    finally:
+        reopened_db.close()
+
+
 def run_scenario_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
     """Execute a declared case through the workflow implemented for this task."""
 
@@ -4580,6 +5166,8 @@ def run_scenario_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: P
         return _parallel_sink_finalization_recovery_case(scenario, case, tmp_path)
     if case.recovery_kind == "pending_sink_redrive":
         return _pending_sink_redrive_recovery_case(scenario, case, tmp_path)
+    if case.recovery_kind == "sink_boundary":
+        return run_sink_boundary_recovery_case(scenario, case, tmp_path)
     if case.recovery_kind == "terminal_resume_idempotence":
         return _eof_aggregation_recovery_case(scenario, case, tmp_path)
     raise AssertionError(f"unsupported recovery kind: {case.recovery_kind!r}")

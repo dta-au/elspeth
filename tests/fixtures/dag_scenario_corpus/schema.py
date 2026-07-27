@@ -50,8 +50,11 @@ RecoveryKind = Literal[
     "expansion_child_enqueue",
     "parallel_sink_finalization",
     "pending_sink_redrive",
+    "sink_boundary",
     "terminal_resume_idempotence",
 ]
+RecoveryFaultKind = Literal["sink_effect"]
+RecoveryFaultSeam = Literal["before_effect"]
 GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "sink", "source", "transform"]
 
 EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
@@ -1234,6 +1237,15 @@ class OutputArtifactExpectation(ClosedModel):
         return filename
 
 
+class RecoveryFaultDeclaration(ClosedModel):
+    """Exact production seam used to interrupt one declared recovery case."""
+
+    kind: Literal["sink_effect"]
+    seam: Literal["before_effect"]
+    sink_name: NonEmpty
+    occurrence: Literal[1] = 1
+
+
 def normalize_template_name(name: str) -> str:
     """Return the deterministic token component for one declared node name."""
 
@@ -1247,6 +1259,7 @@ class HarnessCaseSpec(ClosedModel):
     id: NonEmpty
     workflow: Workflow
     recovery_kind: RecoveryKind | None = Field(default=None, exclude_if=lambda value: value is None)
+    recovery_fault: RecoveryFaultDeclaration | None = Field(default=None, exclude_if=lambda value: value is None)
     fixture: NonEmpty
     input_fixtures: Mapping[NonEmpty, NonEmpty]
     output_artifacts: Mapping[NonEmpty, OutputArtifactExpectation]
@@ -1311,6 +1324,10 @@ class HarnessCaseSpec(ClosedModel):
             raise ValueError("recovery workflow requires recovery_kind")
         if self.workflow != "recovery" and self.recovery_kind is not None:
             raise ValueError("recovery_kind is valid only for the recovery workflow")
+        if self.recovery_kind == "sink_boundary" and self.recovery_fault is None:
+            raise ValueError("sink-boundary recovery requires recovery_fault")
+        if self.recovery_kind != "sink_boundary" and self.recovery_fault is not None:
+            raise ValueError("recovery_fault is valid only for sink-boundary recovery")
         if self.recovery_kind == "terminal_resume_idempotence":
             if not isinstance(self.expected, SummaryRunExpectation) or self.expected.resumed_full_projection_sha256 is None:
                 raise ValueError("terminal-resume recovery requires a pinned full-history hash")
@@ -1874,6 +1891,180 @@ class PendingSinkRedriveRecoveryEvidence(ClosedModel):
         return self
 
 
+class SinkBoundaryWorkProjection(ClosedModel):
+    """Durable scheduler identity on either side of a sink-boundary resume."""
+
+    work_item_id: NonEmpty
+    token_id: NonEmpty
+    row_id: NonEmpty
+    row_payload_sha256: Sha256
+    row_payload_state: Literal["live", "purged"]
+    row_payload_anchor_sha256: Sha256 | None
+    node_id: NonEmpty | None
+    attempt: Count
+    status: NonEmpty
+    pending_sink_name: NonEmpty | None
+    pending_outcome: NonEmpty | None
+    pending_path: NonEmpty | None
+    pending_error_hash: NonEmpty | None
+    pending_error_message: NonEmpty | None
+
+    @model_validator(mode="after")
+    def _validate_payload_lifecycle(self) -> Self:
+        if self.row_payload_state == "live" and self.row_payload_anchor_sha256 is not None:
+            raise ValueError("live scheduler payload cannot carry a purge anchor")
+        if self.row_payload_state == "purged" and self.row_payload_anchor_sha256 is None:
+            raise ValueError("purged scheduler payload requires its durable anchor")
+        return self
+
+
+class SinkBoundaryEffectProjection(ClosedModel):
+    """Stable effect, artifact, and ordered member identity."""
+
+    effect_id: NonEmpty
+    sink_name: NonEmpty
+    sink_node_id: NonEmpty
+    artifact_id: NonEmpty
+    state: Literal["reserved", "prepared", "in_flight", "finalized"]
+    member_token_ids: tuple[NonEmpty, ...]
+    member_row_ids: tuple[NonEmpty, ...]
+
+    @model_validator(mode="after")
+    def _validate_members(self) -> Self:
+        if not self.member_token_ids or len(self.member_token_ids) != len(self.member_row_ids):
+            raise ValueError("sink-boundary effect requires aligned non-empty token and row members")
+        if len(self.member_token_ids) != len(set(self.member_token_ids)):
+            raise ValueError("sink-boundary effect member token identities must be unique")
+        return self
+
+
+class SinkBoundaryRecoveryEvidence(ClosedModel):
+    """Exact generic proof for a pre-publication sink-effect interruption."""
+
+    fault: RecoveryFaultDeclaration
+    fault_count: Literal[1]
+    initial_run_status: Literal["failed"]
+    source_names_exhausted_before: tuple[NonEmpty, ...]
+    checkpoint_topology_hash: Sha256
+    fresh_topology_hash: Sha256
+    lease_live_before_close: Literal[True]
+    token_ids_before: tuple[NonEmpty, ...]
+    token_ids_after: tuple[NonEmpty, ...]
+    work_before: tuple[SinkBoundaryWorkProjection, ...]
+    work_after: tuple[SinkBoundaryWorkProjection, ...]
+    effects_before: tuple[SinkBoundaryEffectProjection, ...]
+    effects_after: tuple[SinkBoundaryEffectProjection, ...]
+    effect_count_before: PositiveCount
+    effect_member_count_before: PositiveCount
+    artifact_count_before: Count
+    publication_count_before: Count
+    effect_count_after: PositiveCount
+    artifact_count_after: PositiveCount
+    publication_count_after: PositiveCount
+    resume_marker_count: Literal[1]
+    resume_marker_event_type: Literal["leader_acquire"]
+    resume_marker_entry_point: Literal["resume"]
+    resume_marker_worker_id: NonEmpty
+    resume_marker_leader_epoch: PositiveCount
+    durable_identity_reused: Literal[True]
+    durable_export_parity: Literal[True]
+    provisional_until_deferred_platform_rebase: Literal[True]
+
+    @model_validator(mode="after")
+    def _validate_exact_identity_reuse(self) -> Self:
+        if self.checkpoint_topology_hash != self.fresh_topology_hash:
+            raise ValueError("sink-boundary recovery fresh topology must equal the checkpoint topology")
+        if not self.source_names_exhausted_before or self.source_names_exhausted_before != tuple(
+            sorted(set(self.source_names_exhausted_before))
+        ):
+            raise ValueError("sink-boundary recovery requires unique sorted exhausted source names")
+        if (
+            not self.token_ids_before
+            or self.token_ids_before != tuple(sorted(set(self.token_ids_before)))
+            or self.token_ids_after != self.token_ids_before
+        ):
+            raise ValueError("sink-boundary recovery must preserve unique sorted token identities")
+        if not self.work_before or tuple(item.work_item_id for item in self.work_before) != tuple(
+            sorted({item.work_item_id for item in self.work_before})
+        ):
+            raise ValueError("sink-boundary recovery requires unique sorted scheduler work identities")
+        if tuple(item.work_item_id for item in self.work_after) != tuple(item.work_item_id for item in self.work_before):
+            raise ValueError("sink-boundary recovery must preserve scheduler work identities")
+
+        def work_identity(item: SinkBoundaryWorkProjection) -> tuple[object, ...]:
+            return (
+                item.work_item_id,
+                item.token_id,
+                item.row_id,
+                item.node_id,
+                item.attempt,
+                item.pending_sink_name,
+                item.pending_outcome,
+                item.pending_path,
+                item.pending_error_hash,
+                item.pending_error_message,
+            )
+
+        if tuple(map(work_identity, self.work_after)) != tuple(map(work_identity, self.work_before)):
+            raise ValueError("sink-boundary recovery must preserve exact scheduler work material")
+        if any(item.status not in {"pending_sink", "terminal"} for item in self.work_before):
+            raise ValueError("sink-boundary recovery permits only pending-sink or already-terminal work before reopen")
+        if not any(item.status == "pending_sink" and item.pending_sink_name == self.fault.sink_name for item in self.work_before):
+            raise ValueError("sink-boundary recovery requires durable pending work for the declared sink before reopen")
+        if any(item.status != "terminal" for item in self.work_after):
+            raise ValueError("sink-boundary recovery requires terminal scheduler work after resume")
+        for before_work, after_work in zip(self.work_before, self.work_after, strict=True):
+            if before_work.status == "pending_sink":
+                if before_work.row_payload_state != "live" or after_work.row_payload_state != "purged":
+                    raise ValueError(
+                        "sink-boundary recovery must transition pending-sink payloads from live material to a typed purge witness"
+                    )
+            elif (
+                before_work.row_payload_state != "purged"
+                or after_work.row_payload_state != "purged"
+                or before_work.row_payload_sha256 != after_work.row_payload_sha256
+                or before_work.row_payload_anchor_sha256 != after_work.row_payload_anchor_sha256
+            ):
+                raise ValueError("sink-boundary recovery must preserve already-terminal scheduler purge witnesses exactly")
+        if len(self.effects_before) != self.effect_count_before or len(self.effects_after) != self.effect_count_after:
+            raise ValueError("sink-boundary recovery effect counts must match exact effect projections")
+        before_effect_ids = tuple(effect.effect_id for effect in self.effects_before)
+        after_effect_ids = tuple(effect.effect_id for effect in self.effects_after)
+        if before_effect_ids != tuple(sorted(set(before_effect_ids))) or after_effect_ids != tuple(sorted(set(after_effect_ids))):
+            raise ValueError("sink-boundary recovery requires unique sorted effect identities")
+        interrupted = tuple(
+            effect for effect in self.effects_before if effect.sink_name == self.fault.sink_name and effect.state == "in_flight"
+        )
+        if len(interrupted) != 1:
+            raise ValueError("sink-boundary recovery must select exactly one declared in-flight sink effect")
+        if len(interrupted[0].member_token_ids) != self.effect_member_count_before:
+            raise ValueError("sink-boundary recovery member count must match the interrupted effect")
+        effects_after = {effect.effect_id: effect for effect in self.effects_after}
+        for before_effect in self.effects_before:
+            after_effect = effects_after.get(before_effect.effect_id)
+            if after_effect is None or after_effect.state != "finalized":
+                raise ValueError("sink-boundary recovery must finalize the original effect identity")
+            if (
+                before_effect.sink_name,
+                before_effect.sink_node_id,
+                before_effect.artifact_id,
+                before_effect.member_token_ids,
+                before_effect.member_row_ids,
+            ) != (
+                after_effect.sink_name,
+                after_effect.sink_node_id,
+                after_effect.artifact_id,
+                after_effect.member_token_ids,
+                after_effect.member_row_ids,
+            ):
+                raise ValueError("sink-boundary recovery must preserve exact effect and member identity")
+        if any(effect.state != "finalized" for effect in self.effects_after):
+            raise ValueError("sink-boundary recovery requires every final sink effect to be finalized")
+        if self.artifact_count_after < self.artifact_count_before or self.publication_count_after < self.publication_count_before:
+            raise ValueError("sink-boundary recovery final artifact/publication counts cannot shrink")
+        return self
+
+
 class RecoveryEvidence(ClosedModel):
     attempted: StrictBool
     database_reopened: StrictBool
@@ -1898,6 +2089,10 @@ class RecoveryEvidence(ClosedModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    sink_boundary: SinkBoundaryRecoveryEvidence | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     terminal_resume_idempotence: TerminalResumeIdempotenceEvidence | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -1910,6 +2105,7 @@ class RecoveryEvidence(ClosedModel):
             self.aggregation_eof,
             self.expansion_child_enqueue,
             self.pending_sink_redrive,
+            self.sink_boundary,
             self.terminal_resume_idempotence,
         )
         if sum(proof is not None for proof in seam_proofs) > 1:
@@ -1928,6 +2124,7 @@ class RecoveryEvidence(ClosedModel):
             or self.aggregation_eof is not None
             or self.expansion_child_enqueue is not None
             or self.pending_sink_redrive is not None
+            or self.sink_boundary is not None
             or self.terminal_resume_idempotence is not None
         ):
             raise ValueError("unattempted recovery forbids checkpoint identity and true result flags")

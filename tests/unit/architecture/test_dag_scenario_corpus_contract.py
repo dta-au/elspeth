@@ -62,6 +62,9 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     ScenarioManifest,
     ScenarioRunEvidence,
     ScenarioSpec,
+    SinkBoundaryEffectProjection,
+    SinkBoundaryRecoveryEvidence,
+    SinkBoundaryWorkProjection,
     Stage,
     SummaryRunExpectation,
     Workflow,
@@ -1215,6 +1218,79 @@ def test_non_recovery_workflow_forbids_recovery_kind() -> None:
         HarnessCaseSpec.model_validate(values)
 
 
+def test_sink_boundary_recovery_requires_a_closed_production_fault_declaration() -> None:
+    values = _case().model_dump(mode="json")
+    values.update(
+        workflow="recovery",
+        recovery_kind="sink_boundary",
+        recovery_fault={
+            "kind": "sink_effect",
+            "seam": "before_effect",
+            "sink_name": "output",
+            "occurrence": 1,
+        },
+    )
+
+    case = HarnessCaseSpec.model_validate(values)
+
+    assert case.recovery_fault is not None
+    assert case.recovery_fault.model_dump(mode="json") == {
+        "kind": "sink_effect",
+        "seam": "before_effect",
+        "sink_name": "output",
+        "occurrence": 1,
+    }
+    assert get_args(corpus_schema.RecoveryFaultKind) == ("sink_effect",)
+    assert get_args(corpus_schema.RecoveryFaultSeam) == ("before_effect",)
+
+    missing = deepcopy(values)
+    missing["recovery_fault"] = None
+    with pytest.raises(ValidationError, match="sink-boundary recovery requires recovery_fault"):
+        HarnessCaseSpec.model_validate(missing)
+
+    wrong_workflow = deepcopy(values)
+    wrong_workflow["recovery_kind"] = "pending_sink_redrive"
+    with pytest.raises(ValidationError, match="recovery_fault is valid only for sink-boundary recovery"):
+        HarnessCaseSpec.model_validate(wrong_workflow)
+
+    for field, replacement in (
+        ("kind", "checkpoint_eof"),
+        ("seam", "eof_flush_before_transform_result"),
+        ("occurrence", 2),
+    ):
+        invalid = deepcopy(values)
+        cast(dict[str, object], invalid["recovery_fault"])[field] = replacement
+        with pytest.raises(ValidationError):
+            HarnessCaseSpec.model_validate(invalid)
+
+
+def test_response_lost_oracle_rejects_jointly_corrupted_semantic_witness() -> None:
+    corrupted_evidence = json.dumps(
+        {"classification": "plausible_but_not_response_lost"},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    corrupted_hash = hashlib.sha256(corrupted_evidence.encode()).hexdigest()
+    request_hash = "1" * 64
+
+    with pytest.raises(AssertionError, match="response-lost semantic evidence"):
+        corpus_harness._validate_durable_sink_effect_attempt_call_material(
+            effect_id="2" * 64,
+            attempt={
+                "_evidence_json": corrupted_evidence,
+                "evidence_hash": corrupted_hash,
+                "request_hash": request_hash,
+                "state": "response_lost",
+            },
+            call={
+                "error_json": corrupted_evidence,
+                "request_hash": request_hash,
+                "response_hash": None,
+                "status": "error",
+            },
+        )
+
+
 def _plural_binding_case_values() -> dict[str, object]:
     return {
         "id": "plural-bindings",
@@ -1496,6 +1572,78 @@ def _valid_pending_sink_redrive_recovery() -> PendingSinkRedriveRecoveryEvidence
         terminal_outcome="success",
         terminal_work_status="terminal",
         final_output_rows=1,
+        durable_export_parity=True,
+        provisional_until_deferred_platform_rebase=True,
+    )
+
+
+def _valid_sink_boundary_recovery() -> SinkBoundaryRecoveryEvidence:
+    before_work = SinkBoundaryWorkProjection(
+        work_item_id="work-1",
+        token_id="token-1",
+        row_id="row-1",
+        row_payload_sha256="1" * 64,
+        row_payload_state="live",
+        row_payload_anchor_sha256=None,
+        node_id="queue-1",
+        attempt=1,
+        status="pending_sink",
+        pending_sink_name="output",
+        pending_outcome="success",
+        pending_path="default_flow",
+        pending_error_hash=None,
+        pending_error_message=None,
+    )
+    after_work = before_work.model_copy(
+        update={
+            "row_payload_sha256": "2" * 64,
+            "row_payload_state": "purged",
+            "row_payload_anchor_sha256": "3" * 64,
+            "status": "terminal",
+        }
+    )
+    before_effect = SinkBoundaryEffectProjection(
+        effect_id="4" * 64,
+        sink_name="output",
+        sink_node_id="sink-output",
+        artifact_id="5" * 64,
+        state="in_flight",
+        member_token_ids=("token-1",),
+        member_row_ids=("row-1",),
+    )
+    after_effect = before_effect.model_copy(update={"state": "finalized"})
+    return SinkBoundaryRecoveryEvidence(
+        fault={
+            "kind": "sink_effect",
+            "seam": "before_effect",
+            "sink_name": "output",
+            "occurrence": 1,
+        },
+        fault_count=1,
+        initial_run_status="failed",
+        source_names_exhausted_before=("primary",),
+        checkpoint_topology_hash="6" * 64,
+        fresh_topology_hash="6" * 64,
+        lease_live_before_close=True,
+        token_ids_before=("token-1",),
+        token_ids_after=("token-1",),
+        work_before=(before_work,),
+        work_after=(after_work,),
+        effects_before=(before_effect,),
+        effects_after=(after_effect,),
+        effect_count_before=1,
+        effect_member_count_before=1,
+        artifact_count_before=0,
+        publication_count_before=0,
+        effect_count_after=1,
+        artifact_count_after=1,
+        publication_count_after=1,
+        resume_marker_count=1,
+        resume_marker_event_type="leader_acquire",
+        resume_marker_entry_point="resume",
+        resume_marker_worker_id="resume-worker",
+        resume_marker_leader_epoch=2,
+        durable_identity_reused=True,
         durable_export_parity=True,
         provisional_until_deferred_platform_rebase=True,
     )
@@ -3334,6 +3482,7 @@ def test_closed_vocabularies_are_exact() -> None:
         "expansion_child_enqueue",
         "parallel_sink_finalization",
         "pending_sink_redrive",
+        "sink_boundary",
         "terminal_resume_idempotence",
     )
 
@@ -3935,6 +4084,43 @@ def test_pending_sink_redrive_recovery_rejects_non_exact_boundary_values(field: 
         PendingSinkRedriveRecoveryEvidence.model_validate(values)
 
 
+def test_sink_boundary_recovery_pins_exact_work_effect_and_resume_identity() -> None:
+    proof = _valid_sink_boundary_recovery()
+    values = _valid_recovery().model_dump(mode="json")
+    values["sink_boundary"] = proof.model_dump(mode="json")
+
+    evidence = RecoveryEvidence.model_validate(values)
+
+    assert evidence.sink_boundary == proof
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("work-id", "preserve scheduler work identities"),
+        ("effect-artifact", "preserve exact effect and member identity"),
+        ("effect-state", "finalize the original effect identity"),
+        ("payload-state", "transition pending-sink payloads"),
+    ),
+)
+def test_sink_boundary_recovery_rejects_identity_and_payload_drift(mutation: str, message: str) -> None:
+    values = _valid_sink_boundary_recovery().model_dump(mode="json")
+    if mutation == "work-id":
+        cast(list[dict[str, object]], values["work_after"])[0]["work_item_id"] = "reminted-work"
+    elif mutation == "effect-artifact":
+        cast(list[dict[str, object]], values["effects_after"])[0]["artifact_id"] = "7" * 64
+    elif mutation == "effect-state":
+        cast(list[dict[str, object]], values["effects_after"])[0]["state"] = "in_flight"
+    else:
+        cast(list[dict[str, object]], values["work_after"])[0].update(
+            row_payload_state="live",
+            row_payload_anchor_sha256=None,
+        )
+
+    with pytest.raises(ValidationError, match=message):
+        SinkBoundaryRecoveryEvidence.model_validate(values)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
@@ -4196,6 +4382,7 @@ def test_expansion_recovery_rejects_inexact_partition_cardinality_and_shape(muta
         ("sink_finalization", "aggregation_eof"),
         ("sink_finalization", "expansion_child_enqueue"),
         ("sink_finalization", "pending_sink_redrive"),
+        ("sink_finalization", "sink_boundary"),
         ("sink_finalization", "terminal_resume_idempotence"),
         ("aggregation_eof", "expansion_child_enqueue"),
         ("aggregation_eof", "pending_sink_redrive"),
@@ -4208,6 +4395,7 @@ def test_expansion_recovery_rejects_inexact_partition_cardinality_and_shape(muta
             "aggregation_eof",
             "expansion_child_enqueue",
             "pending_sink_redrive",
+            "sink_boundary",
             "terminal_resume_idempotence",
         ),
     ),
@@ -4218,6 +4406,7 @@ def test_recovery_evidence_rejects_multiple_seam_specific_proofs(seams: tuple[st
         "aggregation_eof": _valid_aggregation_eof_recovery(),
         "expansion_child_enqueue": _valid_expansion_child_enqueue_recovery(),
         "pending_sink_redrive": _valid_pending_sink_redrive_recovery(),
+        "sink_boundary": _valid_sink_boundary_recovery(),
         "terminal_resume_idempotence": _valid_terminal_resume_idempotence(),
     }
     values = _valid_recovery().model_dump(mode="json")
@@ -4235,6 +4424,7 @@ def test_recovery_evidence_rejects_multiple_seam_specific_proofs(seams: tuple[st
         ("aggregation_eof", _valid_aggregation_eof_recovery()),
         ("expansion_child_enqueue", _valid_expansion_child_enqueue_recovery()),
         ("pending_sink_redrive", _valid_pending_sink_redrive_recovery()),
+        ("sink_boundary", _valid_sink_boundary_recovery()),
         ("terminal_resume_idempotence", _valid_terminal_resume_idempotence()),
     ),
 )
@@ -4268,6 +4458,7 @@ def test_seam_specific_recovery_rejects_contradictory_public_resume_flags(
         ("aggregation_eof", _valid_aggregation_eof_recovery()),
         ("expansion_child_enqueue", _valid_expansion_child_enqueue_recovery()),
         ("pending_sink_redrive", _valid_pending_sink_redrive_recovery()),
+        ("sink_boundary", _valid_sink_boundary_recovery()),
         ("terminal_resume_idempotence", _valid_terminal_resume_idempotence()),
     ),
 )
