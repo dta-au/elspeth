@@ -1720,7 +1720,7 @@ class TestComposerErrorHandling:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Setup", [], state)
+            result = await service.compose("Set up the pipeline.", [], state)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -1773,7 +1773,7 @@ class TestComposerErrorHandling:
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Setup", [], state)
+            result = await service.compose("Set up the pipeline.", [], state)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -1838,7 +1838,7 @@ class TestComposerErrorHandling:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Setup", [], state)
+            result = await service.compose("Set up the pipeline.", [], state)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -1998,7 +1998,7 @@ class TestComposerErrorHandling:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [partial_call, text]
-            result = await service.compose("Setup", [], state)
+            result = await service.compose("Set up the pipeline.", [], state)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -2117,7 +2117,7 @@ class TestComposerErrorHandling:
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Setup", [], state)
+            result = await service.compose("Set up the pipeline.", [], state)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -4964,7 +4964,7 @@ class TestToolArgumentErrorAcrossThreadBoundary:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Setup", [], state, session_id=self.session_id)
+            result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -5040,7 +5040,7 @@ class TestToolArgumentErrorAcrossThreadBoundary:
 
         with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [bad_call, text]
-            result = await service.compose("Setup", [], state, session_id=self.session_id)
+            result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
 
         _assert_no_mutation_empty_state_blocker(
             result,

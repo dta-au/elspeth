@@ -336,7 +336,8 @@ _last_mutation_was_pending_proposal = _no_tool_policy.last_mutation_was_pending_
 _no_mutation_empty_state_validation = _no_tool_policy.no_mutation_empty_state_validation
 _pre_state_interpretation_review_repair_message = _no_tool_policy.pre_state_interpretation_review_repair_message
 _state_is_structurally_empty = _no_tool_policy.state_is_structurally_empty
-_user_request_expects_pipeline_mutation = _no_tool_policy.user_request_expects_pipeline_mutation
+_classify_pipeline_mutation_intent = _no_tool_policy.classify_pipeline_mutation_intent
+_PipelineMutationIntentDecision = _no_tool_policy.PipelineMutationIntentDecision
 _arg_error_payload = _tool_error_payloads.arg_error_payload
 _INVALID_TOOL_ARGUMENTS_REDACTION_STATUS = _tool_error_payloads.INVALID_TOOL_ARGUMENTS_REDACTION_STATUS
 
@@ -2225,7 +2226,7 @@ class ComposerServiceImpl:
         try:
             if (
                 _state_is_structurally_empty(state)
-                and _user_request_expects_pipeline_mutation(message)
+                and _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
                 and guided_terminal is None
                 and self._sessions_service is not None
                 and session_id is not None
@@ -3509,7 +3510,7 @@ class ComposerServiceImpl:
         """
         if (
             repair_turns_used < _MAX_REPAIR_TURNS
-            and _user_request_expects_pipeline_mutation(message)
+            and _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
             and _state_is_structurally_empty(state)
             and _last_failure_was_pre_state_interpretation_review(recorder.invocations)
         ):

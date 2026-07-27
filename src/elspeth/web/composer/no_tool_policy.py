@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import csv
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
+from io import StringIO
 from typing import Any, ClassVar, Final, Literal
 
 from opentelemetry import metrics
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.recipe_intent_routing import match_freeform_recipe_intent
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.state_claim_grounding import (
     GROUNDING_CORRECTION_HEADER,
@@ -62,39 +67,80 @@ _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = (
     _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _PREFLIGHT_NOTICE_HEADER + "\n\n" + _PREFLIGHT_NOTICE_FOOTER
 )
 
-_BUILD_INTENT_PHRASES: Final[tuple[str, ...]] = (
-    "set up",
-    "setup",
-    "build",
-    "create",
-    "make",
-    "wire",
-    "add",
-    "update",
-    "modify",
-    "change",
-    "run",
-    "execute",
-    "process",
-    "route",
-    "split",
-    "save",
-    "workflow",
-    "automation",
-    "pipeline",
-    "runnable",
+_MAX_INTENT_CLASSIFICATION_CHARS: Final = 4_096
+_MUTATION_ACTION_PATTERN: Final = (
+    r"(?:set\s+(?:this|it)\s+up|set\s+up|setup|build|create|make|wire|add|update|modify|change|run|execute|process|route|split|save)"
 )
-_INFORMATION_ONLY_PREFIXES: Final[tuple[str, ...]] = (
-    "what ",
-    "what's ",
-    "which ",
-    "why ",
-    "how ",
-    "explain ",
-    "tell me ",
-    "show me ",
-    "list ",
+_CONTROLLED_OBJECT_GRAMMAR: Final = (
+    r"(?:(?:a|an|the|this)\s+)?"
+    r"(?:"
+    r"[a-z0-9_.-]+\s+to\s+[a-z0-9_.-]+\s+pipeline|"
+    r"(?:(?:requested|csv|jsonl?|parquet)\s+)?(?:pipeline|composition|workflow|automation)|"
+    r"source|input(?:\s+rows?)?|output|node|edge|transform|filter|sink|rows?"
+    r")"
 )
+_CONTROLLED_COMPLEMENT_GRAMMAR: Final = (
+    r"(?:"
+    r"\s+now|"
+    r"\s+for\s+this\s+file|"
+    r"\s+to\s+(?:(?:a|an|the|this)\s+)?(?:output|input|source|node|sink)|"
+    r"\s+by\s+[a-z0-9_.-]+|"
+    r"\s+from\s+[a-z0-9_./-]+|"
+    r"\s+with\s+[a-z0-9_.-]+|"
+    r"\s+using\s+[a-z0-9_.-]+"
+    r")?"
+)
+_DIRECT_MUTATION_GRAMMAR: Final = rf"{_MUTATION_ACTION_PATTERN}\b\s+{_CONTROLLED_OBJECT_GRAMMAR}{_CONTROLLED_COMPLEMENT_GRAMMAR}"
+_POSITIVE_LEAD_GRAMMAR: Final = r"(?:(?:please[\s,]+)|(?:now|actually|just|simply)\s+|go\s+ahead\s+(?:and\s+)?)*"
+_FIRST_PERSON_REQUEST_GRAMMAR: Final = r"(?:(?:i|we)\s+(?:want|need|would\s+like)\s+(?:you\s+)?to\s+|let(?:'|\u2019)s\s+)"
+_SINGLE_CLAUSE_IMPERATIVE_PATTERN: Final = re.compile(
+    rf"{_POSITIVE_LEAD_GRAMMAR}(?:{_FIRST_PERSON_REQUEST_GRAMMAR})?"
+    rf"{_POSITIVE_LEAD_GRAMMAR}{_DIRECT_MUTATION_GRAMMAR}[.!]?",
+    re.IGNORECASE,
+)
+_SINGLE_CLAUSE_POLITE_REQUEST_PATTERN: Final = re.compile(
+    rf"{_POSITIVE_LEAD_GRAMMAR}(?:can|could|would|will)\s+you\s+(?:please\s+)?"
+    rf"{_POSITIVE_LEAD_GRAMMAR}{_DIRECT_MUTATION_GRAMMAR}[.!?]?",
+    re.IGNORECASE,
+)
+_NARROW_COMPLETE_REQUEST_PATTERNS: Final = (
+    re.compile(r"build!", re.IGNORECASE),
+    re.compile(r"just\s+build\s+the\s+whole\s+thing[.!]?", re.IGNORECASE),
+    re.compile(
+        r"set\s+(?:this|it)\s+up\s+to\s+actually\s+run\s+from\s+"
+        r"[a-z0-9_./-]+\.(?:csv|jsonl?|parquet)[.!]?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"how\s+does\s+this\s+work\?\s+now\s+build\s+it[.!]?", re.IGNORECASE),
+    re.compile(r"first\s+inspect\s+the\s+file,\s+then\s+build\s+(?:a|the)\s+pipeline[.!]?", re.IGNORECASE),
+    re.compile(r"create\s+(?:a|the)\s+workflow\s+that\s+rates\s+how\s+cool\s+pages\s+are[.!]?", re.IGNORECASE),
+)
+_COMPLETE_EXPLICIT_REQUEST_PATTERNS: Final = (
+    _SINGLE_CLAUSE_IMPERATIVE_PATTERN,
+    _SINGLE_CLAUSE_POLITE_REQUEST_PATTERN,
+    *_NARROW_COMPLETE_REQUEST_PATTERNS,
+)
+_QUOTE_TERMINATORS: Final = {
+    '"': '"',
+    "`": "`",
+    "\u201c": "\u201d",
+    "\u2018": "\u2019",
+}
+_REGISTERED_RECIPE_DELIMITER_PATTERN: Final = re.compile(
+    r"customer\s+rows\s*\(csv\):",
+    re.IGNORECASE,
+)
+_REGISTERED_RECIPE_ENVELOPE_PATTERN: Final = re.compile(
+    r"please create a pipeline that processes the following customer rows\. "
+    r"each row should be processed two ways in parallel and combined into a single merged output row at "
+    r"[^\s:]+\.jsonl: path a keeps the original row unchanged, path b truncates the "
+    r"[a-z_][a-z0-9_]* field to \d+ characters? with suffix '[^'\r\n]*'\. "
+    r"combine both branches under separate keys `[a-z_][a-z0-9_]*` and `[a-z_][a-z0-9_]*` "
+    r"in each merged output row -- one input row produces one output row containing both branches side-by-side\. "
+    r"customer rows \(csv\):",
+    re.IGNORECASE,
+)
+_ANY_MUTATION_ACTION_PATTERN: Final = re.compile(rf"\b{_MUTATION_ACTION_PATTERN}\b", re.IGNORECASE)
 
 _AugmentationBranch = Literal[
     "no_mutation_empty_state_augmentation",
@@ -133,6 +179,17 @@ class TrustedSystemNoticeSegment:
 
 
 type VisibleMessageSegment = AssistantTextSegment | TrustedSystemNoticeSegment
+
+
+class PipelineMutationIntentDecision(Enum):
+    """Closed request-intent decision used at Composer lifecycle gates."""
+
+    EXPLICIT_MUTATION = "explicit_mutation"
+    CONVERSATIONAL = "conversational"
+    AMBIGUOUS = "ambiguous"
+
+    def __bool__(self) -> bool:
+        raise TypeError("PipelineMutationIntentDecision must be compared to an explicit member")
 
 
 def _split_wrapped_diagnostic(
@@ -288,14 +345,95 @@ def compose_preflight_failure_message(content: str, *, runtime_result: Validatio
     return content + suffix
 
 
-def user_request_expects_pipeline_mutation(message: str) -> bool:
-    """Return True when the user is asking the composer to build/edit/run."""
-    normalized = " ".join(message.lower().split())
-    if not normalized:
+def _strip_quoted_text(message: str) -> tuple[str, bool, bool]:
+    """Replace quoted spans in one bounded pass and report closure and presence."""
+    output: list[str] = []
+    closing_quote: str | None = None
+    quoted_material_seen = False
+    index = 0
+    while index < len(message):
+        character = message[index]
+        if closing_quote is not None:
+            output.append(" ")
+            if character == "\\" and closing_quote in {'"', "'"} and index + 1 < len(message):
+                output.append(" ")
+                index += 2
+                continue
+            if character == closing_quote:
+                closing_quote = None
+            index += 1
+            continue
+
+        if character in _QUOTE_TERMINATORS:
+            closing_quote = _QUOTE_TERMINATORS[character]
+            quoted_material_seen = True
+            output.append(" ")
+            index += 1
+            continue
+        if character == "'":
+            previous_is_word = index > 0 and message[index - 1].isalnum()
+            next_is_word = index + 1 < len(message) and message[index + 1].isalnum()
+            if not (previous_is_word and next_is_word):
+                closing_quote = "'"
+                quoted_material_seen = True
+                output.append(" ")
+                index += 1
+                continue
+
+        output.append(character)
+        index += 1
+    return "".join(output), closing_quote is None, quoted_material_seen
+
+
+def _matches_complete_registered_recipe_request(message: str) -> bool:
+    """Recognize one registered full-request production with shaped CSV data."""
+    delimiters = tuple(_REGISTERED_RECIPE_DELIMITER_PATTERN.finditer(message))
+    if len(delimiters) != 1:
         return False
-    if normalized.startswith(_INFORMATION_ONLY_PREFIXES) and "set up" not in normalized and "setup" not in normalized:
+    normalized_envelope = " ".join(message[: delimiters[0].end()].split())
+    if _REGISTERED_RECIPE_ENVELOPE_PATTERN.fullmatch(normalized_envelope) is None:
         return False
-    return any(f" {phrase} " in f" {normalized} " for phrase in _BUILD_INTENT_PHRASES)
+    match = match_freeform_recipe_intent(message)
+    if match is None or match.inline_blob is None:
+        return False
+    try:
+        rows = list(csv.reader(StringIO(match.inline_blob.content)))
+    except csv.Error:
+        return False
+    if len(rows) < 2 or len(rows[0]) < 2:
+        return False
+    column_count = len(rows[0])
+    return all(len(row) == column_count for row in rows[1:])
+
+
+def classify_pipeline_mutation_intent(message: str) -> PipelineMutationIntentDecision:
+    """Classify whether the user explicitly authorizes pipeline mutation.
+
+    Authority requires the complete bounded request to match a closed positive
+    production. Quoted material cannot be elided to manufacture authority;
+    only a complete registered recipe envelope may contain its prescribed
+    quotes. Unmatched governing prefixes, trailing clauses, bare questions,
+    unrelated objects, and oversized input fail closed to clarification on
+    the conversational path.
+    """
+    if len(message) > _MAX_INTENT_CLASSIFICATION_CHARS:
+        return PipelineMutationIntentDecision.AMBIGUOUS
+
+    unquoted_text, quotes_balanced, quoted_material_seen = _strip_quoted_text(message)
+    if not quotes_balanced:
+        return PipelineMutationIntentDecision.AMBIGUOUS
+    unquoted = " ".join(unquoted_text.split())
+    if not unquoted:
+        return PipelineMutationIntentDecision.CONVERSATIONAL
+    if _ANY_MUTATION_ACTION_PATTERN.search(unquoted) is None:
+        return PipelineMutationIntentDecision.CONVERSATIONAL
+    if _matches_complete_registered_recipe_request(message):
+        return PipelineMutationIntentDecision.EXPLICIT_MUTATION
+    if quoted_material_seen:
+        return PipelineMutationIntentDecision.AMBIGUOUS
+    if any(pattern.fullmatch(unquoted) is not None for pattern in _COMPLETE_EXPLICIT_REQUEST_PATTERNS):
+        return PipelineMutationIntentDecision.EXPLICIT_MUTATION
+    return PipelineMutationIntentDecision.AMBIGUOUS
 
 
 def _tool_failure_detail(payload: Mapping[str, Any]) -> str:

@@ -23,17 +23,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.pipeline_planner import _PROSE_NUDGE_BUDGET
 from elspeth.web.composer.progress import ComposerProgressRegistry
+from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
@@ -41,7 +45,7 @@ from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import chat_messages_table
+from elspeth.web.sessions.models import chat_messages_table, composition_proposals_table, composition_states_table
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -242,6 +246,148 @@ def _assert_no_sentinel_leak(engine: Any, response_text: str) -> None:
     with engine.connect() as conn:
         rows = conn.execute(select(chat_messages_table)).all()
     assert not any(_PROVIDER_LEAK_SENTINEL in str(row) for row in rows)
+
+
+def _empty_state() -> CompositionState:
+    return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+
+def _registered_recipe_request(*, envelope_insertion: str) -> str:
+    preamble = (
+        "Please create a pipeline that processes the following customer rows. "
+        "Each row should be processed two ways in parallel and combined into "
+        "a single merged output row at outputs/merged.jsonl: path A keeps the "
+        "original row unchanged, path B truncates the description field to 30 "
+        "characters with suffix '...'. Combine both branches under separate "
+        "keys `path_a` and `path_b` in each merged output row -- one input row "
+        "produces one output row containing both branches side-by-side."
+    )
+    return (
+        f"{preamble} {envelope_insertion} Customer rows (CSV):\n"
+        "name,description\n"
+        "alice,this is a moderately long description\n"
+        "bob,short note"
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Do not build or run a pipeline",
+        "Do anything but build the pipeline.",
+        "Build no pipeline.",
+        "Stop. Build nothing.",
+        "Can you explain? Build nothing.",
+        "Tell me: build or run?",
+        "Do not: build a pipeline.",
+        "Never: run the pipeline.",
+        "Explain this pseudocode: BUILD pipeline",
+        "Here is an example:\n build a pipeline",
+        "If needed, build the pipeline.",
+        "Tell me: then build the pipeline.",
+        "Do not. Build the pipeline.",
+        "Can you explain? Build the pipeline.",
+        "Run the unit tests.",
+        "Execute this shell command.",
+        "Process my refund.",
+        "Route my support ticket.",
+        "Save this document.",
+        "Wire the payment.",
+        "Split the bill.",
+        "Build the documentation.",
+        "Build documentation for the pipeline.",
+        "Build: no pipeline.",
+        "Build the pipeline; without changing anything.",
+        "Build or run the pipeline?",
+        "Build the pipeline or run it.",
+        "Build the pipeline if needed.",
+        "Save this file.",
+        "Process this data.",
+        "Create a CSV.",
+        "Do not then build the pipeline.",
+        "Don't then build the pipeline.",
+        "Never then run the pipeline.",
+        "Do anything but then build the pipeline.",
+        "Build neither a pipeline nor a workflow.",
+        "Create neither a pipeline nor a workflow.",
+        "Build none of the pipeline.",
+        "Create zero pipeline.",
+        "Build anything but a pipeline.",
+        "Build anything except a pipeline.",
+        "Build anything other than a pipeline.",
+        "Build anything besides a pipeline.",
+        "Build anything rather than a pipeline.",
+        "Build the pipeline. Actually, do not.",
+        "Build the pipeline. Actually, don't.",
+        "Build! Never mind.",
+        "Build the pipeline. Cancel that.",
+        "Build the pipeline. Scratch that.",
+        "Build the pipeline. Forget it.",
+        "Build the pipeline. \"Actually, don't.",
+        "Set this up for the meeting.",
+        "Set it up for payroll.",
+        "Set this up?",
+        "Save this document about the pipeline.",
+        "Execute this shell script for the pipeline.",
+        "Route this bug report to the pipeline team.",
+        "Process this request using pipeline terminology.",
+        "Build the pipeline?",
+        "Run the pipeline?",
+        "Build the pipeline. Undo that.",
+        "Build the pipeline. Revert that.",
+        "Build the pipeline. Abort.",
+        "Build the pipeline. Belay that.",
+        "Build the pipeline. Hold off.",
+        "Build the pipeline. Ignore that.",
+        "Build the pipeline. Withdraw that request.",
+        "Build the pipeline. I take that back.",
+        "Build the pipeline. I changed my mind.",
+        "Build the pipeline. On second thought, leave it.",
+        "Build the pipeline. Actually, skip it.",
+        "Avoid then build the pipeline.",
+        "Refrain, then build the pipeline.",
+        "Document then build the pipeline.",
+        "Say then build the pipeline.",
+        "Mention then build the pipeline.",
+        _registered_recipe_request(envelope_insertion="Actually, cancel that."),
+        _registered_recipe_request(envelope_insertion="Do not build this pipeline."),
+        _registered_recipe_request(envelope_insertion="I changed my mind."),
+        _registered_recipe_request(envelope_insertion="Undo that request."),
+        'Please "do not" build the pipeline.',
+        "Please 'do not' build the pipeline.",
+        "Please \u201cdo not\u201d build the pipeline.",
+        "Please \u2018do not\u2019 build the pipeline.",
+        '"Never" build the pipeline.',
+        'Build "no" pipeline.',
+        'Can you "not" build the pipeline?',
+    ],
+)
+def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+) -> None:
+    """The HTTP route must keep non-authorizing requests conversational."""
+    client, engine, sessions = _build_app(tmp_path, monkeypatch, _timeout_completion())
+    session_id = client.post("/api/sessions", json={"title": "negated build"}).json()["id"]
+    composer = client.app.state.composer_service
+    ordinary_loop = AsyncMock(
+        spec=composer._compose_loop,
+        return_value=ComposerResult(message="No pipeline changes were requested.", state=_empty_state()),
+    )
+    monkeypatch.setattr(composer, "_compose_loop", ordinary_loop)
+
+    response = client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": message},
+    )
+
+    assert response.status_code == 200, response.text
+    ordinary_loop.assert_awaited_once()
+    assert asyncio.run(sessions.list_composition_proposals(UUID(session_id))) == []
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
 
 
 @pytest.mark.parametrize(
@@ -490,6 +636,35 @@ def _valid_pipeline_completion(tmp_path: Path, session_id_holder: dict[str, str]
         )
 
     return completion
+
+
+def test_later_explicit_imperative_reaches_planner_and_auto_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later explicit command must outrank an earlier informational clause."""
+    (tmp_path / "outputs").mkdir(exist_ok=True)
+    session_id_holder: dict[str, str] = {}
+    client, engine, _sessions = _build_app(
+        tmp_path,
+        monkeypatch,
+        _valid_pipeline_completion(tmp_path, session_id_holder),
+    )
+    session_id = client.post("/api/sessions", json={"title": "later explicit build"}).json()["id"]
+    session_id_holder["id"] = session_id
+
+    response = client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": "How does this work? Now build it."},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["state"] is not None
+    assert body["proposals"] == []
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 1
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 1
 
 
 def test_freeform_auto_commit_surfaces_interpretation_reviews(
