@@ -20,7 +20,7 @@ from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Final, Literal, Protocol, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast
 from uuid import UUID
 
 import structlog
@@ -45,7 +45,7 @@ from elspeth.web.composer.capability_skill import (
     PlannerCapabilityManifest,
     build_planner_capability_manifest,
 )
-from elspeth.web.composer.discovery_cache import serialize_tool_result
+from elspeth.web.composer.discovery_cache import pydantic_default, serialize_tool_result
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
 from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
@@ -850,6 +850,155 @@ def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any
             ],
         },
     }
+
+
+class _ClosedProviderValidationEntry(TypedDict):
+    component: str
+    severity: str
+    error_code: str
+
+
+class _ClosedProviderValidationEnvelope(TypedDict):
+    is_valid: bool
+    errors: list[_ClosedProviderValidationEntry]
+    warnings: list[_ClosedProviderValidationEntry]
+    suggestions: list[_ClosedProviderValidationEntry]
+    semantic_contracts: list[object]
+    graph_repair_suggestions: list[object]
+
+
+class _ClosedProviderDiscoveryPayload(TypedDict):
+    success: bool
+    validation: _ClosedProviderValidationEnvelope
+    affected_nodes: list[str]
+    version: int
+    data: NotRequired[object]
+
+
+def _closed_provider_validation_entry(
+    entry: ValidationEntry,
+    *,
+    fallback_code: str,
+) -> _ClosedProviderValidationEntry:
+    """Project one validation entry without state-bearing text or attribution."""
+    return {
+        "component": "pipeline",
+        "severity": entry.severity,
+        "error_code": entry.error_code or fallback_code,
+    }
+
+
+def _closed_provider_discovery_payload(result: ToolResult) -> _ClosedProviderDiscoveryPayload:
+    """Return the closed ToolResult envelope allowed on restricted surfaces.
+
+    Validation messages, semantic contracts, graph repair arguments, runtime
+    preflight details, and optional augmentation fields can all contain
+    authoritative option values. The restricted provider needs only validity,
+    closed codes and severities, stable pipeline attribution, outcome, version,
+    and the separately projected discovery data.
+    """
+    validation = result.validation
+    payload: _ClosedProviderDiscoveryPayload = {
+        "success": result.success,
+        "validation": {
+            "is_valid": validation.is_valid,
+            "errors": [_closed_provider_validation_entry(entry, fallback_code="validation_error") for entry in validation.errors],
+            "warnings": [_closed_provider_validation_entry(entry, fallback_code="validation_warning") for entry in validation.warnings],
+            "suggestions": [
+                _closed_provider_validation_entry(entry, fallback_code="validation_suggestion") for entry in validation.suggestions
+            ],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": list(result.affected_nodes),
+        "version": result.updated_state.version,
+    }
+    if result.data is not None:
+        payload["data"] = deep_thaw(result.data)
+    return payload
+
+
+def _serialize_closed_provider_discovery_payload(payload: Mapping[str, Any]) -> str:
+    """Serialize a closed provider payload with canonical ToolResult support."""
+    return json.dumps(payload, default=pydantic_default)
+
+
+def _serialize_provider_discovery_result(
+    *,
+    call: _ParsedToolCall,
+    result: ToolResult,
+    surface: PlannerSurface,
+    provider_current_state: Mapping[str, Any],
+) -> str:
+    """Serialize one discovery result through the planner surface disclosure.
+
+    Staged/tutorial callers already supply their policy-owned
+    ``provider_current_state`` projection for the initial request. Reuse that
+    exact projection for later state reads and close the validation envelope
+    on every discovery result. Discovery execution, audit, validation, and
+    candidate construction continue to use the authoritative
+    ``CompositionState``. Non-state discovery retains its canonical outcome
+    and data; preview fails closed because its data duplicates authoritative
+    validation, runtime preflight, and proof diagnostics. Failed reads retain
+    their canonical outcome and leak-safe error data. Successful state
+    component reads follow the authoritative result shape, so node/output
+    identifiers that collide with full-state aliases keep dispatch precedence.
+    """
+    if surface not in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE}:
+        return serialize_tool_result(result)
+    payload = _closed_provider_discovery_payload(result)
+
+    def fail_closed() -> None:
+        payload["success"] = False
+        payload["data"] = {
+            "error": "The requested component is unavailable on this planner disclosure surface.",
+            "error_code": "surface_projection_unavailable",
+        }
+
+    if call.name == "preview_pipeline":
+        if result.success:
+            fail_closed()
+        return _serialize_closed_provider_discovery_payload(payload)
+    if call.name != "get_pipeline_state":
+        return _serialize_closed_provider_discovery_payload(payload)
+    if not result.success:
+        return _serialize_closed_provider_discovery_payload(payload)
+
+    authoritative_data = result.data
+    component = call.arguments.get("component")
+    if component == "set_pipeline_arguments":
+        fail_closed()
+    elif isinstance(authoritative_data, Mapping) and set(authoritative_data) == {"sources"}:
+        payload["data"] = {"sources": deep_thaw(provider_current_state.get("sources", []))}
+    elif isinstance(authoritative_data, Mapping) and set(authoritative_data) == {"node"}:
+        selected = authoritative_data["node"]
+        nodes = provider_current_state.get("nodes", [])
+        selected_id = selected.get("id") if isinstance(selected, Mapping) else None
+        node = next(
+            (candidate for candidate in nodes if isinstance(candidate, Mapping) and candidate.get("id") == selected_id),
+            None,
+        )
+        if node is not None:
+            payload["data"] = {"node": deep_thaw(node)}
+        else:
+            fail_closed()
+    elif isinstance(authoritative_data, Mapping) and set(authoritative_data) == {"output"}:
+        selected = authoritative_data["output"]
+        outputs = provider_current_state.get("outputs", [])
+        selected_name = selected.get("sink_name") if isinstance(selected, Mapping) else None
+        output = next(
+            (candidate for candidate in outputs if isinstance(candidate, Mapping) and candidate.get("name") == selected_name),
+            None,
+        )
+        if output is not None:
+            payload["data"] = {"output": deep_thaw(output)}
+        else:
+            fail_closed()
+    elif isinstance(authoritative_data, Mapping) and "inspection" in authoritative_data:
+        payload["data"] = deep_thaw(provider_current_state)
+    else:
+        fail_closed()
+    return _serialize_closed_provider_discovery_payload(payload)
 
 
 async def _await_custody_settlement(awaitable: Awaitable[Any]) -> Any:
@@ -2027,7 +2176,18 @@ async def _plan_pipeline_inner(
             await asyncio.gather(*pending)
         discovery_results = [task.result() for task in discovery_tasks]
         for call, result in discovery_results:
-            messages.append({"role": "tool", "tool_call_id": call.call_id, "content": serialize_tool_result(result)})
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "content": _serialize_provider_discovery_result(
+                        call=call,
+                        result=result,
+                        surface=surface,
+                        provider_current_state=provider_current_state,
+                    ),
+                }
+            )
             await emit_progress(lifecycle.progress, tool_completed_progress_event(call.name, result.success))
         remaining_discovery = model_config.max_discovery_turns - discovery_turns
         if remaining_discovery == 2:

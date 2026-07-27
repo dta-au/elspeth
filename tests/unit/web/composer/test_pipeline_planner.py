@@ -34,6 +34,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
+from elspeth.web.composer.guided.planning import guided_redacted_current_state_context
 from elspeth.web.composer.guided.prompts import load_step_planner_skill
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import (
@@ -47,6 +48,8 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerRequestLifecycle,
     _allowlisted_candidate_feedback,
     _parse_response_tool_calls,
+    _ParsedToolCall,
+    _serialize_provider_discovery_result,
     plan_pipeline,
     planner_tool_definitions,
 )
@@ -60,6 +63,7 @@ from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.state import (
     CompositionState,
+    EdgeSpec,
     NodeSpec,
     OutputSpec,
     PipelineMetadata,
@@ -67,7 +71,7 @@ from elspeth.web.composer.state import (
     ValidationEntry,
     ValidationSummary,
 )
-from elspeth.web.composer.tools._common import ToolContext
+from elspeth.web.composer.tools._common import ToolContext, ToolResult
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
 from elspeth.web.dependencies import create_catalog_service
@@ -163,6 +167,211 @@ def _response_with_usage(
 
 def _empty_state() -> CompositionState:
     return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+
+_DISCLOSURE_CANARIES = (
+    "WITHHELD-SOURCE-OPTION-CANARY",
+    "WITHHELD-NODE-OPTION-CANARY",
+    "WITHHELD-OUTPUT-OPTION-CANARY",
+    "WITHHELD-METADATA-CANARY",
+)
+_VALIDATION_MESSAGE_CANARY = "PRIVATE-VALUE-FIELD-CANARY-9d4c"
+_HIDDEN_CONNECTION_COMPONENT_CANARY = "PRIVATE-HIDDEN-CONNECTION-CANARY"
+_HIDDEN_EDGE_COMPONENT_CANARY = "PRIVATE-HIDDEN-EDGE-CANARY"
+
+
+def _state_with_disclosure_canaries(tmp_path: Path) -> CompositionState:
+    source_canary, node_canary, output_canary, metadata_canary = _DISCLOSURE_CANARIES
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={
+                "path": str(tmp_path / "blobs" / _TEST_SESSION_ID / f"{source_canary}.csv"),
+                "schema": {"mode": "observed"},
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="map_fields",
+                node_type="transform",
+                plugin="field_mapper",
+                input="rows",
+                on_success="mapped",
+                on_error="discard",
+                options={
+                    "schema": {"mode": "observed"},
+                    "mapping": {"name": node_canary},
+                    "select_only": True,
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="mapped",
+                plugin="json",
+                options={
+                    "path": f"outputs/{output_canary}.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(name="Private reviewed pipeline", description=metadata_canary),
+        version=4,
+    )
+
+
+def _state_with_validation_message_canary(tmp_path: Path) -> CompositionState:
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={
+                "path": str(tmp_path / "blobs" / _TEST_SESSION_ID / "input.csv"),
+                "schema": {"mode": "observed"},
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="profile_values",
+                node_type="aggregation",
+                plugin="batch_distribution_profile",
+                input="rows",
+                on_success="profiled",
+                on_error="discard",
+                options={
+                    "schema": {"mode": "observed"},
+                    "value_field": _VALIDATION_MESSAGE_CANARY,
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="profiled",
+                plugin="json",
+                options={
+                    "path": "outputs/profile.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=4,
+    )
+
+
+def _state_with_hidden_topology_component_canaries(tmp_path: Path) -> CompositionState:
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="gate_a_in",
+            options={
+                "path": str(tmp_path / "blobs" / _TEST_SESSION_ID / "input.csv"),
+                "schema": {"mode": "observed"},
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="gate_a",
+                node_type="gate",
+                plugin=None,
+                input="gate_a_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="true",
+                routes=None,
+                fork_to=(_HIDDEN_CONNECTION_COMPONENT_CANARY,),
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="gate_b",
+                node_type="gate",
+                plugin=None,
+                input="gate_b_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="true",
+                routes=None,
+                fork_to=(_HIDDEN_CONNECTION_COMPONENT_CANARY,),
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(
+            EdgeSpec(
+                id=_HIDDEN_EDGE_COMPONENT_CANARY,
+                from_node="missing_from",
+                to_node="missing_to",
+                edge_type="on_success",
+                label=None,
+            ),
+        ),
+        outputs=(
+            OutputSpec(
+                name="result",
+                plugin="json",
+                options={
+                    "path": "outputs/result.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=4,
+    )
+
+
+def _state_with_all_provider_disclosure_canaries(tmp_path: Path) -> CompositionState:
+    disclosed = _state_with_disclosure_canaries(tmp_path)
+    topology = _state_with_hidden_topology_component_canaries(tmp_path)
+    validation = _state_with_validation_message_canary(tmp_path)
+    return replace(
+        disclosed,
+        nodes=(*disclosed.nodes, validation.nodes[0], *topology.nodes),
+        edges=topology.edges,
+    )
+
+
+_ALL_PROVIDER_DISCLOSURE_CANARIES = (
+    *_DISCLOSURE_CANARIES,
+    _VALIDATION_MESSAGE_CANARY,
+    _HIDDEN_CONNECTION_COMPONENT_CANARY,
+    _HIDDEN_EDGE_COMPONENT_CANARY,
+)
 
 
 def _pipeline(data_dir: Path, *, session_id: str = _TEST_SESSION_ID) -> dict[str, Any]:
@@ -362,6 +571,7 @@ async def _plan(
     originating_message: PlannerOriginatingMessage | None = None,
     custody_config: PlannerCustodyConfig | None = None,
     current_state: CompositionState | None = None,
+    provider_current_state: Mapping[str, Any] | None = None,
     intent: str = "Build the requested pipeline.",
     surface: PlannerSurface = PlannerSurface.FREEFORM,
     profile: str | None = None,
@@ -381,7 +591,9 @@ async def _plan(
     return await plan_pipeline(
         intent=intent,
         current_state=current_state or _empty_state(),
-        provider_current_state=(current_state or _empty_state()).to_dict(),
+        provider_current_state=(
+            provider_current_state if provider_current_state is not None else (current_state or _empty_state()).to_dict()
+        ),
         reviewed_facts={"request": "Build the requested pipeline."},
         reviewed_planner_context={"request": "Build the requested pipeline."},
         eligible_deferred_intent_ids=eligible_deferred_intent_ids,
@@ -1103,6 +1315,726 @@ async def test_discovery_round_uses_real_read_only_tool_then_terminal(
     assert len(recorder.invocations) == 1
     assert recorder.invocations[0].tool_name == "list_sources"
     assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_staged_guided_pipeline_state_discovery_preserves_initial_redacted_projection(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A staged planner cannot recover an option value withheld at turn zero."""
+    withheld_canary = "WITHHELD-STAGED-OPTION-CANARY"
+    current_state = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={
+                "path": f"blobs/{_TEST_SESSION_ID}/{withheld_canary}.csv",
+                "schema": {"mode": "observed"},
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="rows",
+                plugin="json",
+                options={
+                    "path": "outputs/result.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=4,
+    )
+    provider_state = guided_redacted_current_state_context(current_state)
+    completion = _ScriptedCompletion(
+        _response(("get_pipeline_state", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=provider_state,
+        surface=PlannerSurface.GUIDED_STAGED,
+    )
+
+    initial_payload = completion.requests[0]["messages"][-1]["content"]
+    assert withheld_canary not in initial_payload
+    discovery_payload = next(message["content"] for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    assert withheld_canary not in discovery_payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("component", "expected_data_key"),
+    [
+        ("source", "sources"),
+        ("map_fields", "node"),
+        ("mapped", "output"),
+    ],
+)
+async def test_staged_guided_component_discovery_preserves_redacted_component_shape(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    component: str,
+    expected_data_key: str,
+) -> None:
+    current_state = _state_with_disclosure_canaries(tmp_path)
+    provider_state = guided_redacted_current_state_context(current_state)
+    completion = _ScriptedCompletion(
+        _response(("get_pipeline_state", {"component": component})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=provider_state,
+        surface=PlannerSurface.GUIDED_STAGED,
+    )
+
+    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    payload = json.loads(tool_message["content"])
+    assert set(payload["data"]) == {expected_data_key}
+    if expected_data_key == "sources":
+        assert payload["data"]["sources"] == provider_state["sources"]
+    elif expected_data_key == "node":
+        assert payload["data"]["node"] == provider_state["nodes"][0]
+    else:
+        assert payload["data"]["output"] == provider_state["outputs"][0]
+    assert all(canary not in tool_message["content"] for canary in _DISCLOSURE_CANARIES)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "profile"),
+    [
+        (PlannerSurface.GUIDED_STAGED, "ordinary"),
+        (PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
+    ],
+)
+async def test_redacted_planner_set_pipeline_arguments_read_fails_closed(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    profile: str,
+) -> None:
+    withheld_canary = "WITHHELD-ROUND-TRIP-CANARY"
+    current_state = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={
+                "path": f"blobs/{_TEST_SESSION_ID}/{withheld_canary}.csv",
+                "schema": {"mode": "observed"},
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="rows",
+                plugin="json",
+                options={
+                    "path": "outputs/result.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=4,
+    )
+    completion = _ScriptedCompletion(
+        _response(("get_pipeline_state", {"component": "set_pipeline_arguments"})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=guided_redacted_current_state_context(current_state),
+        surface=surface,
+        profile=profile,
+    )
+
+    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    payload = json.loads(tool_message["content"])
+    assert payload["success"] is False
+    assert payload["data"]["error_code"] == "surface_projection_unavailable"
+    assert withheld_canary not in tool_message["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "profile"),
+    [
+        (PlannerSurface.GUIDED_STAGED, "ordinary"),
+        (PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
+    ],
+)
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"unexpected": True},
+        {"component": "missing-component"},
+    ],
+)
+async def test_redacted_planner_preserves_canonical_failed_state_read(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    profile: str,
+    arguments: Mapping[str, Any],
+) -> None:
+    current_state = _state_with_disclosure_canaries(tmp_path)
+    completion = _ScriptedCompletion(
+        _response(("get_pipeline_state", dict(arguments))),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=guided_redacted_current_state_context(current_state),
+        surface=surface,
+        profile=profile,
+    )
+
+    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    payload = json.loads(tool_message["content"])
+    assert payload["success"] is False
+    assert payload["data"].get("error_code") != "surface_projection_unavailable"
+    if "unexpected" in arguments:
+        assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+    else:
+        assert payload["data"]["error"] == (
+            "Component 'missing-component' not found. Specify 'source', a node ID, an output name, "
+            "or a full-state alias ('full', 'all', 'pipeline', or empty string)."
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "profile", "restricted"),
+    [
+        (PlannerSurface.FREEFORM, "ordinary", False),
+        (PlannerSurface.GUIDED_FULL, "ordinary", False),
+        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
+        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
+    ],
+)
+@pytest.mark.parametrize("failed", [False, True])
+async def test_pipeline_state_disclosure_projects_the_whole_restricted_envelope(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    profile: str,
+    restricted: bool,
+    failed: bool,
+) -> None:
+    current_state = _state_with_validation_message_canary(tmp_path)
+    provider_state = guided_redacted_current_state_context(current_state) if restricted else current_state.to_dict()
+    arguments = {"component": "missing-component"} if failed else {}
+    completion = _ScriptedCompletion(
+        _response(("get_pipeline_state", arguments)),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=provider_state,
+        surface=surface,
+        profile=profile,
+    )
+
+    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    payload = json.loads(tool_message["content"])
+    assert payload["success"] is not failed
+    if restricted:
+        assert _VALIDATION_MESSAGE_CANARY not in tool_message["content"]
+        assert set(payload["validation"]) == {
+            "is_valid",
+            "errors",
+            "warnings",
+            "suggestions",
+            "semantic_contracts",
+            "graph_repair_suggestions",
+        }
+        for entries in (
+            payload["validation"]["errors"],
+            payload["validation"]["warnings"],
+            payload["validation"]["suggestions"],
+        ):
+            assert all(set(entry) <= {"component", "severity", "error_code"} for entry in entries)
+        if failed:
+            assert payload["data"]["error"] == (
+                "Component 'missing-component' not found. Specify 'source', a node ID, an output name, "
+                "or a full-state alias ('full', 'all', 'pipeline', or empty string)."
+            )
+    else:
+        assert _VALIDATION_MESSAGE_CANARY in tool_message["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "profile", "restricted"),
+    [
+        (PlannerSurface.FREEFORM, "ordinary", False),
+        (PlannerSurface.GUIDED_FULL, "ordinary", False),
+        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
+        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
+    ],
+)
+@pytest.mark.parametrize("failed", [False, True])
+async def test_pipeline_state_disclosure_closes_hidden_topology_validation_components(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    profile: str,
+    restricted: bool,
+    failed: bool,
+) -> None:
+    current_state = _state_with_hidden_topology_component_canaries(tmp_path)
+    provider_state = guided_redacted_current_state_context(current_state) if restricted else current_state.to_dict()
+    if restricted:
+        assert _HIDDEN_CONNECTION_COMPONENT_CANARY not in canonical_json(provider_state)
+        assert _HIDDEN_EDGE_COMPONENT_CANARY not in canonical_json(provider_state)
+    arguments = {"component": "missing-component"} if failed else {}
+    completion = _ScriptedCompletion(
+        _response(("get_pipeline_state", arguments)),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=provider_state,
+        surface=surface,
+        profile=profile,
+    )
+
+    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    payload = json.loads(tool_message["content"])
+    entries = payload["validation"]["errors"]
+    codes = {entry.get("error_code") for entry in entries}
+    assert {"duplicate_connection_producer", "edge_unknown_node"} <= codes
+    assert all(
+        entry["severity"] == "high"
+        for entry in entries
+        if entry.get("error_code") in {"duplicate_connection_producer", "edge_unknown_node"}
+    )
+    if restricted:
+        assert _HIDDEN_CONNECTION_COMPONENT_CANARY not in tool_message["content"]
+        assert _HIDDEN_EDGE_COMPONENT_CANARY not in tool_message["content"]
+        assert {entry["component"] for entry in entries} == {"pipeline"}
+    else:
+        components = {entry["component"] for entry in entries}
+        assert f"connection:{_HIDDEN_CONNECTION_COMPONENT_CANARY}" in components
+        assert f"edge:{_HIDDEN_EDGE_COMPONENT_CANARY}" in components
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "profile", "restricted"),
+    [
+        (PlannerSurface.FREEFORM, "ordinary", False),
+        (PlannerSurface.GUIDED_FULL, "ordinary", False),
+        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
+        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
+    ],
+)
+@pytest.mark.parametrize("failed", [False, True])
+async def test_list_sources_disclosure_closes_authoritative_validation_envelope(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    profile: str,
+    restricted: bool,
+    failed: bool,
+) -> None:
+    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    provider_state = guided_redacted_current_state_context(current_state) if restricted else current_state.to_dict()
+    arguments = {"unexpected": True} if failed else {}
+    completion = _ScriptedCompletion(
+        _response(("list_sources", arguments)),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=provider_state,
+        surface=surface,
+        profile=profile,
+    )
+
+    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    payload = json.loads(tool_message["content"])
+    assert payload["success"] is not failed
+    if failed:
+        assert payload["data"]["success"] is False
+        assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+    else:
+        assert isinstance(payload["data"], list)
+    if restricted:
+        assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
+        for entries in (
+            payload["validation"]["errors"],
+            payload["validation"]["warnings"],
+            payload["validation"]["suggestions"],
+        ):
+            assert {entry["component"] for entry in entries} <= {"pipeline"}
+    else:
+        assert _VALIDATION_MESSAGE_CANARY in tool_message["content"]
+        assert _HIDDEN_CONNECTION_COMPONENT_CANARY in tool_message["content"]
+        assert _HIDDEN_EDGE_COMPONENT_CANARY in tool_message["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "profile", "restricted"),
+    [
+        (PlannerSurface.FREEFORM, "ordinary", False),
+        (PlannerSurface.GUIDED_FULL, "ordinary", False),
+        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
+        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
+    ],
+)
+@pytest.mark.parametrize("failed", [False, True])
+async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_is_unsafe(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    profile: str,
+    restricted: bool,
+    failed: bool,
+) -> None:
+    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    provider_state = guided_redacted_current_state_context(current_state) if restricted else current_state.to_dict()
+    arguments = {"unexpected": True} if failed else {}
+    completion = _ScriptedCompletion(
+        _response(("preview_pipeline", arguments)),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=provider_state,
+        surface=surface,
+        profile=profile,
+    )
+
+    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    payload = json.loads(tool_message["content"])
+    if restricted:
+        assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
+        if failed:
+            assert payload["success"] is False
+            assert payload["data"]["success"] is False
+            assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+            assert payload["data"].get("error_code") != "surface_projection_unavailable"
+        else:
+            assert payload["success"] is False
+            assert set(payload["data"]) == {"error", "error_code"}
+            assert payload["data"]["error_code"] == "surface_projection_unavailable"
+            assert "runtime_preflight" not in payload
+    else:
+        assert payload["success"] is not failed
+        assert _VALIDATION_MESSAGE_CANARY in tool_message["content"]
+        assert _HIDDEN_CONNECTION_COMPONENT_CANARY in tool_message["content"]
+        assert _HIDDEN_EDGE_COMPONENT_CANARY in tool_message["content"]
+        if not failed:
+            assert "authoring_validation" in payload["data"]
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE],
+)
+@pytest.mark.parametrize("tool_name", sorted(PLANNER_DISCOVERY_TOOL_NAMES))
+def test_every_restricted_discovery_success_uses_the_closed_provider_envelope(
+    tmp_path: Path,
+    surface: PlannerSurface,
+    tool_name: str,
+) -> None:
+    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    provider_state = guided_redacted_current_state_context(current_state)
+    authoritative_data = {"inspection": "diagnostic"} if tool_name == "get_pipeline_state" else {"safe_tool_marker": tool_name}
+    result = ToolResult(
+        success=True,
+        updated_state=current_state,
+        validation=current_state.validate(),
+        affected_nodes=(),
+        data=authoritative_data,
+    )
+    call = _ParsedToolCall(
+        call_id="call-1",
+        name=tool_name,
+        raw_arguments="{}",
+        arguments={},
+    )
+
+    payload = json.loads(
+        _serialize_provider_discovery_result(
+            call=call,
+            result=result,
+            surface=surface,
+            provider_current_state=provider_state,
+        )
+    )
+
+    assert all(canary not in canonical_json(payload) for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
+    if tool_name == "get_pipeline_state":
+        assert payload["success"] is True
+        assert payload["data"] == provider_state
+    elif tool_name == "preview_pipeline":
+        assert payload["success"] is False
+        assert payload["data"]["error_code"] == "surface_projection_unavailable"
+    else:
+        assert payload["success"] is True
+        assert payload["data"] == authoritative_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "profile"),
+    [
+        (PlannerSurface.GUIDED_STAGED, "ordinary"),
+        (PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("component", "collision_kind", "expected_data_key"),
+    [
+        ("source", "node", "sources"),
+        ("full", "node", "node"),
+        ("all", "output", "output"),
+        ("pipeline", "node", "node"),
+    ],
+)
+async def test_redacted_planner_selector_collisions_follow_authoritative_precedence(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    profile: str,
+    component: str,
+    collision_kind: str,
+    expected_data_key: str,
+) -> None:
+    current_state = _state_with_disclosure_canaries(tmp_path)
+    if collision_kind == "node":
+        current_state = replace(
+            current_state,
+            nodes=(replace(current_state.nodes[0], id=component),),
+        )
+    else:
+        current_state = replace(
+            current_state,
+            nodes=(replace(current_state.nodes[0], on_success=component),),
+            outputs=(replace(current_state.outputs[0], name=component),),
+        )
+    provider_state = guided_redacted_current_state_context(current_state)
+    completion = _ScriptedCompletion(
+        _response(("get_pipeline_state", {"component": component})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=provider_state,
+        surface=surface,
+        profile=profile,
+    )
+
+    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    payload = json.loads(tool_message["content"])
+    assert set(payload["data"]) == {expected_data_key}
+    assert all(canary not in tool_message["content"] for canary in _DISCLOSURE_CANARIES)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component", [None, "", "full", "all", "pipeline", " FULL "])
+@pytest.mark.parametrize(
+    ("surface", "profile"),
+    [
+        (PlannerSurface.GUIDED_STAGED, "ordinary"),
+        (PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
+    ],
+)
+async def test_redacted_planner_full_state_aliases_return_the_same_surface_projection(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    component: str | None,
+    surface: PlannerSurface,
+    profile: str,
+) -> None:
+    current_state = _state_with_disclosure_canaries(tmp_path)
+    provider_state = guided_redacted_current_state_context(current_state)
+    arguments = {} if component is None else {"component": component}
+    completion = _ScriptedCompletion(
+        _response(("get_pipeline_state", arguments)),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=provider_state,
+        surface=surface,
+        profile=profile,
+    )
+
+    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    payload = json.loads(tool_message["content"])
+    assert payload["data"] == provider_state
+    assert all(canary not in tool_message["content"] for canary in _DISCLOSURE_CANARIES)
+
+
+@pytest.mark.asyncio
+async def test_staged_guided_discovery_reread_after_rejection_stays_redacted(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    current_state = _state_with_disclosure_canaries(tmp_path)
+    completion = _ScriptedCompletion(
+        _response(("get_pipeline_state", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("get_pipeline_state", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=guided_redacted_current_state_context(current_state),
+        surface=PlannerSurface.GUIDED_STAGED,
+    )
+
+    tool_messages = [
+        message["content"]
+        for message in completion.requests[-1]["messages"]
+        if message["role"] == "tool" and message["tool_call_id"] in {"call-1"}
+    ]
+    state_reads = [
+        content for content in tool_messages if json.loads(content).get("data", {}).get("schema") == "guided.current-state-context.v1"
+    ]
+    assert len(state_reads) == 2
+    assert all(all(canary not in content for canary in _DISCLOSURE_CANARIES) for content in state_reads)
+
+
+_DISCOVERY_TEST_ARGUMENTS: Mapping[str, Mapping[str, Any]] = {
+    "diff_pipeline": {},
+    "explain_validation_error": {"error_text": "no_source_configured"},
+    "get_audit_info": {},
+    "get_expression_grammar": {},
+    "get_pipeline_state": {},
+    "get_plugin_assistance": {"plugin_type": "source", "plugin_name": "csv"},
+    "get_plugin_schema": {"plugin_type": "source", "name": "csv"},
+    "list_models": {},
+    "list_recipes": {},
+    "list_sinks": {},
+    "list_sources": {},
+    "list_transforms": {},
+    "preview_pipeline": {},
+    "get_blob_content": {"blob_id": "00000000-0000-4000-8000-000000000001"},
+    "get_blob_metadata": {"blob_id": "00000000-0000-4000-8000-000000000001"},
+    "inspect_source": {"blob_id": "00000000-0000-4000-8000-000000000001"},
+    "list_blobs": {},
+    "list_composer_blobs": {},
+    "list_secret_refs": {},
+    "validate_secret_ref": {"name": "MISSING_SECRET"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "profile", "redacted"),
+    [
+        (PlannerSurface.FREEFORM, "ordinary", False),
+        (PlannerSurface.GUIDED_FULL, "ordinary", False),
+        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
+        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
+    ],
+)
+async def test_every_planner_discovery_tool_honors_surface_state_disclosure(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    profile: str,
+    redacted: bool,
+) -> None:
+    assert set(_DISCOVERY_TEST_ARGUMENTS) == set(PLANNER_DISCOVERY_TOOL_NAMES)
+    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    provider_state = guided_redacted_current_state_context(current_state) if redacted else current_state.to_dict()
+    calls = tuple((name, dict(_DISCOVERY_TEST_ARGUMENTS[name])) for name in PLANNER_DISCOVERY_TOOL_NAMES)
+    completion = _ScriptedCompletion(
+        _response(*calls),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        current_state=current_state,
+        provider_current_state=provider_state,
+        surface=surface,
+        profile=profile,
+        model_overrides={"max_tool_calls_per_turn": len(calls)},
+    )
+
+    tool_messages = {
+        message["tool_call_id"]: message["content"] for message in completion.requests[1]["messages"] if message["role"] == "tool"
+    }
+    assert len(tool_messages) == len(calls)
+    for index, (name, _arguments) in enumerate(calls, start=1):
+        content = tool_messages[f"call-{index}"]
+        if redacted:
+            assert all(canary not in content for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
+        else:
+            assert _VALIDATION_MESSAGE_CANARY in content
+            assert _HIDDEN_CONNECTION_COMPONENT_CANARY in content
+            assert _HIDDEN_EDGE_COMPONENT_CANARY in content
+            if name == "get_pipeline_state":
+                assert _DISCLOSURE_CANARIES[1] in content
 
 
 @pytest.mark.asyncio
