@@ -107,6 +107,24 @@ def _state_content_hash(state: CompositionStateData) -> str:
     )
 
 
+def _pipeline_dispatch_result(*, pipeline_content_hash: str) -> dict[str, object]:
+    return {
+        "success": True,
+        "validation": {
+            "is_valid": True,
+            "errors": [],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [],
+        "version": 1,
+        "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
+        "pipeline_content_hash": pipeline_content_hash,
+    }
+
+
 def _plan(base: AbsentBase | PresentBase | None = None) -> PipelinePlanResult:
     if base is None:
         base = AbsentBase()
@@ -203,7 +221,6 @@ async def _persist_dispatch(
     session_id: UUID,
     *,
     tool_call_id: str = "planner-terminal-call",
-    result_hash_suffix: str = "",
 ) -> PipelineDispatchAuditBinding:
     audit = begin_dispatch(
         tool_call_id,
@@ -214,12 +231,9 @@ async def _persist_dispatch(
     )
     invocation = finish_success(
         audit,
-        result_payload={
-            "success": True,
-            "content_hash": _state_content_hash(_state_data()) + result_hash_suffix,
-            "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
-            "pipeline_content_hash": _state_content_hash(_state_data()),
-        },
+        result_payload=_pipeline_dispatch_result(
+            pipeline_content_hash=_state_content_hash(_state_data()),
+        ),
         version_after=1,
     )
     bindings = await _persist_tool_invocations(
@@ -652,22 +666,12 @@ async def test_settlement_rejects_concurrent_successes_for_same_proposal_call_id
     second_audit = begin_dispatch(plan.tool_call_id, "set_pipeline", _pipeline(), version_before=0, actor="user:alice")
     first = finish_success(
         first_audit,
-        result_payload={
-            "success": True,
-            "attempt": 1,
-            "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
-            "pipeline_content_hash": state_hash,
-        },
+        result_payload=_pipeline_dispatch_result(pipeline_content_hash=state_hash),
         version_after=1,
     )
     second = finish_success(
         second_audit,
-        result_payload={
-            "success": True,
-            "attempt": 2,
-            "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
-            "pipeline_content_hash": state_hash,
-        },
+        result_payload=_pipeline_dispatch_result(pipeline_content_hash=state_hash),
         version_after=1,
     )
     persisted = await asyncio.gather(

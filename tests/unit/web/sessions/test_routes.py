@@ -1296,16 +1296,29 @@ async def test_canonical_pipeline_cancel_during_failed_dispatch_audit_persist_te
         version_before=0,
         actor="user:alice",
     )
+    failed_result: dict[str, object] = {
+        "success": False,
+        "validation": {
+            "is_valid": False,
+            "errors": [],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [],
+        "version": 0,
+    }
     recorder_invocation = finish_success(
         audit,
-        result_payload={"success": False},
+        result_payload=failed_result,
         version_after=0,
     )
     executor_hash = canonical_stable_hash({"executor": "validation-failed"})
     rebound_invocation = finish_success(
         audit,
         result_payload={
-            "success": False,
+            **failed_result,
             "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
             "pipeline_content_hash": executor_hash,
         },

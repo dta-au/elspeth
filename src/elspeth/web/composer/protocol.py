@@ -685,6 +685,7 @@ _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = frozenset(
         "source without metadata",
         "stale model-choice draft",
         "stale prompt-template draft",
+        "stale vague-term draft",
         "str (contained non-encodable character, e.g. surrogate)",
         "unexpected extra keys",
         "interpretation request limit exceeded",
