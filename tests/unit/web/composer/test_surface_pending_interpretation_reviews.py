@@ -6,7 +6,7 @@ import pytest
 import structlog
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import (
     CompositionState,
@@ -17,6 +17,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.config import WebSettings
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
     RAW_HTML_CLEANUP_USER_TERM,
     SOURCE_AUTHORING_KEY,
@@ -257,9 +258,8 @@ async def test_surfacer_is_idempotent(tmp_path, sessions_service) -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_choice_dedup_is_draft_aware(tmp_path, sessions_service) -> None:
-    """A stale pending event for the same node/kind/user_term but an old draft
-    must not deadlock the new staged requirement."""
+async def test_model_choice_changed_identity_supersedes_old_event(tmp_path, sessions_service) -> None:
+    """A newly staged model authority abandons the stale pending card."""
     composer = _composer(tmp_path, sessions_service)
     old_model = "anthropic/claude-sonnet-4.5"
     new_model = "anthropic/claude-sonnet-4.6"
@@ -284,10 +284,12 @@ async def test_model_choice_dedup_is_draft_aware(tmp_path, sessions_service) -> 
     )
     new_record = await _save_state_for_session(sessions_service, session_id, new_state)
     await composer.surface_pending_interpretation_reviews(new_state, session_id=str(session_id), current_state_id=str(new_record.id))
-    events = await sessions_service.list_interpretation_events(session_id, status="pending")
-    drafts = [e.llm_draft for e in events if e.kind is InterpretationKind.LLM_MODEL_CHOICE]
-    assert old_model in drafts
-    assert new_model in drafts
+    events = await sessions_service.list_interpretation_events(session_id, status="all")
+    model_events = [event for event in events if event.kind is InterpretationKind.LLM_MODEL_CHOICE]
+    assert [(event.llm_draft, event.choice) for event in model_events] == [
+        (old_model, InterpretationChoice.ABANDONED),
+        (new_model, InterpretationChoice.PENDING),
+    ]
 
 
 def _staged_vague_term_node() -> NodeSpec:
@@ -300,7 +302,12 @@ def _staged_vague_term_node() -> NodeSpec:
         on_success="out",
         on_error=None,
         options={
-            "prompt_template": "Rate how {{interpretation:cool}} this is.",
+            "prompt_template": "Rate how pending interpretation this is.",
+            PROMPT_TEMPLATE_PARTS_KEY: [
+                {"kind": "text", "text": "Rate how "},
+                {"kind": "interpretation_ref", "requirement_id": "vague_term_review:rate_node"},
+                {"kind": "text", "text": " this is."},
+            ],
             INTERPRETATION_REQUIREMENTS_KEY: [
                 {
                     "id": "vague_term_review:rate_node",
@@ -575,9 +582,8 @@ async def test_surfacer_surfaces_pipeline_decision(tmp_path, sessions_service) -
 
 
 @pytest.mark.asyncio
-async def test_pipeline_decision_dedup_is_draft_aware(tmp_path, sessions_service) -> None:
-    """A stale raw-HTML-cleanup event for the same field_mapper decision must
-    not suppress a newly authored decision draft."""
+async def test_pipeline_decision_changed_identity_supersedes_old_event(tmp_path, sessions_service) -> None:
+    """A newly authored decision authority abandons the stale pending card."""
     composer = _composer(tmp_path, sessions_service)
     old_draft = "Drop raw HTML fields before writing output."
     new_draft = RAW_HTML_CLEANUP_REVIEW_DRAFT
@@ -602,7 +608,9 @@ async def test_pipeline_decision_dedup_is_draft_aware(tmp_path, sessions_service
     )
     new_record = await _save_state_for_session(sessions_service, session_id, new_state)
     await composer.surface_pending_interpretation_reviews(new_state, session_id=str(session_id), current_state_id=str(new_record.id))
-    events = await sessions_service.list_interpretation_events(session_id, status="pending")
-    drafts = [e.llm_draft for e in events if e.kind is InterpretationKind.PIPELINE_DECISION]
-    assert old_draft in drafts
-    assert new_draft in drafts
+    events = await sessions_service.list_interpretation_events(session_id, status="all")
+    decision_events = [event for event in events if event.kind is InterpretationKind.PIPELINE_DECISION]
+    assert [(event.llm_draft, event.choice) for event in decision_events] == [
+        (old_draft, InterpretationChoice.ABANDONED),
+        (new_draft, InterpretationChoice.PENDING),
+    ]

@@ -15,6 +15,7 @@ from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext
 from elspeth.web.composer.tools.sessions import _execute_get_pipeline_state, _execute_set_pipeline
+from elspeth.web.composer.tools.transforms import _execute_patch_node_options, _execute_upsert_node
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -379,6 +380,95 @@ def test_pipeline_decision_review_uses_kind_and_user_term_hash_authority() -> No
     reconciled = reconcile_authoritative_reviews(previous, proposed)
 
     assert reconciled.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]["status"] == "resolved"
+
+
+def _reviewed_web_scrape_state() -> tuple[CompositionState, dict[str, object]]:
+    options: dict[str, object] = {
+        "url_field": "url",
+        "content_field": "page_text",
+        "fingerprint_field": "page_fingerprint",
+        "format": "text",
+        "http": {
+            "abuse_contact": "review@foundryside.dev",
+            "scraping_reason": "authoritative mutation test",
+            "allowed_hosts": "public_only",
+        },
+        "schema": {"mode": "observed"},
+    }
+    node = _node(node_id="scrape", plugin="web_scrape", options=options)
+    resolved = _requirement(
+        requirement_id=f"{WEB_SCRAPE_HTTP_IDENTITY_USER_TERM}:scrape",
+        kind=InterpretationKind.PIPELINE_DECISION,
+        user_term=WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+        status="resolved",
+        draft="Approve the configured web scraping identity.",
+        accepted_value="approved",
+        accepted_artifact_hash=pipeline_decision_artifact_hash(
+            node,
+            (node,),
+            user_term=WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+        ),
+    )
+    return (
+        _state(nodes=(replace(node, options={**options, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}),)),
+        options,
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["upsert_node", "patch_node_options"])
+@pytest.mark.parametrize("reviewed_field_changed", [False, True], ids=["unrelated-field", "reviewed-field"])
+def test_node_mutations_reconcile_review_authority(
+    tool_name: str,
+    reviewed_field_changed: bool,
+) -> None:
+    """Every direct node writer preserves only still-coherent review evidence."""
+    state, options = _reviewed_web_scrape_state()
+    if reviewed_field_changed:
+        changed_options = {
+            **options,
+            "http": {
+                **options["http"],
+                "scraping_reason": "materially changed identity",
+            },
+        }
+    else:
+        changed_options = {**options, "content_field": "body_text"}
+
+    if tool_name == "upsert_node":
+        result = _execute_upsert_node(
+            {
+                "id": "scrape",
+                "node_type": "transform",
+                "plugin": "web_scrape",
+                "input": "in",
+                "on_success": "out",
+                "on_error": "discard",
+                "options": {
+                    **changed_options,
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": InterpretationKind.PIPELINE_DECISION.value,
+                            "user_term": WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+                            "draft": "Approve the configured web scraping identity.",
+                        }
+                    ],
+                },
+            },
+            state,
+            _trained_context(),
+        )
+    else:
+        patch = {"http": changed_options["http"]} if reviewed_field_changed else {"content_field": changed_options["content_field"]}
+        result = _execute_patch_node_options(
+            {"node_id": "scrape", "patch": patch},
+            state,
+            _trained_context(),
+        )
+
+    assert result.success, result.data
+    requirement = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert requirement["status"] == ("pending" if reviewed_field_changed else "resolved")
+    assert requirement["event_id"] == (None if reviewed_field_changed else "event-1")
 
 
 def test_exact_payload_round_trips_through_real_set_pipeline_with_authoritative_review() -> None:

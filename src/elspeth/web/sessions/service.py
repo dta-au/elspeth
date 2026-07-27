@@ -2425,6 +2425,178 @@ def _matching_pending_requirement_index(
     return requirements, matching_indexes[0]
 
 
+def _review_requirement_identity(
+    options: Mapping[str, Any],
+    *,
+    kind: InterpretationKind,
+    user_term: str,
+    context: str,
+) -> Mapping[str, str]:
+    requirements, matching_index = _matching_pending_requirement_index(
+        options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None,
+        kind=kind,
+        user_term=user_term,
+        context=context,
+    )
+    requirement = requirements[matching_index]
+    requirement_id = requirement["id"] if "id" in requirement else None
+    draft = requirement["draft"] if "draft" in requirement else None
+    if not isinstance(requirement_id, str) or not requirement_id:
+        raise InterpretationPlaceholderConsumedError(f"{context}: review requirement id is missing or invalid")
+    if not isinstance(draft, str):
+        raise InterpretationPlaceholderConsumedError(f"{context}: review requirement draft is missing or invalid")
+    return {
+        "id": requirement_id,
+        "kind": kind.value,
+        "user_term": user_term.strip(),
+        "draft": draft,
+    }
+
+
+def _reviewed_content_identity(
+    state_record: CompositionStateRecord,
+    *,
+    kind: InterpretationKind,
+    affected_node_id: str,
+    user_term: str,
+    context: str,
+) -> str:
+    """Canonical identity of the exact content one interpretation event reviews.
+
+    The event row's immutable ``composition_state_id`` is the storage anchor;
+    this projection derives the kind-specific reviewed artifact from that
+    state. It deliberately excludes unrelated composition fields so a later
+    state version can reuse an event only while the reviewed content is
+    unchanged.
+    """
+
+    domain: dict[str, Any] = {
+        "version": 1,
+        "kind": kind.value,
+        "affected_node_id": affected_node_id,
+        "user_term": user_term.strip(),
+    }
+    if kind is InterpretationKind.INVENTED_SOURCE:
+        source_name = source_name_from_component_id(affected_node_id)
+        if source_name is None:
+            raise InterpretationNodeMissingError(
+                f"{context}: invented_source must target a source component ({SOURCE_COMPONENT_ID!r} or {SOURCE_COMPONENT_ID!r}:<name>)"
+            )
+        sources = _require_mapping(
+            state_record.sources,
+            message=f"{context}: invented_source requires a persisted sources mapping",
+        )
+        source = _require_mapping(
+            sources[source_name] if source_name in sources else None,
+            message=f"{context}: invented_source requires persisted source {source_name!r}",
+        )
+        options = _require_mapping(
+            source["options"] if "options" in source else None,
+            message=f"{context}: invented_source requires source.options",
+        )
+        authoring = _require_mapping(
+            options[SOURCE_AUTHORING_KEY] if SOURCE_AUTHORING_KEY in options else None,
+            message=f"{context}: invented_source requires source.options.{SOURCE_AUTHORING_KEY}",
+        )
+        content_hash = authoring["content_hash"] if "content_hash" in authoring else None
+        if not isinstance(content_hash, str) or not content_hash:
+            raise InterpretationPlaceholderConsumedError(f"{context}: source.options.{SOURCE_AUTHORING_KEY}.content_hash must be populated")
+        domain["requirement"] = _review_requirement_identity(
+            options,
+            kind=kind,
+            user_term=user_term,
+            context=context,
+        )
+        domain["artifact_hash"] = content_hash
+        return stable_hash(domain)
+
+    if kind is InterpretationKind.PIPELINE_DECISION:
+        node = _find_interpretation_review_node(
+            state_record,
+            affected_node_id=affected_node_id,
+            context=context,
+        )
+    else:
+        node = _find_llm_transform_node(
+            state_record,
+            affected_node_id=affected_node_id,
+            context=context,
+        )
+    options = _require_mapping(
+        node["options"] if "options" in node else None,
+        message=f"{context}: node {affected_node_id!r} options is not a mapping",
+    )
+
+    if kind is InterpretationKind.VAGUE_TERM:
+        raw_requirements = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
+        structured_match = isinstance(raw_requirements, (list, tuple)) and any(
+            isinstance(requirement, Mapping)
+            and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
+            and isinstance(requirement.get("user_term"), str)
+            and requirement["user_term"].strip() == user_term.strip()
+            for requirement in raw_requirements
+        )
+        if structured_match:
+            requirement_identity = _review_requirement_identity(
+                options,
+                kind=kind,
+                user_term=user_term,
+                context=context,
+            )
+            structure_hash = prompt_structure_hash_from_options(options)
+            if structure_hash is None:
+                raise InterpretationPlaceholderConsumedError(
+                    f"{context}: structured vague-term review requires options.{PROMPT_TEMPLATE_PARTS_KEY}"
+                )
+            parts = options[PROMPT_TEMPLATE_PARTS_KEY]
+            if not any(
+                isinstance(part, Mapping)
+                and part.get("kind") == "interpretation_ref"
+                and part.get("requirement_id") == requirement_identity["id"]
+                for part in parts
+            ):
+                raise InterpretationPlaceholderConsumedError(
+                    f"{context}: structured vague-term review has no prompt part for its requirement"
+                )
+            domain["requirement"] = requirement_identity
+            domain["prompt_structure_hash"] = structure_hash
+        else:
+            prompt_template = options["prompt_template"] if "prompt_template" in options else None
+            if not isinstance(prompt_template, str):
+                raise InterpretationPlaceholderConsumedError(f"{context}: legacy vague-term review requires options.prompt_template")
+            domain["legacy_prompt_hash"] = stable_hash(prompt_template)
+        return stable_hash(domain)
+
+    domain["requirement"] = _review_requirement_identity(
+        options,
+        kind=kind,
+        user_term=user_term,
+        context=context,
+    )
+    if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+        structure_hash = prompt_structure_hash_from_options(options)
+        if structure_hash is None:
+            prompt_template = options["prompt_template"] if "prompt_template" in options else None
+            if not isinstance(prompt_template, str):
+                raise InterpretationPlaceholderConsumedError(f"{context}: llm_prompt_template review requires options.prompt_template")
+            structure_hash = stable_hash(prompt_template)
+        domain["artifact_hash"] = structure_hash
+    elif kind is InterpretationKind.LLM_MODEL_CHOICE:
+        model = options["model"] if "model" in options else None
+        if not isinstance(model, str) or not model:
+            raise InterpretationPlaceholderConsumedError(f"{context}: llm_model_choice review requires a non-empty options.model")
+        domain["artifact_hash"] = model_choice_artifact_hash(model)
+    elif kind is InterpretationKind.PIPELINE_DECISION:
+        domain["artifact_hash"] = _pipeline_decision_artifact_hash_from_state_record(
+            state_record,
+            affected_node_id=affected_node_id,
+            user_term=user_term,
+        )
+    else:
+        raise AssertionError(f"unhandled InterpretationKind {kind!r}")
+    return stable_hash(domain)
+
+
 # Prefixes (case-insensitive) that, when they appear immediately before the
 # placeholder, indicate the LLM placed the placeholder inside a structural
 # directive rather than in the prompt body. Substituting the user's
@@ -2447,6 +2619,8 @@ def _patch_structured_interpretation_prompt(
     affected_node_id: str,
     user_term: str,
     accepted_value: str,
+    event_id: str | None = None,
+    llm_draft: str | None = None,
 ) -> dict[str, Any] | None:
     """Resolve structured interpretation metadata, returning patched options.
 
@@ -2523,6 +2697,13 @@ def _patch_structured_interpretation_prompt(
     matching_index = matching_indexes[0]
     matching_requirement = requirements[matching_index]
     matching_requirement_id = matching_requirement["id"]
+    if llm_draft is not None:
+        current_draft = matching_requirement["draft"] if "draft" in matching_requirement else None
+        if not isinstance(current_draft, str) or current_draft != llm_draft:
+            raise InterpretationPlaceholderConsumedError(
+                f"_patch_llm_transform_prompt: vague_term event draft no longer matches "
+                f"the current review requirement on node {affected_node_id!r}"
+            )
 
     rendered: list[str] = []
     matched_ref_count = 0
@@ -2590,6 +2771,8 @@ def _patch_structured_interpretation_prompt(
     resolved_prompt_template_hash = stable_hash(new_template)
     updated_requirement = dict(matching_requirement)
     updated_requirement["status"] = "resolved"
+    if event_id is not None:
+        updated_requirement["event_id"] = event_id
     updated_requirement["accepted_value"] = accepted_value
     # The requirement-level hash attests THIS requirement's accepted value, not
     # the full render: the render changes again when a sibling vague term
@@ -2612,6 +2795,8 @@ def _patch_llm_transform_prompt(
     affected_node_id: str,
     user_term: str,
     accepted_value: str,
+    event_id: str | None = None,
+    llm_draft: str | None = None,
 ) -> Sequence[Mapping[str, Any]]:
     """Return a new ``nodes`` JSON sequence with the LLM transform's prompt
     template patched to embed ``accepted_value`` for ``user_term``.
@@ -2712,6 +2897,8 @@ def _patch_llm_transform_prompt(
             affected_node_id=affected_node_id,
             user_term=user_term,
             accepted_value=accepted_value,
+            event_id=event_id,
+            llm_draft=llm_draft,
         )
         if structured_options is not None:
             patched_node = dict(node)
@@ -2780,15 +2967,54 @@ def _patch_llm_transform_prompt(
 def _resolve_vague_term(
     state_record: CompositionStateRecord,
     *,
+    surfacing_state_record: CompositionStateRecord | None,
+    event_id: str,
     affected_node_id: str,
     user_term: str,
+    llm_draft: str,
     accepted_value: str,
 ) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str]:
+    live_node = _find_llm_transform_node(
+        state_record,
+        affected_node_id=affected_node_id,
+        context="resolve_interpretation_event",
+    )
+    live_options = _require_mapping(
+        live_node["options"],
+        message=f"resolve_interpretation_event: node {affected_node_id!r} options is not a mapping",
+    )
+    requirements_value = live_options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in live_options else None
+    has_structured_site = isinstance(requirements_value, (list, tuple)) and any(
+        isinstance(requirement, Mapping)
+        and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
+        and isinstance(requirement.get("user_term"), str)
+        and requirement["user_term"].strip() == user_term.strip()
+        and requirement.get("status") == "pending"
+        for requirement in requirements_value
+    )
+    if not has_structured_site:
+        if surfacing_state_record is None:
+            raise InterpretationPlaceholderConsumedError("resolve_interpretation_event: legacy vague-term review has no surfacing state")
+        surfacing_node = _find_llm_transform_node(
+            surfacing_state_record,
+            affected_node_id=affected_node_id,
+            context="resolve_interpretation_event",
+        )
+        surfacing_options = _require_mapping(
+            surfacing_node["options"],
+            message=f"resolve_interpretation_event: surfacing node {affected_node_id!r} options is not a mapping",
+        )
+        if surfacing_options.get("prompt_template") != live_options.get("prompt_template"):
+            raise InterpretationPlaceholderConsumedError(
+                "resolve_interpretation_event: legacy vague-term prompt no longer matches the review surface"
+            )
     patched_nodes = _patch_llm_transform_prompt(
         state_record,
         affected_node_id=affected_node_id,
         user_term=user_term,
         accepted_value=accepted_value,
+        event_id=event_id,
+        llm_draft=llm_draft,
     )
     patched_node = next(n for n in patched_nodes if n["id"] == affected_node_id)
     resolved_template: str = patched_node["options"]["prompt_template"]
@@ -6379,6 +6605,7 @@ class SessionServiceImpl:
                     raise ValueError(
                         f"create_pending_interpretation_event: composition state {state_id_str!r} not found in session {sid!r}"
                     )
+                state_record = self._row_to_state_record(state_row)
                 nodes = self._unwrap_envelope(state_row.nodes)
                 sources = self._unwrap_envelope(state_row.sources)
                 if kind is InterpretationKind.INVENTED_SOURCE:
@@ -6429,7 +6656,6 @@ class SessionServiceImpl:
                             f"{state_id_str!r} has no nodes; affected_node_id "
                             f"{affected_node_id!r} is not present"
                         )
-                    state_record = self._row_to_state_record(state_row)
                     node = _find_interpretation_review_node(
                         state_record,
                         affected_node_id=affected_node_id,
@@ -6471,17 +6697,41 @@ class SessionServiceImpl:
                             f"{state_id_str!r} has no nodes; affected_node_id "
                             f"{affected_node_id!r} is not present"
                         )
-                    state_record = self._row_to_state_record(state_row)
                     node = _find_llm_transform_node(
                         state_record,
                         affected_node_id=affected_node_id,
                         context="create_pending_interpretation_event",
                     )
-                    if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-                        options = _require_mapping(
-                            node["options"],
-                            message=f"create_pending_interpretation_event: node {affected_node_id!r} options is not a mapping",
+                    options = _require_mapping(
+                        node["options"],
+                        message=f"create_pending_interpretation_event: node {affected_node_id!r} options is not a mapping",
+                    )
+                    if kind is InterpretationKind.VAGUE_TERM:
+                        requirements_value = (
+                            options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
                         )
+                        has_structured_match = isinstance(requirements_value, (list, tuple)) and any(
+                            isinstance(requirement, Mapping)
+                            and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
+                            and isinstance(requirement.get("user_term"), str)
+                            and requirement["user_term"].strip() == user_term.strip()
+                            and requirement.get("status") == "pending"
+                            for requirement in requirements_value
+                        )
+                        if has_structured_match:
+                            requirements, matching_index = _matching_pending_requirement_index(
+                                requirements_value,
+                                kind=kind,
+                                user_term=user_term,
+                                context="create_pending_interpretation_event",
+                            )
+                            current_draft = requirements[matching_index].get("draft")
+                            if not isinstance(current_draft, str) or current_draft != llm_draft:
+                                raise ValueError(
+                                    "create_pending_interpretation_event: vague_term event draft does not match "
+                                    "the current review requirement draft"
+                                )
+                    elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
                         if "prompt_template" not in options or not isinstance(options["prompt_template"], str):
                             raise ValueError(
                                 f"create_pending_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
@@ -6504,10 +6754,72 @@ class SessionServiceImpl:
                                 f"must contain exactly one pending {kind.value!r} requirement for {user_term!r}"
                             ) from exc
 
+                current_review_identity = _reviewed_content_identity(
+                    state_record,
+                    kind=kind,
+                    affected_node_id=affected_node_id,
+                    user_term=user_term,
+                    context="create_pending_interpretation_event",
+                )
                 session_row = conn.execute(
                     select(sessions_table.c.interpretation_review_disabled).where(sessions_table.c.id == sid)
                 ).one_or_none()
-                if session_row is not None and bool(session_row.interpretation_review_disabled):
+                review_disabled = session_row is not None and bool(session_row.interpretation_review_disabled)
+
+                # Content-identity dedup and supersession share this transaction
+                # and session lock with the eventual INSERT. The immutable
+                # composition_state_id on each pending row lets us reconstruct
+                # exactly what that card reviewed without adding a mutable hash
+                # column. Unrelated state versions compare equal; a changed
+                # reviewed projection terminally abandons the old card.
+                pending_site_rows = conn.execute(
+                    select(interpretation_events_table)
+                    .where(interpretation_events_table.c.session_id == sid)
+                    .where(interpretation_events_table.c.affected_node_id == affected_node_id)
+                    .where(interpretation_events_table.c.kind == kind_value)
+                    .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
+                    .where(interpretation_events_table.c.interpretation_source == InterpretationSource.USER_APPROVED.value)
+                    .order_by(interpretation_events_table.c.created_at, interpretation_events_table.c.id)
+                ).all()
+                matching_pending_row = None
+                rows_to_abandon: list[str] = []
+                for pending_row in pending_site_rows:
+                    pending_user_term = pending_row.user_term
+                    if not isinstance(pending_user_term, str) or pending_user_term.strip() != user_term.strip():
+                        continue
+                    surfacing_state_row = conn.execute(
+                        select(composition_states_table)
+                        .where(composition_states_table.c.id == pending_row.composition_state_id)
+                        .where(composition_states_table.c.session_id == sid)
+                    ).one_or_none()
+                    if surfacing_state_row is None:
+                        raise AuditIntegrityError("create_pending_interpretation_event: pending review has no same-session surfacing state")
+                    pending_review_identity = _reviewed_content_identity(
+                        self._row_to_state_record(surfacing_state_row),
+                        kind=kind,
+                        affected_node_id=affected_node_id,
+                        user_term=pending_user_term,
+                        context="create_pending_interpretation_event",
+                    )
+                    if not review_disabled and matching_pending_row is None and pending_review_identity == current_review_identity:
+                        matching_pending_row = pending_row
+                    else:
+                        rows_to_abandon.append(pending_row.id)
+                if rows_to_abandon:
+                    conn.execute(
+                        update(interpretation_events_table)
+                        .where(interpretation_events_table.c.id.in_(rows_to_abandon))
+                        .where(interpretation_events_table.c.session_id == sid)
+                        .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
+                        .values(
+                            choice=InterpretationChoice.ABANDONED.value,
+                            resolved_at=now,
+                        )
+                    )
+                if matching_pending_row is not None:
+                    return _interpretation_event_record_from_row(matching_pending_row)
+
+                if review_disabled:
                     marker_row = conn.execute(
                         select(interpretation_events_table)
                         .where(interpretation_events_table.c.session_id == sid)
@@ -6574,8 +6886,11 @@ class SessionServiceImpl:
                     if kind is InterpretationKind.VAGUE_TERM:
                         final_sources, final_nodes, resolved_prompt_template_hash = _resolve_vague_term(
                             live_state_record,
+                            surfacing_state_record=live_state_record,
+                            event_id=event_id,
                             affected_node_id=affected_node_id,
                             user_term=user_term,
+                            llm_draft=llm_draft,
                             accepted_value=llm_draft,
                         )
                     elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
@@ -6696,31 +7011,6 @@ class SessionServiceImpl:
                     )
                     row = conn.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == event_id)).one()
                     return _interpretation_event_record_from_row(row)
-
-                # Idempotent re-surface, every kind: an identical pending event
-                # (same node/kind/user_term/draft) is returned, never twinned.
-                # The resolve path demands exactly ONE pending requirement per
-                # (node, kind, user_term), so twin pending events are
-                # structurally unresolvable — the first resolve stamps the
-                # requirement and the twin 422s placeholder_unavailable forever
-                # (elspeth-1fcaec9b63, reachable by importing the same YAML
-                # twice). Surfacer read-side dedup cannot enforce this: it
-                # crosses transactions, while this SELECT runs under the
-                # session advisory lock.
-                existing_pending_row = conn.execute(
-                    select(interpretation_events_table)
-                    .where(interpretation_events_table.c.session_id == sid)
-                    .where(interpretation_events_table.c.affected_node_id == affected_node_id)
-                    .where(interpretation_events_table.c.kind == kind_value)
-                    .where(interpretation_events_table.c.user_term == user_term)
-                    .where(interpretation_events_table.c.llm_draft == llm_draft)
-                    .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
-                    .where(interpretation_events_table.c.interpretation_source == InterpretationSource.USER_APPROVED.value)
-                    .order_by(interpretation_events_table.c.created_at, interpretation_events_table.c.id)
-                    .limit(1)
-                ).one_or_none()
-                if existing_pending_row is not None:
-                    return _interpretation_event_record_from_row(existing_pending_row)
 
                 conn.execute(
                     insert(interpretation_events_table).values(
@@ -6902,14 +7192,51 @@ class SessionServiceImpl:
                 if live_state_row is None:
                     raise AuditIntegrityError(f"resolve_interpretation_event: session {sid!r} has no composition state to patch")
                 state_record = self._row_to_state_record(live_state_row)
+                surfacing_state_record: CompositionStateRecord | None = None
+                if event_row.composition_state_id is not None:
+                    surfacing_state_row = conn.execute(
+                        select(composition_states_table)
+                        .where(composition_states_table.c.id == event_row.composition_state_id)
+                        .where(composition_states_table.c.session_id == sid)
+                    ).one_or_none()
+                    if surfacing_state_row is not None:
+                        surfacing_state_record = self._row_to_state_record(surfacing_state_row)
+                if surfacing_state_record is None:
+                    raise AuditIntegrityError(f"resolve_interpretation_event: event {eid!r} has no same-session surfacing state")
+                surfacing_review_identity = _reviewed_content_identity(
+                    surfacing_state_record,
+                    kind=kind,
+                    affected_node_id=event_row.affected_node_id,
+                    user_term=event_row.user_term,
+                    context="resolve_interpretation_event",
+                )
+                live_review_identity = _reviewed_content_identity(
+                    state_record,
+                    kind=kind,
+                    affected_node_id=event_row.affected_node_id,
+                    user_term=event_row.user_term,
+                    context="resolve_interpretation_event",
+                )
+                if live_review_identity != surfacing_review_identity:
+                    if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+                        raise InterpretationPlaceholderConsumedError(
+                            "resolve_interpretation_event: llm_prompt_template prompt skeleton no longer matches "
+                            "the structure the review approved"
+                        )
+                    raise InterpretationPlaceholderConsumedError(
+                        "resolve_interpretation_event: reviewed content no longer matches the event's surfacing state"
+                    )
                 final_sources: Mapping[str, Mapping[str, Any]] | None
                 final_nodes: list[Mapping[str, Any]]
                 resolved_prompt_template_hash: str | None
                 if kind is InterpretationKind.VAGUE_TERM:
                     final_sources, final_nodes, resolved_prompt_template_hash = _resolve_vague_term(
                         state_record,
+                        surfacing_state_record=surfacing_state_record,
+                        event_id=eid,
                         affected_node_id=event_row.affected_node_id,
                         user_term=event_row.user_term,
+                        llm_draft=event_row.llm_draft,
                         accepted_value=accepted_value,
                     )
                 elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
@@ -6917,18 +7244,10 @@ class SessionServiceImpl:
                     # node). The acceptance gate compares this to the live
                     # skeleton so a sibling vague_term baked between surfacing and
                     # resolve does not invalidate this review (elspeth-e51216d305).
-                    surfacing_structure_hash: str | None = None
-                    if event_row.composition_state_id is not None:
-                        surfacing_state_row = conn.execute(
-                            select(composition_states_table)
-                            .where(composition_states_table.c.id == event_row.composition_state_id)
-                            .where(composition_states_table.c.session_id == sid)
-                        ).one_or_none()
-                        if surfacing_state_row is not None:
-                            surfacing_structure_hash = _surfacing_prompt_structure_hash(
-                                self._row_to_state_record(surfacing_state_row),
-                                affected_node_id=event_row.affected_node_id,
-                            )
+                    surfacing_structure_hash = _surfacing_prompt_structure_hash(
+                        surfacing_state_record,
+                        affected_node_id=event_row.affected_node_id,
+                    )
                     final_sources, final_nodes, resolved_prompt_template_hash = _resolve_prompt_template_review(
                         state_record,
                         event_id=eid,

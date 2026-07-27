@@ -74,7 +74,11 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
+    SOURCE_AUTHORING_KEY,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     sessions_table,
@@ -1492,14 +1496,12 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
 ) -> None:
-    """HIGH-2: draft-aware dedup re-surfaces PT after a multi-turn prompt edit.
+    """The canonical writer re-surfaces PT after a multi-turn prompt edit.
 
     Turn 1 surfaces event E_A for skeleton A. Turn 2 edits the node prompt to B
-    (re-stages the PT requirement; the stale pending event E_A survives). With
-    node-id-only dedup the second auto-surface would SKIP the node and never
-    create E_B (the review is bricked). Draft-aware dedup skips only when a
-    pending PT event's ``llm_draft`` equals the CURRENT prompt, so a fresh,
-    resolvable E_B (draft == B) is surfaced.
+    and re-stages the PT requirement. The second auto-surface delegates to the
+    transactional writer, which abandons E_A and creates the fresh, resolvable
+    E_B instead of letting a stale card linger.
     """
 
     composer = _build_composer(tmp_path, sessions_service)
@@ -1577,8 +1579,199 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
 
     events_b = await sessions_service.list_interpretation_events(session_id, status="pending")
     pt_b = [e for e in events_b if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE]
-    drafts = {e.llm_draft for e in pt_b}
-    assert prompt_b in drafts, "draft-aware dedup must surface a fresh event for the edited prompt B"
+    assert len(pt_b) == 1
+    assert pt_b[0].llm_draft == prompt_b
+    all_events = await sessions_service.list_interpretation_events(session_id, status="all")
+    by_id = {event.id: event for event in all_events}
+    assert by_id[pt_a[0].id].choice is InterpretationChoice.ABANDONED
+
+
+@pytest.mark.asyncio
+async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writer(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """The writer, not draft-only surfacer dedup, owns reviewed-content identity."""
+    composer = _build_composer(tmp_path, sessions_service)
+    prompt = "Classify {{ row.html }} and return JSON."
+
+    def _state_with_parts(parts: list[dict[str, str]]) -> CompositionState:
+        state = _state_with_prompt_template_review_node()
+        node = state.nodes[0]
+        options = dict(node.options)
+        options["prompt_template"] = prompt
+        options[PROMPT_TEMPLATE_PARTS_KEY] = parts
+        options[INTERPRETATION_REQUIREMENTS_KEY] = [
+            {
+                "id": "prompt_template_review",
+                "kind": InterpretationKind.LLM_PROMPT_TEMPLATE.value,
+                "user_term": "llm_prompt_template:rate_node",
+                "status": "pending",
+                "draft": prompt,
+                "event_id": None,
+                "accepted_value": None,
+                "accepted_artifact_hash": None,
+                "resolved_prompt_template_hash": None,
+            }
+        ]
+        return CompositionState(
+            sources=state.sources,
+            nodes=(
+                NodeSpec(
+                    id=node.id,
+                    node_type=node.node_type,
+                    plugin=node.plugin,
+                    input=node.input,
+                    on_success=node.on_success,
+                    on_error=node.on_error,
+                    options=options,
+                    condition=node.condition,
+                    routes=node.routes,
+                    fork_to=node.fork_to,
+                    branches=node.branches,
+                    policy=node.policy,
+                    merge=node.merge,
+                ),
+            ),
+            edges=state.edges,
+            outputs=state.outputs,
+            metadata=state.metadata,
+            version=state.version,
+        )
+
+    state_a = _state_with_parts([{"kind": "text", "text": prompt}])
+    session_id, state_a_id = await _seed_session_and_state(sessions_service, state=state_a)
+    await composer._auto_surface_prompt_template_reviews(
+        state_a,
+        session_id=str(session_id),
+        current_state_id=str(state_a_id),
+    )
+    [event_a] = await sessions_service.list_interpretation_events(session_id, status="pending")
+
+    split_at = len(prompt) // 2
+    state_b = _state_with_parts(
+        [
+            {"kind": "text", "text": prompt[:split_at]},
+            {"kind": "text", "text": prompt[split_at:]},
+        ]
+    )
+    state_b_dict = state_b.to_dict()
+    state_b_record = await sessions_service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            nodes=state_b_dict["nodes"],
+            sources=state_b_dict["sources"],
+            metadata_=state_b_dict["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    await composer._auto_surface_prompt_template_reviews(
+        state_b,
+        session_id=str(session_id),
+        current_state_id=str(state_b_record.id),
+    )
+
+    all_events = await sessions_service.list_interpretation_events(session_id, status="all")
+    by_id = {event.id: event for event in all_events}
+    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    pending = [event for event in all_events if event.choice is InterpretationChoice.PENDING]
+    assert len(pending) == 1
+    assert pending[0].id != event_a.id
+    assert pending[0].composition_state_id == state_b_record.id
+
+
+@pytest.mark.asyncio
+async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_to_writer(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """A changed pipeline artifact with the same prose supersedes its old card."""
+    composer = _build_composer(tmp_path, sessions_service)
+    draft = "Approve the configured web scraping identity."
+
+    def _state(scraping_reason: str) -> CompositionState:
+        return CompositionState(
+            source=None,
+            nodes=(
+                NodeSpec(
+                    id="fetch_pages",
+                    node_type="transform",
+                    plugin="web_scrape",
+                    input="rows",
+                    on_success="out",
+                    on_error="discard",
+                    options={
+                        "url_field": "url",
+                        "content_field": "content",
+                        "fingerprint_field": "content_fingerprint",
+                        "http": {
+                            "abuse_contact": "review@example.com",
+                            "scraping_reason": scraping_reason,
+                            "allowed_hosts": "public_only",
+                        },
+                        INTERPRETATION_REQUIREMENTS_KEY: [
+                            {
+                                "id": "web_scrape_http_identity:fetch_pages",
+                                "kind": InterpretationKind.PIPELINE_DECISION.value,
+                                "user_term": "web_scrape_http_identity",
+                                "status": "pending",
+                                "draft": draft,
+                                "event_id": None,
+                                "accepted_value": None,
+                                "accepted_artifact_hash": None,
+                                "resolved_prompt_template_hash": None,
+                            }
+                        ],
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    state_a = _state("original reason")
+    session_id, state_a_id = await _seed_session_and_state(sessions_service, state=state_a)
+    await composer.surface_pending_interpretation_reviews(
+        state_a,
+        session_id=str(session_id),
+        current_state_id=str(state_a_id),
+    )
+    [event_a] = await sessions_service.list_interpretation_events(session_id, status="pending")
+
+    state_b = _state("current reason")
+    state_b_dict = state_b.to_dict()
+    state_b_record = await sessions_service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            nodes=state_b_dict["nodes"],
+            sources=state_b_dict["sources"],
+            metadata_=state_b_dict["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    await composer.surface_pending_interpretation_reviews(
+        state_b,
+        session_id=str(session_id),
+        current_state_id=str(state_b_record.id),
+    )
+
+    all_events = await sessions_service.list_interpretation_events(session_id, status="all")
+    by_id = {event.id: event for event in all_events}
+    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    pending = [event for event in all_events if event.choice is InterpretationChoice.PENDING]
+    assert len(pending) == 1
+    assert pending[0].id != event_a.id
+    assert pending[0].composition_state_id == state_b_record.id
 
 
 def test_has_pending_prompt_template_requirement_false_on_duplicate() -> None:

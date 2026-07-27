@@ -609,7 +609,15 @@ def _execute_upsert_node(
         expected_output_count=validated.expected_output_count,
     )
 
-    new_state = state.with_node(node)
+    proposed_state = state.with_node(node)
+    try:
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError):
+        return _failure_result(
+            state,
+            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            error_code="review_reconciliation_failed",
+        )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _failure_result(state, review_contract_error)
@@ -1273,7 +1281,15 @@ def _execute_patch_node_options(
     queue_contract_error = queue_node_contract_error(new_node)
     if queue_contract_error is not None:
         return _failure_result(state, queue_contract_error)
-    new_state = state.with_node(new_node)
+    proposed_state = state.with_node(new_node)
+    try:
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError):
+        return _failure_result(
+            state,
+            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            error_code="review_reconciliation_failed",
+        )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _failure_result(state, review_contract_error)

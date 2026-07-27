@@ -1956,6 +1956,26 @@ def _assert_affected_component(
             ),
             actual_type=("pending vague_term requirement with no resolvable prompt wiring (the operator's resolve would dead-end)"),
         )
+    if kind is InterpretationKind.VAGUE_TERM and llm_draft is not None:
+        requirements = options.get(INTERPRETATION_REQUIREMENTS_KEY)
+        if isinstance(requirements, (list, tuple)):
+            matching = [
+                requirement
+                for requirement in requirements
+                if isinstance(requirement, Mapping)
+                and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
+                and isinstance(requirement.get("user_term"), str)
+                and requirement["user_term"].strip() == user_term.strip()
+                and requirement.get("status") == "pending"
+            ]
+            if matching:
+                current_draft = matching[0].get("draft")
+                if not isinstance(current_draft, str) or current_draft != llm_draft:
+                    raise ToolArgumentError(
+                        argument="llm_draft",
+                        expected="the exact current vague-term requirement draft",
+                        actual_type="stale vague-term draft",
+                    )
     if kind is InterpretationKind.LLM_PROMPT_TEMPLATE and llm_draft is not None and llm_draft != prompt_template:
         raise ToolArgumentError(
             argument="llm_draft",
