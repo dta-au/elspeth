@@ -262,12 +262,9 @@ class TestDispatchTool:
 
         mutated = await _call_handler(  # type: ignore[misc]
             server.request_handlers,
-            "set_source",
+            "set_metadata",
             {
-                "plugin": "csv",
-                "on_success": "source_out",
-                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
-                "on_validation_failure": "discard",
+                "patch": {"name": "CAS updated"},
             },
         )
         assert json.loads(mutated.root.content[0].text)["success"] is True
@@ -279,12 +276,9 @@ class TestDispatchTool:
 
         mutated_again = await _call_handler(  # type: ignore[misc]
             server.request_handlers,
-            "set_source",
+            "set_metadata",
             {
-                "plugin": "csv",
-                "on_success": "next_source_out",
-                "options": {"path": "/data/blobs/next.csv", "schema": {"mode": "observed"}},
-                "on_validation_failure": "discard",
+                "patch": {"description": "second mutation"},
             },
         )
         assert json.loads(mutated_again.root.content[0].text)["success"] is True
@@ -300,9 +294,8 @@ class TestDispatchTool:
                 assert "token" not in json.loads(invocation.result_canonical).get("data", {})
 
         durable = SessionManager(scratch_dir).load(session_id)
-        assert durable.metadata.name == "CAS"
-        assert durable.sources["source"].plugin == "csv"
-        assert durable.sources["source"].on_success == "next_source_out"
+        assert durable.metadata.name == "CAS updated"
+        assert durable.metadata.description == "second mutation"
         assert durable.version == 3
 
     @pytest.mark.asyncio
