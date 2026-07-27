@@ -280,6 +280,11 @@ evidence:
     locator: linear:happy-path
     claim: The linear corpus case exercises the production config, build, runtime, and audit path.
     stages: [config, build, runtime, audit]
+  - id: harness-linear-reopen-after-source
+    kind: harness
+    locator: linear:reopen-after-source
+    claim: A declared production sink-effect BEFORE_EFFECT interruption after source exhaustion closes the initial database and discards runtime objects, then a fresh public resume reuses the exact token, scheduler work, sink effect, artifact, and member identities, publishes once, terminalizes work and outcomes, removes the checkpoint, and preserves durable and export parity; this single-process pre-platform evidence is provisional until the deferred-platform rebase.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-checkpoint-deterministic-resume-reopen-resume
     kind: harness
     locator: checkpoint-deterministic-resume:reopen-resume
@@ -617,6 +622,33 @@ scenarios:
             - {record_type: token, count: 3}
             - {record_type: token_outcome, count: 3}
           source_operation_count: 1
+      - id: reopen-after-source
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: output
+          occurrence: 1
+        fixture: linear/happy-path.yaml
+        input_fixtures:
+          primary: linear/input.csv
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 3
+          required_audit_record_types:
+            - artifact
+            - operation
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_member
+            - token
+            - token_outcome
     dimensions:
       config:
         status: pass
@@ -633,12 +665,9 @@ scenarios:
       audit:
         status: pass
         evidence: [harness-linear-happy-path]
-      recovery: &recovery_partial
-        status: partial
-        evidence: [focused-crash-restart-09]
-        reason: The source-ingress crash seam now passes public-resume, fail-closed, and exactly-once plugin assertions, but the complete linear scenario recovery matrix is not yet executable evidence.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
+      recovery:
+        status: pass
+        evidence: [harness-linear-reopen-after-source]
       concurrency: &concurrency_unknown
         status: unknown
         reason: No complete contention and fencing case exists for this scenario.
@@ -1305,7 +1334,12 @@ scenarios:
       audit:
         status: pass
         evidence: [core-builder-schema-plural-sources-07, harness-multiple-independent-sources-independent-roots]
-      recovery: *recovery_partial
+      recovery: &recovery_partial
+        status: partial
+        evidence: [focused-crash-restart-09]
+        reason: The source-ingress crash seam now passes public-resume, fail-closed, and exactly-once plugin assertions, but the complete linear scenario recovery matrix is not yet executable evidence.
+        owner_issue: elspeth-ef29ef6ba4
+        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: &guided_fail

@@ -117,7 +117,7 @@ EXPECTED_SCENARIO_VALUES = (
 )
 
 EXPECTED_STATUS_MATRIX = {
-    "linear": ("pass", "pass", "pass", "pass", "pass", "partial", "unknown", "pass", "partial", "partial", "partial"),
+    "linear": ("pass", "pass", "pass", "pass", "pass", "pass", "unknown", "pass", "partial", "partial", "partial"),
     "multiple-independent-sources": (
         "pass",
         "pass",
@@ -407,8 +407,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "9da6b219ef4d0969b81f17b7a5e402067bfb661fd258dbf948ceb8f7e86ecf21"
-EXPECTED_CASE_REGISTRY_SHA256 = "7f604fbbe23d0db4d1e22e355888935d8bcf6b8c28d226bb23e3b8319b6ba8ca"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "eae8a2e2ca114c658e075a279dc43e34ba976dc29dff1ddac5fb9f30a45e4ad0"
+EXPECTED_CASE_REGISTRY_SHA256 = "d0c1aa7428d528422a432aff84fc5b45e3335b57b0539887729017baf71f9fa5"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -435,6 +435,7 @@ B2_COALESCE_NEGATIVE_CASE_IDS = (
 B2_COALESCE_CASE_IDS = B2_COALESCE_POSITIVE_CASE_IDS + B2_COALESCE_NEGATIVE_CASE_IDS
 EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
+    "linear:reopen-after-source": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
     "multi-source-queue-fan-in:queued-fan-in": "ccff919ce91062633679fcbe577194b4ce3c852a90c1f8f97622ac371b377c4e",
     "conditional-routing:two-way-gate": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
@@ -480,6 +481,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-linear-happy-path",
         "linear:happy-path",
         ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-linear-reopen-after-source",
+        "linear:reopen-after-source",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
     (
         "harness-checkpoint-deterministic-resume-reopen-resume",
@@ -4727,9 +4733,17 @@ def _remove_harness_evidence(raw: dict[str, object], locator: str) -> None:
             cell["evidence"] = [evidence_id for evidence_id in cast(list[str], cell.get("evidence", [])) if evidence_id not in removed_ids]
 
 
-def _register_linear_case(raw: dict[str, object], case: dict[str, object]) -> None:
-    _remove_harness_evidence(raw, "linear:happy-path")
+def _clear_registered_linear_cases(raw: dict[str, object]) -> dict[str, object]:
     scenario = _raw_scenarios(raw)[0]
+    for registered_case in cast(list[dict[str, object]], scenario["cases"]):
+        _remove_harness_evidence(raw, f"linear:{registered_case['id']}")
+    scenario["cases"] = []
+    _raw_dimensions(scenario)["recovery"] = deepcopy(_raw_dimensions(_raw_scenarios(raw)[1])["recovery"])
+    return scenario
+
+
+def _register_linear_case(raw: dict[str, object], case: dict[str, object]) -> None:
+    scenario = _clear_registered_linear_cases(raw)
     scenario["cases"] = [case]
     evidence_id = _add_harness_evidence(raw, f"linear:{case['id']}")
     for dimension in ("runtime", "audit"):
@@ -4751,6 +4765,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         assert tuple(cell.status for cell in scenario.dimensions.values()) == EXPECTED_STATUS_MATRIX[scenario.id]
     assert tuple((scenario.id, case.id) for scenario, case in iter_harness_cases(manifest)) == (
         ("linear", "happy-path"),
+        ("linear", "reopen-after-source"),
         ("multiple-independent-sources", "independent-roots"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
@@ -4784,11 +4799,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 100
+    assert len(manifest.evidence) == 101
     assert len(assessment_evidence) == 61
-    assert len(harness_evidence) == 39
-    assert len({reference.id for reference in manifest.evidence}) == 100
-    assert len({reference.locator for reference in manifest.evidence}) == 100
+    assert len(harness_evidence) == 40
+    assert len({reference.id for reference in manifest.evidence}) == 101
+    assert len({reference.locator for reference in manifest.evidence}) == 101
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4802,6 +4817,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
     cases = tuple((scenario.id, case.model_dump(mode="json")) for scenario, case in iter_harness_cases(manifest))
     assert tuple((scenario_id, case["id"]) for scenario_id, case in cases) == (
         ("linear", "happy-path"),
+        ("linear", "reopen-after-source"),
         ("multiple-independent-sources", "independent-roots"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
@@ -4844,6 +4860,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
     }
     assert referenced_cells == {
         "harness-linear-happy-path": (("linear", "runtime"), ("linear", "audit")),
+        "harness-linear-reopen-after-source": (("linear", "recovery"),),
         "harness-multiple-independent-sources-independent-roots": (
             ("multiple-independent-sources", "config"),
             ("multiple-independent-sources", "build"),
@@ -5192,6 +5209,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
     ("scenario_id", "case_id"),
     [
         ("linear", "happy-path"),
+        ("linear", "reopen-after-source"),
         ("multiple-independent-sources", "independent-roots"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
@@ -5663,10 +5681,10 @@ def test_manifest_rejects_unknown_harness_locator(tmp_path: Path) -> None:
 
 def test_manifest_rejects_case_without_matching_harness_locator(tmp_path: Path) -> None:
     raw = valid_manifest_dict()
-    _remove_harness_evidence(raw, "linear:happy-path")
+    scenario = _clear_registered_linear_cases(raw)
     for dimension in ("runtime", "audit"):
-        _raw_dimensions(_raw_scenarios(raw)[0])[dimension]["evidence"] = ["runtime-disposition-drains"]
-    _raw_scenarios(raw)[0]["cases"] = [_case_dict()]
+        _raw_dimensions(scenario)[dimension]["evidence"] = ["runtime-disposition-drains"]
+    scenario["cases"] = [_case_dict()]
     with pytest.raises(ValueError, match=r"harness case.*linear:happy-path.*matching evidence locator"):
         load_manifest(write_manifest(tmp_path, raw))
 

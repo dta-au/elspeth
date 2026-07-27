@@ -2174,36 +2174,7 @@ def test_linear_sink_boundary_recovery_reopens_and_resumes_without_reminting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario, run_case = _declared_case("linear", "happy-path")
-    case_values = run_case.model_dump(mode="json")
-    case_values.update(
-        id="reopen-after-source",
-        workflow="recovery",
-        recovery_kind="sink_boundary",
-        recovery_fault={
-            "kind": "sink_effect",
-            "seam": "before_effect",
-            "sink_name": "output",
-            "occurrence": 1,
-        },
-        expected={
-            "kind": "summary",
-            "status": "completed",
-            "output_rows": 3,
-            "required_audit_record_types": (
-                "artifact",
-                "operation",
-                "row",
-                "run",
-                "scheduler_event",
-                "sink_effect",
-                "sink_effect_member",
-                "token",
-                "token_outcome",
-            ),
-        },
-    )
-    case = HarnessCaseSpec.model_validate(case_values)
+    scenario, case = _declared_case("linear", "reopen-after-source")
     production_run = inspect.unwrap(Orchestrator.run)
     production_resume = inspect.unwrap(Orchestrator.resume)
     monkeypatch.setattr(Orchestrator, "run", production_run)
@@ -2538,6 +2509,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         for declared_scenario, declared_case in iter_harness_cases(MANIFEST)
         if declared_case.workflow == "recovery"
     ) == (
+        ("linear", "reopen-after-source"),
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
