@@ -121,6 +121,85 @@ def test_tutorial_recipe_authors_only_opaque_llm_profile() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    approved_state_id = uuid4()
+    newer_state_id = uuid4()
+    run_id = uuid4()
+    session_id = uuid4()
+    current_state_reads = 0
+    received_state_ids: list[Any] = []
+    executed_state_ids: list[Any] = []
+
+    class FakeSessionService:
+        async def get_current_state(self, requested_session_id: Any) -> Any:
+            nonlocal current_state_reads
+            assert requested_session_id == session_id
+            current_state_reads += 1
+            state_id = approved_state_id if current_state_reads == 1 else newer_state_id
+            return SimpleNamespace(id=state_id)
+
+        async def get_run(self, requested_run_id: Any) -> Any:
+            assert requested_run_id == run_id
+            return SimpleNamespace(status="cancelled")
+
+    session_service = FakeSessionService()
+
+    class FakeExecutionService:
+        async def execute(
+            self,
+            requested_session_id: Any,
+            state_id: Any = None,
+            *,
+            user_id: str,
+            auth_provider_type: str,
+        ) -> Any:
+            del user_id, auth_provider_type
+            assert requested_session_id == session_id
+            received_state_ids.append(state_id)
+            if state_id is None:
+                state_id = (await session_service.get_current_state(session_id)).id
+            executed_state_ids.append(state_id)
+            return run_id
+
+    async def fake_verify_session_ownership(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(tutorial_service_module, "verify_session_ownership", fake_verify_session_ownership)
+    monkeypatch.setattr(tutorial_service_module, "state_from_record", lambda _record: SimpleNamespace())
+    monkeypatch.setattr(tutorial_service_module, "_tutorial_launch_blocker", lambda **_kwargs: None)
+
+    settings = _make_tutorial_settings(tmp_path)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                settings=settings,
+                session_service=session_service,
+                execution_service=FakeExecutionService(),
+                plugin_snapshot_factory=lambda _user: SimpleNamespace(),
+                web_plugin_policy=SimpleNamespace(),
+                operator_profile_registry=SimpleNamespace(),
+                catalog_service=SimpleNamespace(),
+            )
+        )
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await tutorial_service_module.run_tutorial_pipeline(
+            request=request,
+            user=SimpleNamespace(user_id="tutorial-user"),
+            session_id=str(session_id),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert received_state_ids == [approved_state_id]
+    assert executed_state_ids == [approved_state_id]
+    assert current_state_reads == 1
+
+
+@pytest.mark.asyncio
 async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: Path) -> None:
     run_id = uuid4()
     session_id = uuid4()
@@ -128,8 +207,8 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
     sentinel_error = "INTERNAL_ROW_VALUE_SHOULD_NOT_LEAVE_TUTORIAL_RESPONSE"
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, *, user_id: str, auth_provider_type: str) -> Any:
-            del session_id, user_id, auth_provider_type
+        async def execute(self, session_id: Any, state_id: Any = None, *, user_id: str, auth_provider_type: str) -> Any:
+            del session_id, state_id, user_id, auth_provider_type
             return run_id
 
     class FakeSessionService:
@@ -163,6 +242,7 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
             request=request,
             user=user,
             session_id=session_id,
+            state_id=state_id,
             settings=settings,
             session_service=FakeSessionService(),
         )
@@ -195,8 +275,8 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
     session_id = uuid4()
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, *, user_id: str, auth_provider_type: str) -> Any:
-            del session_id, user_id, auth_provider_type
+        async def execute(self, session_id: Any, state_id: Any = None, *, user_id: str, auth_provider_type: str) -> Any:
+            del session_id, state_id, user_id, auth_provider_type
             raise UnresolvedInterpretationPlaceholderError(
                 sites=(
                     InterpretationReviewSite(
@@ -217,6 +297,7 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
             request=request,
             user=user,
             session_id=session_id,
+            state_id=uuid4(),
             settings=settings,
             session_service=SimpleNamespace(),
         )
@@ -240,8 +321,8 @@ async def test_cancelled_live_tutorial_run_returns_409_with_machine_code(tmp_pat
     state_id = uuid4()
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, *, user_id: str, auth_provider_type: str) -> Any:
-            del session_id, user_id, auth_provider_type
+        async def execute(self, session_id: Any, state_id: Any = None, *, user_id: str, auth_provider_type: str) -> Any:
+            del session_id, state_id, user_id, auth_provider_type
             return run_id
 
     class FakeSessionService:
@@ -275,6 +356,7 @@ async def test_cancelled_live_tutorial_run_returns_409_with_machine_code(tmp_pat
             request=request,
             user=user,
             session_id=session_id,
+            state_id=state_id,
             settings=settings,
             session_service=FakeSessionService(),
         )
@@ -293,8 +375,8 @@ async def test_live_tutorial_wait_uses_transport_ceiling_minus_headroom(
     captured_timeout: list[float | None] = []
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, *, user_id: str, auth_provider_type: str) -> Any:
-            del session_id, user_id, auth_provider_type
+        async def execute(self, session_id: Any, state_id: Any = None, *, user_id: str, auth_provider_type: str) -> Any:
+            del session_id, state_id, user_id, auth_provider_type
             return "run-1"
 
     async def fake_wait_for_terminal_run(
@@ -323,6 +405,7 @@ async def test_live_tutorial_wait_uses_transport_ceiling_minus_headroom(
             request=request,
             user=user,
             session_id="session-1",
+            state_id=uuid4(),
             settings=settings,
             session_service=SimpleNamespace(),
         )

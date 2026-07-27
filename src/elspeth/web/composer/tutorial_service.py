@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 from fastapi import HTTPException, Request
 from sqlalchemy import func, select, update
@@ -184,7 +185,7 @@ async def _require_tutorial_launch_readiness(
     session_id: Any,
     settings: WebSettings,
     session_service: SessionServiceProtocol,
-) -> None:
+) -> UUID:
     """Recheck the principal-scoped tutorial candidate immediately pre-run."""
     record = await session_service.get_current_state(session_id)
     if record is None:
@@ -208,6 +209,7 @@ async def _require_tutorial_launch_readiness(
             status_code=409,
             detail={"error_type": "tutorial_not_ready", "code": code, "detail": detail},
         )
+    return record.id
 
 
 async def run_tutorial_pipeline(
@@ -231,15 +233,13 @@ async def run_tutorial_pipeline(
     the same backend path a real composed pipeline takes (tutorial backend
     parity), so what the learner sees is what the system actually does.
     """
-    from uuid import UUID
-
     session_uuid = UUID(session_id)
     await verify_session_ownership(session_uuid, user, request)
 
     settings: WebSettings = request.app.state.settings
     session_service: SessionServiceProtocol = request.app.state.session_service
 
-    await _require_tutorial_launch_readiness(
+    approved_state_id = await _require_tutorial_launch_readiness(
         request=request,
         user=user,
         session_id=session_uuid,
@@ -251,6 +251,7 @@ async def run_tutorial_pipeline(
         request=request,
         user=user,
         session_id=session_uuid,
+        state_id=approved_state_id,
         settings=settings,
         session_service=session_service,
     )
@@ -262,6 +263,7 @@ async def _run_live_tutorial(
     request: Request,
     user: UserIdentity,
     session_id: Any,
+    state_id: UUID,
     settings: WebSettings,
     session_service: SessionServiceProtocol,
 ) -> _LiveTutorialRun:
@@ -269,6 +271,7 @@ async def _run_live_tutorial(
     try:
         run_id = await execution_service.execute(
             session_id,
+            state_id=state_id,
             user_id=user.user_id,
             auth_provider_type=settings.auth_provider,
         )
