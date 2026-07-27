@@ -130,6 +130,22 @@ variable "bedrock_foundation_model_arns" {
   type = set(string)
 }
 
+variable "scenario_tf_dir" {
+  type = string
+}
+
+variable "scenario_tf_vars" {
+  type = string
+}
+
+variable "scenario_tf_binding_file" {
+  type = string
+}
+
+variable "transaction_search_baseline_sha256" {
+  type = string
+}
+
 variable "alarm_actions" {
   type    = list(string)
   default = []
@@ -153,10 +169,21 @@ variable "landscape_database_name" {
 variable "aurora_engine_major_version" {
   type    = string
   default = "16"
+
+  validation {
+    condition     = var.aurora_engine_major_version == "16"
+    error_message = "this package is currently validated only for Aurora PostgreSQL major version 16."
+  }
 }
 
 variable "aurora_engine_version" {
   type        = string
+  default     = "16.13"
   nullable    = false
-  description = "Exact Aurora PostgreSQL engine version in aurora_engine_major_version."
+  description = "Pinned Aurora PostgreSQL engine version validated for this package."
+
+  validation {
+    condition     = var.aurora_engine_version == "16.13"
+    error_message = "this package is currently validated only for Aurora PostgreSQL 16.13."
+  }
 }

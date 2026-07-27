@@ -10,12 +10,13 @@ locals {
   name_prefix    = local.namespace
 
   tags = {
-    Owner           = var.owner
-    Purpose         = var.purpose
-    RunId           = var.run_id
-    CleanupDeadline = var.cleanup_deadline
-    Scenario        = local.scenario_id_upper
-    ManagedBy       = "terraform"
+    ACCEPTANCE_RUN_ID = var.run_id
+    Owner             = var.owner
+    Purpose           = var.purpose
+    RunId             = var.run_id
+    CleanupDeadline   = var.cleanup_deadline
+    Scenario          = local.scenario_id_upper
+    ManagedBy         = "terraform"
   }
 
   cpu_architecture = var.target_platform == "linux/amd64" ? "X86_64" : "ARM64"

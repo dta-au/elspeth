@@ -8,6 +8,8 @@ from pathlib import Path
 
 import yaml
 
+from elspeth.web._aws_ecs_acceptance import scenario_inventory
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE = REPO_ROOT / "deploy" / "aws-ecs" / "terraform"
 
@@ -50,16 +52,42 @@ EXPECTED_FILES = {
 }
 
 
+def _source_files() -> list[Path]:
+    return [path for path in PACKAGE.rglob("*") if path.is_file() and ".terraform" not in path.relative_to(PACKAGE).parts]
+
+
 def _text(relative: str) -> str:
     return (PACKAGE / relative).read_text(encoding="utf-8")
 
 
 def _all_text() -> str:
-    return "\n".join(path.read_text(encoding="utf-8") for path in PACKAGE.rglob("*") if path.is_file())
+    return "\n".join(path.read_text(encoding="utf-8") for path in _source_files())
+
+
+def _hcl_map_keys(text: str, assignment: str) -> frozenset[str]:
+    """Return the direct keys of one conventionally formatted HCL map."""
+
+    assignment_pattern = re.compile(rf"^(?P<indent>\s*){re.escape(assignment)}\s*=\s*\{{\s*$")
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = assignment_pattern.match(line)
+        if match is None:
+            continue
+        base_indent = len(match.group("indent"))
+        key_pattern = re.compile(rf"^\s{{{base_indent + 2}}}([A-Za-z0-9_]+)\s*=")
+        keys: set[str] = set()
+        for candidate in lines[index + 1 :]:
+            if candidate == f"{' ' * base_indent}}}":
+                return frozenset(keys)
+            key_match = key_pattern.match(candidate)
+            if key_match is not None:
+                keys.add(key_match.group(1))
+        raise AssertionError(f"unterminated HCL map: {assignment}")
+    raise AssertionError(f"HCL map not found: {assignment}")
 
 
 def test_package_contains_only_the_supported_source_and_operator_inputs() -> None:
-    actual = {path.relative_to(PACKAGE).as_posix() for path in PACKAGE.rglob("*") if path.is_file()}
+    actual = {path.relative_to(PACKAGE).as_posix() for path in _source_files()}
     assert actual == EXPECTED_FILES
 
     ignored = _text(".gitignore")
@@ -142,10 +170,19 @@ def test_ownership_tags_are_mandatory_and_propagated_by_both_scenarios() -> None
             assert re.search(rf"\b{name}\s+=\s+var\.{name}\b", main)
 
         assert "default_tags" in provider
-        assert "Owner           = var.owner" in provider
-        assert "Purpose         = var.purpose" in provider
-        assert "RunId           = var.run_id" in provider
-        assert "CleanupDeadline = var.cleanup_deadline" in provider
+        for tag, variable in (
+            ("Owner", "owner"),
+            ("Purpose", "purpose"),
+            ("RunId", "run_id"),
+            ("CleanupDeadline", "cleanup_deadline"),
+            ("ACCEPTANCE_RUN_ID", "run_id"),
+        ):
+            assert re.search(rf"\b{tag}\s+=\s+var\.{variable}\b", provider)
+
+    bootstrap_provider = _text("bootstrap/versions.tf")
+    module_locals = _text("modules/scenario/locals.tf")
+    assert re.search(r"\bACCEPTANCE_RUN_ID\s+=\s+var\.run_id\b", bootstrap_provider)
+    assert re.search(r"\bACCEPTANCE_RUN_ID\s+=\s+var\.run_id\b", module_locals)
 
 
 def test_database_topology_is_aurora_with_separate_databases_and_roles() -> None:
@@ -155,7 +192,6 @@ def test_database_topology_is_aurora_with_separate_databases_and_roles() -> None
 
     assert re.search(r'engine\s+=\s+"aurora-postgresql"', storage)
     assert re.search(r"engine_version\s+=\s+var\.aurora_engine_version", storage)
-    assert "var.aurora_engine_major_version" in storage
     assert "aws_rds_cluster" in storage
     assert "aws_rds_cluster_instance" in storage
     assert "aws_db_instance" not in storage
@@ -167,6 +203,21 @@ def test_database_topology_is_aurora_with_separate_databases_and_roles() -> None
     assert "ALTER ROLE IF EXISTS" not in bootstrap
     assert "aws_secretsmanager_secret_version.bootstrap" in bootstrap
     assert "landscape_passphrase" not in _all_text().lower()
+    for relative in (
+        "modules/scenario/variables.tf",
+        "scenario-a/variables.tf",
+        "scenario-b/variables.tf",
+    ):
+        text = _text(relative)
+        assert re.search(r'variable "aurora_engine_version".*?default\s*=\s*"16\.13"', text, re.DOTALL)
+        assert re.search(r'condition\s*=\s*var\.aurora_engine_version\s*==\s*"16\.13"', text, re.DOTALL)
+    for relative in (
+        "examples/scenario-a.tfvars.example",
+        "examples/scenario-b.tfvars.example",
+        "README.md",
+    ):
+        assert "16.13" in _text(relative)
+    assert "`ap-southeast-1`" in _text("README.md")
 
 
 def test_bedrock_composer_uses_the_task_role_without_static_credentials() -> None:
@@ -174,7 +225,7 @@ def test_bedrock_composer_uses_the_task_role_without_static_credentials() -> Non
     ecs = _text("modules/scenario/ecs.tf")
     iam = _text("modules/scenario/iam_observability.tf")
     all_text = _all_text()
-    terraform_text = "\n".join(path.read_text(encoding="utf-8") for path in PACKAGE.rglob("*.tf"))
+    terraform_text = "\n".join(path.read_text(encoding="utf-8") for path in _source_files() if path.suffix == ".tf")
 
     for name in ("composer_model", "composer_advisor_model"):
         assert f'variable "{name}"' in variables
@@ -197,20 +248,42 @@ def test_bedrock_composer_uses_the_task_role_without_static_credentials() -> Non
     assert '"Resource" = ["*"]' not in iam
 
 
-def test_inventory_v7_binds_models_agent_digest_and_telemetry_hashes() -> None:
+def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
     locals = _text("modules/scenario/locals.tf")
     ecs = _text("modules/scenario/ecs.tf")
     outputs = _text("modules/scenario/outputs.tf")
 
-    assert "elspeth.aws-ecs-scenario-inventory.v7" in outputs
+    resolved_output = outputs[outputs.index('output "resolved_inventory"') :]
+    assert _hcl_map_keys(resolved_output, "value") == frozenset(
+        {
+            "schema",
+            "acceptance_run_id",
+            "candidate_sha",
+            "aws_account_id",
+            "aws_region",
+            "scenario_id",
+            "phase",
+            "values",
+            "orphan_sweep",
+        }
+    )
+    assert _hcl_map_keys(outputs, "scenario_values") == scenario_inventory._SCENARIO_VALUE_FIELDS
+    assert _hcl_map_keys(outputs, "scenario_orphan_sweep") == scenario_inventory._ORPHAN_INVENTORY_FIELDS
+    assert re.search(r'schema\s+=\s+"elspeth\.aws-ecs-scenario-inventory\.v7"', resolved_output)
+    assert re.search(r"acceptance_run_id\s+=\s+var\.run_id", resolved_output)
+    assert re.search(r'tag_key\s+=\s+"ACCEPTANCE_RUN_ID"', outputs)
+    assert re.search(r"cleanup_owner\s+=\s+var\.owner", outputs)
+    assert re.search(
+        r"transaction_search_baseline_sha256\s+=\s+var\.transaction_search_baseline_sha256",
+        outputs,
+    )
     for name in (
-        "ELSPETH_WEB__COMPOSER_MODEL",
-        "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL",
-        "CLOUDWATCH_AGENT_IMAGE",
-        "CLOUDWATCH_AGENT_CONFIG_JSON_SHA256",
-        "CLOUDWATCH_AGENT_OTEL_YAML_SHA256",
+        "SCENARIO_TF_DIR",
+        "SCENARIO_TF_VARS",
+        "SCENARIO_TF_BINDING_SHA",
+        "SCENARIO_TF_BINDING_FILE",
     ):
-        assert name in outputs
+        assert name in _hcl_map_keys(outputs, "scenario_values")
     assert "@sha256:[0-9a-f]{64}$" in _text("modules/scenario/variables.tf")
     assert "local.cloudwatch_agent_image" in ecs
     assert "var.cloudwatch_agent_image" in _text("modules/scenario/iam_observability.tf")
@@ -227,7 +300,7 @@ def test_networking_has_long_request_support_and_correct_listener_target() -> No
     assert re.search(r"target_group_arn\s+=\s+aws_lb_target_group\.web\.arn", network)
 
 
-def test_scenario_a_is_the_obvious_cold_install_and_b_hostname_is_not_duplicated() -> None:
+def test_scenario_a_is_the_obvious_cold_install_and_b_hostname_matches_runtime_namespace() -> None:
     readme = _text("README.md")
     assert "Scenario A: cold install (recommended)" in readme
     assert "Scenario B: OIDC acceptance variant" in readme
@@ -236,9 +309,15 @@ def test_scenario_a_is_the_obvious_cold_install_and_b_hostname_is_not_duplicated
     module_locals = _text("modules/scenario/locals.tf")
     assert "oidc_domain_prefix        = local.namespace" in module_locals
     assert 'oidc_domain_prefix        = "${local.namespace}-${' not in module_locals
+    assert 'substr(sha256("${lower(var.run_id)}\\u0000${local.scenario_id_upper}"), 0, 20)' in module_locals
+    assert (
+        'oidc_authorization_origin = var.scenario_id == "B" ? '
+        '"https://${aws_cognito_user_pool_domain.web[0].domain}.auth.${var.aws_region}.amazoncognito.com" : ""'
+    ) in module_locals
+    assert "domain       = local.oidc_domain_prefix" in _text("modules/scenario/storage_identity.tf")
 
 
-def test_agent_image_is_retained_and_deployed_only_by_digest() -> None:
+def test_monitoring_resources_use_a_retained_digest_pinned_collector() -> None:
     bootstrap = _text("bootstrap/main.tf")
     bootstrap_outputs = _text("bootstrap/outputs.tf")
     variables = _text("modules/scenario/variables.tf")
@@ -251,6 +330,30 @@ def test_agent_image_is_retained_and_deployed_only_by_digest() -> None:
     assert "cloudwatch_agent_repository_url" in bootstrap_outputs
     assert "@sha256:" in variables
     assert re.search(r"Deploy the\s+CloudWatch agent by digest", readme)
+    ecs = _text("modules/scenario/ecs.tf")
+    observability = _text("modules/scenario/iam_observability.tf")
+    assert re.search(r"cloudwatch_agent_container\s*=\s*\{.*?image\s*=\s*local\.cloudwatch_agent_image", ecs, re.DOTALL)
+    for resource in (
+        'resource "aws_cloudwatch_log_group" "operator"',
+        'resource "aws_cloudwatch_dashboard" "operator"',
+        'resource "aws_cloudwatch_metric_alarm" "operator_direct"',
+        'resource "aws_cloudwatch_metric_alarm" "operator_export_failures"',
+        'resource "aws_xray_group" "scenario"',
+        'resource "aws_xray_sampling_rule" "scenario"',
+        'resource "aws_cloudwatch_event_rule" "deployments"',
+    ):
+        assert resource in observability
+
+
+def test_cold_install_pauses_service_until_two_stage_doctor_and_explicit_enable() -> None:
+    ecs = _text("modules/scenario/ecs.tf")
+    readme = _text("README.md")
+
+    assert re.search(r'resource "aws_ecs_service" "web"\s*\{.*?desired_count\s*=\s*0', ecs, re.DOTALL)
+    schema_init = readme.index("doctor aws-ecs --init-schema --json")
+    ordinary_doctor = readme.index("doctor aws-ecs --json", schema_init)
+    explicit_enable = readme.index("service_enable_command", ordinary_doctor)
+    assert schema_init < ordinary_doctor < explicit_enable
 
 
 def test_certificate_limit_and_code_blind_outputs_are_explicit() -> None:

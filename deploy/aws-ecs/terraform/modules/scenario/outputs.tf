@@ -84,6 +84,10 @@ locals {
     OIDC_EXPECTED_AUDIENCE                          = var.scenario_id == "B" ? aws_cognito_user_pool_client.web[0].id : ""
     OIDC_EXPECTED_AUTHORIZATION_ORIGIN              = local.oidc_authorization_origin
     OIDC_EXPECTED_AUDIENCE_CLAIM                    = "client_id"
+    SCENARIO_TF_DIR                                 = var.scenario_tf_dir
+    SCENARIO_TF_VARS                                = var.scenario_tf_vars
+    SCENARIO_TF_BINDING_SHA                         = var.scenario_tf_binding_sha
+    SCENARIO_TF_BINDING_FILE                        = var.scenario_tf_binding_file
   }
 
   task_definition_families = concat(
@@ -93,7 +97,7 @@ locals {
 
   scenario_orphan_sweep = {
     tag_key                      = "ACCEPTANCE_RUN_ID"
-    owner                        = var.owner
+    cleanup_owner                = var.owner
     ecs_task_definition_families = local.task_definition_families
     elbv2_listener_arns          = [aws_lb_listener.https.arn]
     rds_db_instance_identifiers  = [local.database_instance]
@@ -105,15 +109,16 @@ locals {
       local.database_schema_secret_name,
       local.database_bootstrap_secret_name,
     ]
-    iam_role_names              = [aws_iam_role.task.name, aws_iam_role.execution.name]
-    log_group_names             = [local.web_log_group, local.doctor_log_group, local.event_log_group, local.operator_log_group]
-    log_resource_policy_names   = [local.log_policy_name]
-    cloudwatch_dashboard_names  = [local.dashboard_name]
-    cloudwatch_alarm_names      = local.alarm_names
-    cloudwatch_retained_metrics = []
-    xray_group_names            = [local.xray_group_name]
-    xray_sampling_rule_names    = [local.xray_sampling_name]
-    xray_retained_trace_ids     = []
+    iam_role_names                     = [aws_iam_role.task.name, aws_iam_role.execution.name]
+    log_group_names                    = [local.web_log_group, local.doctor_log_group, local.event_log_group, local.operator_log_group]
+    log_resource_policy_names          = [local.log_policy_name]
+    cloudwatch_dashboard_names         = [local.dashboard_name]
+    cloudwatch_alarm_names             = local.alarm_names
+    cloudwatch_retained_metrics        = []
+    xray_group_names                   = [local.xray_group_name]
+    xray_sampling_rule_names           = [local.xray_sampling_name]
+    xray_retained_trace_ids            = []
+    transaction_search_baseline_sha256 = var.transaction_search_baseline_sha256
     event_rules = [{
       event_bus_name = "default"
       rule_name      = local.event_rule_name
@@ -138,15 +143,15 @@ locals {
 
 output "resolved_inventory" {
   value = {
-    schema         = "elspeth.aws-ecs-scenario-inventory.v7"
-    run_id         = var.run_id
-    candidate_sha  = var.candidate_sha
-    aws_account_id = var.aws_account_id
-    aws_region     = var.aws_region
-    scenario_id    = var.scenario_id
-    phase          = "resolved"
-    values         = local.scenario_values
-    orphan_sweep   = local.scenario_orphan_sweep
+    schema            = "elspeth.aws-ecs-scenario-inventory.v7"
+    acceptance_run_id = var.run_id
+    candidate_sha     = var.candidate_sha
+    aws_account_id    = var.aws_account_id
+    aws_region        = var.aws_region
+    scenario_id       = var.scenario_id
+    phase             = "resolved"
+    values            = local.scenario_values
+    orphan_sweep      = local.scenario_orphan_sweep
   }
   sensitive = true
 }

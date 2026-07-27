@@ -88,6 +88,13 @@ Copy `examples/scenario-a.tfvars.example` to an ignored
 `examples/scenario-a.tfvars`, replace every placeholder, and check that both
 Bedrock provider IDs are present and distinct.
 
+The current runtime inventory validator also requires the absolute scenario
+directory, tfvars path, canonical Terraform-binding JSON path, and the
+transaction-search baseline SHA-256. Supply those existing operator inputs in
+the four `scenario_tf_*` / `transaction_search_baseline_sha256` fields. The
+package hashes the canonical binding JSON and does not copy any of those
+operator files into this source tree.
+
 ```sh
 terraform -chdir=scenario-a init \
   -backend-config=../examples/scenario-a.s3.tfbackend
@@ -107,9 +114,14 @@ apply.
 The service is initially registered with desired count zero so an uninitialised
 database cannot enter a failing restart loop. Use the
 `doctor_task_definition_arn`, `doctor_network_configuration`, and
-`resolved_inventory` outputs to run the doctor task with
-`doctor aws-ecs --init-schema --json`. Require exit code zero, run the ordinary
-doctor once more without `--init-schema`, then use `service_enable_command`.
+`resolved_inventory` outputs in this exact order:
+
+1. Run the doctor task with `doctor aws-ecs --init-schema --json` and require
+   exit code zero.
+2. Run a fresh ordinary doctor task with `doctor aws-ecs --json` and require
+   exit code zero.
+3. Print, inspect, and explicitly run `service_enable_command`.
+
 The service lifecycle ignores later desired-count and task-definition changes
 so ordinary image deployments remain an explicit operator action.
 
@@ -121,8 +133,9 @@ values. `bedrock:InvokeModel` is limited to the ARNs supplied in tfvars.
 Aurora creates one administrative database first, then the database bootstrap
 task creates independent `elspeth_session` and `elspeth_landscape` databases.
 Schema and runtime roles are separate; the runtime role does not own schemas.
-Set `aurora_engine_version` to an exact available version in the configured
-major line. The validation rejects a version from another major line.
+This package pins Aurora PostgreSQL `16.13`. That exact version was confirmed
+available and orderable with `db.serverless` in `ap-southeast-1`. The variable
+validation rejects other engine versions until they are separately verified.
 
 ## Scenario B
 

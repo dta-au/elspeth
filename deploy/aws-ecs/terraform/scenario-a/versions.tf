@@ -25,12 +25,13 @@ provider "aws" {
 
   default_tags {
     tags = {
-      Owner           = var.owner
-      Purpose         = var.purpose
-      RunId           = var.run_id
-      CleanupDeadline = var.cleanup_deadline
-      Scenario        = var.scenario_id
-      ManagedBy       = "terraform"
+      ACCEPTANCE_RUN_ID = var.run_id
+      Owner             = var.owner
+      Purpose           = var.purpose
+      RunId             = var.run_id
+      CleanupDeadline   = var.cleanup_deadline
+      Scenario          = var.scenario_id
+      ManagedBy         = "terraform"
     }
   }
 }

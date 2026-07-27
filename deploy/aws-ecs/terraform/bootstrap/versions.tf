@@ -15,11 +15,12 @@ provider "aws" {
 
   default_tags {
     tags = {
-      Owner           = var.owner
-      Purpose         = var.purpose
-      RunId           = var.run_id
-      CleanupDeadline = var.cleanup_deadline
-      ManagedBy       = "terraform"
+      ACCEPTANCE_RUN_ID = var.run_id
+      Owner             = var.owner
+      Purpose           = var.purpose
+      RunId             = var.run_id
+      CleanupDeadline   = var.cleanup_deadline
+      ManagedBy         = "terraform"
     }
   }
 }

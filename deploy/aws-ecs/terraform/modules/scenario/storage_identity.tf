@@ -57,8 +57,8 @@ resource "aws_rds_cluster" "database" {
 
   lifecycle {
     precondition {
-      condition     = startswith(var.aurora_engine_version, "${var.aurora_engine_major_version}.")
-      error_message = "aurora_engine_version must match aurora_engine_major_version."
+      condition     = var.aurora_engine_major_version == "16" && var.aurora_engine_version == "16.13"
+      error_message = "this package is currently validated only for Aurora PostgreSQL 16.13."
     }
   }
 }

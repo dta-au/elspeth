@@ -24,9 +24,14 @@ bedrock_foundation_model_arns = [
   "arn:REPLACE_PARTITION:bedrock:REPLACE_REGION::foundation-model/REPLACE_ADVISOR_MODEL",
 ]
 
+scenario_tf_dir                       = "/iac/scenario-b"
+scenario_tf_vars                      = "/iac/scenario-b.tfvars"
+scenario_tf_binding_file              = "/iac/scenario-b.tf-binding.json"
+transaction_search_baseline_sha256    = "REPLACE_WITH_TRANSACTION_SEARCH_BASELINE_SHA256"
+
 database_name               = "elspeth"
 session_database_name       = "elspeth_session"
 landscape_database_name     = "elspeth_landscape"
 aurora_engine_major_version = "16"
-aurora_engine_version       = "REPLACE_WITH_EXACT_16_X_VERSION"
+aurora_engine_version       = "16.13"
 alarm_actions               = []

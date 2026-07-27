@@ -133,6 +133,51 @@ variable "bedrock_foundation_model_arns" {
   }
 }
 
+variable "scenario_tf_dir" {
+  type = string
+
+  validation {
+    condition     = startswith(var.scenario_tf_dir, "/")
+    error_message = "scenario_tf_dir must be an absolute path."
+  }
+}
+
+variable "scenario_tf_vars" {
+  type = string
+
+  validation {
+    condition     = startswith(var.scenario_tf_vars, "/")
+    error_message = "scenario_tf_vars must be an absolute path."
+  }
+}
+
+variable "scenario_tf_binding_sha" {
+  type = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{64}$", var.scenario_tf_binding_sha))
+    error_message = "scenario_tf_binding_sha must be a SHA-256 digest."
+  }
+}
+
+variable "scenario_tf_binding_file" {
+  type = string
+
+  validation {
+    condition     = startswith(var.scenario_tf_binding_file, "/")
+    error_message = "scenario_tf_binding_file must be an absolute path."
+  }
+}
+
+variable "transaction_search_baseline_sha256" {
+  type = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{64}$", var.transaction_search_baseline_sha256))
+    error_message = "transaction_search_baseline_sha256 must be a SHA-256 digest."
+  }
+}
+
 variable "alarm_actions" {
   type    = list(string)
   default = []
@@ -158,17 +203,18 @@ variable "aurora_engine_major_version" {
   default = "16"
 
   validation {
-    condition     = can(regex("^[0-9]+$", var.aurora_engine_major_version))
-    error_message = "aurora_engine_major_version must contain only the major version number."
+    condition     = var.aurora_engine_major_version == "16"
+    error_message = "this package is currently validated only for Aurora PostgreSQL major version 16."
   }
 }
 
 variable "aurora_engine_version" {
   type     = string
+  default  = "16.13"
   nullable = false
 
   validation {
-    condition     = startswith(var.aurora_engine_version, "${var.aurora_engine_major_version}.")
-    error_message = "aurora_engine_version must match aurora_engine_major_version."
+    condition     = var.aurora_engine_version == "16.13"
+    error_message = "this package is currently validated only for Aurora PostgreSQL 16.13."
   }
 }
