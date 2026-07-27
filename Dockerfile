@@ -37,7 +37,7 @@ RUN npm run build
 # =============================================================================
 # Stage 2: Python Builder
 # =============================================================================
-FROM python:3.13-slim@sha256:b04b5d7233d2ad9c379e22ea8927cd1378cd15c60d4ef876c065b25ea8fb3bf3 AS builder
+FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS builder
 
 # Install uv for fast, deterministic dependency resolution
 # Using official installer (https://docs.astral.sh/uv/getting-started/installation/)
@@ -92,10 +92,40 @@ RUN find /tmp/frontend-dist -type d -exec chmod 0755 {} + && \
     python -c 'from pathlib import Path; import shutil; import elspeth.web; target = Path(elspeth.web.__file__).parent / "frontend" / "dist"; shutil.rmtree(target, ignore_errors=True); target.parent.mkdir(parents=True, exist_ok=True); shutil.copytree("/tmp/frontend-dist", target)' && \
     rm -rf /tmp/frontend-dist
 
+# Prepare everything the final stage would otherwise need to manufacture.
+# The debug distroless variant retains BusyBox utilities for the documented
+# Docker smoke and the AWS ECS launch wrapper, while the application identity
+# and writable roots stay unchanged.
+RUN groupadd --gid 1654 elspeth && \
+    useradd --uid 1654 --gid elspeth --shell /bin/sh --home-dir /home/elspeth elspeth && \
+    mkdir -p \
+        /runtime-root/app/config \
+        /runtime-root/app/data/blobs \
+        /runtime-root/app/data/outputs \
+        /runtime-root/app/input \
+        /runtime-root/app/ops \
+        /runtime-root/app/output \
+        /runtime-root/app/secrets \
+        /runtime-root/app/state \
+        /runtime-root/etc \
+        /runtime-root/home/elspeth \
+        /runtime-root/usr/bin && \
+    ln -s /busybox/sh /runtime-root/usr/bin/sh && \
+    cp /etc/passwd /runtime-root/etc/passwd && \
+    cp /etc/group /runtime-root/etc/group && \
+    chown -R 1654:1654 /runtime-root/app /runtime-root/home/elspeth && \
+    sed -i \
+        -e 's#^home = .*#home = /usr/bin#' \
+        -e 's#^executable = .*#executable = /usr/bin/python3.13#' \
+        /opt/venv/pyvenv.cfg && \
+    ln -sfn /usr/bin/python3.13 /opt/venv/bin/python && \
+    ln -sfn python /opt/venv/bin/python3 && \
+    ln -sfn python /opt/venv/bin/python3.13
+
 # =============================================================================
 # Stage 3: Runtime
 # =============================================================================
-FROM python:3.13-slim@sha256:b04b5d7233d2ad9c379e22ea8927cd1378cd15c60d4ef876c065b25ea8fb3bf3 AS runtime
+FROM gcr.io/distroless/python3-debian13:debug-nonroot@sha256:6418f576f2011f5d265d03f53aee812b4efcba5c6646a3f4d855b9fb51cd2d72 AS runtime
 
 ARG INSTALL_EXTRAS
 
@@ -108,34 +138,18 @@ LABEL io.elspeth.install-extras="$INSTALL_EXTRAS"
 LABEL io.elspeth.runtime-uid="1654"
 LABEL io.elspeth.runtime-gid="1654"
 
-# Use one documented, clash-resistant non-root identity across all published images.
-RUN groupadd --gid 1654 elspeth && \
-    useradd --uid 1654 --gid elspeth --shell /bin/bash --create-home elspeth
-
-# Copy virtual environment from builder
+# Copy the prepared identity, home, application roots, and virtual environment.
+COPY --from=builder /runtime-root/ /
 COPY --from=builder /opt/venv /opt/venv
 
 # Set up PATH to use venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV HOME="/home/elspeth"
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # Set working directory
 WORKDIR /app
-
-# Create standard mount point directories
-# These will typically be mounted from host
-# /app/state is for the default audit.db location (sqlite:///./state/audit.db)
-RUN mkdir -p \
-        /app/config \
-        /app/data/blobs \
-        /app/data/outputs \
-        /app/input \
-        /app/ops \
-        /app/output \
-        /app/secrets \
-        /app/state && \
-    chown -R elspeth:elspeth /app
 
 # Switch to non-root user
 USER elspeth
@@ -155,7 +169,7 @@ EXPOSE 8451
 
 # Entry point is the elspeth CLI
 # Arguments after image name are passed directly to elspeth
-ENTRYPOINT ["elspeth"]
+ENTRYPOINT ["/opt/venv/bin/elspeth"]
 
 # Default command shows help - explicit command required for all operations.
 # The web server requires ELSPETH_WEB__SECRET_KEY for non-loopback hosts,

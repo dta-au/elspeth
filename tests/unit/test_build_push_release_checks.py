@@ -163,6 +163,22 @@ def test_release_dockerfile_prepares_the_standalone_web_runtime_contract() -> No
     assert dockerfile.index("/app/data/blobs") < dockerfile.index("USER elspeth")
 
 
+def test_release_dockerfile_keeps_builder_os_packages_out_of_the_runtime() -> None:
+    """The final image must use the pinned minimal runtime proven by registry scan."""
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    runtime = dockerfile.split("# Stage 3: Runtime", maxsplit=1)[1]
+
+    assert (
+        "FROM gcr.io/distroless/python3-debian13:debug-nonroot"
+        "@sha256:6418f576f2011f5d265d03f53aee812b4efcba5c6646a3f4d855b9fb51cd2d72 AS runtime"
+    ) in runtime
+    assert "COPY --from=builder /opt/venv /opt/venv" in runtime
+    assert "COPY --from=builder /runtime-root/ /" in runtime
+    assert "RUN " not in runtime
+    assert 'ENTRYPOINT ["/opt/venv/bin/elspeth"]' in runtime
+    assert "ln -s /busybox/sh /runtime-root/usr/bin/sh" in dockerfile
+
+
 def test_registry_smoke_checks_runtime_identity_and_web_directories() -> None:
     """Each independently published registry image must prove the same runtime contract."""
     workflow = BUILD_PUSH_WORKFLOW.read_text(encoding="utf-8")
