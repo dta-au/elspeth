@@ -36,6 +36,56 @@ def test_nodes_from_runtime_list_rejects_non_sequence_section() -> None:
         _nodes_from_runtime_list("not-a-list", "transforms", "transform")
 
 
+@pytest.mark.parametrize(
+    ("branches", "expected_input"),
+    [
+        (["a", "b"], "a"),
+        ({"left": "a", "right": "b"}, "a"),
+    ],
+)
+def test_nodes_from_runtime_list_derives_missing_coalesce_input_from_first_branch(
+    branches: list[str] | dict[str, str],
+    expected_input: str,
+) -> None:
+    nodes = _nodes_from_runtime_list(
+        [{"name": "joined", "branches": branches, "policy": "require_all", "merge": "nested"}],
+        "coalesce",
+        "coalesce",
+    )
+
+    assert nodes[0].input == expected_input
+
+
+def test_nodes_from_runtime_list_rejects_supplied_non_string_coalesce_input() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"coalesce\[0\]\.input must be a non-empty string"):
+        _nodes_from_runtime_list(
+            [{"name": "joined", "input": 7, "branches": ["a", "b"], "policy": "require_all", "merge": "nested"}],
+            "coalesce",
+            "coalesce",
+        )
+
+
+def test_nodes_from_runtime_list_rejects_coalesce_input_that_is_not_first_branch() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"coalesce\[0\]\.input must match its first branch input 'a'"):
+        _nodes_from_runtime_list(
+            [{"name": "joined", "input": "other", "branches": ["a", "b"], "policy": "require_all", "merge": "nested"}],
+            "coalesce",
+            "coalesce",
+        )
+
+
+@pytest.mark.parametrize("branches", [None, ["a"], {"left": "a"}])
+def test_nodes_from_runtime_list_rejects_coalesce_without_two_branches(
+    branches: list[str] | dict[str, str] | None,
+) -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"coalesce\[0\]\.branches must contain at least two input connections"):
+        _nodes_from_runtime_list(
+            [{"name": "joined", "branches": branches, "policy": "require_all", "merge": "nested"}],
+            "coalesce",
+            "coalesce",
+        )
+
+
 def test_outputs_from_runtime_sinks_rejects_non_mapping_sinks() -> None:
     with pytest.raises(RuntimeYamlImportError, match="sinks must be a mapping"):
         _outputs_from_runtime_sinks(["not", "a", "mapping"])

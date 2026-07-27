@@ -226,12 +226,27 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                 branch_spec = None
             else:
                 branch_spec = _string_tuple(branches, f"{path}.branches")
+            if branch_spec is None or len(branch_spec) < 2:
+                raise RuntimeYamlImportError(f"{path}.branches must contain at least two input connections")
+            # Runtime coalesces consume ``branches``. NodeSpec.input is not an
+            # additional connection, but its required placeholder uses the
+            # first arriving branch by convention.
+            if isinstance(branch_spec, Mapping):
+                first_branch_input = next(iter(branch_spec.values()))
+            else:
+                first_branch_input = branch_spec[0]
+            if "input" in entry:
+                coalesce_input = _require_str(entry, "input", path)
+                if coalesce_input != first_branch_input:
+                    raise RuntimeYamlImportError(f"{path}.input must match its first branch input {first_branch_input!r}")
+            else:
+                coalesce_input = first_branch_input
             nodes.append(
                 NodeSpec(
                     id=_require_str(entry, "name", path),
                     node_type=node_type,
                     plugin=None,
-                    input=str(entry.get("input") or ""),
+                    input=coalesce_input,
                     on_success=_optional_str(entry, "on_success"),
                     on_error=None,
                     options={},
