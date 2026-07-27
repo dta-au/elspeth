@@ -38,7 +38,7 @@ def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
         "payload_store_path": payload_dir,
         "session_db_url": "postgresql+psycopg://runtime:session-secret@db/session",
         "landscape_url": "postgresql+psycopg://runtime:landscape-secret@db/landscape",
-        "secret_key": "s" * 40,
+        "secret_key": "this-external-startup-secret-is-long-enough",
         "shareable_link_signing_key": SecretBytes(bytes(range(32))),
         "composer_max_composition_turns": 15,
         "composer_max_discovery_turns": 10,
