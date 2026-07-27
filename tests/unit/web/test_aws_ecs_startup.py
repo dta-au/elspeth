@@ -21,6 +21,7 @@ from elspeth.web.schema_probe import SchemaState
 from elspeth.web.sessions.schema import SessionSchemaError
 
 _SENTINEL = "opaque-credential SELECT raw_secret /secret/runtime/path"
+_AWS_TLS_QUERY = "sslmode=verify-full&sslrootcert=system"
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
@@ -42,9 +43,9 @@ def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
         "host": "0.0.0.0",
         "data_dir": data_dir,
         "payload_store_path": payload_dir,
-        "session_db_url": "postgresql+psycopg://runtime:session-secret@db/session",
-        "landscape_url": "postgresql+psycopg://runtime:landscape-secret@db/landscape",
-        "secret_key": "s" * 40,
+        "session_db_url": ("postgresql+psycopg://runtime:session-secret@db/session?sslmode=verify-full&sslrootcert=system"),
+        "landscape_url": ("postgresql+psycopg://runtime:landscape-secret@db/landscape?sslmode=verify-full&sslrootcert=system"),
+        "secret_key": "this-aws-startup-secret-is-long-enough",
         "shareable_link_signing_key": SecretBytes(bytes(range(32))),
         "composer_max_composition_turns": 15,
         "composer_max_discovery_turns": 10,
@@ -142,6 +143,19 @@ def test_contract_url_failure_reports_only_failed_check_name(
     _assert_redacted(exc_info.value)
 
 
+def test_contract_rejects_explicit_postgresql_tls_downgrade(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        session_db_url=("postgresql+psycopg://runtime:session-secret@db/session?sslmode=disable&sslrootcert=/private/ca.pem"),
+    )
+
+    with pytest.raises(startup.AwsEcsStartupContractError) as exc_info:
+        startup.enforce_aws_ecs_contract(settings)
+
+    assert "session_db_url" in str(exc_info.value)
+    _assert_redacted(exc_info.value)
+
+
 def test_contract_enforcement_forwards_pre_resolved_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(tmp_path)
     captured: dict[str, object] = {}
@@ -198,14 +212,17 @@ def test_shared_target_conflict_check_is_translated_without_cause_or_secrets(
 @pytest.mark.parametrize(
     ("session_url", "landscape_url"),
     [
-        ("postgresql://runtime@db/audit", "postgresql://runtime@db/audit"),
         (
-            "postgresql://runtime@db/audit",
-            "postgresql://runtime@db/audit?options=-csearch_path=landscape",
+            f"postgresql://runtime@db/audit?{_AWS_TLS_QUERY}",
+            f"postgresql://runtime@db/audit?{_AWS_TLS_QUERY}",
         ),
         (
-            "postgresql://runtime@db/audit?options=-csearch_path=shared",
-            "postgresql://runtime@db/audit?options=-csearch_path=shared",
+            f"postgresql://runtime@db/audit?{_AWS_TLS_QUERY}",
+            f"postgresql://runtime@db/audit?options=-csearch_path=landscape&{_AWS_TLS_QUERY}",
+        ),
+        (
+            f"postgresql://runtime@db/audit?options=-csearch_path=shared&{_AWS_TLS_QUERY}",
+            f"postgresql://runtime@db/audit?options=-csearch_path=shared&{_AWS_TLS_QUERY}",
         ),
     ],
 )
@@ -224,10 +241,13 @@ def test_unproven_same_database_targets_raise_static_contract_error(
 @pytest.mark.parametrize(
     ("session_url", "landscape_url"),
     [
-        ("postgresql://db/session", "postgresql://db/landscape"),
         (
-            "postgresql://db/audit?options=-csearch_path=sessions",
-            "postgresql://db/audit?options=-csearch_path=landscape",
+            f"postgresql://db/session?{_AWS_TLS_QUERY}",
+            f"postgresql://db/landscape?{_AWS_TLS_QUERY}",
+        ),
+        (
+            f"postgresql://db/audit?options=-csearch_path=sessions&{_AWS_TLS_QUERY}",
+            f"postgresql://db/audit?options=-csearch_path=landscape&{_AWS_TLS_QUERY}",
         ),
     ],
 )

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from sqlalchemy.engine.url import make_url
+from sqlalchemy.engine.url import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
 from elspeth.web.config import (
@@ -114,7 +114,19 @@ def resolve_deployment_state_mode(settings: WebSettings) -> ResolvedDeploymentSt
     raise DeploymentConfigurationError("deployment_state_mode does not match session_db_url and landscape_url base SQLAlchemy dialects")
 
 
-def _check_external_postgres_url(name: str, env_var: str, url: str | None) -> ContractCheck:
+def _has_approved_aws_ecs_tls_query(parsed: URL) -> bool:
+    sslmode = parsed.query.get("sslmode")
+    sslrootcert = parsed.query.get("sslrootcert")
+    return type(sslmode) is str and sslmode == "verify-full" and type(sslrootcert) is str and bool(sslrootcert.strip())
+
+
+def _check_external_postgres_url(
+    name: str,
+    env_var: str,
+    url: str | None,
+    *,
+    require_aws_authenticated_tls: bool,
+) -> ContractCheck:
     if url is None:
         return ContractCheck(name, False, f"{env_var} must be explicitly set for external PostgreSQL state")
     try:
@@ -126,6 +138,12 @@ def _check_external_postgres_url(name: str, env_var: str, url: str | None) -> Co
             name,
             False,
             f"{env_var} must be a supported synchronous PostgreSQL SQLAlchemy URL",
+        )
+    if require_aws_authenticated_tls and not _has_approved_aws_ecs_tls_query(parsed):
+        return ContractCheck(
+            name,
+            False,
+            f"{env_var} must require authenticated PostgreSQL TLS with sslmode=verify-full and one non-blank sslrootcert",
         )
     return ContractCheck(name, True, f"{env_var} is configured for supported synchronous PostgreSQL access")
 
@@ -344,11 +362,13 @@ def validate_external_postgresql_settings(
         "session_db_url",
         "ELSPETH_WEB__SESSION_DB_URL",
         settings.session_db_url,
+        require_aws_authenticated_tls=settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS,
     )
     landscape_check = _check_external_postgres_url(
         "landscape_url",
         "ELSPETH_WEB__LANDSCAPE_URL",
         settings.landscape_url,
+        require_aws_authenticated_tls=settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS,
     )
     distinct_targets_check = _check_distinct_postgres_targets(
         settings,

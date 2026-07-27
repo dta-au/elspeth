@@ -57,11 +57,11 @@ def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
         "operator_telemetry_task_definition_family": "elspeth-web-task",
         "operator_telemetry_task_definition_revision": "1",
         "host": "0.0.0.0",
-        "session_db_url": "postgresql+psycopg://doctor:secret@db/session",
-        "landscape_url": "postgresql+psycopg://doctor:secret@db/landscape",
+        "session_db_url": ("postgresql+psycopg://doctor:secret@db/session?sslmode=verify-full&sslrootcert=system"),
+        "landscape_url": ("postgresql+psycopg://doctor:secret@db/landscape?sslmode=verify-full&sslrootcert=system"),
         "data_dir": data_dir,
         "payload_store_path": payload_dir,
-        "secret_key": "s" * 40,
+        "secret_key": "this-doctor-secret-is-long-enough",
         "shareable_link_signing_key": bytes(range(32)),
         "composer_max_composition_turns": 15,
         "composer_max_discovery_turns": 10,
@@ -487,6 +487,26 @@ def test_collection_never_touches_auth_db(tmp_path: Path, monkeypatch: pytest.Mo
     assert auth_db.read_bytes() == before_bytes
     assert after_stat == before_stat
     assert all("auth" not in check.name for check in checks)
+
+
+def test_collection_blocks_postgresql_tls_downgrade_before_database_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _patch_database_states(monkeypatch, SchemaState.CURRENT, SchemaState.CURRENT, events)
+    settings = _settings(
+        tmp_path,
+        session_db_url=("postgresql+psycopg://doctor:secret@db/session?sslmode=disable&sslrootcert=/private/ca.pem"),
+    )
+
+    checks = _by_name(collect_checks(settings))
+
+    assert checks["session_db_url"].ok is False
+    assert checks["session_schema"].ok is False
+    assert checks["landscape_schema"].ok is False
+    assert events == []
+    assert "/private/ca.pem" not in repr(checks)
 
 
 @pytest.mark.parametrize(

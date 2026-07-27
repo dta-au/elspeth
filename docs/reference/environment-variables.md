@@ -141,6 +141,11 @@ a target.
 | `ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE` | Required positive per-user Composer request limit. The standalone Docker example uses `60`. |
 | `WEB_CONCURRENCY` | Web worker count. Set exactly `1` for every supported deployment. |
 
+For `aws-ecs`, both PostgreSQL URLs must include `sslmode=verify-full` and one
+nonblank `sslrootcert` value naming the trusted CA bundle. Startup and
+`elspeth doctor aws-ecs` reject omitted, plaintext, and non-verifying TLS modes
+before opening a database connection.
+
 The image includes both PostgreSQL clients, not the PostgreSQL server. Use
 `postgresql+psycopg://` for psycopg v3 or `postgresql+psycopg2://` for
 psycopg2. Initialize new external databases once with

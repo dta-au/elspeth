@@ -16,6 +16,7 @@ _SQLITE_SESSION_URL = "sqlite+pysqlite:///session.db"
 _SQLITE_LANDSCAPE_URL = "sqlite:///landscape.db"
 _POSTGRESQL_SESSION_URL = "postgresql://session_user:session_password@db/session"  # secret-scan: allow-this-line
 _POSTGRESQL_LANDSCAPE_URL = "postgresql+future_driver://landscape_user:landscape_password@db/landscape"
+_AWS_TLS_QUERY = "?sslmode=verify-full&sslrootcert=system"
 
 
 def _base_kwargs() -> dict[str, Any]:
@@ -39,11 +40,12 @@ def _settings(**overrides: Any) -> WebSettings:
 
 
 def _external_settings(tmp_path: Path, *, target: str = "docker-compose", **overrides: Any) -> WebSettings:
+    tls_query = _AWS_TLS_QUERY if target == "aws-ecs" else ""
     values: dict[str, Any] = {
         "deployment_target": target,
         "deployment_state_mode": "external-postgresql",
-        "session_db_url": "postgresql+psycopg://session_user:session_password@db.example/session_database",
-        "landscape_url": "postgresql+psycopg2://landscape_user:landscape_password@db.example/landscape_database",
+        "session_db_url": f"postgresql+psycopg://session_user:session_password@db.example/session_database{tls_query}",
+        "landscape_url": f"postgresql+psycopg2://landscape_user:landscape_password@db.example/landscape_database{tls_query}",
         "data_dir": tmp_path / "private-data-path",
         "payload_store_path": tmp_path / "private-payload-path",
         "host": "0.0.0.0",
@@ -389,6 +391,66 @@ def test_external_postgresql_accepts_only_supported_sync_driver_forms(tmp_path: 
     assert checks["separate_db_targets"].ok
 
 
+@pytest.mark.parametrize("sslmode", ["disable", "allow", "prefer", "require", "verify-ca"])
+def test_aws_ecs_rejects_explicit_postgresql_tls_downgrades_and_redacts(
+    tmp_path: Path,
+    sslmode: str,
+) -> None:
+    secret_url = f"postgresql+psycopg://tls_user:tls_password@private-db/session?sslmode={sslmode}&sslrootcert=/private/ca.pem"
+    settings = _external_settings(tmp_path, target="aws-ecs").model_copy(update={"session_db_url": secret_url})
+
+    check = {item.name: item for item in validate_aws_ecs_settings(settings)}["session_db_url"]
+
+    assert check.ok is False
+    assert secret_url not in check.detail
+    for fragment in ("tls_user", "tls_password", "private-db", "/private/ca.pem"):
+        assert fragment not in check.detail
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+psycopg2", "postgresql+psycopg"])
+def test_aws_ecs_accepts_verified_postgresql_tls_across_supported_drivers(
+    tmp_path: Path,
+    driver: str,
+) -> None:
+    settings = _external_settings(
+        tmp_path,
+        target="aws-ecs",
+        session_db_url=(f"{driver}://session_user:session_password@db.example/session_database?sslmode=verify-full&sslrootcert=system"),
+        landscape_url=(
+            f"{driver}://landscape_user:landscape_password@db.example/landscape_database?sslrootcert=system&sslmode=verify-full"
+        ),
+    )
+
+    checks = {item.name: item for item in validate_aws_ecs_settings(settings)}
+
+    assert checks["session_db_url"].ok is True
+    assert checks["landscape_url"].ok is True
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        pytest.param("", id="missing-all"),
+        pytest.param("sslmode=verify-full", id="missing-ca"),
+        pytest.param("sslrootcert=system", id="missing-mode"),
+        pytest.param("sslmode=verify-full&sslrootcert=", id="blank-ca"),
+        pytest.param("sslmode=verify-full&sslmode=disable&sslrootcert=system", id="duplicate-mode"),
+        pytest.param("sslmode=verify-full&sslrootcert=system&sslrootcert=/other/ca.pem", id="duplicate-ca"),
+    ],
+)
+def test_aws_ecs_rejects_incomplete_or_conflicting_postgresql_tls_parameters(
+    tmp_path: Path,
+    query: str,
+) -> None:
+    settings = _external_settings(tmp_path, target="aws-ecs").model_copy(
+        update={"session_db_url": f"postgresql+psycopg://user:password@db/session?{query}"}
+    )
+
+    check = {item.name: item for item in validate_aws_ecs_settings(settings)}["session_db_url"]
+
+    assert check.ok is False
+
+
 @pytest.mark.parametrize(
     ("url", "secret_fragments"),
     [
@@ -630,8 +692,8 @@ def test_all_checks_pass_for_fully_valid_ecs_settings(tmp_path: Path) -> None:
                 "operator_telemetry_task_definition_family": "elspeth-web-task",
                 "operator_telemetry_task_definition_revision": "42",
                 "host": "0.0.0.0",
-                "session_db_url": "postgresql://u:p@host/session",
-                "landscape_url": "postgresql://u:p@host/landscape",
+                "session_db_url": f"postgresql://u:p@host/session{_AWS_TLS_QUERY}",
+                "landscape_url": f"postgresql://u:p@host/landscape{_AWS_TLS_QUERY}",
                 "data_dir": tmp_path / "data",
                 "payload_store_path": tmp_path / "payloads",
             }
