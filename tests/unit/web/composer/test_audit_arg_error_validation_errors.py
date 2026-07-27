@@ -19,10 +19,15 @@ These tests pin:
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ValidationError
+import json
+import tracemalloc
+from unittest.mock import patch
+
+from pydantic import BaseModel, ValidationError, field_validator
 
 from elspeth.web.composer.audit import canonicalize_pydantic_cause
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.redaction import SetSourceArgumentsModel
 from elspeth.web.composer.service import _arg_error_payload
 
 
@@ -36,6 +41,22 @@ class _ListIntModel(BaseModel):
     """Single ``list[int]`` field for forcing an int-loc element (list index)."""
 
     items: list[int]
+
+
+_PYDANTIC_MESSAGE_CANARY = "PYDANTIC_MESSAGE_CANARY_sk_live_8Ft2_/srv/private.key"
+_PYDANTIC_LOC_CANARY = "PYDANTIC_LOC_CANARY_sk_live_3Jm7"
+
+
+class _HostileValidationModel(BaseModel):
+    """Produces excessive depth/count plus attacker-controlled loc/msg strings."""
+
+    items: dict[str, list[list[list[int]]]]
+    secret: str
+
+    @field_validator("secret")
+    @classmethod
+    def _reject_secret(cls, value: str) -> str:
+        raise ValueError(f"rejected by validator: {_PYDANTIC_MESSAGE_CANARY}")
 
 
 def _make_int_parsing_error() -> ValidationError:
@@ -61,6 +82,22 @@ def _make_list_index_error() -> ValidationError:
     try:
         _ListIntModel.model_validate({"items": [1, "bad", 3]})
     except ValidationError as exc:
+        return exc
+    raise AssertionError("model_validate should have raised")
+
+
+def _make_hostile_validation_error() -> ValidationError:
+    try:
+        _HostileValidationModel.model_validate(
+            {
+                "items": {_PYDANTIC_LOC_CANARY: [[["bad"] * 4]]},
+                "secret": "trigger",
+            }
+        )
+    except ValidationError as exc:
+        raw = json.dumps(exc.errors(), default=str)
+        assert _PYDANTIC_LOC_CANARY in raw
+        assert _PYDANTIC_MESSAGE_CANARY in raw
         return exc
     raise AssertionError("model_validate should have raised")
 
@@ -101,49 +138,119 @@ def test_canonicalize_pydantic_cause_strips_input_url_ctx() -> None:
     assert "ctx" not in entry
 
 
-def test_canonicalize_pydantic_cause_preserves_loc_msg_type() -> None:
-    """``loc`` / ``msg`` / ``type`` are preserved with their Pydantic semantics."""
+def test_canonicalize_pydantic_cause_projects_missing_error() -> None:
+    """Missing-field detail survives only as fixed semantic diagnostics."""
     exc = _make_missing_error()
     result = canonicalize_pydantic_cause(exc)
     assert result is not None
     assert len(result) == 1
     entry = result[0]
-    assert entry["loc"] == ["x"]
+    assert entry["loc"] == ["field"]
     assert entry["type"] == "missing"
-    assert isinstance(entry["msg"], str)
-    assert entry["msg"]  # non-empty
+    assert entry["msg"] == "Required value is missing"
 
 
-def test_canonicalize_pydantic_cause_int_parsing_type() -> None:
-    """``int_parsing`` flows through as the canonicalized ``type`` string."""
+def test_canonicalize_pydantic_cause_projects_int_parsing_type() -> None:
+    """Pydantic parsing codes map to the fixed invalid-type diagnostic."""
     exc = _make_int_parsing_error()
     result = canonicalize_pydantic_cause(exc)
     assert result is not None
-    assert result[0]["type"] == "int_parsing"
-    assert result[0]["loc"] == ["x"]
+    assert result[0]["type"] == "invalid_type"
+    assert result[0]["loc"] == ["field"]
 
 
-def test_canonicalize_pydantic_cause_stringifies_non_str_loc() -> None:
-    """List-index ``int`` elements in ``loc`` MUST be stringified.
-
-    Pydantic produces ``loc=("items", 1)`` for the second element of a
-    ``list[int]`` field. Canonical JSON (rfc8785) accepts mixed-type
-    tuples in principle, but the helper coerces every loc element to
-    ``str`` so the recorded shape is uniform and future-proof against
-    audit consumers that expect ``list[str]``.
-    """
+def test_canonicalize_pydantic_cause_projects_list_index_loc() -> None:
+    """List indices survive only as the fixed ``index`` location token."""
     exc = _make_list_index_error()
     result = canonicalize_pydantic_cause(exc)
     assert result is not None
-    # At least one entry should have a stringified index in loc.
-    list_index_entries = [e for e in result if "items" in e["loc"]]
+    list_index_entries = [e for e in result if "index" in e["loc"]]
     assert list_index_entries, f"expected items-loc entry, got {result}"
     entry = list_index_entries[0]
-    # Every loc element is a str.
-    for piece in entry["loc"]:
-        assert isinstance(piece, str), f"loc element {piece!r} is not str"
-    # The list index was stringified — "1", not 1.
-    assert "1" in entry["loc"]
+    assert entry["loc"] == ["field", "index"]
+
+
+def test_canonicalize_pydantic_cause_is_closed_bounded_and_canary_free() -> None:
+    """Raw loc/msg/type data is projected to fixed bounded diagnostics."""
+    result = canonicalize_pydantic_cause(_make_hostile_validation_error())
+    assert result is not None
+
+    serialized = json.dumps(result, sort_keys=True)
+    assert _PYDANTIC_LOC_CANARY not in serialized
+    assert _PYDANTIC_MESSAGE_CANARY not in serialized
+    assert len(result) <= 8
+    assert all(len(entry["loc"]) <= 4 for entry in result)
+    assert all(set(entry) == {"loc", "msg", "type"} for entry in result)
+    assert all(piece in {"field", "index", "item"} for entry in result for piece in entry["loc"])
+    assert all(
+        entry["type"] in {"invalid", "invalid_choice", "invalid_type", "invalid_value", "missing", "out_of_bounds", "unexpected"}
+        for entry in result
+    )
+    assert all(len(entry["msg"]) <= 64 for entry in result)
+
+
+def test_real_schema_fields_remain_distinguishable_in_payload() -> None:
+    """Closed model field names survive while rejected values remain absent."""
+    try:
+        SetSourceArgumentsModel.model_validate(
+            {
+                "plugin": 101,
+                "on_success": 202,
+                "options": {},
+                "on_validation_failure": "quarantine",
+            }
+        )
+    except ValidationError as cause:
+        arg_err = ToolArgumentError(
+            argument="set_source arguments",
+            expected="object conforming to SetSourceArgumentsModel",
+            actual_type=type(cause).__name__,
+        )
+        arg_err.__cause__ = cause
+    else:
+        raise AssertionError("model_validate should have raised")
+
+    payload = _arg_error_payload(arg_err, "set_source")
+    errors = payload["validation_errors"]
+    assert isinstance(errors, list)
+    assert {tuple(entry["loc"]) for entry in errors} == {("plugin",), ("on_success",)}
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "101" not in serialized
+    assert "202" not in serialized
+
+
+def test_oversized_validation_error_set_uses_fixed_truncated_diagnostic() -> None:
+    """Error-count gating avoids materializing an attacker-sized Python list."""
+
+    class _ManyErrorsModel(BaseModel):
+        values: list[int]
+
+    cause_error: ValidationError | None = None
+    try:
+        _ManyErrorsModel.model_validate({"values": ["bad"] * 20_000})
+    except ValidationError as cause:
+        cause_error = cause
+        assert cause_error.error_count() == 20_000
+    else:
+        raise AssertionError("model_validate should have raised")
+    assert cause_error is not None
+
+    tracemalloc.start()
+    try:
+        with patch.object(ValidationError, "errors", side_effect=AssertionError("errors() must not materialize")):
+            result = canonicalize_pydantic_cause(cause_error)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result == [
+        {
+            "loc": [],
+            "msg": "Validation produced more than 8 errors",
+            "type": "truncated",
+        }
+    ]
+    assert peak < 2 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +269,8 @@ def test_arg_error_payload_factory_threads_validation_errors() -> None:
     assert "validation_errors" in payload
     assert isinstance(payload["validation_errors"], list)
     assert len(payload["validation_errors"]) == 1
-    assert payload["validation_errors"][0]["type"] == "int_parsing"
-    assert payload["validation_errors"][0]["loc"] == ["x"]
+    assert payload["validation_errors"][0]["type"] == "invalid_type"
+    assert payload["validation_errors"][0]["loc"] == ["field"]
 
 
 def test_arg_error_payload_factory_omits_validation_errors_for_non_pydantic_cause() -> None:
@@ -196,3 +303,13 @@ def test_arg_error_payload_factory_strips_leak_vectors_end_to_end() -> None:
 
     serialized = json.dumps(payload, default=str)
     assert "not-an-int" not in serialized, f"rejected value leaked into payload: {serialized}"
+
+
+def test_arg_error_payload_factory_strips_hostile_pydantic_loc_and_message() -> None:
+    """The HTTP/prompt/audit-relevant JSON payload contains only closed diagnostics."""
+    arg_err = ToolArgumentError(argument="content", expected="a string", actual_type="str")
+    arg_err.__cause__ = _make_hostile_validation_error()
+
+    serialized = json.dumps(_arg_error_payload(arg_err, "set_metadata"), sort_keys=True)
+    assert _PYDANTIC_LOC_CANARY not in serialized
+    assert _PYDANTIC_MESSAGE_CANARY not in serialized

@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import threading
+import tracemalloc
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -3762,37 +3763,51 @@ class TestPluginBugCrashesFromToolExecution:
         error_payload = json.loads(tool_messages[0]["content"])
         assert "'plugin' must be a string, got int" in error_payload["error"]
 
+    def test_tool_argument_error_subclass_cannot_leak_cause_to_llm(self) -> None:
+        """A hostile ``__str__`` override cannot enter the prompt/audit path."""
+        with pytest.raises(TypeError, match="does not support subclassing"):
+
+            class LeakyToolArgumentError(ToolArgumentError):
+                def __str__(self) -> str:
+                    return f"{self.args[0]}: caused by {self.__cause__}"
+
     @pytest.mark.asyncio
-    async def test_tool_argument_error_subclass_cannot_leak_cause_to_llm(self) -> None:
-        """Defense-in-depth: if a subclass overrides __str__ to embed the
-        __cause__ chain, the LLM-echo path must still use args[0] only.
+    async def test_tool_argument_canary_is_absent_from_prompt_and_audit_channels(self) -> None:
+        """Caller metadata is canonicalized before prompt and audit serialization."""
+        from pydantic import BaseModel, ValidationError, field_validator
 
-        Simulates a future regression where a helpful-looking subclass does
-        `def __str__(self): return f"{self.args[0]}: caused by {self.__cause__}"`.
-        A DB URL or file path leaked through __cause__ would then reach the
-        LLM API. The compose loop MUST short-circuit __str__ and emit
-        args[0] verbatim, isolating the cause chain to __cause__ (audit-only).
-        """
+        canary = "TOOL_ARGUMENT_CHANNEL_CANARY_sk_live_4Pq8"
+        loc_canary = "TOOL_ARGUMENT_LOC_CANARY_sk_live_9Vr6"
 
-        class LeakyToolArgumentError(ToolArgumentError):
-            def __str__(self) -> str:
-                return f"{self.args[0]}: caused by {self.__cause__}"
+        class _HostileCauseModel(BaseModel):
+            values: dict[str, int]
+            secret: str
 
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+            @field_validator("secret")
+            @classmethod
+            def _reject_secret(cls, value: str) -> str:
+                raise ValueError(f"rejected {canary} at /srv/private.key")
+
+        cause_error: ValidationError | None = None
+        try:
+            _HostileCauseModel.model_validate(
+                {
+                    "values": {loc_canary: "not-an-int"},
+                    "secret": "trigger",
+                }
+            )
+        except ValidationError as cause:
+            cause_error = cause
+            raw_cause = json.dumps(cause.errors(), default=str)
+            assert canary in raw_cause
+            assert loc_canary in raw_cause
+        else:
+            raise AssertionError("model_validate should have raised")
+        assert cause_error is not None
+
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
         state = _empty_state()
-
-        secret_path = "/etc/elspeth/secrets/bootstrap.key"
-        secret_cause = ValueError(f"bad path: {secret_path}")
-        leaky = LeakyToolArgumentError(
-            argument="content",
-            expected="a string",
-            actual_type="int",
-        )
-        leaky.__cause__ = secret_cause
-
-        valid_call = _make_llm_response(
+        tool_call = _make_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -3807,25 +3822,32 @@ class TestPluginBugCrashesFromToolExecution:
             ],
         )
         text = _make_llm_response(content="Got it.")
+        leaky = ToolArgumentError(
+            argument=f"field_{canary}",
+            expected=f"the secret path /srv/{canary}",
+            actual_type=f"ValueError({canary})",
+        )
+        leaky.__cause__ = cause_error
+        BaseException.__setattr__(leaky, "safe_message", canary)
+        BaseException.__setattr__(leaky, "args", (canary,))
+        for private_name in ("_safe_argument", "_safe_expected", "_safe_actual_type", "_safe_code"):
+            BaseException.__setattr__(leaky, private_name, canary)
+        BaseException.__setattr__(leaky, "_tool_argument_error_sealed", False)
 
         with (
             patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch(
-                "elspeth.web.composer.tool_batch.execute_tool",
-                side_effect=leaky,
-            ),
+            patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=leaky),
         ):
-            mock_llm.side_effect = [valid_call, text]
-            await service.compose("Setup", [], state)
+            mock_llm.side_effect = [tool_call, text]
+            result = await service.compose("Setup", [], state)
 
         second_call_messages = mock_llm.call_args_list[1].args[0]
-        tool_messages = [m for m in second_call_messages if m.get("role") == "tool"]
-        assert len(tool_messages) == 1
-        error_payload = json.loads(tool_messages[0]["content"])
-        assert "'content' must be a string, got int" in error_payload["error"]
-        # The crucial assertion: the cause-chain content NEVER appears.
-        assert secret_path not in error_payload["error"]
-        assert "caused by" not in error_payload["error"]
+        prompt_blob = json.dumps(second_call_messages, sort_keys=True)
+        audit_blob = json.dumps([invocation.to_dict() for invocation in result.tool_invocations], sort_keys=True)
+        assert canary not in prompt_blob
+        assert loc_canary not in prompt_blob
+        assert canary not in audit_blob
+        assert loc_canary not in audit_blob
 
 
 class TestPluginCrashSessionPersistence:
@@ -4500,6 +4522,69 @@ class TestToolArgumentError:
         assert exc.args[0] == "'content' must be a string, got int"
         assert str(exc) == "'content' must be a string, got int"
 
+    def test_untrusted_constructor_metadata_is_canonicalized_before_storage(self) -> None:
+        """Arbitrary caller strings must not survive on the exception object."""
+        canary = "TOOL_ARGUMENT_CANARY_sk_live_7eQ9_path_etc_shadow"
+        exc = ToolArgumentError(
+            argument=f"field_{canary}",
+            expected=f"the secret at /srv/{canary}",
+            actual_type=f"ValueError: rejected {canary}",
+        )
+
+        serialized = repr(
+            {
+                "args": exc.args,
+                "argument": exc.argument,
+                "expected": exc.expected,
+                "actual_type": exc.actual_type,
+                "safe_message": exc.safe_message,
+            }
+        )
+        assert canary not in serialized
+        assert len(exc.safe_message) <= 256
+
+    def test_args_cannot_be_reassigned_after_construction(self) -> None:
+        """The trusted BaseException wire payload must be immutable."""
+        exc = ToolArgumentError(
+            argument="content",
+            expected="a string",
+            actual_type="int",
+        )
+        original_args = exc.args
+
+        with pytest.raises(AttributeError, match="frozen after construction"):
+            exc.args = ("TOOL_ARGUMENT_MUTATION_CANARY",)
+
+        assert exc.args == original_args
+
+    def test_code_is_closed_at_construction(self) -> None:
+        """Unknown caller-controlled discriminants cannot enter the carrier."""
+        with pytest.raises(ValueError, match="unsupported code"):
+            ToolArgumentError(
+                argument="content",
+                expected="a string",
+                actual_type="int",
+                code="TOOL_ARGUMENT_CODE_CANARY",
+            )
+
+    @pytest.mark.parametrize(
+        ("argument", "expected"),
+        (
+            ("name", "a string"),
+            ("session_id", "a 12-character lowercase hex string"),
+        ),
+    )
+    def test_composer_mcp_schema_labels_preserve_safe_diagnostics(self, argument: str, expected: str) -> None:
+        """MCP's operator-owned schema labels remain actionable."""
+        exc = ToolArgumentError(
+            argument=argument,
+            expected=expected,
+            actual_type="invalid_session_id" if argument == "session_id" else "dict",
+        )
+        assert exc.argument == argument
+        assert exc.expected == expected
+        assert argument in exc.safe_message
+
     def test_constructor_is_keyword_only(self) -> None:
         """Positional construction must fail — structural leak prevention.
 
@@ -4548,14 +4633,8 @@ class TestToolArgumentError:
         with pytest.raises(AttributeError, match="frozen after construction"):
             exc.actual_type = "str"
 
-    def test_exception_chain_dunders_remain_writable(self) -> None:
-        """__cause__, __context__, __traceback__, __notes__ must stay writable.
-
-        ``raise ... from ...`` and ``add_note()`` rely on these being
-        assignable. The freeze guard covers only the three declared
-        fields — the rest of the exception machinery must work
-        unchanged.
-        """
+    def test_runtime_exception_dunders_remain_writable(self) -> None:
+        """Runtime-required cause/context/traceback slots remain writable."""
         exc = ToolArgumentError(
             argument="content",
             expected="a string",
@@ -4563,9 +4642,214 @@ class TestToolArgumentError:
         )
         cause = ValueError("deep cause")
         exc.__cause__ = cause
+        exc.__context__ = cause
+        exc.__suppress_context__ = True
+        exc.__traceback__ = None
         assert exc.__cause__ is cause
-        exc.add_note("diagnostic note")
-        assert "diagnostic note" in exc.__notes__
+        assert exc.__context__ is cause
+        assert exc.__suppress_context__ is True
+        assert exc.__traceback__ is None
+
+    def test_unknown_attributes_and_free_form_notes_are_rejected(self) -> None:
+        """Normal metadata channels close; the safe serializer ignores reflection."""
+        from elspeth.web.composer.tool_error_payloads import arg_error_payload
+
+        canary = "TOOL_ARGUMENT_ATTR_CANARY_sk_live_2Ks5_/etc/shadow"
+        exc = ToolArgumentError(
+            argument="content",
+            expected="a string",
+            actual_type="int",
+        )
+
+        with pytest.raises(AttributeError, match="closed after construction"):
+            exc.untrusted_metadata = canary
+        with pytest.raises(AttributeError, match="closed after construction"):
+            exc.__notes__ = [canary]
+        with pytest.raises(TypeError, match="does not accept free-form notes"):
+            exc.add_note(canary)
+
+        # Deliberate in-process reflection is outside the untrusted-input
+        # boundary, but the production serializer must still ignore it.
+        BaseException.__setattr__(exc, "forced_metadata", canary)
+        serialized = json.dumps(arg_error_payload(exc, "set_metadata"), sort_keys=True)
+        assert canary not in serialized
+
+    def test_reflective_mutation_of_consumed_fields_cannot_leak(self) -> None:
+        """Every public carrier read re-projects reflectively replaced fields."""
+        from elspeth.web.composer.tool_error_payloads import arg_error_payload
+
+        canary = "TOOL_ARGUMENT_REFLECTION_CANARY_sk_live_7Lq4_/root/.ssh/id_ed25519"
+        exc = ToolArgumentError(
+            argument="content",
+            expected="a string",
+            actual_type="int",
+        )
+
+        for name, value in (
+            ("safe_message", canary),
+            ("args", (canary,)),
+            ("argument", canary),
+            ("expected", canary),
+            ("actual_type", canary),
+            ("code", canary),
+        ):
+            BaseException.__setattr__(exc, name, value)
+
+        serialized = repr(
+            {
+                "payload": arg_error_payload(exc, "set_metadata"),
+                "args": exc.args,
+                "message": str(exc),
+                "repr": repr(exc),
+                "vars": vars(exc),
+                "argument": exc.argument,
+                "expected": exc.expected,
+                "actual_type": exc.actual_type,
+                "code": exc.code,
+            }
+        )
+        assert canary not in serialized
+        assert exc.argument == "content"
+        assert exc.expected == "a string"
+        assert exc.actual_type == "int"
+        assert exc.code is None
+        assert exc.safe_message == "'content' must be a string, got int"
+        assert exc.args == ("'content' must be a string, got int",)
+
+    def test_private_backing_overwrite_and_seal_reset_cannot_leak(self) -> None:
+        """Private reflection and a reset seal cannot bypass read projections."""
+        from elspeth.web.composer.tool_error_payloads import arg_error_payload
+
+        canary = "TOOL_ARGUMENT_PRIVATE_CANARY_sk_live_8Qw2_/srv/operator.key"
+        exc = ToolArgumentError(
+            argument="content",
+            expected="a string",
+            actual_type="int",
+        )
+        for name in ("_safe_argument", "_safe_expected", "_safe_actual_type", "_safe_code"):
+            BaseException.__setattr__(exc, name, canary)
+        BaseException.__setattr__(exc, "_tool_argument_error_sealed", False)
+        with pytest.raises(AttributeError, match="frozen after construction"):
+            exc.safe_message = canary
+        with pytest.raises(AttributeError, match="frozen after construction"):
+            exc.args = (canary,)
+
+        serialized = repr(
+            {
+                "payload": arg_error_payload(exc, "set_metadata"),
+                "args": exc.args,
+                "message": str(exc),
+                "repr": repr(exc),
+                "vars": vars(exc),
+                "argument": exc.argument,
+                "expected": exc.expected,
+                "actual_type": exc.actual_type,
+                "code": exc.code,
+            }
+        )
+        assert canary not in serialized
+
+    @pytest.mark.parametrize("replacement", (None, 7, ["not", "a", "scalar"]))
+    def test_private_backing_missing_or_wrong_typed_uses_fixed_fallbacks(self, replacement: object) -> None:
+        """Missing and malformed private state cannot crash public projections."""
+        from elspeth.web.composer.tool_error_payloads import arg_error_payload
+
+        exc = ToolArgumentError(
+            argument="content",
+            expected="a string",
+            actual_type="int",
+        )
+        private_names = ("_safe_argument", "_safe_expected", "_safe_actual_type", "_safe_code")
+        if replacement is None:
+            for name in private_names:
+                BaseException.__delattr__(exc, name)
+        else:
+            for name in private_names:
+                BaseException.__setattr__(exc, name, replacement)
+
+        assert exc.argument == "tool argument"
+        assert exc.expected == "a valid value"
+        assert exc.actual_type == "invalid value"
+        assert exc.code is None
+        assert exc.args == ("'tool argument' must be a valid value, got invalid value",)
+        assert arg_error_payload(exc, "set_metadata")["error"].endswith(exc.safe_message)
+
+    @pytest.mark.parametrize(
+        ("argument", "model_name"),
+        (
+            ("upsert_node arguments", "_UpsertNodeArgumentsModel"),
+            ("splice_transform arguments", "SpliceTransformArgumentsModel"),
+            ("upsert_edge arguments", "_UpsertEdgeArgumentsModel"),
+            ("remove_node arguments", "_RemoveByIdArgumentsModel"),
+            ("remove_edge arguments", "_RemoveByIdArgumentsModel"),
+            ("set_metadata arguments", "_SetMetadataArgumentsModel"),
+            ("set_output arguments", "_SetOutputArgumentsModel"),
+            ("remove_output arguments", "_RemoveOutputArgumentsModel"),
+            ("request_interpretation_review arguments", "_RequestInterpretationReviewArgumentsModel"),
+        ),
+    )
+    def test_mutation_argument_producer_labels_remain_actionable(self, argument: str, model_name: str) -> None:
+        """Every existing mutation validator label survives the closed projection."""
+        exc = ToolArgumentError(
+            argument=argument,
+            expected=f"object conforming to {model_name}",
+            actual_type="ValidationError",
+        )
+        assert exc.argument == argument
+        assert exc.expected == f"object conforming to {model_name}"
+        assert argument in exc.safe_message
+
+    def test_oversized_diagnostic_strings_take_early_fixed_fallback(self) -> None:
+        """Oversized caller text is rejected before casefolding or scanning."""
+        oversized = "Z" * 8_000_000
+
+        tracemalloc.start()
+        try:
+            exc = ToolArgumentError(
+                argument="content",
+                expected=oversized,
+                actual_type=oversized,
+            )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert exc.expected == "a valid value"
+        assert exc.actual_type == "invalid value"
+        assert peak < 2 * 1024 * 1024
+
+    def test_hostile_subclass_cannot_override_consumed_message_fields(self) -> None:
+        """Subclassing is rejected, or its payload projection must remain closed."""
+        from elspeth.web.composer.tool_error_payloads import arg_error_payload
+
+        canary = "TOOL_ARGUMENT_SUBCLASS_CANARY_sk_live_5Rx9_/var/lib/private"
+
+        try:
+
+            class _HostileToolArgumentError(ToolArgumentError):
+                def __init__(self) -> None:
+                    Exception.__init__(self, canary)
+
+                @property
+                def safe_message(self) -> str:
+                    return canary
+
+                def __str__(self) -> str:
+                    return canary
+
+        except TypeError as exc:
+            assert "does not support subclassing" in str(exc)
+            return
+
+        hostile = _HostileToolArgumentError()
+        serialized = repr(
+            {
+                "payload": arg_error_payload(hostile, "set_metadata"),
+                "args": hostile.args,
+                "message": str(hostile),
+            }
+        )
+        assert canary not in serialized
 
     def test_supports_exception_chaining(self) -> None:
         """raise ToolArgumentError(...) from exc must preserve __cause__.
