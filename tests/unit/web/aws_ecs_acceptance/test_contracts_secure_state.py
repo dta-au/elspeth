@@ -412,6 +412,38 @@ def test_serialized_control_manifest_write_locks_the_complete_transaction(tmp_pa
     assert not [candidate for candidate in os.listdir(tmp_path) if candidate.endswith(".tmp")]
 
 
+def test_receipt_manifest_lock_retries_interrupted_flock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("fcntl")
+    secure_documents = importlib.import_module("elspeth.web._aws_ecs_acceptance.secure_documents")
+    real_fcntl = secure_documents._fcntl
+    operations: list[int] = []
+
+    def interrupted_once(descriptor: int, operation: int) -> None:
+        operations.append(operation)
+        if operation == real_fcntl.LOCK_EX and operations.count(real_fcntl.LOCK_EX) == 1:
+            raise InterruptedError
+        real_fcntl.flock(descriptor, operation)
+
+    monkeypatch.setattr(
+        secure_documents,
+        "_fcntl",
+        SimpleNamespace(
+            LOCK_EX=real_fcntl.LOCK_EX,
+            LOCK_UN=real_fcntl.LOCK_UN,
+            flock=interrupted_once,
+        ),
+    )
+
+    path = tmp_path / "control.json"
+    with secure_documents._receipt_manifest_write_lock(path, check="control_manifest_file"):
+        pass
+
+    assert operations == [real_fcntl.LOCK_EX, real_fcntl.LOCK_EX, real_fcntl.LOCK_UN]
+
+
 def test_protected_document_write_rejects_symlinked_immediate_parent(tmp_path: Path) -> None:
     secure_documents = importlib.import_module("elspeth.web._aws_ecs_acceptance.secure_documents")
     real_parent = tmp_path / "real"

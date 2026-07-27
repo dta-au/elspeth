@@ -110,6 +110,17 @@ def _open_receipt_manifest_lock(lock_path: Path, *, check: str) -> int:
                 os.unlink(temporary_path)
 
 
+def _flock_retry_interrupted(descriptor: int, operation: int) -> None:
+    """Complete a flock operation across transient signal interruptions."""
+
+    while True:
+        try:
+            _fcntl.flock(descriptor, operation)
+        except InterruptedError:
+            continue
+        return
+
+
 @contextlib.contextmanager
 def _receipt_manifest_write_lock(path: Path, *, check: str) -> Iterator[None]:
     """Exclude cross-process receipt writers with one crash-released sidecar."""
@@ -133,13 +144,16 @@ def _receipt_manifest_write_lock(path: Path, *, check: str) -> Iterator[None]:
         ):
             raise AcceptanceCheckError(check)
         try:
-            _fcntl.flock(descriptor, _fcntl.LOCK_EX)
+            _flock_retry_interrupted(descriptor, _fcntl.LOCK_EX)
         except OSError:
             raise AcceptanceCheckError(check) from None
         try:
             yield
         finally:
-            _fcntl.flock(descriptor, _fcntl.LOCK_UN)
+            try:
+                _flock_retry_interrupted(descriptor, _fcntl.LOCK_UN)
+            except OSError:
+                raise AcceptanceCheckError(check) from None
     finally:
         os.close(descriptor)
 
