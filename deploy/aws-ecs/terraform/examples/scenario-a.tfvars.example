@@ -5,7 +5,6 @@ candidate_image         = "REPLACE_WITH_ELSPETH_IMAGE@sha256:REPLACE_WITH_64_HEX
 aws_account_id          = "REPLACE_WITH_12_DIGIT_ACCOUNT_ID"
 aws_region              = "REPLACE_WITH_AWS_REGION"
 aws_profile             = "REPLACE_WITH_AWS_PROFILE"
-iam_permissions_boundary_arn = "arn:aws:iam::REPLACE_WITH_12_DIGIT_ACCOUNT_ID:policy/elspeth-REPLACE_WITH_BOOTSTRAP_RUN_ID-ecs-boundary"
 target_platform         = "linux/amd64"
 owner                   = "REPLACE_WITH_OWNER"
 purpose                 = "ELSPETH disposable cold install"

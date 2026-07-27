@@ -366,7 +366,11 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "aws_account_id": "123456789012",
         "aws_region": "ap-southeast-1",
         "run_id": "12345678-1234-4123-8123-123456789abc",
-        "iam_permissions_boundary_arn": ("arn:aws:iam::123456789012:policy/elspeth-12345678-1234-4123-8123-123456789abc-ecs-boundary"),
+        "backend_state_bucket": "elspeth-state-example",
+        "ecr_repository": "elspeth-web-example",
+        "cloudwatch_agent_ecr_repository": "elspeth-agent-example",
+        "scenario_a_bucket": "elspeth-a-example",
+        "scenario_b_bucket": "elspeth-b-example",
     }
     for name, value in values.items():
         rendered = rendered.replace(f"${{{name}}}", value)
@@ -383,6 +387,17 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     )
     mutation_actions = {action for sid, statement in statements.items() if sid != "ReadDiscovery" for action in statement["Action"]}
     assert not any(action.endswith(":*") for action in mutation_actions)
+    assert not {
+        "iam:CreatePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:TagPolicy",
+        "iam:UntagPolicy",
+    }.intersection(mutation_actions)
+    assert "CreateRunPermissionsBoundary" not in statements
+    assert "ManageRunPermissionsBoundary" not in statements
 
     push_images = statements["PushAndCleanElspethImages"]
     assert {
@@ -392,7 +407,11 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "ecr:PutImage",
         "ecr:UploadLayerPart",
     }.issubset(push_images["Action"])
-    assert push_images["Resource"] == "arn:aws:ecr:ap-southeast-1:123456789012:repository/elspeth-*"
+    assert push_images["Resource"] == [
+        "arn:aws:ecr:ap-southeast-1:123456789012:repository/elspeth-web-example",
+        "arn:aws:ecr:ap-southeast-1:123456789012:repository/elspeth-agent-example",
+    ]
+    assert all(sid == "PushAndCleanElspethImages" for sid, statement in statements.items() if "ecr:BatchDeleteImage" in statement["Action"])
     assert statements["AuthenticateForEcrPush"]["Action"] == ["ecr:GetAuthorizationToken"]
     assert statements["AuthenticateForEcrPush"]["Condition"]["StringEquals"]["aws:RequestedRegion"] == values["aws_region"]
 
@@ -417,8 +436,20 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     assert not {"cloudwatch:PutDashboard", "cloudwatch:DeleteDashboards"}.intersection(
         statements["MutateRunTaggedRegionalResources"]["Action"]
     )
-    assert {"s3:ListBucketVersions", "s3:DeleteBucketPublicAccessBlock"}.issubset(statements["ManageElspethNamedBuckets"]["Action"])
-    assert "s3:DeleteObjectVersion" in statements["ManageElspethNamedBucketObjects"]["Action"]
+    named_buckets = statements["ManageElspethNamedBuckets"]
+    assert {"s3:ListBucketVersions", "s3:DeleteBucketPublicAccessBlock"}.issubset(named_buckets["Action"])
+    assert named_buckets["Resource"] == [
+        "arn:aws:s3:::elspeth-state-example",
+        "arn:aws:s3:::elspeth-a-example",
+        "arn:aws:s3:::elspeth-b-example",
+    ]
+    named_objects = statements["ManageElspethNamedBucketObjects"]
+    assert "s3:DeleteObjectVersion" in named_objects["Action"]
+    assert named_objects["Resource"] == [
+        "arn:aws:s3:::elspeth-state-example/*",
+        "arn:aws:s3:::elspeth-a-example/*",
+        "arn:aws:s3:::elspeth-b-example/*",
+    ]
     assert "acm:GetCertificate" in statements["ReadDiscovery"]["Action"]
 
     create_role = statements["CreateRunScopedRolesWithBoundary"]
@@ -430,11 +461,13 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     ]
     assert create_role["Condition"]["StringEquals"] == {
         "aws:RequestTag/ACCEPTANCE_RUN_ID": values["run_id"],
-        "iam:PermissionsBoundary": values["iam_permissions_boundary_arn"],
+        "iam:PermissionsBoundary": "arn:aws:iam::aws:policy/PowerUserAccess",
     }
     pass_role = statements["PassRunScopedRolesToEcsTasksOnly"]
     assert pass_role["Condition"]["StringEquals"]["iam:PassedToService"] == "ecs-tasks.amazonaws.com"
-    assert statements["ManageRunPermissionsBoundary"]["Resource"] == values["iam_permissions_boundary_arn"]
+    managed_roles = statements["ManageRunScopedRoles"]
+    assert "iam:DeleteRolePermissionsBoundary" in managed_roles["Action"]
+    assert "iam:PutRolePermissionsBoundary" not in mutation_actions
     assert "iam:CreateServiceLinkedRole" in statements["CreateRequiredServiceLinkedRoles"]["Action"]
     assert statements["CreateRequiredServiceLinkedRoles"]["Condition"]["StringEquals"]["iam:AWSServiceName"] == [
         "ecs.amazonaws.com",
@@ -442,23 +475,67 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "rds.amazonaws.com",
     ]
 
-    for relative in (
-        "modules/scenario/variables.tf",
-        "scenario-a/variables.tf",
-        "scenario-b/variables.tf",
-    ):
-        assert 'variable "iam_permissions_boundary_arn"' in _text(relative)
+    module_variables = _text("modules/scenario/variables.tf")
+    assert re.search(
+        r'variable "iam_permissions_boundary_arn".*?default\s*=\s*"arn:aws:iam::aws:policy/PowerUserAccess"',
+        module_variables,
+        re.DOTALL,
+    )
+    for relative in ("scenario-a/variables.tf", "scenario-b/variables.tf"):
+        assert 'variable "iam_permissions_boundary_arn"' not in _text(relative)
     for relative in ("examples/scenario-a.tfvars.example", "examples/scenario-b.tfvars.example"):
-        assert "iam_permissions_boundary_arn" in _text(relative)
+        assert "iam_permissions_boundary_arn" not in _text(relative)
     iam = _text("modules/scenario/iam_observability.tf")
     assert iam.count("permissions_boundary = var.iam_permissions_boundary_arn") == 2
+    assert '"${aws_cloudwatch_log_group.operator.arn}:log-stream:*"' in iam
+    network = _text("modules/scenario/network.tf")
+    for resource_type, name in (
+        ("ingress", "alb_https"),
+        ("ingress", "task_from_alb"),
+        ("egress", "alb_to_task"),
+        ("egress", "task_all"),
+        ("ingress", "database_from_task"),
+        ("ingress", "efs_from_task"),
+    ):
+        assert re.search(
+            rf'resource "aws_vpc_security_group_{resource_type}_rule" "{name}" \{{'
+            rf'(?:(?!\nresource ").)*\n  tags = local\.tags',
+            network,
+            re.DOTALL,
+        )
     bootstrap = _text("bootstrap/main.tf")
     bootstrap_outputs = _text("bootstrap/outputs.tf")
-    assert 'resource "aws_iam_policy" "ecs_permissions_boundary"' in bootstrap
-    assert '"arn:aws:bedrock:*::foundation-model/*"' in bootstrap
-    assert '"arn:aws:bedrock:${var.aws_region}:${var.aws_account_id}:inference-profile/*"' in bootstrap
-    assert 'output "iam_permissions_boundary_arn"' in bootstrap_outputs
-    assert "Unavoidable Resource `*` mutations" in _text("README.md")
+    assert 'resource "aws_iam_policy" "ecs_permissions_boundary"' not in bootstrap
+    assert 'output "iam_permissions_boundary_arn"' not in bootstrap_outputs
+    assert statements["DedicatedAccountOnlyUntaggedMutations"]["Action"] == [
+        "logs:DeleteResourcePolicy",
+        "logs:PutResourcePolicy",
+    ]
+    network_relationships = statements["ManageRunEc2NetworkRelationships"]
+    assert network_relationships["Resource"] != "*"
+    assert network_relationships["Condition"]["StringEquals"] == {
+        "aws:ResourceTag/ACCEPTANCE_RUN_ID": values["run_id"],
+        "aws:RequestedRegion": values["aws_region"],
+    }
+    assert not {
+        "ec2:CreateSecurityGroupEgressRule",
+        "ec2:CreateSecurityGroupIngressRule",
+        "ec2:DeleteSecurityGroupRule",
+    }.intersection(mutation_actions)
+    assert {
+        "AuthorizeOnRunSecurityGroups",
+        "CreateRunTaggedSecurityGroupRules",
+        "ManageRunCognitoChildren",
+        "ManageRunEfsMountTargets",
+        "ManageRunEventTargets",
+    }.issubset(statements)
+    assert "repository/elspeth-*" not in template
+    assert "arn:aws:s3:::elspeth-*" not in template
+    readme = _text("README.md")
+    for name in values:
+        assert f"${{{name}}}" in readme
+    assert "dedicated empty account" in readme
+    assert "not supported in a shared account" in readme
 
 
 def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs() -> None:
@@ -468,6 +545,7 @@ def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs() -> No
     for provider in ("aws", "random", "tls"):
         assert f'mock_provider "{provider}"' in content
     for forbidden in (
+        "iam_permissions_boundary_arn",
         "rollback_baseline_image",
         "rollback_baseline_sha",
         "scenario_tf_dir",

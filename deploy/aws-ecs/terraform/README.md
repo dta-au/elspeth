@@ -65,9 +65,16 @@ principal:
 export aws_account_id=REPLACE_WITH_12_DIGIT_ACCOUNT
 export aws_region=REPLACE_WITH_AWS_REGION
 export run_id=REPLACE_WITH_LOWERCASE_UUID
-export iam_permissions_boundary_arn="arn:aws:iam::${aws_account_id}:policy/elspeth-${run_id}-ecs-boundary"
+export backend_state_bucket=REPLACE_WITH_EXACT_BOOTSTRAP_STATE_BUCKET
+export ecr_repository=REPLACE_WITH_EXACT_BOOTSTRAP_APP_REPOSITORY
+export cloudwatch_agent_ecr_repository=REPLACE_WITH_EXACT_BOOTSTRAP_AGENT_REPOSITORY
+scenario_a_namespace="a-$(printf '%s\0A' "$run_id" | sha256sum | cut -c1-20)"
+scenario_b_namespace="b-$(printf '%s\0B' "$run_id" | sha256sum | cut -c1-20)"
+compact_run_id="$(printf '%s' "$run_id" | tr -d '-')"
+export scenario_a_bucket="elspeth-${scenario_a_namespace}-$(printf '%.12s' "$compact_run_id")"
+export scenario_b_bucket="elspeth-${scenario_b_namespace}-$(printf '%.12s' "$compact_run_id")"
 mkdir -p bootstrap/.terraform
-envsubst '${aws_account_id} ${aws_region} ${run_id} ${iam_permissions_boundary_arn}' \
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_bucket} ${scenario_b_bucket}' \
   < iam/installer-policy.json.tftpl \
   > bootstrap/.terraform/installer-policy.json
 ```
@@ -78,18 +85,29 @@ trusted administrator only to install or amend this policy in the dedicated
 disposable account; do not run Terraform with an account-administrator
 wildcard policy.
 
-The bootstrap owns a run-scoped permissions boundary and outputs its exact
-ARN. Copy `iam_permissions_boundary_arn` into each scenario tfvars file. Both
-generated task roles must carry that boundary. The boundary permits the
-current-region inference profile and foundation-model destinations in other
-regions because Bedrock cross-region inference may route there; it does not
-broaden other resource types across regions.
+The bucket derivation above is the same deterministic formula used by the
+scenario module. The rendered policy consequently limits S3 bucket/object
+mutations and ECR image push or force-delete operations to the exact bootstrap,
+Scenario A, and Scenario B names for this run. The three bootstrap names must
+match `examples/bootstrap.tfvars` exactly.
 
-The template's **Unavoidable Resource `*` mutations** are an explicit,
-action-by-action residual list for APIs whose association, child-resource, or
-service policy calls cannot be usefully constrained to the Terraform-created
-ARN at authorization time. They remain limited to the selected region and do
-not include wildcard service actions.
+Both generated ECS roles must use the AWS-managed
+`arn:aws:iam::aws:policy/PowerUserAccess` permissions boundary. The installer
+can attach that boundary but cannot create, version, replace, or delete any
+managed policy. This prevents it from widening the boundary before adding
+inline role permissions and passing a role to ECS. Effective task permissions
+remain the intersection of the installer-immutable boundary and this package's
+narrow task/execution policies, including the exact cross-region Bedrock
+foundation-model ARNs supplied in scenario inputs.
+
+Networking relationships, EFS mount targets, Cognito children, EventBridge
+targets, and X-Ray resources use supported ARN and run-tag conditions. The
+`DedicatedAccountOnlyUntaggedMutations` residual contains only CloudWatch Logs
+account-level resource-policy mutations, whose API does not support
+resource-level authorization. The statement is region-limited and contains no
+wildcard service actions, but another principal's Logs resource policy in that
+region could still be affected. This installer policy is therefore supported
+only in a dedicated empty account and is **not supported in a shared account**.
 
 ## 1. Bootstrap state and image repositories
 
@@ -104,8 +122,7 @@ terraform -chdir=bootstrap apply -var-file=../examples/bootstrap.tfvars
 Bootstrap state is local by design because it creates the remote state bucket.
 Preserve that state until both scenario states have been destroyed. Destroy
 Scenario A and Scenario B first, then destroy bootstrap last so the state
-bucket, repositories, and run permissions boundary remain available throughout
-scenario teardown.
+bucket and repositories remain available throughout scenario teardown.
 
 The bootstrap creates separate ECR repositories for ELSPETH and the
 shell-bearing CloudWatch agent. Temporary application tags may expire. The

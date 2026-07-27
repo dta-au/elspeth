@@ -14,7 +14,6 @@ module "scenario" {
   aws_account_id                     = var.aws_account_id
   aws_region                         = var.aws_region
   aws_profile                        = var.aws_profile
-  iam_permissions_boundary_arn       = var.iam_permissions_boundary_arn
   target_platform                    = var.target_platform
   owner                              = var.owner
   purpose                            = var.purpose
