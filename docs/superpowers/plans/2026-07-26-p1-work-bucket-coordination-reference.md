@@ -123,6 +123,31 @@ git worktree add ".worktrees/p1-${BUCKET_SLUG}" \
   "$BASE_SHA"
 ```
 
+Bootstrap every new worktree before running tests or starting a worker:
+
+```bash
+WORKTREE=/home/john/elspeth/.worktrees/p1-${BUCKET_SLUG}
+cd "$WORKTREE"
+env -u VIRTUAL_ENV uv sync --frozen --all-extras
+test "$(env -u VIRTUAL_ENV uv run --frozen python -c \
+  'import sys; print(sys.prefix)')" = "$WORKTREE/.venv"
+env -u VIRTUAL_ENV uv run --frozen python -c \
+  'import importlib.metadata as m; assert m.version("rfc8785") == "0.1.4"'
+test "$(env -u VIRTUAL_ENV uv run --frozen which pytest)" = \
+  "$WORKTREE/.venv/bin/pytest"
+test "$(env -u VIRTUAL_ENV uv run --frozen which ruff)" = \
+  "$WORKTREE/.venv/bin/ruff"
+test "$(env -u VIRTUAL_ENV uv run --frozen which mypy)" = \
+  "$WORKTREE/.venv/bin/mypy"
+```
+
+Do not run bare `uv run pytest` as the first command in a fresh worktree.
+Until the frozen local environment exists, executable resolution can escape to
+a user-global pytest process that cannot see mandatory locked dependencies.
+`rfc8785` is a base dependency; its absence is a bootstrap failure, never an
+optional-dependency explanation. Use `env -u VIRTUAL_ENV uv run --frozen
+python -m pytest` after the checks above.
+
 Do not reuse `.worktrees/deferred-platform-completion`; it belongs to active
 ticket `elspeth-b5d7aa5655` on branch
 `codex/deferred-platform-completion`.
@@ -329,36 +354,38 @@ Continuation rules:
 
 ### R3. Resume `elspeth-ef29ef6ba4` as bounded corpus waves
 
-The DAG foundation is already integrated: merge commit
-`36146eac4f4346c56a0ef2b44ec8801a60e3972e` is contained in current
-`release/0.7.2`. The last recorded delivery had 15 scenarios and 165 cells but
-only two executable production-path cases, with 109 applicable cells still
-non-pass. The old branch is not a useful resume base, and the parent claim must
-not remain a long-lived worker lease while many independent gaps are idle.
+The bounded pre-platform recovery wave is complete at
+`release/0.7.2@55727d54c6b057b77a926778deeb933208d78543`. P3
+`elspeth-7dcc6554e7` and all seven B1-X/B2-X recovery children are closed. The
+current schema-v2 manifest has 15 scenarios, 46 cases, 107 evidence
+references, and 165 cells; 71 applicable cells remain non-pass. The augmented
+recovery gate reports 593 passed, zero xfails, and three known quorum warnings.
+The parent `elspeth-ef29ef6ba4` remains open.
+
+The four B1 recovery cells and partial-terminal B2 recovery now pass. S6
+fork/coalesce and S7 sequential-coalesce remain partial because the current
+evidence reaches terminal publication after completed coalesces; it does not
+prove a held coalesce branch or a literal between-merge seam. Do not promote
+those cells from adjacency or reinterpret the completed packet as evidence for
+the unavailable seam.
 
 Resume sequence:
 
-1. Audit the stale parent handoff, then release the old
-   `codex-dag-corpus` claim. Preserve the parent as the corpus completion
-   umbrella rather than assigning it to one worker for the entire backlog.
-2. Start from the then-current `release/0.7.2` tip in a fresh isolated worktree.
-3. Repair the two evidence-integrity children first:
-   `elspeth-e8acea2a55` (hash the runtime-consumed input) and
-   `elspeth-d88d0e45c0` (contain repository-relative links). Each gets its own
-   reproduce/test/fix/verify/commit/close cycle.
-4. Refresh the manifest and derive a current non-pass ledger. Split remaining
-   executable cases into bounded child waves rather than claiming all 109
-   cells as one implementation:
-   - source/fan-in/routing scenarios;
-   - fork/coalesce/nested/parallel graph scenarios;
-   - aggregation, row-expansion, retry/quarantine, and sink-redrive scenarios;
-   - authoring and semantic round-trip evidence.
-5. Keep row-union cells bound to their product capability issue; a corpus
-   worker documents/proves the supported rejection contract but does not
-   invent the missing capability.
-6. Hold the multi-worker lease/reclaim scenario until
-   `elspeth-b5d7aa5655` lands. Then rebase the corpus wave and use the new
-   distributed runtime rather than building a parallel lease harness.
+1. Capture the exact reviewed release tip and require
+   `55727d54c6b057b77a926778deeb933208d78543` to be its ancestor.
+2. Rebase the clean paused deferred-platform replay range onto that captured
+   tip. Treat every pre-platform recovery claim as provisional and rerun the
+   complete registered recovery gate after the rebase.
+3. Use the new distributed runtime for B4-B and scenario-specific concurrency
+   evidence. Do not build a parallel corpus-only lease authority.
+4. Resolve the scale dependency cycle around `elspeth-cb1053fe46` before scale
+   execution without weakening its acceptance contract or closing the parent.
+5. Keep row-union, guided authoring, round-trip, and remaining product cells
+   bound to their live capability owners; prove fail-closed rejection where a
+   capability remains unsupported.
+6. Add a genuine public held-branch or between-merge seam before promoting S6
+   or S7 recovery, unless the requirement is deliberately revised and the
+   manifest contract is updated with review.
 7. Close the parent only when every applicable cell is executable and passing,
    or when a remaining cell is explicitly owned by an open capability ticket
    whose expected corpus behavior is a tested fail-closed rejection.

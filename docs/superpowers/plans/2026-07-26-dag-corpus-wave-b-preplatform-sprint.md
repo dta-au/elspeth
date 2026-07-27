@@ -53,28 +53,27 @@ APIs, Filigree, Loomweave, Warpline, Ruff, and mypy.
 
 ## Post-integration execution checkpoint
 
-Refreshed on 2026-07-27 after Wave B integration, the resulting P1 correctness
-wave, and the independent recovery durable/export parity oracle. The immutable
-Wave B implementation/evidence head remains
+Refreshed on 2026-07-27 after Wave B integration, the resulting correctness
+wave, the independent recovery durable/export parity oracle, and the seven
+bounded B1-X/B2-X recovery children. The immutable Wave B
+implementation/evidence head remains
 `210a92d544dbb10d5d0b438351f123e05da19f5d`; Wave B was integrated at
 `2b47c25428ed0e978443df953e0fd587860aeed8`. The current reviewed
 production/evidence floor is
-`release/0.7.2@cb07cfa91f252c86737e8e15c711ccd1ec9fe76e`. The commit containing
+`release/0.7.2@55727d54c6b057b77a926778deeb933208d78543`. The commit containing
 this documentation refresh is coordination-only and is not the platform
 production replay anchor. Capture the exact reviewed release tip after later
 bug-fix/corpus commits before the platform rebase.
 
-The focused final gate reports `546 passed, 0 xfailed, 3 known quorum
+The augmented final gate reports `593 passed, 0 xfailed, 3 known quorum
 warnings`. Focused Ruff check/format, mypy, and task-commit diff checks are
-green. The release worktree's repository-wide `git diff --check` still reports
-pre-existing trailing whitespace in the protected, unrelated
-`config/cicd/enforce_tier_model/web.yaml`; this sprint did not alter it. The
-former coalesce identity xfails now pass after `elspeth-3a6fa9141f` closed at
+green. The release worktree is clean at this refresh. The former coalesce
+identity xfails pass after `elspeth-3a6fa9141f` closed at
 `229e2245d84e1195dc6693cf6ab55684190bcf9b`.
 
-The current schema-v2 manifest has 15 scenarios, 39 cases, 100 evidence
-references, and 165 cells: 77 `pass`, 27 `partial`, 16 `fail`, 33 `unknown`,
-and 12 `not_applicable`. Seventy-six applicable cells remain non-pass. B4-A
+The current schema-v2 manifest has 15 scenarios, 46 cases, 107 evidence
+references, and 165 cells: 82 `pass`, 26 `partial`, 16 `fail`, 29 `unknown`,
+and 12 `not_applicable`. Seventy-one applicable cells remain non-pass. B4-A
 closed at `210a92d544dbb10d5d0b438351f123e05da19f5d` and promoted only checkpoint
 runtime/audit. Its single-process, fresh-object proof remains provisional
 pending the deferred-platform rebase.
@@ -91,13 +90,15 @@ parity now compares the portable export with an explicit direct-table
 record-family omission. Existing exact/static/direct recovery assertions stay
 in force, and no manifest cell was promoted.
 
-The sprint did not complete B1-X or B2-X. Seven P2 recovery children remain
-open behind P3 `elspeth-7dcc6554e7`: `elspeth-1805aec2a6`,
-`elspeth-3ae349b761`, `elspeth-9e74843418`, `elspeth-7729c0beb5`,
-`elspeth-d09414a1a0`, `elspeth-e7a8fb1547`, and `elspeth-cd09538cd0`.
-The scale issue `elspeth-cb1053fe46` also remains blocked by the parent whose
-acceptance depends on those scale cells; reconcile that dependency cycle
-before scale execution.
+P3 `elspeth-7dcc6554e7` and all seven P2 recovery children are closed:
+`elspeth-1805aec2a6`, `elspeth-3ae349b761`, `elspeth-9e74843418`,
+`elspeth-7729c0beb5`, `elspeth-d09414a1a0`, `elspeth-e7a8fb1547`, and
+`elspeth-cd09538cd0`. Four B1-X cells and partial-terminal B2-X now pass. S6
+fork/coalesce and S7 sequential-coalesce remain partial because held-branch
+and literal between-merge seams are not proven. The scale issue
+`elspeth-cb1053fe46` also remains blocked by the parent whose acceptance
+depends on those scale cells; reconcile that dependency cycle before scale
+execution.
 
 The recorded, refreshable paused-platform snapshot is clean at
 `132bd53232ea6b3885250675c361d3c057b19ac5`, through Task 5. Its recorded
@@ -365,14 +366,14 @@ start until its commit is integrated and verified.
 - Modify: `tests/integration/core/dag/test_dag_scenario_production_path.py`
 - Add fault-enabled fixtures beside each B1 scenario fixture
 
-- [ ] **Step 1: Add a typed recovery-fault declaration and RED dispatcher
+- [x] **Step 1: Add a typed recovery-fault declaration and RED dispatcher
   tests.**
 
   Supported B1 seams must be named, closed-vocabulary values. A recovery case
   cannot silently use the checkpoint scenario's EOF seam when its topology
   requires a different durable boundary.
 
-- [ ] **Step 2: Execute four separate child/commit/review cycles.**
+- [x] **Step 2: Execute four separate child/commit/review cycles.**
 
   `reopen-resume-after-source`, `independent-roots-reopen-resume`,
   `queued-fan-in-reopen-resume`, and `route-reopen-resume` must each close the
@@ -386,20 +387,24 @@ start until its commit is integrated and verified.
   topology, the intended durable token/work state exists, and no premature
   sink artifact was published.
 
-- [ ] **Step 3: Implement only production-path fault plumbing in corpus test
+- [x] **Step 3: Implement only production-path fault plumbing in corpus test
   infrastructure.**
 
   If a required durable seam is absent in production, stop and create a
   Filigree bug; do not inject state directly to make the corpus pass.
 
-- [ ] **Step 4: Promote one recovery cell after each topology child passes its
+- [x] **Step 4: Promote one recovery cell after each topology child passes its
   own review and gate.**
 
   Recovery evidence remains provisional at its recorded Wave B SHA until the
   post-platform invalidation and rerun described in Task 12.
 
-**Final status:** deferred. All four children remain open behind
-`elspeth-7dcc6554e7`; no B1 recovery cell was promoted to pass.
+**Final status:** complete. `elspeth-1805aec2a6`,
+`elspeth-3ae349b761`, `elspeth-9e74843418`, and `elspeth-7729c0beb5` are
+closed after independent implementation/review and serialized manifest
+integration. All four B1 recovery cells pass with fresh-object public resume,
+exact durable identity, one publication, terminal work/outcomes, checkpoint
+cleanup, and direct durable/export parity evidence.
 
 ## Task 4: Scale boundary — consume the dedicated issue, do not duplicate it
 
@@ -513,7 +518,7 @@ start until its commit is integrated and verified.
 - Modify B2 fixtures/harness/tests
 - Coordinator applies the exact manifest delta after each child integrates
 
-- [ ] **Step 1: Execute four separate child/commit/review cycles.**
+- [x] **Step 1: Execute four separate child/commit/review cycles.**
 
   Cover partial-terminal resume, held coalesce branch, between sequential
   merges, and one-parallel-barrier-complete/one-pending. Require fresh-object
@@ -523,7 +528,7 @@ start until its commit is integrated and verified.
   expected interrupted status/checkpoint/topology and durable work state are
   present, and no premature sink artifact was published.
 
-- [ ] **Step 2: Promote one B2 recovery cell only after its topology child is
+- [x] **Step 2: Promote or retain one B2 recovery cell only after its topology child is
   integrated and independently reviewed.**
 
 - [x] **Step 3: Mark each integrated recovery evidence set provisional at its exact Wave B
@@ -533,11 +538,15 @@ start until its commit is integrated and verified.
   the later platform-rebase packet; keep all scale cells non-pass under
   `elspeth-cb1053fe46`.**
 
-**Final status:** partial. The parallel-coalesce child
-`elspeth-a19d62ab4c` closed at
-`906c6915dd4935a871fac3e34175b2633ba2cebe`; the other three B2-X children
-remain open behind `elspeth-7dcc6554e7`. The integrated proof remains
-provisional.
+**Final status:** complete for the bounded packets, partial for scenario
+coverage. The parallel-coalesce child `elspeth-a19d62ab4c` remains closed at
+`906c6915dd4935a871fac3e34175b2633ba2cebe`; partial-terminal
+`elspeth-d09414a1a0`, post-coalesce pending-sink
+`elspeth-e7a8fb1547`, and sequential terminal-publication
+`elspeth-cd09538cd0` are also closed. Partial-terminal recovery passes. S6 and
+S7 intentionally retain partial recovery status because no held coalesce
+branch or literal between-merge seam was proven. All integrated proof remains
+provisional pending deferred-platform reacceptance.
 
 ## Task 9: B3-R — stateful runtime and audit
 
@@ -666,12 +675,14 @@ provisional.
   `ca65ecab32f77c8cbd2b33ce8685c381011078e0`. The immutable Wave B
   implementation/evidence head is `210a92d544dbb10d5d0b438351f123e05da19f5d`;
   the only later Wave B commit changes this plan and the handoff document.
-  Exact-current merge and quality reviews approved the integration. The four
-  post-integration P1 fixes and the independent durable/export oracle now lead
-  to production/evidence floor
-  `cb07cfa91f252c86737e8e15c711ccd1ec9fe76e`. The release checkout gate passes
-  546 tests with zero xfails and 3 warnings; Ruff, formatting, mypy, and
-  task-commit diff checks also pass. Deferred platform work remains paused at
+  Exact-current merge and quality reviews approved the integration. The
+  post-integration correctness fixes, independent durable/export oracle,
+  bounded lease fix, and seven recovery children now lead to
+  production/evidence floor
+  `55727d54c6b057b77a926778deeb933208d78543`. The augmented release
+  checkout gate passes 593 tests with zero xfails and 3 warnings; Ruff,
+  formatting, mypy, and task-commit diff checks also pass. Deferred platform
+  work remains paused at
   `132bd53232ea6b3885250675c361d3c057b19ac5`. Independent recovery/export
   parity is resolved as `elspeth-168c26e22e` without a manifest promotion;
   distributed and scale evidence remain incomplete as recorded in the final
@@ -681,7 +692,7 @@ provisional.
 
   At execution, capture the exact reviewed `release/0.7.2` tip and require it to
   descend from the current production/evidence floor
-  `cb07cfa91f252c86737e8e15c711ccd1ec9fe76e`. Rebase
+  `55727d54c6b057b77a926778deeb933208d78543`. Rebase
   `codex/deferred-platform-completion` onto that captured tip, rerun its
   impacted authority suites, then implement B4-B using its real
   independent-process PostgreSQL harness. Do not retain any pre-rebase
