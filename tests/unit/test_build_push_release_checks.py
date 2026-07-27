@@ -212,6 +212,20 @@ def test_release_dockerfile_copies_frontend_dist_into_installed_package() -> Non
     )
 
 
+def test_release_dockerfile_makes_frontend_assets_readable_by_runtime_identity() -> None:
+    """Generated SPA files must remain readable after the image switches away from root."""
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    directory_mode = "find /tmp/frontend-dist -type d -exec chmod 0755 {} +"
+    file_mode = "find /tmp/frontend-dist -type f -exec chmod 0644 {} +"
+    copy_assets = 'shutil.copytree("/tmp/frontend-dist", target)'
+
+    assert directory_mode in dockerfile
+    assert file_mode in dockerfile
+    assert dockerfile.index(directory_mode) < dockerfile.index(copy_assets)
+    assert dockerfile.index(file_mode) < dockerfile.index(copy_assets)
+
+
 def _extras_validation_scripts() -> list[str]:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     blocks = re.findall(

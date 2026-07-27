@@ -86,7 +86,9 @@ RUN . /opt/venv/bin/activate && \
 # Copy built SPA assets into the installed package, where app.py looks for
 # elspeth/web/frontend/dist at runtime.
 COPY --from=frontend-builder /frontend/dist /tmp/frontend-dist/
-RUN . /opt/venv/bin/activate && \
+RUN find /tmp/frontend-dist -type d -exec chmod 0755 {} + && \
+    find /tmp/frontend-dist -type f -exec chmod 0644 {} + && \
+    . /opt/venv/bin/activate && \
     python -c 'from pathlib import Path; import shutil; import elspeth.web; target = Path(elspeth.web.__file__).parent / "frontend" / "dist"; shutil.rmtree(target, ignore_errors=True); target.parent.mkdir(parents=True, exist_ok=True); shutil.copytree("/tmp/frontend-dist", target)' && \
     rm -rf /tmp/frontend-dist
 
