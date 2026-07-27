@@ -2511,6 +2511,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
     ) == (
         ("linear", "reopen-after-source"),
         ("multiple-independent-sources", "independent-roots-reopen-resume"),
+        ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),

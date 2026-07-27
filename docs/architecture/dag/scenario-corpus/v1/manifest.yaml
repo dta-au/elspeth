@@ -305,6 +305,11 @@ evidence:
     locator: multi-source-queue-fan-in:queued-fan-in
     claim: The queued-fan-in corpus case executes two source roots through an explicit scheduling queue and downstream transform with exact runtime and audit evidence.
     stages: [config, build, runtime, audit]
+  - id: harness-multi-source-queue-fan-in-queued-fan-in-reopen-resume
+    kind: harness
+    locator: multi-source-queue-fan-in:queued-fan-in-reopen-resume
+    claim: A declared production sink-effect BEFORE_EFFECT interruption after both queued fan-in sources exhaust proves every six-row source identity and canonical ingest order crossed the shared queue and normalization transform before one ordered six-member effect remains pending, then a fresh public resume reuses exact durable identities, publishes the canonical output once without source replay, terminalizes work and outcomes, removes the checkpoint, and preserves durable/export parity; this single-process pre-platform evidence is provisional until the deferred-platform rebase.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-conditional-routing-two-way-gate
     kind: harness
     locator: conditional-routing:two-way-gate
@@ -2087,6 +2092,34 @@ scenarios:
             ],
             "source_operation_count": 2
           }
+      - id: queued-fan-in-reopen-resume
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: output
+          occurrence: 1
+        fixture: multi-source-queue-fan-in/queued-fan-in.yaml
+        input_fixtures:
+          orders: multi-source-queue-fan-in/orders.csv
+          refunds: multi-source-queue-fan-in/refunds.csv
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 6
+          required_audit_record_types:
+            - artifact
+            - operation
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_member
+            - token
+            - token_outcome
     dimensions:
       config:
         status: pass
@@ -2114,11 +2147,9 @@ scenarios:
       audit:
         status: pass
         evidence: [harness-multi-source-queue-fan-in-queued-fan-in]
-      recovery: &recovery_unknown
-        status: unknown
-        reason: No complete database-reopen recovery case exists for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
+      recovery:
+        status: pass
+        evidence: [harness-multi-source-queue-fan-in-queued-fan-in-reopen-resume]
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: *guided_fail
@@ -3326,7 +3357,11 @@ scenarios:
         evidence:
           - harness-conditional-routing-two-way-gate
           - harness-conditional-routing-error-route-and-discard
-      recovery: *recovery_unknown
+      recovery: &recovery_unknown
+        status: unknown
+        reason: No complete database-reopen recovery case exists for this scenario.
+        owner_issue: elspeth-ef29ef6ba4
+        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: *guided_fail

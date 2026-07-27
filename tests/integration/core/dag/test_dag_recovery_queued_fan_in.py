@@ -34,42 +34,15 @@ _EXPECTED_OUTPUT_ROWS = (
 
 def _queued_fan_in_recovery_declaration() -> tuple[ScenarioSpec, HarnessCaseSpec]:
     manifest = load_manifest()
-    scenario, runtime_case = next(
+    return next(
         (scenario, case)
         for scenario, case in iter_harness_cases(manifest)
-        if (scenario.id, case.id) == ("multi-source-queue-fan-in", "queued-fan-in")
+        if (scenario.id, case.id)
+        == (
+            "multi-source-queue-fan-in",
+            "queued-fan-in-reopen-resume",
+        )
     )
-    recovery_case = HarnessCaseSpec.model_validate(
-        {
-            **runtime_case.model_dump(mode="json"),
-            "id": "queued-fan-in-reopen-resume",
-            "workflow": "recovery",
-            "recovery_kind": "sink_boundary",
-            "recovery_fault": {
-                "kind": "sink_effect",
-                "seam": "before_effect",
-                "sink_name": "output",
-                "occurrence": 1,
-            },
-            "expected": {
-                "kind": "summary",
-                "status": "completed",
-                "output_rows": 6,
-                "required_audit_record_types": [
-                    "artifact",
-                    "operation",
-                    "row",
-                    "run",
-                    "scheduler_event",
-                    "sink_effect",
-                    "sink_effect_member",
-                    "token",
-                    "token_outcome",
-                ],
-            },
-        }
-    )
-    return scenario, recovery_case
 
 
 def test_queued_fan_in_sink_boundary_recovery_reopens_and_resumes_once(

@@ -137,7 +137,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "unknown",
+        "pass",
         "unknown",
         "pass",
         "fail",
@@ -407,8 +407,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "184e6663333884675328b8107d1ae8b873ff2aec25a16d24b346ffd98a24f17b"
-EXPECTED_CASE_REGISTRY_SHA256 = "ee270aec6a707b5df5ee8f9b5be2a15c1fa9955445ecdbf88bd43b540c8b124c"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "aeaeb4745a85da61e5e440fb90586177a3e28dcd7ef7f77afed09ee95ed97b87"
+EXPECTED_CASE_REGISTRY_SHA256 = "dd180f5e7aa049e278951b0819a208351b94dae3da2fc4f6ea9e58c818e9d112"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -439,6 +439,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
     "multiple-independent-sources:independent-roots-reopen-resume": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
     "multi-source-queue-fan-in:queued-fan-in": "ccff919ce91062633679fcbe577194b4ce3c852a90c1f8f97622ac371b377c4e",
+    "multi-source-queue-fan-in:queued-fan-in-reopen-resume": "ccff919ce91062633679fcbe577194b4ce3c852a90c1f8f97622ac371b377c4e",
     "conditional-routing:two-way-gate": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
     "conditional-routing:error-route-and-discard": "27dbf1f2d1908a6f6f3df8166bff152e56977d93ffc4061c91c48871c26a282b",
     "fork-multiple-terminals-partial-failure:one-terminal-fails": "e0505f84e778047f4d68a47e27f442d82824b898cf58fe5cb084842cfbbdb925",
@@ -507,6 +508,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-multi-source-queue-fan-in-queued-fan-in",
         "multi-source-queue-fan-in:queued-fan-in",
         ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-multi-source-queue-fan-in-queued-fan-in-reopen-resume",
+        "multi-source-queue-fan-in:queued-fan-in-reopen-resume",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
     (
         "harness-conditional-routing-two-way-gate",
@@ -4744,7 +4750,12 @@ def _clear_registered_linear_cases(raw: dict[str, object]) -> dict[str, object]:
     for registered_case in cast(list[dict[str, object]], scenario["cases"]):
         _remove_harness_evidence(raw, f"linear:{registered_case['id']}")
     scenario["cases"] = []
-    _raw_dimensions(scenario)["recovery"] = deepcopy(_raw_dimensions(_raw_scenarios(raw)[2])["recovery"])
+    _raw_dimensions(scenario)["recovery"] = {
+        "status": "unknown",
+        "reason": "No complete database-reopen recovery case exists for this scenario.",
+        "owner_issue": "elspeth-ef29ef6ba4",
+        "exit_gate": "The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.",
+    }
     return scenario
 
 
@@ -4775,6 +4786,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("multiple-independent-sources", "independent-roots"),
         ("multiple-independent-sources", "independent-roots-reopen-resume"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
+        ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
@@ -4806,11 +4818,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 102
+    assert len(manifest.evidence) == 103
     assert len(assessment_evidence) == 61
-    assert len(harness_evidence) == 41
-    assert len({reference.id for reference in manifest.evidence}) == 102
-    assert len({reference.locator for reference in manifest.evidence}) == 102
+    assert len(harness_evidence) == 42
+    assert len({reference.id for reference in manifest.evidence}) == 103
+    assert len({reference.locator for reference in manifest.evidence}) == 103
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4828,6 +4840,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("multiple-independent-sources", "independent-roots"),
         ("multiple-independent-sources", "independent-roots-reopen-resume"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
+        ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
@@ -4882,6 +4895,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("multi-source-queue-fan-in", "runtime"),
             ("multi-source-queue-fan-in", "audit"),
         ),
+        "harness-multi-source-queue-fan-in-queued-fan-in-reopen-resume": (("multi-source-queue-fan-in", "recovery"),),
         "harness-conditional-routing-two-way-gate": (
             ("conditional-routing", "config"),
             ("conditional-routing", "build"),
@@ -5222,6 +5236,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("multiple-independent-sources", "independent-roots"),
         ("multiple-independent-sources", "independent-roots-reopen-resume"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
+        ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
