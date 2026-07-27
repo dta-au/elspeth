@@ -25,6 +25,7 @@ from tests.fixtures.dag_scenario_corpus.harness import (
     SinkBoundaryInterruptedContext,
     run_sink_boundary_recovery_case,
 )
+from tests.fixtures.dag_scenario_corpus.loader import iter_harness_cases
 from tests.fixtures.dag_scenario_corpus.schema import (
     HarnessCaseSpec,
     ScenarioManifest,
@@ -42,17 +43,6 @@ SURVIVOR_ROWS = (
     '{"id":1,"value":10}',
     '{"id":2,"value":20}',
     '{"id":3,"value":30}',
-)
-REQUIRED_AUDIT_RECORD_TYPES = (
-    "artifact",
-    "operation",
-    "row",
-    "run",
-    "scheduler_event",
-    "sink_effect",
-    "sink_effect_member",
-    "token",
-    "token_outcome",
 )
 
 
@@ -102,40 +92,7 @@ def declared_partial_terminal_recovery_case(
 ) -> tuple[ScenarioSpec, HarnessCaseSpec]:
     """Return the scenario plus its coordinator-ready recovery declaration."""
 
-    scenario = next((candidate for candidate in manifest.scenarios if candidate.id == SCENARIO_ID), None)
-    if scenario is None:
-        raise AssertionError(f"DAG corpus lacks required scenario {SCENARIO_ID!r}")
-    case = HarnessCaseSpec.model_validate(
-        {
-            "id": CASE_ID,
-            "workflow": "recovery",
-            "recovery_kind": "sink_boundary",
-            "recovery_fault": {
-                "kind": "sink_effect",
-                "seam": "before_effect",
-                "sink_name": "survivor",
-                "occurrence": 1,
-            },
-            "fixture": f"{SCENARIO_ID}/reopen-after-survivor-boundary.yaml",
-            "input_fixtures": {
-                "primary": f"{SCENARIO_ID}/input.csv",
-            },
-            "output_artifacts": {
-                "failing": {
-                    "filename": "failing.jsonl",
-                    "presence": "absent",
-                },
-                "survivor": "survivor.jsonl",
-            },
-            "expected": {
-                "kind": "summary",
-                "status": RunStatus.COMPLETED_WITH_FAILURES.value,
-                "output_rows": 3,
-                "required_audit_record_types": REQUIRED_AUDIT_RECORD_TYPES,
-            },
-        }
-    )
-    return scenario, case
+    return next((scenario, case) for scenario, case in iter_harness_cases(manifest) if (scenario.id, case.id) == (SCENARIO_ID, CASE_ID))
 
 
 def _require_summary_expectation(case: HarnessCaseSpec) -> SummaryRunExpectation:

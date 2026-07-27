@@ -163,7 +163,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "unknown",
+        "pass",
         "unknown",
         "pass",
         "fail",
@@ -407,8 +407,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "874d42ee550ac125f9e3d5694a96799a7a3d320ca97e44f13fbf4514098e2041"
-EXPECTED_CASE_REGISTRY_SHA256 = "5cd3814aafe7f7a74aef471a94aa62c80da41f1ce831ea986246f706a407a3c4"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "b3680a85a0598eb84d201052cb5fb0a38680fd98ca2dacaca8d9a25fd756024e"
+EXPECTED_CASE_REGISTRY_SHA256 = "d8ab85b65bd3a874318a7258cd55c1ba754161ecb97383bb23f64e3efcc3dce0"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -444,6 +444,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "conditional-routing:route-reopen-resume": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
     "conditional-routing:error-route-and-discard": "27dbf1f2d1908a6f6f3df8166bff152e56977d93ffc4061c91c48871c26a282b",
     "fork-multiple-terminals-partial-failure:one-terminal-fails": "e0505f84e778047f4d68a47e27f442d82824b898cf58fe5cb084842cfbbdb925",
+    "fork-multiple-terminals-partial-failure:reopen-after-partial-terminal": "e0505f84e778047f4d68a47e27f442d82824b898cf58fe5cb084842cfbbdb925",
     "fork-coalesce-policies:require-all-union": "aeb887b17d3f6acc17e1fe71e24d1bad8314f6dbe34649e69930d09ff7b31404",
     "fork-coalesce-policies:require-all-nested": "98048b43b03a9870f117c8b2705ccd592e9b9c26329cfcc3891554c9b5778545",
     "fork-coalesce-policies:require-all-select": "254560eaa7db76b9f3303a7dc52cd362421bd6dc0277c95fa6f629445284e3df",
@@ -534,6 +535,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-fork-multiple-terminals-partial-failure-one-terminal-fails",
         "fork-multiple-terminals-partial-failure:one-terminal-fails",
         ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-fork-multiple-terminals-partial-failure-reopen-after-partial-terminal",
+        "fork-multiple-terminals-partial-failure:reopen-after-partial-terminal",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
     *(
         (
@@ -4797,6 +4803,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("conditional-routing", "error-route-and-discard"),
         ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
+        ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
@@ -4825,11 +4832,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 104
+    assert len(manifest.evidence) == 105
     assert len(assessment_evidence) == 61
-    assert len(harness_evidence) == 43
-    assert len({reference.id for reference in manifest.evidence}) == 104
-    assert len({reference.locator for reference in manifest.evidence}) == 104
+    assert len(harness_evidence) == 44
+    assert len({reference.id for reference in manifest.evidence}) == 105
+    assert len({reference.locator for reference in manifest.evidence}) == 105
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4852,6 +4859,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("conditional-routing", "error-route-and-discard"),
         ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
+        ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
@@ -4920,6 +4928,9 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         "harness-fork-multiple-terminals-partial-failure-one-terminal-fails": (
             ("fork-multiple-terminals-partial-failure", "runtime"),
             ("fork-multiple-terminals-partial-failure", "audit"),
+        ),
+        "harness-fork-multiple-terminals-partial-failure-reopen-after-partial-terminal": (
+            ("fork-multiple-terminals-partial-failure", "recovery"),
         ),
         **{
             f"harness-fork-coalesce-policies-{case_id}": (
@@ -5193,6 +5204,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         "conditional-routing/error-route-and-discard.yaml": EXPECTED_ERROR_ROUTE_AND_DISCARD_YAML,
         "conditional-routing/input.csv": EXPECTED_INPUT_CSV,
         "fork-multiple-terminals-partial-failure/one-terminal-fails.yaml": EXPECTED_ONE_TERMINAL_FAILS_YAML,
+        "fork-multiple-terminals-partial-failure/reopen-after-survivor-boundary.yaml": EXPECTED_ONE_TERMINAL_FAILS_YAML,
         "fork-multiple-terminals-partial-failure/input.csv": EXPECTED_INPUT_CSV,
         **{f"fork-coalesce-policies/{case_id}.yaml": expected for case_id, expected in EXPECTED_COALESCE_YAMLS.items()},
         "fork-coalesce-policies/matrix-input.csv": b"id,value\n1,10\n",
@@ -5250,6 +5262,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("conditional-routing", "error-route-and-discard"),
         ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
+        ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     ],

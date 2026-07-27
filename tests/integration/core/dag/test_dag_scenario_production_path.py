@@ -2513,6 +2513,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         ("multiple-independent-sources", "independent-roots-reopen-resume"),
         ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("conditional-routing", "route-reopen-resume"),
+        ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
