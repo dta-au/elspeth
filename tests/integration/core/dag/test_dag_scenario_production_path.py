@@ -737,7 +737,11 @@ def test_b2_coalesce_failure_and_collision_cases_declare_exact_run_oracles(
 
 
 def test_b2_coalesce_full_matrix_declares_exact_contracts(tmp_path: Path) -> None:
-    declared = tuple((scenario.id, case.id) for scenario, case in iter_harness_cases(MANIFEST) if scenario.id == "fork-coalesce-policies")
+    declared = tuple(
+        (scenario.id, case.id)
+        for scenario, case in iter_harness_cases(MANIFEST)
+        if scenario.id == "fork-coalesce-policies" and case.workflow == "run"
+    )
     assert declared == B2_COALESCE_ALL_CASES
 
     for scenario_id, case_id in declared:
@@ -2514,6 +2518,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
+        ("fork-coalesce-policies", "require-all-nested-reopen-after-coalesce"),
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),

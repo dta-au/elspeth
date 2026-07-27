@@ -20,16 +20,14 @@ from tests.fixtures.dag_scenario_corpus.harness import (
     SinkBoundaryInterruptedContext,
     run_sink_boundary_recovery_case,
 )
-from tests.fixtures.dag_scenario_corpus.loader import load_manifest
+from tests.fixtures.dag_scenario_corpus.loader import iter_harness_cases, load_manifest
 from tests.fixtures.dag_scenario_corpus.schema import (
     HarnessCaseSpec,
     ScenarioRunEvidence,
     ScenarioSpec,
-    SemanticRunExpectation,
 )
 
 S6_PENDING_SINK_CASE_ID = "require-all-nested-reopen-after-coalesce"
-_SOURCE_CASE_ID = "require-all-nested"
 _SCENARIO_ID = "fork-coalesce-policies"
 
 
@@ -69,37 +67,17 @@ class _InterruptedS6Facts:
 
 
 def build_s6_pending_sink_case() -> tuple[ScenarioSpec, HarnessCaseSpec]:
-    """Derive the isolated recovery declaration from the maintained S6 case."""
+    """Return the maintained S6 recovery declaration."""
 
-    manifest = load_manifest()
-    scenario = next(item for item in manifest.scenarios if item.id == _SCENARIO_ID)
-    source_case = next(item for item in scenario.cases if item.id == _SOURCE_CASE_ID)
-    if not isinstance(source_case.expected, SemanticRunExpectation):
-        raise AssertionError("S6 source case must retain its exact semantic runtime expectation")
-    required_record_types = tuple(record.record_type for record in source_case.expected.audit_record_counts)
-    case = HarnessCaseSpec.model_validate(
-        {
-            "id": S6_PENDING_SINK_CASE_ID,
-            "workflow": "recovery",
-            "recovery_kind": "sink_boundary",
-            "recovery_fault": {
-                "kind": "sink_effect",
-                "seam": "before_effect",
-                "sink_name": "output",
-                "occurrence": 1,
-            },
-            "fixture": source_case.fixture,
-            "input_fixtures": dict(source_case.input_fixtures),
-            "output_artifacts": {name: artifact.model_dump(mode="json") for name, artifact in source_case.output_artifacts.items()},
-            "expected": {
-                "kind": "summary",
-                "status": "completed",
-                "output_rows": 1,
-                "required_audit_record_types": required_record_types,
-            },
-        }
+    return next(
+        (scenario, case)
+        for scenario, case in iter_harness_cases(load_manifest())
+        if (scenario.id, case.id)
+        == (
+            _SCENARIO_ID,
+            S6_PENDING_SINK_CASE_ID,
+        )
     )
-    return scenario, case
 
 
 def _capture_interrupted_s6_state(

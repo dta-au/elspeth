@@ -407,8 +407,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "b3680a85a0598eb84d201052cb5fb0a38680fd98ca2dacaca8d9a25fd756024e"
-EXPECTED_CASE_REGISTRY_SHA256 = "d8ab85b65bd3a874318a7258cd55c1ba754161ecb97383bb23f64e3efcc3dce0"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "322d6ba48d3a6d1c4fc504b54a54e6c1af6e084180ce9869c4a35684b1a188eb"
+EXPECTED_CASE_REGISTRY_SHA256 = "29454f7a6daca0417afdeaf455f98b95b89a70fe8e327b303fddfd4edc6f0139"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -433,6 +433,12 @@ B2_COALESCE_NEGATIVE_CASE_IDS = (
     "union-collision-fail",
 )
 B2_COALESCE_CASE_IDS = B2_COALESCE_POSITIVE_CASE_IDS + B2_COALESCE_NEGATIVE_CASE_IDS
+B2_COALESCE_REGISTERED_CASE_IDS = (
+    *B2_COALESCE_POSITIVE_CASE_IDS[:2],
+    "require-all-nested-reopen-after-coalesce",
+    *B2_COALESCE_POSITIVE_CASE_IDS[2:],
+    *B2_COALESCE_NEGATIVE_CASE_IDS,
+)
 EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "linear:reopen-after-source": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
@@ -447,6 +453,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "fork-multiple-terminals-partial-failure:reopen-after-partial-terminal": "e0505f84e778047f4d68a47e27f442d82824b898cf58fe5cb084842cfbbdb925",
     "fork-coalesce-policies:require-all-union": "aeb887b17d3f6acc17e1fe71e24d1bad8314f6dbe34649e69930d09ff7b31404",
     "fork-coalesce-policies:require-all-nested": "98048b43b03a9870f117c8b2705ccd592e9b9c26329cfcc3891554c9b5778545",
+    "fork-coalesce-policies:require-all-nested-reopen-after-coalesce": "98048b43b03a9870f117c8b2705ccd592e9b9c26329cfcc3891554c9b5778545",
     "fork-coalesce-policies:require-all-select": "254560eaa7db76b9f3303a7dc52cd362421bd6dc0277c95fa6f629445284e3df",
     "fork-coalesce-policies:first-union": "f032d03c31c3c02366cbbbbff3fdd37c6d70739954b9487f05e5945d974b1f91",
     "fork-coalesce-policies:first-nested": "1e46bd2315844ddc82e8af6063c20c4b9b72cb55c5c363049961bd46a3c06e3d",
@@ -545,9 +552,13 @@ EXPECTED_HARNESS_EVIDENCE = (
         (
             f"harness-fork-coalesce-policies-{case_id}",
             f"fork-coalesce-policies:{case_id}",
-            (("config", "build", "runtime", "audit") if case_id == "union-collision-fail" else ("config", "build", "runtime")),
+            (
+                ("config", "build", "runtime", "audit", "recovery")
+                if case_id == "require-all-nested-reopen-after-coalesce"
+                else (("config", "build", "runtime", "audit") if case_id == "union-collision-fail" else ("config", "build", "runtime"))
+            ),
         )
-        for case_id in B2_COALESCE_CASE_IDS
+        for case_id in B2_COALESCE_REGISTERED_CASE_IDS
     ),
     (
         "harness-sequential-nested-fork-coalesce-two-sequential-require-all",
@@ -4804,7 +4815,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
-        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
+        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
         ("parallel-coalesces", "resume-after-left-finalize"),
@@ -4832,11 +4843,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 105
+    assert len(manifest.evidence) == 106
     assert len(assessment_evidence) == 61
-    assert len(harness_evidence) == 44
-    assert len({reference.id for reference in manifest.evidence}) == 105
-    assert len({reference.locator for reference in manifest.evidence}) == 105
+    assert len(harness_evidence) == 45
+    assert len({reference.id for reference in manifest.evidence}) == 106
+    assert len({reference.locator for reference in manifest.evidence}) == 106
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4860,7 +4871,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
-        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
+        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
         ("parallel-coalesces", "two-parallel-require-all"),
         ("parallel-coalesces", "resume-after-left-finalize"),
@@ -4934,20 +4945,24 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ),
         **{
             f"harness-fork-coalesce-policies-{case_id}": (
-                (
-                    ("fork-coalesce-policies", "config"),
-                    ("fork-coalesce-policies", "build"),
-                    ("fork-coalesce-policies", "runtime"),
-                    ("fork-coalesce-policies", "audit"),
-                )
-                if case_id == "union-collision-fail"
+                (("fork-coalesce-policies", "recovery"),)
+                if case_id == "require-all-nested-reopen-after-coalesce"
                 else (
-                    ("fork-coalesce-policies", "config"),
-                    ("fork-coalesce-policies", "build"),
-                    ("fork-coalesce-policies", "runtime"),
+                    (
+                        ("fork-coalesce-policies", "config"),
+                        ("fork-coalesce-policies", "build"),
+                        ("fork-coalesce-policies", "runtime"),
+                        ("fork-coalesce-policies", "audit"),
+                    )
+                    if case_id == "union-collision-fail"
+                    else (
+                        ("fork-coalesce-policies", "config"),
+                        ("fork-coalesce-policies", "build"),
+                        ("fork-coalesce-policies", "runtime"),
+                    )
                 )
             )
-            for case_id in B2_COALESCE_CASE_IDS
+            for case_id in B2_COALESCE_REGISTERED_CASE_IDS
         },
         "harness-sequential-nested-fork-coalesce-two-sequential-require-all": (
             ("sequential-nested-fork-coalesce", "build"),
@@ -5263,7 +5278,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
-        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
+        *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     ],
 )

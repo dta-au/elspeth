@@ -345,6 +345,11 @@ evidence:
     locator: fork-coalesce-policies:require-all-nested
     claim: The require-all-nested corpus case proves semantic production runtime behavior; canonical parent and derived audit identity are covered by composed-coalesces-canonical-identity.
     stages: [config, build, runtime]
+  - id: harness-fork-coalesce-policies-require-all-nested-reopen-after-coalesce
+    kind: harness
+    locator: fork-coalesce-policies:require-all-nested-reopen-after-coalesce
+    claim: The S6 require-all nested case proves a sequence-0 post-coalesce, pre-publication interruption after source exhaustion; a fresh public resume waits through the live sink-effect lease, reuses the exact one-row/five-token/six-parent lineage plus five scheduler-work and effect/artifact/member identities, reconciles at generation 3, publishes the exact nested output once, terminalizes all five outcomes and work items, removes the checkpoint, and preserves independent durable/export parity. This does not exercise a held coalesce branch, so recovery remains partial and the single-process evidence is provisional until the deferred-platform rebase.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-fork-coalesce-policies-require-all-select
     kind: harness
     locator: fork-coalesce-policies:require-all-select
@@ -3493,6 +3498,42 @@ scenarios:
         output_artifacts:
           output: output.jsonl
         expected: {"kind":"semantic_runtime","status":"completed","sink_outputs":[{"rows":["{\"path_a\":{\"branch_marker\":\"a\",\"id\":1,\"value\":10},\"path_b\":{\"branch_marker\":\"b\",\"id\":1,\"value\":10},\"path_c\":{\"branch_marker\":\"c\",\"id\":1,\"value\":10}}"],"sink_name":"output"}],"rows_processed":1,"rows_succeeded":1,"rows_failed":0,"audit_record_counts":[{"count":1,"record_type":"artifact"},{"count":3,"record_type":"call"},{"count":8,"record_type":"edge"},{"count":1,"record_type":"manifest"},{"count":7,"record_type":"node"},{"count":9,"record_type":"node_state"},{"count":2,"record_type":"operation"},{"count":3,"record_type":"routing_event"},{"count":1,"record_type":"row"},{"count":1,"record_type":"run"},{"count":17,"record_type":"scheduler_event"},{"count":1,"record_type":"sink_effect"},{"count":3,"record_type":"sink_effect_attempt"},{"count":1,"record_type":"sink_effect_member"},{"count":1,"record_type":"sink_effect_stream"},{"count":5,"record_type":"token"},{"count":5,"record_type":"token_outcome"},{"count":6,"record_type":"token_parent"}],"source_operation_count":1,"projection_sha256":"88c9c67826ed8fc40be1d4b51d8235e1c491225012c39e851e2a03755ca0fbb0","projection_counts":{"rows":1,"tokens":5,"parent_links":6,"node_states":9,"routes":3,"terminal_dispositions":5,"scheduler_work":5}}
+      - id: require-all-nested-reopen-after-coalesce
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: output
+          occurrence: 1
+        fixture: fork-coalesce-policies/require-all-nested.yaml
+        input_fixtures:
+          primary: fork-coalesce-policies/matrix-input.csv
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 1
+          required_audit_record_types:
+            - artifact
+            - call
+            - edge
+            - manifest
+            - node
+            - node_state
+            - operation
+            - routing_event
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_attempt
+            - sink_effect_member
+            - sink_effect_stream
+            - token
+            - token_outcome
+            - token_parent
       - id: require-all-select
         workflow: run
         fixture: fork-coalesce-policies/require-all-select.yaml
@@ -3707,10 +3748,12 @@ scenarios:
           - coalesce-union-policy-identity
       recovery:
         status: partial
-        evidence: [focused-crash-restart-02]
-        reason: Selected restart seams pass, but the complete scenario recovery path is not executable evidence.
+        evidence:
+          - focused-crash-restart-02
+          - harness-fork-coalesce-policies-require-all-nested-reopen-after-coalesce
+        reason: Exact post-coalesce, pre-publication recovery evidence passes, but no held coalesce branch is exercised.
         owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
+        exit_gate: A real corpus seam passes while holding one coalesce branch across close, reopen, and public resume without duplicate or lost work.
       concurrency: &concurrency_partial
         status: partial
         reason: Selected contention paths pass without the complete registered scenario matrix.
