@@ -3900,6 +3900,14 @@ def _sink_boundary_work_snapshot(
     return tuple(projections)
 
 
+def _required_sink_boundary_sql_text(value: object, *, field: str) -> str:
+    """Return one exact non-empty SQL identity without coercion or trimming."""
+
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise AssertionError(f"sink-boundary recovery {field} must be non-empty SQL text, got {value!r}")
+    return value
+
+
 def _sink_boundary_effect_projection(
     effects: tuple[dict[str, Any], ...],
     members: tuple[dict[str, Any], ...],
@@ -3908,23 +3916,32 @@ def _sink_boundary_effect_projection(
 ) -> tuple[SinkBoundaryEffectProjection, ...]:
     """Bind each durable effect to its declared sink and ordered member identities."""
 
+    validated_members = tuple(
+        (
+            _required_sink_boundary_sql_text(member.get("effect_id"), field="member.effect_id"),
+            _required_sink_boundary_sql_text(member.get("token_id"), field="member.token_id"),
+            _required_sink_boundary_sql_text(member.get("row_id"), field="member.row_id"),
+        )
+        for member in members
+    )
     projections: list[SinkBoundaryEffectProjection] = []
     for effect in effects:
-        effect_id = str(effect["effect_id"])
-        sink_node_id = str(effect["sink_node_id"])
+        effect_id = _required_sink_boundary_sql_text(effect.get("effect_id"), field="effect.effect_id")
+        sink_node_id = _required_sink_boundary_sql_text(effect.get("sink_node_id"), field="effect.sink_node_id")
+        artifact_id = _required_sink_boundary_sql_text(effect.get("artifact_id"), field="effect.artifact_id")
         sink_name = sink_names_by_node_id.get(sink_node_id)
         if sink_name is None:
             raise AssertionError(f"sink-boundary recovery effect targets an undeclared sink node: {sink_node_id!r}")
-        effect_members = tuple(member for member in members if str(member["effect_id"]) == effect_id)
+        effect_members = tuple(member for member in validated_members if member[0] == effect_id)
         projections.append(
             SinkBoundaryEffectProjection(
                 effect_id=effect_id,
                 sink_name=sink_name,
                 sink_node_id=sink_node_id,
-                artifact_id=str(effect["artifact_id"]),
+                artifact_id=artifact_id,
                 state=str(effect["state"]),
-                member_token_ids=tuple(str(member["token_id"]) for member in effect_members),
-                member_row_ids=tuple(str(member["row_id"]) for member in effect_members),
+                member_token_ids=tuple(member[1] for member in effect_members),
+                member_row_ids=tuple(member[2] for member in effect_members),
             )
         )
     return tuple(projections)
@@ -4816,16 +4833,21 @@ def run_sink_boundary_recovery_case(
     original_coordinator_init = SinkEffectCoordinator.__init__
     corpus_lease_ttl = timedelta(seconds=3)
 
-    def initialize_with_bounded_corpus_lease(
+    def initialize_interrupted_run_coordinator(
         self: SinkEffectCoordinator,
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        kwargs.update(lease_ttl=corpus_lease_ttl, poll_interval=0.05)
+        if kwargs.get("fault_hook") is not None:
+            raise AssertionError("sink-boundary recovery initial coordinator refuses a caller-supplied fault_hook")
+        kwargs.update(
+            lease_ttl=corpus_lease_ttl,
+            poll_interval=0.05,
+            fault_hook=inject_declared_fault,
+        )
         original_coordinator_init(self, *args, **kwargs)
 
     def inject_declared_fault(
-        _coordinator: SinkEffectCoordinator,
         seam: SinkEffectExecutionSeam,
     ) -> None:
         if seam is not target_seam:
@@ -4851,12 +4873,17 @@ def run_sink_boundary_recovery_case(
         if len(observed_target_seams) == fault.occurrence:
             raise SinkEffectInjectedFault(seam)
 
+    def initialize_resume_coordinator(
+        self: SinkEffectCoordinator,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        kwargs.update(lease_ttl=corpus_lease_ttl, poll_interval=0.05)
+        original_coordinator_init(self, *args, **kwargs)
+
     try:
         catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
-        with (
-            patch.object(SinkEffectCoordinator, "__init__", new=initialize_with_bounded_corpus_lease),
-            patch.object(SinkEffectCoordinator, "_fault", new=inject_declared_fault),
-        ):
+        with patch.object(SinkEffectCoordinator, "__init__", new=initialize_interrupted_run_coordinator):
             try:
                 Orchestrator(
                     require_initial_database(),
@@ -5013,7 +5040,7 @@ def run_sink_boundary_recovery_case(
             raise AssertionError("sink-boundary recovery did not use its public reopened resume point")
 
         fresh_checkpoint_config = RuntimeCheckpointConfig.from_settings(fresh_rendered.settings.checkpoint)
-        with patch.object(SinkEffectCoordinator, "__init__", new=initialize_with_bounded_corpus_lease):
+        with patch.object(SinkEffectCoordinator, "__init__", new=initialize_resume_coordinator):
             result = Orchestrator(
                 reopened_db,
                 checkpoint_manager=reopened_checkpoint_manager,

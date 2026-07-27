@@ -1357,6 +1357,50 @@ def test_response_lost_oracle_rejects_independent_material_drift(
     )
 
 
+@pytest.mark.parametrize(
+    ("location", "field", "value", "qualified_field"),
+    (
+        ("effect", "artifact_id", None, "effect.artifact_id"),
+        ("effect", "effect_id", 17, "effect.effect_id"),
+        ("effect", "sink_node_id", "", "effect.sink_node_id"),
+        ("member", "effect_id", None, "member.effect_id"),
+        ("member", "token_id", None, "member.token_id"),
+        ("member", "row_id", None, "member.row_id"),
+    ),
+)
+def test_sink_boundary_effect_projection_rejects_non_text_sql_identity(
+    location: str,
+    field: str,
+    value: object,
+    qualified_field: str,
+) -> None:
+    effects: list[dict[str, object]] = [
+        {
+            "effect_id": "effect-1",
+            "sink_node_id": "sink-output",
+            "artifact_id": "artifact-1",
+            "state": "in_flight",
+        }
+    ]
+    members: list[dict[str, object]] = [
+        {
+            "effect_id": "effect-1",
+            "token_id": "token-1",
+            "row_id": "row-1",
+        }
+    ]
+    target = effects[0] if location == "effect" else members[0]
+    target[field] = value
+
+    with pytest.raises(AssertionError) as exc_info:
+        corpus_harness._sink_boundary_effect_projection(
+            tuple(effects),
+            tuple(members),
+            sink_names_by_node_id={"sink-output": "output"},
+        )
+    assert str(exc_info.value) == (f"sink-boundary recovery {qualified_field} must be non-empty SQL text, got {value!r}")
+
+
 def _plural_binding_case_values() -> dict[str, object]:
     return {
         "id": "plural-bindings",
@@ -1664,7 +1708,7 @@ def _valid_sink_boundary_recovery() -> SinkBoundaryRecoveryEvidence:
         update={
             "row_payload_sha256": "2" * 64,
             "row_payload_state": "purged",
-            "row_payload_anchor_sha256": "3" * 64,
+            "row_payload_anchor_sha256": hashlib.sha256(before_work.token_id.encode()).hexdigest(),
             "status": "terminal",
         }
     )
@@ -4167,6 +4211,7 @@ def test_sink_boundary_recovery_pins_exact_work_effect_and_resume_identity() -> 
         ("effect-artifact", "preserve exact effect and member identity"),
         ("effect-state", "finalize the original effect identity"),
         ("payload-state", "transition pending-sink payloads"),
+        ("payload-anchor", "pending-sink purge anchor must equal the token identity hash"),
     ),
 )
 def test_sink_boundary_recovery_rejects_identity_and_payload_drift(mutation: str, message: str) -> None:
@@ -4177,14 +4222,47 @@ def test_sink_boundary_recovery_rejects_identity_and_payload_drift(mutation: str
         cast(list[dict[str, object]], values["effects_after"])[0]["artifact_id"] = "7" * 64
     elif mutation == "effect-state":
         cast(list[dict[str, object]], values["effects_after"])[0]["state"] = "in_flight"
-    else:
+    elif mutation == "payload-state":
         cast(list[dict[str, object]], values["work_after"])[0].update(
             row_payload_state="live",
             row_payload_anchor_sha256=None,
         )
+    else:
+        cast(list[dict[str, object]], values["work_after"])[0]["row_payload_anchor_sha256"] = "3" * 64
 
     with pytest.raises(ValidationError, match=message):
         SinkBoundaryRecoveryEvidence.model_validate(values)
+
+
+def test_sink_boundary_recovery_preserves_non_token_anchor_for_already_terminal_work() -> None:
+    proof = _valid_sink_boundary_recovery()
+    terminal_work = proof.work_before[0].model_copy(
+        update={
+            "work_item_id": "work-0",
+            "token_id": "token-0",
+            "row_id": "row-0",
+            "row_payload_sha256": "8" * 64,
+            "row_payload_state": "purged",
+            "row_payload_anchor_sha256": "9" * 64,
+            "node_id": "barrier-1",
+            "status": "terminal",
+            "pending_sink_name": None,
+            "pending_outcome": None,
+            "pending_path": None,
+            "pending_error_hash": None,
+            "pending_error_message": None,
+        }
+    )
+    values = proof.model_dump(mode="json")
+    values["token_ids_before"] = ["token-0", "token-1"]
+    values["token_ids_after"] = ["token-0", "token-1"]
+    cast(list[dict[str, object]], values["work_before"]).insert(0, terminal_work.model_dump(mode="json"))
+    cast(list[dict[str, object]], values["work_after"]).insert(0, terminal_work.model_dump(mode="json"))
+
+    validated = SinkBoundaryRecoveryEvidence.model_validate(values)
+
+    assert validated.work_before[0].row_payload_anchor_sha256 == "9" * 64
+    assert validated.work_after[0] == validated.work_before[0]
 
 
 @pytest.mark.parametrize(

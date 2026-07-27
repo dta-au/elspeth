@@ -2209,6 +2209,22 @@ def test_linear_sink_boundary_recovery_reopens_and_resumes_without_reminting(
     monkeypatch.setattr(Orchestrator, "run", production_run)
     monkeypatch.setattr(Orchestrator, "resume", production_resume)
     install_corpus_plugin_manager(monkeypatch)
+    coordinator_fault_hooks: list[object | None] = []
+    production_coordinator_init = corpus_harness.SinkEffectCoordinator.__init__
+
+    def record_coordinator_fault_hook(
+        self: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        coordinator_fault_hooks.append(kwargs.get("fault_hook"))
+        production_coordinator_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        corpus_harness.SinkEffectCoordinator,
+        "__init__",
+        record_coordinator_fault_hook,
+    )
     built_identity_tuples: list[tuple[int, int, int, int, int, int]] = []
     production_build = corpus_harness.build_scenario
 
@@ -2355,6 +2371,9 @@ def test_linear_sink_boundary_recovery_reopens_and_resumes_without_reminting(
 
     _assert_declared_recovery_evidence(scenario, case, evidence)
     assert len(interrupted_facts) == 1
+    assert len(coordinator_fault_hooks) == 2
+    assert callable(coordinator_fault_hooks[0])
+    assert coordinator_fault_hooks[1] is None
     assert observed_terminal_statuses == [RunStatus.COMPLETED]
     assert interrupted_facts[0]["completed_node_state_count"] == 6
     assert len(built_identity_tuples) == 2

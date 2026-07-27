@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -2019,6 +2020,9 @@ class SinkBoundaryRecoveryEvidence(ClosedModel):
                     raise ValueError(
                         "sink-boundary recovery must transition pending-sink payloads from live material to a typed purge witness"
                     )
+                expected_anchor = hashlib.sha256(before_work.token_id.encode()).hexdigest()
+                if after_work.row_payload_anchor_sha256 != expected_anchor:
+                    raise ValueError("sink-boundary recovery pending-sink purge anchor must equal the token identity hash")
             elif (
                 before_work.row_payload_state != "purged"
                 or after_work.row_payload_state != "purged"
