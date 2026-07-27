@@ -168,7 +168,7 @@ def _settings(tmp_path: Path, *, session_url: str, landscape_url: str) -> WebSet
         payload_store_path=payload_dir,
         session_db_url=session_url,
         landscape_url=landscape_url,
-        secret_key="s" * 40,
+        secret_key="this-validate-only-startup-secret-is-long-enough",
         shareable_link_signing_key=SecretBytes(bytes(range(32))),
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
