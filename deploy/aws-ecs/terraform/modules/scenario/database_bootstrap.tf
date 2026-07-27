@@ -1,6 +1,8 @@
 locals {
   database_bootstrap_script = <<-PY
     import os
+    import urllib.request
+    from pathlib import Path
     from urllib.parse import urlsplit, urlunsplit
 
     import psycopg
@@ -15,6 +17,13 @@ locals {
         os.environ["ELSPETH_DB_SESSION_DATABASE"],
         os.environ["ELSPETH_DB_LANDSCAPE_DATABASE"],
     ]
+    rds_ca = Path("/tmp/rds-global-bundle.pem")
+    rds_ca.write_bytes(
+        urllib.request.urlopen(
+            "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem",
+            timeout=20,
+        ).read()
+    )
 
     def database_url(database: str) -> str:
         parsed = urlsplit(admin_url)

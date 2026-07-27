@@ -58,7 +58,14 @@ EXPECTED_FILES = {
 
 
 def _source_files() -> list[Path]:
-    return [path for path in PACKAGE.rglob("*") if path.is_file() and ".terraform" not in path.relative_to(PACKAGE).parts]
+    return [
+        path
+        for path in PACKAGE.rglob("*")
+        if path.is_file()
+        and ".terraform" not in path.relative_to(PACKAGE).parts
+        and not path.name.endswith((".tfstate", ".tfplan"))
+        and ".tfstate." not in path.name
+    ]
 
 
 def _text(relative: str) -> str:
@@ -211,6 +218,15 @@ def test_database_topology_is_aurora_with_separate_databases_and_roles() -> None
     assert "ALTER ROLE IF EXISTS" not in bootstrap
     assert "aws_secretsmanager_secret_version.bootstrap" in bootstrap
     assert "landscape_passphrase" not in _all_text().lower()
+    assert storage.count("sslmode=verify-full") == 5
+    assert storage.count("sslrootcert=${local.data_dir}/rds-global-bundle.pem") == 4
+    assert storage.count("sslrootcert=/tmp/rds-global-bundle.pem") == 1
+    assert '?sslmode=require"' not in storage
+    assert re.search(r"posix_user\s*{\s*uid\s*=\s*1654\s*gid\s*=\s*1654", storage, re.DOTALL)
+    assert re.search(r"creation_info\s*{\s*owner_uid\s*=\s*1654\s*owner_gid\s*=\s*1654", storage, re.DOTALL)
+    assert 'path = "/elspeth-${local.namespace}"' in storage
+    assert "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" in bootstrap
+    assert "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" in _text("modules/scenario/ecs.tf")
     for relative in (
         "modules/scenario/variables.tf",
         "scenario-a/variables.tf",

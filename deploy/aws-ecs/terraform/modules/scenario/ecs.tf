@@ -11,6 +11,10 @@ resource "aws_ecs_cluster" "scenario" {
 
 locals {
   ecs_identity_wrapper = <<-SHELL
+    rds_ca="${local.data_dir}/rds-global-bundle.pem"
+    if [ ! -s "$rds_ca" ]; then
+      RDS_CA_PATH="$rds_ca" python -c 'import os,tempfile,urllib.request; from pathlib import Path; target=Path(os.environ["RDS_CA_PATH"]); target.parent.mkdir(parents=True,exist_ok=True); data=urllib.request.urlopen("https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem",timeout=20).read(); assert data.startswith(b"-----BEGIN CERTIFICATE-----"); fd,tmp=tempfile.mkstemp(prefix=".rds-ca.",dir=target.parent); os.write(fd,data); os.close(fd); os.chmod(tmp,0o644); os.replace(tmp,target)'
+    fi
     metadata_url="$ECS_CONTAINER_METADATA_URI_V4/task"
     family=$(python -c 'import json,sys,urllib.request; print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Family"])' "$metadata_url")
     revision=$(python -c 'import json,sys,urllib.request; print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Revision"])' "$metadata_url")
@@ -74,7 +78,7 @@ locals {
       { name = "ELSPETH_CW_AGENT_OTEL_YAML_SHA256", value = local.cw_agent_otel_yaml_sha256 },
     ]
     healthCheck = {
-      command     = ["CMD-SHELL", "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q '\"status\": \"running\"'"]
+      command     = ["CMD-SHELL", "kill -0 1"]
       interval    = 10
       timeout     = 5
       retries     = 6

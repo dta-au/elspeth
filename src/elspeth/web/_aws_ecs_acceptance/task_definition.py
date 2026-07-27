@@ -48,7 +48,9 @@ _SECRET_ARN_SUFFIX_PATTERN = re.compile(r"(.+)-[A-Za-z0-9]{6}\Z")
 _CLOUDWATCH_AGENT_CONFIG_MAX_BYTES = 16 * 1024
 _CLOUDWATCH_AGENT_CONFIG_MAX_BASE64_CHARS = 4 * ((_CLOUDWATCH_AGENT_CONFIG_MAX_BYTES + 2) // 3)
 _CLOUDWATCH_AGENT_COMMAND = (
-    "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; CTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl; "
+    "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; "
+    "TRANSLATOR=/opt/aws/amazon-cloudwatch-agent/bin/config-translator; "
+    "AGENT=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent; "
     'mkdir -p "$CONFIG_DIR"; printf \'%s\' "$ELSPETH_CW_AGENT_CONFIG_JSON_B64" | base64 -d > '
     "\"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' "
     '"$ELSPETH_CW_AGENT_OTEL_YAML_B64" | base64 -d > '
@@ -56,15 +58,16 @@ _CLOUDWATCH_AGENT_COMMAND = (
     '"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" | '
     "sha256sum -c -; printf '%s\\n' "
     '"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml" | '
-    'sha256sum -c -; "$CTL" -a fetch-config -m auto -c '
-    '"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" -s; "$CTL" -a append-config -m auto -c '
-    '"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml" -s; while "$CTL" -a status -m auto '
-    '| grep -q \'"status": "running"\'; do sleep 30; done; exit 1'
+    'sha256sum -c -; "$TRANSLATOR" -mode auto -os linux '
+    '-input "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" '
+    '-output "/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml"; '
+    'exec "$AGENT" -config "/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml" '
+    '-otelconfig "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml"'
 )
 _CLOUDWATCH_AGENT_HEALTH_CHECK = {
     "command": [
         "CMD-SHELL",
-        '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q \'"status": "running"\'',
+        "kill -0 1",
     ],
     "interval": 10,
     "timeout": 5,

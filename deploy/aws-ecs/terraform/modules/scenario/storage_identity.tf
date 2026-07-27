@@ -84,8 +84,8 @@ resource "aws_secretsmanager_secret" "runtime" {
 resource "aws_secretsmanager_secret_version" "runtime" {
   secret_id = aws_secretsmanager_secret.runtime.id
   secret_string = jsonencode({
-    session_url                = "postgresql+psycopg://${local.database_runtime_role}:${random_password.database_runtime.result}@${aws_rds_cluster.database.endpoint}:5432/${local.session_database}?sslmode=require"
-    landscape_url              = "postgresql+psycopg://${local.database_runtime_role}:${random_password.database_runtime.result}@${aws_rds_cluster.database.endpoint}:5432/${local.landscape_database}?sslmode=require"
+    session_url                = "postgresql+psycopg://${local.database_runtime_role}:${random_password.database_runtime.result}@${aws_rds_cluster.database.endpoint}:5432/${local.session_database}?sslmode=verify-full&sslrootcert=${local.data_dir}/rds-global-bundle.pem"
+    landscape_url              = "postgresql+psycopg://${local.database_runtime_role}:${random_password.database_runtime.result}@${aws_rds_cluster.database.endpoint}:5432/${local.landscape_database}?sslmode=verify-full&sslrootcert=${local.data_dir}/rds-global-bundle.pem"
     secret_key                 = random_password.secret_key.result
     shareable_link_signing_key = random_password.shareable_link.result
   })
@@ -101,8 +101,8 @@ resource "aws_secretsmanager_secret" "schema" {
 resource "aws_secretsmanager_secret_version" "schema" {
   secret_id = aws_secretsmanager_secret.schema.id
   secret_string = jsonencode({
-    session_url   = "postgresql+psycopg://${local.database_schema_role}:${random_password.database_schema.result}@${aws_rds_cluster.database.endpoint}:5432/${local.session_database}?sslmode=require"
-    landscape_url = "postgresql+psycopg://${local.database_schema_role}:${random_password.database_schema.result}@${aws_rds_cluster.database.endpoint}:5432/${local.landscape_database}?sslmode=require"
+    session_url   = "postgresql+psycopg://${local.database_schema_role}:${random_password.database_schema.result}@${aws_rds_cluster.database.endpoint}:5432/${local.session_database}?sslmode=verify-full&sslrootcert=${local.data_dir}/rds-global-bundle.pem"
+    landscape_url = "postgresql+psycopg://${local.database_schema_role}:${random_password.database_schema.result}@${aws_rds_cluster.database.endpoint}:5432/${local.landscape_database}?sslmode=verify-full&sslrootcert=${local.data_dir}/rds-global-bundle.pem"
   })
 }
 
@@ -116,7 +116,7 @@ resource "aws_secretsmanager_secret" "bootstrap" {
 resource "aws_secretsmanager_secret_version" "bootstrap" {
   secret_id = aws_secretsmanager_secret.bootstrap.id
   secret_string = jsonencode({
-    admin_url        = "postgresql://elspeth_admin:${random_password.database.result}@${aws_rds_cluster.database.endpoint}:5432/${var.database_name}?sslmode=require" # secret-scan: allow-this-line -- generated value, never literal material
+    admin_url        = "postgresql://elspeth_admin:${random_password.database.result}@${aws_rds_cluster.database.endpoint}:5432/${var.database_name}?sslmode=verify-full&sslrootcert=/tmp/rds-global-bundle.pem" # secret-scan: allow-this-line -- generated value, never literal material
     schema_password  = random_password.database_schema.result
     runtime_password = random_password.database_runtime.result
   })
@@ -145,16 +145,16 @@ resource "aws_efs_access_point" "data" {
   file_system_id = aws_efs_file_system.data.id
 
   posix_user {
-    uid = 1000
-    gid = 1000
+    uid = 1654
+    gid = 1654
   }
 
   root_directory {
-    path = "/elspeth"
+    path = "/elspeth-${local.namespace}"
 
     creation_info {
-      owner_uid   = 1000
-      owner_gid   = 1000
+      owner_uid   = 1654
+      owner_gid   = 1654
       permissions = "0750"
     }
   }
