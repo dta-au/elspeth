@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from pathlib import Path
@@ -416,6 +417,19 @@ def test_schema_init_and_runtime_doctors_have_separate_credentials_and_commands(
     both_exit_zero = readme.index("Both task exit codes must be `0`", runtime_doctor)
     explicit_enable = readme.index("service_enable_command", both_exit_zero)
     assert schema_init < runtime_doctor < both_exit_zero < explicit_enable
+
+
+def test_acceptance_verifier_containers_use_the_live_published_identity() -> None:
+    validator_source = inspect.getsource(task_definition.validate_task_definition_policy_binding)
+    published_user_match = re.search(r'expected_user\s*!=\s*"([^"]+)"', validator_source)
+    assert published_user_match is not None
+    published_user = published_user_match.group(1)
+
+    ecs = _text("modules/scenario/ecs.tf")
+    payload = ecs[ecs.index("payload_container = {") : ecs.index("local_auth_container = {")]
+    local_auth = ecs[ecs.index("local_auth_container = {") : ecs.index("rollback_environment = [")]
+    for container in (payload, local_auth):
+        assert re.search(rf'\buser\s*=\s*"{re.escape(published_user)}"', container)
 
 
 def test_scenario_b_inventory_has_a_validated_nonempty_cognito_subject() -> None:

@@ -146,7 +146,7 @@ locals {
     name             = local.web_container_name
     image            = var.candidate_image
     essential        = true
-    user             = "1000:1000"
+    user             = "1654:1654"
     entryPoint       = ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
     command          = ["provision-storage"]
     environment      = local.runtime_environment
@@ -159,7 +159,7 @@ locals {
     name             = local.web_container_name
     image            = var.candidate_image
     essential        = true
-    user             = "1000:1000"
+    user             = "1654:1654"
     entryPoint       = ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
     command          = ["verify-local-auth"]
     environment      = local.runtime_environment
