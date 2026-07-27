@@ -525,10 +525,8 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
                 "patch": {
                     INTERPRETATION_REQUIREMENTS_KEY: [
                         {
-                            "id": "drop_raw_html_review",
                             "kind": "pipeline_decision",
                             "user_term": "drop_raw_html_fields",
-                            "status": "pending",
                             "draft": "Drop the scraped raw HTML and fingerprint fields before saving the JSON output.",
                         }
                     ]

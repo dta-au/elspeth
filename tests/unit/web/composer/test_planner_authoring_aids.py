@@ -975,5 +975,6 @@ class TestRun3PackEdits:
         assert len(rows) == 1
         assert rows[0]["kind"] == "vague_term"
         assert rows[0]["user_term"] == "urgency"
+        assert set(rows[0]) == {"kind", "user_term", "draft"}
         parts = urgency["options"]["prompt_template_parts"]
-        assert any(p.get("kind") == "interpretation_ref" and p.get("requirement_id") == rows[0]["id"] for p in parts)
+        assert any(p.get("kind") == "interpretation_ref" and p.get("requirement_id") == "urgency:assess_urgency" for p in parts)

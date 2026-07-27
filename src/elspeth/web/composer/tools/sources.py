@@ -43,6 +43,8 @@ from elspeth.web.composer.tools._common import (
     ToolResult,
     _apply_merge_patch,
     _attach_post_call_hints,
+    _canonical_interpretation_requirement_error,
+    _canonicalize_authored_interpretation_requirements,
     _credential_wiring_contract_failure,
     _discovery_result,
     _failure_result,
@@ -52,6 +54,7 @@ from elspeth.web.composer.tools._common import (
     _plugin_policy_failure,
     _prevalidate_source,
     _resolver_owned_interpretation_requirement_error,
+    _source_review_requirement_id,
     _validate_plugin_name,
     _validate_source_path,
     _vf_destination_note,
@@ -288,13 +291,14 @@ def _options_with_source_blob_review(
     *,
     mime_type: str,
     content: str,
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Ensure LLM-authored blob-backed sources carry a Class 2 review gate."""
     if SOURCE_AUTHORING_KEY not in options:
         return options
     user_term = _source_blob_review_user_term(mime_type=mime_type, content=content)
     requirement = _pending_interpretation_requirement(
-        requirement_id=f"source_review:{user_term}",
+        requirement_id=_source_review_requirement_id(user_term),
         kind=InterpretationKind.INVENTED_SOURCE,
         user_term=user_term,
         draft=content,
@@ -303,6 +307,7 @@ def _options_with_source_blob_review(
         options,
         requirement=requirement,
         replace_kind=InterpretationKind.INVENTED_SOURCE,
+        existing_options=existing_options,
     )
 
 
@@ -354,6 +359,7 @@ def _resolve_source_blob(
     session_engine: Engine | None,
     session_id: str | None,
     tool_name: str = "set_source_from_blob",
+    existing_options: Mapping[str, Any] | None = None,
 ) -> _ResolvedSourceBlob | ToolResult:
     """Resolve an existing ready blob into authoritative source options."""
     if session_engine is None or session_id is None:
@@ -382,11 +388,6 @@ def _resolve_source_blob(
     else:
         plugin, mime_extra = _MIME_TO_SOURCE[blob["mime_type"]]
 
-    try:
-        catalog.get_schema("source", plugin)
-    except (ValueError, KeyError) as exc:
-        return _failure_result(state, f"Unknown source plugin '{plugin}': {exc}")
-
     creation_modality = CreationModality(blob["creation_modality"])
     merged_options: Mapping[str, Any] = {
         **caller_options,
@@ -414,7 +415,22 @@ def _resolve_source_blob(
             merged_options,
             mime_type=blob["mime_type"],
             content=content,
+            existing_options=existing_options,
         )
+    canonical_error = _canonical_interpretation_requirement_error(
+        merged_options,
+        tool_name=tool_name,
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
+        )
+    try:
+        catalog.get_schema("source", plugin)
+    except (ValueError, KeyError) as exc:
+        return _failure_result(state, f"Unknown source plugin '{plugin}': {exc}")
     prevalidation_error = _prevalidate_source(plugin, merged_options, on_validation_failure)
     if prevalidation_error is not None:
         return _failure_result(state, prevalidation_error)
@@ -482,9 +498,35 @@ def _execute_set_source(
         ) from exc
 
     plugin = validated.plugin
-    options = validated.options
+    options: Mapping[str, Any] = validated.options
     source_name = validated.source_name
     _validate_source_name_argument(source_name)
+
+    # Stage A validates the untrusted compact shell before any plugin work.
+    review_metadata_error = _resolver_owned_interpretation_requirement_error(
+        options,
+        tool_name="set_source",
+        component_id=_source_component_id(source_name),
+        source=True,
+    )
+    if review_metadata_error is not None:
+        return _failure_result(state, review_metadata_error)
+    options = _canonicalize_authored_interpretation_requirements(
+        options,
+        component_id=_source_component_id(source_name),
+        source=True,
+        existing_options=state.sources[source_name].options if source_name in state.sources else None,
+    )
+    canonical_error = _canonical_interpretation_requirement_error(
+        options,
+        tool_name="set_source",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
+        )
 
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(plugin, options)
     if endpoint_policy_error is not None:
@@ -507,13 +549,6 @@ def _execute_set_source(
     manual_authoring_error = _reject_manual_source_authoring(options, tool_name="set_source")
     if manual_authoring_error is not None:
         return _failure_result(state, manual_authoring_error)
-    # Reject LLM-supplied resolver-owned review metadata (a forged "resolved"
-    # INVENTED_SOURCE requirement would bypass _pending_source_sites' human
-    # review). Symmetric with the LLM-node write paths; resolved review metadata
-    # may only be written by resolve_interpretation_event.
-    review_metadata_error = _resolver_owned_interpretation_requirement_error(options, tool_name="set_source")
-    if review_metadata_error is not None:
-        return _failure_result(state, review_metadata_error)
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=_source_component_id(source_name),
@@ -594,29 +629,40 @@ def _execute_set_source_from_blob(
     source_name = validated.source_name
     _validate_source_name_argument(source_name)
 
-    endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(validated.plugin, validated.options)
-    if endpoint_policy_error is not None:
-        return _failure_result(state, endpoint_policy_error)
-
     # Caller options merge into the bound source's options, so a forged
     # "resolved" INVENTED_SOURCE requirement here would bypass human review even
     # though the blob path also re-stamps a pending requirement — guard at the
     # boundary rather than relying on that downstream overwrite.
-    review_metadata_error = _resolver_owned_interpretation_requirement_error(validated.options, tool_name="set_source_from_blob")
+    review_metadata_error = _resolver_owned_interpretation_requirement_error(
+        validated.options,
+        tool_name="set_source_from_blob",
+        component_id=_source_component_id(source_name),
+        source=True,
+    )
     if review_metadata_error is not None:
         return _failure_result(state, review_metadata_error)
+    caller_options = _canonicalize_authored_interpretation_requirements(
+        validated.options,
+        component_id=_source_component_id(source_name),
+        source=True,
+        existing_options=state.sources[source_name].options if source_name in state.sources else None,
+    )
+    endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(validated.plugin, caller_options)
+    if endpoint_policy_error is not None:
+        return _failure_result(state, endpoint_policy_error)
 
     on_vf = validated.on_validation_failure if validated.on_validation_failure is not None else _DEFAULT_SOURCE_VALIDATION_FAILURE
     resolved = _resolve_source_blob(
         blob_id=validated.blob_id,
         explicit_plugin=validated.plugin,
-        caller_options=validated.options,
+        caller_options=caller_options,
         on_validation_failure=on_vf,
         state=state,
         catalog=context.catalog,
         session_engine=context.session_engine,
         session_id=context.session_id,
         tool_name="set_source_from_blob",
+        existing_options=state.sources[source_name].options if source_name in state.sources else None,
     )
     if isinstance(resolved, ToolResult):
         return resolved
@@ -916,7 +962,7 @@ def _execute_patch_source_options(
     if source_name not in state.sources:
         return _failure_result(state, f"No source named '{source_name}' configured to patch.")
     current_source = state.sources[source_name]
-    patch = validated.patch
+    patch: Mapping[str, Any] = validated.patch
 
     manual_authoring_error = _reject_manual_source_authoring(patch, tool_name="patch_source_options")
     if manual_authoring_error is not None:
@@ -925,9 +971,20 @@ def _execute_patch_source_options(
     # carries a forged "resolved" INVENTED_SOURCE requirement is the live review
     # bypass vector. Checking the delta — mirroring patch_node_options — leaves a
     # legitimately-resolved requirement already in stored options untouched.
-    review_metadata_error = _resolver_owned_interpretation_requirement_error(patch, tool_name="patch_source_options")
+    review_metadata_error = _resolver_owned_interpretation_requirement_error(
+        patch,
+        tool_name="patch_source_options",
+        component_id=_source_component_id(source_name),
+        source=True,
+    )
     if review_metadata_error is not None:
         return _failure_result(state, review_metadata_error)
+    patch = _canonicalize_authored_interpretation_requirements(
+        patch,
+        component_id=_source_component_id(source_name),
+        source=True,
+        existing_options=current_source.options,
+    )
     if "blob_ref" in patch:
         return _failure_result(
             state,
@@ -953,7 +1010,17 @@ def _execute_patch_source_options(
                 "clear_source first) to change the underlying blob.",
             )
 
-    new_options = _apply_merge_patch(current_source.options, patch)
+    new_options = _apply_merge_patch(current_source.options, dict(patch))
+    canonical_error = _canonical_interpretation_requirement_error(
+        new_options,
+        tool_name="patch_source_options",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
+        )
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(current_source.plugin, new_options)
     if endpoint_policy_error is not None:
         return _failure_result(state, endpoint_policy_error)

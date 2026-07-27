@@ -8,12 +8,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext
 from elspeth.web.composer.tools.sessions import _execute_get_pipeline_state, _execute_set_pipeline
+from elspeth.web.composer.tools.transforms import _execute_patch_node_options, _execute_upsert_node
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -157,10 +159,8 @@ def test_exact_authoring_payload_validates_and_omits_server_owned_review_fields(
     assert "resolved_prompt_template_hash" not in options
     shell = options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert shell == {
-        "id": "model_choice_review:model",
         "kind": InterpretationKind.LLM_MODEL_CHOICE.value,
         "user_term": "llm_model_choice:model",
-        "status": "pending",
         "draft": model,
     }
 
@@ -382,6 +382,95 @@ def test_pipeline_decision_review_uses_kind_and_user_term_hash_authority() -> No
     assert reconciled.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]["status"] == "resolved"
 
 
+def _reviewed_web_scrape_state() -> tuple[CompositionState, dict[str, object]]:
+    options: dict[str, object] = {
+        "url_field": "url",
+        "content_field": "page_text",
+        "fingerprint_field": "page_fingerprint",
+        "format": "text",
+        "http": {
+            "abuse_contact": "review@foundryside.dev",
+            "scraping_reason": "authoritative mutation test",
+            "allowed_hosts": "public_only",
+        },
+        "schema": {"mode": "observed"},
+    }
+    node = _node(node_id="scrape", plugin="web_scrape", options=options)
+    resolved = _requirement(
+        requirement_id=f"{WEB_SCRAPE_HTTP_IDENTITY_USER_TERM}:scrape",
+        kind=InterpretationKind.PIPELINE_DECISION,
+        user_term=WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+        status="resolved",
+        draft="Approve the configured web scraping identity.",
+        accepted_value="approved",
+        accepted_artifact_hash=pipeline_decision_artifact_hash(
+            node,
+            (node,),
+            user_term=WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+        ),
+    )
+    return (
+        _state(nodes=(replace(node, options={**options, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}),)),
+        options,
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["upsert_node", "patch_node_options"])
+@pytest.mark.parametrize("reviewed_field_changed", [False, True], ids=["unrelated-field", "reviewed-field"])
+def test_node_mutations_reconcile_review_authority(
+    tool_name: str,
+    reviewed_field_changed: bool,
+) -> None:
+    """Every direct node writer preserves only still-coherent review evidence."""
+    state, options = _reviewed_web_scrape_state()
+    if reviewed_field_changed:
+        changed_options = {
+            **options,
+            "http": {
+                **options["http"],
+                "scraping_reason": "materially changed identity",
+            },
+        }
+    else:
+        changed_options = {**options, "content_field": "body_text"}
+
+    if tool_name == "upsert_node":
+        result = _execute_upsert_node(
+            {
+                "id": "scrape",
+                "node_type": "transform",
+                "plugin": "web_scrape",
+                "input": "in",
+                "on_success": "out",
+                "on_error": "discard",
+                "options": {
+                    **changed_options,
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": InterpretationKind.PIPELINE_DECISION.value,
+                            "user_term": WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+                            "draft": "Approve the configured web scraping identity.",
+                        }
+                    ],
+                },
+            },
+            state,
+            _trained_context(),
+        )
+    else:
+        patch = {"http": changed_options["http"]} if reviewed_field_changed else {"content_field": changed_options["content_field"]}
+        result = _execute_patch_node_options(
+            {"node_id": "scrape", "patch": patch},
+            state,
+            _trained_context(),
+        )
+
+    assert result.success, result.data
+    requirement = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert requirement["status"] == ("pending" if reviewed_field_changed else "resolved")
+    assert requirement["event_id"] == (None if reviewed_field_changed else "event-1")
+
+
 def test_exact_payload_round_trips_through_real_set_pipeline_with_authoritative_review() -> None:
     options = {
         "url_field": "url",
@@ -410,7 +499,7 @@ def test_exact_payload_round_trips_through_real_set_pipeline_with_authoritative_
     previous = _state(nodes=(replace(node, options={**options, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}),))
     exact = _exact_arguments(previous)
 
-    result = _execute_set_pipeline(exact.data, previous, _trained_context())
+    result = _execute_set_pipeline(deep_thaw(exact.data), previous, _trained_context())
 
     assert result.success, result.data
     carried = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
@@ -864,7 +953,7 @@ def test_unknown_pipeline_decision_user_term_fails_closed() -> None:
     with pytest.raises(ValueError, match="not a registered decision kind"):
         reconcile_authoritative_reviews(previous, proposed)
 
-    result = _execute_set_pipeline(_exact_arguments(previous).data, previous, _trained_context())
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(previous).data), previous, _trained_context())
     assert not result.success
     assert result.updated_state is previous
     assert result.updated_state.version == previous.version

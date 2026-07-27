@@ -721,12 +721,11 @@ def fork_coalesce_exemplar_args(
                 f"Classify the urgency of support ticket {{{{ row.ticket_id }}}}: {{{{ row.body }}}} using these {_URGENCY_RUBRIC}. Reply with the single category word.",
                 prompt_template_parts=[
                     {"kind": "text", "text": "Classify the urgency of support ticket {{ row.ticket_id }}: {{ row.body }} using these "},
-                    {"kind": "interpretation_ref", "requirement_id": "urgency_semantics_review"},
+                    {"kind": "interpretation_ref", "requirement_id": "urgency:assess_urgency"},
                     {"kind": "text", "text": ". Reply with the single category word."},
                 ],
                 interpretation_requirements=[
                     {
-                        "id": "urgency_semantics_review",
                         "kind": "vague_term",
                         "user_term": "urgency",
                         "draft": _URGENCY_RUBRIC,

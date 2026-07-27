@@ -547,13 +547,12 @@ id "rate_cool"):
   "prompt_template": "Rate how <your draft definition of \"cool\"> the page is, on a 1-10 scale. Page content: {{ row['content'] }}. Reply with the score followed by one short reason.",
   "prompt_template_parts": [
     {"kind": "text", "text": "Rate how "},
-    {"kind": "interpretation_ref", "requirement_id": "cool_semantics_review"},
+    {"kind": "interpretation_ref", "requirement_id": "cool:rate_cool"},
     {"kind": "text", "text": " the page is, on a 1-10 scale. Page content: {{ row['content'] }}. Reply with the score followed by one short reason."}
   ],
   "required_input_fields": ["content"],
   "interpretation_requirements": [
     {
-      "id": "cool_semantics_review",
       "kind": "vague_term",
       "user_term": "cool",
       "draft": "<your draft definition of \"cool\" — the exact scale/rubric/cutoff/category semantics you authored>"
@@ -562,11 +561,13 @@ id "rate_cool"):
 }
 ```
 
-You author ONLY `kind`, `user_term`, and `draft` (plus `id` when a
-`prompt_template_parts` `interpretation_ref` must reference the row, as here).
-`status` defaults to `pending` and the server-bookkeeping fields (`event_id`,
-`accepted_value`, `accepted_artifact_hash`, `resolved_prompt_template_hash`)
-are NEVER authored — the backend owns them.
+You author ONLY `kind`, `user_term`, and `draft`. The backend projects a node
+requirement ID as `<normalized user_term>:<node id>`; use that projected value
+in `prompt_template_parts` when an `interpretation_ref` must reference the row,
+as the example does, but never add `id` to the requirement shell. Never author
+`status` or the server-bookkeeping fields (`event_id`, `accepted_value`,
+`accepted_artifact_hash`, `resolved_prompt_template_hash`) — the backend owns
+them.
 
 Merge this review shape into options accepted by the selected plugin's live
 schema; the example deliberately contains no provider, model, credential, or
@@ -715,12 +716,11 @@ pipeline state, copy the requirement's exact `draft` for the matching `kind` and
 requirement or bound blob content is the authority for the exact artifact text.
 
 `interpretation_requirements` is always a JSON array. Never emit it as an object,
-even when there is only one requirement. The AUTHORED shape is the short form:
-`kind`, `user_term`, and `draft` (add `id` only when a `prompt_template_parts`
-`interpretation_ref` must reference the row). `status` defaults to `pending`;
-the server-bookkeeping fields (`event_id`, `accepted_value`,
-`accepted_artifact_hash`, `resolved_prompt_template_hash`) appear on records
-you READ back but are never authored.
+even when there is only one requirement. The AUTHORED shape contains exactly
+`kind`, `user_term`, and `draft`. Never add `id`, `status`, or the
+server-bookkeeping fields (`event_id`, `accepted_value`,
+`accepted_artifact_hash`, `resolved_prompt_template_hash`); those fields appear
+on records you READ back but are owned by the backend.
 
 | Kind | When to call | Required shape |
 | --- | --- | --- |

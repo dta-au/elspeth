@@ -22,6 +22,7 @@ import pydantic
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
+from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.web.composer.guided.protocol import GUIDED_MAX_COMPONENTS_PER_KIND
 from elspeth.web.execution.schemas import DiscardSummary, RunAccounting
 from elspeth.web.sessions.protocol import (
@@ -831,7 +832,7 @@ class InterpretationEventResponse(BaseModel):
     # hash_domain_version='v2'.
     composition_state_id: UUID | None = None
     affected_node_id: str | None = Field(default=None, max_length=256)
-    tool_call_id: str | None = Field(default=None, max_length=256)
+    tool_call_id: str | None = Field(default=None, max_length=PROVIDER_TOOL_CALL_ID_MAX_LENGTH)
     user_term: str | None = Field(default=None, max_length=8192)
     kind: InterpretationKind | None = None
     llm_draft: str | None = Field(default=None, max_length=8192)

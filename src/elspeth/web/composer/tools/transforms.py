@@ -33,6 +33,9 @@ from elspeth.web.composer.tools._common import (
     ToolResult,
     _apply_merge_patch,
     _attach_post_call_hints,
+    _canonical_interpretation_requirement_error,
+    _canonicalize_authored_interpretation_requirements,
+    _composition_canonical_interpretation_requirement_error,
     _credential_wiring_contract_failure,
     _discovery_result,
     _failure_result,
@@ -482,31 +485,52 @@ def _execute_upsert_node(
     validated = cast(_UpsertNodeArgumentsModel, _validate_mutation_arguments(_UpsertNodeArgumentsModel, args, "upsert_node arguments"))
     node_id = validated.id
     node_type = validated.node_type
-    if node_type == "queue":
-        # A queue is a structural pass-through fan-in point with no plugin,
-        # no routing, and no plugin options — so the plugin/credential/review
-        # gates below do not apply. The ONLY intrinsic constraint is
-        # queue_node_contract_error (state.py), the single source of truth
-        # shared with state validation and YAML generation. Pipeline
-        # completeness (producers/downstream) stays validation telemetry, so an
-        # orphan queue inserted during incremental authoring still persists.
-        return _execute_upsert_queue_node(validated, state)
     plugin = validated.plugin
-    node_options = validated.options
+    node_options: Mapping[str, Any] = validated.options
+    existing_node = next((node for node in state.nodes if node.id == node_id), None)
     runtime_owned_error = _runtime_owned_llm_option_error(
         plugin,
         node_options,
         tool_name="upsert_node",
+        component_id=node_id,
     )
     if runtime_owned_error is not None:
         return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
+    node_options = _canonicalize_authored_interpretation_requirements(
+        node_options,
+        component_id=node_id,
+        existing_options=existing_node.options if existing_node is not None else None,
+    )
+    review_options = _options_with_default_llm_reviews(
+        node_id=node_id,
+        plugin=plugin,
+        options=node_options,
+        existing_options=existing_node.options if existing_node is not None else None,
+    )
+    canonical_error = _canonical_interpretation_requirement_error(
+        review_options,
+        tool_name="upsert_node",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            f"Node '{node_id}': {canonical_error}",
+            error_code="interpretation_requirements_invalid",
+        )
+    if node_type == "queue":
+        # Canonical invariant B applies to structural queues too; the queue
+        # contract then decides whether those canonical options are permitted.
+        return _execute_upsert_queue_node(
+            validated.model_copy(update={"options": dict(review_options)}),
+            state,
+        )
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=node_id,
         component_type="node",
         plugin_type="transform" if plugin is not None else None,
         plugin_name=plugin,
-        options=node_options,
+        options=review_options,
     )
     if credential_error is not None:
         return credential_error
@@ -528,11 +552,6 @@ def _execute_upsert_node(
         if batch_required_error is not None:
             return _failure_result(state, batch_required_error)
 
-        review_options = _options_with_default_llm_reviews(
-            node_id=node_id,
-            plugin=plugin,
-            options=node_options,
-        )
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
         if prevalidation_error is not None:
             return _failure_result(state, prevalidation_error)
@@ -543,12 +562,12 @@ def _execute_upsert_node(
         # LOWERED executable. Running the raw provider-config policy on the
         # authored options would false-positive on the absent private retry
         # budget (see the fuller rationale at set_pipeline in sessions.py).
-        if "profile" not in node_options:
-            provider_policy_error = _validate_transform_provider_config_policy(node_options, plugin=plugin)
+        if "profile" not in review_options:
+            provider_policy_error = _validate_transform_provider_config_policy(review_options, plugin=plugin)
             if provider_policy_error is not None:
                 return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
 
-        provider_path_error = _validate_transform_provider_config_path(node_options, context.data_dir, session_id=context.session_id)
+        provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
         if provider_path_error is not None:
             return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
 
@@ -578,11 +597,7 @@ def _execute_upsert_node(
         input=validated.input,
         on_success=validated.on_success,
         on_error=validated.on_error or ("discard" if node_type in ("transform", "aggregation") else None),
-        options=_options_with_default_llm_reviews(
-            node_id=node_id,
-            plugin=plugin,
-            options=node_options,
-        ),
+        options=review_options,
         condition=validated.condition,
         routes=validated.routes,
         fork_to=fork_to,
@@ -594,7 +609,15 @@ def _execute_upsert_node(
         expected_output_count=validated.expected_output_count,
     )
 
-    new_state = state.with_node(node)
+    proposed_state = state.with_node(node)
+    try:
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError):
+        return _failure_result(
+            state,
+            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            error_code="review_reconciliation_failed",
+        )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _failure_result(state, review_contract_error)
@@ -840,6 +863,7 @@ def _execute_splice_transform(
             on_success=existing.on_success,
             on_error=node_args.on_error,
             options=node_args.options,
+            existing_options=existing.options,
         )
         if type(prepared_replay) is ToolResult:
             return prepared_replay
@@ -850,6 +874,16 @@ def _execute_splice_transform(
             return _failure_result(state, f"Node '{node_args.id}' already exists with a divergent splice definition.")
         if not identical:
             return _failure_result(state, f"Node '{node_args.id}' already exists with a divergent splice definition.")
+        canonical_error = _composition_canonical_interpretation_requirement_error(
+            state,
+            tool_name="splice_transform",
+        )
+        if canonical_error is not None:
+            return _failure_result(
+                state,
+                canonical_error,
+                error_code="interpretation_requirements_invalid",
+            )
         return _mutation_result(
             state,
             (predecessor_id, node_args.id, successor_id),
@@ -919,6 +953,16 @@ def _execute_splice_transform(
         version=state.version,
         guided_session=state.guided_session,
     )
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        proposed,
+        tool_name="splice_transform",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
+        )
     try:
         reconciled = reconcile_authoritative_reviews(state, proposed)
     except (KeyError, TypeError, ValueError):
@@ -926,6 +970,16 @@ def _execute_splice_transform(
             state,
             "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
             error_code="review_reconciliation_failed",
+        )
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        reconciled,
+        tool_name="splice_transform",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
         )
     review_contract_error = composition_review_contract_error(reconciled)
     if review_contract_error is not None:
@@ -1149,7 +1203,7 @@ def _execute_patch_node_options(
             actual_type=type(exc).__name__,
         ) from exc
     node_id = validated.node_id
-    patch = validated.patch
+    patch: Mapping[str, Any] = validated.patch
     current = next((n for n in state.nodes if n.id == node_id), None)
     if current is None:
         return _failure_result(state, f"Node '{node_id}' not found.")
@@ -1160,15 +1214,32 @@ def _execute_patch_node_options(
         current.plugin,
         patch,
         tool_name="patch_node_options",
+        component_id=node_id,
     )
     if runtime_owned_error is not None:
         return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
-    new_options: Mapping[str, Any] = _apply_merge_patch(current.options, patch)
+    patch = _canonicalize_authored_interpretation_requirements(
+        patch,
+        component_id=node_id,
+        existing_options=current.options,
+    )
+    new_options: Mapping[str, Any] = _apply_merge_patch(current.options, dict(patch))
     new_options = _options_with_default_llm_reviews(
         node_id=node_id,
         plugin=current.plugin,
         options=new_options,
+        existing_options=current.options,
     )
+    canonical_error = _canonical_interpretation_requirement_error(
+        new_options,
+        tool_name="patch_node_options",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            f"Node '{node_id}': {canonical_error}",
+            error_code="interpretation_requirements_invalid",
+        )
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=node_id,
@@ -1210,7 +1281,15 @@ def _execute_patch_node_options(
     queue_contract_error = queue_node_contract_error(new_node)
     if queue_contract_error is not None:
         return _failure_result(state, queue_contract_error)
-    new_state = state.with_node(new_node)
+    proposed_state = state.with_node(new_node)
+    try:
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError):
+        return _failure_result(
+            state,
+            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            error_code="review_reconciliation_failed",
+        )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _failure_result(state, review_contract_error)
@@ -1298,6 +1377,7 @@ def _prepare_transform_candidate(
     on_success: str | None,
     on_error: str | None,
     options: Mapping[str, Any],
+    existing_options: Mapping[str, Any] | None = None,
     trigger: Mapping[str, Any] | None = None,
     output_mode: str | None = None,
     expected_output_count: int | None = None,
@@ -1305,16 +1385,42 @@ def _prepare_transform_candidate(
     """Validate and prepare one transform candidate without mutating state."""
     if plugin is None:
         return _failure_result(state, f"Node '{node_id}': transform plugin is required.")
-    runtime_owned_error = _runtime_owned_llm_option_error(plugin, options, tool_name=tool_name)
+    runtime_owned_error = _runtime_owned_llm_option_error(
+        plugin,
+        options,
+        tool_name=tool_name,
+        component_id=node_id,
+    )
     if runtime_owned_error is not None:
         return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
+    options = _canonicalize_authored_interpretation_requirements(
+        options,
+        component_id=node_id,
+        existing_options=existing_options,
+    )
+    review_options = _options_with_default_llm_reviews(
+        node_id=node_id,
+        plugin=plugin,
+        options=options,
+        existing_options=existing_options,
+    )
+    canonical_error = _canonical_interpretation_requirement_error(
+        review_options,
+        tool_name=tool_name,
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            f"Node '{node_id}': {canonical_error}",
+            error_code="interpretation_requirements_invalid",
+        )
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=node_id,
         component_type="node",
         plugin_type="transform",
         plugin_name=plugin,
-        options=options,
+        options=review_options,
     )
     if credential_error is not None:
         return credential_error
@@ -1324,11 +1430,10 @@ def _prepare_transform_candidate(
     batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, output_mode)
     if batch_placement_error is not None:
         return _failure_result(state, batch_placement_error)
-    batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, options)
+    batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, review_options)
     if batch_required_error is not None:
         return _failure_result(state, batch_required_error)
 
-    review_options = _options_with_default_llm_reviews(node_id=node_id, plugin=plugin, options=options)
     prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
     if prevalidation_error is not None:
         return _failure_result(state, prevalidation_error)
@@ -1337,11 +1442,11 @@ def _prepare_transform_candidate(
     # prevalidation above already validated the LOWERED executable. The raw
     # provider-config policy would false-positive on the absent private retry
     # budget (see set_pipeline in sessions.py for the full rationale).
-    if "profile" not in options:
-        provider_policy_error = _validate_transform_provider_config_policy(options, plugin=plugin)
+    if "profile" not in review_options:
+        provider_policy_error = _validate_transform_provider_config_policy(review_options, plugin=plugin)
         if provider_policy_error is not None:
             return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
-    provider_path_error = _validate_transform_provider_config_path(options, context.data_dir, session_id=context.session_id)
+    provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
     if provider_path_error is not None:
         return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
     if node_type == "aggregation":

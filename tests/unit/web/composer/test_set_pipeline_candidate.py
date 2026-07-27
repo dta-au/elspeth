@@ -29,7 +29,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
-from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
+from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import (
     SetPipelineCandidate,
     ToolContext,
@@ -37,6 +37,7 @@ from elspeth.web.composer.tools import (
     build_set_pipeline_candidate,
     execute_tool,
 )
+from elspeth.web.composer.tools import sessions as sessions_tools
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY
@@ -548,6 +549,66 @@ def test_exact_reviewed_source_authority_allows_private_blob_resolution(tmp_path
 
     assert candidate.acceptable is True, candidate.result.to_dict()
     assert candidate.result.updated_state.sources["source"].options["path"] == blob.storage_path
+
+
+def test_reviewed_source_rehydrates_trusted_options_and_runs_b_before_plugin_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
+    facts = _reviewed_source_facts(blob_id=str(blobs[0].id))
+    reviewed = next(iter(facts["reviewed_sources"].values()))
+    reviewed["options"][INTERPRETATION_REQUIREMENTS_KEY] = [
+        {
+            "id": "duplicate-review-id",
+            "kind": "vague_term",
+            "user_term": "alpha",
+            "draft": "sk-sensitive-reviewed-source",
+            "status": "pending",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        },
+        {
+            "id": "duplicate-review-id",
+            "kind": "pipeline_decision",
+            "user_term": "beta",
+            "draft": "second draft",
+            "status": "pending",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        },
+    ]
+    authority = resolve_reviewed_source_authority(
+        engine=engine,
+        session_id=session_id,
+        user_id="review-owner",
+        reviewed_facts=facts,
+        expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+    )
+
+    def _plugin_validation_must_not_run(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("plugin validation ran before canonical invariant B")
+
+    monkeypatch.setattr(sessions_tools, "_validate_plugin_name", _plugin_validation_must_not_run)
+    candidate = build_set_pipeline_candidate(
+        _named_reviewed_pipeline(tmp_path, facts),
+        _empty_state(),
+        _trained_context(
+            data_dir=tmp_path,
+            session_engine=engine,
+            session_id=session_id,
+            user_id="review-owner",
+            reviewed_source_authority=authority,
+        ),
+    )
+
+    assert candidate.acceptable is False
+    assert candidate.result.data["error_code"] == "interpretation_requirements_invalid"
+    assert "sk-sensitive-reviewed-source" not in candidate.result.data["error"]
 
 
 @pytest.mark.parametrize("mutation", ["name", "plugin", "options", "failure_policy"])
@@ -1860,6 +1921,137 @@ def _session_with_user_message() -> tuple[Any, str, str]:
             )
         )
     return engine, session_id, message_id
+
+
+def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Path) -> None:
+    engine, session_id, message_id = _session_with_user_message()
+    content = "name,score\nada,42\n"
+    args = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {
+                "schema": {"mode": "observed"},
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    {
+                        "kind": "pipeline_decision",
+                        "user_term": "inline_source_data",
+                        "draft": "sk-sensitive-inline-review",
+                    }
+                ],
+            },
+            "inline_blob": {
+                "filename": "ada.csv",
+                "mime_type": "text/csv",
+                "content": content,
+            },
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    state = _empty_state()
+    context = _trained_context(
+        data_dir=tmp_path,
+        session_engine=engine,
+        session_id=session_id,
+        user_message_id=message_id,
+        user_message_content="Generate a CSV source.",
+        composer_model_identifier="test-model",
+        composer_model_version="test-model-v1",
+        composer_provider="test-provider",
+        composer_skill_hash="a" * 64,
+        tool_arguments_hash="b" * 64,
+    )
+
+    result = _execute_set_pipeline(args, state, context)
+
+    with engine.begin() as conn:
+        blob_rows = conn.execute(select(func.count()).select_from(blobs_table)).scalar_one()
+    blob_files = tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file())
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.data["error_code"] == "interpretation_requirements_invalid"
+    assert "sk-sensitive-inline-review" not in result.data["error"]
+    assert blob_rows == 0
+    assert blob_files == ()
+
+
+def test_inline_blob_replacement_preserves_trusted_existing_source_requirement_id(tmp_path: Path) -> None:
+    engine, session_id, message_id = _session_with_user_message()
+    content = "name,score\nada,42\n"
+    trusted_id = "trusted-inline-source-id"
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={
+                "path": "/tmp/existing.csv",
+                "schema": {"mode": "observed"},
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    {
+                        "id": trusted_id,
+                        "kind": "invented_source",
+                        "user_term": "inline_source_data",
+                        "draft": content,
+                        "status": "pending",
+                        "event_id": None,
+                        "accepted_value": None,
+                        "accepted_artifact_hash": None,
+                        "resolved_prompt_template_hash": None,
+                    }
+                ],
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    args = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {
+                "schema": {"mode": "observed"},
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    {
+                        "kind": "invented_source",
+                        "user_term": "inline_source_data",
+                        "draft": content,
+                    }
+                ],
+            },
+            "inline_blob": {
+                "filename": "ada.csv",
+                "mime_type": "text/csv",
+                "content": content,
+            },
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    context = _trained_context(
+        data_dir=tmp_path,
+        session_engine=engine,
+        session_id=session_id,
+        user_message_id=message_id,
+        user_message_content="Generate a CSV source.",
+        composer_model_identifier="test-model",
+        composer_model_version="test-model-v1",
+        composer_provider="test-provider",
+        composer_skill_hash="a" * 64,
+        tool_arguments_hash="b" * 64,
+    )
+
+    result = _execute_set_pipeline(args, state, context)
+
+    assert result.success, result.to_dict()
+    requirements = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert requirements[0]["id"] == trusted_id
 
 
 @pytest.mark.asyncio

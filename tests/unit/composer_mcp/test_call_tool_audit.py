@@ -146,6 +146,96 @@ async def test_arg_error_path_records_before_return() -> None:
     assert inv.version_after is None
 
 
+@pytest.mark.asyncio
+async def test_composer_tool_schema_validation_is_enforced_without_audit_hash() -> None:
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        scratch = Path(td)
+        probe = _ProbeRecorder()
+        server = create_server(catalog, scratch, recorder=probe)
+        response = await _call_handler(
+            server.request_handlers,
+            "get_pipeline_state",
+            {"unexpected": "secret-value"},
+        )
+
+    _assert_tool_argument_error_response_and_audit(
+        response,
+        probe,
+        tool_name="get_pipeline_state",
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_invalid_collision_violation_records_arg_error_before_handler() -> None:
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        scratch = Path(td)
+        probe = _ProbeRecorder()
+        server = create_server(catalog, scratch, recorder=probe)
+        with patch("elspeth.composer_mcp.server.execute_tool") as mock_execute:
+            response = await _call_handler(
+                server.request_handlers,
+                "set_output",
+                {
+                    "sink_name": "main",
+                    "plugin": "csv",
+                    "options": {
+                        "path": "outputs/out.csv",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                    },
+                    "on_write_failure": "discard",
+                    "unexpected": "schema-invalid",
+                },
+            )
+
+    mock_execute.assert_not_called()
+    assert len(probe.invocations) == 1
+    _assert_tool_argument_error_response_and_audit(
+        response,
+        probe,
+        tool_name="set_output",
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_preview_args_do_not_run_runtime_preflight_or_handler() -> None:
+    catalog = create_catalog_service()
+    preflight_calls = 0
+
+    async def probing_preflight(_state) -> object:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return object()
+
+    with tempfile.TemporaryDirectory() as td:
+        scratch = Path(td)
+        probe = _ProbeRecorder()
+        server = create_server(
+            catalog,
+            scratch,
+            recorder=probe,
+            runtime_preflight=probing_preflight,
+            runtime_preflight_settings_hash="settings-hash",
+        )
+        with patch("elspeth.composer_mcp.server.execute_tool") as mock_execute:
+            response = await _call_handler(
+                server.request_handlers,
+                "preview_pipeline",
+                {"unexpected": "schema-invalid"},
+            )
+
+    assert preflight_calls == 0
+    mock_execute.assert_not_called()
+    assert len(probe.invocations) == 1
+    _assert_tool_argument_error_response_and_audit(
+        response,
+        probe,
+        tool_name="preview_pipeline",
+    )
+
+
 @pytest.mark.parametrize("bad_name", [123, {"x": "y"}])
 @pytest.mark.asyncio
 async def test_new_session_rejects_non_string_name_as_arg_error(bad_name: object) -> None:

@@ -6641,6 +6641,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'validate_secret_ref'" in result.data["error"]
@@ -6658,6 +6659,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'validate_secret_ref'" in result.data["error"]
@@ -6676,6 +6678,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'wire_secret_ref'" in result.data["error"]
@@ -6693,6 +6696,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'wire_secret_ref'" in result.data["error"]
@@ -6715,6 +6719,7 @@ class TestSecretToolsArgumentValidation:
             secret_service=self._svc(),
             user_id="test-user",
             tool_arguments_hash="0" * 64,
+            validate_arguments=True,
         )
         assert result.success is False
         assert "Invalid arguments for tool 'wire_secret_ref'" in result.data["error"]
@@ -8788,20 +8793,17 @@ class TestSetPipeline:
                     "schema": {"mode": "observed"},
                     PROMPT_TEMPLATE_PARTS_KEY: [
                         {"kind": "text", "text": "Classify "},
-                        {"kind": "interpretation_ref", "requirement_id": "prompt_review"},
+                        {
+                            "kind": "interpretation_ref",
+                            "requirement_id": "llm_prompt_template:code_themes:code_themes",
+                        },
                         {"kind": "text", "text": ": {{ row.text }}"},
                     ],
                     INTERPRETATION_REQUIREMENTS_KEY: [
                         {
-                            "id": "prompt_review",
                             "kind": "llm_prompt_template",
                             "user_term": "llm_prompt_template:code_themes",
-                            "status": "pending",
                             "draft": "Classify pending interpretation: {{ row.text }}",
-                            "event_id": None,
-                            "accepted_value": None,
-                            "accepted_artifact_hash": None,
-                            "resolved_prompt_template_hash": None,
                         }
                     ],
                 },

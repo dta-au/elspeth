@@ -1745,8 +1745,11 @@ def _reconcile_node_options(
             unresolved_text=PENDING_INTERPRETATION_AUTHORING_TEXT,
         )
         options["prompt_template"] = rendered
-        if carried_prompt_review:
-            options["resolved_prompt_template_hash"] = stable_hash(rendered)
+    if carried_prompt_review:
+        prompt_template = options["prompt_template"] if "prompt_template" in options else None
+        if type(prompt_template) is not str:
+            raise ValueError("carried prompt review has no rendered prompt_template")
+        options["resolved_prompt_template_hash"] = stable_hash(prompt_template)
     return options
 
 

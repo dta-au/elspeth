@@ -532,10 +532,13 @@ def _pending_interpretation_review_repair_message(
         "draft as llm_draft. For llm_prompt_template, llm_draft must equal the current "
         "options.prompt_template. For invented_source, llm_draft must equal the "
         "source requirement draft. For pipeline_decision, llm_draft must equal "
-        "the target node's requirement draft. If a pipeline_decision site has no "
+        "the target node's requirement draft. When patching interpretation_requirements, "
+        "author exactly the public shell fields kind, user_term, and draft; never "
+        "author id, status, or resolver-owned evidence fields. If a pipeline_decision site has no "
         f"matching requirement and user_term is {RAW_HTML_CLEANUP_USER_TERM!r}, patch "
         "the target field_mapper node first with an interpretation_requirements "
-        "entry whose kind is 'pipeline_decision', status is 'pending', and draft is "
+        "entry whose kind is 'pipeline_decision', user_term is "
+        f"{RAW_HTML_CLEANUP_USER_TERM!r}, and draft is "
         f"{RAW_HTML_CLEANUP_REVIEW_DRAFT!r}. "
         # B-vs-C is resolved deterministically at the wire-stage route
         # (azure_prompt_shield_available; see routes/composer/guided.py). The repair
@@ -545,7 +548,7 @@ def _pending_interpretation_review_repair_message(
         # State B where the secret is reachable.
         f"If user_term is {PROMPT_SHIELD_USER_TERM!r}, patch the target LLM node first "
         "with an interpretation_requirements entry whose kind is 'pipeline_decision', "
-        f"status is 'pending', and draft is {PROMPT_SHIELD_WARNING_DRAFT!r}; if the "
+        f"user_term is {PROMPT_SHIELD_USER_TERM!r}, and draft is {PROMPT_SHIELD_WARNING_DRAFT!r}; if the "
         "workflow cannot add the shield, keep going with the warning instead of blocking. "
         f"This is forced repair turn {next_turn} of {_MAX_REPAIR_TURNS}."
     )
@@ -996,7 +999,6 @@ async def _auto_surface_prompt_template_reviews_for_state(
     planner identity).
     """
 
-    events = await sessions_service.list_interpretation_events(UUID(session_id), status="pending")
     for site in interpretation_sites(state):
         if site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE:
             continue
@@ -1009,21 +1011,10 @@ async def _auto_surface_prompt_template_reviews_for_state(
             raise InvariantError(
                 "_auto_surface_prompt_template_reviews: prompt-template interpretation site lost its non-empty prompt_template"
             )
-        # Draft-aware dedup (Task 7 HIGH-2): skip the node only when a pending
-        # PT event already carries the node's CURRENT prompt_template. A stale
-        # pending event from a prior turn whose draft is an OLDER skeleton must
-        # NOT suppress re-surfacing — node-id-only dedup would brick the review
-        # after a multi-turn prompt edit (the stale event survives, the
-        # Case-A skeleton-hash resolve gate then rejects forever, and the LLM
-        # can no longer re-surface). The stale event lingers cosmetically; a
-        # governed SUPERSEDED/cancel primitive is a follow-up.
-        if any(
-            event.affected_node_id == site.component_id
-            and event.llm_draft == prompt_template
-            and event.kind is InterpretationKind.LLM_PROMPT_TEMPLATE
-            for event in events
-        ):
-            continue
+        # The transactional writer owns kind-specific reviewed-content
+        # identity. Calling it for every candidate preserves idempotence across
+        # unrelated state versions while allowing same-text skeleton changes to
+        # supersede stale cards.
         # The create_pending gate (sessions/service.py) REQUIRES exactly one
         # pending PT requirement on the node for this user_term. Surface only
         # where that precondition holds — otherwise create_pending would raise
@@ -1153,7 +1144,6 @@ async def surface_pending_interpretation_reviews_for_state(
         provider=provider,
         composer_skill_hash=composer_skill_hash,
     )
-    events = await sessions_service.list_interpretation_events(UUID(session_id), status="pending")
     for site in interpretation_sites(state):
         if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
             continue  # handled above
@@ -1161,15 +1151,9 @@ async def surface_pending_interpretation_reviews_for_state(
         if surfaced is None:
             continue
         affected_node_id, user_term, llm_draft = surfaced
-        if any(
-            event.affected_node_id == affected_node_id
-            and event.user_term is not None
-            and event.user_term.strip() == user_term.strip()
-            and event.kind is site.kind
-            and (event.llm_draft or "").strip() == llm_draft.strip()
-            for event in events
-        ):
-            continue
+        # Do not pre-deduplicate by draft text here. The writer compares the
+        # canonical per-kind reviewed artifact under the session transaction,
+        # reusing only coherent authority and abandoning superseded cards.
         # W1 backstop: the per-kind precondition above is NECESSARY but not
         # always SUFFICIENT (e.g. pipeline_decision must additionally pass
         # validate_pipeline_decision_semantics, which the surfacer does not
@@ -3044,7 +3028,11 @@ class ComposerServiceImpl:
         )
         assistant_message = response.choices[0].message
         raw_assistant_content = assistant_message.content
-        assistant_tool_calls = assistant_message.tool_calls or ()
+        provider_tool_calls = assistant_message.tool_calls or ()
+        from elspeth.web.composer.tool_batch import _admit_tool_batch
+
+        admitted_batch = _admit_tool_batch(provider_tool_calls)
+        assistant_tool_calls = admitted_batch.calls
         if len(assistant_tool_calls) > self._max_tool_calls_per_turn:
             self._telemetry.tool_call_cap_exceeded_total.add(1)
             raise ComposerConvergenceError.capture(
@@ -3060,12 +3048,13 @@ class ComposerServiceImpl:
                     "cap": self._max_tool_calls_per_turn,
                 },
             )
+
         return _CallModelOutcome(
             response=response,
             assistant_message=assistant_message,
             raw_assistant_content=raw_assistant_content,
             assistant_tool_calls=tuple(assistant_tool_calls),
-            has_tool_calls=bool(assistant_message.tool_calls),
+            has_tool_calls=bool(assistant_tool_calls),
         )
 
     async def _persist_turn_audit(

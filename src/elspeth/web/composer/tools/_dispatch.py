@@ -39,6 +39,7 @@ from elspeth.web.composer.tools._common import (
     ToolContext,
     ToolHandler,
     ToolResult,
+    _composition_canonical_interpretation_requirement_error,
     _failure_result,
     build_plugin_schemas_for_failure,
     normalize_tool_result_validation,
@@ -384,6 +385,21 @@ def _inject_prior_validation(
 # ``_inject_prior_validation`` wrap step in ``execute_tool``.
 _ALL_MUTATION_TOOL_NAMES: Final[frozenset[str]] = _MUTATION_TOOL_NAMES | _BLOB_MUTATION_TOOL_NAMES | _SECRET_MUTATION_TOOL_NAMES
 
+# Every public tool that can publish a new CompositionState. Blob-only
+# create/update/delete tools are intentionally excluded: they persist blob
+# records/files but never publish composition state, so a composition gate
+# after their handler would be too late to protect those external side effects.
+_COMPOSITION_STATE_MUTATION_TOOL_NAMES: Final[frozenset[str]] = (
+    _MUTATION_TOOL_NAMES
+    | _SECRET_MUTATION_TOOL_NAMES
+    | frozenset(
+        {
+            "set_source_from_blob",
+            "wire_blob_inline_ref",
+        }
+    )
+)
+
 
 def _closed_root_schema(tool_name: str) -> dict[str, Any]:
     """Return the tool's argument schema with a fail-closed root object."""
@@ -518,6 +534,28 @@ def finalize_tool_result(
     return normalize_tool_result_validation(result, catalog)
 
 
+def _enforce_composition_interpretation_gate(
+    result: ToolResult,
+    *,
+    tool_name: str,
+    prior_state: CompositionState,
+) -> ToolResult:
+    """Reject a successful public state mutation before its result is published."""
+    if not result.success or tool_name not in _COMPOSITION_STATE_MUTATION_TOOL_NAMES:
+        return result
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        result.updated_state,
+        tool_name=tool_name,
+    )
+    if canonical_error is None:
+        return result
+    return _failure_result(
+        prior_state,
+        canonical_error,
+        error_code="interpretation_requirements_invalid",
+    )
+
+
 def execute_tool(
     tool_name: str,
     arguments: dict[str, Any],
@@ -542,7 +580,10 @@ def execute_tool(
     composer_skill_hash: str | None = None,
     tool_arguments_hash: str | None = None,
     reviewed_source_authority: ReviewedSourceAuthority | None = None,
+    validate_arguments: bool = False,
+    require_data_dir_for_paths: bool = False,
     raise_schema_argument_errors: bool = False,
+    _interpretation_requirements_are_internal: bool = False,
 ) -> ToolResult:
     """Execute a composition tool by name.
 
@@ -600,11 +641,20 @@ def execute_tool(
         composer_skill_hash: Hash of the composer skill markdown used for
             the request.
         tool_arguments_hash: Canonical audited arguments hash for this tool
-            call.
+            call. This is optional audit evidence only; its presence never
+            controls argument admission or path-policy enforcement.
+        validate_arguments: Enforce the declared closed JSON Schema before
+            handler dispatch. Public LLM/MCP entry points must enable this.
+        require_data_dir_for_paths: Fail closed when source-local paths are
+            supplied without a dispatcher data directory. Public LLM/MCP
+            entry points must enable this.
         raise_schema_argument_errors: When true, audited declaration-schema
             failures raise ``ToolArgumentError`` for compose-loop ARG_ERROR
             routing. Direct callers keep the historical failed-``ToolResult``
             contract by leaving this false.
+        _interpretation_requirements_are_internal: Private server-owned
+            proposal revalidation seam. It is not a declared tool argument
+            and must remain false for public LLM/MCP dispatch.
     """
     if catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
@@ -622,7 +672,7 @@ def execute_tool(
         return normalize_tool_result_validation(_failure_result(state, f"Unknown tool: {tool_name}"), catalog)
     current_validation = prior_validation or catalog.validate_composition_state(state).validation
 
-    if tool_arguments_hash is not None:
+    if validate_arguments or raise_schema_argument_errors:
         argument_error = _validate_tool_arguments(
             tool_name,
             arguments,
@@ -647,7 +697,7 @@ def execute_tool(
         catalog=catalog,
         plugin_snapshot=plugin_snapshot,
         data_dir=data_dir,
-        require_data_dir_for_paths=tool_arguments_hash is not None,
+        require_data_dir_for_paths=require_data_dir_for_paths,
         session_engine=session_engine,
         session_id=session_id,
         secret_service=secret_service,
@@ -664,9 +714,15 @@ def execute_tool(
         composer_skill_hash=composer_skill_hash,
         tool_arguments_hash=tool_arguments_hash,
         reviewed_source_authority=reviewed_source_authority,
+        _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
     )
 
     result = handler(arguments, state, context)
+    result = _enforce_composition_interpretation_gate(
+        result,
+        tool_name=tool_name,
+        prior_state=state,
+    )
 
     return finalize_tool_result(
         result,

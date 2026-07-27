@@ -165,6 +165,7 @@ def _structured_llm_node(
     *,
     node_id: str = "llm_transform_1",
     user_term: str = "cool",
+    draft: str = "A draft of cool",
 ) -> dict:
     """Return a production-serialized LLM transform with structured pending interpretation state."""
     state = CompositionState(
@@ -189,7 +190,7 @@ def _structured_llm_node(
                             "id": user_term,
                             "user_term": user_term,
                             "status": "pending",
-                            "draft": "A draft of cool",
+                            "draft": draft,
                             "event_id": None,
                             "accepted_value": None,
                             "resolved_prompt_template_hash": None,
@@ -216,6 +217,7 @@ def _vague_term_and_prompt_template_node(
     *,
     node_id: str = "llm_transform_1",
     vague_term: str = "cool",
+    vague_draft: str = "A draft of cool",
 ) -> dict:
     """Structured LLM node carrying BOTH a pending vague_term slot AND a pending
     whole-prompt llm_prompt_template review — the real Turn-2b shape the composer
@@ -250,7 +252,7 @@ def _vague_term_and_prompt_template_node(
                             "id": vague_term,
                             "user_term": vague_term,
                             "status": "pending",
-                            "draft": "A draft of cool",
+                            "draft": vague_draft,
                             "event_id": None,
                             "accepted_value": None,
                             "resolved_prompt_template_hash": None,
@@ -1618,7 +1620,7 @@ async def test_resolve_prompt_template_review_survives_sibling_vague_term_bake(s
     state = await _seed_state_with_llm_node(
         service,
         session_id=session_id,
-        node=_vague_term_and_prompt_template_node(),
+        node=_vague_term_and_prompt_template_node(vague_draft="Innovative and creative"),
     )
 
     vague_event = await service.create_pending_interpretation_event(
@@ -1767,7 +1769,7 @@ async def test_08_list_status_pending_filters_to_pending_only(service) -> None:
     session_id = uuid4()
     state = await _seed_state_with_llm_node(service, session_id=session_id)
 
-    # Two pending events on distinct tool_call_ids.
+    # Two pending events on distinct review sites.
     e_pending = await service.create_pending_interpretation_event(
         session_id=session_id,
         composition_state_id=state.id,
@@ -1781,14 +1783,27 @@ async def test_08_list_status_pending_filters_to_pending_only(service) -> None:
         provider="anthropic",
         composer_skill_hash="a" * 64,
     )
+    second_node = _llm_node(
+        node_id="llm_transform_2",
+        user_term="warm",
+    )
+    second_state = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            nodes=[_llm_node(), second_node],
+            metadata_={"name": "Phase 5b Test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
     e_to_resolve = await service.create_pending_interpretation_event(
         session_id=session_id,
-        composition_state_id=state.id,
-        affected_node_id="llm_transform_1",
+        composition_state_id=second_state.id,
+        affected_node_id="llm_transform_2",
         tool_call_id="call_resolved",
-        user_term="cool",
+        user_term="warm",
         kind=InterpretationKind.VAGUE_TERM,
-        llm_draft="cool def 2",
+        llm_draft="warm def",
         model_identifier="anthropic/claude-opus-4-7",
         model_version="2026-05-01",
         provider="anthropic",
@@ -2942,7 +2957,7 @@ async def test_resolve_structured_requirement_round_trips_without_authoring_meta
     state = await _seed_state_with_llm_node(
         service,
         session_id=session_id,
-        node=_structured_llm_node(),
+        node=_structured_llm_node(draft="modern and clear"),
     )
     event = await service.create_pending_interpretation_event(
         session_id=session_id,

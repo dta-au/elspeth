@@ -314,7 +314,11 @@ def _state_with_source(source: SourceSpec) -> CompositionState:
     )
 
 
-def _llm_generated_source(*, draft: str = "https://example.gov.au") -> SourceSpec:
+def _llm_generated_source(
+    *,
+    draft: str = "https://example.gov.au",
+    content_hash: str = "0" * 64,
+) -> SourceSpec:
     return SourceSpec(
         plugin="csv",
         on_success="rows",
@@ -322,7 +326,7 @@ def _llm_generated_source(*, draft: str = "https://example.gov.au") -> SourceSpe
             "path": "/tmp/generated.csv",
             SOURCE_AUTHORING_KEY: {
                 "modality": CreationModality.LLM_GENERATED.value,
-                "content_hash": "0" * 64,
+                "content_hash": content_hash,
                 "review_event_id": None,
                 "resolved_kind": None,
             },
@@ -471,6 +475,604 @@ def _now() -> datetime:
     return datetime(2026, 5, 18, 12, 0, 0, tzinfo=UTC)
 
 
+def _canonical_pending_requirement(
+    *,
+    requirement_id: str,
+    kind: InterpretationKind,
+    user_term: str,
+    draft: str,
+) -> dict[str, object]:
+    return {
+        "id": requirement_id,
+        "kind": kind.value,
+        "user_term": user_term,
+        "status": "pending",
+        "draft": draft,
+        "event_id": None,
+        "accepted_value": None,
+        "accepted_artifact_hash": None,
+        "resolved_prompt_template_hash": None,
+    }
+
+
+def _event_liveness_state(
+    kind: InterpretationKind,
+    *,
+    draft: str,
+    identity_variant: str = "a",
+) -> tuple[CompositionState, str, str]:
+    """Build one canonical pending review site for stale-event race tests."""
+    if kind is InterpretationKind.INVENTED_SOURCE:
+        content_hash = ("0" if identity_variant == "a" else "1") * 64
+        return (
+            _state_with_source(_llm_generated_source(draft=draft, content_hash=content_hash)),
+            SOURCE_COMPONENT_ID,
+            "inline_source_url_list",
+        )
+
+    if kind is InterpretationKind.PIPELINE_DECISION:
+        user_term = "web_scrape_http_identity"
+        node = NodeSpec(
+            id="fetch_pages",
+            node_type="transform",
+            plugin="web_scrape",
+            input="rows",
+            on_success="out",
+            on_error="discard",
+            options={
+                "url_field": "url",
+                "content_field": "content",
+                "fingerprint_field": "content_fingerprint",
+                "http": {
+                    "abuse_contact": "review@example.com",
+                    "scraping_reason": f"event liveness test {identity_variant}",
+                    "allowed_hosts": "public_only",
+                },
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    _canonical_pending_requirement(
+                        requirement_id=f"{user_term}:fetch_pages",
+                        kind=kind,
+                        user_term=user_term,
+                        draft=draft,
+                    )
+                ],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return _state_with(node), node.id, user_term
+
+    node_id = "reviewed_llm"
+    if kind is InterpretationKind.VAGUE_TERM:
+        user_term = "cool"
+        requirement_id = f"{user_term}:{node_id}:{identity_variant}"
+        options: dict[str, object] = {
+            "prompt_template": "Rate pending interpretation: {{ row.text }}",
+            PROMPT_TEMPLATE_PARTS_KEY: [
+                {"kind": "text", "text": "Rate "},
+                {"kind": "interpretation_ref", "requirement_id": requirement_id},
+                {"kind": "text", "text": ": {{ row.text }}"},
+            ],
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                _canonical_pending_requirement(
+                    requirement_id=requirement_id,
+                    kind=kind,
+                    user_term=user_term,
+                    draft=draft,
+                )
+            ],
+        }
+    elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+        user_term = f"llm_prompt_template:{node_id}"
+        split_at = max(1, len(draft) // 2)
+        prompt_parts = (
+            [{"kind": "text", "text": draft}]
+            if identity_variant == "a"
+            else [
+                {"kind": "text", "text": draft[:split_at]},
+                {"kind": "text", "text": draft[split_at:]},
+            ]
+        )
+        options = {
+            "prompt_template": draft,
+            PROMPT_TEMPLATE_PARTS_KEY: prompt_parts,
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                _canonical_pending_requirement(
+                    requirement_id=f"prompt_template_review:{node_id}",
+                    kind=kind,
+                    user_term=user_term,
+                    draft=draft,
+                )
+            ],
+        }
+    elif kind is InterpretationKind.LLM_MODEL_CHOICE:
+        user_term = f"llm_model_choice:{node_id}"
+        options = {
+            "model": draft,
+            "prompt_template": "Summarise {{ row.text }}.",
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                _canonical_pending_requirement(
+                    requirement_id=f"model_choice_review:{node_id}:{identity_variant}",
+                    kind=kind,
+                    user_term=user_term,
+                    draft=draft,
+                )
+            ],
+        }
+    else:
+        raise AssertionError(f"unhandled InterpretationKind {kind!r}")
+    node = NodeSpec(
+        id=node_id,
+        node_type="transform",
+        plugin="llm",
+        input="rows",
+        on_success="out",
+        on_error="discard",
+        options=options,
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    return _state_with(node), node.id, user_term
+
+
+async def _save_event_liveness_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionState,
+) -> UUID:
+    state_dict = state.to_dict()
+    record = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=state_dict["sources"],
+            nodes=state_dict["nodes"],
+            edges=state_dict["edges"],
+            outputs=state_dict["outputs"],
+            metadata_=state_dict["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    return record.id
+
+
+async def _seed_event_liveness_session(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionState,
+) -> UUID:
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Interpretation event liveness test",
+                created_at=_now(),
+                updated_at=_now(),
+            )
+        )
+    return await _save_event_liveness_state(service, session_id, state)
+
+
+# --------------------------------------------------------------------------- #
+# Review-event liveness — only the exact current draft may settle
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "old_draft", "current_draft"),
+    [
+        (InterpretationKind.VAGUE_TERM, "visually appealing", "aesthetically pleasing"),
+        (InterpretationKind.INVENTED_SOURCE, "https://old.example", "https://current.example"),
+        (
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            "Summarise {{ row.text }}.",
+            "Classify {{ row.text }}.",
+        ),
+        (
+            InterpretationKind.PIPELINE_DECISION,
+            "Approve the original scraping identity.",
+            "Approve the current scraping identity.",
+        ),
+        (
+            InterpretationKind.LLM_MODEL_CHOICE,
+            "anthropic/claude-haiku-4.5",
+            "anthropic/claude-sonnet-4.5",
+        ),
+    ],
+    ids=[kind.value for kind in InterpretationKind],
+)
+async def test_only_event_for_exact_current_draft_can_settle(
+    service: SessionServiceImpl,
+    kind: InterpretationKind,
+    old_draft: str,
+    current_draft: str,
+) -> None:
+    old_state, affected_node_id, user_term = _event_liveness_state(kind, draft=old_draft)
+    session_id = uuid4()
+    old_state_id = await _seed_event_liveness_session(service, session_id, old_state)
+    old_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=old_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"old-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=old_draft,
+        **_provenance_kwargs(),
+    )
+
+    current_state, current_component_id, current_user_term = _event_liveness_state(kind, draft=current_draft)
+    assert current_component_id == affected_node_id
+    assert current_user_term == user_term
+    current_state_id = await _save_event_liveness_state(service, session_id, current_state)
+
+    # The older card is still an immutable audit row, but it is no longer live
+    # authority for the same site after that site's draft changes.
+    with pytest.raises(ValueError):
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=old_event.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+        )
+    pending_rows = await service.list_interpretation_events(session_id, status="pending")
+    assert [row.id for row in pending_rows] == [old_event.id]
+
+    current_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=current_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"current-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=current_draft,
+        **_provenance_kwargs(),
+    )
+    all_rows = await service.list_interpretation_events(session_id, status="all")
+    by_id = {row.id: row for row in all_rows}
+    assert by_id[old_event.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[old_event.id].resolved_at is not None
+    assert by_id[current_event.id].choice is InterpretationChoice.PENDING
+    resolved_event, resolved_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=current_event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+
+    assert resolved_event.accepted_value == current_draft
+    if kind is InterpretationKind.INVENTED_SOURCE:
+        assert resolved_state.sources is not None
+        options = resolved_state.sources["source"]["options"]
+    else:
+        assert resolved_state.nodes is not None
+        options = next(node["options"] for node in resolved_state.nodes if node["id"] == affected_node_id)
+    requirement = next(
+        requirement
+        for requirement in options[INTERPRETATION_REQUIREMENTS_KEY]
+        if requirement["kind"] == kind.value and requirement["user_term"] == user_term
+    )
+    assert requirement["status"] == "resolved"
+    assert requirement["event_id"] == str(current_event.id)
+    assert requirement["accepted_value"] == current_draft
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "draft"),
+    [
+        (InterpretationKind.VAGUE_TERM, "visually appealing"),
+        (InterpretationKind.INVENTED_SOURCE, "https://same.example"),
+        (InterpretationKind.LLM_PROMPT_TEMPLATE, "Classify {{ row.text }}."),
+        (InterpretationKind.PIPELINE_DECISION, "Approve the configured scraping identity."),
+        (InterpretationKind.LLM_MODEL_CHOICE, "anthropic/claude-haiku-4.5"),
+    ],
+    ids=[kind.value for kind in InterpretationKind],
+)
+async def test_review_event_identity_supersedes_same_text_changed_artifact(
+    service: SessionServiceImpl,
+    kind: InterpretationKind,
+    draft: str,
+) -> None:
+    """Authority follows reviewed content, while unrelated state versions stay idempotent."""
+    state_a, affected_node_id, user_term = _event_liveness_state(
+        kind,
+        draft=draft,
+        identity_variant="a",
+    )
+    session_id = uuid4()
+    state_a_id = await _seed_event_liveness_session(service, session_id, state_a)
+    event_a = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_a_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"artifact-a-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+
+    state_b, current_component_id, current_user_term = _event_liveness_state(
+        kind,
+        draft=draft,
+        identity_variant="b",
+    )
+    assert current_component_id == affected_node_id
+    assert current_user_term == user_term
+    state_b_id = await _save_event_liveness_state(service, session_id, state_b)
+
+    # Independent resolution liveness: even before a replacement event exists,
+    # the older card cannot settle a different live artifact with identical text.
+    with pytest.raises(ValueError):
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=event_a.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+        )
+    assert [row.id for row in await service.list_interpretation_events(session_id, status="pending")] == [event_a.id]
+
+    event_b = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_b_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"artifact-b-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+    assert event_b.id != event_a.id
+    rows_after_supersession = await service.list_interpretation_events(session_id, status="all")
+    by_id = {row.id: row for row in rows_after_supersession}
+    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_a.id].resolved_at is not None
+    assert by_id[event_b.id].choice is InterpretationChoice.PENDING
+
+    # A new composition-state version whose reviewed projection is unchanged
+    # reuses the current event instead of producing another card.
+    unrelated_state = replace(
+        state_b,
+        metadata=PipelineMetadata(name="Unrelated metadata edit"),
+    )
+    unrelated_state_id = await _save_event_liveness_state(service, session_id, unrelated_state)
+    event_b_again = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=unrelated_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"artifact-b-unrelated-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+    assert event_b_again.id == event_b.id
+    assert [row.id for row in await service.list_interpretation_events(session_id, status="pending")] == [event_b.id]
+
+    resolved_event, _resolved_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event_b.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+    assert resolved_event.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
+    assert resolved_event.accepted_value == draft
+    assert await service.list_interpretation_events(session_id, status="pending") == []
+
+
+@pytest.mark.asyncio
+async def test_structured_vague_term_identity_tracks_prompt_parts_structure(
+    service: SessionServiceImpl,
+) -> None:
+    """An unchanged requirement cannot carry authority into a different slot skeleton."""
+    draft = "visually appealing"
+    state_a, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.VAGUE_TERM,
+        draft=draft,
+        identity_variant="a",
+    )
+    session_id = uuid4()
+    state_a_id = await _seed_event_liveness_session(service, session_id, state_a)
+    event_a = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_a_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="vague-structure-a",
+        user_term=user_term,
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+
+    node_a = state_a.nodes[0]
+    requirement_id = node_a.options[INTERPRETATION_REQUIREMENTS_KEY][0]["id"]
+    options_b = dict(node_a.options)
+    options_b["prompt_template"] = "Explain pending interpretation: {{ row.text }}"
+    options_b[PROMPT_TEMPLATE_PARTS_KEY] = [
+        {"kind": "text", "text": "Explain "},
+        {"kind": "interpretation_ref", "requirement_id": requirement_id},
+        {"kind": "text", "text": ": {{ row.text }}"},
+    ]
+    state_b = replace(
+        state_a,
+        nodes=(replace(node_a, options=options_b),),
+    )
+    state_b_id = await _save_event_liveness_state(service, session_id, state_b)
+
+    with pytest.raises(ValueError):
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=event_a.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+        )
+
+    event_b = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_b_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="vague-structure-b",
+        user_term=user_term,
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+    assert event_b.id != event_a.id
+    all_rows = await service.list_interpretation_events(session_id, status="all")
+    by_id = {row.id: row for row in all_rows}
+    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_b.id].choice is InterpretationChoice.PENDING
+
+    event_b_again = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_b_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="vague-structure-b-again",
+        user_term=user_term,
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+    assert event_b_again.id == event_b.id
+
+    resolved_event, resolved_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event_b.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+    assert resolved_event.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
+    assert resolved_state.nodes is not None
+    [resolved_node] = [node for node in resolved_state.nodes if node["id"] == affected_node_id]
+    assert resolved_node["options"]["prompt_template"] == "Explain visually appealing: {{ row.text }}"
+
+
+@pytest.mark.asyncio
+async def test_legacy_vague_term_event_is_bound_to_its_surfacing_prompt(
+    service: SessionServiceImpl,
+) -> None:
+    """Legacy placeholder rows lack a stored requirement draft, so bind to the prompt."""
+    session_id = uuid4()
+    old_state = _state_with(
+        _llm_node(
+            node_id="legacy_llm",
+            term="cool",
+            prompt_template="Rate {{interpretation:cool}} using the original rubric.",
+        )
+    )
+    old_state_id = await _seed_event_liveness_session(service, session_id, old_state)
+    old_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=old_state_id,
+        affected_node_id="legacy_llm",
+        tool_call_id="old-legacy-vague",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="visually appealing",
+        **_provenance_kwargs(),
+    )
+    current_state = _state_with(
+        _llm_node(
+            node_id="legacy_llm",
+            term="cool",
+            prompt_template="Rate {{interpretation:cool}} using the current rubric.",
+        )
+    )
+    current_state_id = await _save_event_liveness_state(service, session_id, current_state)
+
+    with pytest.raises(ValueError):
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=old_event.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+        )
+
+    current_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=current_state_id,
+        affected_node_id="legacy_llm",
+        tool_call_id="current-legacy-vague",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="aesthetically pleasing",
+        **_provenance_kwargs(),
+    )
+    resolved, resolved_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=current_event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+
+    assert resolved.accepted_value == "aesthetically pleasing"
+    assert resolved_state.nodes is not None
+    prompt = next(node["options"]["prompt_template"] for node in resolved_state.nodes if node["id"] == "legacy_llm")
+    assert prompt == "Rate aesthetically pleasing using the current rubric."
+
+
+@pytest.mark.asyncio
+async def test_structured_vague_term_writer_rejects_noncurrent_draft(
+    service: SessionServiceImpl,
+) -> None:
+    state, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.VAGUE_TERM,
+        draft="the current definition",
+    )
+    session_id = uuid4()
+    state_id = await _seed_event_liveness_session(service, session_id, state)
+
+    with pytest.raises(ValueError, match="event draft"):
+        await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state_id,
+            affected_node_id=affected_node_id,
+            tool_call_id="stale-at-create",
+            user_term=user_term,
+            kind=InterpretationKind.VAGUE_TERM,
+            llm_draft="an older definition",
+            **_provenance_kwargs(),
+        )
+
+    assert await service.list_interpretation_events(session_id, status="all") == []
+
+
+def test_structured_vague_term_boundary_rejects_noncurrent_draft() -> None:
+    state, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.VAGUE_TERM,
+        draft="the current definition",
+    )
+
+    with pytest.raises(ToolArgumentError, match="stale vague-term draft"):
+        _assert_affected_component(
+            state,
+            affected_node_id,
+            InterpretationKind.VAGUE_TERM,
+            user_term,
+            "an older definition",
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Tests 01 — tool registration
 # --------------------------------------------------------------------------- #
@@ -605,7 +1207,7 @@ async def test_02c_structured_pending_requirement_happy_path(service: SessionSer
             "affected_node_id": "rate_node",
             "kind": "vague_term",
             "user_term": "cool",
-            "llm_draft": "Visually appealing.",
+            "llm_draft": "visually appealing",
         },
         state=state,
         session_id=session_id,

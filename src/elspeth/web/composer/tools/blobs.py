@@ -70,6 +70,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools._common import (
     ToolContext,
     ToolResult,
+    _composition_canonical_interpretation_requirement_error,
     _discovery_result,
     _failure_result,
     _mutation_result,
@@ -444,6 +445,7 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
                     node.plugin,
                     {keys[0]: marker},
                     tool_name="wire_blob_inline_ref",
+                    component_id=node_id,
                 )
                 if runtime_owned_error is not None:
                     raise ValueError(runtime_owned_error)
@@ -458,6 +460,12 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
 
     if prefix.startswith("output:"):
         output_name = prefix.removeprefix("output:")
+        if keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
+            raise ValueError(
+                "wire_blob_inline_ref cannot write output interpretation_requirements; "
+                "review metadata may only be staged as pending composer input and "
+                "resolved by resolve_interpretation_event."
+            )
         new_outputs = []
         found = False
         for output in state.outputs:
@@ -579,6 +587,16 @@ def _execute_wire_blob_inline_ref(
         new_state = _apply_inline_blob_marker(state, ref.field_path, marker)
     except ValueError as exc:
         return _failure_result(state, str(exc))
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        new_state,
+        tool_name="wire_blob_inline_ref",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
+        )
     endpoint_policy_error = _inline_blob_endpoint_policy_error(new_state, ref.field_path)
     if endpoint_policy_error is not None:
         return _failure_result(state, endpoint_policy_error)

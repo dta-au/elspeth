@@ -69,11 +69,42 @@ def test_execute_tool_rejects_extra_top_level_arguments_before_handler() -> None
         _empty_state(),
         _catalog(),
         tool_arguments_hash="0" * 64,
+        validate_arguments=True,
     )
 
     assert result.success is False
     assert "Invalid arguments for tool 'get_pipeline_state'" in result.data["error"]
     assert "unsupported" in result.data["error"]
+    assert "sk-test-secret" not in result.data["error"]
+
+
+def test_execute_tool_rejects_extra_arguments_without_audit_hash_before_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _explode(
+        arguments: dict[str, Any],
+        state: CompositionState,
+        context: ToolContext,
+    ) -> ToolResult:
+        del arguments, state, context
+        raise AssertionError("schema-invalid arguments reached the handler")
+
+    monkeypatch.setattr(
+        dispatch_module,
+        "_DISCOVERY_TOOLS",
+        {**dispatch_module._DISCOVERY_TOOLS, "get_pipeline_state": _explode},
+    )
+
+    result = execute_tool(
+        "get_pipeline_state",
+        {"component": "source", "leaked_value": "sk-test-secret"},
+        _empty_state(),
+        _catalog(),
+        validate_arguments=True,
+    )
+
+    assert result.success is False
+    assert "Invalid arguments for tool 'get_pipeline_state'" in result.data["error"]
     assert "sk-test-secret" not in result.data["error"]
 
 
@@ -84,6 +115,7 @@ def test_execute_tool_rejects_wrong_argument_types_before_handler() -> None:
         _empty_state(),
         _catalog(),
         tool_arguments_hash="0" * 64,
+        validate_arguments=True,
     )
 
     assert result.success is False
@@ -104,6 +136,26 @@ def test_source_path_arguments_require_data_dir_for_s2_confinement() -> None:
         _empty_state(),
         _catalog(),
         tool_arguments_hash="0" * 64,
+        require_data_dir_for_paths=True,
+    )
+
+    assert result.success is False
+    assert "Path violation (S2)" in result.data["error"]
+    assert "data_dir" in result.data["error"]
+
+
+def test_source_path_arguments_require_data_dir_without_audit_hash() -> None:
+    result = execute_tool(
+        "set_source",
+        {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {"path": "outside.csv", "schema": {"mode": "observed"}},
+            "on_validation_failure": "error",
+        },
+        _empty_state(),
+        _catalog(),
+        require_data_dir_for_paths=True,
     )
 
     assert result.success is False

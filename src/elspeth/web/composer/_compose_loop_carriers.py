@@ -96,12 +96,14 @@ class _CallModelOutcome:
     ``raw_assistant_content``. P5's B-4D-3 last-chance path produces a
     second instance per iteration.
 
-    ``response``, ``assistant_message`` and the ``assistant_tool_calls``
-    entries are LiteLLM-owned objects; ELSPETH treats them as opaque
-    Tier-3 values. ``response`` is threaded into the session-aware
-    dispatch helper, which writes its ``model`` field into interpretation
-    events. ``raw_assistant_content`` is the assistant text *before* any
-    augmentation by ``_finalize_no_tool_response`` (scalar string-or-None).
+    ``response`` and ``assistant_message`` are LiteLLM-owned objects;
+    ELSPETH treats them as opaque Tier-3 values. ``assistant_tool_calls``
+    contains ELSPETH-owned immutable copies admitted immediately after the
+    provider returns, before any subsequent await. ``response`` is threaded
+    into the session-aware dispatch helper, which writes its ``model`` field
+    into interpretation events. ``raw_assistant_content`` is the assistant
+    text *before* any augmentation by ``_finalize_no_tool_response`` (scalar
+    string-or-None).
     """
 
     response: Any
@@ -111,9 +113,9 @@ class _CallModelOutcome:
     has_tool_calls: bool
 
     # No freeze_fields: response and assistant_message are opaque (Tier-3
-    # LiteLLM values), assistant_tool_calls is already a tuple,
-    # raw_assistant_content is str|None, has_tool_calls is bool. frozen=True
-    # alone is sufficient.
+    # LiteLLM values), assistant_tool_calls is already a tuple of frozen
+    # admitted values, raw_assistant_content is str|None, and has_tool_calls
+    # is bool. frozen=True alone is sufficient.
 
 
 @dataclass(frozen=True, slots=True)

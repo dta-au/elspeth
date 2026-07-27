@@ -149,6 +149,14 @@ def test_static_planner_guidance_contains_no_deployment_plugin_facts() -> None:
     assert "Single-query LLM output remains one response column" not in core
 
 
+def test_interpretation_requirement_guidance_uses_exact_public_shell() -> None:
+    interaction = load_skill("pipeline_composer")
+
+    assert "You author ONLY `kind`, `user_term`, and `draft`." in interaction
+    assert "plus `id`" not in interaction
+    assert "`status` defaults to `pending`" not in interaction
+
+
 def test_freeform_skill_hash_covers_the_exact_composed_static_prompt() -> None:
     rendered = build_system_prompt(None)
 

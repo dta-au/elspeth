@@ -462,7 +462,7 @@ class TestDispatchTool:
         )
         assert result["success"] is True
 
-    def test_set_source_mutates_state(self, scratch_dir: Path) -> None:
+    def test_set_source_path_without_session_identity_fails_closed(self, scratch_dir: Path) -> None:
         # set_source is promoted to a type-driven manifest entry
         # (SetSourceArgumentsModel) with extra="forbid" — the LLM-supplied
         # argument set MUST include all four required fields.  Prior to
@@ -480,8 +480,9 @@ class TestDispatchTool:
             _mock_catalog(),
             scratch_dir,
         )
-        assert result["success"] is True
-        assert result["state"]["sources"]["source"]["plugin"] == "csv"
+        assert result["success"] is False
+        assert "Path violation (S2)" in result["data"]["error"]
+        assert "data_dir" in result["data"]["error"]
 
     def test_set_output_requires_explicit_collision_policy(self, scratch_dir: Path) -> None:
         result = _dispatch_tool(
@@ -615,16 +616,11 @@ class TestDispatchTool:
         )
         session_id = new_result["data"]["session_id"]
 
-        # Modify state via set_source.  All four required fields per
-        # SetSourceArgumentsModel (extra="forbid").
+        # Modify state with a path-free composer tool. Raw local source paths
+        # are intentionally unavailable to this unscoped direct dispatcher.
         modified = _dispatch_tool(
-            "set_source",
-            {
-                "plugin": "csv",
-                "on_success": "node_1",
-                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
-                "on_validation_failure": "discard",
-            },
+            "set_metadata",
+            {"patch": {"name": "Round Trip"}},
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
@@ -654,7 +650,7 @@ class TestDispatchTool:
             session_checkout_ref=session_checkout_ref,
         )
         assert load_result["success"] is True
-        assert load_result["state"]["sources"]["source"]["plugin"] == "csv"
+        assert load_result["state"]["metadata"]["name"] == "Round Trip"
 
     def test_delete_missing_session_before_scratch_exists_returns_not_found(self, tmp_path: Path) -> None:
         scratch_dir = tmp_path / "scratch"
