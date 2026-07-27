@@ -84,6 +84,8 @@ def test_ci_and_release_image_build_with_node_24() -> None:
 def test_active_deployment_runbooks_require_node_24() -> None:
     aws = (REPO_ROOT / "docs/runbooks/aws-ecs-deployment.md").read_text(encoding="utf-8")
     ansible = (REPO_ROOT / "docs/runbooks/ansible-ubuntu-deployment.md").read_text(encoding="utf-8")
+    redeploy = (REPO_ROOT / "docs/runbooks/aws-ecs-existing-service-redeploy.md").read_text(encoding="utf-8")
+    caddy = (REPO_ROOT / "docs/runbooks/caddy-development-refresh.md").read_text(encoding="utf-8")
 
     assert "Node 24/npm 11" in aws
     assert "Node 22/npm" not in aws
@@ -94,3 +96,49 @@ def test_active_deployment_runbooks_require_node_24() -> None:
     assert "Node.js 20.19" not in ansible
     assert "NodeSource Node 20.x" not in ansible
     assert "https://deb.nodesource.com/node_20.x" not in ansible
+
+    for text in (redeploy, caddy):
+        assert "Node.js 24" in text
+        assert "npm 11" in text
+        assert "npm --prefix src/elspeth/web/frontend ci" in text
+
+
+def test_source_checkout_install_docs_use_locked_toolchains() -> None:
+    paths = (
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "CONTRIBUTING.md",
+        REPO_ROOT / "docs/guides/telemetry.md",
+        REPO_ROOT / "docs/guides/tier2-tracing.md",
+        REPO_ROOT / "docs/guides/troubleshooting.md",
+        REPO_ROOT / "docs/guides/your-first-pipeline.md",
+        REPO_ROOT / "docs/guides/user-manual.md",
+        REPO_ROOT / "docs/guides/landscape-mcp-analysis.md",
+        REPO_ROOT / "docs/reference/web-scrape-transform.md",
+    )
+
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert "Python 3.11+" not in text, path
+        assert "\nnpm install\n" not in text, path
+        assert "uv pip install -e" not in text, path
+        assert "uv pip install elspeth[" not in text, path
+        assert "uv pip install ddtrace" not in text, path
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    contributing = (REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    first_pipeline = (REPO_ROOT / "docs/guides/your-first-pipeline.md").read_text(encoding="utf-8")
+    user_manual = (REPO_ROOT / "docs/guides/user-manual.md").read_text(encoding="utf-8")
+    landscape_mcp = (REPO_ROOT / "docs/guides/landscape-mcp-analysis.md").read_text(encoding="utf-8")
+    web_scrape = (REPO_ROOT / "docs/reference/web-scrape-transform.md").read_text(encoding="utf-8")
+
+    assert "Node.js 24 and npm 11" in readme
+    assert "npm --prefix src/elspeth/web/frontend ci" in readme
+    assert "Node.js 24, and npm 11" in contributing
+    assert "npm --prefix src/elspeth/web/frontend ci" in contributing
+    assert "Python 3.12+" in first_pipeline
+    assert "Node.js 24, npm 11" in first_pipeline
+    assert "npm --prefix src/elspeth/web/frontend ci" in first_pipeline
+    assert "uv sync --frozen --all-extras" in user_manual
+    assert "uv sync --frozen --extra mcp" in landscape_mcp
+    assert "there is no separate `web` extra" in web_scrape
+    assert ".[web]" not in web_scrape

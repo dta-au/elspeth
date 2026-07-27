@@ -15,6 +15,7 @@ from elspeth.web.aws_ecs_acceptance import SCENARIO_ASSIGNMENT_NAMES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-deployment.md"
+REDEPLOY_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-existing-service-redeploy.md"
 BEDROCK_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-bedrock-opus-sonnet.md"
 RUNBOOK_INDEX = REPO_ROOT / "docs" / "runbooks" / "index.md"
 DOCKER_GUIDE = REPO_ROOT / "docs" / "guides" / "docker.md"
@@ -930,12 +931,49 @@ def test_runbook_binds_bootstrap_approvals_and_terminal_receipt_lifecycle() -> N
 
 
 def test_runbook_is_linked_from_operator_indexes() -> None:
+    index = RUNBOOK_INDEX.read_text(encoding="utf-8")
+    guide = DOCKER_GUIDE.read_text(encoding="utf-8")
+
+    assert REDEPLOY_RUNBOOK.is_file()
     assert (
-        "| [AWS ECS Deployment](aws-ecs-deployment.md) | Deploying ELSPETH web to AWS ECS Fargate with Aurora PostgreSQL |"
-    ) in RUNBOOK_INDEX.read_text(encoding="utf-8")
+        "| [AWS ECS Existing-Service Redeploy](aws-ecs-existing-service-redeploy.md) "
+        "| Build, scan, and deploy an immutable image to an existing ECS/Fargate service |"
+    ) in index
     assert (
-        "[AWS ECS Deployment Runbook](../runbooks/aws-ecs-deployment.md) - Production ECS/Fargate deployment contract"
-    ) in DOCKER_GUIDE.read_text(encoding="utf-8")
+        "| [AWS ECS Full Disposable Acceptance](aws-ecs-deployment.md) "
+        "| Provision, exercise, and destroy the release-specific two-scenario acceptance environment |"
+    ) in index
+    assert (
+        "[AWS ECS Existing-Service Redeploy](../runbooks/aws-ecs-existing-service-redeploy.md) - Everyday immutable image redeploy"
+    ) in guide
+    assert (
+        "[AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance"
+    ) in guide
+
+
+def test_existing_service_redeploy_requires_immutable_scan_clean_identity() -> None:
+    text = REDEPLOY_RUNBOOK.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+
+    for phrase in (
+        'test -z "$(git status --porcelain)"',
+        '--build-arg INSTALL_EXTRAS="webui llm aws postgres"',
+        'CANDIDATE_IMAGE="$ECR_REPOSITORY_URI@$IMAGE_DIGEST"',
+        "describe-image-scan-findings",
+        'test "$SCAN_STATUS" = COMPLETE',
+        'setenv("ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE"; $sha)',
+        'setenv("ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION"; $revision)',
+        'command:["doctor","aws-ecs","--json"]',
+        '"minimumHealthyPercent":0,"maximumPercent":100',
+        'test "$RUNNING_DIGEST" = "$SCAN_DIGEST"',
+        "$ELSPETH_BASE_URL/api/health",
+        "$ELSPETH_BASE_URL/api/ready",
+        "ELSPETH_ACCEPTANCE_BASE_URL",
+    ):
+        assert phrase in text
+
+    assert "Do not interpret an unavailable parent-index scan as a clean platform image." in normalized
+    assert "direct ECS Exec inherits the task definition's static environment" in normalized
 
 
 def test_bedrock_runbook_removes_openrouter_secret_for_all_bedrock_composer() -> None:

@@ -1,7 +1,7 @@
 # ELSPETH's base Compose file is CLI-first and uses local SQLite state.
 #
 # Run CLI commands with an immutable release image, for example:
-#   IMAGE_TAG=v0.7.2 docker compose run --rm elspeth --version
+#   IMAGE_TAG=sha-<full-commit> docker compose run --rm elspeth --version
 #
 # The supported PostgreSQL web deployment adds both shipped overlays:
 #   docker compose -f docker-compose.yaml -f deploy/compose/postgres.yaml \

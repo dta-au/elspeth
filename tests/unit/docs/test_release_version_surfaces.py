@@ -34,22 +34,42 @@ def test_current_release_indexes_name_release_072() -> None:
     assert "`release/0.7.2`" in roadmap
 
 
-def test_current_container_examples_use_release_072_tag() -> None:
+def test_current_container_examples_require_a_confirmed_published_tag() -> None:
     for relative_path in (
         "README.md",
         "docs/guides/docker.md",
         "docs/guides/troubleshooting.md",
+        "docs/guides/your-first-pipeline.md",
         "docs/reference/environment-variables.md",
+        "docs/runbooks/resume-failed-run.md",
     ):
         text = _text(relative_path)
-        assert "v0.7.2" in text, relative_path
+        assert "IMAGE_TAG" in text, relative_path
+        assert "exact published" in text, relative_path
+        assert "v0.7.2" not in text, relative_path
         assert "v0.7.1" not in text, relative_path
+        assert "elspeth:latest" not in text, relative_path
+
+    docker = _text("docs/guides/docker.md")
+    assert "docker buildx imagetools inspect" in docker
+    assert "do not infer an image tag from the python package version" in docker.lower()
+
+
+def test_first_pipeline_docker_walkthrough_creates_the_mounted_state_directory() -> None:
+    tutorial = _text("docs/guides/your-first-pipeline.md")
+
+    assert "mkdir -p my-pipeline/{config,input,output,data}" in tutorial
+    assert "-v $(pwd)/data:/app/data" in tutorial
+    assert "mkdir -p my-pipeline/{config,input,output,state}" not in tutorial
 
 
 def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
     ansible = _text("docs/runbooks/ansible-ubuntu-deployment.md")
     assert "schema-incompatible 0.7.2 upgrade from 0.7.1" in ansible
     assert "direct 0.7.1→0.7.2 upgrade" in ansible
+    assert "full 40-character Git commit SHA" in ansible
+    assert "ELSPETH_RELEASE_REF=v0.7.2" not in ansible
+    assert "ELSPETH_ROLLBACK_REF=v0.7.1" not in ansible
 
     sharing = _text("docs/guides/sharing-pipelines.md")
     assert "For 0.7.2" in sharing

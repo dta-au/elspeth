@@ -19,7 +19,7 @@ def test_docker_guide_uses_release_tag_variable_for_image_examples() -> None:
     text = DOCKER_GUIDE.read_text(encoding="utf-8")
 
     assert STALE_IMAGE_TAG not in text
-    assert "IMAGE_TAG=" in text
+    assert "IMAGE_TAG:?export an exact published sha-* or v* image tag" in text
     assert "ghcr.io/johnm-dta/elspeth:${IMAGE_TAG}" in text
     assert "your-acr.azurecr.io/elspeth:${IMAGE_TAG}" in text
 
