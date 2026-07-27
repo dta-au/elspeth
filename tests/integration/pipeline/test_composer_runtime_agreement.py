@@ -104,6 +104,14 @@ where the architectural fix landed:
   multiple producers without a queue"). Pinned by
   ``TestComposerRuntimeQueueAgreement`` with a manual negative control proving
   the queue-free topology still reproduces the runtime rejection.
+* Shape 12 — queue-to-coalesce consumer accounting
+  (``elspeth-3f4e63900f``). Runtime connection registration treats only mapped
+  coalesce branches (branch name differs from input connection) as ordinary
+  consumers; list-form/identity branches are direct gate-to-coalesce COPY
+  edges. Composer previously omitted mapped branches from duplicate-consumer
+  accounting and inferred queue liveness from the coalesce node's first
+  compatibility ``input`` field. Pinned in both directions by
+  ``TestComposerRuntimeQueueAgreement``.
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
@@ -4167,6 +4175,16 @@ class TestComposerRuntimeQueueAgreement:
     ``GraphValidationError("Duplicate producer for connection 'inbound' ...")``,
     which the negative control below asserts directly by deleting the emitted
     ``queues:`` section.
+
+    Shape 12 is pinned on
+    ``web/composer/state._coalesce_mapped_branch_connections`` and its use in
+    connection/queue consumer accounting. Reverting those call sites to exclude
+    mapped branch claims and to count only ``node.input`` makes the mapped-only
+    test fail with ``queue_no_consumer``, the mapped-plus-ordinary test fail to
+    report ``duplicate_connection_consumer``, and the list-form test fail to
+    report ``queue_no_consumer``. Verified by manually reverting both call
+    sites on 2026-07-28; the three focused tests failed in exactly those ways,
+    then passed after restoration.
     """
 
     def _example_yaml(self) -> str:
@@ -4182,8 +4200,121 @@ class TestComposerRuntimeQueueAgreement:
             sinks=bundle.sinks,
             aggregations=bundle.aggregations,
             gates=list(settings.gates),
+            coalesce_settings=list(settings.coalesce),
             queues=settings.queues,
         )
+
+    def _queue_to_coalesce_yaml(self, *, branch_form: str, ordinary_consumer: bool = False) -> str:
+        import yaml
+
+        if branch_form == "mapping":
+            fork_to = ["queued_path", "other_path"]
+            transforms: list[dict[str, Any]] = [
+                {
+                    "name": "queued_leg",
+                    "plugin": "passthrough",
+                    "input": "queued_path",
+                    "on_success": "inbound",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                },
+                {
+                    "name": "other_leg",
+                    "plugin": "passthrough",
+                    "input": "other_path",
+                    "on_success": "other_done",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                },
+            ]
+            branches: list[str] | dict[str, str] = {
+                "other_path": "other_done",
+                "queued_path": "inbound",
+            }
+        elif branch_form == "list":
+            fork_to = ["inbound", "other_done"]
+            transforms = []
+            branches = ["inbound", "other_done"]
+        else:
+            raise AssertionError(f"unknown branch form: {branch_form}")
+
+        if ordinary_consumer:
+            transforms.append(
+                {
+                    "name": "duplicate_consumer",
+                    "plugin": "passthrough",
+                    "input": "inbound",
+                    "on_success": "duplicate_out",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                }
+            )
+
+        def source(path: str, on_success: str) -> dict[str, Any]:
+            return {
+                "plugin": "csv",
+                "on_success": on_success,
+                "options": {
+                    "path": path,
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "discard",
+                },
+            }
+
+        sinks: dict[str, Any] = {
+            "combined": {
+                "plugin": "json",
+                "on_write_failure": "discard",
+                "options": {
+                    "path": "examples/multi_source_queue/output/combined.jsonl",
+                    "format": "jsonl",
+                    "collision_policy": "auto_increment",
+                    "schema": {"mode": "observed"},
+                },
+            }
+        }
+        if ordinary_consumer:
+            sinks["duplicate_out"] = {
+                "plugin": "json",
+                "on_write_failure": "discard",
+                "options": {
+                    "path": "examples/multi_source_queue/output/duplicate.jsonl",
+                    "format": "jsonl",
+                    "collision_policy": "auto_increment",
+                    "schema": {"mode": "observed"},
+                },
+            }
+
+        doc = {
+            "sources": {
+                "orders": source("examples/multi_source_queue/input/orders.csv", "inbound"),
+                "refunds": source("examples/multi_source_queue/input/refunds.csv", "inbound"),
+                "fork_root": source("examples/multi_source_queue/input/orders.csv", "fork_input"),
+            },
+            "queues": {"inbound": {}},
+            "transforms": transforms,
+            "gates": [
+                {
+                    "name": "fork_rows",
+                    "input": "fork_input",
+                    "condition": "True",
+                    "routes": {"true": "fork", "false": "discard"},
+                    "fork_to": fork_to,
+                }
+            ],
+            "coalesce": [
+                {
+                    "name": "merged",
+                    "branches": branches,
+                    "policy": "require_all",
+                    "merge": "nested",
+                    "on_success": "combined",
+                }
+            ],
+            "sinks": sinks,
+            "landscape": {"url": "sqlite:///examples/multi_source_queue/runs/audit.db"},
+        }
+        return yaml.safe_dump(doc, sort_keys=False)
 
     def test_queue_round_trips_composer_import_export_and_runtime_graph(self) -> None:
         from elspeth.contracts import NodeType
@@ -4247,4 +4378,44 @@ class TestComposerRuntimeQueueAgreement:
         # With no queue, the two sources publishing 'inbound' are an undeclared
         # duplicate producer; the runtime rejects this at graph build time.
         with pytest.raises(GraphValidationError, match="Duplicate producer for connection 'inbound'"):
+            self._build_runtime_graph_for_settings(settings)
+
+    def test_mapped_coalesce_branch_is_the_queues_single_consumer_in_both_layers(self) -> None:
+        """A mapped branch consumes its connection in Composer exactly as runtime does."""
+        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        state = composition_state_from_runtime_yaml(self._queue_to_coalesce_yaml(branch_form="mapping"))
+        composer_result = state.validate()
+        assert composer_result.is_valid, [e.message for e in composer_result.errors]
+
+        generated_yaml = composer_yaml_generator.generate_yaml(state)
+        settings = load_settings_from_yaml_string(generated_yaml)
+        graph = self._build_runtime_graph_for_settings(settings)
+        graph.validate()
+
+    def test_mapped_coalesce_and_ordinary_queue_consumers_are_rejected_in_both_layers(self) -> None:
+        """A mapped branch plus an ordinary node is forbidden queue fan-out."""
+        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        state = composition_state_from_runtime_yaml(self._queue_to_coalesce_yaml(branch_form="mapping", ordinary_consumer=True))
+        composer_result = state.validate()
+        assert any(error.error_code == "duplicate_connection_consumer" for error in composer_result.errors)
+
+        settings = load_settings_from_yaml_string(composer_yaml_generator.generate_yaml(state))
+        with pytest.raises(GraphValidationError, match="Duplicate consumers"):
+            self._build_runtime_graph_for_settings(settings)
+
+    def test_list_form_identity_branch_is_not_a_queue_consumer_in_either_layer(self) -> None:
+        """List-form branches are gate identity edges, not queue connection consumers."""
+        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        state = composition_state_from_runtime_yaml(self._queue_to_coalesce_yaml(branch_form="list"))
+        composer_result = state.validate()
+        assert any(error.error_code == "queue_no_consumer" for error in composer_result.errors)
+
+        settings = load_settings_from_yaml_string(composer_yaml_generator.generate_yaml(state))
+        with pytest.raises(GraphValidationError, match="queue 'inbound' with no downstream consumer"):
             self._build_runtime_graph_for_settings(settings)

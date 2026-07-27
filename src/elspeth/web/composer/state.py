@@ -250,6 +250,24 @@ def _coalesce_branch_connections(branches: CoalesceBranches | None) -> tuple[str
     return branches
 
 
+def _coalesce_mapped_branch_connections(branches: CoalesceBranches | None) -> tuple[str, ...]:
+    """Return branch connections registered as runtime consumers.
+
+    Identity branches (``branch_name == input_connection``), including every
+    list-form branch, are direct gate-to-coalesce COPY edges. Only mapped
+    branches traverse the ordinary connection registry and claim a consumer.
+    """
+    return tuple(
+        input_connection
+        for branch_name, input_connection in zip(
+            _coalesce_branch_names(branches),
+            _coalesce_branch_connections(branches),
+            strict=True,
+        )
+        if branch_name != input_connection
+    )
+
+
 def _serialize_branches(branches: CoalesceBranches) -> list[str] | dict[str, str]:
     """Serialize coalesce branches preserving list-vs-mapping semantics."""
     if isinstance(branches, Mapping):
@@ -1414,14 +1432,22 @@ def _check_schema_contracts(
             )
         )
 
-    # Coalesce reads its branches (not its input); a queue reads its fan-in
-    # predecessors but republishes under the same id, so counting it as a
-    # consumer of its own connection would make the legal queue-then-consumer
-    # pattern read as a duplicate consumer (elspeth-a5b86149d4). Both are
-    # excluded from ordinary consumer accounting.
+    # A queue reads its fan-in predecessors but republishes under the same id,
+    # so counting it as a consumer of its own connection would make the legal
+    # queue-then-consumer pattern read as a duplicate consumer
+    # (elspeth-a5b86149d4). Coalesce identity branches are direct COPY edges;
+    # mapped branches claim their input connection in the runtime registry and
+    # must do the same here (elspeth-3f4e63900f).
     consumer_claims: list[tuple[str, str, str]] = [
         (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue")
     ]
+    for node in nodes:
+        if node.node_type != "coalesce":
+            continue
+        consumer_claims.extend(
+            (connection_name, node.id, f"coalesce '{node.id}' mapped branch")
+            for connection_name in _coalesce_mapped_branch_connections(node.branches)
+        )
     consumer_counts = Counter(connection_name for connection_name, _node_id, _desc in consumer_claims)
     duplicate_consumers = sorted(name for name, count in consumer_counts.items() if count > 1)
     for connection_name in duplicate_consumers:
@@ -3051,7 +3077,7 @@ class CompositionState:
         # is covered by the input-reachability check above (a queue's input is
         # its id, which its producers publish to); more-than-one ordinary
         # consumer is covered by the duplicate-consumer check. Here we require
-        # exactly one downstream consumer (reject zero) and a name disjoint from
+        # exactly one runtime downstream consumer (reject zero) and a name disjoint from
         # the source keys and the reserved source producer namespace, mirroring
         # the runtime's global source/queue name uniqueness. Sink-name disjoint-
         # ness rides the existing connection/sink overlap check via the queue's
@@ -3060,12 +3086,15 @@ class CompositionState:
         for node in self.nodes:
             if node.node_type != "queue":
                 continue
-            ordinary_consumers = [n.id for n in self.nodes if n.node_type != "queue" and n.input == node.id]
-            if not ordinary_consumers:
+            downstream_consumers = [n.id for n in self.nodes if n.node_type not in ("coalesce", "queue") and n.input == node.id]
+            downstream_consumers.extend(
+                n.id for n in self.nodes if n.node_type == "coalesce" and node.id in _coalesce_mapped_branch_connections(n.branches)
+            )
+            if not downstream_consumers:
                 errors.append(
                     _err(
                         f"node:{node.id}",
-                        f"Queue '{node.id}' has no downstream consumer; a queue must feed exactly one ordinary node.",
+                        f"Queue '{node.id}' has no downstream consumer; a queue must feed exactly one runtime node.",
                         "high",
                         "queue_no_consumer",
                     )
