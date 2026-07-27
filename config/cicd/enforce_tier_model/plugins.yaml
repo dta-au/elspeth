@@ -385,44 +385,6 @@ allow_hits:
     carried. The qname-level rationale above was re-verified against the
     current code at this site.
   expires: '2026-09-03'
-- key: plugins/infrastructure/clients/retrieval/connection.py:R6:_is_loopback_host:fp=b55f0564115f3188
-  owner: john
-  reason: |-
-    ipaddress.ip_address() raises ValueError when the Tier-3 host string is not an IP literal (e.g. a hostname). The except returns False = 'not a loopback IP' -- an explicit, meaning-preserving classification, not a swallowed error. The actual SSRF allow/deny decision is made by the caller (_validate_chroma_http_target).
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-09-03'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-06-05T18:16:43.679740+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM: ipaddress.ip_address() raises ValueError specifically to signal 'not an IP literal' (e.g. a hostname like 'example.com'). The except converts that signal into the meaning-preserving classification 'not a loopback IP literal' = False, which is the correct answer to the predicate _is_loopback_host. This is not a swallowed error — it is the documented control-flow contract of the stdlib function, and the actual SSRF policy decision is made downstream by validate_url_for_ssrf. The rationale matches the code, and the classification preserves meaning rather than fabricating trust.
-  judge_signature_version: 2
-  scope_fingerprint: a04a2c257fb9c62ba6a661bc2a1875d644d5833ced11b1131b41555986d93554
-  judge_transport: openrouter
-  ast_path: 'body[10]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:9da73ba97de2e23621c4c325104bc318c14702749c632746d9ff86f3376e812c'
-- key: plugins/infrastructure/clients/retrieval/connection.py:R6:_host_url:fp=535090efcf4e5ddb
-  owner: john
-  reason: |-
-    ipaddress.ip_address() raises ValueError on a non-IP-literal host; the except falls back to using the Tier-3 host string as a hostname (IPv6 bracket normalization applies only to successfully parsed IPs). Explicit branch selection on external input, not error suppression -- host shape was already validated above (rejects scheme/path/query).
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-09-03'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-06-05T18:16:51.337443+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.92
-  judge_rationale: |-
-    RULE MISFIRES. The except clause is not swallowing an error — it's using ValueError as a branch discriminator: ip_address() succeeded → IPv6 bracket-normalize; ip_address() failed → host is a hostname literal, use as-is. Both branches assign url_host and the function proceeds with a well-defined result; this is the documented Python idiom for 'is this string an IP?'. The host shape was already pre-validated against scheme/path/query characters on line 37, and downstream _validate_chroma_http_target enforces SSRF policy, so neither swallowing nor fabrication is occurring.
-  judge_signature_version: 2
-  scope_fingerprint: c61f192f8181bd41acf992d1f25a4d21e577a1776bc86b23f39411d19aa2ad7b
-  judge_transport: openrouter
-  ast_path: 'body[11]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:fa8e3b72692c1c3c04bbc7cb710f2c1285327df8f35f39e5faa5cd0b7fdf9dc3'
 - key: plugins/sources/azure_blob_source.py:R6:AzureBlobSource:_load_json_array:fp=1e594410d1dda5e2
   owner: john
   reason: |-
@@ -445,25 +407,6 @@ allow_hits:
     carried. The qname-level rationale above was re-verified against the
     current code at this site.
   expires: '2026-09-15'
-- key: plugins/sinks/database_sink.py:R1:DatabaseSink:get_post_call_hints:fp=c946686ebc7efd22
-  owner: john
-  reason: |-
-    This is a composer-assistance hook, not a Tier-1 audit read or sink runtime contract. The base contract says `get_post_call_hints` is called after composer mutations and plugins inspect only their own config to return optional advisory hints: `src/elspeth/plugins/infrastructure/base.py:832` says "Return forward-looking hints conditional on the just-set config", and `src/elspeth/plugins/infrastructure/base.py:834-840` says it is called after `set_source`, `upsert_node`, and `patch_*_options` to return short operator/LLM imperatives. The concrete site reads a sparse user-authored config snapshot and emits a hint only when the optional destructive mode is present: `src/elspeth/plugins/sinks/database_sink.py:777` is `if config_snapshot.get("if_exists") == "replace":`, followed by the warning at `src/elspeth/plugins/sinks/database_sink.py:779` that `replace` "DROPS and recreates the target table". Future drift that made `config_snapshot` a fully reified `DatabaseSinkConfig`, a Landscape/audit record, or a required invariant-bearing runtime DTO would invalidate this suppression; at this site it is an optional Tier-3 composer/config boundary probe for advisory UX text.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-09-15'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-06-17T16:17:04.323511+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. The parameter is typed `Mapping[str, object]` — a sparse composer/user-authored config snapshot passed to an advisory hook, not a first-party reified DTO with a guaranteed shape. The `if_exists` key is genuinely optional (the hook emits a hint only when destructive 'replace' mode is present), so `.get(...) == "replace"` is the meaning-preserving Tier-3 boundary read: absent key correctly yields no hint, present-and-'replace' yields the warning. Direct subscript would crash the advisory path on perfectly valid sparse configs. No fabrication, no silent recovery of a value that should exist.
-  judge_signature_version: 2
-  scope_fingerprint: 8660f6017d7ee3e60545b448eac9423bbf1ba83c99d66185d8dc677b4ef3f270
-  judge_transport: openrouter
-  ast_path: 'body[27]/body[21]/body[1]/test/left'
-  judge_metadata_signature: 'hmac-sha256:v2:fcd25c8cef1e623bbea6cc911b81907118089340374b7c970f67efd87429965c'
 - key: plugins/transforms/batch_drift_compare.py:R8:BatchDriftCompare:_categorical_shifts:fp=c441d5adf610022d
   owner: john
   reason: |-
@@ -646,65 +589,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[16]/body[19]/body[6]/body[0]/body[4]/handlers[1]'
   judge_metadata_signature: 'hmac-sha256:v2:de39b5616155bf82bed244662085e72e25d78048d81dc1af1311bf12b30ad1b1'
-- key: plugins/infrastructure/clients/llm.py:R1:_extract_usage_from_provider_response:fp=54f676db05cacf08
-  owner: john
-  reason: |-
-    In _extract_usage_from_provider_response (llm.py:210), usage.get('completion_tokens') reads from the external provider's usage mapping (Tier 3). The provider may omit this field; the code maps absence to None rather than a fabricated default and defers normalization to TokenUsage.from_dict, preserving the distinction between 'not reported' and a real value per the fabrication test. This is meaning-preserving record-absence-as-None at an external boundary, not defensive .get on our own typed data. Legitimate R1 suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:09:01.603015+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM: `usage` is the provider's usage payload — external Tier-3 data whose shape is not guaranteed by any first-party contract, even though our code returns the wrapped object. The `.get()` calls map absent fields to `None` (record-absence-as-None), passing them through to `TokenUsage.from_dict` for normalization — meaning-preserving, non-fabricating boundary handling exactly as the Tier-3 quick reference prescribes for transform-on-external-calls. The docstring explicitly names this as the Tier-3 boundary, and the code matches: no default substitution, no silent swallow of a bad value, just explicit absence recording.
-  judge_signature_version: 2
-  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
-  judge_transport: openrouter
-  ast_path: 'body[36]/body[2]/body[0]/value/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:1223e9e509f2841aa6f0b12cef2a9781b384b4d496e9a9c77eb2ac5f23813f4b'
-- key: plugins/infrastructure/clients/llm.py:R1:_extract_usage_from_provider_response:fp=3ce6385129d45fcc
-  owner: john
-  reason: |-
-    In _extract_usage_from_provider_response (llm.py:211), usage.get('total_tokens') reads the external provider's usage payload (Tier 3 — provider-authored, possibly a partial aggregate-only object). Absence maps to None, not a fabricated 0, and TokenUsage.from_dict normalizes downstream, keeping honest absence distinguishable from a reported count per the fabrication decision test — the prescribed Tier-3 record-absence-as-None pattern, not defensive access on a typed first-party object.
-
-    The @trust_boundary decorator nudge does NOT apply here, even though the three structural conditions are met (external `usage` parameter, rule R1, subject rooted at `usage`): the decorator is structurally INFEASIBLE for this function. TBE1 (severity error, elspeth-lints trust_boundary/tests) mandates that every @trust_boundary carry a test_ref pointing to a pytest test whose body "contains a raising assertion for malformed-input rejection and calls the decorated function through source_param." This function provably NEVER raises on malformed `usage` — its documented contract (docstring at llm.py:200-202: "missing and non-int fields become explicit None rather than raising") is record-absence-as-None, the correct Tier-3 treatment. No raising-shape test can be written for a function that does not raise, so a @trust_boundary here could never satisfy TBE1 and would itself become a build-failing violation. The per-line allowlist entry is therefore the only valid suppression mechanism for this finding; its five sibling per-line entries (R1/R2 on the same `usage` parameter, llm.py:209-217) are already ACCEPTED under this same campaign, confirming per-line as the established and consistent treatment for this boundary. Legitimate R1 suppression; the decorator is structurally unavailable, not merely unpreferred.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:09:08.747135+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM: `usage` is the provider-returned payload (Tier-3 external data per the Quick Reference's 'Transform on external calls' clause), and the `.get()` calls record absence as explicit `None` rather than fabricating 0 — the prescribed record-absence-as-None Tier-3 boundary pattern. The docstring at lines 197-202 makes the non-raising contract explicit, and `TokenUsage.from_dict` handles normalization downstream. The decorator nudge would structurally apply by the three-question test, but the agent correctly notes this function's contract is non-raising by design (honest absence recording), which is incompatible with TBE1's raising-shape test requirement; per-line suppression is the appropriate mechanism here.
-  judge_signature_version: 2
-  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
-  judge_transport: openrouter
-  ast_path: 'body[36]/body[2]/body[0]/value/values[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:5f2ab80c8f053ca0724190bfa0ce6e0e4858518c7e4c3de0074de20aecbb42f7'
-- key: plugins/infrastructure/clients/llm.py:R2:_extract_usage_from_provider_response:fp=f8ac3c8b6b9c5f85
-  owner: john
-  reason: |-
-    In _extract_usage_from_provider_response (llm.py:216), getattr(usage, "completion_tokens", None) reads a provider SDK usage object that is Tier-3 external data (parameter typed `usage: Any`). The existing rationale still accurately describes the code: this is the documented Tier-3 normalization boundary, and the getattr-with-None preserves honest absence (None when the provider omits the field) instead of fabricating zero, with TokenUsage.from_dict doing the single normalization. The non-Mapping branch handles SDK objects that expose attributes rather than keys. Not defensive access on our typed data, not fabrication — absence flows through as None.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:09:23.694972+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. The `usage` parameter is typed `Any` and holds a provider SDK object — Tier-3 external data per the Plugin Ownership scope carve-out (LLM provider response contents are external even when a first-party client returns them). The function is the documented normalization boundary that converts provider-variable shapes into TokenUsage via from_dict, and getattr(..., None) preserves absence as None rather than fabricating zero — meaning-preserving Tier-3 coercion. The non-Mapping branch legitimately handles SDK attribute-style objects; guarding shape here is honest, not redundant defensive code.
-  judge_signature_version: 2
-  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
-  judge_transport: openrouter
-  ast_path: 'body[36]/body[2]/orelse[0]/value/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:7b88a0e95e4e1e61ba4850f1f73e4ad168d206ebc0436c0348093fd80ed1f855'
 - key: plugins/transforms/rag/config.py:R6:_get_providers:fp=3371a100de2c9052
   owner: john
   reason: |-
@@ -804,25 +688,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[23]/body[16]/body[2]/body[0]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:e64a2e4122df19c59be51503e19bae9d47f82dd45ef6cc5881491f772e4f840e'
-- key: plugins/infrastructure/clients/llm.py:R4:AuditedLLMClient:_emit_telemetry_after_audit:fp=bbfdc3112d58d4a4
-  owner: john
-  reason: |-
-    PRESCRIBED FORM — telemetry best-effort swallow under the audit>telemetry>logger primacy order; Tier-1 and programming errors re-raise first. In AuditedLLMClient._emit_telemetry_after_audit (plugins/infrastructure/clients/llm.py:337), `except Exception as tel_err` is the LAST of three clauses wrapping self._telemetry_emit(ExternalCallCompleted(...)): line 333-334 `except contract_errors.TIER_1_ERRORS: raise` (system bugs / audit integrity violations crash), line 335-336 `except (TypeError, AttributeError, KeyError, NameError): raise` (programming errors crash), and only THEN the broad catch for genuine telemetry-transport failures. The method name and comment state the doctrine: the audit record is already persisted (Landscape is the authoritative legal record), and telemetry is best-effort per the audit>telemetry>logger primacy order, so a telemetry emission failure must not corrupt or crash the already-audited call flow. This is not a silent failure: the broad catch emits logger.warning with error, error_type, run_id, state_id, operation_id and exc_info — the sanctioned last-resort logging channel precisely because the telemetry subsystem itself is the broken component here (CLAUDE.md permits logger for telemetry-system failures). "No silent failures" is honored: the failure is acknowledged on the logger, not dropped. The broad catch is correct because a transport failure can surface as many exception types, while the two re-raise clauses ensure our-code bugs and Tier-1 violations still crash. R4 flags `except Exception` generically. Per-line allowlist is the prescribed mechanism.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:10:35.501905+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    PRESCRIBED FORM — this is the sanctioned telemetry best-effort pattern under the audit>telemetry>logger primacy order. The visible code shows the correct layered structure: TIER_1_ERRORS re-raise (audit integrity preserved), programming-error types (TypeError/AttributeError/KeyError/NameError) re-raise (our-code bugs crash), and only then the broad catch for genuine telemetry-transport failures, which are logged with full context via structured logger.warning including exc_info. The audit record is already persisted before this method runs, so telemetry failure must not corrupt the audited call flow, and logger is the policy-sanctioned last-resort channel when the telemetry subsystem itself is broken. The rationale correctly identifies the R4 concern and shows how the two prior narrow re-raise clauses prevent bug-suppression while permitting the transport-failure catch.
-  judge_signature_version: 2
-  scope_fingerprint: 734ab788c50e2c797bd58b4188ea6463c5c5d169577920f567ba0ad45bcffecf
-  judge_transport: openrouter
-  ast_path: 'body[38]/body[2]/body[1]/handlers[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:90bec995a0daa7d4f3f6cb11bc0bac5d2d6927b6dffd5ddb69d6a664260662a0'
 - key: plugins/infrastructure/batching/mixin.py:R4:BatchTransformMixin:_process_and_complete:fp=bf027f2d61c56c68
   owner: john
   reason: |-
@@ -1127,25 +992,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[21]/body[13]/body[3]/body[4]/handlers[1]'
   judge_metadata_signature: 'hmac-sha256:v2:d4604163b06d5b4b876f55e827bae22f37f75f4e4bff27b4349ca35705b1fa83'
-- key: plugins/transforms/blob_fetch.py:R1:_normalized_content_type:fp=5248eddc9cf3f217
-  owner: john
-  reason: |-
-    `plugins/transforms/blob_fetch.py:202-203` is a Tier-3 HTTP response boundary helper, not a Tier-1 audit-data read: `_normalized_content_type(response: httpx.Response) -> str` reads an external server header with `response.headers.get("content-type", "")`, then immediately coerces and normalizes it via `.split(";", 1)[0].strip().lower()`. The `.get()` default is the prescribed boundary behavior for absent external `Content-Type`, producing an empty normalized media type rather than treating a remote header omission as internal corruption.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:12:01.571243+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.78
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. The `.get()` targets an httpx.Response header dict — a Tier-3 external HTTP boundary where the Content-Type header may legitimately be absent. Recording absence as an empty normalized media type is meaning-preserving coercion at the boundary, not fabrication of a first-party field (empty string flows through the same normalization pipeline and downstream logic treats it as 'unknown media type'). The function does not take the external data as a named parameter suitable for @trust_boundary source_param routing in the R1/R5 pattern the decorator was designed for (the external data is nested inside response.headers), so the per-line suppression is appropriate here.
-  judge_signature_version: 2
-  scope_fingerprint: f70c7ee20f7615c362432398f8df3d83c016b46e8c8e74ec1c79f71a7ed85db5
-  judge_transport: openrouter
-  ast_path: 'body[31]/body[0]/value/func/value/func/value/value/func/value/args[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:3be85c41c0705fdd8036e641fa50b16b2037b687286b56d65a81f86660723fb2'
 - key: plugins/transforms/blob_fetch.py:R1:BlobFetch:process:fp=2b455baba7e9bac9
   owner: john
   reason: |-
@@ -1205,101 +1051,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[19]/body[14]/body[0]/body[1]/value'
   judge_metadata_signature: 'hmac-sha256:v2:20b0ff3cf4e9e715ecde4082fc182daca97d1bd70fdf8f67142b259ca66e32a6'
-- key: plugins/infrastructure/clients/http.py:R4:AuditedHTTPClient:_emit_telemetry_after_audit:fp=55c835d8752036d8
-  owner: john
-  reason: |-
-    This is a prescribed telemetry-after-audit boundary, not a Tier-1 audit-data suppression. In `plugins/infrastructure/clients/http.py:249-260`, the audit write happens first via `call = self._record_call(...)`, and only after that succeeds does the code call `self._emit_telemetry_after_audit(...)`. Inside the cited method, `plugins/infrastructure/clients/http.py:309-312` explicitly re-raises Tier-1 integrity failures and programmer bugs: `except contract_errors.TIER_1_ERRORS: raise` and `except (TypeError, AttributeError, KeyError, NameError): raise`. The broad catch at `plugins/infrastructure/clients/http.py:313-323` is limited to non-Tier-1 telemetry emission failures after audit primacy has already been satisfied, and it explicitly acknowledges the failure with `logger.warning("telemetry_emit_failed", ..., exc_info=True)` rather than silently swallowing it. Drift that removes the prior audit write, widens the catch to include `contract_errors.TIER_1_ERRORS`, or drops the explicit telemetry failure log would invalidate this suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:12:48.539766+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    PRESCRIBED FORM. Telemetry primacy policy states audit fires first (sync, crash-on-failure) and telemetry fires second (async, best-effort). The visible code re-raises Tier-1 integrity errors and programmer-bug exceptions (TypeError/AttributeError/KeyError/NameError) before the broad catch, so the remaining Exception clause is scoped to genuine telemetry-emission failures after audit primacy is satisfied, and it records the failure via logger.warning with exc_info rather than silently swallowing. This matches the policy's prescribed shape for best-effort telemetry after the audit write.
-  judge_signature_version: 2
-  scope_fingerprint: f0a6f8fc062ac02180496e221f342a0a209b0e8e4f0221fc80ed7213ceaa777c
-  judge_transport: openrouter
-  ast_path: 'body[26]/body[10]/body[2]/handlers[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:a070d71c10d8818769eee804a8dd297caf8d1babd168fe42dc1bd867d4c9f419'
-- key: plugins/infrastructure/clients/http.py:R1:AuditedHTTPClient:_request_with_optional_body_cap:fp=d5b0214dd0c0e577
-  owner: john
-  reason: |-
-    This is a scanner false positive at a Tier-3 HTTP boundary, not defensive access to Tier-1 audit data. In `src/elspeth/plugins/infrastructure/clients/http.py:418`, the receiver is typed as `client: httpx.Client`, and the flagged site is `src/elspeth/plugins/infrastructure/clients/http.py:441` inside the GET dispatch branch: `return client.get(full_url, **request_kwargs)`. That is an outbound HTTP verb method call on an `httpx.Client`, not `dict.get()` against internal/audit data. This suppression is valid only while the enclosing function keeps the typed `httpx.Client` receiver and the flagged line remains the GET request dispatch under `if method == "GET"`.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:12:54.272551+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.95
-  judge_rationale: |-
-    RULE MISFIRES. The R1 rule targets `dict.get()` that can hide missing-key bugs, but the flagged expression `client.get(full_url, **request_kwargs)` is an HTTP GET verb method on an `httpx.Client` (typed parameter at line 418), not a dict lookup. The scanner matched the `.get(` shape but the receiver is not a dict — there is no missing-key concern to adjudicate. The rationale correctly identifies the pattern-match false positive and the code excerpt confirms both the typed receiver and the GET dispatch context.
-  judge_signature_version: 2
-  scope_fingerprint: 6d1ea1aa00d57eab38d824cda6c686eb4ba9926cc29e960c3f36206ac8c027ec
-  judge_transport: openrouter
-  ast_path: 'body[26]/body[15]/body[6]/body[0]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:f61ac92ab0ff0398036d518db9a0cd7188a45064bba6b07ce65104d28f1f3f44'
-- key: plugins/infrastructure/clients/http.py:R5:AuditedHTTPClient:_execute_request:fp=3ce58f5f431c478d
-  owner: john
-  reason: |-
-    This is a legitimate Tier-3 external-call boundary in `src/elspeth/plugins/infrastructure/clients/http.py:508-519`: `_execute_request` calls `_request_with_optional_body_cap(...)`, which dispatches to `httpx`/streaming HTTP and can fail on external network/response behavior. The `isinstance` at `src/elspeth/plugins/infrastructure/clients/http.py:523` is not defending Tier-1 audit data; it distinguishes the client-owned boundary exception `HTTPResponseBodyTooLargeError` so the already-built truncated response audit payload can be recorded before re-raising. The site is drift-sensitive because the suppression is only valid while the code remains `except Exception as e:` around the external request and only reads `e.response_payload` / `e.response_data` inside `if isinstance(e, HTTPResponseBodyTooLargeError):`, followed by `_record_and_emit(...)` and bare `raise`.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:13:03.115351+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    PRESCRIBED FORM. The `except Exception as e:` catches errors from an external HTTP call (Tier-3 boundary), and the `isinstance(e, HTTPResponseBodyTooLargeError)` discriminates a specific client-owned boundary exception carrying pre-built truncated response payload data so it can be recorded in the audit trail before re-raising via bare `raise`. This is not defensive shape-guarding of first-party data; it is type-directed extraction of audit context from a known exception subtype at the external-call error path, and the exception is re-raised so no error is swallowed. The rationale correctly identifies the tier and the code visibly matches: record-then-reraise with no fabrication.
-  judge_signature_version: 2
-  scope_fingerprint: 5692a00bbac4b3b3eddb1aea6f84a451a9c9bb8dfedfd675b8c94955d017216e
-  judge_transport: openrouter
-  ast_path: 'body[26]/body[16]/body[10]/handlers[0]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:7dc32efd4411802ccde2aa24caef47c9f3d9d4841b9a37a4714cbc62d4b486dd'
-- key: plugins/infrastructure/clients/http.py:R5:AuditedHTTPClient:request_ssrf_safe:fp=0d4078f078d7f7db
-  owner: john
-  reason: |-
-    `plugins/infrastructure/clients/http.py:803` is a prescribed exception-type discrimination at an external HTTP boundary, not defensive probing of Tier-1 audit data. In `AuditedHTTPClient.request_ssrf_safe`, the `try` block performs the SSRF-pinned outbound request (`response = self._send_ssrf_safe_request(...)`) and redirect validation, then the `except Exception as e:` path records the failed external call before re-raising. The flagged code, `if isinstance(e, HTTPResponseBodyTooLargeError):`, selects the one typed boundary exception that carries a deliberately bounded audit payload (`response_payload = e.response_payload`, `error_response_data = e.response_data`) for an over-large external response body. That exception type is defined in the same file with those attributes, and is raised by `_consume_capped_response` only after building a truncated response payload for the external response body cap. If this site drifts away from `except Exception as e:` handling the SSRF-safe external request, or stops using the specific `HTTPResponseBodyTooLargeError` attributes to preserve bounded audit evidence before `raise`, this suppression should become stale.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:13:10.269494+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. The isinstance check discriminates exception types in an except Exception handler at an external HTTP boundary — this is the standard Python idiom for extracting typed attributes from one specific exception subtype (HTTPResponseBodyTooLargeError.response_payload / .response_data) to preserve bounded audit evidence before re-raising. This is not a shape-guard on Tier-1/Tier-2 data that a contract already guarantees; it is exception-type dispatch, which isinstance is the correct tool for. The recorded call and re-raise preserve auditability, and the rationale correctly identifies the invariant that would make the suppression stale.
-  judge_signature_version: 2
-  scope_fingerprint: 1e136a63713847e83cb30685661dbc411931364e39ba16e84ccfede6c540bb26
-  judge_transport: openrouter
-  ast_path: 'body[26]/body[20]/body[13]/handlers[0]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:abf703e0fbd2300e9e4c3ad123a638d3c5d11ff83c97d4927b46f75911b3a26b'
-- key: plugins/infrastructure/clients/http.py:R5:AuditedHTTPClient:_follow_redirects_safe:fp=1b15f04a10a6c9ad
-  owner: john
-  reason: |-
-    This is a prescribed exception-type narrowing at an external HTTP boundary, not defensive handling of Tier-1 audit data. In `plugins/infrastructure/clients/http.py:890`, `_follow_redirects_safe(...)` is the redirect-following helper for `httpx.Response` hops; the flagged site at `plugins/infrastructure/clients/http.py:1037` uses `isinstance(hop_err, HTTPResponseBodyTooLargeError)` solely to decide whether the caught hop failure has the type-specific `response_payload` field: `hop_response_payload = hop_err.response_payload if isinstance(hop_err, HTTPResponseBodyTooLargeError) else None`. That matches the prescribed form for caught exceptions: narrow to the specific exception type before reading exception-specific attributes. A future drift that applies this `isinstance()` to Landscape/audit rows, internal DTOs, or already-validated pipeline data would invalidate this suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:13:21.168492+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
-  judge_rationale: |-
-    PRESCRIBED FORM. The isinstance() narrows a caught exception to check whether it carries a type-specific attribute (response_payload) available only on HTTPResponseBodyTooLargeError. This is the standard Python idiom for safely accessing exception-subclass-specific fields after a broad except — not a shape guard on data we control. R5's concern (masking contract violations on trusted data) does not apply: the subject is an exception instance from a broad `except Exception`, and the narrowing exists precisely because the exception hierarchy makes the attribute conditional. The alternative (a separate except branch) would fragment the audit-recording logic that must run for all hop failures.
-  judge_signature_version: 2
-  scope_fingerprint: ccef44ed32515b836157c9965d4a8c63b52d93f1c1aa402f1065b594a2032d32
-  judge_transport: openrouter
-  ast_path: 'body[26]/body[22]/body[3]/body[22]/handlers[0]/body[1]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:0a920d8ade6fe143c28ebe97676a988d1d6feee3c40c5086419f67c01c9fc010'
 - key: plugins/sinks/chroma_sink.py:R5:ChromaSink:write:fp=84d97368b50b056f
   owner: john
   reason: |-
@@ -1357,63 +1108,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[30]/body[11]/body[9]/body[5]/body[2]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:cf10a863626c6e46282c02540a36c02e229c2f298a9e53bc5563224f7575dd73'
-- key: plugins/infrastructure/clients/llm.py:R1:_extract_usage_from_provider_response:fp=153b600f7b824428
-  owner: john
-  reason: |-
-    _extract_usage_from_provider_response (llm.py:196-219) normalizes provider token-usage payloads at the documented Tier-3 boundary (docstring 197-202: providers may return an SDK object, a mapping, or a partial aggregate-only payload). The flagged usage.get('prompt_tokens') at line 208 sits in the Mapping branch and supplies NO default — an absent counter flows into TokenUsage.from_dict (219), which records the explicit None absence rather than a fabricated zero. That is the prescribed recorded-absence pattern for provider-authored optional fields: no ELSPETH contract guarantees the key, absence is an expected provider variation, and nothing downstream treats None as 0. Invalid if a default is ever supplied here, if TokenUsage.from_dict stops preserving None, or if usage stops being external provider data.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T15:12:50.035480+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. This is a genuine Tier-3 boundary: provider token-usage payloads (LiteLLM/SDK responses) are externally-sourced data whose shape ELSPETH does not contract, and the docstring plainly documents that providers vary between SDK objects, mappings, and partial payloads. The .get() calls supply NO default — absent keys become explicit None and flow to TokenUsage.from_dict, which is the policy-prescribed recorded-absence pattern (not fabrication: None stays None, not coerced to 0). The function is a decorator candidate on shape, but the parameter is a single `usage: Any` that is not clearly a dict subject (the Mapping branch is one of two shapes handled), and R1/R5 on both branches would need coverage; a per-line entry here is defensible, though a @trust_boundary(source_param='usage') refactor would also be valid.
-  judge_signature_version: 2
-  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
-  judge_transport: openrouter
-  ast_path: 'body[36]/body[2]/body[0]/value/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:b7de49f089873753a05729259d959f0b2075ab04edb2fe239e8b1fa4369bdbca'
-- key: plugins/infrastructure/clients/llm.py:R2:_extract_usage_from_provider_response:fp=92c580e9594a61bd
-  owner: john
-  reason: |-
-    In _extract_usage_from_provider_response (llm.py:196-219), the non-Mapping branch (212-217) handles provider SDK usage objects — Tier-3 external data typed usage: Any, per the docstring's normalization contract. The flagged getattr(usage, 'prompt_tokens', None) at line 214 probes the OpenAI-compatible usage attribute on an object whose shape the provider, not ELSPETH, authors; SDK variants legitimately omit per-side counters on aggregate-only responses. The None sentinel flows into TokenUsage.from_dict (219), which records absence explicitly — never a fabricated zero, never a skipped record. R2's dynamic-probe concern targets first-party objects with knowable shapes; this is the boundary-normalization exception where the attribute set is genuinely provider-variable. Invalid if usage becomes a first-party typed model or absence stops being recorded as None.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T15:12:57.163662+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
-  judge_rationale: |-
-    RULE MISFIRES on Tier-3 external boundary. The function normalizes provider SDK usage objects (typed `usage: Any`) — an externally-authored shape per the Plugin Ownership scope note ('LLM provider's reply wrapped by a third-party SDK... external system controls that shape'). The getattr default flows to None (not a fabricated zero), and TokenUsage.from_dict records absence explicitly, satisfying the Tier-3 record-what-we-got requirement. The rationale correctly names the tier, the code confirms the flow (None sentinel preserved, no coercion to 0), and R2's concern about first-party knowable shapes does not apply to provider-variable SDK usage payloads.
-  judge_signature_version: 2
-  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
-  judge_transport: openrouter
-  ast_path: 'body[36]/body[2]/orelse[0]/value/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:d622461afcb81c1c9435ecc35c0273460ee18e9b0b2d8c7b19c412225b28be43'
-- key: plugins/infrastructure/clients/llm.py:R2:_extract_usage_from_provider_response:fp=d741dbbe7cf1857f
-  owner: john
-  reason: |-
-    Same Tier-3 provider-usage normalization boundary (llm.py:196-219, docstring 197-202). The flagged getattr(usage, 'total_tokens', None) at line 216 reads the aggregate counter from a provider SDK object in the non-Mapping branch; providers that report only per-side counts legitimately omit total_tokens, and some report ONLY totals — both are expected external variations, not first-party contract violations. The None default is the recorded-absence sentinel consumed by TokenUsage.from_dict (219), which preserves it as an explicit unknown rather than fabricating arithmetic (no total is ever synthesized from the parts). The probe is data-only attribute access on external data — precisely the boundary case R2's prescribed remediation (type the object, use direct access) cannot serve, because no single shape exists to type. Invalid if totals are ever computed as a fallback or the function stops normalizing external provider payloads.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T15:13:06.944736+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. The function normalizes a provider SDK usage object at an explicit Tier-3 boundary — the value's contents originate from an external LLM provider (LiteLLM/OpenAI-compatible SDK), and no first-party ELSPETH contract guarantees which of {prompt_tokens, completion_tokens, total_tokens} the object exposes; providers legitimately vary. The getattr(..., None) records absence as explicit None (the fabrication-decision test's honest answer), and TokenUsage.from_dict consumes None without synthesizing a total from parts — no fabrication. R2's prescribed remediation ('type the object, access directly') is impossible here because there is no single shape to type. The parameter is `usage`, not a param carrying external data as the decorator expects, and R2 is not in the decorator's suppressible set {R1, R5}, so the @trust_boundary nudge does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
-  judge_transport: openrouter
-  ast_path: 'body[36]/body[2]/orelse[0]/value/values[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:3c1d77236a7755be3fef6da208d6552954ea4a9f2f78e5f3276aa0b6204120e2'
 - key: plugins/transforms/rag/transform.py:R2:RAGRetrievalTransform:_configured_collection_name:fp=757eb1e99aea1a3e
   owner: john
   reason: |-
@@ -1509,3 +1203,309 @@ allow_hits:
   judge_transport: claude_agent_sdk
   ast_path: 'body[19]/body[14]/body[0]/body[2]/value'
   judge_metadata_signature: 'hmac-sha256:v2:583fde080decee9d04009db5ac233cb7bc6ec5f0f9bc8191aef76337742a8a3b'
+- key: plugins/infrastructure/clients/http.py:R1:AuditedHTTPClient:_request_with_optional_body_cap:fp=204cec0b5169e0df
+  owner: john
+  reason: |-
+    This is a scanner false positive at a Tier-3 HTTP boundary, not defensive access to Tier-1 audit data. In `src/elspeth/plugins/infrastructure/clients/http.py:418`, the receiver is typed as `client: httpx.Client`, and the flagged site is `src/elspeth/plugins/infrastructure/clients/http.py:441` inside the GET dispatch branch: `return client.get(full_url, **request_kwargs)`. That is an outbound HTTP verb method call on an `httpx.Client`, not `dict.get()` against internal/audit data. This suppression is valid only while the enclosing function keeps the typed `httpx.Client` receiver and the flagged line remains the GET request dispatch under `if method == "GET"`.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:22:43.710710+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the flagged expression is `client.get(full_url, **request_kwargs)`, an HTTP verb method invoked on the explicitly typed `httpx.Client`, not `dict.get()` or defensive access that could conceal a missing key. The visible function signature and GET dispatch branch independently support the site-specific rationale, so R1's premise is false at this location. The trust-boundary decorator is inapplicable because the expression is not a defensive read rooted in external data.
+  judge_signature_version: 2
+  scope_fingerprint: 6d1ea1aa00d57eab38d824cda6c686eb4ba9926cc29e960c3f36206ac8c027ec
+  judge_transport: codex_cli
+  ast_path: 'body[29]/body[16]/body[6]/body[0]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:cd21a20a5b56dcba19c2ccb4b75c25ed2dfd6f7945a785620c49dcff0a8c357a'
+- key: plugins/infrastructure/clients/http.py:R4:AuditedHTTPClient:_emit_telemetry_after_audit:fp=55c835d8752036d8
+  owner: john
+  reason: |-
+    This is a prescribed telemetry-after-audit boundary, not a Tier-1 audit-data suppression. In `plugins/infrastructure/clients/http.py:249-260`, the audit write happens first via `call = self._record_call(...)`, and only after that succeeds does the code call `self._emit_telemetry_after_audit(...)`. Inside the cited method, `plugins/infrastructure/clients/http.py:309-312` explicitly re-raises Tier-1 integrity failures and programmer bugs: `except contract_errors.TIER_1_ERRORS: raise` and `except (TypeError, AttributeError, KeyError, NameError): raise`. The broad catch at `plugins/infrastructure/clients/http.py:313-323` is limited to non-Tier-1 telemetry emission failures after audit primacy has already been satisfied, and it explicitly acknowledges the failure with `logger.warning("telemetry_emit_failed", ..., exc_info=True)` rather than silently swallowing it. Drift that removes the prior audit write, widens the catch to include `contract_errors.TIER_1_ERRORS`, or drops the explicit telemetry failure log would invalidate this suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-06'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-08T13:12:48.539766+00:00'
+  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.85
+  judge_rationale: |-
+    PRESCRIBED FORM. Telemetry primacy policy states audit fires first (sync, crash-on-failure) and telemetry fires second (async, best-effort). The visible code re-raises Tier-1 integrity errors and programmer-bug exceptions (TypeError/AttributeError/KeyError/NameError) before the broad catch, so the remaining Exception clause is scoped to genuine telemetry-emission failures after audit primacy is satisfied, and it records the failure via logger.warning with exc_info rather than silently swallowing. This matches the policy's prescribed shape for best-effort telemetry after the audit write.
+  judge_signature_version: 2
+  scope_fingerprint: f0a6f8fc062ac02180496e221f342a0a209b0e8e4f0221fc80ed7213ceaa777c
+  judge_transport: openrouter
+  ast_path: 'body[26]/body[10]/body[2]/handlers[2]'
+  judge_metadata_signature: 'hmac-sha256:v2:a070d71c10d8818769eee804a8dd297caf8d1babd168fe42dc1bd867d4c9f419'
+- key: plugins/infrastructure/clients/http.py:R5:AuditedHTTPClient:_execute_request:fp=6f35bfed0cfea005
+  owner: john
+  reason: |-
+    This is a legitimate Tier-3 external-call boundary in `src/elspeth/plugins/infrastructure/clients/http.py:508-519`: `_execute_request` calls `_request_with_optional_body_cap(...)`, which dispatches to `httpx`/streaming HTTP and can fail on external network/response behavior. The `isinstance` at `src/elspeth/plugins/infrastructure/clients/http.py:523` is not defending Tier-1 audit data; it distinguishes the client-owned boundary exception `HTTPResponseBodyTooLargeError` so the already-built truncated response audit payload can be recorded before re-raising. The site is drift-sensitive because the suppression is only valid while the code remains `except Exception as e:` around the external request and only reads `e.response_payload` / `e.response_data` inside `if isinstance(e, HTTPResponseBodyTooLargeError):`, followed by `_record_and_emit(...)` and bare `raise`.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:23:31.225591+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the `isinstance` is exception-subtype dispatch, not a defensive shape guard that hides a contract violation. `plugins/infrastructure/clients/http.py:73-89` defines `HTTPResponseBodyTooLargeError` and its audit fields, while `plugins/infrastructure/clients/http.py:417-443` constructs that exception after an oversized external response; at lines 568-593 the handler extracts those fields only for that subtype, records the failure, and bare-raises every exception. The decorator is inapplicable because the tested subject is the caught exception `e`, not data rooted in an external function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 5692a00bbac4b3b3eddb1aea6f84a451a9c9bb8dfedfd675b8c94955d017216e
+  judge_transport: codex_cli
+  ast_path: 'body[29]/body[17]/body[10]/handlers[0]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:e32f00d1cf88eced63dbc28ba523c153bf30ccd4903fa799820aeb30eb39812a'
+- key: plugins/infrastructure/clients/http.py:R5:AuditedHTTPClient:_follow_redirects_safe:fp=4fd8e49bcaf54146
+  owner: john
+  reason: |-
+    This is a prescribed exception-type narrowing at an external HTTP boundary, not defensive handling of Tier-1 audit data. In `plugins/infrastructure/clients/http.py:890`, `_follow_redirects_safe(...)` is the redirect-following helper for `httpx.Response` hops; the flagged site at `plugins/infrastructure/clients/http.py:1037` uses `isinstance(hop_err, HTTPResponseBodyTooLargeError)` solely to decide whether the caught hop failure has the type-specific `response_payload` field: `hop_response_payload = hop_err.response_payload if isinstance(hop_err, HTTPResponseBodyTooLargeError) else None`. That matches the prescribed form for caught exceptions: narrow to the specific exception type before reading exception-specific attributes. A future drift that applies this `isinstance()` to Landscape/audit rows, internal DTOs, or already-validated pipeline data would invalidate this suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:23:47.190988+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    PRESCRIBED FORM. The visible code catches an arbitrary redirect-hop exception, narrows it with `isinstance(hop_err, HTTPResponseBodyTooLargeError)` solely before accessing that exception type’s `response_payload`, records the failed hop, and then re-raises the original exception; it neither hides a contract violation nor silently recovers. The rationale specifically addresses the flagged R5 pattern and is consistent with the code, and the decorator alternative does not apply because the checked subject is a caught exception rather than data rooted in an external function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: ccef44ed32515b836157c9965d4a8c63b52d93f1c1aa402f1065b594a2032d32
+  judge_transport: codex_cli
+  ast_path: 'body[29]/body[23]/body[3]/body[22]/handlers[0]/body[1]/value/test'
+  judge_metadata_signature: 'hmac-sha256:v2:17b18b18a43caffea8327deb09fa5b97062b379e7bd66b237e52bfe914d92753'
+- key: plugins/infrastructure/clients/http.py:R5:AuditedHTTPClient:request_ssrf_safe:fp=4a38fb85da000f2e
+  owner: john
+  reason: |-
+    `plugins/infrastructure/clients/http.py:803` is a prescribed exception-type discrimination at an external HTTP boundary, not defensive probing of Tier-1 audit data. In `AuditedHTTPClient.request_ssrf_safe`, the `try` block performs the SSRF-pinned outbound request (`response = self._send_ssrf_safe_request(...)`) and redirect validation, then the `except Exception as e:` path records the failed external call before re-raising. The flagged code, `if isinstance(e, HTTPResponseBodyTooLargeError):`, selects the one typed boundary exception that carries a deliberately bounded audit payload (`response_payload = e.response_payload`, `error_response_data = e.response_data`) for an over-large external response body. That exception type is defined in the same file with those attributes, and is raised by `_consume_capped_response` only after building a truncated response payload for the external response body cap. If this site drifts away from `except Exception as e:` handling the SSRF-safe external request, or stops using the specific `HTTPResponseBodyTooLargeError` attributes to preserve bounded audit evidence before `raise`, this suppression should become stale.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:23:58.473568+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the flagged `isinstance` is exception-type discrimination within a broad error path, not a defensive shape check that masks a contract violation. The visible code uses the specific `HTTPResponseBodyTooLargeError` branch to extract its bounded response evidence, records the failed external call, emits telemetry after audit, and then re-raises the original exception; it neither coerces nor silently recovers. Although R5 is decorator-suppressible, the checked subject is the caught exception `e`, not data rooted in an external function parameter, so the structural decorator test is not satisfied.
+  judge_signature_version: 2
+  scope_fingerprint: 1e136a63713847e83cb30685661dbc411931364e39ba16e84ccfede6c540bb26
+  judge_transport: codex_cli
+  ast_path: 'body[29]/body[21]/body[13]/handlers[0]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:3af216774ef60d2f30a81a71b13dd27f57afac20e4123e7fcaa31dca69cb3864'
+- key: plugins/infrastructure/clients/llm.py:R1:_extract_usage_from_provider_response:fp=153b600f7b824428
+  owner: john
+  reason: |-
+    _extract_usage_from_provider_response (llm.py:196-219) normalizes provider token-usage payloads at the documented Tier-3 boundary (docstring 197-202: providers may return an SDK object, a mapping, or a partial aggregate-only payload). The flagged usage.get('prompt_tokens') at line 208 sits in the Mapping branch and supplies NO default — an absent counter flows into TokenUsage.from_dict (219), which records the explicit None absence rather than a fabricated zero. That is the prescribed recorded-absence pattern for provider-authored optional fields: no ELSPETH contract guarantees the key, absence is an expected provider variation, and nothing downstream treats None as 0. Invalid if a default is ever supplied here, if TokenUsage.from_dict stops preserving None, or if usage stops being external provider data.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-06'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-08T15:12:50.035480+00:00'
+  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.82
+  judge_rationale: |-
+    RULE MISFIRES / PRESCRIBED FORM. This is a genuine Tier-3 boundary: provider token-usage payloads (LiteLLM/SDK responses) are externally-sourced data whose shape ELSPETH does not contract, and the docstring plainly documents that providers vary between SDK objects, mappings, and partial payloads. The .get() calls supply NO default — absent keys become explicit None and flow to TokenUsage.from_dict, which is the policy-prescribed recorded-absence pattern (not fabrication: None stays None, not coerced to 0). The function is a decorator candidate on shape, but the parameter is a single `usage: Any` that is not clearly a dict subject (the Mapping branch is one of two shapes handled), and R1/R5 on both branches would need coverage; a per-line entry here is defensible, though a @trust_boundary(source_param='usage') refactor would also be valid.
+  judge_signature_version: 2
+  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
+  judge_transport: openrouter
+  ast_path: 'body[36]/body[2]/body[0]/value/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:b7de49f089873753a05729259d959f0b2075ab04edb2fe239e8b1fa4369bdbca'
+- key: plugins/infrastructure/clients/llm.py:R1:_extract_usage_from_provider_response:fp=3ce6385129d45fcc
+  owner: john
+  reason: |-
+    In _extract_usage_from_provider_response (llm.py:211), usage.get('total_tokens') reads the external provider's usage payload (Tier 3 — provider-authored, possibly a partial aggregate-only object). Absence maps to None, not a fabricated 0, and TokenUsage.from_dict normalizes downstream, keeping honest absence distinguishable from a reported count per the fabrication decision test — the prescribed Tier-3 record-absence-as-None pattern, not defensive access on a typed first-party object.
+
+    The @trust_boundary decorator nudge does NOT apply here, even though the three structural conditions are met (external `usage` parameter, rule R1, subject rooted at `usage`): the decorator is structurally INFEASIBLE for this function. TBE1 (severity error, elspeth-lints trust_boundary/tests) mandates that every @trust_boundary carry a test_ref pointing to a pytest test whose body "contains a raising assertion for malformed-input rejection and calls the decorated function through source_param." This function provably NEVER raises on malformed `usage` — its documented contract (docstring at llm.py:200-202: "missing and non-int fields become explicit None rather than raising") is record-absence-as-None, the correct Tier-3 treatment. No raising-shape test can be written for a function that does not raise, so a @trust_boundary here could never satisfy TBE1 and would itself become a build-failing violation. The per-line allowlist entry is therefore the only valid suppression mechanism for this finding; its five sibling per-line entries (R1/R2 on the same `usage` parameter, llm.py:209-217) are already ACCEPTED under this same campaign, confirming per-line as the established and consistent treatment for this boundary. Legitimate R1 suppression; the decorator is structurally unavailable, not merely unpreferred.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-06'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-08T12:09:08.747135+00:00'
+  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.82
+  judge_rationale: |-
+    RULE MISFIRES / PRESCRIBED FORM: `usage` is the provider-returned payload (Tier-3 external data per the Quick Reference's 'Transform on external calls' clause), and the `.get()` calls record absence as explicit `None` rather than fabricating 0 — the prescribed record-absence-as-None Tier-3 boundary pattern. The docstring at lines 197-202 makes the non-raising contract explicit, and `TokenUsage.from_dict` handles normalization downstream. The decorator nudge would structurally apply by the three-question test, but the agent correctly notes this function's contract is non-raising by design (honest absence recording), which is incompatible with TBE1's raising-shape test requirement; per-line suppression is the appropriate mechanism here.
+  judge_signature_version: 2
+  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
+  judge_transport: openrouter
+  ast_path: 'body[36]/body[2]/body[0]/value/values[2]'
+  judge_metadata_signature: 'hmac-sha256:v2:5f2ab80c8f053ca0724190bfa0ce6e0e4858518c7e4c3de0074de20aecbb42f7'
+- key: plugins/infrastructure/clients/llm.py:R1:_extract_usage_from_provider_response:fp=54f676db05cacf08
+  owner: john
+  reason: |-
+    In _extract_usage_from_provider_response (llm.py:210), usage.get('completion_tokens') reads from the external provider's usage mapping (Tier 3). The provider may omit this field; the code maps absence to None rather than a fabricated default and defers normalization to TokenUsage.from_dict, preserving the distinction between 'not reported' and a real value per the fabrication test. This is meaning-preserving record-absence-as-None at an external boundary, not defensive .get on our own typed data. Legitimate R1 suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-06'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-08T12:09:01.603015+00:00'
+  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.9
+  judge_rationale: |-
+    RULE MISFIRES / PRESCRIBED FORM: `usage` is the provider's usage payload — external Tier-3 data whose shape is not guaranteed by any first-party contract, even though our code returns the wrapped object. The `.get()` calls map absent fields to `None` (record-absence-as-None), passing them through to `TokenUsage.from_dict` for normalization — meaning-preserving, non-fabricating boundary handling exactly as the Tier-3 quick reference prescribes for transform-on-external-calls. The docstring explicitly names this as the Tier-3 boundary, and the code matches: no default substitution, no silent swallow of a bad value, just explicit absence recording.
+  judge_signature_version: 2
+  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
+  judge_transport: openrouter
+  ast_path: 'body[36]/body[2]/body[0]/value/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:1223e9e509f2841aa6f0b12cef2a9781b384b4d496e9a9c77eb2ac5f23813f4b'
+- key: plugins/infrastructure/clients/llm.py:R2:_extract_usage_from_provider_response:fp=607a45e8cab2fc04
+  owner: john
+  reason: |-
+    In _extract_usage_from_provider_response (llm.py:196-219), the non-Mapping branch (212-217) handles provider SDK usage objects — Tier-3 external data typed usage: Any, per the docstring's normalization contract. The flagged getattr(usage, 'prompt_tokens', None) at line 214 probes the OpenAI-compatible usage attribute on an object whose shape the provider, not ELSPETH, authors; SDK variants legitimately omit per-side counters on aggregate-only responses. The None sentinel flows into TokenUsage.from_dict (219), which records absence explicitly — never a fabricated zero, never a skipped record. R2's dynamic-probe concern targets first-party objects with knowable shapes; this is the boundary-normalization exception where the attribute set is genuinely provider-variable. Invalid if usage becomes a first-party typed model or absence stops being recorded as None.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:25:07.318419+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — `usage: Any` is a provider-authored Tier-3 response whose runtime shape is not guaranteed by an ELSPETH contract, and the function explicitly normalizes SDK objects, mappings, and partial aggregate-only payloads. The flagged `getattr(usage, "prompt_tokens", None)` therefore probes genuinely provider-variable external data rather than concealing a missing attribute on a first-party typed object. The resulting sentinel is preserved through `TokenUsage.from_dict` as explicit absence rather than coerced to a fabricated value. R2 is not decorator-suppressible, so the structural `@trust_boundary` alternative does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
+  judge_transport: codex_cli
+  ast_path: 'body[37]/body[2]/orelse[0]/value/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:6bfa3473c51444364f6a9c52060d64855f9c19f3bfdd9ef9c8d62be8574f03bc'
+- key: plugins/infrastructure/clients/llm.py:R2:_extract_usage_from_provider_response:fp=bf0271b359645c16
+  owner: john
+  reason: |-
+    Same Tier-3 provider-usage normalization boundary (llm.py:196-219, docstring 197-202). The flagged getattr(usage, 'total_tokens', None) at line 216 reads the aggregate counter from a provider SDK object in the non-Mapping branch; providers that report only per-side counts legitimately omit total_tokens, and some report ONLY totals — both are expected external variations, not first-party contract violations. The None default is the recorded-absence sentinel consumed by TokenUsage.from_dict (219), which preserves it as an explicit unknown rather than fabricating arithmetic (no total is ever synthesized from the parts). The probe is data-only attribute access on external data — precisely the boundary case R2's prescribed remediation (type the object, use direct access) cannot serve, because no single shape exists to type. Invalid if totals are ever computed as a fallback or the function stops normalizing external provider payloads.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:25:29.147074+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — `usage` is a Tier-3 provider-controlled SDK object whose attribute shape is explicitly documented as variable, so the defaulted `getattr` does not hide a first-party contract bug. The visible code preserves a missing `total_tokens` value as `None` and passes it through `TokenUsage.from_dict`, consistent with recording absence rather than fabricating a total from the component counts. The decorator alternative does not apply because the finding is R2, not R1 or R5.
+  judge_signature_version: 2
+  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
+  judge_transport: codex_cli
+  ast_path: 'body[37]/body[2]/orelse[0]/value/values[2]'
+  judge_metadata_signature: 'hmac-sha256:v2:29742f2fe7479fa6e6e9ac726e1b65c4b7314e4c0319b12972b4032816aa19c9'
+- key: plugins/infrastructure/clients/llm.py:R2:_extract_usage_from_provider_response:fp=818a66a4a23525e6
+  owner: john
+  reason: |-
+    In _extract_usage_from_provider_response (llm.py:216), getattr(usage, "completion_tokens", None) reads a provider SDK usage object that is Tier-3 external data (parameter typed `usage: Any`). The existing rationale still accurately describes the code: this is the documented Tier-3 normalization boundary, and the getattr-with-None preserves honest absence (None when the provider omits the field) instead of fabricating zero, with TokenUsage.from_dict doing the single normalization. The non-Mapping branch handles SDK objects that expose attributes rather than keys. Not defensive access on our typed data, not fabrication — absence flows through as None.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:25:42.281247+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the flagged `getattr(..., None)` operates on a provider-controlled SDK usage object typed as `Any`, so its attributes are not guaranteed by a first-party ELSPETH contract and the site is a Tier-3 normalization boundary. The visible code preserves omitted attributes as `None` and passes them through the single `TokenUsage.from_dict` normalization path, rather than fabricating token counts or hiding a bug in controlled typed data. R2 is not suppressible by `@trust_boundary`, so the structural decorator alternative does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: a0a988adb8e41118c21f649275d3ce685b029e8b08ae9ccc34bcb0025bc47064
+  judge_transport: codex_cli
+  ast_path: 'body[37]/body[2]/orelse[0]/value/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:2a129b86a5aefd2b9261b46a1e2cad1711d97524161d6c335ca1cfbc18656920'
+- key: plugins/infrastructure/clients/llm.py:R4:AuditedLLMClient:_emit_telemetry_after_audit:fp=bbfdc3112d58d4a4
+  owner: john
+  reason: |-
+    PRESCRIBED FORM — telemetry best-effort swallow under the audit>telemetry>logger primacy order; Tier-1 and programming errors re-raise first. In AuditedLLMClient._emit_telemetry_after_audit (plugins/infrastructure/clients/llm.py:337), `except Exception as tel_err` is the LAST of three clauses wrapping self._telemetry_emit(ExternalCallCompleted(...)): line 333-334 `except contract_errors.TIER_1_ERRORS: raise` (system bugs / audit integrity violations crash), line 335-336 `except (TypeError, AttributeError, KeyError, NameError): raise` (programming errors crash), and only THEN the broad catch for genuine telemetry-transport failures. The method name and comment state the doctrine: the audit record is already persisted (Landscape is the authoritative legal record), and telemetry is best-effort per the audit>telemetry>logger primacy order, so a telemetry emission failure must not corrupt or crash the already-audited call flow. This is not a silent failure: the broad catch emits logger.warning with error, error_type, run_id, state_id, operation_id and exc_info — the sanctioned last-resort logging channel precisely because the telemetry subsystem itself is the broken component here (CLAUDE.md permits logger for telemetry-system failures). "No silent failures" is honored: the failure is acknowledged on the logger, not dropped. The broad catch is correct because a transport failure can surface as many exception types, while the two re-raise clauses ensure our-code bugs and Tier-1 violations still crash. R4 flags `except Exception` generically. Per-line allowlist is the prescribed mechanism.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-06'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-08T12:10:35.501905+00:00'
+  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.85
+  judge_rationale: |-
+    PRESCRIBED FORM — this is the sanctioned telemetry best-effort pattern under the audit>telemetry>logger primacy order. The visible code shows the correct layered structure: TIER_1_ERRORS re-raise (audit integrity preserved), programming-error types (TypeError/AttributeError/KeyError/NameError) re-raise (our-code bugs crash), and only then the broad catch for genuine telemetry-transport failures, which are logged with full context via structured logger.warning including exc_info. The audit record is already persisted before this method runs, so telemetry failure must not corrupt the audited call flow, and logger is the policy-sanctioned last-resort channel when the telemetry subsystem itself is broken. The rationale correctly identifies the R4 concern and shows how the two prior narrow re-raise clauses prevent bug-suppression while permitting the transport-failure catch.
+  judge_signature_version: 2
+  scope_fingerprint: 734ab788c50e2c797bd58b4188ea6463c5c5d169577920f567ba0ad45bcffecf
+  judge_transport: openrouter
+  ast_path: 'body[38]/body[2]/body[1]/handlers[2]'
+  judge_metadata_signature: 'hmac-sha256:v2:90bec995a0daa7d4f3f6cb11bc0bac5d2d6927b6dffd5ddb69d6a664260662a0'
+- key: plugins/infrastructure/clients/retrieval/connection.py:R6:_host_url:fp=55a06b50d07ab062
+  owner: john
+  reason: |-
+    ipaddress.ip_address() raises ValueError on a non-IP-literal host; the except falls back to using the Tier-3 host string as a hostname (IPv6 bracket normalization applies only to successfully parsed IPs). Explicit branch selection on external input, not error suppression -- host shape was already validated above (rejects scheme/path/query).
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:26:30.144148+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — `ValueError` from `ipaddress.ip_address()` is used as an explicit discriminator between an IP literal and a hostname, not silently suppressed as an unexpected failure. The visible code preserves the Tier-3 hostname unchanged for subsequent SSRF validation, while successfully parsed IPv6 literals alone receive bracket normalization; it neither fabricates a value nor promotes malformed input without further validation. R6 is not eligible for the `@trust_boundary` decorator’s R1/R5 suppression mechanism.
+  judge_signature_version: 2
+  scope_fingerprint: c61f192f8181bd41acf992d1f25a4d21e577a1776bc86b23f39411d19aa2ad7b
+  judge_transport: codex_cli
+  ast_path: 'body[12]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:b82f67f02dbde88f8ecf28ed6cbfde3ba06ce956c7437d9f11bcb28ea7a76305'
+- key: plugins/infrastructure/clients/retrieval/connection.py:R6:_is_loopback_host:fp=0e602df1f082860c
+  owner: john
+  reason: |-
+    ipaddress.ip_address() raises ValueError when the Tier-3 host string is not an IP literal (e.g. a hostname). The except returns False = 'not a loopback IP' -- an explicit, meaning-preserving classification, not a swallowed error. The actual SSRF allow/deny decision is made by the caller (_validate_chroma_http_target).
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:26:42.746454+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — `ValueError` is the documented parse outcome for a host that is not an IP literal, and `False` explicitly classifies that host as not being a literal loopback address rather than silently recovering from an unexpected failure. The visible caller then subjects the resulting hostname to `validate_url_for_ssrf`, so this helper does not itself convert parse failure into an SSRF allow decision. R6 is therefore not capturing a swallowed error at this site, and the decorator alternative does not apply because R6 is not suppressible by `@trust_boundary`.
+  judge_signature_version: 2
+  scope_fingerprint: a04a2c257fb9c62ba6a661bc2a1875d644d5833ced11b1131b41555986d93554
+  judge_transport: codex_cli
+  ast_path: 'body[11]/body[2]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:2dd1b1b7d3c7e869641d6aa6a52890bce738d46dd0c8526aaddac72b1861a9a4'
+- key: plugins/sinks/database_sink.py:R1:DatabaseSink:get_post_call_hints:fp=c946686ebc7efd22
+  owner: john
+  reason: |-
+    This is a composer-assistance hook, not a Tier-1 audit read or sink runtime contract. The base contract says `get_post_call_hints` is called after composer mutations and plugins inspect only their own config to return optional advisory hints: `src/elspeth/plugins/infrastructure/base.py:832` says "Return forward-looking hints conditional on the just-set config", and `src/elspeth/plugins/infrastructure/base.py:834-840` says it is called after `set_source`, `upsert_node`, and `patch_*_options` to return short operator/LLM imperatives. The concrete site reads a sparse user-authored config snapshot and emits a hint only when the optional destructive mode is present: `src/elspeth/plugins/sinks/database_sink.py:777` is `if config_snapshot.get("if_exists") == "replace":`, followed by the warning at `src/elspeth/plugins/sinks/database_sink.py:779` that `replace` "DROPS and recreates the target table". Future drift that made `config_snapshot` a fully reified `DatabaseSinkConfig`, a Landscape/audit record, or a required invariant-bearing runtime DTO would invalidate this suppression; at this site it is an optional Tier-3 composer/config boundary probe for advisory UX text.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-09-15'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-06-17T16:17:04.323511+00:00'
+  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.82
+  judge_rationale: |-
+    RULE MISFIRES / PRESCRIBED FORM. The parameter is typed `Mapping[str, object]` — a sparse composer/user-authored config snapshot passed to an advisory hook, not a first-party reified DTO with a guaranteed shape. The `if_exists` key is genuinely optional (the hook emits a hint only when destructive 'replace' mode is present), so `.get(...) == "replace"` is the meaning-preserving Tier-3 boundary read: absent key correctly yields no hint, present-and-'replace' yields the warning. Direct subscript would crash the advisory path on perfectly valid sparse configs. No fabrication, no silent recovery of a value that should exist.
+  judge_signature_version: 2
+  scope_fingerprint: 8660f6017d7ee3e60545b448eac9423bbf1ba83c99d66185d8dc677b4ef3f270
+  judge_transport: openrouter
+  ast_path: 'body[27]/body[21]/body[1]/test/left'
+  judge_metadata_signature: 'hmac-sha256:v2:fcd25c8cef1e623bbea6cc911b81907118089340374b7c970f67efd87429965c'
+- key: plugins/transforms/blob_fetch.py:R1:_normalized_content_type:fp=5248eddc9cf3f217
+  owner: john
+  reason: |-
+    `plugins/transforms/blob_fetch.py:202-203` is a Tier-3 HTTP response boundary helper, not a Tier-1 audit-data read: `_normalized_content_type(response: httpx.Response) -> str` reads an external server header with `response.headers.get("content-type", "")`, then immediately coerces and normalizes it via `.split(";", 1)[0].strip().lower()`. The `.get()` default is the prescribed boundary behavior for absent external `Content-Type`, producing an empty normalized media type rather than treating a remote header omission as internal corruption.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-06'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-08T13:12:01.571243+00:00'
+  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.78
+  judge_rationale: |-
+    RULE MISFIRES / PRESCRIBED FORM. The `.get()` targets an httpx.Response header dict — a Tier-3 external HTTP boundary where the Content-Type header may legitimately be absent. Recording absence as an empty normalized media type is meaning-preserving coercion at the boundary, not fabrication of a first-party field (empty string flows through the same normalization pipeline and downstream logic treats it as 'unknown media type'). The function does not take the external data as a named parameter suitable for @trust_boundary source_param routing in the R1/R5 pattern the decorator was designed for (the external data is nested inside response.headers), so the per-line suppression is appropriate here.
+  judge_signature_version: 2
+  scope_fingerprint: f70c7ee20f7615c362432398f8df3d83c016b46e8c8e74ec1c79f71a7ed85db5
+  judge_transport: openrouter
+  ast_path: 'body[31]/body[0]/value/func/value/func/value/value/func/value/args[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:3be85c41c0705fdd8036e641fa50b16b2037b687286b56d65a81f86660723fb2'

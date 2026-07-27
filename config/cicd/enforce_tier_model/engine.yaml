@@ -721,44 +721,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[30]/body[4]/body[4]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:db405a4389797de1b586bf581a005d7c0ae73f0cce9b9b70dea677659984b1cd'
-- key: engine/executors/sink.py:R4:SinkExecutor:_best_effort_cleanup:fp=4b84c777300b0312
-  owner: john
-  reason: |-
-    This is a prescribed best-effort cleanup suppression during an already-propagating crash, not a primary-path defensive catch. In `src/elspeth/engine/executors/sink.py:223-229`, `_best_effort_cleanup` is explicitly scoped to "cleanup of OPEN states before re-raising a system error" and says it will "Attempt to close them as FAILED; if that also fails, log and let the original error propagate." The broad catch at `src/elspeth/engine/executors/sink.py:244` is preceded by `except contract_errors.TIER_1_ERRORS: raise` at lines 242-243, so audit-integrity/framework-invariant failures from the cleanup are not suppressed. The caller preserves the in-flight failure: `src/elspeth/engine/executors/sink.py:484-491` calls `_best_effort_cleanup(...)` and then immediately `raise`s in both the Tier-1 and generic exception paths. This suppression depends on that exact shape: if the `TIER_1_ERRORS` re-raise or the caller's post-cleanup `raise` is removed, the allowlist entry should go stale.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:17:08.211976+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    PRESCRIBED FORM. This is a best-effort cleanup during an already-propagating crash: the code re-raises Tier-1/audit-integrity errors on line 242-243 so those bubble unimpeded, and only non-Tier-1 cleanup failures are logged so the original error can propagate (per the caller's post-cleanup re-raise described in the rationale). The broad except is doing exactly what R4's remediation permits — catching specific Tier-1 errors first, then logging the residual on a secondary cleanup path where suppressing would-be-lost information (the primary error) is the priority. The rationale names the exact structural preconditions that keep this honest.
-  judge_signature_version: 2
-  scope_fingerprint: f1632136105f9a3e355d9ebdb4b8e198c6bdf473bc7bbe06f40a09a89f9bdd57
-  judge_transport: openrouter
-  ast_path: 'body[30]/body[6]/body[2]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:445e173fa7c360fd3530e35fe2e18d2f9fd6107d677551ccc33ecba7a63bb2d3'
-- key: engine/executors/sink.py:R5:SinkExecutor:_open_primary_states:fp=ecf7dc78ccb431b4
-  owner: john
-  reason: |-
-    `engine/executors/sink.py:455` is a prescribed capability-dispatch form, not a Tier-1 audit-data defensive check: `can_use_bulk_begin = isinstance(self._execution, _BulkBeginNodeStateRepository) and all(` tests whether the internal execution repository object supports the optional bulk state-opening path before using that faster repository API. The fallback path remains the ordinary per-token state opening path, so this `isinstance()` is not accepting malformed audit rows, not coercing corrupted Landscape data, and not masking a missing invariant. A future drift that changes this site to inspect persisted state shape or token/audit payload contents instead of the repository capability would invalidate this suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:17:16.172129+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
-  judge_rationale: |-
-    RULE MISFIRES. The isinstance check tests whether the internal execution repository object structurally supports the optional _BulkBeginNodeStateRepository capability protocol, choosing between a bulk-begin fast path and a per-token fallback. This is capability dispatch on a first-party protocol type, not a defensive shape check on data — no Tier-1 audit row, Tier-2 pipeline row, or Tier-3 external payload is being inspected. Both branches are correct code paths; nothing is being coerced or swallowed. R5's concern (masking contract violations) does not apply since the fallback branch is a legitimate alternative implementation, not a silent recovery.
-  judge_signature_version: 2
-  scope_fingerprint: 55de6959e6dd6e74e519d3d26b2a26f50dd3d34ad100439d00154d7b93cd4574
-  judge_transport: openrouter
-  ast_path: 'body[30]/body[12]/body[2]/body[0]/value/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:f01746af1d34274c10abfe6a7b216afb5f6977ec45183effa0ead90052a68d8a'
 - key: engine/executors/state_guard.py:R7:stamp_node_state_id:fp=ab4f8df97e6d5fd6
   owner: john
   reason: |-
@@ -1198,3 +1160,41 @@ allow_hits:
   judge_transport: claude_agent_sdk
   ast_path: 'body[30]/body[2]/body[0]/value/values[1]'
   judge_metadata_signature: 'hmac-sha256:v2:1cf4c11dac25561466abce9090d466b5ac1f1bd3ac9b7cebd8f3baf780fbc91c'
+- key: engine/executors/sink.py:R4:SinkExecutor:_best_effort_cleanup:fp=922257bcb6b9e6c3
+  owner: john
+  reason: |-
+    This is a prescribed best-effort cleanup suppression during an already-propagating crash, not a primary-path defensive catch. In `src/elspeth/engine/executors/sink.py:223-229`, `_best_effort_cleanup` is explicitly scoped to "cleanup of OPEN states before re-raising a system error" and says it will "Attempt to close them as FAILED; if that also fails, log and let the original error propagate." The broad catch at `src/elspeth/engine/executors/sink.py:244` is preceded by `except contract_errors.TIER_1_ERRORS: raise` at lines 242-243, so audit-integrity/framework-invariant failures from the cleanup are not suppressed. The caller preserves the in-flight failure: `src/elspeth/engine/executors/sink.py:484-491` calls `_best_effort_cleanup(...)` and then immediately `raise`s in both the Tier-1 and generic exception paths. This suppression depends on that exact shape: if the `TIER_1_ERRORS` re-raise or the caller's post-cleanup `raise` is removed, the allowlist entry should go stale.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:21:23.143686+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.88
+  judge_rationale: |-
+    PRESCRIBED FORM — The broad catch is confined to secondary best-effort cleanup during an already-propagating system failure, and the stated caller immediately re-raises the original exception, so this site does not convert the primary failure into silent recovery. The visible code first re-raises all `TIER_1_ERRORS`, preserving audit-integrity failures, while logging only a non-Tier-1 cleanup failure so that it does not replace the original crash. The rationale is site-specific, identifies the exact structural conditions on which the exemption depends, and directly addresses R4's suppression concern.
+  judge_signature_version: 2
+  scope_fingerprint: f1632136105f9a3e355d9ebdb4b8e198c6bdf473bc7bbe06f40a09a89f9bdd57
+  judge_transport: codex_cli
+  ast_path: 'body[39]/body[3]/body[2]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:caa92c22637552a95ac6a990f74ca6a70ba54fb662260f270ca6f67e0cd45560'
+- key: engine/executors/sink.py:R5:SinkExecutor:_open_primary_states:fp=8b90998d7414d8bc
+  owner: john
+  reason: |-
+    `engine/executors/sink.py:455` is a prescribed capability-dispatch form, not a Tier-1 audit-data defensive check: `can_use_bulk_begin = isinstance(self._execution, _BulkBeginNodeStateRepository) and all(` tests whether the internal execution repository object supports the optional bulk state-opening path before using that faster repository API. The fallback path remains the ordinary per-token state opening path, so this `isinstance()` is not accepting malformed audit rows, not coercing corrupted Landscape data, and not masking a missing invariant. A future drift that changes this site to inspect persisted state shape or token/audit payload contents instead of the repository capability would invalidate this suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:22:32.802179+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the `isinstance()` is capability dispatch on the internal execution repository, not a shape check on audit or pipeline data and not a defensive re-check of a required contract. The visible branches confirm the rationale: repositories supporting the optional bulk API use `begin_node_states_many`, while others use the ordinary `begin_node_state` API, so no malformed value is suppressed, coerced, or fabricated. The decorator is inapplicable because the checked subject is `self._execution`, not external data rooted at a function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 55de6959e6dd6e74e519d3d26b2a26f50dd3d34ad100439d00154d7b93cd4574
+  judge_transport: codex_cli
+  ast_path: 'body[39]/body[9]/body[2]/body[0]/value/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:1c8436253bf5c87dd527a60c4f22e93b62c1f310bc23c89b4cf831ceda185d07'

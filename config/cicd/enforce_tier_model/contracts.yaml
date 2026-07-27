@@ -640,44 +640,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[18]/body[2]/body[2]/body[4]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:cc94dd5198b72531f286fdc5b7406eb40b5ebf9fb23b29d84b9ff1a1507376d2'
-- key: contracts/composer_llm_audit.py:R5:_require_optional_finite_number:fp=0ff08c4939cf7914
-  owner: john
-  reason: |-
-    Prescribed write-side DTO invariant guard, not a Tier-1 read-path recovery or sink-side defensive fallback. In `src/elspeth/contracts/composer_llm_audit.py:56-62`, `_require_optional_finite_number` accepts a constructor value typed as `object`, permits only `None` or finite numeric values, and raises before the audit DTO can be constructed: `if isinstance(value, bool) or not isinstance(value, (int, float)):` followed by `raise TypeError(...)` and `if not math.isfinite(float(value)):`. Its only local use in the enclosing `ComposerLLMCall.__post_init__` is `src/elspeth/contracts/composer_llm_audit.py:152-154`, where the write-side audit record validates `self.temperature` and then canonicalizes it with `object.__setattr__(self, "temperature", float(self.temperature))`. Drift would invalidate this suppression if the helper is reused to tolerate malformed stored audit data, to continue after audit corruption, or to validate Tier-2 pipeline row fields instead of rejecting constructor input before it enters the composer LLM audit record.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-09-15'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-06-17T16:04:44.721738+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
-  judge_rationale: |-
-    PRESCRIBED FORM. The isinstance check is an offensive validator at the DTO constructor boundary: it accepts `object`-typed input, rejects bool (which would otherwise pass `isinstance(value, int)` due to Python's bool<:int subtyping) and any non-numeric, raising TypeError before the audit record can be constructed. This is the prescribed offensive `isinstance`→`raise` pattern guarding entry into a Tier-1 audit DTO, not a defensive recovery — there is no `.get`, no default substitution, no swallowed exception. The bool-exclusion is a specific, load-bearing invariant the rationale identifies correctly, and the visible code matches the claim.
-  judge_signature_version: 2
-  scope_fingerprint: b1f2aff0aad07d63d99cedc029f914db39294e60dfebeeb41f7dd0311f0acd61
-  judge_transport: openrouter
-  ast_path: 'body[15]/body[1]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:d5e61bf281fcf5ae0f585dd671a0fd2c6635e8bf251185cc000cf7537d3d95da'
-- key: contracts/composer_llm_audit.py:R5:_require_optional_finite_number:fp=0d15231a587f574a
-  owner: john
-  reason: |-
-    Prescribed write-side DTO invariant guard, not a Tier-1 read-side defensive fallback. In `contracts/composer_llm_audit.py:131-154`, `ComposerLLMCall.__post_init__` validates the audit record before it can be serialized/persisted, calling `_require_optional_finite_number(self.temperature, "temperature")` and then canonicalizing an accepted value with `object.__setattr__(self, "temperature", float(self.temperature))`. The flagged helper at `contracts/composer_llm_audit.py:56-62` is the crash-at-construction guard for that optional audit field: it permits only `None` or finite numeric temperature values, explicitly rejects `bool`, rejects non-`int`/`float`, and raises on NaN/Infinity. This matches the prescribed write-side DTO pattern: reject invalid audit data before it enters the audit trail.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-09-15'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-06-17T16:04:52.360616+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
-  judge_rationale: |-
-    PRESCRIBED FORM. This is a write-side DTO construction-time invariant guard at the audit boundary: `_require_optional_finite_number` is called from `ComposerLLMCall.__post_init__` to reject invalid temperature values before the audit record can be persisted. The isinstance checks here are the prescribed offensive pattern — they detect invalid states (bool masquerading as int, non-numeric types) and raise informative TypeError/ValueError, which is exactly what audit-trail integrity (Tier-1 write boundary) requires. The bool exclusion is meaningful since `bool` is an `int` subclass in Python; rejecting it prevents True/False from silently being recorded as 1.0/0.0 temperatures. The rationale correctly identifies the pattern and the visible code confirms it.
-  judge_signature_version: 2
-  scope_fingerprint: b1f2aff0aad07d63d99cedc029f914db39294e60dfebeeb41f7dd0311f0acd61
-  judge_transport: openrouter
-  ast_path: 'body[15]/body[1]/test/values[1]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:dff7db7ac2d0f53fe1351f4e5bdd8db8b00f2fa3b03ed91b51bb62f14521e596'
 - key: contracts/node_state_context.py:R5:PoolExecutionContext:__post_init__:fp=4db30e935e2b6e44
   owner: john
   reason: |-
@@ -1445,3 +1407,41 @@ allow_hits:
   judge_transport: claude_agent_sdk
   ast_path: 'body[30]/body[11]/body[3]/body[2]/body[0]/value'
   judge_metadata_signature: 'hmac-sha256:v2:aacf0b841ba9fc4c21042bbe4fdea0c471587402ac4ebf3f3359b42e36e5f004'
+- key: contracts/composer_llm_audit.py:R5:_require_optional_finite_number:fp=594e362b7b78418c
+  owner: john
+  reason: |-
+    Prescribed write-side DTO invariant guard, not a Tier-1 read-side defensive fallback. In `contracts/composer_llm_audit.py:131-154`, `ComposerLLMCall.__post_init__` validates the audit record before it can be serialized/persisted, calling `_require_optional_finite_number(self.temperature, "temperature")` and then canonicalizing an accepted value with `object.__setattr__(self, "temperature", float(self.temperature))`. The flagged helper at `contracts/composer_llm_audit.py:56-62` is the crash-at-construction guard for that optional audit field: it permits only `None` or finite numeric temperature values, explicitly rejects `bool`, rejects non-`int`/`float`, and raises on NaN/Infinity. This matches the prescribed write-side DTO pattern: reject invalid audit data before it enters the audit trail.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:09:17.077259+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    PRESCRIBED FORM — the visible helper uses `isinstance` offensively to reject `bool` and non-numeric values with a meaningful `TypeError`, then rejects non-finite numeric values with `ValueError`; it neither suppresses an error nor supplies a fallback. The site-specific rationale plainly states that `ComposerLLMCall.__post_init__` invokes this guard before serialization/persistence and only then canonicalizes the accepted value, establishing a write-side Tier-1 audit DTO invariant rather than defensively re-checking a trusted read. The decorator alternative does not apply because the finding is not shown as shape-guarding external data rooted in a boundary function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: b1f2aff0aad07d63d99cedc029f914db39294e60dfebeeb41f7dd0311f0acd61
+  judge_transport: codex_cli
+  ast_path: 'body[16]/body[1]/test/values[1]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:bbf680d15707bb32a0fc577cf877c58f17f66bffeda8bb6c97790bbea84d775d'
+- key: contracts/composer_llm_audit.py:R5:_require_optional_finite_number:fp=0d20f3f15f31a8bb
+  owner: john
+  reason: |-
+    Prescribed write-side DTO invariant guard, not a Tier-1 read-path recovery or sink-side defensive fallback. In `src/elspeth/contracts/composer_llm_audit.py:56-62`, `_require_optional_finite_number` accepts a constructor value typed as `object`, permits only `None` or finite numeric values, and raises before the audit DTO can be constructed: `if isinstance(value, bool) or not isinstance(value, (int, float)):` followed by `raise TypeError(...)` and `if not math.isfinite(float(value)):`. Its only local use in the enclosing `ComposerLLMCall.__post_init__` is `src/elspeth/contracts/composer_llm_audit.py:152-154`, where the write-side audit record validates `self.temperature` and then canonicalizes it with `object.__setattr__(self, "temperature", float(self.temperature))`. Drift would invalidate this suppression if the helper is reused to tolerate malformed stored audit data, to continue after audit corruption, or to validate Tier-2 pipeline row fields instead of rejecting constructor input before it enters the composer LLM audit record.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:09:35.340071+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM: the visible helper uses `isinstance` offensively to reject booleans and non-numeric constructor values with an informative `TypeError`, then rejects non-finite numbers with `ValueError`; it neither suppresses a contract violation nor substitutes a fallback. The rationale is site-specific and establishes that this is write-side invariant enforcement before construction of a Tier-1 audit DTO, consistent with the visible `object` parameter and immediate raises. This helper is not itself an external-data boundary function, so the structural `@trust_boundary` alternative does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: b1f2aff0aad07d63d99cedc029f914db39294e60dfebeeb41f7dd0311f0acd61
+  judge_transport: codex_cli
+  ast_path: 'body[16]/body[1]/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:8b9b94f371eae74a6b84fe51a5ae46ad36a47c0573a31c2c0366c9d1c97e7a10'

@@ -95,63 +95,6 @@ per_file_rules:
   expires: null
   max_hits: 1
 allow_hits:
-- key: core/landscape/database.py:R1:LandscapeDB:_configure_sqlite:_emit_begin:fp=a9b73e78431f9915
-  owner: john
-  reason: |-
-    `src/elspeth/core/landscape/database.py:645` reads an optional SQLAlchemy execution option, not Tier-1 audit data: `if conn.get_execution_options().get(WRITE_INTENT_OPTION, False):`. The enclosing SQLite `begin` listener selects `BEGIN IMMEDIATE` only when the engine-side write helper has explicitly set `WRITE_INTENT_OPTION`; absence is the documented plain-transaction path, not malformed/corrupt data to crash on. The paired writer path at `src/elspeth/core/landscape/database.py:172-174` sets that transient framework option with `conn.execution_options(**{WRITE_INTENT_OPTION: True})` immediately before `conn.begin()`. This suppression is valid only for this optional SQLAlchemy execution-options probe inside `_emit_begin`; if the site drifts to reading Landscape rows, checkpoints, audit JSON, or any persisted Tier-1 record with `.get()`, it must be reified or allowed to crash instead.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:08:16.168643+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    RULE MISFIRES. The `.get()` is on SQLAlchemy's execution-options mapping — a framework-owned transient dict whose contents are set by our paired writer path (`conn.execution_options(**{WRITE_INTENT_OPTION: True})`) and whose absence is the documented default path for plain transactions. This is not Tier-1 audit data being defensively probed; it is a presence-check on an optional framework flag where absence has a defined meaning (DEFERRED begin). The R1 pattern's premise (hides missing-key bug in data we control) doesn't apply — the key is intentionally optional by design.
-  judge_signature_version: 2
-  scope_fingerprint: cb1ecba71e0e4af4fbb8f8d9b5e34790b33b2d571c3fd742242f31da87e81b10
-  judge_transport: openrouter
-  ast_path: 'body[45]/body[3]/body[4]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:6158eeacfed3ca17cb802cb5496266fddfbc63edb555f1d316b2ed1bef2ba1f7'
-- key: core/landscape/run_coordination_repository.py:R6:RunCoordinationRepository:_read_registered_workers:fp=fd1ff8456b1f9107
-  owner: john
-  reason: |-
-    This is a prescribed diagnostic best-effort suppression, not a normal Tier-1 read path. The enclosing caller is already converting a locked database write failure into `WriteLockHeldError`: `raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc` at src/elspeth/core/landscape/run_coordination_repository.py:464. The flagged helper is only enriching that error with a forensic worker roster; its docstring explicitly binds the behavior to the BUSY-takeover diagnostic and says the fallback must not hide the primary failure: "Best effort — an unreadable registry yields an empty roster, never masks the WriteLockHeldError." at src/elspeth/core/landscape/run_coordination_repository.py:1005-1006. The catch is also narrowed to DB-layer failures while non-DB programmer errors still surface, as stated in the local comment: "A non-DB (programmer) error is not an expected outcome here and is allowed to surface." at src/elspeth/core/landscape/run_coordination_repository.py:1025-1026. Future drift would invalidate this suppression if `_read_registered_workers` becomes a primary audit read, is called outside the `WriteLockHeldError` construction path, or broadens the catch beyond SQLAlchemy DB failures.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:08:23.077798+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM: R6 flags a silent-except, but this is a narrowly-scoped forensic diagnostic helper whose sole purpose is to enrich an already-raised WriteLockHeldError with a best-effort worker roster. The except is narrowed to SQLAlchemyError (DB-layer failures — expected because the writer we are diagnosing holds the lock), non-DB programmer errors still surface, and the failure is logged with exc_info. Crucially, the primary error (WriteLockHeldError) is NOT swallowed — it is raised by the caller regardless; this helper merely returns () so the diagnostic enrichment never masks the real failure. The docstring, narrowed catch, and audit-log record together satisfy the auditability standard for a best-effort diagnostic path.
-  judge_signature_version: 2
-  scope_fingerprint: d796edbbdd299bcf789299f1bffbd9c05fc7ef0036f679efe353e1c72825f039
-  judge_transport: openrouter
-  ast_path: 'body[29]/body[16]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:4fa5ee6c8e2731d99747e0951579aadabcff32f5a424599707aec23883700c87'
-- key: core/landscape/run_coordination_repository.py:R6:_record_best_effort_event:fp=9a4208c0d0f37f5f
-  owner: john
-  reason: |-
-    Prescribed best-effort suppression, not a normal Tier-1 write path. _record_best_effort_event records a fence_refusal / heartbeat_degraded attribution row on a FRESH connection AFTER the triggering transaction rolled back; per ADR-030 section A.2 the row carries no durable state, so a lost event is benign. The catch MUST NOT raise: record_fence_refusal runs inside fenced_leader_transaction's `except RunLeadershipLostError: ... raise` unwind at src/elspeth/core/landscape/run_coordination_repository.py:276-288, so a raise here would replace the recoverable leadership-lost signal with a crash-class error, and on the record_heartbeat_degraded path it would crash the heartbeat thread before it latches coordination-lost. The catch is narrowed to SQLAlchemy DB-layer failures; non-DB programmer errors are not SQLAlchemyError and still surface. Transient write contention (database is locked) logs at WARNING; any other DB fault (FK miss on a vanished run, event_id dedup collision, real corruption) logs at ERROR so it stays visible and alarmable without crashing the leader. Same shape and discipline as the already-signed _read_registered_workers R6 waiver in this file. Future drift invalidates this suppression if the function becomes a primary audit write, is called outside a best-effort/unwind path, or broadens the catch beyond SQLAlchemy DB failures.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:08:30.526418+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
-  judge_rationale: |-
-    PRESCRIBED FORM. R6 fires on the SQLAlchemyError swallow, but the docstring and rationale together establish this is the policy-prescribed best-effort attribution writer: the function runs inside the RunLeadershipLostError unwind and the heartbeat-degraded path, where raising would replace a recoverable typed signal with a crash-class error or kill the heartbeat thread — a routing/type mismatch the policy explicitly warns against. The catch is narrowed to SQLAlchemyError (non-DB programmer errors still surface), transient contention is logged WARNING and other DB faults ERROR so the event remains alarmable, and ADR-030 §A.2 makes losing the row benign because the triggering transaction left no durable state. This is the recoverable-typed peel-off structure the policy prescribes, not a silent swallow of an audit-integrity failure.
-  judge_signature_version: 2
-  scope_fingerprint: 9628d33168fb574346e0dc8be9b27d1a2857b72c93ba18f5f8b02b80f183d728
-  judge_transport: openrouter
-  ast_path: 'body[26]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:2ccc7cb99f2ef343ec4761439612643ef0b1ac481aca2d4d83654831251955e1'
 - key: core/payload_store.py:R6:FilesystemPayloadStore:_payload_file_exists:fp=a76c743109d2dd8b
   owner: john
   reason: |-
@@ -1199,44 +1142,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[20]/body[8]/body[9]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:dc4348ee38de17fb45028b6e363d568fd23982df23c77336129d1dea541cc426'
-- key: core/landscape/database.py:R1:_shared_connection_lock:fp=466852792f292750
-  owner: john
-  reason: |-
-    This is a site-specific internal memoization cache, not a Tier-1 audit-data read being defensively tolerated. In `core/landscape/database.py:193-200`, `_shared_connection_lock()` first excludes non-`StaticPool` engines (`"if not isinstance(engine.pool, StaticPool):"`), then under `_SHARED_CONNECTION_LOCKS_GUARD` does `"lock = _SHARED_CONNECTION_LOCKS.get(engine)"` and immediately reifies the only valid missing case by creating and storing `"threading.RLock()"`. A future drift that removed the `StaticPool` guard, the guard lock, or the immediate `None -> create/store` path would invalidate this suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:05:11.196353+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.93
-  judge_rationale: |-
-    RULE MISFIRES. The `.get()` here is not a defensive read of Tier-1 audit data or a shape-guard on a typed contract — it is the canonical get-or-create idiom on a process-local WeakKeyDictionary memoization cache that we own. Absence of the key is a legitimate, expected state (first lookup for this engine), and the code immediately reifies it by constructing and storing an RLock under a guard lock. R1's concern (hiding missing-key bugs in a schema/contract) does not apply to a memoization cache whose semantics are precisely 'missing means not-yet-created'. Direct subscript access would be incorrect here, not more honest.
-  judge_signature_version: 2
-  scope_fingerprint: f649293b36238e20e386e4331bab7a4ff2d00fa599fde43eccfbf9213577b856
-  judge_transport: openrouter
-  ast_path: 'body[32]/body[2]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:d218a815721f5648c3b4a87a3645ccb2ab8a6cda099ab13afedb695c86420fc9'
-- key: core/landscape/database.py:R9:LandscapeDB:_create_sqlcipher_engine:fp=02217c21887b2077
-  owner: john
-  reason: |-
-    This is a legitimate boundary normalization of optional SQLite URI parameters, not a Tier-1 audit-data read. In `core/landscape/database.py:829`, `_create_sqlcipher_engine` parses the caller-provided URL with `parsed = make_url(url)`, then copies unknown query keys into `uri_params` at `core/landscape/database.py:863-876`. In the `read_only` branch, the code deliberately overrides the URI mode and removes an optional caller-supplied SQLite URI flag: `uri_params["mode"] = "ro"` followed by `uri_params.pop("immutable", None)` at `core/landscape/database.py:878-880`. Absence of `"immutable"` is an expected valid URL shape, not corruption. Crashing when no `immutable` query parameter was supplied would reject ordinary read-only encrypted SQLite URLs, so the defaulted `pop` is the prescribed optional-boundary form here.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:05:17.861937+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
-  judge_rationale: |-
-    RULE MISFIRES. The `pop("immutable", None)` is not suppressing a missing-key bug on our own data — it is unconditionally removing an optional URI query parameter that the caller may or may not have supplied when the code forces read-only mode. `uri_params` is populated from the parsed URL's query string (Tier-3 external input), and the `immutable` key is legitimately optional in SQLite URIs. The default `None` is the idiomatic 'remove if present' pattern, not a fabricated default that hides a contract violation; there is no schema saying `immutable` must exist. R9's concern (hiding missing-key bugs) does not apply here.
-  judge_signature_version: 2
-  scope_fingerprint: 6588ef6a4996d13770646da430ff774520f6216990df6aa361adb18a7262f995
-  judge_transport: openrouter
-  ast_path: 'body[45]/body[5]/body[12]/body[1]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:418220ca30aea46324d95a64efb393550e35eb2b98407a999eeb8695198564d9'
 - key: core/landscape/run_status_projection.py:R5:AuditRunStatusProjection:count_failed_coalesce_barrier_rows:fp=9a1b58b0aad0c554
   owner: john
   reason: |-
@@ -1427,63 +1332,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[16]/body[5]/test'
   judge_metadata_signature: 'hmac-sha256:v2:8c184c9aa6a42f281952cdc9b58f7c675ac00e715b1f400dc572eb6fb32d0618'
-- key: core/landscape/journal.py:R9:LandscapeJournal:_enrich_committed_records:fp=cb4a4c2780a9b029
-  owner: john
-  reason: |-
-    This is a prescribed optional internal-scratch-field cleanup, not a Tier-1 audit-data invariant being hidden. `JournalRecord` declares `_payload_ref_columns` as optional scratch metadata at `src/elspeth/core/landscape/journal.py:104` (`"_payload_ref_columns: NotRequired[list[str]]"`), and the write hook only adds it when payload enrichment is enabled and `_payload_ref_columns_from_context(...)` returns a non-`None` column list: `src/elspeth/core/landscape/journal.py:188-191` (`"if self._include_payloads:" ... `"if payload_ref_columns is not None:"` ... `"record[\"_payload_ref_columns\"] = payload_ref_columns"`). That helper intentionally returns `None` for non-payload/non-`calls` statements at `src/elspeth/core/landscape/journal.py:377-385`, so absence is a valid, expected state for committed journal records. In the cited site, `_enrich_committed_records` first calls `self._enrich_with_payloads(record)` and then strips only this private transient key with `record.pop("_payload_ref_columns", None)` at `src/elspeth/core/landscape/journal.py:232-235`; using a default there preserves the documented optionality and prevents leaking internal scratch metadata into the serialized journal. A future drift that made `_payload_ref_columns` required for every enriched record would invalidate this rationale because lines 188-191/377-385 would no longer define absence as an expected state.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:06:53.675311+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. The rationale plainly states — and the excerpt is consistent with — that `_payload_ref_columns` is a `NotRequired` scratch key on the TypedDict that is only added when payload enrichment produces a non-None column list; absence is a valid documented state, not a schema violation. R9's concern (hiding a missing-key bug) does not apply because the contract explicitly makes the key optional, and this pop() is the cleanup that strips internal scratch metadata before serialization. The default is meaning-preserving (nothing to strip → no-op), not a fabricated substitute for missing audit data. Bare `record.pop(...)` would crash legitimately-absent-key cases, which is the wrong behavior given the declared optionality.
-  judge_signature_version: 2
-  scope_fingerprint: b1918bbc4c8e8e58d242fbc276876ea6599831107745d4e54d3298773fc514b5
-  judge_transport: openrouter
-  ast_path: 'body[29]/body[9]/body[0]/body[1]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:efe5de85516803f7af23c4fe408c25aaa7a387057dcb7c55e0272762f8d78c87'
-- key: core/landscape/journal.py:R6:LandscapeJournal:_ensure_owner_only_parent:fp=958746b414baad98
-  owner: john
-  reason: |-
-    This is a site-specific, explicitly documented race-boundary suppression, not a swallowed Tier-1 audit-data failure. In `core/landscape/journal.py:313-324`, `_ensure_owner_only_parent` attempts `directory.mkdir(mode=_JOURNAL_DIRECTORY_MODE)` and catches only `FileExistsError` with the local explanation: `# Created concurrently between the exists() probe and mkdir.` The handler does not accept the raced directory as trusted; it immediately falls through to `LandscapeJournal._verify_owner_only_dir(directory)` on line 324. That verifier uses `os.lstat(directory)` and crashes if the raced path is not a directory, is not owned by the current user, or has non-owner permission bits (`raise OSError(...)` / `raise PermissionError(...)` at lines 359-364). The allowlist remains valid only while this `FileExistsError` handler is followed by the same owner-only verification on both create and race paths.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:07:00.209836+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
-  judge_rationale: |-
-    PRESCRIBED FORM. The R6 silent-except concern is that catching an exception without re-raise or explicit error handling swallows failure. Here the FileExistsError is not swallowed: it is a narrow race-window catch (concurrent mkdir between exists() probe and mkdir), and the code immediately falls through to _verify_owner_only_dir on line 324, which crashes with OSError/PermissionError if the raced directory violates the owner-only invariant. Both the create path and the race path converge on the same verification, so the security invariant is preserved rather than silently abandoned. This is the prescribed shape for a genuine filesystem race boundary.
-  judge_signature_version: 2
-  scope_fingerprint: c3d415b28c9bcdeec9e9dc74b3ce62a93ed10d75ee321822508e69e56ab74e7d
-  judge_transport: openrouter
-  ast_path: 'body[29]/body[13]/body[4]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:646ed1d75d6e0e36f8fe391c5d172944cb0f7a557c336e7a526742053a178e93'
-- key: core/landscape/journal.py:R1:LandscapeJournal:_enrich_with_payloads:fp=60d3ae61b30a0257
-  owner: john
-  reason: |-
-    This is a legitimate optional internal-enrichment sentinel, not a Tier-1 audit-data shape violation. `JournalRecord` declares `_payload_ref_columns` as optional scratch metadata at `src/elspeth/core/landscape/journal.py:104`: `_payload_ref_columns: NotRequired[list[str]]`. The key is only attached when payload enrichment is enabled and SQLAlchemy can identify payload-reference columns: `src/elspeth/core/landscape/journal.py:188-191` says `if self._include_payloads:` then `payload_ref_columns = self._payload_ref_columns_from_context(context, parameters)` and only `if payload_ref_columns is not None:` does it write `record["_payload_ref_columns"] = payload_ref_columns`. The caller intentionally enriches every committed write record when payload inclusion is enabled (`src/elspeth/core/landscape/journal.py:227-229`), including non-`calls` writes for which `_payload_ref_columns_from_context` legitimately returns `None` at `src/elspeth/core/landscape/journal.py:406-407`. In that exact flow, `src/elspeth/core/landscape/journal.py:416-418` uses `columns = record.get("_payload_ref_columns")` followed by `if columns is None or self._payload_store is None: return` to distinguish "this committed write has no payload columns to enrich" from records that do. Drift that made `_payload_ref_columns` required, public, or sourced from persisted audit data would invalidate this suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:07:07.590522+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.78
-  judge_rationale: |-
-    RULE MISFIRES. The rationale identifies `_payload_ref_columns` as a `NotRequired[list[str]]` TypedDict field — genuinely optional scratch metadata attached only when payload enrichment is enabled and the write targets the `calls` table. The `.get()` here distinguishes 'key legitimately absent' (non-calls writes, or payloads disabled) from 'key present with columns to enrich', which is the correct idiom for a `NotRequired` field on a first-party TypedDict. This is not defensive access against a guaranteed-present field; it is the prescribed way to read an optional key. The rule R1 fires on the shape but the premise (missing key = bug) does not hold for `NotRequired` TypedDict members.
-  judge_signature_version: 2
-  scope_fingerprint: 77a513cef0520c9110fcb899ce691a5152baa51f33b55ab57bbe7b56ae662ead
-  judge_transport: openrouter
-  ast_path: 'body[29]/body[21]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:02c654b3ad531b12c75b6fed4ec0b43030733053274a2d8f1cb29d3dd26c730a'
 - key: core/landscape/reproducibility.py:R5:_validate_node_determinism_values:fp=020b103f17cd63ad
   owner: john
   reason: |-
@@ -1503,82 +1351,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[10]/body[2]/body[1]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:e545c45032c00142042575440b86266ca327e66b8c20cf8b416882b626d2bcbd'
-- key: core/landscape/export_mappers.py:R5:node_state_to_export_record:fp=8d8b08be882cde40
-  owner: john
-  reason: |-
-    core/landscape/export_mappers.py:12 uses `if isinstance(state, NodeStateOpen):` inside `node_state_to_export_record` as variant dispatch over the reified node-state lifecycle object, not as defensive validation of raw audit data. The enclosing mapper receives a typed `state` and immediately serializes the open-state variant differently from terminal variants; future drift that changes this from `NodeStateOpen` variant dispatch into a catch-and-continue guard over malformed Tier-1 data would invalidate this suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:07:22.101771+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    PRESCRIBED FORM / RULE MISFIRES. The function signature is `state: object`, which means the type system has erased the variant identity; isinstance here is the standard tagged-union dispatch pattern over a closed set of NodeState variants (Open/Pending/Completed/Failed), not a defensive shape guard on Tier-1 audit data. Each branch selects a variant-specific serialization; this is variant discrimination, which R5's remediation guidance ('do not use isinstance to hide bugs') does not forbid. The rationale correctly identifies the pattern and the code plainly shows per-variant projections rather than a coerce/default fallback.
-  judge_signature_version: 2
-  scope_fingerprint: cb3685e6d843ea664dadae04cdbd8149ee1294d3f4f5c422ca5589883b7a72ce
-  judge_transport: openrouter
-  ast_path: 'body[5]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:ad9f6cf56d724a3821f22ac2f05f4067b534b42b80b18165439416a983ae9aca'
-- key: core/landscape/export_mappers.py:R5:node_state_to_export_record:fp=0673d329c8e501b3
-  owner: john
-  reason: |-
-    This is prescribed variant reification, not defensive recovery. In `src/elspeth/core/landscape/export_mappers.py:10`, `node_state_to_export_record(run_id: str, state: object)` projects an in-memory `NodeState` variant into a flat audit export record. The flagged site at `src/elspeth/core/landscape/export_mappers.py:32` is one branch of an exhaustive variant dispatch: `if isinstance(state, NodeStatePending):`. The function does not tolerate malformed Tier-1 audit state: after the known variants (`NodeStateOpen`, `NodeStatePending`, `NodeStateCompleted`, `NodeStateFailed`), `src/elspeth/core/landscape/export_mappers.py:93` crashes with `raise AuditIntegrityError(f"Unknown NodeState variant for export: {type(state).__name__}")`. This suppression is valid only while the `isinstance` checks remain the direct NodeState variant dispatch and the unknown-variant path continues to raise `AuditIntegrityError` instead of returning a partial/default export record.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:07:29.839650+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
-  judge_rationale: |-
-    PRESCRIBED FORM. The function signature accepts `state: object` and performs exhaustive variant dispatch across the NodeState sum type, with the fall-through raising `AuditIntegrityError` — this is the offensive pattern for reifying a tagged-union variant into its flat record. The `isinstance` here is not a defensive shape guard on trusted data; it is the discrimination mechanism for a union typed as `object`, and each branch raises loudly on unknown variants rather than fabricating a default. The code visibly matches the rationale (raise on unknown variant is stated to exist at line 93, and the excerpt's structure is consistent with that).
-  judge_signature_version: 2
-  scope_fingerprint: cb3685e6d843ea664dadae04cdbd8149ee1294d3f4f5c422ca5589883b7a72ce
-  judge_transport: openrouter
-  ast_path: 'body[5]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:1f0491a2971b91a84b17e9da09eb9869b59eccbcee8bafc346d002d35463a122'
-- key: core/landscape/export_mappers.py:R5:node_state_to_export_record:fp=dfaabe8125513ac3
-  owner: john
-  reason: |-
-    `src/elspeth/core/landscape/export_mappers.py:52` is the export mapper's closed-variant reification point, not a defensive probe over corrupt audit data: `if isinstance(state, NodeStateCompleted):`. The enclosing function is typed as `node_state_to_export_record(run_id: str, state: object) -> NodeStateExportRecord`, so this `isinstance()` is the prescribed dispatch boundary that turns a deliberately erased variant object into the corresponding export record. The site is drift-sensitive: if this branch stops being the first closed-union arm for `NodeStateCompleted`, or if unknown variants are tolerated instead of rejected, this suppression no longer applies.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:07:36.272506+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    PRESCRIBED FORM. The function signature accepts `state: object`, meaning the closed union of NodeState variants is not runtime-enforced by type. This isinstance chain is the prescribed dispatch mechanism for a tagged/closed union — each arm reifies a specific variant into its export record shape, and (by policy convention shown in the surrounding excerpt) an unmatched variant would raise. This is the offensive-dispatch pattern, not a defensive probe: the isinstance is load-bearing for correctness because different variants have different field sets (e.g., NodeStateCompleted has output_hash and success_reason_json, NodeStatePending does not). The rationale correctly identifies this as a variant-dispatch site, and the visible code supports that reading.
-  judge_signature_version: 2
-  scope_fingerprint: cb3685e6d843ea664dadae04cdbd8149ee1294d3f4f5c422ca5589883b7a72ce
-  judge_transport: openrouter
-  ast_path: 'body[5]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:55a448567345e5cd632ba5a9eb3deacc8b28f2fe11b48b388b078b08348b940c'
-- key: core/landscape/export_mappers.py:R5:node_state_to_export_record:fp=0db856e45367c87d
-  owner: john
-  reason: |-
-    `core/landscape/export_mappers.py:72` is not using `isinstance()` to forgive malformed Tier-1 audit data. It is dispatching on a reified internal node-state variant inside `node_state_to_export_record`: `if isinstance(state, NodeStateFailed):`. The boundary has already produced a typed `NodeState` object; this mapper is converting the closed in-process state model into an export record and only adds failure-specific fields for the `NodeStateFailed` variant. A future drift that changes this from variant-specific export shaping into accepting/coercing untyped input, or adds a broad fallback for unknown state shapes, would invalidate this suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:07:43.674929+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
-  judge_rationale: |-
-    PRESCRIBED FORM / RULE MISFIRES on the misuse concern: this is variant dispatch on a closed sum type (NodeStateRunning/Completed/Failed) to shape variant-specific export records, not a defensive shape-guard on untrusted data. Each branch reads variant-specific fields and the tail raises AuditIntegrityError on an unknown variant — the offensive crash-on-invariant-break pattern for Tier-1 audit data. The isinstance chain is the standard Python idiom for discriminating a tagged union without a match statement; there is no coercion, no silent fallback, no fabrication.
-  judge_signature_version: 2
-  scope_fingerprint: cb3685e6d843ea664dadae04cdbd8149ee1294d3f4f5c422ca5589883b7a72ce
-  judge_transport: openrouter
-  ast_path: 'body[5]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:61beef0ed7cbcb7cd11f5faf0b27d49bd4dce77f585fd78d43aeeb7959c2e780'
 - key: core/security/config_secrets.py:R6:_classify_azure_secret_error:fp=8438e869f1e24b32
   owner: john
   reason: |-
@@ -1902,105 +1674,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[36]/body[12]/body[4]/test/values[0]/operand'
   judge_metadata_signature: 'hmac-sha256:v2:d7345aa17c9917f242ad780fc3eb28eed14c93e497fcf606d5e8e343b6ecf3de'
-- key: core/landscape/scheduler/barrier.py:R1:BarrierJournalRepository:_transition_passthrough_pending_sink:fp=58975b2dabef2351
-  owner: john
-  reason: |-
-    core/landscape/scheduler/barrier.py:536 is a sparse internal join, not defensive access to a required audit field: `emission = emission_by_token.get(row["token_id"])`. The required Tier-1 row field is still read offensively via `row["token_id"]`, so a malformed `blocked_rows` row would crash. The `.get()` is only checking whether this BLOCKED row is one of the sink-bound passthrough emissions built at core/landscape/scheduler/barrier.py:531 (`emission_by_token = {emission.token_id: emission for emission in passthrough_emissions}`); rows with no matching emission are intentionally skipped at core/landscape/scheduler/barrier.py:537-538. This is bounded by the later invariant at core/landscape/scheduler/barrier.py:584-588: if every requested emission was not transitioned, the function raises `AuditIntegrityError`. Drift would invalidate this suppression if `row["token_id"]` became a `.get()`, if unmatched rows were no longer an intentional non-transition case, or if the final `transitioned != len(emission_by_token)` crash guard were removed.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:10:28.521315+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    RULE MISFIRES. The `.get()` here is not defensive access to a required field of the row — it is a membership test against an in-memory dict `emission_by_token` built one scope up from `passthrough_emissions`. A blocked row that has no corresponding emission is a legitimate, intentional skip (line 537-538), not a missing-key bug, so this is a set-membership idiom, not an R1 defensive access. The Tier-1 row field `row["token_id"]` is still read offensively via subscript, which would crash on malformed input, and the closing invariant at 584-588 raises AuditIntegrityError if not every emission transitioned — so the audit contract is preserved. The rationale is site-specific and consistent with the visible code.
-  judge_signature_version: 2
-  scope_fingerprint: aa1407058f828241e708003e279899afad54e2012432ce5d593ae442be2c1b76
-  judge_transport: openrouter
-  ast_path: 'body[23]/body[4]/body[4]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:cb59a196635daca36b4c65e747cd3a16f9a6fc74d249aef19651a0e9e2c62152'
-  judge_excerpt_redactions:
-    - pattern: dotenv_secret_assignment
-      byte_count: 27
-      redacted_hash: 90ad2aad5450f100
-- key: core/landscape/execution/node_states.py:R5:_validate_transform_success_reason:fp=92f1eaf00efa3d96
-  owner: john
-  reason: |-
-    `core/landscape/execution/node_states.py:60` is a write-side audit-boundary reification check, not defensive masking of Tier-1 data. The function `_validate_transform_success_reason(success_reason: object) -> None` accepts an untrusted/unknown `object` before the value is persisted as node-state audit metadata, and line 60 rejects non-mapping payloads with `if not isinstance(success_reason, Mapping):`. That is the prescribed pattern for converting a boundary value into an audit-safe shape before it enters Landscape, so suppressing this R5 `isinstance()` finding is legitimate. If this site drifted from validating `success_reason: object` before audit persistence into re-reading Landscape-owned data, this rationale would no longer apply.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:10:35.496551+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    PRESCRIBED FORM. The function signature `_validate_transform_success_reason(success_reason: object)` accepts an untyped `object` — the shape is not contractually guaranteed at this point. The isinstance check is the prescribed offensive validation that raises ValueError on malformed input before the value is persisted as Tier-1 audit metadata; this is exactly the boundary-reification pattern policy endorses (crash on the upgrade with a meaningfully-typed exception). The raised ValueError is appropriately typed for the surrounding routing structure, and the rationale correctly identifies this as a write-side audit-boundary check rather than defensive masking of already-trusted data.
-  judge_signature_version: 2
-  scope_fingerprint: 93f4b2568d45ea4df94acbd933a810bbc735e78807979bad30cce4e3fbc32c66
-  judge_transport: openrouter
-  ast_path: 'body[23]/body[2]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:45a9a4650fb6a5b9173079b9bf133766bc09b7c867442ec409310212fc39eae8'
-- key: core/landscape/execution/node_states.py:R1:_validate_transform_success_reason:fp=fa02d6052281dff6
-  owner: john
-  reason: |-
-    This is a write-side validation boundary, not a Tier-1 read path hiding audit corruption. In `core/landscape/execution/node_states.py:56-64`, `_validate_transform_success_reason(success_reason: object)` explicitly validates arbitrary input "before Tier 1 audit serialization": it permits `None`, rejects non-mappings, then uses `action = success_reason.get("action")` only to validate that the required `"action"` field is present and a `str` before the value enters the audit trail. If future drift moved this `.get()` to a Landscape readback/deserialized audit path, or stopped raising on missing/non-string `"action"`, this suppression would no longer apply.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:10:42.836125+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    PRESCRIBED FORM. The function takes `success_reason: object` — an untyped input being validated at the write-side boundary before it enters Tier-1 audit serialization. The code follows the offensive pattern: isinstance-check the mapping shape and raise, then use `.get("action")` followed by `isinstance(action, str)` → raise if missing/wrong type. This is validation that PROMOTES external/untyped input into Tier-1, not a defensive `.get()` on already-trusted Tier-1 data. The `.get()` here is equivalent to `dict.get()` returning None so the subsequent isinstance check catches both absence and wrong type in one raise — a meaning-preserving boundary validation, not silent recovery.
-  judge_signature_version: 2
-  scope_fingerprint: 93f4b2568d45ea4df94acbd933a810bbc735e78807979bad30cce4e3fbc32c66
-  judge_transport: openrouter
-  ast_path: 'body[23]/body[3]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:841a535007496ea2f0b507a38fd96f519b28cbc7d3d84e9b99fd95649d414ce1'
-- key: core/landscape/execution/node_states.py:R5:_validate_transform_success_reason:fp=0c193c71eccd38c4
-  owner: john
-  reason: |-
-    `src/elspeth/core/landscape/execution/node_states.py:56-64` is a write-boundary validator immediately before Tier-1 audit serialization, not a defensive read of already-trusted audit data. The enclosing function declares that purpose in its docstring: `"""Validate TransformSuccessReason shape before Tier 1 audit serialization."""` It rejects malformed `success_reason` before `record_completed_node_state` and `complete_node_state` serialize it with `canonical_json(...)` into `node_states.success_reason_json`. The flagged line `if not isinstance(action, str):` is the prescribed write-side invariant check for the required `success_reason['action']` field and fails closed with `ValueError("success_reason['action'] must be a str")`; future drift that moved this check after serialization or changed it to a default/coercion path would invalidate this suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:10:55.815073+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    PRESCRIBED FORM. The function is a write-boundary validator that checks the shape of a TransformSuccessReason before it is serialized into the Tier-1 audit record. The success_reason value is typed as `object` and its shape at this point is not contractually guaranteed by a first-party typed contract at the call site (it's a Mapping payload assembled from transform outputs), so an offensive isinstance→raise is the prescribed enforcement pattern: detect the invalid state and raise a meaningful ValueError rather than silently serializing malformed data into the audit trail. The check fails closed (no coercion, no default), and the docstring plainly states the purpose, matching the visible code.
-  judge_signature_version: 2
-  scope_fingerprint: 93f4b2568d45ea4df94acbd933a810bbc735e78807979bad30cce4e3fbc32c66
-  judge_transport: openrouter
-  ast_path: 'body[23]/body[4]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:79306104a5fe806967f484b1fdf07a16ba5d4fd5bf2a39609b9d30a4d96d0974'
-- key: core/landscape/execution/node_states.py:R6:NodeStateRepository:begin_node_state:fp=161fc79a4a941267
-  owner: john
-  reason: |-
-    This is a legitimate Tier-3 boundary fallback, not a Tier-1 audit-data violation. In `core/landscape/execution/node_states.py:95` the method accepts `quarantined: bool = False`, and the docstring at `core/landscape/execution/node_states.py:108-109` says: `"quarantined: If True, input_data is Tier-3 external data that may contain non-canonical values (NaN, Infinity). Uses repr_hash fallback."` The swallowed `ValueError`/`TypeError` occurs only under `if quarantined:` at `core/landscape/execution/node_states.py:119-123`, where `stable_hash(input_data)` is attempted and only non-canonical external input falls back to `repr_hash(input_data)`. The non-quarantined path at `core/landscape/execution/node_states.py:124-125` still lets `stable_hash(input_data)` crash, preserving the Tier-1/Tier-2 fail-fast behavior. Drift would invalidate this suppression if the `except (ValueError, TypeError)` moved outside `if quarantined:`, if `quarantined` stopped meaning Tier-3 external data, or if the fallback stopped immediately deriving `input_hash = repr_hash(input_data)`.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:11:03.392927+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    PRESCRIBED FORM. R6 fires on the swallowed ValueError/TypeError, but the site is gated by `if quarantined:` — the branch that explicitly handles Tier-3 external data whose values may be non-canonical (NaN/Infinity) and hence unhashable by stable_hash. The except swaps to repr_hash, a meaning-preserving fallback that still records what we got (no fabrication, no default substitution), and the non-quarantined path at line 125 preserves fail-fast for Tier-1/Tier-2. The rationale correctly identifies the tier, the code visibly matches, and the fallback is bounded to the specific exception types stable_hash raises on non-canonical floats.
-  judge_signature_version: 2
-  scope_fingerprint: 80b19a9a2a0cf35b55c532b368daad1a5519291b6204dc1198aa00c51a1c184c
-  judge_transport: openrouter
-  ast_path: 'body[24]/body[2]/body[2]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:f8e3943ccd64f001030d7947b991140832d26ae712e47fdb7913e523e01eed4e'
 - key: core/landscape/execution/node_states.py:R6:NodeStateRepository:record_completed_node_state:fp=9a4b378c445ce8a7
   owner: john
   reason: |-
@@ -2058,25 +1731,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[44]/body[3]/body[1]/test/values[1]/left'
   judge_metadata_signature: 'hmac-sha256:v2:4177c04ea504839ea62b6672693b49c97d7f6fc756fc3c9ef6959e8c24452276'
-- key: core/landscape/journal.py:R6:LandscapeJournal:_payload_ref_columns_from_context:fp=e775eda3478341d2
-  owner: john
-  reason: |-
-    core/landscape/journal.py:404 `except AttributeError: return None` classifies the compiled SQLAlchemy statement flowing through the journal's execution-event hook. The journal observes EVERY statement on the landscape connection; only INSERTs into the payload-backed 'calls' table carry payload-ref columns, and statement objects are third-party SQLAlchemy Core constructs whose `.table` attribute exists only on table-bearing statement classes — the `_TableBearingStatement` Protocol (core/landscape/journal.py:64-66) records exactly this structural, not asserted, typing. An AttributeError from `cast('_TableBearingStatement', statement).table` (journal.py:402-405) therefore means 'not a table-bearing statement' — the same designed not-applicable outcome as the explicit `if table.name != 'calls': return None` on the following line (journal.py:406-407), recorded as None (no payload-ref columns), never a fabricated value. The tier split within this same function is deliberate and proves the contrast: the preceding probe of `context.compiled` — our own first-party execution-context contract — RAISES AuditIntegrityError on absence (journal.py:395-398) instead of degrading. The None consumer is the payload-capture branch at journal.py:189-191, which simply records no _payload_ref_columns for non-'calls' statements, the designed majority case. INVALIDATED IF: the except at journal.py:404 is widened beyond AttributeError, the `context.compiled` probe stops raising AuditIntegrityError, or payload-ref derivation stops being scoped to the 'calls' table.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:23:08.705456+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    PRESCRIBED FORM / RULE MISFIRES. The `statement` object is a third-party SQLAlchemy Core construct whose `.table` attribute is only present on table-bearing statement classes — a structural (Protocol) rather than nominal guarantee, as the `_TableBearingStatement` Protocol at lines 64-66 records. The AttributeError branch is the structural-typing discriminator: 'not a table-bearing statement' is a designed not-applicable outcome that returns None (no payload-ref columns), semantically identical to the following `if table.name != 'calls': return None`. The contrast with the immediately preceding first-party probe of `context.compiled` — which raises AuditIntegrityError on absence — demonstrates the author knows the tier distinction and applies it correctly. The rationale plainly states the structural-typing fact the excerpt corroborates.
-  judge_signature_version: 2
-  scope_fingerprint: fda6e8405cbba0c393fc42eb3e24e4ab8c0df4d9846f262974679520659e8acc
-  judge_transport: openrouter
-  ast_path: 'body[29]/body[20]/body[3]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:83501c89c5e9d7c2cb24b33e915fa3373607148b9baabbaa7e7df6baec5bce5c'
 - key: core/templates.py:R1:_filter_keyword_value:fp=8ad25b12a7cbeef5
   owner: john
   reason: |-
@@ -2432,3 +2086,349 @@ allow_hits:
     - pattern: dotenv_secret_assignment
       byte_count: 25
       redacted_hash: bc60c33b8c3b578f
+- key: core/landscape/database.py:R1:LandscapeDB:_configure_sqlite:_emit_begin:fp=e68905c6e519fc47
+  owner: john
+  reason: |-
+    `src/elspeth/core/landscape/database.py:645` reads an optional SQLAlchemy execution option, not Tier-1 audit data: `if conn.get_execution_options().get(WRITE_INTENT_OPTION, False):`. The enclosing SQLite `begin` listener selects `BEGIN IMMEDIATE` only when the engine-side write helper has explicitly set `WRITE_INTENT_OPTION`; absence is the documented plain-transaction path, not malformed/corrupt data to crash on. The paired writer path at `src/elspeth/core/landscape/database.py:172-174` sets that transient framework option with `conn.execution_options(**{WRITE_INTENT_OPTION: True})` immediately before `conn.begin()`. This suppression is valid only for this optional SQLAlchemy execution-options probe inside `_emit_begin`; if the site drifts to reading Landscape rows, checkpoints, audit JSON, or any persisted Tier-1 record with `.get()`, it must be reified or allowed to crash instead.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:09:46.723578+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — `conn.get_execution_options()` is SQLAlchemy transaction metadata, not a persisted Tier-1 Landscape record, and `WRITE_INTENT_OPTION` is intentionally optional. The visible listener assigns `BEGIN IMMEDIATE` when the option is present and true, while absence selects the documented plain `BEGIN` transaction path, so `.get(..., False)` expresses the option’s semantics rather than concealing corruption. This is not a Tier-3 parameter-rooted boundary case, so the structural decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: cb1ecba71e0e4af4fbb8f8d9b5e34790b33b2d571c3fd742242f31da87e81b10
+  judge_transport: codex_cli
+  ast_path: 'body[62]/body[3]/body[4]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:3cdef0465dda1d9a2eec8eb7071ea4a7d1d8f650ab9093234a927f7f89cb0e0b'
+- key: core/landscape/database.py:R1:_shared_connection_lock:fp=c778457fa0f7e0d6
+  owner: john
+  reason: |-
+    This is a site-specific internal memoization cache, not a Tier-1 audit-data read being defensively tolerated. In `core/landscape/database.py:193-200`, `_shared_connection_lock()` first excludes non-`StaticPool` engines (`"if not isinstance(engine.pool, StaticPool):"`), then under `_SHARED_CONNECTION_LOCKS_GUARD` does `"lock = _SHARED_CONNECTION_LOCKS.get(engine)"` and immediately reifies the only valid missing case by creating and storing `"threading.RLock()"`. A future drift that removed the `StaticPool` guard, the guard lock, or the immediate `None -> create/store` path would invalidate this suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:10:09.188728+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — `_SHARED_CONNECTION_LOCKS` is an internal memoization map whose missing-key state is expected and immediately resolved by creating and storing a per-engine `RLock`; it is not a Tier-1 audit-data read or a required-schema lookup whose absence is being hidden. The `StaticPool` check and guard lock visible around the lookup constrain this behavior to the documented shared-connection case, and no malformed value is silently suppressed, coerced, or fabricated. The decorator alternative does not apply because the lookup is rooted in the process-local cache rather than external data passed through a function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: f649293b36238e20e386e4331bab7a4ff2d00fa599fde43eccfbf9213577b856
+  judge_transport: codex_cli
+  ast_path: 'body[37]/body[2]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:e867cb669760526b934fe3d134ae247ff83c4d7745d8c70b2ea98ecef8753675'
+- key: core/landscape/database.py:R9:LandscapeDB:_create_sqlcipher_engine:fp=bc4db39d2c339d56
+  owner: john
+  reason: |-
+    This is a legitimate boundary normalization of optional SQLite URI parameters, not a Tier-1 audit-data read. In `core/landscape/database.py:829`, `_create_sqlcipher_engine` parses the caller-provided URL with `parsed = make_url(url)`, then copies unknown query keys into `uri_params` at `core/landscape/database.py:863-876`. In the `read_only` branch, the code deliberately overrides the URI mode and removes an optional caller-supplied SQLite URI flag: `uri_params["mode"] = "ro"` followed by `uri_params.pop("immutable", None)` at `core/landscape/database.py:878-880`. Absence of `"immutable"` is an expected valid URL shape, not corruption. Crashing when no `immutable` query parameter was supplied would reject ordinary read-only encrypted SQLite URLs, so the defaulted `pop` is the prescribed optional-boundary form here.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:10:18.614994+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — `uri_params` is assembled from caller-provided SQLite URL query parameters, so the presence of `immutable` is not guaranteed by a first-party schema. In the `read_only` branch, `mode` is deliberately forced to `ro` and the optional, potentially conflicting `immutable` flag is removed; `pop("immutable", None)` expresses valid absence rather than concealing a missing-key invariant failure. R9 is not eligible for the `@trust_boundary` decorator mechanism, which covers only R1 and R5.
+  judge_signature_version: 2
+  scope_fingerprint: 6588ef6a4996d13770646da430ff774520f6216990df6aa361adb18a7262f995
+  judge_transport: codex_cli
+  ast_path: 'body[62]/body[5]/body[12]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:9839a160480b22b6ee8235f1d62e79a39959423c4246a4f0e06cb90696cbb829'
+- key: core/landscape/execution/node_states.py:R1:_validate_transform_success_reason:fp=fef8223c7ed48bac
+  owner: john
+  reason: |-
+    This is a write-side validation boundary, not a Tier-1 read path hiding audit corruption. In `core/landscape/execution/node_states.py:56-64`, `_validate_transform_success_reason(success_reason: object)` explicitly validates arbitrary input "before Tier 1 audit serialization": it permits `None`, rejects non-mappings, then uses `action = success_reason.get("action")` only to validate that the required `"action"` field is present and a `str` before the value enters the audit trail. If future drift moved this `.get()` to a Landscape readback/deserialized audit path, or stopped raising on missing/non-string `"action"`, this suppression would no longer apply.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:10:32.961406+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM — the `.get("action")` is part of an offensive write-side validation that immediately raises when the required field is absent or is not a string, rather than supplying a default or allowing malformed data into Tier 1. The visible function explicitly accepts an unenforced `object`, validates its mapping shape, and crashes informatively before audit serialization, consistent with runtime enforcement of the `TransformSuccessReason` contract. This is not a Tier-3 external-parameter boundary, so the structural decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 93f4b2568d45ea4df94acbd933a810bbc735e78807979bad30cce4e3fbc32c66
+  judge_transport: codex_cli
+  ast_path: 'body[26]/body[3]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:f505ac95050ee00491808853e7ae117e7337e08ddd3b3f06e62b43a34fc7862e'
+- key: core/landscape/execution/node_states.py:R5:_validate_transform_success_reason:fp=292f24be397b0a8f
+  owner: john
+  reason: |-
+    `src/elspeth/core/landscape/execution/node_states.py:56-64` is a write-boundary validator immediately before Tier-1 audit serialization, not a defensive read of already-trusted audit data. The enclosing function declares that purpose in its docstring: `"""Validate TransformSuccessReason shape before Tier 1 audit serialization."""` It rejects malformed `success_reason` before `record_completed_node_state` and `complete_node_state` serialize it with `canonical_json(...)` into `node_states.success_reason_json`. The flagged line `if not isinstance(action, str):` is the prescribed write-side invariant check for the required `success_reason['action']` field and fails closed with `ValueError("success_reason['action'] must be a str")`; future drift that moved this check after serialization or changed it to a default/coercion path would invalidate this suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:12:09.611790+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    PRESCRIBED FORM — the flagged `isinstance` is an offensive invariant check that raises a meaningful error instead of coercing, defaulting, or silently recovering. The visible helper validates the required `action` field, and the call sites at `src/elspeth/core/landscape/execution/node_states.py:238` and `:474` invoke it immediately before canonical audit serialization, with no local handling of the resulting `ValueError`. This is a first-party audit write invariant rather than a Tier-3 parameter boundary, so the decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 93f4b2568d45ea4df94acbd933a810bbc735e78807979bad30cce4e3fbc32c66
+  judge_transport: codex_cli
+  ast_path: 'body[26]/body[4]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:14794ab5acc92920250bdd74cbc63319f61b02d6717da39812ace68288dc2924'
+- key: core/landscape/execution/node_states.py:R5:_validate_transform_success_reason:fp=ee093449ccf912c1
+  owner: john
+  reason: |-
+    `core/landscape/execution/node_states.py:60` is a write-side audit-boundary reification check, not defensive masking of Tier-1 data. The function `_validate_transform_success_reason(success_reason: object) -> None` accepts an untrusted/unknown `object` before the value is persisted as node-state audit metadata, and line 60 rejects non-mapping payloads with `if not isinstance(success_reason, Mapping):`. That is the prescribed pattern for converting a boundary value into an audit-safe shape before it enters Landscape, so suppressing this R5 `isinstance()` finding is legitimate. If this site drifted from validating `success_reason: object` before audit persistence into re-reading Landscape-owned data, this rationale would no longer apply.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:13:53.225489+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM — the `isinstance` check offensively rejects a malformed audit payload with an informative exception; it neither coerces, defaults, nor silently masks the violation. The validator runs immediately before serialization at core/landscape/execution/node_states.py:238-239, and the typed `TransformSuccessReason` annotation is not itself runtime enforcement, so the explicit write-boundary check prevents invalid metadata from entering Tier 1. This is not a decorator case because `success_reason` is first-party structured audit metadata, not Tier-3 external data flowing from a function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 93f4b2568d45ea4df94acbd933a810bbc735e78807979bad30cce4e3fbc32c66
+  judge_transport: codex_cli
+  ast_path: 'body[26]/body[2]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:51480f463ef6dcc01c1c7ac82814a58f113f53ad1a17b73a199752270f0cb4e9'
+- key: core/landscape/execution/node_states.py:R6:NodeStateRepository:begin_node_state:fp=929580000007cefd
+  owner: john
+  reason: |-
+    This is a legitimate Tier-3 boundary fallback, not a Tier-1 audit-data violation. In `core/landscape/execution/node_states.py:95` the method accepts `quarantined: bool = False`, and the docstring at `core/landscape/execution/node_states.py:108-109` says: `"quarantined: If True, input_data is Tier-3 external data that may contain non-canonical values (NaN, Infinity). Uses repr_hash fallback."` The swallowed `ValueError`/`TypeError` occurs only under `if quarantined:` at `core/landscape/execution/node_states.py:119-123`, where `stable_hash(input_data)` is attempted and only non-canonical external input falls back to `repr_hash(input_data)`. The non-quarantined path at `core/landscape/execution/node_states.py:124-125` still lets `stable_hash(input_data)` crash, preserving the Tier-1/Tier-2 fail-fast behavior. Drift would invalidate this suppression if the `except (ValueError, TypeError)` moved outside `if quarantined:`, if `quarantined` stopped meaning Tier-3 external data, or if the fallback stopped immediately deriving `input_hash = repr_hash(input_data)`.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:15:40.127035+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM — the exception is handled only when `quarantined` explicitly marks `input_data` as Tier-3 external data, and the documented `repr_hash` fallback preserves a representation-derived audit hash instead of fabricating a replacement value. The quarantine is structurally established before this call: `engine/orchestrator/source_iteration.py:631-644` routes only `source_item.is_quarantined` rows through `QuarantineRouter`, consistent with the guarded branch shown here. The non-quarantined path remains fail-fast, so this is recorded-quarantine handling rather than silent recovery that promotes malformed data into Tier-2.
+  judge_signature_version: 2
+  scope_fingerprint: 80b19a9a2a0cf35b55c532b368daad1a5519291b6204dc1198aa00c51a1c184c
+  judge_transport: codex_cli
+  ast_path: 'body[27]/body[2]/body[2]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:982d03ed4b37aefce8dcc3a04810cff08f5ae4877c750045c83101ef1b8a4f29'
+- key: core/landscape/export_mappers.py:R5:node_state_to_export_record:fp=777f2002bc41866d
+  owner: john
+  reason: |-
+    This is prescribed variant reification, not defensive recovery. In `src/elspeth/core/landscape/export_mappers.py:10`, `node_state_to_export_record(run_id: str, state: object)` projects an in-memory `NodeState` variant into a flat audit export record. The flagged site at `src/elspeth/core/landscape/export_mappers.py:32` is one branch of an exhaustive variant dispatch: `if isinstance(state, NodeStatePending):`. The function does not tolerate malformed Tier-1 audit state: after the known variants (`NodeStateOpen`, `NodeStatePending`, `NodeStateCompleted`, `NodeStateFailed`), `src/elspeth/core/landscape/export_mappers.py:93` crashes with `raise AuditIntegrityError(f"Unknown NodeState variant for export: {type(state).__name__}")`. This suppression is valid only while the `isinstance` checks remain the direct NodeState variant dispatch and the unknown-variant path continues to raise `AuditIntegrityError` instead of returning a partial/default export record.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:16:22.542551+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    PRESCRIBED FORM — the `isinstance` checks perform explicit runtime dispatch across the four known `NodeState` variants rather than suppressing a contract failure. The complete function at `core/landscape/export_mappers.py:178` returns a fully specified record for each variant and terminates at line 261 with `AuditIntegrityError` for every unknown type, so malformed Tier-1 audit state is neither coerced nor silently recovered. The decorator is inapplicable because `state` is not claimed or shown to be Tier-3 external data.
+  judge_signature_version: 2
+  scope_fingerprint: cb3685e6d843ea664dadae04cdbd8149ee1294d3f4f5c422ca5589883b7a72ce
+  judge_transport: codex_cli
+  ast_path: 'body[14]/body[2]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:1f15c23a0d60ff05d63b4acf7046060aa546ec0ca1cf37371e69fbd1ce2a0eae'
+- key: core/landscape/export_mappers.py:R5:node_state_to_export_record:fp=a8ed163ca479607e
+  owner: john
+  reason: |-
+    `core/landscape/export_mappers.py:72` is not using `isinstance()` to forgive malformed Tier-1 audit data. It is dispatching on a reified internal node-state variant inside `node_state_to_export_record`: `if isinstance(state, NodeStateFailed):`. The boundary has already produced a typed `NodeState` object; this mapper is converting the closed in-process state model into an export record and only adds failure-specific fields for the `NodeStateFailed` variant. A future drift that changes this from variant-specific export shaping into accepting/coercing untyped input, or adds a broad fallback for unknown state shapes, would invalidate this suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:16:39.393827+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — this `isinstance(state, NodeStateFailed)` is variant dispatch over the stated typed internal `NodeState` model, not a guard that forgives malformed input or hides a contract violation. The visible code returns variant-specific export fields and terminates unknown variants with `AuditIntegrityError`, so it neither coerces nor silently recovers. This is not a parameter-rooted Tier-3 boundary case requiring `@trust_boundary`.
+  judge_signature_version: 2
+  scope_fingerprint: cb3685e6d843ea664dadae04cdbd8149ee1294d3f4f5c422ca5589883b7a72ce
+  judge_transport: codex_cli
+  ast_path: 'body[14]/body[4]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:c4e27482df67f189d4fd601c7e04c83f0d77232311c813acd22f16e91abe9ec8'
+- key: core/landscape/export_mappers.py:R5:node_state_to_export_record:fp=0140935363ce7dae
+  owner: john
+  reason: |-
+    core/landscape/export_mappers.py:12 uses `if isinstance(state, NodeStateOpen):` inside `node_state_to_export_record` as variant dispatch over the reified node-state lifecycle object, not as defensive validation of raw audit data. The enclosing mapper receives a typed `state` and immediately serializes the open-state variant differently from terminal variants; future drift that changes this from `NodeStateOpen` variant dispatch into a catch-and-continue guard over malformed Tier-1 data would invalidate this suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:17:08.796340+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — this `isinstance` is exhaustive variant dispatch, not a defensive guard that masks malformed Tier-1 data. The mapper selects distinct serialization shapes for `NodeStateOpen`, `NodeStatePending`, `NodeStateCompleted`, and `NodeStateFailed`, then raises `AuditIntegrityError` for every unknown variant (core/landscape/export_mappers.py:178-261), so contract drift crashes informatively rather than being suppressed or coerced. The `state` parameter is first-party lifecycle state rather than external data, so the Tier-3 decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: cb3685e6d843ea664dadae04cdbd8149ee1294d3f4f5c422ca5589883b7a72ce
+  judge_transport: codex_cli
+  ast_path: 'body[14]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:22a40e25ee3c4caf4eadb1ec824c120355bd9e9841a00e4ff1b79a380905daa0'
+- key: core/landscape/export_mappers.py:R5:node_state_to_export_record:fp=00c9457795efd3e9
+  owner: john
+  reason: |-
+    `src/elspeth/core/landscape/export_mappers.py:52` is the export mapper's closed-variant reification point, not a defensive probe over corrupt audit data: `if isinstance(state, NodeStateCompleted):`. The enclosing function is typed as `node_state_to_export_record(run_id: str, state: object) -> NodeStateExportRecord`, so this `isinstance()` is the prescribed dispatch boundary that turns a deliberately erased variant object into the corresponding export record. The site is drift-sensitive: if this branch stops being the first closed-union arm for `NodeStateCompleted`, or if unknown variants are tolerated instead of rejected, this suppression no longer applies.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:17:31.547174+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    RULE MISFIRES — the visible code uses `isinstance(state, NodeStateCompleted)` as one arm of explicit closed-variant dispatch that selects the variant-specific export-record mapping; it is not a defensive shape probe, coercion, default, or suppression of an audit-data contract violation. The `state: object` signature described in the rationale makes runtime reification necessary at this point, and the adjacent `NodeStatePending` and `NodeStateFailed` arms corroborate that purpose. This is not a function-scoped Tier-3 parameter boundary, so the `@trust_boundary` decorator is inapplicable.
+  judge_signature_version: 2
+  scope_fingerprint: cb3685e6d843ea664dadae04cdbd8149ee1294d3f4f5c422ca5589883b7a72ce
+  judge_transport: codex_cli
+  ast_path: 'body[14]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:3c5a32423a58b21e63abd6510ad0a5c05f2eed0efd548226cf8f9c003c904368'
+- key: core/landscape/journal.py:R1:LandscapeJournal:_enrich_with_payloads:fp=b3f3659423e01f90
+  owner: john
+  reason: |-
+    This is a legitimate optional internal-enrichment sentinel, not a Tier-1 audit-data shape violation. `JournalRecord` declares `_payload_ref_columns` as optional scratch metadata at `src/elspeth/core/landscape/journal.py:104`: `_payload_ref_columns: NotRequired[list[str]]`. The key is only attached when payload enrichment is enabled and SQLAlchemy can identify payload-reference columns: `src/elspeth/core/landscape/journal.py:188-191` says `if self._include_payloads:` then `payload_ref_columns = self._payload_ref_columns_from_context(context, parameters)` and only `if payload_ref_columns is not None:` does it write `record["_payload_ref_columns"] = payload_ref_columns`. The caller intentionally enriches every committed write record when payload inclusion is enabled (`src/elspeth/core/landscape/journal.py:227-229`), including non-`calls` writes for which `_payload_ref_columns_from_context` legitimately returns `None` at `src/elspeth/core/landscape/journal.py:406-407`. In that exact flow, `src/elspeth/core/landscape/journal.py:416-418` uses `columns = record.get("_payload_ref_columns")` followed by `if columns is None or self._payload_store is None: return` to distinguish "this committed write has no payload columns to enrich" from records that do. Drift that made `_payload_ref_columns` required, public, or sourced from persisted audit data would invalidate this suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:18:07.109464+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — R1 assumes a missing key indicates a schema bug, but `JournalRecord` explicitly declares `_payload_ref_columns` as `NotRequired[list[str]]` at core/landscape/journal.py:98-114. The write path conditionally adds the scratch key only when payload-column metadata exists at core/landscape/journal.py:229-238, while every committed record is passed through enrichment and the scratch key is removed before serialization at core/landscape/journal.py:273-307; therefore `.get()` represents contractually expected absence rather than silently masking malformed Tier-1 audit data. The decorator is inapplicable because `record` is first-party internal metadata, not an external-data parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 77a513cef0520c9110fcb899ce691a5152baa51f33b55ab57bbe7b56ae662ead
+  judge_transport: codex_cli
+  ast_path: 'body[34]/body[31]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:7bff75a85c41f2701f96a34a371fb92bd833fbc9cccd4eb3e313af39f665c467'
+- key: core/landscape/journal.py:R6:LandscapeJournal:_ensure_owner_only_parent:fp=0b98b5b09f47f79d
+  owner: john
+  reason: |-
+    This is a site-specific, explicitly documented race-boundary suppression, not a swallowed Tier-1 audit-data failure. In `core/landscape/journal.py:313-324`, `_ensure_owner_only_parent` attempts `directory.mkdir(mode=_JOURNAL_DIRECTORY_MODE)` and catches only `FileExistsError` with the local explanation: `# Created concurrently between the exists() probe and mkdir.` The handler does not accept the raced directory as trusted; it immediately falls through to `LandscapeJournal._verify_owner_only_dir(directory)` on line 324. That verifier uses `os.lstat(directory)` and crashes if the raced path is not a directory, is not owned by the current user, or has non-owner permission bits (`raise OSError(...)` / `raise PermissionError(...)` at lines 359-364). The allowlist remains valid only while this `FileExistsError` handler is followed by the same owner-only verification on both create and race paths.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:18:37.827430+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the caught FileExistsError represents the documented mkdir race, not a swallowed Tier-1 integrity failure. After both creation paths, core/landscape/journal.py:631 invokes the same verifier; core/landscape/journal.py:682-694 uses lstat and raises if the raced path is not a directory, has the wrong owner, or permits non-owner access. The handler therefore converges on fail-closed invariant verification without silently accepting malformed state.
+  judge_signature_version: 2
+  scope_fingerprint: c3d415b28c9bcdeec9e9dc74b3ce62a93ed10d75ee321822508e69e56ab74e7d
+  judge_transport: codex_cli
+  ast_path: 'body[34]/body[21]/body[4]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:972b6b248cce631bb40dc15027fbd17ffa275698c9a6f5741eacf17be5476dcf'
+- key: core/landscape/journal.py:R6:LandscapeJournal:_payload_ref_columns_from_context:fp=56960750ec96887e
+  owner: john
+  reason: |-
+    core/landscape/journal.py:404 `except AttributeError: return None` classifies the compiled SQLAlchemy statement flowing through the journal's execution-event hook. The journal observes EVERY statement on the landscape connection; only INSERTs into the payload-backed 'calls' table carry payload-ref columns, and statement objects are third-party SQLAlchemy Core constructs whose `.table` attribute exists only on table-bearing statement classes — the `_TableBearingStatement` Protocol (core/landscape/journal.py:64-66) records exactly this structural, not asserted, typing. An AttributeError from `cast('_TableBearingStatement', statement).table` (journal.py:402-405) therefore means 'not a table-bearing statement' — the same designed not-applicable outcome as the explicit `if table.name != 'calls': return None` on the following line (journal.py:406-407), recorded as None (no payload-ref columns), never a fabricated value. The tier split within this same function is deliberate and proves the contrast: the preceding probe of `context.compiled` — our own first-party execution-context contract — RAISES AuditIntegrityError on absence (journal.py:395-398) instead of degrading. The None consumer is the payload-capture branch at journal.py:189-191, which simply records no _payload_ref_columns for non-'calls' statements, the designed majority case. INVALIDATED IF: the except at journal.py:404 is widened beyond AttributeError, the `context.compiled` probe stops raising AuditIntegrityError, or payload-ref derivation stops being scoped to the 'calls' table.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:19:07.814996+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    RULE MISFIRES — the narrowly scoped AttributeError is used to classify a third-party SQLAlchemy statement that does not satisfy the structural `_TableBearingStatement` Protocol, rather than to suppress a failure in first-party guaranteed data. The visible code consistently treats non-table-bearing statements and statements for tables other than `calls` as the legitimate not-applicable result `None`, while a missing first-party `context.compiled` attribute raises `AuditIntegrityError`. This is site-specific, non-duplicated justification for an optional structural capability check, not silent recovery, coercion, or fabrication.
+  judge_signature_version: 2
+  scope_fingerprint: fda6e8405cbba0c393fc42eb3e24e4ab8c0df4d9846f262974679520659e8acc
+  judge_transport: codex_cli
+  ast_path: 'body[34]/body[30]/body[3]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:dbf193a0066c051ec859279e5a44d051a41e47211b186a1a913e5e7e9d655cec'
+- key: core/landscape/journal.py:R9:LandscapeJournal:_enrich_committed_records:fp=15cd55316234c68d
+  owner: john
+  reason: |-
+    This is a prescribed optional internal-scratch-field cleanup, not a Tier-1 audit-data invariant being hidden. `JournalRecord` declares `_payload_ref_columns` as optional scratch metadata at `src/elspeth/core/landscape/journal.py:104` (`"_payload_ref_columns: NotRequired[list[str]]"`), and the write hook only adds it when payload enrichment is enabled and `_payload_ref_columns_from_context(...)` returns a non-`None` column list: `src/elspeth/core/landscape/journal.py:188-191` (`"if self._include_payloads:" ... `"if payload_ref_columns is not None:"` ... `"record[\"_payload_ref_columns\"] = payload_ref_columns"`). That helper intentionally returns `None` for non-payload/non-`calls` statements at `src/elspeth/core/landscape/journal.py:377-385`, so absence is a valid, expected state for committed journal records. In the cited site, `_enrich_committed_records` first calls `self._enrich_with_payloads(record)` and then strips only this private transient key with `record.pop("_payload_ref_columns", None)` at `src/elspeth/core/landscape/journal.py:232-235`; using a default there preserves the documented optionality and prevents leaking internal scratch metadata into the serialized journal. A future drift that made `_payload_ref_columns` required for every enriched record would invalidate this rationale because lines 188-191/377-385 would no longer define absence as an expected state.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:19:48.245832+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the missing-key premise is false because `JournalRecord` explicitly declares `_payload_ref_columns` as `NotRequired` at core/landscape/journal.py:113. The producer conditionally adds the scratch field only when payload enrichment is enabled and column discovery succeeds (core/landscape/journal.py:235-238), while the helper legitimately returns `None` for uncompiled or non-`calls` statements (core/landscape/journal.py:724-737). Therefore the defaulted `pop` at core/landscape/journal.py:307 removes optional transient metadata without concealing a Tier-1 invariant violation.
+  judge_signature_version: 2
+  scope_fingerprint: b1918bbc4c8e8e58d242fbc276876ea6599831107745d4e54d3298773fc514b5
+  judge_transport: codex_cli
+  ast_path: 'body[34]/body[10]/body[0]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:6bb7123b54de0c1ee45595b57a4f9d59e5b91d3a6ca6bcfd9cb2e9c15b69f16d'
+- key: core/landscape/run_coordination_repository.py:R6:RunCoordinationRepository:_read_registered_workers:fp=fd1ff8456b1f9107
+  owner: john
+  reason: |-
+    This is a prescribed diagnostic best-effort suppression, not a normal Tier-1 read path. The enclosing caller is already converting a locked database write failure into `WriteLockHeldError`: `raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc` at src/elspeth/core/landscape/run_coordination_repository.py:464. The flagged helper is only enriching that error with a forensic worker roster; its docstring explicitly binds the behavior to the BUSY-takeover diagnostic and says the fallback must not hide the primary failure: "Best effort — an unreadable registry yields an empty roster, never masks the WriteLockHeldError." at src/elspeth/core/landscape/run_coordination_repository.py:1005-1006. The catch is also narrowed to DB-layer failures while non-DB programmer errors still surface, as stated in the local comment: "A non-DB (programmer) error is not an expected outcome here and is allowed to surface." at src/elspeth/core/landscape/run_coordination_repository.py:1025-1026. Future drift would invalidate this suppression if `_read_registered_workers` becomes a primary audit read, is called outside the `WriteLockHeldError` construction path, or broadens the catch beyond SQLAlchemy DB failures.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-06'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-08T12:08:23.077798+00:00'
+  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.85
+  judge_rationale: |-
+    RULE MISFIRES / PRESCRIBED FORM: R6 flags a silent-except, but this is a narrowly-scoped forensic diagnostic helper whose sole purpose is to enrich an already-raised WriteLockHeldError with a best-effort worker roster. The except is narrowed to SQLAlchemyError (DB-layer failures — expected because the writer we are diagnosing holds the lock), non-DB programmer errors still surface, and the failure is logged with exc_info. Crucially, the primary error (WriteLockHeldError) is NOT swallowed — it is raised by the caller regardless; this helper merely returns () so the diagnostic enrichment never masks the real failure. The docstring, narrowed catch, and audit-log record together satisfy the auditability standard for a best-effort diagnostic path.
+  judge_signature_version: 2
+  scope_fingerprint: d796edbbdd299bcf789299f1bffbd9c05fc7ef0036f679efe353e1c72825f039
+  judge_transport: openrouter
+  ast_path: 'body[29]/body[16]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:4fa5ee6c8e2731d99747e0951579aadabcff32f5a424599707aec23883700c87'
+- key: core/landscape/run_coordination_repository.py:R6:_record_best_effort_event:fp=9a4208c0d0f37f5f
+  owner: john
+  reason: |-
+    Prescribed best-effort suppression, not a normal Tier-1 write path. _record_best_effort_event records a fence_refusal / heartbeat_degraded attribution row on a FRESH connection AFTER the triggering transaction rolled back; per ADR-030 section A.2 the row carries no durable state, so a lost event is benign. The catch MUST NOT raise: record_fence_refusal runs inside fenced_leader_transaction's `except RunLeadershipLostError: ... raise` unwind at src/elspeth/core/landscape/run_coordination_repository.py:276-288, so a raise here would replace the recoverable leadership-lost signal with a crash-class error, and on the record_heartbeat_degraded path it would crash the heartbeat thread before it latches coordination-lost. The catch is narrowed to SQLAlchemy DB-layer failures; non-DB programmer errors are not SQLAlchemyError and still surface. Transient write contention (database is locked) logs at WARNING; any other DB fault (FK miss on a vanished run, event_id dedup collision, real corruption) logs at ERROR so it stays visible and alarmable without crashing the leader. Same shape and discipline as the already-signed _read_registered_workers R6 waiver in this file. Future drift invalidates this suppression if the function becomes a primary audit write, is called outside a best-effort/unwind path, or broadens the catch beyond SQLAlchemy DB failures.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-06'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-08T12:08:30.526418+00:00'
+  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.86
+  judge_rationale: |-
+    PRESCRIBED FORM. R6 fires on the SQLAlchemyError swallow, but the docstring and rationale together establish this is the policy-prescribed best-effort attribution writer: the function runs inside the RunLeadershipLostError unwind and the heartbeat-degraded path, where raising would replace a recoverable typed signal with a crash-class error or kill the heartbeat thread — a routing/type mismatch the policy explicitly warns against. The catch is narrowed to SQLAlchemyError (non-DB programmer errors still surface), transient contention is logged WARNING and other DB faults ERROR so the event remains alarmable, and ADR-030 §A.2 makes losing the row benign because the triggering transaction left no durable state. This is the recoverable-typed peel-off structure the policy prescribes, not a silent swallow of an audit-integrity failure.
+  judge_signature_version: 2
+  scope_fingerprint: 9628d33168fb574346e0dc8be9b27d1a2857b72c93ba18f5f8b02b80f183d728
+  judge_transport: openrouter
+  ast_path: 'body[26]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:2ccc7cb99f2ef343ec4761439612643ef0b1ac481aca2d4d83654831251955e1'
+- key: core/landscape/scheduler/barrier.py:R1:BarrierJournalRepository:_transition_passthrough_pending_sink:fp=81974065e0617e96
+  owner: john
+  reason: |-
+    core/landscape/scheduler/barrier.py:536 is a sparse internal join, not defensive access to a required audit field: `emission = emission_by_token.get(row["token_id"])`. The required Tier-1 row field is still read offensively via `row["token_id"]`, so a malformed `blocked_rows` row would crash. The `.get()` is only checking whether this BLOCKED row is one of the sink-bound passthrough emissions built at core/landscape/scheduler/barrier.py:531 (`emission_by_token = {emission.token_id: emission for emission in passthrough_emissions}`); rows with no matching emission are intentionally skipped at core/landscape/scheduler/barrier.py:537-538. This is bounded by the later invariant at core/landscape/scheduler/barrier.py:584-588: if every requested emission was not transitioned, the function raises `AuditIntegrityError`. Drift would invalidate this suppression if `row["token_id"]` became a `.get()`, if unmatched rows were no longer an intentional non-transition case, or if the final `transitioned != len(emission_by_token)` crash guard were removed.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-10-24'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-07-26T22:20:53.325978+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — `emission_by_token.get(row["token_id"])` implements an intentional sparse join between blocked rows and the subset of passthrough emissions, rather than masking a missing required field. The Tier-1 row schema is still enforced offensively by `row["token_id"]`, while an absent mapping entry deliberately means that the blocked row is not selected for transition; the stated final `transitioned != len(emission_by_token)` guard separately crashes if any requested emission was not transitioned. The lookup is therefore not silent recovery from malformed trusted data, and its subject is a locally constructed mapping rather than Tier-3 data rooted at a function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: aa1407058f828241e708003e279899afad54e2012432ce5d593ae442be2c1b76
+  judge_transport: codex_cli
+  ast_path: 'body[22]/body[4]/body[4]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:a0e014d687ac259140b2d7d3e1778705be902bebab5417e4b4bcd9ba176dc3d9'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 27
+      redacted_hash: 49d4003f5d87a821

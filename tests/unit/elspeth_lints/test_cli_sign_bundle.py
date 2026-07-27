@@ -198,6 +198,7 @@ def _stale_rotation_key(finding: Any, *, fp: str = "deadbeefdeadbeef") -> str:
 # (a bare ``allow_hits:`` with no items is rejected by the loader). It is never a
 # bundle action key, so verify ignores it.
 _SPARE_PRE_JUDGE_KEY = "plugins/spare.py:R1:Widget:lookup:fp=feedface00000000"
+_TRAILING_SPARE_PRE_JUDGE_KEY = "plugins/trailing.py:R1:Widget:lookup:fp=feedface11111111"
 
 
 def _write_signed_entry_with_spare(
@@ -207,10 +208,10 @@ def _write_signed_entry_with_spare(
     finding: Any,
     scope_fingerprint: str | None = None,
 ) -> str:
-    """Write a YAML with a leading spare pre-judge entry then the (drifted) signed entry.
+    """Write a YAML with the (drifted) signed entry between two spare entries.
 
-    The signed entry is LAST, so a pop->restore round-trip re-appends it to the
-    same position and the file stays byte-identical (the block_not_laundered pin).
+    Keeping the signed entry in the middle makes sequence position observable:
+    drift repair must replace or restore it in place rather than appending it.
     """
     key = _canonical_key(finding)
     stored_scope = finding.scope_fingerprint if scope_fingerprint is None else scope_fingerprint
@@ -218,6 +219,7 @@ def _write_signed_entry_with_spare(
         "allow_hits:",
         *_pre_judge_entry_lines(_SPARE_PRE_JUDGE_KEY),
         *_signed_entry_lines(key, ast_path=finding.ast_path, scope_fingerprint=stored_scope),
+        *_pre_judge_entry_lines(_TRAILING_SPARE_PRE_JUDGE_KEY),
     ]
     (allowlist_dir / yaml_name).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return key
@@ -458,6 +460,15 @@ def test_sign_bundle_drift_repair_rejudges(tmp_path: Path) -> None:
     post = _diagnose(root, allowlist_dir)
     assert not any(i.status == "AST_PATH_BINDING_DRIFT" for i in post.items)
     assert any(i.status == "OK_AUTHORITATIVE" for i in post.items)
+    repaired_key = next(i.key for i in post.items if i.status == "OK_AUTHORITATIVE")
+    import yaml
+
+    written = yaml.safe_load((allowlist_dir / "plugins.yaml").read_text(encoding="utf-8"))
+    assert [entry["key"] for entry in written["allow_hits"]] == [
+        _SPARE_PRE_JUDGE_KEY,
+        repaired_key,
+        _TRAILING_SPARE_PRE_JUDGE_KEY,
+    ]
 
 
 def test_sign_bundle_drift_repair_block_not_laundered(tmp_path: Path) -> None:

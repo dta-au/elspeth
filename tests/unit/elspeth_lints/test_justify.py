@@ -3178,6 +3178,33 @@ def test_pop_then_restore_round_trip_on_single_entry_file(tmp_path: Path) -> Non
     assert data["allow_hits"][0]["reason"] == "only entry"
 
 
+def test_pop_then_restore_round_trip_preserves_middle_entry_position(tmp_path: Path) -> None:
+    """Drift repair must not turn a middle-row replacement into YAML reorder churn."""
+    from elspeth_lints.core.cli import _append_entry_to_yaml, _pop_allow_hits_entry_with_position
+
+    target_yaml = tmp_path / "plugins.yaml"
+    middle_key = "plugins/middle.py:R1:Widget:lookup:fp=bbb"
+    original = """\
+allow_hits:
+- key: plugins/first.py:R1:Widget:lookup:fp=aaa
+  owner: john
+  reason: first entry
+- key: plugins/middle.py:R1:Widget:lookup:fp=bbb
+  owner: john
+  reason: middle entry
+- key: plugins/last.py:R1:Widget:lookup:fp=ccc
+  owner: john
+  reason: last entry
+"""
+    target_yaml.write_text(original, encoding="utf-8")
+
+    removed = _pop_allow_hits_entry_with_position(target_yaml, middle_key)
+    _append_entry_to_yaml(target_yaml, removed.text, entry_index=removed.index)
+
+    assert removed.index == 1
+    assert target_yaml.read_text(encoding="utf-8") == original
+
+
 def test_justify_readonly_tools_scrubs_judge_rationale_before_persist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

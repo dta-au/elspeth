@@ -84,6 +84,14 @@ class _JudgeSignatureSigningFailure:
     exit_code: int
 
 
+@dataclass(frozen=True, slots=True)
+class _RemovedAllowHitsEntry:
+    """Exact YAML entry text plus its sequence position before removal."""
+
+    text: str
+    index: int
+
+
 # CLI spelling -> stored transport identity.  Keep ``agent`` as the legacy
 # Claude Agent SDK spelling and expose Codex explicitly rather than silently
 # rebinding old signed metadata to a different transport.
@@ -1981,7 +1989,11 @@ def _run_justify(args: argparse.Namespace) -> int:
         return 0
 
     yaml_entry = build_signed_yaml_entry()
-    _append_entry_to_yaml(target_yaml, yaml_entry)
+    _append_entry_to_yaml(
+        target_yaml,
+        yaml_entry,
+        entry_index=getattr(args, "_allow_hits_entry_index", None),
+    )
     _append_judge_decision_event_after_judge(
         allowlist_dir=allowlist_dir,
         finding=finding,
@@ -2825,24 +2837,27 @@ def _upsert_audit_review_in_yaml(target_yaml: Path, *, entry_key: str, review_te
     atomic_update_text(target_yaml, upsert_in, encoding="utf-8", create_parent=False)
 
 
-def _append_entry_to_yaml(target_yaml: Path, entry_text: str) -> None:
+def _append_entry_to_yaml(target_yaml: Path, entry_text: str, *, entry_index: int | None = None) -> None:
     """Insert one ``allow_hits`` entry into the per-module YAML file.
 
-    Append-only at the END of the existing ``allow_hits:`` block. If
-    the file does not exist, create it with an ``allow_hits:`` header.
-    If the file exists but has no ``allow_hits:`` block, append one at
-    the bottom. The full read → locate block → insert → write sequence
-    runs under ``atomic_update_text`` so concurrent justify invocations
-    cannot compute updates from the same old YAML. We deliberately do
-    NOT round-trip through PyYAML — the per-module YAMLs carry
-    multi-paragraph comments that ``yaml.dump`` would erase, and the
-    rotate command's surgical text-edit approach is the established
-    pattern in this codebase.
+    New entries append at the END of the existing ``allow_hits:`` block.
+    ``entry_index`` is reserved for drift repair: it inserts a replacement at
+    the stale row's original sequence position so re-signing does not create
+    reorder-only diffs. If the file does not exist, create it with an
+    ``allow_hits:`` header. If the file exists but has no ``allow_hits:`` block,
+    append one at the bottom. The full read → locate block → insert → write
+    sequence runs under ``atomic_update_text`` so concurrent justify
+    invocations cannot compute updates from the same old YAML. We deliberately
+    do NOT round-trip through PyYAML — the per-module YAMLs carry multi-paragraph
+    comments that ``yaml.dump`` would erase, and the rotate command's surgical
+    text-edit approach is the established pattern in this codebase.
     """
     entry_key = _entry_key_from_yaml_entry(entry_text)
 
     def append_to(current: str | None) -> str:
         if current is None:
+            if entry_index is not None:
+                raise ValueError(f"{target_yaml}: cannot restore allow_hits entry position into a missing file")
             return f"allow_hits:\n{entry_text}"
 
         lines = current.splitlines(keepends=True)
@@ -2866,6 +2881,8 @@ def _append_entry_to_yaml(target_yaml: Path, entry_text: str) -> None:
                 break
 
         if header_index is None:
+            if entry_index is not None:
+                raise ValueError(f"{target_yaml}: cannot restore allow_hits entry position without an allow_hits block")
             prefix = "" if not current or current.endswith("\n") else "\n"
             return current + f"{prefix}\nallow_hits:\n{entry_text}"
 
@@ -2908,7 +2925,17 @@ def _append_entry_to_yaml(target_yaml: Path, entry_text: str) -> None:
             replaced.extend(lines[cursor:])
             return "".join(replaced)
 
-        new_lines = [*lines[:block_end], entry_text, *lines[block_end:]]
+        insertion_point = block_end
+        if entry_index is not None:
+            entry_ranges = _allow_hit_entry_ranges(lines, start=header_index + 1, end=block_end)
+            if entry_index < 0 or entry_index > len(entry_ranges):
+                raise ValueError(
+                    f"{target_yaml}: allow_hits entry index {entry_index} is outside the current block with {len(entry_ranges)} entries"
+                )
+            if entry_index < len(entry_ranges):
+                insertion_point = entry_ranges[entry_index][0]
+
+        new_lines = [*lines[:insertion_point], entry_text, *lines[insertion_point:]]
         return "".join(new_lines)
 
     atomic_update_text(target_yaml, append_to, encoding="utf-8", create_parent=True)
@@ -3411,17 +3438,23 @@ def _run_sign_judge_signatures(args: argparse.Namespace) -> int:
         sys.stdout.write(
             f"sign-judge-signatures: [{index}/{len(specs)}] {spec.source}: {spec.file_path}:{spec.rule}:{spec.symbol}:fp={spec.fingerprint}\n"
         )
-        removed_stale_entry: str | None = None
+        removed_stale_entry: _RemovedAllowHitsEntry | None = None
         stale_yaml: Path | None = None
         try:
             if spec.stale_source_file is not None and spec.stale_key is not None:
                 stale_yaml = args.allowlist_dir / spec.stale_source_file
-                removed_stale_entry = _pop_allow_hits_entry(stale_yaml, spec.stale_key)
+                removed_stale_entry = _pop_allow_hits_entry_with_position(stale_yaml, spec.stale_key)
         except ValueError as exc:
             sys.stderr.write(f"sign-judge-signatures error: {exc}\n")
             return 2
 
-        exit_code = _run_justify(_namespace_for_signing_spec(spec, args))
+        exit_code = _run_justify(
+            _namespace_for_signing_spec(
+                spec,
+                args,
+                allow_hits_entry_index=removed_stale_entry.index if removed_stale_entry is not None else None,
+            )
+        )
         if exit_code != 0:
             failures.append(
                 _JudgeSignatureSigningFailure(
@@ -3432,7 +3465,11 @@ def _run_sign_judge_signatures(args: argparse.Namespace) -> int:
                 )
             )
             if stale_yaml is not None and removed_stale_entry is not None:
-                _append_entry_to_yaml(stale_yaml, removed_stale_entry)
+                _append_entry_to_yaml(
+                    stale_yaml,
+                    removed_stale_entry.text,
+                    entry_index=removed_stale_entry.index,
+                )
                 sys.stderr.write(
                     "sign-judge-signatures: justify failed; restored the stale row for the blocked entry. "
                     "continuing with remaining entries.\n"
@@ -3635,7 +3672,12 @@ def _remove_diagnosed_stale_entries(allowlist_dir: Path, stale_keys: Sequence[tu
 
 def _pop_allow_hits_entry(target_yaml: Path, entry_key: str) -> str:
     """Remove and return one exact allow_hits entry from ``target_yaml``."""
-    removed_entry: str | None = None
+    return _pop_allow_hits_entry_with_position(target_yaml, entry_key).text
+
+
+def _pop_allow_hits_entry_with_position(target_yaml: Path, entry_key: str) -> _RemovedAllowHitsEntry:
+    """Remove one exact entry and retain its original sequence position."""
+    removed_entry: _RemovedAllowHitsEntry | None = None
 
     def remove_from(current: str | None) -> str:
         nonlocal removed_entry
@@ -3662,9 +3704,10 @@ def _pop_allow_hits_entry(target_yaml: Path, entry_key: str) -> str:
             block_end = idx
             break
 
+        entry_ranges = _allow_hit_entry_ranges(lines, start=header_index + 1, end=block_end)
         matching_ranges = [
             (entry_start, entry_end)
-            for entry_start, entry_end in _allow_hit_entry_ranges(lines, start=header_index + 1, end=block_end)
+            for entry_start, entry_end in entry_ranges
             if lines[entry_start].rstrip("\r\n") == f"- key: {entry_key}"
         ]
         if not matching_ranges:
@@ -3673,7 +3716,10 @@ def _pop_allow_hits_entry(target_yaml: Path, entry_key: str) -> str:
             raise ValueError(f"{target_yaml}: duplicate allow_hits entries found for key {entry_key!r}")
 
         entry_start, entry_end = matching_ranges[0]
-        removed_entry = "".join(lines[entry_start:entry_end])
+        removed_entry = _RemovedAllowHitsEntry(
+            text="".join(lines[entry_start:entry_end]),
+            index=entry_ranges.index((entry_start, entry_end)),
+        )
         new_lines = [*lines[:entry_start], *lines[entry_end:]]
         return _normalize_empty_allow_hits("".join(new_lines))
 
@@ -3736,7 +3782,12 @@ def _remove_allow_hits_entries(target_yaml: Path, entry_keys: set[str]) -> None:
     atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
 
 
-def _namespace_for_signing_spec(spec: _JudgeSignatureSigningSpec, args: argparse.Namespace) -> argparse.Namespace:
+def _namespace_for_signing_spec(
+    spec: _JudgeSignatureSigningSpec,
+    args: argparse.Namespace,
+    *,
+    allow_hits_entry_index: int | None = None,
+) -> argparse.Namespace:
     return argparse.Namespace(
         root=args.root,
         repo_root=args.repo_root,
@@ -3753,6 +3804,7 @@ def _namespace_for_signing_spec(spec: _JudgeSignatureSigningSpec, args: argparse
         justify_format=args.justify_format,
         judge_transport=args.judge_transport,
         judge_tools=args.judge_tools,
+        _allow_hits_entry_index=allow_hits_entry_index,
     )
 
 
@@ -3988,19 +4040,29 @@ def _execute_drift_repair_action(action: Any, *, specs_by_stale_key: dict[str, A
         )
         return 2
 
-    removed_stale_entry: str | None = None
+    removed_stale_entry: _RemovedAllowHitsEntry | None = None
     stale_yaml: Path | None = None
     try:
         if spec.stale_source_file is not None and spec.stale_key is not None:
             stale_yaml = args.allowlist_dir / spec.stale_source_file
-            removed_stale_entry = _pop_allow_hits_entry(stale_yaml, spec.stale_key)
+            removed_stale_entry = _pop_allow_hits_entry_with_position(stale_yaml, spec.stale_key)
     except ValueError as exc:
         sys.stderr.write(f"sign-bundle: drift_repair error: {exc}\n")
         return 2
 
-    exit_code = _run_justify(_namespace_for_signing_spec(spec, args))
+    exit_code = _run_justify(
+        _namespace_for_signing_spec(
+            spec,
+            args,
+            allow_hits_entry_index=removed_stale_entry.index if removed_stale_entry is not None else None,
+        )
+    )
     if exit_code != 0 and stale_yaml is not None and removed_stale_entry is not None:
-        _append_entry_to_yaml(stale_yaml, removed_stale_entry)
+        _append_entry_to_yaml(
+            stale_yaml,
+            removed_stale_entry.text,
+            entry_index=removed_stale_entry.index,
+        )
         sys.stderr.write(
             f"sign-bundle: judge did not re-sign {action.key!r}; restored the original signed entry intact. "
             "No stale verdict was laundered onto the changed scope.\n"
