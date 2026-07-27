@@ -19,6 +19,7 @@ from elspeth.web.execution.schemas import ValidationResult
 class RuntimePreflightKey:
     session_scope: str
     state_version: int
+    state_content_hash: str
     settings_hash: str
 
 

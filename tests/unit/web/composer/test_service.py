@@ -5215,6 +5215,91 @@ class TestComposerRuntimePreflightCacheAndTimeout:
         mock_preflight.assert_called_once_with(state, "user-1", None)
 
     @pytest.mark.asyncio
+    async def test_unsaved_preflight_does_not_share_distinct_state_content_at_same_version(self) -> None:
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        first_state = _empty_state()
+        second_state = replace(
+            first_state,
+            metadata=PipelineMetadata(name="Distinct unsaved pipeline"),
+        )
+        assert first_state.version == second_state.version
+        first_result = ValidationResult(is_valid=True, checks=[], errors=[])
+        second_result = ValidationResult(
+            is_valid=False,
+            checks=[],
+            errors=[
+                ValidationError(
+                    component_id="distinct",
+                    component_type="pipeline",
+                    message="Distinct state is invalid.",
+                    suggestion="Use the matching preflight result.",
+                    error_code="distinct_state",
+                )
+            ],
+        )
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_joined_coordinator = asyncio.Event()
+        coordinator_calls = 0
+        coordinator = service._runtime_preflight_coordinator
+        original_run = coordinator.run
+
+        def preflight(
+            candidate: CompositionState,
+            user_id: str | None,
+            session_id: str | None,
+        ) -> ValidationResultModel:
+            assert user_id == "user-1"
+            assert session_id is None
+            if candidate is first_state:
+                first_started.set()
+                assert release_first.wait(timeout=5)
+                return first_result
+            assert candidate is second_state
+            return second_result
+
+        async def observed_run(*args: Any, **kwargs: Any) -> Any:
+            nonlocal coordinator_calls
+            coordinator_calls += 1
+            if coordinator_calls == 2:
+                second_joined_coordinator.set()
+            return await original_run(*args, **kwargs)
+
+        with (
+            patch.object(service, "_runtime_preflight", side_effect=preflight) as mock_preflight,
+            patch.object(coordinator, "run", side_effect=observed_run),
+        ):
+            first_task = asyncio.create_task(
+                service._cached_runtime_preflight(
+                    first_state,
+                    session_id=None,
+                    user_id="user-1",
+                    cache=service._new_runtime_preflight_cache(),
+                    initial_version=first_state.version,
+                    session_scope="session:unsaved",
+                )
+            )
+            assert await asyncio.to_thread(first_started.wait, 5)
+            second_task = asyncio.create_task(
+                service._cached_runtime_preflight(
+                    second_state,
+                    session_id=None,
+                    user_id="user-1",
+                    cache=service._new_runtime_preflight_cache(),
+                    initial_version=second_state.version,
+                    session_scope="session:unsaved",
+                )
+            )
+            await asyncio.wait_for(second_joined_coordinator.wait(), timeout=5)
+            await asyncio.sleep(0)
+            release_first.set()
+            first, second = await asyncio.gather(first_task, second_task)
+
+        assert first is first_result
+        assert second is second_result
+        assert mock_preflight.call_count == 2
+
+    @pytest.mark.asyncio
     async def test_runtime_preflight_timeout_is_cached_for_compose_call(self) -> None:
         settings = _make_settings(composer_runtime_preflight_timeout_seconds=0.01)
         service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)

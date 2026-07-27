@@ -1810,6 +1810,7 @@ class ComposerServiceImpl:
         key = RuntimePreflightKey(
             session_scope=session_scope,
             state_version=state.version,
+            state_content_hash=composition_content_hash(state),
             settings_hash=settings_hash,
         )
         # A cache miss is the normal, expected state on the first preflight for
@@ -4078,9 +4079,11 @@ class ComposerServiceImpl:
         last_validation: ValidationSummary | None = None
 
         # Runtime preflight cache: scoped to this compose() call. Keyed by
-        # (session_scope, state_version, settings_hash). A timeout or failure
-        # is cached for the lifetime of this compose call so subsequent
-        # preview_pipeline calls don't re-fire an already-failed worker.
+        # (session_scope, state_version, state_content_hash, settings_hash).
+        # A timeout or failure is cached for the lifetime of this compose call
+        # so subsequent preview_pipeline calls don't re-fire an already-failed
+        # worker. Content identity prevents concurrent unsaved requests from
+        # sharing a result solely because they both start at version zero.
         runtime_preflight_cache = self._new_runtime_preflight_cache()
         last_runtime_preflight: ValidationResult | None = None
         session_scope = f"session:{session_id}" if session_id is not None else "session:unsaved"

@@ -29,6 +29,7 @@ async def test_coordinator_deduplicates_concurrent_same_session_state_settings()
     key = RuntimePreflightKey(
         session_scope="session:abc123",
         state_version=7,
+        state_content_hash="state-hash",
         settings_hash="settings-hash",
     )
     calls = 0
@@ -62,6 +63,7 @@ async def test_coordinator_deduplicates_concurrent_failure_for_same_key() -> Non
     key = RuntimePreflightKey(
         session_scope="session:abc123",
         state_version=7,
+        state_content_hash="state-hash",
         settings_hash="settings-hash",
     )
     calls = 0
@@ -105,6 +107,7 @@ async def test_coordinator_evicts_inflight_entry_when_only_awaiter_is_cancelled(
     key = RuntimePreflightKey(
         session_scope="session:abc123",
         state_version=11,
+        state_content_hash="state-hash",
         settings_hash="settings-hash",
     )
     started = asyncio.Event()
@@ -145,8 +148,8 @@ async def test_coordinator_does_not_share_different_session_scopes() -> None:
         return _passing_preflight()
 
     await asyncio.gather(
-        coordinator.run(RuntimePreflightKey("session:http", 1, "settings"), worker),
-        coordinator.run(RuntimePreflightKey("session:mcp", 1, "settings"), worker),
+        coordinator.run(RuntimePreflightKey("session:http", 1, "state", "settings"), worker),
+        coordinator.run(RuntimePreflightKey("session:mcp", 1, "state", "settings"), worker),
     )
 
     assert calls == 2

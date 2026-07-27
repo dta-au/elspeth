@@ -45,6 +45,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.audit import build_canonicalization_sentinel
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -328,6 +329,7 @@ async def _mcp_preview_runtime_preflight(
     key = RuntimePreflightKey(
         session_scope=session_scope,
         state_version=state.version,
+        state_content_hash=composition_content_hash(state),
         settings_hash=settings_hash,
     )
 
