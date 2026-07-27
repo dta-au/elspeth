@@ -13,6 +13,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from elspeth.contracts import RunStatus
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.dag import GraphValidationError
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter
@@ -2226,6 +2227,26 @@ def test_linear_sink_boundary_recovery_reopens_and_resumes_without_reminting(
         return built
 
     monkeypatch.setattr(corpus_harness, "build_scenario", record_fresh_build)
+    observed_terminal_statuses: list[RunStatus] = []
+    assert_all_tokens_and_work_terminal = corpus_harness._assert_all_tokens_and_work_terminal
+
+    def assert_declared_terminal_status(
+        *args: Any,
+        expected_run_status: RunStatus,
+        **kwargs: Any,
+    ) -> None:
+        observed_terminal_statuses.append(expected_run_status)
+        assert_all_tokens_and_work_terminal(
+            *args,
+            expected_run_status=expected_run_status,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        corpus_harness,
+        "_assert_all_tokens_and_work_terminal",
+        assert_declared_terminal_status,
+    )
 
     interrupted_facts: list[dict[str, object]] = []
 
@@ -2334,6 +2355,7 @@ def test_linear_sink_boundary_recovery_reopens_and_resumes_without_reminting(
 
     _assert_declared_recovery_evidence(scenario, case, evidence)
     assert len(interrupted_facts) == 1
+    assert observed_terminal_statuses == [RunStatus.COMPLETED]
     assert interrupted_facts[0]["completed_node_state_count"] == 6
     assert len(built_identity_tuples) == 2
     assert len(set(built_identity_tuples)) == 2

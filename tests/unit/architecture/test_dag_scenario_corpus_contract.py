@@ -70,7 +70,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     Workflow,
 )
 
-from elspeth.contracts import Determinism, PipelineRow, PluginSchema
+from elspeth.contracts import Determinism, PipelineRow, PluginSchema, RunStatus
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
@@ -1289,6 +1289,72 @@ def test_response_lost_oracle_rejects_jointly_corrupted_semantic_witness() -> No
                 "status": "error",
             },
         )
+
+
+def test_generic_recovery_terminal_status_contract_accepts_completed_with_failures() -> None:
+    corpus_harness._assert_expected_terminal_run_status(
+        actual_status=RunStatus.COMPLETED_WITH_FAILURES,
+        expected_status=RunStatus.COMPLETED_WITH_FAILURES,
+    )
+
+    with pytest.raises(AssertionError) as exc_info:
+        corpus_harness._assert_expected_terminal_run_status(
+            actual_status=RunStatus.COMPLETED,
+            expected_status=RunStatus.COMPLETED_WITH_FAILURES,
+        )
+    assert str(exc_info.value) == (
+        "DAG recovery corpus expected terminal run status 'completed_with_failures', but persisted <RunStatus.COMPLETED: 'completed'>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "rejection_field"),
+    (
+        ("noncanonical-evidence", "response-lost semantic evidence"),
+        ("call-status", "response-lost call.status"),
+        ("response-hash", "response-lost call.response_hash"),
+        ("error-json", "response-lost call.error_json"),
+    ),
+)
+def test_response_lost_oracle_rejects_independent_material_drift(
+    mutation: str,
+    rejection_field: str,
+) -> None:
+    canonical_evidence = '{"classification":"response_lost"}'
+    request_hash = "1" * 64
+    attempt: dict[str, object] = {
+        "_evidence_json": canonical_evidence,
+        "evidence_hash": hashlib.sha256(canonical_evidence.encode()).hexdigest(),
+        "request_hash": request_hash,
+        "state": "response_lost",
+    }
+    call: dict[str, object] = {
+        "error_json": canonical_evidence,
+        "request_hash": request_hash,
+        "response_hash": None,
+        "status": "error",
+    }
+    if mutation == "noncanonical-evidence":
+        noncanonical_evidence = '{ "classification": "response_lost" }'
+        attempt["_evidence_json"] = noncanonical_evidence
+        attempt["evidence_hash"] = hashlib.sha256(noncanonical_evidence.encode()).hexdigest()
+        call["error_json"] = noncanonical_evidence
+    elif mutation == "call-status":
+        call["status"] = "success"
+    elif mutation == "response-hash":
+        call["response_hash"] = "3" * 64
+    else:
+        call["error_json"] = '{"classification":"different"}'
+
+    with pytest.raises(AssertionError) as exc_info:
+        corpus_harness._validate_durable_sink_effect_attempt_call_material(
+            effect_id="2" * 64,
+            attempt=attempt,
+            call=call,
+        )
+    assert str(exc_info.value) == (
+        f"DAG corpus durable sink_effect_attempt integrity: {rejection_field} differs from authoritative material"
+    )
 
 
 def _plural_binding_case_values() -> dict[str, object]:

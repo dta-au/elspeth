@@ -2920,16 +2920,32 @@ def _assert_terminal_recovery_state(
         raise AssertionError("DAG recovery corpus requires a completed resumed node-state attempt carrying the checkpoint marker")
 
 
+def _assert_expected_terminal_run_status(
+    *,
+    actual_status: RunStatus | None,
+    expected_status: RunStatus,
+) -> None:
+    """Require the exact terminal status declared by a generic recovery case."""
+
+    if expected_status not in {RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES, RunStatus.EMPTY}:
+        raise AssertionError(f"DAG recovery corpus expected a terminal run status, got {expected_status!r}")
+    if actual_status is not expected_status:
+        raise AssertionError(f"DAG recovery corpus expected terminal run status {expected_status.value!r}, but persisted {actual_status!r}")
+
+
 def _assert_all_tokens_and_work_terminal(
     db: LandscapeDB,
     *,
     run_id: str,
     payload_store: FilesystemPayloadStore,
+    expected_run_status: RunStatus = RunStatus.COMPLETED,
 ) -> None:
     repositories = RecorderFactory.read_only(db, payload_store=payload_store)
     run = repositories.run_lifecycle.get_run(run_id)
-    if run is None or run.status is not RunStatus.COMPLETED:
-        raise AssertionError(f"DAG recovery corpus did not persist a completed run: {run!r}")
+    _assert_expected_terminal_run_status(
+        actual_status=None if run is None else run.status,
+        expected_status=expected_run_status,
+    )
     source_records = repositories.run_lifecycle.get_run_source_lifecycle_records(run_id)
     if not source_records or any(record.lifecycle_state != "exhausted" for record in source_records.values()):
         raise AssertionError(f"DAG recovery corpus sources lost their exhausted state: {source_records!r}")
@@ -5021,6 +5037,7 @@ def run_sink_boundary_recovery_case(
             reopened_db,
             run_id=run_id,
             payload_store=reopened_store,
+            expected_run_status=RunStatus(case.expected.status),
         )
         final_repositories = RecorderFactory.read_only(reopened_db, payload_store=reopened_store)
         final_source_records = final_repositories.run_lifecycle.get_run_source_lifecycle_records(run_id)
