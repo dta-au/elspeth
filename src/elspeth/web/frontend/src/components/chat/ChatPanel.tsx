@@ -1851,6 +1851,14 @@ export function ChatPanel({
     const tutorialStepBuilt =
       tutorialPromptSentForStep &&
       (guidedNextTurn != null || hasPendingGuidedInterpretations);
+    // Before the locked tutorial prompt is sent, the initial single-select is
+    // a rival driver whose choices do not represent the scripted build. After
+    // Send, however, a single-select can be the server-authored continuation
+    // of a legal component-review Add action. Keep that recovery path live.
+    const suppressTutorialSingleSelect =
+      isTutorial === true &&
+      guidedNextTurn?.type === "single_select" &&
+      !tutorialPromptSentForStep;
     // "Describe what you want" composer, docked at the BOTTOM of the panel, full
     // width — the primary chat affordance, mirroring the freeform body's
     // ChatInput which docks below the message log. The tutorial uses the SAME
@@ -2009,7 +2017,7 @@ export function ChatPanel({
           >
             {/* Interpretation reviews moved above the intent box (approve-before-
                 advance); the turn widget remains here as the current decision. */}
-            {guidedNextTurn && (
+            {guidedNextTurn && !suppressTutorialSingleSelect && (
               <GuidedTurn
                 turn={guidedNextTurn}
                 onSubmit={(body) => void respondGuided(body)}

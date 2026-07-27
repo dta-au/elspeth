@@ -3441,6 +3441,51 @@ assistant_message_kind: "synthetic_failure",
     ).toBeNull();
   });
 
+  it("tutorial: exposes an Add-created source picker after the stage prompt was sent", async () => {
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_1_source",
+        chat_history: [
+          {
+            role: "user",
+            content: "create the source",
+            seq: 1,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+          },
+        ],
+      },
+      // A legal Add action from review_components creates a new pending source
+      // at plugin_selection, which the backend projects as this turn.
+      guidedNextTurn: singleSelectTurn("b".repeat(64)),
+      respondGuided: respondGuidedSpy,
+    });
+
+    render(
+      <ChatPanel
+        isTutorial
+        lockedChatPrompt={{ step_1_source: "create the source" }}
+      />,
+    );
+
+    expect(
+      screen.getByRole("group", { name: "Which source plugin should we use?" }),
+    ).toBeVisible();
+    await act(async () => {
+      screen.getByRole("button", { name: "CSV" }).click();
+    });
+    expect(respondGuidedSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ chosen: ["csv"] }),
+    );
+  });
+
   it("passes the backend guided-chat message limit to the guided ChatInput", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",

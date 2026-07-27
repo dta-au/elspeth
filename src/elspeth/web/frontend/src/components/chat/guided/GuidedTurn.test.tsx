@@ -196,22 +196,21 @@ describe("GuidedTurn dispatcher — routing", () => {
     ).toBeTruthy();
   });
 
-  it("single_select + isTutorial: suppresses the pick widget entirely", () => {
-    // The chip menu is a live, submit-on-click RIVAL to the one action a passive
-    // learner has (Send). Its options don't even include the scripted source, so
-    // clicking any chip derails the tutorial into an unscripted build. In
-    // tutorial mode the pick widget is omitted; the decision collapses to its
-    // heading + "press Send" caption (rendered by ChatPanel, not here).
-    const { container } = render(
+  it("single_select + isTutorial: renders the tutorial-aware picker", () => {
+    // ChatPanel owns the contextual pre-Send suppression because only it knows
+    // whether the locked stage prompt has already been sent. Once allowed
+    // through, the dispatcher renders the tutorial-aware picker so a legal
+    // Add-created turn remains actionable.
+    render(
       <GuidedTurn
         turn={makeTurn("single_select", SINGLE_SELECT_PAYLOAD)}
         onSubmit={vi.fn()}
         isTutorial
       />,
     );
-    expect(screen.queryByText("Which data source should we use?")).toBeNull();
-    expect(screen.queryByRole("button", { name: "CSV File" })).toBeNull();
-    expect(container).toBeEmptyDOMElement();
+    expect(screen.getByText("Which data source should we use?")).toBeVisible();
+    expect(screen.getByRole("button", { name: "CSV File" })).toBeEnabled();
+    expect(screen.queryByText(/choosing an option continues/i)).toBeNull();
   });
 
   it("inspect_and_confirm: renders InspectAndConfirmTurn ('Looks right' button)", () => {
