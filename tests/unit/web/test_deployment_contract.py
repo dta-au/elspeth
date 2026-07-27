@@ -24,7 +24,7 @@ def _base_kwargs() -> dict[str, Any]:
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
-        "secret_key": "a" * 40,
+        "secret_key": "this-non-loopback-secret-is-long-enough",
         "shareable_link_signing_key": bytes(range(32)),
     }
 

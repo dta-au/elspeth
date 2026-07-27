@@ -838,7 +838,7 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def _enforce_secret_key_in_production(self) -> WebSettings:
-        """Reject default or undersized JWT HMAC keys outside explicit test contexts."""
+        """Reject default, undersized, or uniform-byte JWT HMAC keys outside explicit test contexts."""
         if _allow_insecure_test_keys(self.host):
             return self
         if is_default_secret_key_placeholder(self.secret_key):
@@ -849,6 +849,11 @@ class WebSettings(BaseModel):
         if is_undersized_secret_key(self.secret_key):
             raise ValueError(
                 f"secret_key must be at least {_MIN_NON_LOCAL_JWT_SECRET_KEY_BYTES} bytes outside explicit test contexts. "
+                "Generate a high-entropy key for ELSPETH_WEB__SECRET_KEY."
+            )
+        if is_uniform_byte_key(self.secret_key.encode("utf-8")):
+            raise ValueError(
+                "secret_key is a known-weak uniform-byte placeholder outside explicit test contexts. "
                 "Generate a high-entropy key for ELSPETH_WEB__SECRET_KEY."
             )
         return self

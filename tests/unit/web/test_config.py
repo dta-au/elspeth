@@ -841,6 +841,18 @@ class TestSecretKeyGuard:
                 shareable_link_signing_key=b"\xab\xcd" * 16,
             )
 
+    def test_uniform_byte_secret_key_rejected_on_non_local_host(self) -> None:
+        with pytest.raises(ValidationError, match="known-weak uniform-byte"):
+            WebSettings(
+                host="0.0.0.0",
+                secret_key="x" * 32,
+                composer_max_composition_turns=15,
+                composer_max_discovery_turns=10,
+                composer_timeout_seconds=85.0,
+                composer_rate_limit_per_minute=10,
+                shareable_link_signing_key=b"\xab\xcd" * 16,
+            )
+
     def test_short_secret_key_allowed_on_localhost(self) -> None:
         settings = WebSettings(
             host="127.0.0.1",
