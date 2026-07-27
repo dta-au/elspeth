@@ -252,6 +252,37 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert len(failures) == 1
         assert isinstance(failures[0], AuthenticationError)
 
+    def test_email_verification_token_is_expired_at_boundary(self, provider, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(auth_local.time, "time", lambda: 1_000)
+        provider.create_user(
+            "alice",
+            "password123",
+            display_name="Alice",
+            email="alice@example.com",
+            email_verified=False,
+        )
+        token = provider.create_email_verification_token("alice", ttl_seconds=0)
+        issued_tokens: list[str] = []
+
+        with pytest.raises(AuthenticationError, match="expired"):
+            provider.verify_email_and_issue_token(
+                token,
+                record_token_issued=lambda _identity, access_token: issued_tokens.append(access_token),
+            )
+
+        assert issued_tokens == []
+        with provider._connect() as conn:
+            state = conn.execute(
+                """
+                SELECT tokens.used_at, users.email_verified
+                FROM email_verification_tokens AS tokens
+                JOIN users ON users.user_id = tokens.user_id
+                WHERE tokens.user_id = ?
+                """,
+                ("alice",),
+            ).fetchone()
+        assert state == (None, 0)
+
     def test_verification_audit_failure_restores_bounded_retry_lifetime(self, provider, monkeypatch: pytest.MonkeyPatch) -> None:
         now = [1_000]
         monkeypatch.setattr(auth_local.time, "time", lambda: now[0])

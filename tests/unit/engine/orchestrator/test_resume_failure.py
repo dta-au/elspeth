@@ -350,7 +350,8 @@ class TestResumeFinalizesAsFailed:
             f"Run should be finalized as FAILED when resume fails with non-shutdown exception. finalize_run calls: {finalize_calls}"
         )
 
-    def test_resume_partial_failure_ceremony_reports_cumulative_audit_counters(self) -> None:
+    @pytest.mark.parametrize("work_source", ["unprocessed-row", "scheduler-only"])
+    def test_resume_partial_failure_ceremony_reports_cumulative_audit_counters(self, work_source: str) -> None:
         """Partial-result resume failures must not emit resume-local-only counters."""
         db = make_landscape_db()
         event_bus = MagicMock(spec_set=["emit"])
@@ -374,7 +375,9 @@ class TestResumeFinalizesAsFailed:
         resume_state = ResumeState(
             factory=mock_factory,
             run_id=run_id,
-            unprocessed_rows=(
+            unprocessed_rows=()
+            if work_source == "scheduler-only"
+            else (
                 ResumedRow(
                     row_id="row-resumed",
                     row_index=1,
@@ -390,6 +393,7 @@ class TestResumeFinalizesAsFailed:
             has_restored_barrier_work=False,
             coordination_token=coordination_token,
         )
+        mock_factory.scheduler.count_active_work.return_value = int(work_source == "scheduler-only")
         resume_only_result = RunResult(
             run_id=run_id,
             status=RunStatus.FAILED,

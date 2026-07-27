@@ -600,7 +600,7 @@ class LocalAuthProvider:
             user_id, expires_at, used_at, email_verified = row
             if used_at is not None:
                 raise AuthenticationError("Email verification token already used")
-            if expires_at < now:
+            if expires_at <= now:
                 raise AuthenticationError("Email verification token expired")
             if email_verified:
                 raise AuthenticationError("Email already verified")
@@ -608,7 +608,7 @@ class LocalAuthProvider:
                 """
                 UPDATE email_verification_tokens
                 SET used_at = ?
-                WHERE token_hash = ? AND used_at IS NULL AND expires_at >= ?
+                WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?
                 """,
                 (now, token_hash, now),
             )

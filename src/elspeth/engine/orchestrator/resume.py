@@ -1027,6 +1027,8 @@ class ResumeCoordinator:
             has_active_scheduler_work = (
                 not unprocessed_rows and not state.has_restored_barrier_work and factory.scheduler.count_active_work(run_id=run_id) > 0
             )
+            if has_active_scheduler_work:
+                resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
             if not unprocessed_rows and not state.has_restored_barrier_work and not has_active_scheduler_work:
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
 
