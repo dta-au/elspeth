@@ -32,6 +32,7 @@ from hypothesis import event, given, settings
 from hypothesis import strategies as st
 
 from elspeth.web.composer.redaction import (
+    _STABLE_RESPONSE_SENTINELS,
     MANIFEST,
     _SensitiveMarker,
     redact_tool_call_arguments,
@@ -278,6 +279,8 @@ def test_redaction_replaces_every_sensitive_response_value(tool_name: str) -> No
     def check(payload: object) -> None:
         raw_response = payload.model_dump()
         redacted_response = redact_tool_call_response(tool_name, raw_response, telemetry=NoopRedactionTelemetry())
+        if redacted_response == {"_redaction_status": "response_projection_limit"}:
+            return
 
         for node in sensitive_nodes:
             # Extract values at this path from BOTH views. value_provider is
@@ -331,6 +334,9 @@ def test_redaction_replaces_every_sensitive_response_value(tool_name: str) -> No
                         # (substitutes None with a sentinel). Out of scope.
                         continue
                     redacted_value = redacted_pairs[key]
+                    if isinstance(raw_value, str) and raw_value in _STABLE_RESPONSE_SENTINELS:
+                        assert redacted_value == raw_value
+                        continue
                     assert redacted_value != raw_value, (
                         f"Sensitive value at container path {node.path!r}"
                         f"[{key!r}] in the response for tool {tool_name!r} "
@@ -344,6 +350,9 @@ def test_redaction_replaces_every_sensitive_response_value(tool_name: str) -> No
                 # Scalar descent.
                 if raw_extracted is None:
                     continue  # only allowed skip; see container branch
+                if isinstance(raw_extracted, str) and raw_extracted in _STABLE_RESPONSE_SENTINELS:
+                    assert redacted_extracted == raw_extracted
+                    continue
                 assert redacted_extracted != raw_extracted, (
                     f"Sensitive value at scalar path {node.path!r} in the "
                     f"response for tool {tool_name!r} was NOT redacted. "

@@ -15,14 +15,21 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, TypeGuard
 
 import rfc8785
 
 # Version string stored with every run for hash verification.
 # Single source of truth — core/canonical.py imports this constant.
 CANONICAL_VERSION = "sha256-rfc8785-v1"
+_LOWER_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def is_lower_sha256_hex(value: object) -> TypeGuard[str]:
+    """Return whether ``value`` is exactly one lowercase SHA-256 hex digest."""
+    return isinstance(value, str) and _LOWER_SHA256_HEX_RE.fullmatch(value) is not None
 
 
 def _normalize_frozen_and_reject_non_finite(obj: Any) -> Any:

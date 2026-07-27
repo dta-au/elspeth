@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 from dataclasses import replace
@@ -14,8 +15,11 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select, text
 
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.protocol import ComposerPluginCrashError
+from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_tool_call_response
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import ValidationSummary
@@ -118,6 +122,128 @@ def _advisor_model_response(content: str = "Try setting `provider: azure` with t
     )
 
 
+def test_current_loop_arg_error_tool_row_scrubs_arbitrary_error_message(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+) -> None:
+    canary = "RAW_CURRENT_LOOP_ARG_ERROR_/private/operator/path_sk-secret"
+    outcome = SimpleNamespace(
+        call=SimpleNamespace(function=SimpleNamespace(name="set_source")),
+        error_class="ToolArgumentError",
+        error_message=canary,
+    )
+
+    serialized = composer_service_with_real_sessions._serialize_response_via_walker(  # type: ignore[attr-defined]
+        outcome,
+        telemetry=composer_service_with_real_sessions._redaction_telemetry,  # type: ignore[attr-defined]
+    )
+    payload = json.loads(serialized)
+
+    assert payload["_redaction_status"] == "arg_error"
+    assert payload["error_class"] == "ToolArgumentError"
+    assert payload["error_message"] == "<redacted-arg-error-message>"
+    assert canary not in serialized
+
+
+@pytest.mark.parametrize(
+    ("failure_status", "error_class", "error_message", "expected"),
+    [
+        (
+            ComposerToolStatus.PLUGIN_CRASH,
+            "RAW_CLASS_/private/operator/path_sk-secret",
+            "RAW_MESSAGE_/private/operator/path_sk-secret",
+            {
+                "_redaction_status": "plugin_crash",
+                "error_class": "<redacted-plugin-crash-class>",
+                "error_message": "<redacted-failure-message>",
+            },
+        ),
+        (
+            ComposerToolStatus.CANCELLED,
+            "CancelledError",
+            "RAW_CANCEL_/private/operator/path_sk-secret",
+            {
+                "_redaction_status": "cancelled",
+                "error_class": "CancelledError",
+                "error_message": "cancelled",
+            },
+        ),
+    ],
+)
+def test_current_loop_non_arg_failure_projection_matches_legacy(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    failure_status: ComposerToolStatus,
+    error_class: str,
+    error_message: str,
+    expected: dict[str, object],
+) -> None:
+    outcome = SimpleNamespace(
+        call=SimpleNamespace(function=SimpleNamespace(name="set_source")),
+        error_class=error_class,
+        error_message=error_message,
+    )
+
+    serialized = composer_service_with_real_sessions._serialize_response_via_walker(  # type: ignore[attr-defined]
+        outcome,
+        telemetry=composer_service_with_real_sessions._redaction_telemetry,  # type: ignore[attr-defined]
+        failure_status=failure_status,
+    )
+
+    assert json.loads(serialized) == expected
+    if error_class != expected["error_class"]:
+        assert error_class not in serialized
+    assert error_message not in serialized
+
+
+@pytest.mark.asyncio
+async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+) -> None:
+    arguments_canonical = canonical_json({"source": None, "nodes": [], "edges": [], "outputs": []})
+    result_canonical = canonical_json(
+        {
+            "success": True,
+            "validation": {
+                "is_valid": True,
+                "errors": [],
+                "warnings": [],
+                "suggestions": [],
+                "semantic_contracts": [],
+                "graph_repair_suggestions": [],
+            },
+            "affected_nodes": [],
+            "version": 1,
+            "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
+            "pipeline_content_hash": "RAW_CURRENT_PLANNER_HASH_/private/operator/path_sk-secret",
+        }
+    )
+    invocation = ComposerToolInvocation(
+        tool_call_id="call_current_planner_hash_canary",
+        tool_name="set_pipeline",
+        arguments_canonical=arguments_canonical,
+        arguments_hash=hashlib.sha256(arguments_canonical.encode()).hexdigest(),
+        result_canonical=result_canonical,
+        result_hash=hashlib.sha256(result_canonical.encode()).hexdigest(),
+        status=ComposerToolStatus.SUCCESS,
+        error_class=None,
+        error_message=None,
+        version_before=0,
+        version_after=1,
+        started_at=datetime(2026, 7, 27, tzinfo=UTC),
+        finished_at=datetime(2026, 7, 27, tzinfo=UTC),
+        latency_ms=12,
+        actor="composer-web:user-test",
+    )
+
+    with pytest.raises(AuditIntegrityError, match="content hash is malformed"):
+        await composer_service_with_real_sessions._persist_pipeline_planner_audit(  # type: ignore[attr-defined]
+            session_id=UUID(result_session_id),
+            current_state_id=None,
+            llm_calls=(),
+            invocations=(invocation,),
+        )
+
+
 @pytest.mark.asyncio
 async def test_step1_three_tools_all_succeed_accumulates_three_outcomes(
     composer_service_with_real_sessions: ComposerServiceImpl,
@@ -158,6 +284,126 @@ async def test_step1_tool_argument_error_continues_loop(
     assert outcomes[0].error_class is None
     assert outcomes[1].error_class == "ToolArgumentError"
     assert outcomes[2].error_class is None
+
+
+@pytest.mark.asyncio
+async def test_current_loop_schema_valid_semantic_arg_error_persists_only_closed_argument_projection(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filename_canary = "RAW_CURRENT_FILENAME_/private/operator/path_sk-secret.csv"
+    description_canary = "RAW_CURRENT_DESCRIPTION_/private/operator/path_sk-secret"
+    arguments = {
+        "filename": filename_canary,
+        "mime_type": "text/csv",
+        "content": "safe content",
+        "description": description_canary,
+    }
+
+    def _semantic_arg_error(*_args: Any, **_kwargs: Any) -> ToolResult:
+        raise ToolArgumentError(argument="content", expected="semantic constraint", actual_type="str")
+
+    monkeypatch.setattr("elspeth.web.composer.tool_batch.execute_tool", _semantic_arg_error)
+    responses = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call_current_create_blob_semantic_arg_error",
+                                function=SimpleNamespace(name="create_blob", arguments=json.dumps(arguments)),
+                            )
+                        ],
+                    )
+                )
+            ]
+        ),
+        _text_response("Recovered after the semantic argument error."),
+    ]
+
+    async def _llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    result = await _run_one_turn(
+        composer_service_with_real_sessions,
+        llm=_llm,
+        session_id=result_session_id,
+    )
+
+    expected_arguments = {
+        "_redaction_status": "invalid_tool_arguments",
+        "error_class": "ToolArgumentError",
+        "field_count": 4,
+    }
+    assert len(result.persisted_assistant_tool_calls) == 1
+    persisted_call = result.persisted_assistant_tool_calls[0]
+    assert json.loads(persisted_call["function"]["arguments"]) == expected_arguments
+    expected_canonical = canonical_json(expected_arguments)
+    _content, audit_envelope = redacted_tool_invocation_content_and_envelope(result.tool_invocations[0])
+    persisted_invocation = audit_envelope["invocation"]
+    assert persisted_invocation["arguments_canonical"] == expected_canonical
+    assert persisted_invocation["arguments_hash"] == hashlib.sha256(expected_canonical.encode()).hexdigest()
+    persisted_blob = json.dumps(
+        {
+            "assistant_tool_calls": result.persisted_assistant_tool_calls,
+            "tool_rows": result.persisted_tool_row_content,
+        },
+        sort_keys=True,
+    )
+    assert filename_canary not in persisted_blob
+    assert description_canary not in persisted_blob
+
+
+@pytest.mark.asyncio
+async def test_current_loop_non_object_arg_error_matches_durable_projection_and_hash(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+) -> None:
+    responses = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call_current_set_source_non_object",
+                                function=SimpleNamespace(name="set_source", arguments="[]"),
+                            )
+                        ],
+                    )
+                )
+            ]
+        ),
+        _text_response("Recovered after the non-object argument error."),
+    ]
+
+    async def _llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    result = await _run_one_turn(
+        composer_service_with_real_sessions,
+        llm=_llm,
+        session_id=result_session_id,
+    )
+
+    expected_arguments = {
+        "_redaction_status": "invalid_tool_arguments",
+        "error_class": "TypeError",
+        "field_count": 1,
+    }
+    expected_canonical = canonical_json(expected_arguments)
+    assert len(result.persisted_assistant_tool_calls) == 1
+    persisted_call = result.persisted_assistant_tool_calls[0]
+    assert json.loads(persisted_call["function"]["arguments"]) == expected_arguments
+
+    _content, audit_envelope = redacted_tool_invocation_content_and_envelope(result.tool_invocations[0])
+    persisted_invocation = audit_envelope["invocation"]
+    assert persisted_invocation["arguments_canonical"] == expected_canonical
+    assert persisted_invocation["arguments_hash"] == hashlib.sha256(expected_canonical.encode()).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -207,6 +453,92 @@ async def test_step1_plugin_bug_captures_crash_breaks_loop(
     assert outcomes[1].error_class == "RuntimeError"
     assert outcomes[1].error_message == "RuntimeError"
     assert "phase3 synthetic runtime error" not in (outcomes[1].error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_current_loop_plugin_crash_with_invalid_arguments_uses_closed_class_and_matches_durable_projection(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error_class_canary = "RAW_PLUGIN_CLASS_/private/operator/path_sk-secret"
+    plugin_error = type(error_class_canary, (RuntimeError,), {})
+
+    def _plugin_crash(*_args: Any, **_kwargs: Any) -> ToolResult:
+        raise plugin_error("RAW_PLUGIN_MESSAGE_/private/operator/path_sk-secret")
+
+    monkeypatch.setattr("elspeth.web.composer.tool_batch.execute_tool", _plugin_crash)
+    invalid_arguments = {
+        "plugin": "csv",
+        "options": [],
+        "on_success": "rows",
+        "on_validation_failure": "discard",
+    }
+    responses = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call_invalid_set_source_plugin_crash",
+                                function=SimpleNamespace(name="set_source", arguments=json.dumps(invalid_arguments)),
+                            )
+                        ],
+                    )
+                )
+            ]
+        )
+    ]
+
+    async def _llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    with pytest.raises(ComposerPluginCrashError):
+        await _run_one_turn(
+            composer_service_with_real_sessions,
+            llm=_llm,
+            session_id=result_session_id,
+        )
+
+    expected_arguments = {
+        "_redaction_status": "invalid_tool_arguments",
+        "error_class": "<redacted-plugin-crash-class>",
+        "field_count": 4,
+    }
+    persisted_call = composer_service_with_real_sessions._phase3_last_redacted_assistant_tool_calls[0]  # type: ignore[attr-defined]
+    assert json.loads(persisted_call["function"]["arguments"]) == expected_arguments
+    arguments_canonical = canonical_json(invalid_arguments)
+    durable_invocation = ComposerToolInvocation(
+        tool_call_id="call_invalid_set_source_plugin_crash",
+        tool_name="set_source",
+        arguments_canonical=arguments_canonical,
+        arguments_hash=hashlib.sha256(arguments_canonical.encode()).hexdigest(),
+        result_canonical=None,
+        result_hash=None,
+        status=ComposerToolStatus.PLUGIN_CRASH,
+        error_class=error_class_canary,
+        error_message=error_class_canary,
+        version_before=1,
+        version_after=None,
+        started_at=datetime(2026, 7, 27, tzinfo=UTC),
+        finished_at=datetime(2026, 7, 27, tzinfo=UTC),
+        latency_ms=12,
+        actor="composer-web:user-test",
+    )
+    _content, audit_envelope = redacted_tool_invocation_content_and_envelope(durable_invocation)
+    persisted_invocation = audit_envelope["invocation"]
+    expected_canonical = canonical_json(expected_arguments)
+    assert persisted_invocation["arguments_canonical"] == expected_canonical
+    assert persisted_invocation["arguments_hash"] == hashlib.sha256(expected_canonical.encode()).hexdigest()
+    assert error_class_canary not in json.dumps(
+        {
+            "assistant_tool_calls": composer_service_with_real_sessions._phase3_last_redacted_assistant_tool_calls,  # type: ignore[attr-defined]
+            "invocation": persisted_invocation,
+        },
+        sort_keys=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -302,7 +634,8 @@ async def test_step2_persists_intercepted_advisor_tool_call_rows(
     persisted_content = json.loads(result.persisted_tool_row_content[0])
     assert persisted_content["status"] == "SUCCESS"
     assert persisted_content["guidance"] == "<redacted>"
-    assert persisted_content["model"] == "anthropic/claude-sonnet-4-6"
+    assert persisted_content["model"] == "<redacted-response-text>"
+    assert "anthropic/claude-sonnet-4-6" not in result.persisted_tool_row_content[0]
 
     sessions_service = service._sessions_service  # type: ignore[attr-defined]
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
@@ -361,8 +694,11 @@ async def test_step2_redacts_intercepted_advisor_unknown_arguments_before_persis
     assert len(result.persisted_assistant_tool_calls) == 1
     persisted_call = result.persisted_assistant_tool_calls[0]
     persisted_args = json.loads(persisted_call["function"]["arguments"])
-    assert "full_context" not in persisted_args
-    assert persisted_args["_unknown_arguments"] == "<redacted-unknown-argument-key>"
+    assert persisted_args == {
+        "_redaction_status": "invalid_tool_arguments",
+        "error_class": "ValueError",
+        "field_count": 5,
+    }
     persisted_blob = json.dumps(
         {
             "assistant_tool_calls": result.persisted_assistant_tool_calls,

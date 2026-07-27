@@ -57,19 +57,15 @@ def test_redaction_model_accepts_valid_argument_dict() -> None:
 @pytest.mark.parametrize(
     "raw, expected",
     [
-        ("cool", "<interpretation-term:4-chars>"),
-        ("", "<interpretation-term:0-chars>"),
-        ("a" * 64, "<interpretation-term:64-chars>"),
-        ("a" * 65, "<interpretation-term:65-chars:truncated>"),
-        ("a" * 200, "<interpretation-term:200-chars:truncated>"),
+        ("cool", "<redacted-interpretation-text>"),
+        ("", "<redacted-interpretation-text>"),
+        ("a" * 64, "<redacted-interpretation-text>"),
+        ("a" * 65, "<redacted-interpretation-text>"),
+        ("a" * 200, "<redacted-interpretation-text>"),
     ],
 )
 def test_summarize_fixed_form_with_length_disclosure(raw: str, expected: str) -> None:
-    """Spec test 2 (part 1): the summariser collapses to a fixed-form
-    ``<interpretation-term:N-chars[:truncated]>`` scalar at every reachable
-    input including the empty string — this is what makes
-    ``redacted_value != raw_value`` uniformly true for the redaction-
-    completeness property test."""
+    """Interpretation text collapses to one stable, value-free sentinel."""
     assert _summarize_interpretation_term(raw) == expected
 
 
@@ -77,9 +73,8 @@ def test_audit_envelope_carries_redacted_form() -> None:
     """Spec test 3: redact_tool_call_arguments substitutes the summarised
     form into the audit row's tool-call column.
 
-    ``user_term`` and ``llm_draft`` collapse to the fixed-form
-    ``<interpretation-term:N-chars[:truncated]>`` scalar; ``affected_node_id``
-    flows through verbatim (it's structural metadata, not user content).
+    ``user_term`` and ``llm_draft`` collapse to a stable fixed sentinel;
+    ``affected_node_id`` flows through verbatim as structural metadata.
     """
     long_term = "very-important-context-string-that-exceeds-the-cap-by-quite-a-lot-of-characters"
     long_draft = "x" * 200
@@ -99,8 +94,8 @@ def test_audit_envelope_carries_redacted_form() -> None:
     assert redacted["affected_node_id"] == "rate_node"
     assert redacted["kind"] == "vague_term"
     # user_term and llm_draft are summarised to the fixed-form scalar.
-    assert redacted["user_term"] == f"<interpretation-term:{len(long_term)}-chars:truncated>"
-    assert redacted["llm_draft"] == f"<interpretation-term:{len(long_draft)}-chars:truncated>"
+    assert redacted["user_term"] == "<redacted-interpretation-text>"
+    assert redacted["llm_draft"] == "<redacted-interpretation-text>"
     # Sanity: raw values did NOT leak through.
     assert long_term not in redacted["user_term"]
     assert long_draft not in redacted["llm_draft"]
@@ -157,9 +152,10 @@ def test_response_redaction_summarizes_review_text_if_present() -> None:
     )
 
     data = redacted["data"]
-    assert data["user_term"] == f"<interpretation-term:{len(long_term)}-chars:truncated>"
-    assert data["llm_draft"] == f"<interpretation-term:{len(long_draft)}-chars:truncated>"
+    assert data["user_term"] == "<redacted-interpretation-text>"
+    assert data["llm_draft"] == "<redacted-interpretation-text>"
     assert long_term not in data["user_term"]
     assert long_draft not in data["llm_draft"]
-    assert data["event_id"] == raw_response["data"]["event_id"]
-    assert data["affected_node_id"] == "rate_node"
+    assert data["event_id"] == "<redacted-response-text>"
+    assert data["affected_node_id"] == "<redacted-response-text>"
+    assert data["message"] == "<redacted-interpretation-text>"

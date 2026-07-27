@@ -40,7 +40,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
@@ -617,7 +617,7 @@ def _pipeline_dispatch_recovery_from_envelope(
     if result_payload.get("pipeline_content_hash_schema") != "composer.pipeline-dispatch-result.v1":
         raise AuditIntegrityError("pipeline dispatch result content schema is malformed")
     content_hash = result_payload.get("pipeline_content_hash")
-    if type(content_hash) is not str or len(content_hash) != 64 or any(character not in "0123456789abcdef" for character in content_hash):
+    if not is_lower_sha256_hex(content_hash):
         raise AuditIntegrityError("pipeline dispatch result content hash is malformed")
     return PipelineDispatchRecovery(binding=binding, executor_content_hash=content_hash)
 

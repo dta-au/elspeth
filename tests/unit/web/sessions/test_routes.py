@@ -1559,6 +1559,50 @@ async def test_canonical_pipeline_recovery_rejects_tampered_bound_content_hash(t
     assert (await service.list_composition_proposals(session_id))[0].status == "rejected"
 
 
+@pytest.mark.asyncio
+async def test_canonical_pipeline_http_readback_rejects_malformed_bound_content_hash(tmp_path, monkeypatch) -> None:
+    from sqlalchemy import select, update
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.core.canonical import canonical_json
+    from elspeth.web.sessions.models import chat_messages_table
+
+    app, service, _pipeline, session_id, row, endpoint = await _create_canonical_pipeline_route_proposal(
+        tmp_path,
+        monkeypatch,
+        tool_call_id="canonical-bound-malformed-call",
+    )
+    settle = service.settle_pipeline_composition_proposal
+
+    async def interrupt_before_settlement(**kwargs: Any):
+        del kwargs
+        raise RuntimeError("interrupted before atomic settlement")
+
+    monkeypatch.setattr(service, "settle_pipeline_composition_proposal", interrupt_before_settlement)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        with pytest.raises(RuntimeError, match="interrupted before atomic settlement"):
+            await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+
+        hash_canary = "RAW_CANARY_" + "A" * 53
+        assert len(hash_canary) == 64
+        with service._engine.begin() as conn:
+            audit_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "audit")).one()
+            envelopes = list(audit_row.tool_calls)
+            invocation = envelopes[0]["invocation"]
+            result_payload = json.loads(invocation["result_canonical"])
+            result_payload["pipeline_content_hash"] = hash_canary
+            invocation["result_canonical"] = canonical_json(result_payload)
+            invocation["result_hash"] = stable_hash(result_payload)
+            conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=envelopes))
+
+        monkeypatch.setattr(service, "settle_pipeline_composition_proposal", settle)
+        with pytest.raises(AuditIntegrityError, match="pipeline dispatch result content hash is malformed") as exc_info:
+            await client.post(endpoint, json={"draft_hash": row.pipeline_metadata.draft_hash})
+
+    assert hash_canary not in str(exc_info.value)
+    assert await service.get_current_state(session_id) is None
+
+
 @pytest.mark.parametrize("surface_name", ["GUIDED_STAGED", "TUTORIAL_PROFILE"])
 def test_generic_accept_rejects_guided_pipeline_surfaces_before_dispatch(tmp_path, monkeypatch, surface_name) -> None:
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
