@@ -625,6 +625,13 @@ class TestShippedExamples:
         hostile_binary = tmp_path / "ambient-python-bin"
         hostile_binary.write_text("#!/usr/bin/env sh\nexit 97\n", encoding="utf-8")
         hostile_binary.chmod(0o755)
+        launcher_env = {
+            **os.environ,
+            "PYTHON_BIN": str(hostile_binary),
+            "ELSPETH_BIN": str(hostile_binary),
+        }
+        launcher_env.pop("ELSPETH_BLOB_TRANSFORMS_PYTHON_BIN", None)
+        launcher_env.pop("ELSPETH_BLOB_TRANSFORMS_CLI_BIN", None)
         result = subprocess.run(
             ["bash", copied_example_dir / "run.sh"],
             cwd=tmp_path,
@@ -632,11 +639,7 @@ class TestShippedExamples:
             text=True,
             timeout=120,
             check=False,
-            env={
-                **os.environ,
-                "PYTHON_BIN": str(hostile_binary),
-                "ELSPETH_BIN": str(hostile_binary),
-            },
+            env=launcher_env,
         )
         assert result.returncode == 0, result.stdout + result.stderr
 
