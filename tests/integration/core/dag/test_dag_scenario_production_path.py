@@ -2519,6 +2519,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         ("fork-coalesce-policies", "require-all-nested-reopen-after-coalesce"),
+        ("sequential-nested-fork-coalesce", "reopen-terminal-publication"),
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),

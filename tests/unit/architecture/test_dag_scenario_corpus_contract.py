@@ -189,7 +189,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "unknown",
+        "partial",
         "unknown",
         "pass",
         "fail",
@@ -407,8 +407,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "322d6ba48d3a6d1c4fc504b54a54e6c1af6e084180ce9869c4a35684b1a188eb"
-EXPECTED_CASE_REGISTRY_SHA256 = "29454f7a6daca0417afdeaf455f98b95b89a70fe8e327b303fddfd4edc6f0139"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "2eabea4332cae4a30411a35f710c9288cc67bfbe782ae4b247a4315c64695346"
+EXPECTED_CASE_REGISTRY_SHA256 = "068a3a9c88322d4ba66729095f705a1502f6a7d009c157930c9107c3b1a59aca"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -472,6 +472,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "fork-coalesce-policies:union-collision-first-wins": "8a20e5eceb01859427ac5e60d0e370f8ba100a7b9ce0903b2ca6e28f288073c7",
     "fork-coalesce-policies:union-collision-fail": "973269df09a38f4beabc778c2b06365a10363444229530974e71888f98a4d57f",
     "sequential-nested-fork-coalesce:two-sequential-require-all": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
+    "sequential-nested-fork-coalesce:reopen-terminal-publication": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
     "parallel-coalesces:two-parallel-require-all": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
     "parallel-coalesces:resume-after-left-finalize": "83e6e7edd9f34379d23a1f9b267b49d66524a6ce61c3e96b6b831046260cdfe2",
     "aggregation-immutable-batch:eof-immutable-membership": "0a6a82b9fbe15356ccf0437bf34b72e3324b6884b8990752c05943e0179fb9cb",
@@ -564,6 +565,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-sequential-nested-fork-coalesce-two-sequential-require-all",
         "sequential-nested-fork-coalesce:two-sequential-require-all",
         ("config", "build", "runtime"),
+    ),
+    (
+        "harness-sequential-nested-fork-coalesce-reopen-terminal-publication",
+        "sequential-nested-fork-coalesce:reopen-terminal-publication",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
     (
         "harness-parallel-coalesces-two-parallel-require-all",
@@ -4817,6 +4823,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
+        ("sequential-nested-fork-coalesce", "reopen-terminal-publication"),
         ("parallel-coalesces", "two-parallel-require-all"),
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
@@ -4843,11 +4850,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 106
+    assert len(manifest.evidence) == 107
     assert len(assessment_evidence) == 61
-    assert len(harness_evidence) == 45
-    assert len({reference.id for reference in manifest.evidence}) == 106
-    assert len({reference.locator for reference in manifest.evidence}) == 106
+    assert len(harness_evidence) == 46
+    assert len({reference.id for reference in manifest.evidence}) == 107
+    assert len({reference.locator for reference in manifest.evidence}) == 107
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4873,6 +4880,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
+        ("sequential-nested-fork-coalesce", "reopen-terminal-publication"),
         ("parallel-coalesces", "two-parallel-require-all"),
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
@@ -4968,6 +4976,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("sequential-nested-fork-coalesce", "build"),
             ("sequential-nested-fork-coalesce", "runtime"),
         ),
+        "harness-sequential-nested-fork-coalesce-reopen-terminal-publication": (("sequential-nested-fork-coalesce", "recovery"),),
         "harness-parallel-coalesces-two-parallel-require-all": (
             ("parallel-coalesces", "build"),
             ("parallel-coalesces", "runtime"),
@@ -5279,6 +5288,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),
+        ("sequential-nested-fork-coalesce", "reopen-terminal-publication"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     ],
 )

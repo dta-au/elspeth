@@ -450,6 +450,11 @@ evidence:
     locator: sequential-nested-fork-coalesce:two-sequential-require-all
     claim: Two sequential require-all nested barriers execute exact schema propagation, output, parent-set, disposition, and scheduler runtime evidence.
     stages: [config, build, runtime]
+  - id: harness-sequential-nested-fork-coalesce-reopen-terminal-publication
+    kind: harness
+    locator: sequential-nested-fork-coalesce:reopen-terminal-publication
+    claim: After both sequential require-all coalesces and source exhaustion, a declared output BEFORE_EFFECT interruption closes and discards the initial runtime, then a fresh public resume preserves exact row, token, parent, coalesce-state, scheduler-work, sink-effect, artifact, member, and original commit-attempt identities, converts the interrupted commit to response_lost, performs exactly one returned commit and one three-row publication, avoids source replay, removes the checkpoint, and preserves independent durable/export parity; this terminal-publication evidence does not prove the structurally unavailable between-merge seam and remains provisional until the deferred-platform rebase.
+    stages: [config, build, runtime, audit, recovery]
   - id: sequential-nested-second-merge-schema-negative
     kind: pytest
     locator: tests/integration/core/dag/test_dag_scenario_production_path.py::test_b2_sequential_nested_rejects_incompatible_second_merge_schema
@@ -3776,6 +3781,42 @@ scenarios:
         output_artifacts:
           output: output.jsonl
         expected: {"kind":"semantic_runtime","status":"completed","sink_outputs":[{"sink_name":"output","rows":["{\"branch_b1\":{\"branch_a1\":{\"id\":1,\"value\":10},\"branch_a2\":{\"id\":1,\"value\":10}},\"branch_b2\":{\"branch_a1\":{\"id\":1,\"value\":10},\"branch_a2\":{\"id\":1,\"value\":10}}}","{\"branch_b1\":{\"branch_a1\":{\"id\":2,\"value\":20},\"branch_a2\":{\"id\":2,\"value\":20}},\"branch_b2\":{\"branch_a1\":{\"id\":2,\"value\":20},\"branch_a2\":{\"id\":2,\"value\":20}}}","{\"branch_b1\":{\"branch_a1\":{\"id\":3,\"value\":30},\"branch_a2\":{\"id\":3,\"value\":30}},\"branch_b2\":{\"branch_a1\":{\"id\":3,\"value\":30},\"branch_a2\":{\"id\":3,\"value\":30}}}"]}],"rows_processed":3,"rows_succeeded":3,"rows_failed":0,"audit_record_counts":[{"record_type":"artifact","count":1},{"record_type":"call","count":3},{"record_type":"edge","count":9},{"record_type":"manifest","count":1},{"record_type":"node","count":6},{"record_type":"node_state","count":24},{"record_type":"operation","count":2},{"record_type":"routing_event","count":12},{"record_type":"row","count":3},{"record_type":"run","count":1},{"record_type":"scheduler_event","count":72},{"record_type":"sink_effect","count":1},{"record_type":"sink_effect_attempt","count":3},{"record_type":"sink_effect_member","count":3},{"record_type":"sink_effect_stream","count":1},{"record_type":"token","count":21},{"record_type":"token_outcome","count":21},{"record_type":"token_parent","count":24}],"source_operation_count":1,"projection_sha256":"e42f20bc6fdb92d99cd0f2bd6dcfe9670d1a07e7770879ec7112431b425775c8","projection_counts":{"rows":3,"tokens":21,"parent_links":24,"node_states":24,"routes":12,"terminal_dispositions":21,"scheduler_work":21}}
+      - id: reopen-terminal-publication
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: output
+          occurrence: 1
+        fixture: sequential-nested-fork-coalesce/two-sequential-require-all.yaml
+        input_fixtures:
+          primary: sequential-nested-fork-coalesce/input.csv
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 3
+          required_audit_record_types:
+            - artifact
+            - call
+            - edge
+            - manifest
+            - node
+            - node_state
+            - operation
+            - routing_event
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_attempt
+            - sink_effect_member
+            - sink_effect_stream
+            - token
+            - token_outcome
+            - token_parent
     dimensions:
       config: *config_pass
       build:
@@ -3799,11 +3840,13 @@ scenarios:
         evidence:
           - composed-coalesces-repeat-run-boundary
           - composed-coalesces-canonical-identity
-      recovery: &recovery_unknown
-        status: unknown
-        reason: No complete database-reopen recovery case exists for this scenario.
+      recovery:
+        status: partial
+        evidence:
+          - harness-sequential-nested-fork-coalesce-reopen-terminal-publication
+        reason: Terminal publication recovery passes after both sequential coalesces, but literal between-merge recovery is not proven.
         owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
+        exit_gate: A genuine public between-merge corpus seam passes, or the requirement is deliberately revised, and the deferred-platform rerun passes.
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: *guided_fail
@@ -4104,7 +4147,11 @@ scenarios:
         reason: Exact durable leader-path evidence passes, but authoritative scheduler disposition and follower drain audit proof remain open under elspeth-2e66723070 and elspeth-6f6bbbec00.
         owner_issue: elspeth-2e66723070
         exit_gate: Both authoritative scheduler-disposition and follower-drain issues integrate, then durable and portable exact corpus evidence passes unchanged.
-      recovery: *recovery_unknown
+      recovery: &recovery_unknown
+        status: unknown
+        reason: No complete database-reopen recovery case exists for this scenario.
+        owner_issue: elspeth-ef29ef6ba4
+        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: *guided_fail

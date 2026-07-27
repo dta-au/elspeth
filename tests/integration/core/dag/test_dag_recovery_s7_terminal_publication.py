@@ -21,71 +21,15 @@ from tests.fixtures.dag_scenario_corpus.schema import HarnessCaseSpec, ScenarioS
 
 
 def _s7_recovery_case() -> tuple[ScenarioSpec, HarnessCaseSpec]:
-    manifest = load_manifest()
-    declared_cases = tuple(iter_harness_cases(manifest))
-    registered = next(
-        (
-            (scenario, case)
-            for scenario, case in declared_cases
-            if (scenario.id, case.id)
-            == (
-                "sequential-nested-fork-coalesce",
-                "reopen-terminal-publication",
-            )
-        ),
-        None,
-    )
-    if registered is not None:
-        return registered
-    scenario, run_case = next(
+    return next(
         (scenario, case)
-        for scenario, case in declared_cases
+        for scenario, case in iter_harness_cases(load_manifest())
         if (scenario.id, case.id)
         == (
             "sequential-nested-fork-coalesce",
-            "two-sequential-require-all",
+            "reopen-terminal-publication",
         )
     )
-    case_data = run_case.model_dump(mode="python")
-    case_data.update(
-        {
-            "id": "reopen-terminal-publication",
-            "workflow": "recovery",
-            "recovery_kind": "sink_boundary",
-            "recovery_fault": {
-                "kind": "sink_effect",
-                "seam": "before_effect",
-                "sink_name": "output",
-                "occurrence": 1,
-            },
-            "expected": {
-                "kind": "summary",
-                "status": "completed",
-                "output_rows": 3,
-                "required_audit_record_types": (
-                    "artifact",
-                    "call",
-                    "edge",
-                    "manifest",
-                    "node",
-                    "node_state",
-                    "operation",
-                    "routing_event",
-                    "row",
-                    "run",
-                    "scheduler_event",
-                    "sink_effect",
-                    "sink_effect_attempt",
-                    "sink_effect_member",
-                    "sink_effect_stream",
-                    "token",
-                    "token_outcome",
-                    "token_parent",
-                ),
-            },
-        }
-    )
-    return scenario, HarnessCaseSpec.model_validate(case_data)
 
 
 def test_s7_reopens_after_both_coalesces_and_publishes_once(
