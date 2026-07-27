@@ -259,6 +259,18 @@ describe("GuidedTurn dispatcher — routing", () => {
     expect(screen.getByRole("button", { name: "Edit customers" })).toBeEnabled();
   });
 
+  it("review_components: disallows an unusable tutorial source add", () => {
+    render(
+      <GuidedTurn
+        turn={makeTurn("review_components", COMPONENT_REVIEW_PAYLOAD)}
+        onSubmit={vi.fn()}
+        isTutorial
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Add source" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Finish sources" })).toBeEnabled();
+  });
+
   it("propose_pipeline: renders the current durable proposal renderer", () => {
     render(
       <GuidedTurn

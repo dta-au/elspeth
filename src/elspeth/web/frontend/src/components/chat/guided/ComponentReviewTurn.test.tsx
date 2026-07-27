@@ -124,15 +124,30 @@ describe("ComponentReviewTurn", () => {
           allowed_actions: ["add", "edit", "reorder", "finish"],
         }}
         onSubmit={onSubmit}
+        isTutorial
       />,
     );
 
     expect(screen.queryByRole("button", { name: "Remove audit_log" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Move audit_log/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Add output" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Edit audit_log" }));
     expect(onSubmit).toHaveBeenCalledWith(
       componentBody({ action: "edit", target: { kind: "output", stable_id: SOURCE_A } }),
     );
+  });
+
+  it("disallows adding a source in tutorial review while keeping finish actionable", () => {
+    render(
+      <ComponentReviewTurn
+        payload={SOURCE_REVIEW}
+        onSubmit={vi.fn()}
+        isTutorial
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Add source" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Finish sources" })).toBeEnabled();
   });
 
   it("hides closed actions and disables every rendered control while pending", () => {

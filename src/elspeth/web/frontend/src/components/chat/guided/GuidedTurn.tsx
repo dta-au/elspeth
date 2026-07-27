@@ -133,6 +133,7 @@ export function GuidedTurn({
           payload={turn.payload}
           onSubmit={guardedSubmit}
           disabled={disabled}
+          isTutorial={isTutorial}
         />
       );
     case "propose_pipeline":

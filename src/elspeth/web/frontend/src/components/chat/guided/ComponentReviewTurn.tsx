@@ -9,6 +9,7 @@ interface ComponentReviewTurnProps {
   payload: ComponentReviewPayload;
   onSubmit: (body: GuidedRespondAction) => void;
   disabled?: boolean;
+  isTutorial?: boolean;
 }
 
 function responseFor(component_action: GuidedComponentAction): GuidedRespondAction {
@@ -32,6 +33,7 @@ export function ComponentReviewTurn({
   payload,
   onSubmit,
   disabled = false,
+  isTutorial = false,
 }: ComponentReviewTurnProps) {
   const headingId = useId();
   const stableIds = payload.items.map((item) => item.stable_id);
@@ -138,7 +140,7 @@ export function ComponentReviewTurn({
         })}
       </ol>
       <div className="guided-component-review-actions">
-        {allowed.has("add") && (
+        {allowed.has("add") && !(isTutorial && payload.component_kind === "source") && (
           <button
             type="button"
             className="guided-component-review-btn"
