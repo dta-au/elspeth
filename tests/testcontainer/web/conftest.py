@@ -13,9 +13,12 @@ from xdist import is_xdist_worker
 
 _SEQUENTIAL_TEST_COMMAND = (
     "CI=1 uv run --frozen pytest -q -n 0 -m testcontainer "
+    "tests/testcontainer/web/test_schema_probe_postgres.py "
     "tests/testcontainer/web/test_external_deployment_postgres.py "
     "tests/testcontainer/web/test_aws_ecs_validate_only_startup.py "
-    "tests/testcontainer/web/test_doctor_aws_ecs_postgres.py"
+    "tests/testcontainer/web/test_doctor_aws_ecs_postgres.py "
+    "tests/testcontainer/web/test_aws_ecs_readiness_postgres.py "
+    "tests/testcontainer/web/test_landscape_write_gate_postgres.py"
 )
 
 

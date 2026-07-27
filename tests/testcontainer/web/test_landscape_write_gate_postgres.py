@@ -18,7 +18,6 @@ from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine, insert, inspect, select, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ProgrammingError
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -70,20 +69,8 @@ def _connect(url: str) -> psycopg.Connection[Any]:
     assert parsed.host is not None
     assert parsed.username is not None
     assert parsed.database is not None
-    return psycopg.connect(
-        host=parsed.host,
-        port=parsed.port or 5432,
-        dbname=parsed.database,
-        user=parsed.username,
-        password=parsed.password,
-        autocommit=True,
-    )
-
-
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    psycopg_url = parsed.set(drivername="postgresql").render_as_string(hide_password=False)
+    return psycopg.connect(psycopg_url, autocommit=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +82,8 @@ class _RuntimeDatabase:
 
 
 @pytest.fixture
-def runtime_database(postgres_url: str) -> Iterator[_RuntimeDatabase]:
+def runtime_database(external_deployment_postgres_url: str) -> Iterator[_RuntimeDatabase]:
+    postgres_url = external_deployment_postgres_url
     session_database = _identifier("session")
     landscape_database = _identifier("landscape")
     runtime_role = _identifier("runtime")

@@ -18,7 +18,6 @@ from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.engine import URL, make_url
 from structlog.testing import capture_logs
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 import elspeth.web.readiness as readiness_module
@@ -63,20 +62,8 @@ def _psycopg_connect(url: str) -> psycopg.Connection[Any]:
     assert parsed.host is not None
     assert parsed.username is not None
     assert parsed.database is not None
-    return psycopg.connect(
-        host=parsed.host,
-        port=parsed.port or 5432,
-        dbname=parsed.database,
-        user=parsed.username,
-        password=parsed.password,
-        autocommit=True,
-    )
-
-
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    psycopg_url = parsed.set(drivername="postgresql").render_as_string(hide_password=False)
+    return psycopg.connect(psycopg_url, autocommit=True)
 
 
 @dataclass
@@ -150,21 +137,21 @@ class _RuntimeDatabases:
 
 
 @pytest.fixture
-def runtime_databases(postgres_url: str) -> Iterator[_RuntimeDatabases]:
+def runtime_databases(external_deployment_postgres_url: str) -> Iterator[_RuntimeDatabases]:
     databases = _RuntimeDatabases(
-        postgres_url=postgres_url,
+        postgres_url=external_deployment_postgres_url,
         session_database=_identifier("ready_session"),
         landscape_database=_identifier("ready_landscape"),
         runtime_role=_identifier("ready_runtime"),
         runtime_password=f"runtime-{uuid.uuid4().hex}",
     )
-    with _psycopg_connect(postgres_url) as admin:
+    with _psycopg_connect(databases.postgres_url) as admin:
         for database in (databases.session_database, databases.landscape_database):
             admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
     try:
         yield databases
     finally:
-        with _psycopg_connect(postgres_url) as admin:
+        with _psycopg_connect(databases.postgres_url) as admin:
             for database in (databases.session_database, databases.landscape_database):
                 admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
             if databases.role_created:
@@ -191,7 +178,7 @@ def _settings(tmp_path: Path, databases: _RuntimeDatabases) -> WebSettings:
         payload_store_path=payload_dir,
         session_db_url=databases.session_runtime_url,
         landscape_url=databases.landscape_runtime_url,
-        secret_key="s" * 40,
+        secret_key="readiness-production-shaped-test-secret-40",
         shareable_link_signing_key=SecretBytes(bytes(range(32))),
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
