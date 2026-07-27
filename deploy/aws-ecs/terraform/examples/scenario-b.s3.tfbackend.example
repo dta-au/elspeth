@@ -1,0 +1,5 @@
+bucket         = "REPLACE_WITH_BOOTSTRAP_STATE_BUCKET"
+key            = "elspeth/scenario-b/terraform.tfstate"
+region         = "REPLACE_WITH_AWS_REGION"
+encrypt        = true
+use_lockfile   = true
