@@ -124,7 +124,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "partial",
+        "pass",
         "unknown",
         "pass",
         "fail",
@@ -407,8 +407,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "eae8a2e2ca114c658e075a279dc43e34ba976dc29dff1ddac5fb9f30a45e4ad0"
-EXPECTED_CASE_REGISTRY_SHA256 = "d0c1aa7428d528422a432aff84fc5b45e3335b57b0539887729017baf71f9fa5"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "184e6663333884675328b8107d1ae8b873ff2aec25a16d24b346ffd98a24f17b"
+EXPECTED_CASE_REGISTRY_SHA256 = "ee270aec6a707b5df5ee8f9b5be2a15c1fa9955445ecdbf88bd43b540c8b124c"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -437,6 +437,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "linear:happy-path": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "linear:reopen-after-source": "12adb2d878a143756243fb56138b50b1e86ab21c6b3f439c2c79dd037ddf96e4",
     "multiple-independent-sources:independent-roots": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
+    "multiple-independent-sources:independent-roots-reopen-resume": "10b5d812e415dddd67d088fc771da3d4623d75fc3d2e4041562a4e4ae02741c0",
     "multi-source-queue-fan-in:queued-fan-in": "ccff919ce91062633679fcbe577194b4ce3c852a90c1f8f97622ac371b377c4e",
     "conditional-routing:two-way-gate": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
     "conditional-routing:error-route-and-discard": "27dbf1f2d1908a6f6f3df8166bff152e56977d93ffc4061c91c48871c26a282b",
@@ -496,6 +497,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-multiple-independent-sources-independent-roots",
         "multiple-independent-sources:independent-roots",
         ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-multiple-independent-sources-independent-roots-reopen-resume",
+        "multiple-independent-sources:independent-roots-reopen-resume",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
     (
         "harness-multi-source-queue-fan-in-queued-fan-in",
@@ -4738,7 +4744,7 @@ def _clear_registered_linear_cases(raw: dict[str, object]) -> dict[str, object]:
     for registered_case in cast(list[dict[str, object]], scenario["cases"]):
         _remove_harness_evidence(raw, f"linear:{registered_case['id']}")
     scenario["cases"] = []
-    _raw_dimensions(scenario)["recovery"] = deepcopy(_raw_dimensions(_raw_scenarios(raw)[1])["recovery"])
+    _raw_dimensions(scenario)["recovery"] = deepcopy(_raw_dimensions(_raw_scenarios(raw)[2])["recovery"])
     return scenario
 
 
@@ -4767,6 +4773,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("linear", "happy-path"),
         ("linear", "reopen-after-source"),
         ("multiple-independent-sources", "independent-roots"),
+        ("multiple-independent-sources", "independent-roots-reopen-resume"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
@@ -4799,11 +4806,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 101
+    assert len(manifest.evidence) == 102
     assert len(assessment_evidence) == 61
-    assert len(harness_evidence) == 40
-    assert len({reference.id for reference in manifest.evidence}) == 101
-    assert len({reference.locator for reference in manifest.evidence}) == 101
+    assert len(harness_evidence) == 41
+    assert len({reference.id for reference in manifest.evidence}) == 102
+    assert len({reference.locator for reference in manifest.evidence}) == 102
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4819,6 +4826,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("linear", "happy-path"),
         ("linear", "reopen-after-source"),
         ("multiple-independent-sources", "independent-roots"),
+        ("multiple-independent-sources", "independent-roots-reopen-resume"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
@@ -4867,6 +4875,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("multiple-independent-sources", "runtime"),
             ("multiple-independent-sources", "audit"),
         ),
+        "harness-multiple-independent-sources-independent-roots-reopen-resume": (("multiple-independent-sources", "recovery"),),
         "harness-multi-source-queue-fan-in-queued-fan-in": (
             ("multi-source-queue-fan-in", "config"),
             ("multi-source-queue-fan-in", "build"),
@@ -5211,6 +5220,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("linear", "happy-path"),
         ("linear", "reopen-after-source"),
         ("multiple-independent-sources", "independent-roots"),
+        ("multiple-independent-sources", "independent-roots-reopen-resume"),
         ("multi-source-queue-fan-in", "queued-fan-in"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),

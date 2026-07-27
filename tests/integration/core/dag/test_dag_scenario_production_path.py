@@ -2510,6 +2510,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         if declared_case.workflow == "recovery"
     ) == (
         ("linear", "reopen-after-source"),
+        ("multiple-independent-sources", "independent-roots-reopen-resume"),
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),

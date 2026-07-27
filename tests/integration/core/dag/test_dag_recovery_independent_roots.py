@@ -25,46 +25,15 @@ from tests.fixtures.dag_scenario_corpus.schema import (
 
 def _independent_roots_recovery_case() -> tuple[ScenarioSpec, HarnessCaseSpec]:
     manifest = load_manifest()
-    scenario, run_case = next(
+    return next(
         (scenario, case)
         for scenario, case in iter_harness_cases(manifest)
         if (scenario.id, case.id)
         == (
             "multiple-independent-sources",
-            "independent-roots",
+            "independent-roots-reopen-resume",
         )
     )
-    values = run_case.model_dump(mode="json")
-    values.update(
-        {
-            "id": "independent-roots-reopen-resume",
-            "workflow": "recovery",
-            "recovery_kind": "sink_boundary",
-            "recovery_fault": {
-                "kind": "sink_effect",
-                "seam": "before_effect",
-                "sink_name": "output",
-                "occurrence": 1,
-            },
-            "expected": {
-                "kind": "summary",
-                "status": "completed",
-                "output_rows": 6,
-                "required_audit_record_types": [
-                    "artifact",
-                    "operation",
-                    "row",
-                    "run",
-                    "scheduler_event",
-                    "sink_effect",
-                    "sink_effect_member",
-                    "token",
-                    "token_outcome",
-                ],
-            },
-        }
-    )
-    return scenario, HarnessCaseSpec.model_validate(values)
 
 
 def test_independent_roots_reopen_and_resume_without_replay_or_reminting(

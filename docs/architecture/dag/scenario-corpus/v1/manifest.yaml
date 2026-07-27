@@ -295,6 +295,11 @@ evidence:
     locator: multiple-independent-sources:independent-roots
     claim: The independent-roots corpus case executes two independently named source roots through the production runtime and exact durable and portable audit paths.
     stages: [config, build, runtime, audit]
+  - id: harness-multiple-independent-sources-independent-roots-reopen-resume
+    kind: harness
+    locator: multiple-independent-sources:independent-roots-reopen-resume
+    claim: A declared production sink-effect BEFORE_EFFECT interruption after both independent sources are exhausted proves six ordered durable rows and exactly two source loads, then closes and reopens fresh database, payload-store, settings, plugins, graph, and config objects for public resume that reuses all six token, scheduler-work, sink-effect, artifact, and member identities, publishes the canonical six-row output once, terminalizes work and outcomes, removes the checkpoint, and preserves durable/export parity; this single-process pre-platform evidence is provisional until the deferred-platform rebase.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-multi-source-queue-fan-in-queued-fan-in
     kind: harness
     locator: multi-source-queue-fan-in:queued-fan-in
@@ -1310,6 +1315,34 @@ scenarios:
             ],
             "source_operation_count": 2
           }
+      - id: independent-roots-reopen-resume
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: output
+          occurrence: 1
+        fixture: multiple-independent-sources/independent-roots.yaml
+        input_fixtures:
+          orders: multiple-independent-sources/orders.csv
+          refunds: multiple-independent-sources/refunds.csv
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 6
+          required_audit_record_types:
+            - artifact
+            - operation
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_member
+            - token
+            - token_outcome
     dimensions:
       config:
         status: pass
@@ -1334,12 +1367,11 @@ scenarios:
       audit:
         status: pass
         evidence: [core-builder-schema-plural-sources-07, harness-multiple-independent-sources-independent-roots]
-      recovery: &recovery_partial
-        status: partial
-        evidence: [focused-crash-restart-09]
-        reason: The source-ingress crash seam now passes public-resume, fail-closed, and exactly-once plugin assertions, but the complete linear scenario recovery matrix is not yet executable evidence.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
+      recovery:
+        status: pass
+        evidence:
+          - focused-crash-restart-09
+          - harness-multiple-independent-sources-independent-roots-reopen-resume
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: &guided_fail
