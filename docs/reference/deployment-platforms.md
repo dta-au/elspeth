@@ -1,12 +1,14 @@
 # Deployment Platforms
 
 ELSPETH ships one container image and a small set of maintained deployment
-artifacts. The image contains PostgreSQL clients, not a PostgreSQL server:
-both `postgresql+psycopg://` (psycopg v3) and
-`postgresql+psycopg2://` (psycopg2) URLs work. Compose is the only shipped
-bundle that provisions PostgreSQL. AWS ECS, Azure production, and Kubernetes
-BYO deployments require operator-provided external PostgreSQL. Native Linux
-may instead use SQLite on one persistent host or external PostgreSQL.
+artifacts. The image contains PostgreSQL clients, not a PostgreSQL server or
+`psql`. These clients are the psycopg v3 and psycopg2 Python drivers; both
+`postgresql+psycopg://` and `postgresql+psycopg2://` URLs work. The final
+runtime is a pinned non-root distroless image with no package manager. Compose
+is the only shipped bundle that provisions PostgreSQL. AWS ECS, Azure
+production, and Kubernetes BYO deployments require operator-provided external
+PostgreSQL. Native Linux may instead use SQLite on one persistent host or
+external PostgreSQL.
 
 Use an immutable, release-specific image tag or digest. ELSPETH web currently
 supports one web process or replica. Payload persistence is separate from
@@ -17,7 +19,7 @@ database persistence: preserve both stores across every replacement.
 | Profile | Database | Payload storage | Deployment entry point | Status |
 | --- | --- | --- | --- | --- |
 | Docker Compose | Bundled PostgreSQL sidecar, or operator external PostgreSQL; SQLite remains suitable for CLI/local work | Named `elspeth_state` volume | [Docker guide](../guides/docker.md) and [`deploy/compose`](../../deploy/compose) three-file bundle | Maintained |
-| AWS ECS | External Aurora PostgreSQL or PostgreSQL | EFS or another external filesystem | [AWS ECS operator-supplied task-definition runbook/controller](../runbooks/aws-ecs-deployment.md) | Maintained |
+| AWS ECS | External Aurora PostgreSQL or PostgreSQL | EFS or another external filesystem | [Existing-service redeploy](../runbooks/aws-ecs-existing-service-redeploy.md); [full disposable acceptance](../runbooks/aws-ecs-deployment.md) | Maintained |
 | Azure Ubuntu VM | External Azure Database for PostgreSQL in production; SQLite only for explicitly non-production use on one persistent host | Persistent host storage | [Native Linux/Azure VM runbook](../runbooks/ansible-ubuntu-deployment.md) using [`deploy/linux-systemd/elspeth-web.service`](../../deploy/linux-systemd/elspeth-web.service) | Maintained as exactly one Azure Ubuntu VM |
 | Kubernetes (BYO manifests) | External PostgreSQL | Operator-provided persistent payload storage | BYO manifests only | Runtime contract only; no maintained bundle in this release |
 | Native Linux | SQLite on one single host, or external PostgreSQL | Persistent host directory | [Native Linux/Azure VM runbook](../runbooks/ansible-ubuntu-deployment.md) and [portable systemd unit](../../deploy/linux-systemd/elspeth-web.service) | Maintained |
@@ -54,9 +56,17 @@ state volumes have independent lifecycles.
 ## AWS ECS
 
 AWS uses one ECS task, external Aurora PostgreSQL/PostgreSQL, and durable EFS
-paths. The operator supplies candidate, doctor, and previous task-definition
-ARNs to the [AWS runbook/controller](../runbooks/aws-ecs-deployment.md), which
-validates the exact definitions and enforces `minimumHealthyPercent=0`,
+paths. For an everyday image/config replacement, follow the
+[existing-service redeploy runbook](../runbooks/aws-ecs-existing-service-redeploy.md).
+It discovers the current service, publishes an immutable ECR image, requires
+the registry scan, clones the selected task definition narrowly, runs a
+one-shot doctor, and proves the candidate task and both probes.
+
+The exhaustive [full acceptance runbook](../runbooks/aws-ecs-deployment.md)
+provisions and destroys a disposable two-scenario environment using an
+external Terraform package. It is not the everyday redeploy procedure. That
+program's operator supplies candidate, doctor, and previous task-definition
+ARNs; the controller validates them and enforces `minimumHealthyPercent=0`,
 `maximumPercent=100`, and `desiredCount=1` so replacement is deliberately
 zero-overlap.
 

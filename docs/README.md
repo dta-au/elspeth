@@ -69,6 +69,7 @@ Tutorials and operator/developer how-to material.
 - [Clarion for Codex Agents](guides/clarion-for-codex-agents.md)
 - [Troubleshooting](guides/troubleshooting.md)
 - [Docker](guides/docker.md)
+- [Deployment Platforms](reference/deployment-platforms.md)
 
 ## Reference
 
@@ -93,6 +94,9 @@ Runbooks and production procedures.
 - [Backup and Recovery](runbooks/backup-and-recovery.md)
 - [Configure Key Vault Secrets](runbooks/configure-keyvault-secrets.md)
 - [Ansible Ubuntu Deployment](runbooks/ansible-ubuntu-deployment.md)
+- [Caddy Development Install Refresh](runbooks/caddy-development-refresh.md)
+- [AWS ECS Existing-Service Redeploy](runbooks/aws-ecs-existing-service-redeploy.md)
+- [AWS ECS Full Disposable Acceptance](runbooks/aws-ecs-deployment.md)
 
 ## Release History
 

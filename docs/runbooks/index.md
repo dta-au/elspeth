@@ -17,7 +17,9 @@ Operational procedures for ELSPETH pipeline management.
 | [Backup and Recovery](backup-and-recovery.md) | Backup audit trail, restore from backup |
 | [Deployment Platforms](../reference/deployment-platforms.md) | Choose a maintained Compose, AWS ECS, native Linux, or Azure Ubuntu VM path; Kubernetes is BYO and Azure Container Apps is deferred |
 | [Native Linux and Azure Ubuntu VM Deployment](ansible-ubuntu-deployment.md) | Install one systemd-managed web process on Ubuntu; Azure may use one VM behind Front Door |
-| [AWS ECS Deployment](aws-ecs-deployment.md) | Deploying ELSPETH web to AWS ECS Fargate with Aurora PostgreSQL |
+| [Caddy Development Install Refresh](caddy-development-refresh.md) | Rebuild the frontend and restart the repository-specific source-checkout service behind Caddy |
+| [AWS ECS Existing-Service Redeploy](aws-ecs-existing-service-redeploy.md) | Build, scan, and deploy an immutable image to an existing ECS/Fargate service |
+| [AWS ECS Full Disposable Acceptance](aws-ecs-deployment.md) | Provision, exercise, and destroy the release-specific two-scenario acceptance environment |
 | [AWS ECS Bedrock Opus and Sonnet](aws-ecs-bedrock-opus-sonnet.md) | Configure and validate operator-approved Bedrock Opus and Sonnet profiles on ECS |
 | [Audit Tier-1 Violation](audit-tier1-violation.md) | Compose-loop audit counters or audit-grade transcript logging fail |
 

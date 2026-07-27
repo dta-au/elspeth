@@ -371,6 +371,11 @@ After restart, verify by composing a new session and confirming the new guidance
 
 The staging site is a source-checkout systemd/Caddy deployment from `/home/john/elspeth`, not the generic VM/Docker flow. When a pre-release plan changes the session DB schema (e.g. composer-progress-persistence Phase 1A and later schema-changing phases), the schema validator at startup will refuse a stale DB; the only accepted cutover path is archive + delete + recreate. Row-level `DELETE FROM chat_messages` / `DELETE FROM composition_states` is incorrect: it leaves the old table shape behind and startup rejects the stale DB.
 
+For an ordinary frontend rebuild and backend restart that does not require a
+schema reset, use
+[Caddy development install refresh](caddy-development-refresh.md). Do not run
+this destructive reset procedure merely to refresh application code or assets.
+
 This procedure destroys staging session rows, chat history, composition states, audit access log rows, runs, run events, blob/blob-link database records, and encrypted `user_secrets` stored in the web session DB. It does not delete blob payload files under the data directory, payload storage, Filigree state, or source files. **If the deploy changes only the session DB schema, do not touch a current Landscape audit DB. If the Landscape schema is stale, archive/export required evidence and recreate it with the current release; no predecessor schema is transformed in place.** **Do not run any of this outside staging.**
 
 For SQLite, `sessions.db`, `sessions.db-wal`, `sessions.db-shm`, and `sessions.db-journal` are handled as one matched artifact set for archive, deletion, and recreation.

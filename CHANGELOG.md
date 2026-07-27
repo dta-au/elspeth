@@ -8,6 +8,21 @@ All notable changes to ELSPETH are documented here.
 
 ### Deployment
 
+- **Release containers are minimal and scan-clean** — the final runtime now
+  uses a pinned non-root distroless Python image, keeps OS build packages and
+  package managers out of the release layer, preserves the BusyBox shell
+  compatibility required by the shipped Compose/ECS launch wrappers, and
+  normalizes generated frontend assets so the runtime identity can read them.
+  The locked frontend dependency tree audits clean, and the AWS redeploy path
+  scans the platform manifest rather than mistaking an unscannable OCI parent
+  index for a clean image.
+- **Everyday AWS redeploy is separate from full acceptance provisioning** —
+  the existing-service runbook discovers the live ECR/ECS contract, publishes
+  an immutable digest, records the full release SHA and actual task-definition
+  revision, runs doctor before service mutation, and verifies the candidate
+  task, target, liveness, readiness, and telemetry identity. The exhaustive
+  two-scenario Terraform acceptance runbook remains a separate,
+  release-specific procedure.
 - **Honest cross-platform deployment contract** — the release publishes a
   maintained three-file Docker Compose/PostgreSQL bundle, the existing AWS ECS
   acceptance/deployment controller for operator-supplied task-definition ARNs,

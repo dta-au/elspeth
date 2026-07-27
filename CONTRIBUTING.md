@@ -4,16 +4,27 @@ Thanks for your interest in contributing to ELSPETH! This document covers the ba
 
 ## Development Setup
 
+Install Python 3.12 or newer, `uv`, Node.js 24, and npm 11. The repository's
+`.node-version`, `package.json`, and lockfiles are the toolchain authority.
+
 ```bash
 git clone https://github.com/johnm-dta/elspeth.git && cd elspeth
-uv venv && source .venv/bin/activate
-uv pip install -e ".[dev,azure]"
+uv sync --frozen --extra dev --extra azure
+source .venv/bin/activate
 
 # Azure Blob integration tests require the Azurite emulator
-npm install
+npm ci
+
+# Web Composer changes also require the separately locked frontend tree
+npm --prefix src/elspeth/web/frontend ci
 ```
 
-**Important:** Use `uv` for all package management. Do not use `pip` directly.
+Use `uv` for Python package management and `npm ci` for both locked JavaScript
+trees. Do not use `pip` directly or refresh a lockfile as an incidental setup
+step.
+
+For the repository-specific Caddy/systemd development install, follow
+[Caddy development install refresh](docs/runbooks/caddy-development-refresh.md).
 
 ## Running Quality Checks
 

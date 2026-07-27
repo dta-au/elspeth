@@ -99,15 +99,21 @@ row and confirm every live token reached an expected terminal path.
 
 ## Docker Resume
 
-When running in Docker:
+When running in Docker, select an exact tag that you have confirmed exists in
+the registry. Use the same immutable image identity that created the
+checkpoint unless a reviewed compatibility decision approves a newer image:
 
 ```bash
+: "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
+docker buildx imagetools inspect \
+  "ghcr.io/johnm-dta/elspeth:${IMAGE_TAG}" >/dev/null
+
 docker run --rm \
   -v $(pwd)/config:/app/config:ro \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/state:/app/state \
-  ghcr.io/johnm-dta/elspeth:latest \
+  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
   resume <RUN_ID> --execute
 ```
 

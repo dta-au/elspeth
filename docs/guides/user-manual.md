@@ -22,12 +22,14 @@ This manual covers day-to-day usage of the ELSPETH CLI for running auditable pip
 
 ### Installation
 
+Install Python 3.12 or newer and `uv`, then synchronize the locked source
+checkout:
+
 ```bash
-# Clone and install
 git clone https://github.com/johnm-dta/elspeth.git
 cd elspeth
-uv venv && source .venv/bin/activate
-uv pip install -e ".[all]"  # Full installation with LLM support
+uv sync --frozen --all-extras
+source .venv/bin/activate
 ```
 
 ### Verify Installation
@@ -662,10 +664,13 @@ For comprehensive troubleshooting, see the [Troubleshooting Guide](troubleshooti
 
 **"ELSPETH_FINGERPRINT_KEY is not set"** - Set the key or allow raw secrets for development:
 ```bash
-export ELSPETH_FINGERPRINT_KEY="your-key"
+export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
 # OR for development only:
 export ELSPETH_ALLOW_RAW_SECRETS=true
 ```
+
+Persist the generated production fingerprint key in the deployment secret
+manager; changing it breaks credential correlation across audit records.
 
 **"Unknown plugin: xyz"** - Check available plugins with `elspeth plugins list` (names are case-sensitive).
 

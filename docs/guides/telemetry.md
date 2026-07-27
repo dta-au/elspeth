@@ -140,8 +140,11 @@ telemetry:
 
 **Required dependency:**
 ```bash
-uv pip install opentelemetry-exporter-otlp-proto-grpc
+uv sync --frozen
 ```
+
+The OTLP exporter is a locked base dependency; no ad-hoc package install is
+required.
 
 **Span mapping:**
 - `span.name` = Event class name (e.g., "TransformCompleted")
@@ -217,7 +220,7 @@ telemetry:
 
 **Required dependency:**
 ```bash
-uv pip install azure-monitor-opentelemetry-exporter
+uv sync --frozen --extra azure
 ```
 
 **Azure-specific features:**
@@ -229,7 +232,8 @@ uv pip install azure-monitor-opentelemetry-exporter
 **Finding your connection string:**
 1. Go to Azure Portal > Application Insights resource
 2. Overview > Connection String (copy)
-3. Set as environment variable: `export APPLICATIONINSIGHTS_CONNECTION_STRING="InstrumentationKey=..."`
+3. Load it from the approved secret store:
+   `: "${APPLICATIONINSIGHTS_CONNECTION_STRING:?load the connection string}"`
 
 ### Datadog Exporter
 
@@ -247,10 +251,10 @@ telemetry:
         version: "1.0.0"            # Optional service version tag
 ```
 
-**Required dependency:**
-```bash
-uv pip install ddtrace
-```
+**Required dependency:** `ddtrace` is not part of ELSPETH's maintained
+lockfile or deployment extras. Use the Datadog exporter only from a separately
+reviewed, locked downstream environment that adds a compatible `ddtrace`;
+do not modify the repository `.venv` ad hoc.
 
 **Datadog-specific features:**
 - All event fields available as `elspeth.*` tags
@@ -260,11 +264,12 @@ uv pip install ddtrace
 **Using with Datadog Agent (recommended):**
 ```bash
 # Start Datadog Agent (Docker example)
+: "${DD_AGENT_IMAGE:?set an operator-approved immutable Datadog Agent image reference}"
 docker run -d --name dd-agent \
-  -e DD_API_KEY=${DD_API_KEY} \
+  -e DD_API_KEY="${DD_API_KEY:?load the Datadog key from the secret store}" \
   -e DD_APM_ENABLED=true \
   -p 8126:8126 \
-  datadog/agent:latest
+  "$DD_AGENT_IMAGE"
 ```
 
 ## Secrets Handling
@@ -288,7 +293,7 @@ telemetry:
 
 ```bash
 # .env file (gitignored) - secrets for local development
-OTEL_TOKEN=my-secret-token
+OTEL_TOKEN=fake_otel_token_for_docs_only
 ```
 
 | Secret Type | Environment Variable |

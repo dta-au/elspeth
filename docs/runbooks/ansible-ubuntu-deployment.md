@@ -70,7 +70,8 @@ session database.
 The examples use `/opt/elspeth` for the checked-out release:
 
 ```bash
-export ELSPETH_RELEASE_REF=v0.7.2
+: "${ELSPETH_RELEASE_REF:?set the approved full 40-character Git commit SHA}"
+[[ "$ELSPETH_RELEASE_REF" =~ ^[0-9a-f]{40}$ ]]
 sudo install -d -o elspeth -g elspeth -m 0750 /opt/elspeth
 if [ ! -d /opt/elspeth/.git ]; then
   sudo -u elspeth git clone --filter=blob:none \
@@ -78,6 +79,7 @@ if [ ! -d /opt/elspeth/.git ]; then
 fi
 sudo -u elspeth git -C /opt/elspeth fetch --tags --force
 sudo -u elspeth git -C /opt/elspeth checkout --detach "$ELSPETH_RELEASE_REF"
+test "$(git -C /opt/elspeth rev-parse HEAD)" = "$ELSPETH_RELEASE_REF"
 cd /opt/elspeth
 sudo --preserve-env=ELSPETH_JUDGE_METADATA_HMAC_KEY -u elspeth \
   uv run --frozen --extra dev elspeth-lints check --rules trust_tier.tier_model \
@@ -211,9 +213,11 @@ replacement until the old process is gone.
    output:
 
    ```bash
-   export ELSPETH_RELEASE_REF=v0.7.2
+   : "${ELSPETH_RELEASE_REF:?set the approved full 40-character Git commit SHA}"
+   [[ "$ELSPETH_RELEASE_REF" =~ ^[0-9a-f]{40}$ ]]
    sudo -u elspeth git -C /opt/elspeth fetch --tags --force
    sudo -u elspeth git -C /opt/elspeth checkout --detach "$ELSPETH_RELEASE_REF"
+   test "$(git -C /opt/elspeth rev-parse HEAD)" = "$ELSPETH_RELEASE_REF"
    cd /opt/elspeth
    sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra postgres
    sudo -u elspeth node --version  # must report v24.x
@@ -289,9 +293,11 @@ Rollback is also stop-before-start:
    with the approved previous tag or commit:
 
    ```bash
-   export ELSPETH_ROLLBACK_REF=v0.7.1
+   : "${ELSPETH_ROLLBACK_REF:?set the approved full 40-character rollback commit SHA}"
+   [[ "$ELSPETH_ROLLBACK_REF" =~ ^[0-9a-f]{40}$ ]]
    sudo -u elspeth git -C /opt/elspeth fetch --tags --force
    sudo -u elspeth git -C /opt/elspeth checkout --detach "$ELSPETH_ROLLBACK_REF"
+   test "$(git -C /opt/elspeth rev-parse HEAD)" = "$ELSPETH_ROLLBACK_REF"
    cd /opt/elspeth
    sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra postgres
    sudo -u elspeth node --version  # must report v24.x

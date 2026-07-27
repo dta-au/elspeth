@@ -131,24 +131,43 @@ Add the secrets your pipeline needs.
 
 ### 3.1 Common Secrets
 
+Use a mode-0600 temporary file so secret values do not appear in command-line
+arguments. Load the provider key from an approved secret source first:
+
 ```bash
+set -Eeuo pipefail
+: "${AZURE_OPENAI_API_KEY:?load the Azure OpenAI key from the secret store}"
+: "${AZURE_OPENAI_ENDPOINT:?set the Azure OpenAI endpoint}"
+
+SECRET_FILE=$(mktemp)
+chmod 600 "$SECRET_FILE"
+trap 'rm -f -- "$SECRET_FILE"' EXIT HUP INT TERM
+
 # Azure OpenAI API key
+printf '%s' "$AZURE_OPENAI_API_KEY" >"$SECRET_FILE"
 az keyvault secret set \
   --vault-name "$VAULT_NAME" \
   --name "azure-openai-key" \
-  --value "your-actual-api-key-here"
+  --file "$SECRET_FILE" \
+  --encoding utf-8 \
+  --output none
+unset AZURE_OPENAI_API_KEY
 
 # Azure OpenAI endpoint
 az keyvault secret set \
   --vault-name "$VAULT_NAME" \
   --name "openai-endpoint" \
-  --value "https://your-openai-instance.openai.azure.com/"
+  --value "$AZURE_OPENAI_ENDPOINT" \
+  --output none
 
 # ELSPETH fingerprint key (used for secret fingerprinting in audit trail)
+openssl rand -hex 32 >"$SECRET_FILE"
 az keyvault secret set \
   --vault-name "$VAULT_NAME" \
   --name "elspeth-fingerprint-key" \
-  --value "$(openssl rand -hex 32)"  # Generate a random 64-char hex string
+  --file "$SECRET_FILE" \
+  --encoding utf-8 \
+  --output none
 ```
 
 ### 3.2 Verify Secrets
@@ -378,11 +397,8 @@ elspeth run --settings settings.yaml --execute
 
 2. **Using service principal with wrong credentials:**
    ```bash
-   export AZURE_CLIENT_ID="your-client-id"
-   export AZURE_CLIENT_SECRET="your-client-secret"
-   export AZURE_TENANT_ID="your-tenant-id"
-
-   # Verify credentials
+   # Authenticate through the deployment's approved workload identity or
+   # protected service-principal flow; do not paste a client secret here.
    az account show --query tenantId
    ```
 
@@ -421,11 +437,7 @@ elspeth run --settings settings.yaml --execute
      --vault-name "elspeth-prod-vault" \
      --query "[].name"
 
-   # If missing, create it
-   az keyvault secret set \
-     --vault-name "elspeth-prod-vault" \
-     --name "azure-openai-key" \
-     --value "your-api-key-here"
+   # If missing, repeat Step 3.1's file-backed secret creation procedure.
    ```
 
 3. **Wrong vault name in settings:**
@@ -447,7 +459,7 @@ elspeth run --settings settings.yaml --execute
    ```bash
    # Check your role assignment
    az role assignment list \
-     --assignee "your-email@example.com" \
+     --assignee "operator@example.com" \
      --resource-group "my-resource-group" \
      --query "[].roleDefinitionName"
 
@@ -532,10 +544,7 @@ elspeth run --settings settings.yaml --execute
 
 ```bash
 # Create a random fingerprint key
-az keyvault secret set \
-  --vault-name "elspeth-prod-vault" \
-  --name "elspeth-fingerprint-key" \
-  --value "$(openssl rand -hex 32)"
+# Repeat Step 3.1's file-backed fingerprint-key creation procedure.
 
 # Or skip the fingerprint key (if not using audit fingerprints):
 # Set it in the process environment before ELSPETH starts
@@ -558,12 +567,12 @@ If you previously used environment variables for secrets, migrate to Key Vault.
 
 ```bash
 # Old: secrets stored in .env or exported in shell
-export AZURE_OPENAI_KEY="sk-..."
-export AZURE_OPENAI_ENDPOINT="https://..."
+export AZURE_OPENAI_KEY="fake_azure_openai_key_for_docs_only"
+export AZURE_OPENAI_ENDPOINT="https://example-resource.openai.azure.com/"
 
 # .env file (only for local development, and never committed)
-AZURE_OPENAI_KEY=sk-...
-AZURE_OPENAI_ENDPOINT=https://...
+AZURE_OPENAI_KEY=fake_azure_openai_key_for_docs_only
+AZURE_OPENAI_ENDPOINT=https://example-resource.openai.azure.com/
 
 # Pipeline config didn't have secrets section
 # settings.yaml (old)
@@ -688,7 +697,7 @@ For audit integrity, we record a fingerprint (HMAC) of the secret, not the secre
 
 ```python
 # Never stored in audit trail:
-secret_value = "sk-proj-1234567890..."
+secret_value = "fake_secret_value_for_docs_only"
 
 # Stored instead:
 fingerprint = hmac.new(

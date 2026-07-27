@@ -30,8 +30,8 @@ Choose your environment:
 
 | Environment | Requirements |
 |-------------|--------------|
-| **Local Python** | Python 3.11+, uv package manager |
-| **Web UI** | Python 3.11+, uv, npm, `.[webui]` extra, local auth user |
+| **Local Python** | Python 3.12+, uv package manager |
+| **Web UI** | Python 3.12+, uv, Node.js 24, npm 11, `webui` extra, local auth user |
 | **Docker** | Docker installed and running |
 
 ---
@@ -45,10 +45,9 @@ Choose your environment:
 git clone https://github.com/johnm-dta/elspeth.git
 cd elspeth
 
-# Create virtual environment and install
-uv venv
+# Create the locked virtual environment and install
+uv sync --frozen --extra dev
 source .venv/bin/activate
-uv pip install -e ".[dev]"
 
 # Verify installation
 elspeth --version
@@ -255,18 +254,17 @@ Use this path when you want to:
 From the repository root:
 
 ```bash
-uv venv
+uv sync --frozen --extra webui --extra dev
 source .venv/bin/activate
-uv pip install -e ".[webui,dev]"
+node --version  # must report v24.x
+npm --version   # must report 11.x
 ```
 
 ### Step 2: Build the Frontend Bundle
 
 ```bash
-cd src/elspeth/web/frontend
-npm install
-npm run build
-cd ../../../../
+npm --prefix src/elspeth/web/frontend ci
+npm --prefix src/elspeth/web/frontend run build
 ```
 
 The FastAPI app serves the built React bundle from
@@ -274,34 +272,25 @@ The FastAPI app serves the built React bundle from
 
 ### Step 3: Create a Local Demo User
 
-Use a non-default signing key and create a local development account:
+Create the required local data roots and generate fresh development-only
+signing keys:
 
 ```bash
-export ELSPETH_WEB__SECRET_KEY="local-dev-secret-key"
+mkdir -p data/blobs data/outputs
+export ELSPETH_WEB__SECRET_KEY="$(openssl rand -hex 32)"
+export ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="$(openssl rand -base64 32)"
+export ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15
+export ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10
+export ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0
+export ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60
 
-python - <<'PY'
-import os
-from pathlib import Path
-from elspeth.web.auth.local import LocalAuthProvider
-
-provider = LocalAuthProvider(
-    db_path=Path("data/auth.db"),
-    secret_key=os.environ["ELSPETH_WEB__SECRET_KEY"],
-)
-try:
-    provider.create_user(
-        user_id="demo",
-        password="demo12345",
-        display_name="Demo User",
-        email="demo@example.com",
-    )
-    print("Created demo user: demo / demo12345")
-except ValueError:
-    print("Demo user already exists: demo / demo12345")
-PY
+elspeth composer users add demo \
+  --display-name "Demo User" \
+  --email demo@example.com
 ```
 
-Do not reuse these credentials outside local development.
+When prompted, enter `demo12345` as the password. Do not reuse these credentials
+or signing keys outside local development.
 
 ### Step 4: Start the Web App
 
@@ -355,12 +344,21 @@ source CSV -> threshold decision -> normal/high-value outputs -> audit record
 
 ## Option C: Running with Docker
 
+Select a tag that you have confirmed exists in the registry. Do not use a
+moving `latest` tag or infer an image tag from the package version:
+
+```bash
+: "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
+docker buildx imagetools inspect \
+  "ghcr.io/johnm-dta/elspeth:${IMAGE_TAG}" >/dev/null
+```
+
 ### Step 1: Set Up Directory Structure
 
 Create a working directory with the required structure:
 
 ```bash
-mkdir -p my-pipeline/{config,input,output,state}
+mkdir -p my-pipeline/{config,input,output,data}
 cd my-pipeline
 ```
 
@@ -449,7 +447,7 @@ EOF
 docker run --rm \
   -v $(pwd)/config:/app/config:ro \
   -v $(pwd)/input:/app/input:ro \
-  ghcr.io/johnm-dta/elspeth:latest \
+  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
   validate --settings /app/config/pipeline.yaml
 ```
 
@@ -471,7 +469,7 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:latest \
+  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
@@ -501,7 +499,7 @@ For Docker environments where TUI isn't available, use non-interactive explain o
 ```bash
 docker run --rm \
   -v $(pwd)/data:/app/data:ro \
-  ghcr.io/johnm-dta/elspeth:latest \
+  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
   explain --run latest --row 2 --no-tui --database /app/data/audit.db
 ```
 
@@ -517,7 +515,7 @@ For repeated runs, docker-compose is more convenient:
 # docker-compose.yaml
 services:
   elspeth:
-    image: ghcr.io/johnm-dta/elspeth:latest
+    image: ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set the confirmed published tag}
     volumes:
       - ./config:/app/config:ro
       - ./input:/app/input:ro
@@ -736,14 +734,19 @@ elspeth plugins inspect source csv
 ### Web UI Commands
 
 ```bash
-uv pip install -e ".[webui,dev]"
+uv sync --frozen --extra webui --extra dev
+source .venv/bin/activate
 
-cd src/elspeth/web/frontend
-npm install
-npm run build
-cd ../../../../
+npm --prefix src/elspeth/web/frontend ci
+npm --prefix src/elspeth/web/frontend run build
 
-export ELSPETH_WEB__SECRET_KEY="local-dev-secret-key"
+mkdir -p data/blobs data/outputs
+export ELSPETH_WEB__SECRET_KEY="$(openssl rand -hex 32)"
+export ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="$(openssl rand -base64 32)"
+export ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15
+export ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10
+export ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0
+export ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60
 elspeth web --host 127.0.0.1 --port 8451
 ```
 
@@ -763,7 +766,7 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:latest \
+  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set the confirmed published tag} \
   <command>
 ```
 

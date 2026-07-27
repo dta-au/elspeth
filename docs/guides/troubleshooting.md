@@ -41,12 +41,13 @@ This guide covers common errors and their solutions when running ELSPETH pipelin
 
 Option 1 - Set the fingerprint key (recommended for production):
 ```bash
-export ELSPETH_FINGERPRINT_KEY="your-secure-key-here"
+export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
 ```
 
-Or add to your `.env` file:
+Persist the generated value in your approved secret store. For local
+development, an untracked `.env` can reference the locally generated value:
 ```bash
-ELSPETH_FINGERPRINT_KEY=your-secure-key-here
+ELSPETH_FINGERPRINT_KEY=fake_replace_with_generated_value_for_docs_only
 ```
 
 Option 2 - Allow raw secrets (development only):
@@ -57,8 +58,8 @@ export ELSPETH_ALLOW_RAW_SECRETS=true
 **Docker:**
 ```bash
 docker run --rm \
-  -e ELSPETH_FINGERPRINT_KEY="your-key" \
-  ghcr.io/johnm-dta/elspeth:v0.7.2 \
+  -e ELSPETH_FINGERPRINT_KEY="${ELSPETH_FINGERPRINT_KEY:?generate and export the fingerprint key}" \
+  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
@@ -82,10 +83,10 @@ docker run --rm \
 3. Ensure you have the correct optional dependencies installed:
    ```bash
    # For LLM plugins
-   uv pip install -e ".[llm]"
+   uv sync --frozen --extra llm
 
    # For all plugins
-   uv pip install -e ".[all]"
+   uv sync --frozen --all-extras
    ```
 
 ---
@@ -100,9 +101,12 @@ docker run --rm \
 
 1. Check your `.env` file has the correct API key:
    ```bash
-   OPENROUTER_API_KEY=sk-or-...
-   AZURE_OPENAI_API_KEY=...
+   OPENROUTER_API_KEY=fake_openrouter_key_for_docs_only
+   AZURE_OPENAI_API_KEY=fake_azure_openai_key_for_docs_only
    ```
+
+   Replace the obvious documentation-only values from your approved secret
+   store; never commit the resulting `.env`.
 
 2. Verify the key is valid and not expired
 
@@ -120,8 +124,8 @@ docker run --rm \
      - plugin: llm
        options:
          provider: azure
-         endpoint: "https://your-resource.openai.azure.com"
-         deployment_name: "your-deployment"
+         endpoint: "https://example-resource.openai.azure.com"
+         deployment_name: "example-deployment"
    ```
 
 ---
@@ -169,7 +173,7 @@ docker run --rm \
 
 **Solution:**
 ```bash
-uv pip install 'elspeth[tracing-langfuse]'
+uv sync --frozen --extra tracing-langfuse
 ```
 
 ---
@@ -302,7 +306,7 @@ uv pip install 'elspeth[tracing-langfuse]'
    ```bash
    docker run --rm \
      -v $(pwd)/input:/app/input:ro \
-     ghcr.io/johnm-dta/elspeth:v0.7.2 \
+     ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
      ls /app/input
    ```
 
@@ -397,11 +401,11 @@ The readiness probe prevents traffic before the app is ready. The liveness probe
    - Missing colons after keys
    - Unquoted special characters
 
-3. Use a YAML linter:
+3. Parse the file independently with the already locked PyYAML dependency:
    ```bash
-   # Install yamllint
-   uv pip install yamllint
-   yamllint settings.yaml
+   uv run --frozen python -c \
+     'import pathlib, sys, yaml; yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())' \
+     settings.yaml
    ```
 
 ---

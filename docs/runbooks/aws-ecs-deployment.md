@@ -1,9 +1,18 @@
-# Runbook: AWS ECS Fargate deployment
+# Runbook: Full disposable AWS ECS acceptance environment
 
 Deploy one ELSPETH web task to AWS ECS Fargate with Aurora PostgreSQL, EFS,
 Cognito/OIDC, task-role S3 and Bedrock access, and CloudWatch operator
 telemetry. This runbook permits planned downtime: it deliberately uses a
 zero-overlap, single-task deployment.
+
+> **Scope:** This is the exhaustive, release-specific, two-scenario acceptance
+> and teardown program. Its Terraform package and owning remote state are not
+> tracked in this repository, so a clean source checkout cannot execute it from
+> top to bottom. For an ordinary rebuild and rollout to an existing ECS
+> service, use
+> [AWS ECS existing-service redeploy](aws-ecs-existing-service-redeploy.md).
+> Reconcile every schema epoch, task-definition input, and external Terraform
+> path with the selected release before using this acceptance program.
 
 ---
 
@@ -11,7 +20,8 @@ zero-overlap, single-task deployment.
 
 Use this runbook when you need to:
 
-- deploy or upgrade ELSPETH web on ECS Fargate;
+- provision, deploy, upgrade, and destroy the disposable two-scenario ECS
+  acceptance environment;
 - prove schema, persistence, authentication, S3, Bedrock, Guardrail, and
   operator-telemetry behavior before admitting traffic;
 - roll back one immutable task definition without guessing about database
@@ -27,8 +37,9 @@ Landscape audit record.
 
 ## Contract summary
 
-This is the canonical operator entry point for the AWS ECS deployment. The
-application and collector have deliberately separate evidence roles:
+This is the canonical operator entry point for the full disposable AWS
+acceptance program. The application and collector have deliberately separate
+evidence roles:
 
 - Landscape is the permanent source of truth for lineage, replay, and run
   decisions. Its write must succeed before an operational signal is emitted.

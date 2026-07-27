@@ -2,13 +2,14 @@
 
 Tier 2 tracing provides deep LLM observability beyond the framework's Tier 1 telemetry. While Tier 1 captures latency, status, and content hashes for ALL external calls, Tier 2 captures full prompts, responses, and token-level metrics for LLM calls specifically.
 
-> **Langfuse SDK v3.12+ Required** (as of ELSPETH RC-3)
+> **Langfuse SDK v3.14+ Required**
 >
-> ELSPETH now uses Langfuse SDK v3 which is built on OpenTelemetry standards. If you're upgrading from an earlier ELSPETH version with Langfuse v2, update your SDK:
+> ELSPETH uses Langfuse SDK v3, built on OpenTelemetry standards. In a source
+> checkout, install the locked tracing extra:
 > ```bash
-> uv pip install 'langfuse>=3.12,<4'
+> uv sync --frozen --extra tracing-langfuse
 > ```
-> No configuration changes are required - the migration is internal to ELSPETH.
+> Do not install a second, unpinned SDK into the checkout environment.
 
 ## Overview
 
@@ -64,7 +65,7 @@ transforms:
 ### Required Dependency
 
 ```bash
-uv pip install elspeth[azure]
+uv sync --frozen --extra azure
 # azure-monitor-opentelemetry is bundled with the azure extras
 ```
 
@@ -74,7 +75,7 @@ uv pip install elspeth[azure]
 2. Overview > Connection String (copy)
 3. Set as environment variable:
    ```bash
-   export APPLICATIONINSIGHTS_CONNECTION_STRING="InstrumentationKey=..."
+   : "${APPLICATIONINSIGHTS_CONNECTION_STRING:?load the connection string from the secret store}"
    ```
 
 ### What Gets Captured
@@ -120,11 +121,12 @@ transforms:
 ### Required Dependency
 
 ```bash
-uv pip install elspeth[tracing-langfuse]
-# Or manually: uv pip install 'langfuse>=3.12,<4'
+uv sync --frozen --extra tracing-langfuse
 ```
 
-> **Note:** Langfuse SDK v3.12+ is required. This version uses OpenTelemetry-based context managers for trace lifecycle management and is thread-safe for concurrent pipeline execution.
+> **Note:** Langfuse SDK v3.14+ is required and pinned by `uv.lock`. This
+> version uses OpenTelemetry-based context managers for trace lifecycle
+> management and is thread-safe for concurrent pipeline execution.
 
 ### Langfuse Credentials
 
@@ -134,8 +136,8 @@ uv pip install elspeth[tracing-langfuse]
 4. Copy Public Key and Secret Key
 5. Set as environment variables:
    ```bash
-   export LANGFUSE_PUBLIC_KEY="pk-..."
-   export LANGFUSE_SECRET_KEY="sk-..."
+   : "${LANGFUSE_PUBLIC_KEY:?load the public key from the secret store}"
+   : "${LANGFUSE_SECRET_KEY:?load the secret key from the secret store}"
    ```
 
 ### What Gets Captured
@@ -329,19 +331,18 @@ transforms:
         secret_key: ${LANGFUSE_SECRET_KEY}
 ```
 
-## Graceful Degradation
+## Missing-dependency behavior
 
-Tier 2 tracing is designed to fail gracefully. If the required SDK is not installed:
+When Langfuse tracing is explicitly configured but the SDK is absent, startup
+fails with `RuntimeError`; ELSPETH does not silently run without requested
+tracing. In a source checkout, repair the locked environment and restart:
 
-1. Plugin logs a warning at startup:
-   ```
-   Langfuse tracing requested but package not installed
-   hint="Install with: uv pip install elspeth[tracing-langfuse]"
-   ```
+```bash
+uv sync --frozen --extra tracing-langfuse
+```
 
-2. Pipeline continues without tracing
-
-3. No runtime errors - tracing methods become no-ops
+Runtime transport failures are logged and do not become Landscape evidence,
+but programming errors still fail closed.
 
 **To explicitly disable tracing:**
 ```yaml
@@ -417,9 +418,11 @@ tracing:
 
 **Check environment variables:**
 ```bash
-echo $LANGFUSE_PUBLIC_KEY  # Should print pk-...
-echo $LANGFUSE_SECRET_KEY  # Should print sk-...
+test -n "${LANGFUSE_PUBLIC_KEY:-}" && printf '%s\n' 'LANGFUSE_PUBLIC_KEY is set'
+test -n "${LANGFUSE_SECRET_KEY:-}" && printf '%s\n' 'LANGFUSE_SECRET_KEY is set'
 ```
+
+Do not print either key while troubleshooting.
 
 **Check for validation errors in logs:**
 ```

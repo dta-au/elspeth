@@ -15,6 +15,7 @@ This guide covers running ELSPETH in Docker containers for development and produ
 - [Container Registries](#container-registries)
 - [Pipeline Configuration](#pipeline-configuration)
 - [Building Locally](#building-locally)
+- [Runtime Image Contract](#runtime-image-contract)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -24,7 +25,7 @@ This guide covers running ELSPETH in Docker containers for development and produ
 ELSPETH containers follow a **CLI-first design** - arguments are passed directly to the `elspeth` CLI:
 
 ```bash
-IMAGE_TAG=v0.7.2
+: "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
 
 # Show help
 docker run ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} --help
@@ -36,8 +37,15 @@ docker run ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} --version
 docker run ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} plugins list
 ```
 
-Replace `v0.7.2` with the exact release or immutable `sha-<commit>` tag that
-matches the deployment you are operating.
+Confirm the tag exists before use:
+
+```bash
+docker buildx imagetools inspect \
+  "ghcr.io/johnm-dta/elspeth:${IMAGE_TAG}" >/dev/null
+```
+
+Do not infer an image tag from the Python package version. A source release and
+a registry publication are separate events.
 
 ---
 
@@ -120,7 +128,9 @@ docker run --rm \
 
 Pass secrets and configuration via environment variables. See the [Environment Variables Reference](../reference/environment-variables.md) for the complete list.
 
-The image contains PostgreSQL clients, not a PostgreSQL server. It supports
+The image contains PostgreSQL clients, not a PostgreSQL server or the `psql`
+command. These clients are the psycopg v3 and psycopg2 Python drivers. The
+image supports
 `postgresql+psycopg://` with psycopg v3 and
 `postgresql+psycopg2://` with psycopg2. Compose is the only shipped bundle
 that provisions PostgreSQL. AWS ECS, Azure production, and BYO Kubernetes
@@ -335,16 +345,23 @@ docker run --rm ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} health --json
 
 ### Example JSON Output
 
+Exact plugin counts and the Python patch version vary by release. A generic
+image without `DATABASE_URL` reports the database check as skipped:
+
 ```json
 {
   "status": "healthy",
   "version": "0.7.2",
-  "commit": "abc123f",
+  "commit": "unavailable",
   "checks": {
     "version": {"status": "ok", "value": "0.7.2"},
-    "python": {"status": "ok", "value": "3.13.1"},
-    "database": {"status": "ok", "value": "connected"},
-    "plugins": {"status": "ok", "value": "4 sources, 11 transforms, 4 sinks"}
+    "commit": {"status": "warn", "value": "unavailable"},
+    "python": {"status": "ok", "value": "3.13.5"},
+    "database": {"status": "skip", "value": "DATABASE_URL not set"},
+    "config_dir": {"status": "ok", "value": "/app/config"},
+    "output_dir": {"status": "ok", "value": "/app/output"},
+    "plugins": {"status": "ok", "value": "7 sources, 31 transforms, 8 sinks"},
+    "web": {"status": "skip", "value": "skipped via --skip-web"}
   }
 }
 ```
@@ -362,11 +379,11 @@ persistent payload storage. See the
 
 | Tag Pattern | Example | Use Case |
 |-------------|---------|----------|
-| `sha-<commit>` | `sha-abc123f` | CI/CD deployments (immutable, recommended) |
-| `v<version>` | `v0.7.2` | Release versions |
+| `sha-<commit>` | `sha-<full-commit>` | CI/CD deployments (immutable, recommended) |
+| `v<version>` | `v<released-version>` | Published release versions |
 
 Use `sha-<commit>` tags for immutable deployments. The build workflow does not
-publish `latest`.
+publish `latest`. Always inspect the selected registry tag before using it.
 
 ---
 
@@ -381,7 +398,8 @@ Images are published to:
 
 ```bash
 # GitHub Container Registry
-echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
+printf '%s' "$GITHUB_TOKEN" \
+  | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
 docker pull ghcr.io/johnm-dta/elspeth:${IMAGE_TAG}
 
 # Azure Container Registry
@@ -426,28 +444,59 @@ payload_store:
 ## Building Locally
 
 ```bash
-# Build the image
-docker build -t elspeth:local .
+# Build the generic release profile
+docker build \
+  --build-arg INSTALL_EXTRAS=all \
+  --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+  -t elspeth:local .
 
 # Run locally built image
 docker run --rm elspeth:local --version
 
-# Build with specific Python version
-docker build --build-arg PYTHON_VERSION=3.12 -t elspeth:local-py312 .
+# Build the lean AWS/PostgreSQL profile
+docker build \
+  --build-arg INSTALL_EXTRAS="webui llm aws postgres" \
+  --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+  -t elspeth:aws-postgres .
 ```
 
-### Multi-stage Build
+The Python and Node versions are pinned in `Dockerfile` and `.node-version`;
+they are not Docker build arguments. Update those reviewed version surfaces
+and their contract tests together when intentionally changing a toolchain.
 
-The Dockerfile uses multi-stage builds for smaller images:
+## Runtime Image Contract
 
-```dockerfile
-# Stage 1: Build dependencies
-FROM python:3.11-slim AS builder
-# ... install build deps, compile wheels
+The release Dockerfile uses three stages:
 
-# Stage 2: Runtime image
-FROM python:3.11-slim AS runtime
-# ... copy only runtime requirements
+1. a pinned Node.js 24 builder runs `npm ci` and creates the React bundle;
+2. a pinned Python 3.13 builder installs locked Python extras, installs ELSPETH
+   non-editably, normalizes generated frontend directories to `0755` and files
+   to `0644`, and prepares the runtime filesystem; and
+3. a pinned `gcr.io/distroless/python3-debian13:debug-nonroot` image receives
+   only that prepared runtime.
+
+The final image runs as UID/GID 1654, contains no package manager or OS build
+toolchain, and does not contain `psql`. The debug-nonroot variant deliberately
+retains BusyBox `/bin/sh` compatibility for the shipped Compose initialization
+step and the existing ECS entrypoint wrapper. Treat that shell as a narrow
+launch/diagnostic dependency, not as an invitation to mutate a running
+container.
+
+Verify the built artifact rather than inferring its contents from the
+Dockerfile:
+
+```bash
+IMAGE=elspeth:local
+
+test "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = "elspeth"
+test "$(docker run --rm --entrypoint id "$IMAGE" -u)" = "1654"
+test "$(docker run --rm --entrypoint id "$IMAGE" -g)" = "1654"
+docker run --rm --entrypoint /bin/sh "$IMAGE" -c \
+  'test -d /app/data/blobs &&
+   test -d /app/data/outputs &&
+   test -r /opt/venv/lib/python3.13/site-packages/elspeth/web/frontend/dist/index.html &&
+   test ! -e /usr/bin/apt-get &&
+   test ! -e /usr/bin/psql'
 ```
 
 ---
@@ -471,7 +520,8 @@ For general ELSPETH troubleshooting (API errors, configuration issues, etc.), se
 **Cause:** PostgreSQL not accessible from container.
 
 **Fix:**
-- In docker-compose: Use service name as host (`db` not `localhost`)
+- In the shipped three-file Compose bundle, use the service name `postgres`,
+  not `localhost`
 - Standalone: Use `--network host` or ensure container can reach database
 
 ### Secrets not fingerprinted
@@ -482,15 +532,19 @@ For general ELSPETH troubleshooting (API errors, configuration issues, etc.), se
 
 **Fix:**
 ```bash
+export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
+: "${IMAGE_TAG:?set the confirmed published image tag}"
 docker run --rm \
-  -e ELSPETH_FINGERPRINT_KEY="your-key" \
-  ...
+  -e ELSPETH_FINGERPRINT_KEY="${ELSPETH_FINGERPRINT_KEY}" \
+  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG} \
+  health --json
 ```
 
 ## See Also
 
 - [Deployment Platforms](../reference/deployment-platforms.md) - Maintained and BYO support boundaries
-- [AWS ECS Deployment Runbook](../runbooks/aws-ecs-deployment.md) - Production ECS/Fargate deployment contract
+- [AWS ECS Existing-Service Redeploy](../runbooks/aws-ecs-existing-service-redeploy.md) - Everyday immutable image redeploy
+- [AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance
 - [Your First Pipeline](your-first-pipeline.md) - Getting started guide
 - [Configuration Reference](../reference/configuration.md) - Complete config options
 - [Runbooks](../runbooks/) - Operational procedures

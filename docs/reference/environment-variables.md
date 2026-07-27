@@ -48,11 +48,8 @@ Used to HMAC-hash API keys and passwords before storing them in the audit trail.
 Without this key, ELSPETH will refuse to run if your config contains API keys. This prevents accidental secret leakage to audit databases.
 
 ```bash
-# Generate a secure key
-python -c "import secrets; print(secrets.token_hex(32))"
-
-# Set in environment
-export ELSPETH_FINGERPRINT_KEY="your-generated-key"
+# Generate and set a secure key, then persist it in the deployment secret store
+export ELSPETH_FINGERPRINT_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 ```
 
 ### ELSPETH_SIGNING_KEY
@@ -120,7 +117,7 @@ Used by the `llm` transform (provider: openrouter).
 
 Used by `llm` (provider: azure) transforms.
 
-**Endpoint format:** `https://your-resource.openai.azure.com`
+**Endpoint format:** `https://example-resource.openai.azure.com`
 
 ## Web Deployment Variables
 
@@ -249,46 +246,49 @@ Create a `.env` file in your project root:
 # ELSPETH Security Settings
 # =====================================================================
 
-# Secret fingerprinting key (REQUIRED for production)
-# Used to hash API keys before storing in audit trail
-ELSPETH_FINGERPRINT_KEY=your-stable-secret-key
+# Every value below is deliberately fake. Replace it from an approved secret
+# store and keep this file untracked.
+
+# Secret fingerprinting key (REQUIRED for production). Generate 32 random bytes
+# and keep the resulting value stable for audit correlation.
+ELSPETH_FINGERPRINT_KEY=fake_fingerprint_key_for_docs_only
 
 # Signing key for audit exports (optional)
 # Enables HMAC signatures on exported audit records
-ELSPETH_SIGNING_KEY=your-signing-key
+ELSPETH_SIGNING_KEY=fake_signing_key_for_docs_only
 
 # =====================================================================
 # LLM API Keys
 # =====================================================================
 
 # OpenRouter (for llm transform with provider: openrouter)
-OPENROUTER_API_KEY=sk-or-v1-your-key-here
+OPENROUTER_API_KEY=fake_openrouter_key_for_docs_only
 
 # Azure OpenAI (for llm (provider: azure) transforms)
-AZURE_OPENAI_API_KEY=your-azure-key
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_API_KEY=fake_azure_openai_key_for_docs_only
+AZURE_OPENAI_ENDPOINT=https://example-resource.openai.azure.com
 
 # =====================================================================
 # Azure Content Safety Services
 # =====================================================================
 
 # Azure Content Safety (for azure_content_safety transform)
-AZURE_CONTENT_SAFETY_KEY=your-content-safety-key
-AZURE_CONTENT_SAFETY_ENDPOINT=https://your-resource.cognitiveservices.azure.com
+AZURE_CONTENT_SAFETY_KEY=fake_content_safety_key_for_docs_only
+AZURE_CONTENT_SAFETY_ENDPOINT=https://example-resource.cognitiveservices.azure.com
 
 # Azure Prompt Shield (for azure_prompt_shield transform)
-AZURE_PROMPT_SHIELD_KEY=your-prompt-shield-key
-AZURE_PROMPT_SHIELD_ENDPOINT=https://your-resource.cognitiveservices.azure.com
+AZURE_PROMPT_SHIELD_KEY=fake_prompt_shield_key_for_docs_only
+AZURE_PROMPT_SHIELD_ENDPOINT=https://example-resource.cognitiveservices.azure.com
 
 # Azure Document Intelligence (for azure_document_intelligence transform)
-AZURE_DOCUMENT_INTELLIGENCE_KEY=your-document-intelligence-key
+AZURE_DOCUMENT_INTELLIGENCE_KEY=fake_document_intelligence_key_for_docs_only
 
 # =====================================================================
 # Azure Storage
 # =====================================================================
 
 # Azure Blob Storage (for azure_blob source/sink)
-AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
+AZURE_STORAGE_CONNECTION_STRING=fake_azure_storage_connection_string_for_docs_only
 
 # =====================================================================
 # Web Composer Local Registration
@@ -305,13 +305,13 @@ ELSPETH_WEB__REGISTRATION_MODE=closed
 # =====================================================================
 
 # OTLP auth token (optional; required if your OTLP endpoint enforces auth)
-OTEL_TOKEN=your-otel-token
+OTEL_TOKEN=fake_otel_token_for_docs_only
 
 # Azure Application Insights connection string
-APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=...
+APPLICATIONINSIGHTS_CONNECTION_STRING=fake_application_insights_connection_string_for_docs_only
 
 # Datadog API key (optional if using local agent)
-DD_API_KEY=your-datadog-api-key
+DD_API_KEY=fake_datadog_api_key_for_docs_only
 
 # =====================================================================
 # Development Settings (DO NOT USE IN PRODUCTION)
@@ -338,11 +338,11 @@ Add to `.gitignore`:
 ### 2. Use different keys per environment
 
 ```bash
-# Production: Real fingerprint key for audit integrity
-ELSPETH_FINGERPRINT_KEY=prod-key-that-never-changes
+# Production: generate once, store securely, and keep stable
+export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
 
-# Development: Can use any value
-ELSPETH_FINGERPRINT_KEY=dev-key
+# Development: generate a separate local-only value
+export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
 ```
 
 ### 3. Keep production keys stable
@@ -382,7 +382,7 @@ docker run --rm \
   -e DATABASE_URL="sqlite:////app/data/audit.db" \
   -v elspeth-data:/app/data \
   -v $(pwd)/config:/app/config:ro \
-  ghcr.io/johnm-dta/elspeth:v0.7.2 \
+  ghcr.io/johnm-dta/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 

@@ -195,13 +195,18 @@ supported multi-worker shape.
 Choose the authoring path that matches how you want to work. Both paths end in
 an Elspeth pipeline that can be validated, executed, audited, and explained.
 
+For a source checkout, install Python 3.12 or newer and
+[uv](https://docs.astral.sh/uv/). Building or developing the Web Composer also
+requires the repository-pinned Node.js 24 and npm 11 toolchain; verify it with
+`node --version` and `npm --version` before installing frontend dependencies.
+
 ### YAML Operator Path
 
 ```bash
 # Install
 git clone https://github.com/johnm-dta/elspeth.git && cd elspeth
-uv venv && source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv sync --frozen --extra dev
+source .venv/bin/activate
 
 # Validate configuration
 elspeth validate --settings examples/threshold_gate/settings.yaml
@@ -242,13 +247,12 @@ interactively:
 
 ```bash
 # 1) Install backend web dependencies
-uv pip install -e ".[webui,dev]"
+uv sync --frozen --extra webui --extra dev
+source .venv/bin/activate
 
 # 2) Build the frontend bundle once
-cd src/elspeth/web/frontend
-npm install
-npm run build
-cd ../../../../
+npm --prefix src/elspeth/web/frontend ci
+npm --prefix src/elspeth/web/frontend run build
 
 # 3) Create the required local roots and set all required web settings
 mkdir -p data/blobs data/outputs
@@ -289,9 +293,8 @@ export ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60
 elspeth web --host 127.0.0.1 --port 8451
 
 # Terminal 2
-cd src/elspeth/web/frontend
-npm install
-npm run dev
+npm --prefix src/elspeth/web/frontend ci
+npm --prefix src/elspeth/web/frontend run dev
 ```
 
 Then open `http://localhost:5173`.
@@ -471,12 +474,14 @@ landscape:
 ```
 
 ```bash
-export ELSPETH_SIGNING_KEY="your-secret-key"
+export ELSPETH_SIGNING_KEY="$(openssl rand -hex 32)"
 elspeth run --settings pipeline.yaml --execute
 ```
 
 Signed exports include every record with an HMAC-SHA256 signature, a manifest
 with total count and running hash, and timestamps for chain-of-custody review.
+Persist the signing key in the deployment secret manager for as long as those
+signatures must remain verifiable.
 
 ### JSONL Change Journal (Optional)
 
@@ -631,8 +636,9 @@ elspeth-mcp
 # Explicit database path
 elspeth-mcp --database sqlite:///./runs/audit.db
 
-# Encrypted database
-ELSPETH_AUDIT_PASSPHRASE="secret" elspeth-mcp --database sqlite:///./runs/audit.db
+# Encrypted database; load the existing passphrase from the secret manager
+: "${ELSPETH_AUDIT_PASSPHRASE:?load the audit passphrase}"
+elspeth-mcp --database sqlite:///./runs/audit.db
 ```
 
 Key tools: `diagnose()` (what's broken?), `get_failure_context(run_id)` (deep dive), `explain_token(run_id, token_id)` (row lineage), `get_performance_report(run_id)` (bottlenecks).
@@ -740,26 +746,27 @@ Transform-added fields (not in source) use their normalized names when restoring
 ### Environment Variables
 
 ```bash
-# Required for production (secret fingerprinting)
-export ELSPETH_FINGERPRINT_KEY="your-stable-key"
+# Required for production (secret fingerprinting). Store the generated value in
+# the deployment secret manager; do not commit it.
+export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
 
 # Azure Key Vault (alternative to direct key)
-export ELSPETH_KEYVAULT_URL="https://your-vault.vault.azure.net/"
+export ELSPETH_KEYVAULT_URL="https://example-vault.vault.azure.net/"
 export ELSPETH_KEYVAULT_SECRET_NAME="elspeth-fingerprint-key"
 # Optional: pin the exact allowed Key Vault URL(s), comma-separated, as an SSRF
 # hardening control; when unset, any https *.vault.azure.net host is accepted
-export ELSPETH_KEYVAULT_ALLOWED_VAULT_URLS="https://your-vault.vault.azure.net/"
+export ELSPETH_KEYVAULT_ALLOWED_VAULT_URLS="$ELSPETH_KEYVAULT_URL"
 
-# LLM API keys
-export AZURE_OPENAI_API_KEY="..."
-export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
-export OPENROUTER_API_KEY="sk-or-..."
+# Provider configuration. Inject real credentials from a secret manager.
+export AZURE_OPENAI_API_KEY="fake_azure_openai_key_for_docs_only"
+export AZURE_OPENAI_ENDPOINT="https://example-resource.openai.azure.com/"
+export OPENROUTER_API_KEY="fake_openrouter_key_for_docs_only"
 
-# Signed exports
-export ELSPETH_SIGNING_KEY="your-signing-key"
+# Signed exports. Persist this value if signatures must remain verifiable.
+export ELSPETH_SIGNING_KEY="$(openssl rand -hex 32)"
 
-# Audit database encryption (SQLCipher)
-export ELSPETH_AUDIT_PASSPHRASE="your-audit-passphrase"
+# Audit database encryption (SQLCipher). Store this outside the repository.
+export ELSPETH_AUDIT_PASSPHRASE="$(openssl rand -base64 32)"
 ```
 
 Elspeth automatically loads `.env` files. Use `--no-dotenv` to skip in CI/CD.
@@ -855,16 +862,21 @@ Rate limits are **per-service** - all plugins using the same service share the b
 
 ## Docker
 
-Elspeth can run from a published Docker image. Replace `v0.7.2` with the tag
-published for the release you are deploying; use the exact tag for an older
-release line when deploying an earlier version.
+Elspeth can run from a published Docker image. Select an exact tag that you
+have confirmed exists in the registry; do not derive a tag from the package
+version or assume an unverified release tag was published.
 
-The image contains PostgreSQL clients, not a PostgreSQL server. It supports
-both `postgresql+psycopg://` (psycopg v3) and
-`postgresql+psycopg2://` (psycopg2). The shipped Compose bundle is the only
-maintained bundle that provisions PostgreSQL; AWS and the maintained Azure
-Ubuntu VM path use external PostgreSQL in production. Run one web process and
-preserve payload persistence separately from database persistence. See the
+The image contains PostgreSQL clients, not a PostgreSQL server or the `psql`
+command. These clients are the psycopg v3 and psycopg2 Python drivers, and the
+image supports both
+`postgresql+psycopg://` and `postgresql+psycopg2://` URLs. The final runtime is
+a pinned, non-root distroless image with no package manager; add runtime
+capabilities through locked Python extras or a reviewed derived image, not by
+installing packages in a running container. The shipped Compose bundle is the
+only maintained bundle that provisions PostgreSQL; AWS and the maintained
+Azure Ubuntu VM path use external PostgreSQL in production. Run one web
+process and preserve payload persistence separately from database persistence.
+See the
 [deployment platform matrix](docs/reference/deployment-platforms.md) for the
 maintained Compose, AWS ECS, and native Linux paths plus the explicit Azure VM
 and Kubernetes boundaries. The AWS procedure validates operator-supplied
@@ -872,7 +884,7 @@ task-definition ARNs; it does not synthesize or clone a generic task
 definition.
 
 ```bash
-IMAGE_TAG=v0.7.2
+: "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
 
 # Run a pipeline
 docker run --rm \
@@ -956,6 +968,8 @@ See [Architecture Documentation](ARCHITECTURE.md) for C4 diagrams and detailed d
 | [docs/reference/](docs/reference/) | Developers | Configuration reference |
 | [docs/reference/deployment-platforms.md](docs/reference/deployment-platforms.md) | Operators | Maintained deployment paths, database ownership, persistence, and deferred platform boundaries |
 | [docs/runbooks/](docs/runbooks/) | Operators | Deployment and operations |
+| [docs/runbooks/caddy-development-refresh.md](docs/runbooks/caddy-development-refresh.md) | Developers | Rebuild and restart the source-checkout Caddy/systemd development install |
+| [docs/runbooks/aws-ecs-existing-service-redeploy.md](docs/runbooks/aws-ecs-existing-service-redeploy.md) | Operators | Build, scan, and deploy an immutable image to an existing ECS service |
 
 ---
 
@@ -986,15 +1000,15 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 **Development setup:**
 
 ```bash
-uv venv && source .venv/bin/activate
-uv pip install -e ".[dev,azure]"
+uv sync --frozen --extra dev --extra azure
+source .venv/bin/activate
 
 # Install the git hook dispatchers (pre-commit + commit-msg policy gates)
 scripts/git-hooks/install-pre-commit-dispatcher.sh
 scripts/git-hooks/install-commit-msg-dispatcher.sh
 
 # Install Azurite (Azure Blob Storage emulator for integration tests)
-npm install
+npm ci
 
 # Run tests
 .venv/bin/python -m pytest tests/ -v
