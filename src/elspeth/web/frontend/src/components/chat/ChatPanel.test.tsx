@@ -1252,6 +1252,45 @@ describe("ChatPanel mode discriminator", () => {
     expect(screen.getByTestId("chat-input")).toHaveAttribute("data-disabled", "false");
   });
 
+  it("anchors tutorial proposal activity once in the Current Decision footer", () => {
+    const headline = "I'm asking the model to choose the next safe pipeline update.";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: { ...activeGuidedSession(), step: "step_3_transforms" },
+      guidedNextTurn: proposalTurn(),
+      guidedProposalReview: proposalReview("submitting"),
+      guidedResponsePending: true,
+      composerProgress: {
+        session_id: "session-guided",
+        request_id: "req-1",
+        phase: "calling_model",
+        headline,
+        evidence: [],
+        likely_next: null,
+        reason: null,
+        updated_at: "2026-07-27T00:00:00Z",
+      },
+    });
+
+    const { container } = render(
+      <ChatPanel
+        isTutorial
+        lockedChatPrompt={{ step_3_transforms: "add the transforms" }}
+      />,
+    );
+
+    const activity = screen.getAllByText(headline);
+    expect(activity).toHaveLength(1);
+    const footer = container.querySelector(".guided-current-decision-footer");
+    expect(footer).not.toBeNull();
+    expect(footer!.contains(activity[0])).toBe(true);
+    expect(
+      container.querySelector(".guided-proposal > .guided-decision-pending"),
+    ).toBeNull();
+  });
+
   it("renders guided-active surface (GuidedTurn + ExitToFreeformButton) when guidedSession is active and next turn is present", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",
@@ -2699,6 +2738,58 @@ describe("ChatPanel mode discriminator", () => {
 
     // A reader reviewing earlier turns is not yanked to the bottom.
     expect(scrollTop).toBe(100);
+  });
+
+  it("tutorial auto-scroll: a proposal Send pins the response activity footer when the reader is at the bottom", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: { ...activeGuidedSession(), step: "step_3_transforms" },
+      guidedNextTurn: proposalTurn(),
+      guidedProposalReview: proposalReview("active"),
+      guidedResponsePending: false,
+    });
+
+    const { container } = render(
+      <ChatPanel
+        isTutorial
+        lockedChatPrompt={{ step_3_transforms: "add the transforms" }}
+      />,
+    );
+
+    const scroll = container.querySelector<HTMLElement>(
+      ".guided-workspace-scroll",
+    );
+    expect(scroll).not.toBeNull();
+    let scrollHeight = 1000;
+    let scrollTop = 600;
+    Object.defineProperty(scroll!, "scrollHeight", {
+      configurable: true,
+      get: () => scrollHeight,
+    });
+    Object.defineProperty(scroll!, "clientHeight", {
+      configurable: true,
+      get: () => 400,
+    });
+    Object.defineProperty(scroll!, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => {
+        scrollTop = value;
+      },
+    });
+    fireEvent.scroll(scroll!);
+
+    act(() => {
+      scrollHeight = 1050;
+      useSessionStore.setState({
+        guidedProposalReview: proposalReview("submitting"),
+        guidedResponsePending: true,
+      });
+    });
+
+    expect(scrollTop).toBe(1050);
   });
 
   it("tutorial completed: the completion surface renders under the guided shell with the stepper and the --completed frame escape hook", () => {

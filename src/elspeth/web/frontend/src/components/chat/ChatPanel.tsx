@@ -1635,20 +1635,27 @@ export function ChatPanel({
   );
 
   // Guided workspace auto-scroll: keep the conversation column pinned to the
-  // bottom as turns arrive (chat_history growth) and when a Send starts
-  // (guidedChatPending flips true), but ONLY while the user already sits
-  // within 40px of the bottom — a reader scrolled up into the transcript must
-  // not be yanked down (freeform's heuristic, tracked pre-append by the
-  // onScroll handler above). Deliberately defined BEFORE the step-advance
-  // focus effect below: on a Send both fire, and the focus effect's
-  // scrollIntoView must win so the just-built decision presents itself.
+  // bottom as turns arrive (chat_history growth) and when either kind of Send
+  // starts. Most guided chat uses guidedChatPending; the step-3 proposal
+  // composer deliberately delegates to respondGuided and therefore uses
+  // guidedResponsePending. Watch both so mounting either pending footer cannot
+  // leave the last few pixels below the viewport. Only pin while the reader
+  // already sits within 40px of the bottom — a reader scrolled up into the
+  // transcript must not be yanked down (freeform's heuristic, tracked
+  // pre-append by the onScroll handler above). Deliberately defined BEFORE the
+  // step-advance focus effect below: on a Send both fire, and the focus
+  // effect's scrollIntoView must win so the just-built decision presents itself.
   const guidedChatHistoryLength = guidedSession?.chat_history.length ?? 0;
   useEffect(() => {
     const container = guidedWorkspaceScrollRef.current;
     if (!container) return;
     if (!guidedWorkspaceAtBottomRef.current) return;
     container.scrollTop = container.scrollHeight;
-  }, [guidedChatHistoryLength, guidedChatPending]);
+  }, [
+    guidedChatHistoryLength,
+    guidedChatPending,
+    guidedResponsePending,
+  ]);
 
   // Spec §7.4 — maintain focus on the first interactive element of the new turn
   // after step advance.  Without this, a step-advancing button click unmounts
@@ -2050,7 +2057,6 @@ export function ChatPanel({
                     : undefined
                 }
                 wireValidationIssues={wireValidationIssues}
-                composerProgress={composerProgress}
               />
             )}
           </div>

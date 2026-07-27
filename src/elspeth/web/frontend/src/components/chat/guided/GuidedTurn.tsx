@@ -15,7 +15,6 @@
 //
 // ============================================================================
 
-import type { ComposerProgressSnapshot } from "@/types/api";
 import type {
   TurnPayload,
   GuidedProposalReviewState,
@@ -52,9 +51,6 @@ interface GuidedTurnProps {
   wireValidationIssues?: string[];
   /** Exact proposal/hash-bound local review lifecycle. Required by proposal turns. */
   proposalReviewState?: GuidedProposalReviewState | null;
-  /** Live compose progress (read-only) — forwarded to proposal turns so a
-   * pending decision submit shows the adaptive headline + elapsed readout. */
-  composerProgress?: ComposerProgressSnapshot | null;
 }
 
 function guidedTurnInstanceKey(turn: TurnPayload): string {
@@ -72,7 +68,6 @@ export function GuidedTurn({
   wirePendingAcknowledgements,
   wireValidationIssues,
   proposalReviewState,
-  composerProgress = null,
 }: GuidedTurnProps) {
   const guardedSubmit = (body: GuidedRespondAction) => {
     if (disabled) return;
@@ -148,7 +143,6 @@ export function GuidedTurn({
           onSubmit={guardedSubmit}
           disabled={disabled}
           isTutorial={isTutorial}
-          composerProgress={composerProgress}
         />
       );
     case "confirm_wiring":
