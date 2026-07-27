@@ -245,6 +245,7 @@ def _valid_chat_message_kwargs() -> dict[str, object]:
         "session_id": "sess-1",
         "role": "user",
         "content": "hello",
+        "segments": [{"kind": "text", "content": "hello"}],
         "tool_calls": None,
         "created_at": datetime.now(UTC),
     }

@@ -94,6 +94,7 @@ from elspeth.web.composer.guided.state_machine import (
     TurnRecord,
 )
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
+from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.progress import (
@@ -162,6 +163,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schemas import (
     AcceptProposalRequest,
     ChatMessageResponse,
+    ChatMessageSegmentResponse,
     ChatTurnResponse,
     ComposerPreferencesResponse,
     CompositionObject,
@@ -403,6 +405,13 @@ def _message_response(msg: ChatMessageRecord, *, include_raw_content: bool = Fal
         role=msg.role,
         content=msg.content,
         raw_content=msg.raw_content if include_raw_content else None,
+        segments=[
+            ChatMessageSegmentResponse(kind=segment.kind, content=segment.content)
+            for segment in visible_message_segments(
+                content=msg.content,
+                raw_content=msg.raw_content if msg.role == "assistant" else None,
+            )
+        ],
         tool_calls=deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None,
         created_at=msg.created_at,
         composition_state_id=str(msg.composition_state_id) if msg.composition_state_id else None,

@@ -7,6 +7,7 @@ export type {
   UserProfile,
   Session,
   ChatMessage,
+  ChatMessageSegment,
   ToolCall,
   NodeSpec,
   EdgeSpec,

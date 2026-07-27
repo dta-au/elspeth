@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Any, Final, Literal
+from dataclasses import dataclass
+from typing import Any, ClassVar, Final, Literal
 
 from opentelemetry import metrics
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.state_claim_grounding import (
+    GROUNDING_CORRECTION_HEADER,
+    GROUNDING_CORRECTION_INSTRUCTION,
+)
 from elspeth.web.composer.tools import is_discovery_tool
 from elspeth.web.execution.schemas import (
     CHECK_STATE_EXISTS,
@@ -27,33 +32,34 @@ _COMPOSER_AUDIT_INTEGRITY_VIOLATION_COUNTER = metrics.get_meter(__name__).create
     description="Producer-side audit-integrity invariant violations (augmentation/replacement prefix contracts)",
 )
 
-_EMPTY_STATE_FINALIZE_SUFFIX = (
-    "\n\n---\n\n"
-    "[ELSPETH-SYSTEM] The pipeline is still empty — the composer did not "
-    "complete a valid build this turn. To continue: refine your request "
-    "with more specifics, or reply telling the composer to retry with the "
-    "plan it described above."
+_TRUSTED_NOTICE_SEPARATOR: Final = "\n\n---\n\n"
+_TRUSTED_NOTICE_MARKER: Final = "[ELSPETH-SYSTEM] "
+
+_EMPTY_STATE_NOTICE_HEADER: Final = "The pipeline is still empty — the composer did not complete a valid build this turn."
+_EMPTY_STATE_NOTICE_NEXT_STEP: Final = (
+    "To continue: refine your request with more specifics, or reply telling the composer to retry with the plan it described above."
 )
+_EMPTY_STATE_NOTICE_BODY: Final = f"{_EMPTY_STATE_NOTICE_HEADER} {_EMPTY_STATE_NOTICE_NEXT_STEP}"
+_EMPTY_STATE_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _EMPTY_STATE_NOTICE_BODY
 _EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER = (
-    "\n\n---\n\n"
-    "[ELSPETH-SYSTEM] The pipeline is still empty — the composer did not "
-    "complete a valid build this turn.\n\nCause: {blocker}\n\n"
-    "To continue: refine your request with more specifics, or reply telling "
-    "the composer to retry with the plan it described above."
+    _TRUSTED_NOTICE_SEPARATOR
+    + _TRUSTED_NOTICE_MARKER
+    + _EMPTY_STATE_NOTICE_HEADER
+    + "\n\nCause: {blocker}\n\n"
+    + _EMPTY_STATE_NOTICE_NEXT_STEP
 )
 
+_PREFLIGHT_NOTICE_HEADER: Final = "Runtime preflight failed before this build could be marked complete."
+_PREFLIGHT_NOTICE_FOOTER: Final = "The composer's analysis above is preserved verbatim; the validator's objection is recorded here."
 _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL = (
-    "\n\n---\n\n"
-    "[ELSPETH-SYSTEM] Runtime preflight failed before this build could be "
-    "marked complete.\n\nCause: {detail}{suggestion_block}\n\n"
-    "The composer's analysis above is preserved verbatim; the validator's "
-    "objection is recorded here."
+    _TRUSTED_NOTICE_SEPARATOR
+    + _TRUSTED_NOTICE_MARKER
+    + _PREFLIGHT_NOTICE_HEADER
+    + "\n\nCause: {detail}{suggestion_block}\n\n"
+    + _PREFLIGHT_NOTICE_FOOTER
 )
 _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = (
-    "\n\n---\n\n"
-    "[ELSPETH-SYSTEM] Runtime preflight failed before this build could be "
-    "marked complete.\n\nThe composer's analysis above is preserved verbatim; "
-    "the validator's objection is recorded here."
+    _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _PREFLIGHT_NOTICE_HEADER + "\n\n" + _PREFLIGHT_NOTICE_FOOTER
 )
 
 _BUILD_INTENT_PHRASES: Final[tuple[str, ...]] = (
@@ -100,6 +106,125 @@ _AugmentationBranch = Literal[
     "interpretation_review_handoff_augmentation",
     "proof_repair_exhausted_augmentation",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantTextSegment:
+    """Untrusted assistant prose rendered with ordinary message semantics."""
+
+    kind: ClassVar[Literal["text"]] = "text"
+    content: str
+
+    def __post_init__(self) -> None:
+        if type(self.content) is not str:
+            raise TypeError("AssistantTextSegment.content must be an exact string")
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedSystemNoticeSegment:
+    """Operator-authored suffix authenticated by the durable synthesis pairing."""
+
+    kind: ClassVar[Literal["trusted_system_notice"]] = "trusted_system_notice"
+    content: str
+
+    def __post_init__(self) -> None:
+        if type(self.content) is not str or not self.content:
+            raise TypeError("TrustedSystemNoticeSegment.content must be a non-empty exact string")
+
+
+type VisibleMessageSegment = AssistantTextSegment | TrustedSystemNoticeSegment
+
+
+def _split_wrapped_diagnostic(
+    suffix: str,
+    *,
+    header: str,
+    footer: str,
+) -> tuple[VisibleMessageSegment, ...] | None:
+    """Split one exact fixed-wrapper shape without trusting its diagnostic."""
+    prefix = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + header + "\n\nCause: "
+    postfix = "\n\n" + footer
+    if not suffix.startswith(prefix) or not suffix.endswith(postfix):
+        return None
+    diagnostic = suffix[len(prefix) : -len(postfix)]
+    if not diagnostic:
+        return None
+    return (
+        TrustedSystemNoticeSegment(header),
+        AssistantTextSegment(f"Cause: {diagnostic}"),
+        TrustedSystemNoticeSegment(footer),
+    )
+
+
+def _split_grounding_correction(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
+    """Split the exact grounding wrapper without trusting violation bullets."""
+    prefix = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + GROUNDING_CORRECTION_HEADER + "\n\n"
+    postfix = "\n\n" + GROUNDING_CORRECTION_INSTRUCTION
+    if not suffix.startswith(prefix) or not suffix.endswith(postfix):
+        return None
+    violation_bullets = suffix[len(prefix) : -len(postfix)]
+    if not violation_bullets.startswith("- "):
+        return None
+    return (
+        TrustedSystemNoticeSegment(GROUNDING_CORRECTION_HEADER),
+        AssistantTextSegment(violation_bullets),
+        TrustedSystemNoticeSegment(GROUNDING_CORRECTION_INSTRUCTION),
+    )
+
+
+def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
+    """Recognize the closed set of canonical composer synthesis suffixes."""
+    if suffix == _EMPTY_STATE_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_EMPTY_STATE_NOTICE_BODY),)
+    empty_with_blocker = _split_wrapped_diagnostic(
+        suffix,
+        header=_EMPTY_STATE_NOTICE_HEADER,
+        footer=_EMPTY_STATE_NOTICE_NEXT_STEP,
+    )
+    if empty_with_blocker is not None:
+        return empty_with_blocker
+    if suffix == _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE:
+        return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_PREFLIGHT_NOTICE_FOOTER}"),)
+    preflight_with_diagnostic = _split_wrapped_diagnostic(
+        suffix,
+        header=_PREFLIGHT_NOTICE_HEADER,
+        footer=_PREFLIGHT_NOTICE_FOOTER,
+    )
+    if preflight_with_diagnostic is not None:
+        return preflight_with_diagnostic
+    return _split_grounding_correction(suffix)
+
+
+def visible_message_segments(*, content: str, raw_content: str | None) -> tuple[VisibleMessageSegment, ...]:
+    """Project durable assistant text into provenance-bearing visible segments.
+
+    The ``raw_content`` prefix pairing is necessary but not sufficient: empty
+    or stale prefixes can match attacker-controlled content.  A suffix mints
+    trusted chrome only when it exactly matches one of the closed canonical
+    composer shapes above. Dynamic blocker, validator, and grounding
+    diagnostics remain ordinary text between fixed trusted segments.
+
+    Equality, legacy replacement, malformed, and unknown synthesis shapes fail
+    closed to one ordinary text segment. Empty ``raw_content`` is accepted only
+    when the complete content matches one of those same canonical wrappers.
+    """
+    if type(content) is not str:
+        raise TypeError("content must be an exact string")
+    if raw_content is not None and type(raw_content) is not str:
+        raise TypeError("raw_content must be an exact string or None")
+    if raw_content == "":
+        canonical_content = content if content.startswith(_TRUSTED_NOTICE_SEPARATOR) else _TRUSTED_NOTICE_SEPARATOR + content
+        suffix_segments = _canonical_trusted_suffix_segments(canonical_content)
+        if suffix_segments is not None:
+            return suffix_segments
+        return (AssistantTextSegment(content),)
+    if raw_content is None or not content.startswith(raw_content):
+        return (AssistantTextSegment(content),)
+
+    suffix_segments = _canonical_trusted_suffix_segments(content[len(raw_content) :])
+    if suffix_segments is None:
+        return (AssistantTextSegment(content),)
+    return (AssistantTextSegment(raw_content), *suffix_segments)
 
 
 def state_is_structurally_empty(state: CompositionState) -> bool:
