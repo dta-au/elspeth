@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from elspeth.web._aws_ecs_acceptance import scenario_inventory
+from elspeth.web._aws_ecs_acceptance import scenario_inventory, task_definition
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE = REPO_ROOT / "deploy" / "aws-ecs" / "terraform"
@@ -149,9 +149,8 @@ def test_scenario_backends_are_partial_locked_encrypted_and_isolated() -> None:
 
     readme = _text("README.md")
     for phrase in (
-        "aws sts get-caller-identity",
-        "explicit AWS account",
-        "explicit AWS region",
+        'aws --profile "$AWS_PROFILE" --region "$AWS_REGION" sts get-caller-identity',
+        "explicit AWS profile, account, and region",
         "workspace show",
         "-backend-config",
         "scenario-a.s3.tfbackend",
@@ -239,13 +238,20 @@ def test_bedrock_composer_uses_the_task_role_without_static_credentials() -> Non
     assert "openrouter" not in all_text.lower()
     assert "AWS_ACCESS_KEY_ID" not in all_text
     assert "AWS_SECRET_ACCESS_KEY" not in all_text
-    assert "AWS_PROFILE" not in all_text
+    assert "AWS_PROFILE" not in runtime
     assert "AWS_ENDPOINT_URL" not in all_text
     assert "AGENTCORE" not in terraform_text.upper()
     assert '"bedrock:InvokeModel"' in iam
     assert "var.bedrock_inference_profile_arns" in iam
     assert "var.bedrock_foundation_model_arns" in iam
     assert '"Resource" = ["*"]' not in iam
+
+
+def test_composer_boot_probe_exercises_primary_and_advisor_models() -> None:
+    module_locals = _text("modules/scenario/locals.tf")
+    assert '{ name = "ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED", value = "true" }' in module_locals
+    assert '{ name = "ELSPETH_WEB__COMPOSER_MODEL", value = var.composer_model }' in module_locals
+    assert '{ name = "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", value = var.composer_advisor_model }' in module_locals
 
 
 def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
@@ -287,7 +293,8 @@ def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
     assert "@sha256:[0-9a-f]{64}$" in _text("modules/scenario/variables.tf")
     assert "local.cloudwatch_agent_image" in ecs
     assert "var.cloudwatch_agent_image" in _text("modules/scenario/iam_observability.tf")
-    assert "filesha256(" in locals
+    assert "sha256(local.cw_agent_json)" in locals
+    assert "sha256(local.cw_agent_otel)" in locals
     assert "elspeth.cloudwatch-agent.v1.json" in locals
     assert "elspeth.cloudwatch-agent.v1.otel.yaml" in locals
     assert "resolved_inventory" in outputs
@@ -345,6 +352,27 @@ def test_monitoring_resources_use_a_retained_digest_pinned_collector() -> None:
         assert resource in observability
 
 
+def test_cloudwatch_agent_sidecar_exactly_matches_runtime_admission_constants() -> None:
+    ecs = _text("modules/scenario/ecs.tf")
+    module_locals = _text("modules/scenario/locals.tf")
+    sidecar = ecs[ecs.index("cloudwatch_agent_container = {") : ecs.index("candidate_web_container = {")]
+    observed_env_names = frozenset(re.findall(r'\{ name = "([^"]+)", value = ', sidecar))
+
+    assert observed_env_names == task_definition._CLOUDWATCH_AGENT_ENV_NAMES
+    command_line = next(line for line in module_locals.splitlines() if line.strip().startswith("cw_agent_command"))
+    assert json.loads(command_line.split("=", 1)[1].strip()) == task_definition._CLOUDWATCH_AGENT_COMMAND
+
+    expected_health = task_definition._CLOUDWATCH_AGENT_HEALTH_CHECK
+    assert json.dumps(expected_health["command"][1]) in sidecar
+    for name in ("interval", "timeout", "retries", "startPeriod"):
+        assert re.search(rf"\b{name}\s*=\s*{expected_health[name]}\b", sidecar)
+
+    assert "cw_agent_config_json_sha256 = sha256(local.cw_agent_json)" in module_locals
+    assert "cw_agent_otel_yaml_sha256   = sha256(local.cw_agent_otel)" in module_locals
+    assert '{ name = "ELSPETH_CW_AGENT_CONFIG_JSON_SHA256", value = local.cw_agent_config_json_sha256 }' in sidecar
+    assert '{ name = "ELSPETH_CW_AGENT_OTEL_YAML_SHA256", value = local.cw_agent_otel_yaml_sha256 }' in sidecar
+
+
 def test_cold_install_pauses_service_until_two_stage_doctor_and_explicit_enable() -> None:
     ecs = _text("modules/scenario/ecs.tf")
     readme = _text("README.md")
@@ -354,6 +382,91 @@ def test_cold_install_pauses_service_until_two_stage_doctor_and_explicit_enable(
     ordinary_doctor = readme.index("doctor aws-ecs --json", schema_init)
     explicit_enable = readme.index("service_enable_command", ordinary_doctor)
     assert schema_init < ordinary_doctor < explicit_enable
+
+
+def test_schema_init_and_runtime_doctors_have_separate_credentials_and_commands() -> None:
+    ecs = _text("modules/scenario/ecs.tf")
+    outputs = _text("modules/scenario/outputs.tf")
+    root_outputs = "\n".join((_text("scenario-a/outputs.tf"), _text("scenario-b/outputs.tf")))
+    readme = _text("README.md")
+
+    schema_container = ecs[ecs.index("schema_init_doctor_container = {") : ecs.index("runtime_doctor_container = {")]
+    runtime_container = ecs[ecs.index("runtime_doctor_container = {") : ecs.index("payload_container = {")]
+    assert 'command          = ["doctor", "aws-ecs", "--init-schema", "--json"]' in schema_container
+    assert "secrets          = local.schema_owner_secrets" in schema_container
+    assert 'command          = ["doctor", "aws-ecs", "--json"]' in runtime_container
+    assert "secrets          = local.runtime_secrets" in runtime_container
+    assert 'resource "aws_ecs_task_definition" "schema_init_doctor"' in ecs
+    assert 'resource "aws_ecs_task_definition" "runtime_doctor"' in ecs
+    assert "DOCTOR_TASK_DEFINITION                          = aws_ecs_task_definition.runtime_doctor.arn" in outputs
+
+    for name in (
+        "schema_init_doctor_task_definition_arn",
+        "schema_init_doctor_network_configuration",
+        "schema_init_doctor_overrides",
+        "runtime_doctor_task_definition_arn",
+        "runtime_doctor_network_configuration",
+        "runtime_doctor_overrides",
+    ):
+        assert f'output "{name}"' in outputs
+        assert f'output "{name}"' in root_outputs
+        assert name in readme
+    schema_init = readme.index("doctor aws-ecs --init-schema --json")
+    runtime_doctor = readme.index("doctor aws-ecs --json", schema_init)
+    both_exit_zero = readme.index("Both task exit codes must be `0`", runtime_doctor)
+    explicit_enable = readme.index("service_enable_command", both_exit_zero)
+    assert schema_init < runtime_doctor < both_exit_zero < explicit_enable
+
+
+def test_scenario_b_inventory_has_a_validated_nonempty_cognito_subject() -> None:
+    module_variables = _text("modules/scenario/variables.tf")
+    outputs = _text("modules/scenario/outputs.tf")
+    scenario_a_variables = _text("scenario-a/variables.tf")
+    scenario_b_variables = _text("scenario-b/variables.tf")
+    scenario_b_example = _text("examples/scenario-b.tfvars.example")
+
+    assert 'variable "cognito_subject_sub"' in module_variables
+    assert 'var.scenario_id == "A" ? var.cognito_subject_sub == ""' in module_variables
+    assert 'cognito_subject_sub             = var.scenario_id == "B" ? var.cognito_subject_sub : ""' in outputs
+    assert re.search(r'variable "cognito_subject_sub".*?default\s*=\s*""', scenario_a_variables, re.DOTALL)
+    assert re.search(
+        r'variable "cognito_subject_sub".*?condition\s*=\s*\(\s*'
+        r"length\(trimspace\(var\.cognito_subject_sub\)\)\s*>\s*0",
+        scenario_b_variables,
+        re.DOTALL,
+    )
+    assert re.search(
+        r'cognito_subject_sub\s*=\s*"REPLACE_WITH_SCENARIO_B_COGNITO_SUBJECT"',
+        scenario_b_example,
+    )
+
+
+def test_explicit_aws_profile_is_bound_across_provider_backend_and_local_cli() -> None:
+    module_variables = _text("modules/scenario/variables.tf")
+    module_outputs = _text("modules/scenario/outputs.tf")
+    database_bootstrap = _text("modules/scenario/database_bootstrap.tf")
+    readme = _text("README.md")
+
+    assert 'variable "aws_profile"' in module_variables
+    for root in ("bootstrap", "scenario-a", "scenario-b"):
+        variables = _text(f"{root}/variables.tf")
+        provider = _text(f"{root}/versions.tf")
+        example = _text(f"examples/{root}.tfvars.example")
+        assert 'variable "aws_profile"' in variables
+        assert "profile             = var.aws_profile" in provider
+        assert "aws_profile" in example
+    for scenario in ("scenario-a", "scenario-b"):
+        assert re.search(
+            r'profile\s*=\s*"REPLACE_WITH_AWS_PROFILE"',
+            _text(f"examples/{scenario}.s3.tfbackend.example"),
+        )
+        assert re.search(r"\baws_profile\s+=\s+var\.aws_profile\b", _text(f"{scenario}/main.tf"))
+
+    assert re.search(r"\bAWS_PROFILE\s*=\s*var\.aws_profile\b", database_bootstrap)
+    assert database_bootstrap.count('--profile "$AWS_PROFILE"') == 3
+    assert 'aws --profile "$AWS_PROFILE" --region "$AWS_REGION"' in readme
+    assert "--profile ${jsonencode(var.aws_profile)}" in module_outputs
+    assert "--region ${jsonencode(var.aws_region)}" in module_outputs
 
 
 def test_certificate_limit_and_code_blind_outputs_are_explicit() -> None:
@@ -370,8 +483,10 @@ def test_certificate_limit_and_code_blind_outputs_are_explicit() -> None:
         "service_name",
         "task_role_arn",
         "runtime_database_secret_arn",
-        "doctor_task_definition_arn",
-        "doctor_network_configuration",
+        "schema_init_doctor_task_definition_arn",
+        "schema_init_doctor_network_configuration",
+        "runtime_doctor_task_definition_arn",
+        "runtime_doctor_network_configuration",
         "service_enable_command",
         "resolved_inventory",
         "teardown",

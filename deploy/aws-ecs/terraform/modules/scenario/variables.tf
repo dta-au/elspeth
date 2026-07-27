@@ -66,6 +66,15 @@ variable "aws_region" {
   type = string
 }
 
+variable "aws_profile" {
+  type = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", var.aws_profile))
+    error_message = "aws_profile must be an explicit shell-safe AWS profile name."
+  }
+}
+
 variable "target_platform" {
   type    = string
   default = "linux/amd64"
@@ -175,6 +184,18 @@ variable "transaction_search_baseline_sha256" {
   validation {
     condition     = can(regex("^[0-9a-f]{64}$", var.transaction_search_baseline_sha256))
     error_message = "transaction_search_baseline_sha256 must be a SHA-256 digest."
+  }
+}
+
+variable "cognito_subject_sub" {
+  type    = string
+  default = ""
+
+  validation {
+    condition = var.scenario_id == "A" ? var.cognito_subject_sub == "" : (
+      can(regex("^[\\x20-\\x7e]{1,128}$", var.cognito_subject_sub))
+    )
+    error_message = "cognito_subject_sub must be empty for Scenario A and a nonempty printable subject of at most 128 characters for Scenario B."
   }
 }
 

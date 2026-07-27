@@ -6,6 +6,18 @@ locals {
       assignPublicIp = "ENABLED"
     }
   })
+  schema_init_doctor_overrides = jsonencode({
+    containerOverrides = [{
+      name    = local.doctor_name
+      command = ["doctor", "aws-ecs", "--init-schema", "--json"]
+    }]
+  })
+  runtime_doctor_overrides = jsonencode({
+    containerOverrides = [{
+      name    = local.doctor_name
+      command = ["doctor", "aws-ecs", "--json"]
+    }]
+  })
 
   forward_actions = jsonencode([{
     Type           = "forward"
@@ -59,7 +71,7 @@ locals {
     ALB_BASE_URL                                    = "https://${aws_lb.web.dns_name}"
     ALB_ARN                                         = aws_lb.web.arn
     CANDIDATE_TASK_DEFINITION                       = aws_ecs_task_definition.candidate_web.arn
-    DOCTOR_TASK_DEFINITION                          = aws_ecs_task_definition.doctor.arn
+    DOCTOR_TASK_DEFINITION                          = aws_ecs_task_definition.runtime_doctor.arn
     DOCTOR_CONTAINER_NAME                           = local.doctor_name
     DOCTOR_NETWORK_CONFIGURATION                    = local.doctor_network_configuration
     PAYLOAD_VERIFIER_TASK_DEFINITION                = aws_ecs_task_definition.payload.arn
@@ -91,7 +103,14 @@ locals {
   }
 
   task_definition_families = concat(
-    [local.web_family, local.doctor_family, local.payload_family, local.local_auth_family, local.database_bootstrap_family],
+    [
+      local.web_family,
+      local.schema_init_doctor_family,
+      local.runtime_doctor_family,
+      local.payload_family,
+      local.local_auth_family,
+      local.database_bootstrap_family,
+    ],
     var.scenario_id == "B" ? [local.rollback_web_family, local.rollback_doctor_family] : [],
   )
 
@@ -134,7 +153,7 @@ locals {
         versions   = [aws_bedrock_guardrail_version.content.version]
       },
     ]
-    cognito_subject_sub             = ""
+    cognito_subject_sub             = var.scenario_id == "B" ? var.cognito_subject_sub : ""
     cognito_pool_owned              = var.scenario_id == "B"
     expected_retained_metric_series = 0
     expected_retained_trace_ids     = 0
@@ -184,19 +203,39 @@ output "runtime_database_secret_arn" {
   value       = aws_secretsmanager_secret.runtime.arn
 }
 
-output "doctor_task_definition_arn" {
-  description = "Task definition to run doctor aws-ecs, optionally overriding the command with --init-schema for the first install."
-  value       = aws_ecs_task_definition.doctor.arn
+output "schema_init_doctor_task_definition_arn" {
+  description = "Schema-owner task definition for the first doctor aws-ecs --init-schema --json run only."
+  value       = aws_ecs_task_definition.schema_init_doctor.arn
 }
 
-output "doctor_network_configuration" {
-  description = "AWS CLI JSON for running the doctor task on the installation network."
+output "schema_init_doctor_network_configuration" {
+  description = "AWS CLI network JSON for the schema-init doctor task."
   value       = local.doctor_network_configuration
 }
 
+output "schema_init_doctor_overrides" {
+  description = "AWS CLI overrides JSON fixing the schema-init doctor command."
+  value       = local.schema_init_doctor_overrides
+}
+
+output "runtime_doctor_task_definition_arn" {
+  description = "Runtime-credential task definition for the ordinary doctor aws-ecs --json run."
+  value       = aws_ecs_task_definition.runtime_doctor.arn
+}
+
+output "runtime_doctor_network_configuration" {
+  description = "AWS CLI network JSON for the ordinary runtime doctor task."
+  value       = local.doctor_network_configuration
+}
+
+output "runtime_doctor_overrides" {
+  description = "AWS CLI overrides JSON fixing the ordinary runtime doctor command."
+  value       = local.runtime_doctor_overrides
+}
+
 output "service_enable_command" {
-  description = "Run only after the first schema doctor succeeds."
-  value       = "aws ecs update-service --region ${var.aws_region} --cluster ${aws_ecs_cluster.scenario.name} --service ${aws_ecs_service.web.name} --desired-count 1"
+  description = "Run only after the schema-init and ordinary runtime doctor tasks both exit zero."
+  value       = "aws --profile ${jsonencode(var.aws_profile)} --region ${jsonencode(var.aws_region)} ecs update-service --cluster ${jsonencode(aws_ecs_cluster.scenario.name)} --service ${jsonencode(aws_ecs_service.web.name)} --desired-count 1"
 }
 
 output "teardown" {

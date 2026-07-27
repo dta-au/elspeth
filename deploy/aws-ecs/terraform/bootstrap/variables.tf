@@ -21,6 +21,15 @@ variable "aws_region" {
   type = string
 }
 
+variable "aws_profile" {
+  type = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", var.aws_profile))
+    error_message = "aws_profile must be an explicit shell-safe AWS profile name."
+  }
+}
+
 variable "backend_state_bucket" {
   type = string
 }

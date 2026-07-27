@@ -13,6 +13,7 @@ module "scenario" {
   rollback_baseline_sha              = var.rollback_baseline_sha
   aws_account_id                     = var.aws_account_id
   aws_region                         = var.aws_region
+  aws_profile                        = var.aws_profile
   target_platform                    = var.target_platform
   owner                              = var.owner
   purpose                            = var.purpose
@@ -27,6 +28,7 @@ module "scenario" {
   scenario_tf_binding_sha            = local.scenario_tf_binding_sha
   scenario_tf_binding_file           = var.scenario_tf_binding_file
   transaction_search_baseline_sha256 = var.transaction_search_baseline_sha256
+  cognito_subject_sub                = var.cognito_subject_sub
   alarm_actions                      = var.alarm_actions
   database_name                      = var.database_name
   session_database_name              = var.session_database_name

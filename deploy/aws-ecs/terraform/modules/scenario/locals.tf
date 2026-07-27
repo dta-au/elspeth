@@ -34,7 +34,8 @@ locals {
   payload_store_path     = "/var/lib/elspeth/payloads"
 
   web_family                = "${local.namespace}-web"
-  doctor_family             = "${local.namespace}-doctor"
+  schema_init_doctor_family = "${local.namespace}-schema-init-doctor"
+  runtime_doctor_family     = "${local.namespace}-runtime-doctor"
   payload_family            = "${local.namespace}-payload"
   local_auth_family         = "${local.namespace}-local-auth"
   rollback_web_family       = "${local.namespace}-rollback-web"
@@ -156,7 +157,7 @@ locals {
     { name = "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS", value = "8" },
     { name = "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", value = "120" },
     { name = "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE", value = "30" },
-    { name = "ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED", value = "false" },
+    { name = "ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED", value = "true" },
     { name = "ELSPETH_WEB__COMPOSER_MODEL", value = var.composer_model },
     { name = "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", value = var.composer_advisor_model },
     { name = "ELSPETH_WEB__REGISTRATION_MODE", value = "open" },
@@ -205,15 +206,15 @@ locals {
     { name = "ELSPETH_DB_RUNTIME_PASSWORD", valueFrom = "${aws_secretsmanager_secret.bootstrap.arn}:runtime_password::" },
   ]
 
-  cw_agent_json               = file("${path.module}/../../telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.json")
-  cw_agent_config_json_sha256 = filesha256("${path.module}/../../telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.json")
-  cw_agent_otel_yaml_sha256   = filesha256("${path.module}/../../telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.otel.yaml")
+  cw_agent_json = file("${path.module}/../../telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.json")
   cw_agent_otel = replace(
     file("${path.module}/../../telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.otel.yaml"),
     "$${OPERATOR_METRICS_LOG_GROUP}",
     local.operator_log_group,
   )
-  cw_agent_command = "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; AGENT=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent; mkdir -p \"$CONFIG_DIR\"; printf '%s' \"$ELSPETH_CW_AGENT_CONFIG_JSON_B64\" | base64 -d > \"$CONFIG_DIR/elspeth.cloudwatch-agent.v1.json\"; printf '%s' \"$ELSPETH_CW_AGENT_OTEL_YAML_B64\" | base64 -d > \"$CONFIG_DIR/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' \"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  $CONFIG_DIR/elspeth.cloudwatch-agent.v1.json\" | sha256sum -c -; printf '%s\\n' \"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  $CONFIG_DIR/elspeth.cloudwatch-agent.v1.otel.yaml\" | sha256sum -c -; \"$AGENT\" config-translator -input \"$CONFIG_DIR/elspeth.cloudwatch-agent.v1.json\" -output \"$CONFIG_DIR/amazon-cloudwatch-agent.toml\" -mode onPremise -os linux; exec \"$AGENT\" -config \"$CONFIG_DIR/amazon-cloudwatch-agent.toml\" -otelconfig \"$CONFIG_DIR/elspeth.cloudwatch-agent.v1.otel.yaml\""
+  cw_agent_config_json_sha256 = sha256(local.cw_agent_json)
+  cw_agent_otel_yaml_sha256   = sha256(local.cw_agent_otel)
+  cw_agent_command            = "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; CTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl; mkdir -p \"$CONFIG_DIR\"; printf '%s' \"$ELSPETH_CW_AGENT_CONFIG_JSON_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' \"$ELSPETH_CW_AGENT_OTEL_YAML_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' \"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" | sha256sum -c -; printf '%s\\n' \"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" | sha256sum -c -; \"$CTL\" -a fetch-config -m auto -c \"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" -s; \"$CTL\" -a append-config -m auto -c \"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" -s; while \"$CTL\" -a status -m auto | grep -q '\"status\": \"running\"'; do sleep 30; done; exit 1"
 
   oidc_domain_prefix        = local.namespace
   oidc_authorization_origin = var.scenario_id == "B" ? "https://${aws_cognito_user_pool_domain.web[0].domain}.auth.${var.aws_region}.amazoncognito.com" : ""

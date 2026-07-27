@@ -19,7 +19,9 @@ S3 object storage, logs/metrics/traces, and local ELSPETH authentication.
 `scenario-b/` exists only for acceptance of the Cognito/OIDC path and upgrade
 or rollback exercises. Its state key, namespace, networking, database, secrets,
 and Cognito hostname are isolated from Scenario A. Do not start here for a cold
-installation.
+installation. Its tfvars must name the nonempty Cognito subject that the
+acceptance run owns; the resolved inventory binds that subject to the
+Terraform-owned pool.
 
 Both scenarios create a disposable self-signed ALB certificate. It is valid for
 only 24 hours. Terraform outputs its CA certificate so a client can trust it
@@ -28,22 +30,27 @@ temporarily; this is not a production certificate strategy.
 ## Prerequisites and identity checks
 
 - Terraform `>= 1.14, < 2.0`.
-- An explicit AWS account and an explicit AWS region chosen by the operator.
-- AWS credentials available through the normal SDK/CLI credential chain.
+- An explicit AWS profile, account, and region chosen by the operator.
+- AWS credentials available through that named SDK/CLI profile.
 - A digest-pinned ELSPETH application image.
 - Two distinct `bedrock/...` provider IDs plus the exact inference-profile and
   foundation-model ARNs those IDs may invoke.
 
-Before every init, apply, or destroy, verify identity and region explicitly:
+Before every init, apply, or destroy, verify the named profile, identity, and
+region explicitly:
 
 ```sh
-aws sts get-caller-identity
-aws configure get region
+export AWS_PROFILE=REPLACE_WITH_AWS_PROFILE
+export AWS_REGION=REPLACE_WITH_AWS_REGION
+aws --profile "$AWS_PROFILE" --region "$AWS_REGION" sts get-caller-identity
+aws --profile "$AWS_PROFILE" configure get region
 ```
 
 Compare the returned account with `aws_account_id` and the configured region
-with `aws_region`. Do not rely on an implicit profile, region, or remembered
-account.
+with `aws_region`. Set the same required `aws_profile` value in the bootstrap
+and scenario tfvars. Do not rely on an implicit profile, region, or remembered
+account. The providers bind all AWS resources to that profile while
+`allowed_account_ids` independently protects the account boundary.
 
 ## 1. Bootstrap state and image repositories
 
@@ -72,7 +79,7 @@ digest and SHA-256 hashes of both tracked telemetry configuration files.
 
 The scenario roots contain only `backend "s3" {}`. Generate ignored
 `.tfbackend` inputs from the matching examples and replace the bucket and
-region placeholders:
+region/profile placeholders:
 
 ```sh
 cp examples/scenario-a.s3.tfbackend.example examples/scenario-a.s3.tfbackend
@@ -80,7 +87,8 @@ cp examples/scenario-b.s3.tfbackend.example examples/scenario-b.s3.tfbackend
 ```
 
 The A and B files use separate state keys, S3 server-side encryption, and S3
-native state locking (`use_lockfile = true`). Do not make their keys equal.
+native state locking (`use_lockfile = true`). Their explicit `profile` must
+match the scenario tfvars. Do not make their keys equal.
 
 ## 3. Install Scenario A
 
@@ -112,15 +120,62 @@ documented cold-install choice. Re-run the account and region checks before
 apply.
 
 The service is initially registered with desired count zero so an uninitialised
-database cannot enter a failing restart loop. Use the
-`doctor_task_definition_arn`, `doctor_network_configuration`, and
-`resolved_inventory` outputs in this exact order:
+database cannot enter a failing restart loop. The schema-init task definition
+uses schema-owner database URLs and is reserved for
+`doctor aws-ecs --init-schema --json`. The separate runtime doctor definition
+uses the same runtime-only database URLs as the web service and runs
+`doctor aws-ecs --json`.
 
-1. Run the doctor task with `doctor aws-ecs --init-schema --json` and require
-   exit code zero.
-2. Run a fresh ordinary doctor task with `doctor aws-ecs --json` and require
-   exit code zero.
-3. Print, inspect, and explicitly run `service_enable_command`.
+Run them in that order with the explicit task definitions, network
+configurations, and command overrides:
+
+```sh
+export AWS_PROFILE=REPLACE_WITH_AWS_PROFILE
+export AWS_REGION=REPLACE_WITH_AWS_REGION
+ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
+
+SCHEMA_TASK_DEFINITION=$(terraform -chdir=scenario-a output -raw schema_init_doctor_task_definition_arn)
+SCHEMA_NETWORK=$(terraform -chdir=scenario-a output -raw schema_init_doctor_network_configuration)
+SCHEMA_OVERRIDES=$(terraform -chdir=scenario-a output -raw schema_init_doctor_overrides)
+SCHEMA_TASK_ARN=$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs run-task \
+  --cluster "$ECS_CLUSTER" \
+  --task-definition "$SCHEMA_TASK_DEFINITION" \
+  --launch-type FARGATE \
+  --network-configuration "$SCHEMA_NETWORK" \
+  --overrides "$SCHEMA_OVERRIDES" \
+  --count 1 \
+  --query 'tasks[0].taskArn' \
+  --output text)
+aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs wait tasks-stopped \
+  --cluster "$ECS_CLUSTER" --tasks "$SCHEMA_TASK_ARN"
+test "$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs describe-tasks \
+  --cluster "$ECS_CLUSTER" --tasks "$SCHEMA_TASK_ARN" \
+  --query 'tasks[0].containers[?name==`doctor`].exitCode | [0]' \
+  --output text)" = 0
+
+RUNTIME_TASK_DEFINITION=$(terraform -chdir=scenario-a output -raw runtime_doctor_task_definition_arn)
+RUNTIME_NETWORK=$(terraform -chdir=scenario-a output -raw runtime_doctor_network_configuration)
+RUNTIME_OVERRIDES=$(terraform -chdir=scenario-a output -raw runtime_doctor_overrides)
+RUNTIME_TASK_ARN=$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs run-task \
+  --cluster "$ECS_CLUSTER" \
+  --task-definition "$RUNTIME_TASK_DEFINITION" \
+  --launch-type FARGATE \
+  --network-configuration "$RUNTIME_NETWORK" \
+  --overrides "$RUNTIME_OVERRIDES" \
+  --count 1 \
+  --query 'tasks[0].taskArn' \
+  --output text)
+aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs wait tasks-stopped \
+  --cluster "$ECS_CLUSTER" --tasks "$RUNTIME_TASK_ARN"
+test "$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs describe-tasks \
+  --cluster "$ECS_CLUSTER" --tasks "$RUNTIME_TASK_ARN" \
+  --query 'tasks[0].containers[?name==`doctor`].exitCode | [0]' \
+  --output text)" = 0
+```
+
+Both task exit codes must be `0`. Then print, inspect, and explicitly run
+`service_enable_command`; never enable the service after only the privileged
+schema-init check.
 
 The service lifecycle ignores later desired-count and task-definition changes
 so ordinary image deployments remain an explicit operator action.
@@ -159,7 +214,8 @@ and a teardown reminder. These are intended to be useful without reading the
 Terraform source.
 
 For teardown, select the same backend config and exact workspace used for
-installation, verify the explicit AWS account and region again, and run:
+installation, verify the explicit AWS profile, account, and region again, and
+run:
 
 ```sh
 terraform -chdir=scenario-a destroy \

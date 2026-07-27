@@ -29,12 +29,28 @@ output "runtime_database_secret_arn" {
   value = module.scenario.runtime_database_secret_arn
 }
 
-output "doctor_task_definition_arn" {
-  value = module.scenario.doctor_task_definition_arn
+output "schema_init_doctor_task_definition_arn" {
+  value = module.scenario.schema_init_doctor_task_definition_arn
 }
 
-output "doctor_network_configuration" {
-  value = module.scenario.doctor_network_configuration
+output "schema_init_doctor_network_configuration" {
+  value = module.scenario.schema_init_doctor_network_configuration
+}
+
+output "schema_init_doctor_overrides" {
+  value = module.scenario.schema_init_doctor_overrides
+}
+
+output "runtime_doctor_task_definition_arn" {
+  value = module.scenario.runtime_doctor_task_definition_arn
+}
+
+output "runtime_doctor_network_configuration" {
+  value = module.scenario.runtime_doctor_network_configuration
+}
+
+output "runtime_doctor_overrides" {
+  value = module.scenario.runtime_doctor_overrides
 }
 
 output "service_enable_command" {

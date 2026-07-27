@@ -68,15 +68,13 @@ locals {
     entryPoint        = ["/bin/sh", "-ceu"]
     command           = [local.cw_agent_command]
     environment = [
-      { name = "AWS_REGION", value = var.aws_region },
-      { name = "AWS_DEFAULT_REGION", value = var.aws_region },
       { name = "ELSPETH_CW_AGENT_CONFIG_JSON_B64", value = base64encode(local.cw_agent_json) },
-      { name = "ELSPETH_CW_AGENT_CONFIG_JSON_SHA256", value = sha256(local.cw_agent_json) },
+      { name = "ELSPETH_CW_AGENT_CONFIG_JSON_SHA256", value = local.cw_agent_config_json_sha256 },
       { name = "ELSPETH_CW_AGENT_OTEL_YAML_B64", value = base64encode(local.cw_agent_otel) },
-      { name = "ELSPETH_CW_AGENT_OTEL_YAML_SHA256", value = sha256(local.cw_agent_otel) },
+      { name = "ELSPETH_CW_AGENT_OTEL_YAML_SHA256", value = local.cw_agent_otel_yaml_sha256 },
     ]
     healthCheck = {
-      command     = ["CMD-SHELL", "grep -aq 'amazon-cloudwatch-agent' /proc/1/cmdline"]
+      command     = ["CMD-SHELL", "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q '\"status\": \"running\"'"]
       interval    = 10
       timeout     = 5
       retries     = 6
@@ -120,14 +118,26 @@ locals {
     logConfiguration = local.web_log_configuration
   }
 
-  doctor_container = {
+  schema_init_doctor_container = {
+    name             = local.doctor_name
+    image            = var.candidate_image
+    essential        = true
+    entryPoint       = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
+    command          = ["doctor", "aws-ecs", "--init-schema", "--json"]
+    environment      = local.runtime_environment
+    secrets          = local.schema_owner_secrets
+    mountPoints      = local.mount_points
+    logConfiguration = local.doctor_log_configuration
+  }
+
+  runtime_doctor_container = {
     name             = local.doctor_name
     image            = var.candidate_image
     essential        = true
     entryPoint       = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
     command          = ["doctor", "aws-ecs", "--json"]
     environment      = local.runtime_environment
-    secrets          = local.schema_owner_secrets
+    secrets          = local.runtime_secrets
     mountPoints      = local.mount_points
     logConfiguration = local.doctor_log_configuration
   }
@@ -172,7 +182,7 @@ locals {
     ])
   })
 
-  rollback_doctor_container = merge(local.doctor_container, {
+  rollback_doctor_container = merge(local.runtime_doctor_container, {
     image       = var.rollback_baseline_image
     environment = local.rollback_environment
   })
@@ -213,15 +223,47 @@ resource "aws_ecs_task_definition" "candidate_web" {
   tags = local.tags
 }
 
-resource "aws_ecs_task_definition" "doctor" {
-  family                   = local.doctor_family
+resource "aws_ecs_task_definition" "schema_init_doctor" {
+  family                   = local.schema_init_doctor_family
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = 512
   memory                   = 1024
   task_role_arn            = aws_iam_role.task.arn
   execution_role_arn       = aws_iam_role.execution.arn
-  container_definitions    = jsonencode([local.doctor_container])
+  container_definitions    = jsonencode([local.schema_init_doctor_container])
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = local.cpu_architecture
+  }
+
+  volume {
+    name = local.efs_volume.name
+    efs_volume_configuration {
+      file_system_id          = local.efs_volume.efsVolumeConfiguration.fileSystemId
+      root_directory          = local.efs_volume.efsVolumeConfiguration.rootDirectory
+      transit_encryption      = local.efs_volume.efsVolumeConfiguration.transitEncryption
+      transit_encryption_port = local.efs_volume.efsVolumeConfiguration.transitEncryptionPort
+      authorization_config {
+        access_point_id = local.efs_volume.efsVolumeConfiguration.authorizationConfig.accessPointId
+        iam             = local.efs_volume.efsVolumeConfiguration.authorizationConfig.iam
+      }
+    }
+  }
+
+  tags = local.tags
+}
+
+resource "aws_ecs_task_definition" "runtime_doctor" {
+  family                   = local.runtime_doctor_family
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 512
+  memory                   = 1024
+  task_role_arn            = aws_iam_role.task.arn
+  execution_role_arn       = aws_iam_role.execution.arn
+  container_definitions    = jsonencode([local.runtime_doctor_container])
 
   runtime_platform {
     operating_system_family = "LINUX"

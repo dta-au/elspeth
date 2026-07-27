@@ -66,6 +66,15 @@ variable "aws_region" {
   type = string
 }
 
+variable "aws_profile" {
+  type = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", var.aws_profile))
+    error_message = "aws_profile must be an explicit shell-safe AWS profile name."
+  }
+}
+
 variable "target_platform" {
   type    = string
   default = "linux/amd64"
@@ -144,6 +153,16 @@ variable "scenario_tf_binding_file" {
 
 variable "transaction_search_baseline_sha256" {
   type = string
+}
+
+variable "cognito_subject_sub" {
+  type    = string
+  default = ""
+
+  validation {
+    condition     = var.cognito_subject_sub == ""
+    error_message = "cognito_subject_sub must remain empty for Scenario A."
+  }
 }
 
 variable "alarm_actions" {

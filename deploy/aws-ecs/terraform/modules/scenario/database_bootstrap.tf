@@ -154,6 +154,7 @@ resource "terraform_data" "database_bootstrap" {
       chmod 700 "$work"
       trap 'rm -rf -- "$work"' EXIT
       if ! task_arn=$(aws ecs run-task \
+        --profile "$AWS_PROFILE" \
         --region "$AWS_REGION" \
         --cluster "$ECS_CLUSTER" \
         --task-definition "$TASK_DEFINITION" \
@@ -170,6 +171,7 @@ resource "terraform_data" "database_bootstrap" {
         exit 1
       }
       if ! aws ecs wait tasks-stopped \
+        --profile "$AWS_PROFILE" \
         --region "$AWS_REGION" \
         --cluster "$ECS_CLUSTER" \
         --tasks "$task_arn" >"$work/wait.out" 2>"$work/wait.err"; then
@@ -177,6 +179,7 @@ resource "terraform_data" "database_bootstrap" {
         exit 1
       fi
       if ! exit_code=$(aws ecs describe-tasks \
+        --profile "$AWS_PROFILE" \
         --region "$AWS_REGION" \
         --cluster "$ECS_CLUSTER" \
         --tasks "$task_arn" \
@@ -193,6 +196,7 @@ resource "terraform_data" "database_bootstrap" {
 
     environment = {
       AWS_PAGER             = ""
+      AWS_PROFILE           = var.aws_profile
       AWS_REGION            = var.aws_region
       ECS_CLUSTER           = aws_ecs_cluster.scenario.name
       TASK_DEFINITION       = aws_ecs_task_definition.database_bootstrap.arn
