@@ -16,18 +16,19 @@ are filtered from options before YAML generation. These are UI-layer
 concerns that should not leak into engine configuration. Plugin configs
 use Pydantic with extra="forbid" — unknown keys cause validation failure.
 
-Public export/share/MCP YAML has one extra scrub: blob-bound source storage
-paths are omitted. HTTP export returns ``source_blob_ids`` so imports can
-re-bind an uploaded blob in the destination session; other public surfaces
-must not expose a server storage path as a path-only replay target. Runtime
-execution keeps the path because the engine still needs the local file path
-after blob ownership checks pass.
+Public export/share/MCP views have one extra scrub. Blob identity and
+``persist_directory`` custody carriers are recursive; source/sink storage keys
+and ``bind_source`` apply only at their schema-defined locations. Arbitrary
+plugin payloads (for example LLM ``lookup`` dictionaries) remain semantic data.
+Runtime execution keeps private custody facts because the engine still needs
+local paths after ownership checks pass.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, TypedDict, cast
 
 import yaml
 
@@ -42,12 +43,30 @@ from elspeth.web.composer.guided_blob_refs import (
 )
 from elspeth.web.composer.state import COMPOSER_NODE_TYPES, CompositionState, queue_node_contract_error
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
-from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
+from elspeth.web.paths import (
+    NESTED_LOCAL_PATH_OPTION_KEYS,
+    SINK_LOCAL_PATH_OPTION_KEYS,
+    SOURCE_LOCAL_PATH_OPTION_KEYS,
+)
 
 # Web-specific metadata keys that should NOT appear in engine YAML.
 # These are UI-layer concerns for provenance tracking, not plugin config.
 # Plugin configs use Pydantic with extra="forbid" — unknown keys cause errors.
 _WEB_ONLY_OPTION_KEYS = frozenset({"blob_ref"}) | AUTHORING_METADATA_OPTION_KEYS
+_PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS = _WEB_ONLY_OPTION_KEYS | frozenset(NESTED_LOCAL_PATH_OPTION_KEYS) | frozenset({"blob_id"})
+_PUBLIC_STORAGE_OPTION_KEYS = frozenset(SOURCE_LOCAL_PATH_OPTION_KEYS) | frozenset(SINK_LOCAL_PATH_OPTION_KEYS)
+_PUBLIC_CUSTODY_SUBTREE_KEYS = frozenset({"custody", "provider_config"})
+
+
+class PublicCompositionDict(TypedDict):
+    """Composition-state wire shape after recursive public projection."""
+
+    version: int
+    metadata: dict[str, str]
+    sources: dict[str, dict[str, Any]]
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    outputs: list[dict[str, Any]]
 
 
 @trust_boundary(
@@ -74,7 +93,7 @@ def _has_bind_source_mode(options: dict[str, Any]) -> bool:
     return options.get("mode") == "bind_source"
 
 
-def _strip_web_metadata(options: dict[str, Any], *, omit_blob_bound_source_paths: bool = False) -> dict[str, Any]:
+def _strip_web_metadata(options: dict[str, Any], *, omit_source_paths: bool = False) -> dict[str, Any]:
     """Remove web-specific metadata keys from options dict.
 
     Returns a shallow copy with web-only keys removed.
@@ -85,17 +104,17 @@ def _strip_web_metadata(options: dict[str, Any], *, omit_blob_bound_source_paths
         # not in _WEB_ONLY_OPTION_KEYS, so it survives into ``stripped`` — pop
         # it directly without a default (a missing key here would be a bug).
         stripped.pop("mode")
-    if omit_blob_bound_source_paths and _has_blob_binding(options):
+    if omit_source_paths:
         for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
             stripped.pop(key, None)
     return stripped
 
 
-def _source_entry(source: dict[str, Any], *, omit_blob_bound_source_paths: bool) -> dict[str, Any]:
+def _source_entry(source: dict[str, Any], *, omit_source_paths: bool) -> dict[str, Any]:
     """Convert a serialized SourceSpec dict into runtime YAML shape."""
     source_options = _strip_web_metadata(
         dict(source["options"]),
-        omit_blob_bound_source_paths=omit_blob_bound_source_paths,
+        omit_source_paths=omit_source_paths,
     )
     source_options["on_validation_failure"] = source["on_validation_failure"]
     return {
@@ -105,7 +124,12 @@ def _source_entry(source: dict[str, Any], *, omit_blob_bound_source_paths: bool)
     }
 
 
-def _generate_pipeline_dict(state: CompositionState, *, omit_blob_bound_source_paths: bool) -> dict[str, Any]:
+def _generate_pipeline_dict(
+    state: CompositionState,
+    *,
+    omit_source_paths: bool,
+    state_dict: PublicCompositionDict | None = None,
+) -> dict[str, Any]:
     """Convert a CompositionState to ELSPETH's canonical pipeline dict.
 
     Maps CompositionState fields to the YAML structure expected by
@@ -125,7 +149,7 @@ def _generate_pipeline_dict(state: CompositionState, *, omit_blob_bound_source_p
     # Unwrap frozen containers to plain Python types (R4).
     # to_dict() recursively converts MappingProxyType -> dict,
     # tuple -> list. Without this, yaml.dump() raises RepresenterError.
-    state_dict = state.to_dict()
+    state_dict = cast(PublicCompositionDict, state.to_dict()) if state_dict is None else state_dict
 
     doc: dict[str, Any] = {}
 
@@ -136,9 +160,7 @@ def _generate_pipeline_dict(state: CompositionState, *, omit_blob_bound_source_p
 
     sources = state_dict["sources"]
     if sources:
-        doc["sources"] = {
-            name: _source_entry(source, omit_blob_bound_source_paths=omit_blob_bound_source_paths) for name, source in sources.items()
-        }
+        doc["sources"] = {name: _source_entry(source, omit_source_paths=omit_source_paths) for name, source in sources.items()}
 
     # Queues — structural pass-through fan-in points (elspeth-a5b86149d4).
     # Emitted after sources and before executable node lists so the YAML reads
@@ -268,7 +290,7 @@ def _generate_pipeline_dict(state: CompositionState, *, omit_blob_bound_source_p
 
 def generate_pipeline_dict(state: CompositionState) -> dict[str, Any]:
     """Convert a CompositionState to the runtime pipeline dict."""
-    return _generate_pipeline_dict(state, omit_blob_bound_source_paths=False)
+    return _generate_pipeline_dict(state, omit_source_paths=False)
 
 
 def reattach_guided_blob_refs_for_public_export(state: CompositionState) -> CompositionState:
@@ -369,10 +391,79 @@ def reattach_guided_blob_refs_for_public_export(state: CompositionState) -> Comp
     return replace(state, sources=reattached) if changed else state
 
 
+def _recursive_public_option_projection(
+    value: Any,
+    *,
+    strip_storage_here: bool = False,
+    custody_subtree: bool = False,
+    strip_bind_source_mode: bool = False,
+) -> Any:
+    """Project options without treating arbitrary plugin data as custody."""
+    if isinstance(value, Mapping):
+        projected: dict[str, Any] = {}
+        for key, nested in value.items():
+            if key in _PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS or key.endswith("_blob_id"):
+                continue
+            if (strip_storage_here or custody_subtree) and key in _PUBLIC_STORAGE_OPTION_KEYS:
+                continue
+            if strip_bind_source_mode and key == "mode" and nested == "bind_source":
+                continue
+            child_custody_subtree = custody_subtree or key in _PUBLIC_CUSTODY_SUBTREE_KEYS
+            projected[key] = _recursive_public_option_projection(
+                nested,
+                custody_subtree=child_custody_subtree,
+                strip_bind_source_mode=False,
+            )
+        return projected
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [
+            _recursive_public_option_projection(
+                item,
+                strip_storage_here=strip_storage_here,
+                custody_subtree=custody_subtree,
+                strip_bind_source_mode=strip_bind_source_mode,
+            )
+            for item in value
+        ]
+    return value
+
+
+def generate_public_composition_dict(state: CompositionState) -> PublicCompositionDict:
+    """Return the single recursive public projection of composer state.
+
+    The shape remains ``CompositionState.to_dict()`` compatible so graph
+    consumers retain source/node/edge/output structure. Only public facts
+    survive: source/sink path carriers, nested transform persistence paths,
+    blob identifiers, bind-source markers, and recursively nested authoring
+    metadata are excluded.
+    """
+    export_state = reattach_guided_blob_refs_for_public_export(state)
+    projected = cast(PublicCompositionDict, export_state.to_dict())
+
+    for source in projected["sources"].values():
+        source["options"] = _recursive_public_option_projection(
+            source["options"],
+            strip_storage_here=True,
+            strip_bind_source_mode=True,
+        )
+    for node in projected["nodes"]:
+        node["options"] = _recursive_public_option_projection(node["options"])
+    for output in projected["outputs"]:
+        output["options"] = _recursive_public_option_projection(
+            output["options"],
+            strip_storage_here=True,
+        )
+    return projected
+
+
 def generate_public_pipeline_dict(state: CompositionState) -> dict[str, Any]:
     """Convert a CompositionState to public export/share/MCP pipeline dict."""
-    export_state = reattach_guided_blob_refs_for_public_export(state)
-    return _generate_pipeline_dict(export_state, omit_blob_bound_source_paths=True)
+    public_state = generate_public_composition_dict(state)
+    return _generate_pipeline_dict(
+        state,
+        omit_source_paths=True,
+        state_dict=public_state,
+    )
 
 
 def generate_yaml(state: CompositionState) -> str:

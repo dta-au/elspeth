@@ -15,14 +15,18 @@ Fixtures live in ``tests/integration/web/conftest.py``:
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from elspeth.core.canonical import canonical_json
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.sessions.models import composer_completion_events_table
@@ -214,6 +218,97 @@ def test_get_shared_inspect_happy_path(
         "llm_interpretations",
         "secrets",
     }
+
+
+def test_shared_route_and_persistence_expose_only_public_projection(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """The path-only integration fixture must stay private across every carrier."""
+    client, session_id = audit_readiness_client_with_state
+    settings = client.app.state.settings
+    private_source_path = str(settings.data_dir / "blobs" / str(session_id) / "audit_readiness_fixture.csv")
+    private_sink_path = str(settings.data_dir / "outputs" / str(session_id) / "audit_readiness_fixture_out.csv")
+
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    marked_body = marked.json()
+    resolved = client.get(f"/api/sessions/shared/{marked_body['token']}")
+    assert resolved.status_code == 200, resolved.text
+    resolved_body = resolved.json()
+
+    digest_hex = marked_body["payload_digest"].removeprefix("sha256:")
+    stored_bytes = client.app.state.payload_store.retrieve(digest_hex)
+    stored_body = json.loads(stored_bytes)
+    with client.app.state.session_engine.connect() as conn:
+        audit_row = conn.execute(
+            select(composer_completion_events_table).where(composer_completion_events_table.c.session_id == str(session_id))
+        ).one()
+
+    for representation in (stored_body, resolved_body):
+        serialized = json.dumps(representation, sort_keys=True)
+        assert private_source_path not in serialized
+        assert private_sink_path not in serialized
+        assert "blob_ref" not in serialized
+        assert "secret(s) in your inventory" not in serialized
+
+    assert resolved_body["composition_snapshot"]["sources"]["source"]["plugin"] == "csv"
+    assert resolved_body["composition_snapshot"]["nodes"][0]["id"] == "pass"
+    assert resolved_body["composition_snapshot"]["outputs"][0]["name"] == "out"
+    assert private_source_path not in stored_body["yaml"]
+    assert audit_row.payload_digest == marked_body["payload_digest"]
+    assert private_source_path not in repr(audit_row)
+
+
+def test_shared_route_projects_legacy_signed_blob_without_rewriting_evidence(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """A valid outstanding token cannot bypass the current public projection."""
+    client, session_id = audit_readiness_client_with_state
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    service = client.app.state.shareable_review_service
+    payload_store = client.app.state.payload_store
+    signed_payload = service._signer.verify(marked.json()["token"])
+    stored = json.loads(payload_store.retrieve(signed_payload.payload_digest.removeprefix("sha256:")))
+
+    private_path = "/srv/elspeth/blobs/alice/legacy-http.csv"
+    private_index = "/srv/elspeth/indexes/alice/legacy-http"
+    blob_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
+    stored["composition_snapshot"]["sources"]["source"]["options"].update(
+        {
+            "path": private_path,
+            "blob_ref": blob_id,
+            "mode": "bind_source",
+        }
+    )
+    stored["composition_snapshot"]["nodes"][0]["plugin"] = "llm"
+    stored["composition_snapshot"]["nodes"][0]["options"] = {
+        "prompt_template": "{{ lookup.path }}",
+        "lookup": {"path": "north", "file": "case.txt", "mode": "bind_source"},
+        "provider_config": {"persist_directory": private_index},
+    }
+    stored["yaml"] = f"legacy_path: {private_path}\nlegacy_blob: {blob_id}\n"
+    stored["audit_readiness"]["rows"][-1]["detail"] = "23 secret(s) in your inventory"
+    legacy_bytes = canonical_json(stored).encode()
+    digest_hex = payload_store.store(legacy_bytes)
+    legacy_token = service._signer.sign(
+        replace(
+            signed_payload,
+            nonce_hex="cd" * 16,
+            payload_digest=f"sha256:{digest_hex}",
+        )
+    )
+
+    response = client.get(f"/api/sessions/shared/{legacy_token}")
+
+    assert response.status_code == 200, response.text
+    serialized = response.text
+    for private_value in (private_path, private_index, blob_id, "23 secret(s) in your inventory"):
+        assert private_value not in serialized
+    expected_lookup = {"path": "north", "file": "case.txt", "mode": "bind_source"}
+    assert response.json()["composition_snapshot"]["nodes"][0]["options"]["lookup"] == expected_lookup
+    assert yaml.safe_load(response.json()["yaml"])["transforms"][0]["options"]["lookup"] == expected_lookup
+    assert payload_store.retrieve(digest_hex) == legacy_bytes
 
 
 def test_get_shared_inspect_recipient_is_not_creator(

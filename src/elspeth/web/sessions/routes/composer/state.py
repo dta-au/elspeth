@@ -118,9 +118,8 @@ def _reject_imported_plugin_policy(
     )
 
 
-class StateYamlResponse(TypedDict, total=False):
+class StateYamlResponse(TypedDict):
     yaml: str
-    source_blob_ids: dict[str, str]
 
 
 class ImportStateYamlRequest(BaseModel):
@@ -803,13 +802,12 @@ def _reattach_guided_blob_refs(state: CompositionState) -> CompositionState:
 
     The manual set_source commit strips ``blob_ref`` from guided sources (it
     cannot prove ``path == storage_path``); it survives only in the persisted
-    reviewed source snapshot. Both export egress channels — the public-YAML storage-path omission
-    (``_strip_web_metadata(..., omit_blob_bound_source_paths=True)``) and the
-    ``source_blob_ids`` sidecar — key off ``source.options["blob_ref"]``, so
-    without this a guided blob source leaks its absolute storage path AND emits no
-    sidecar (breaking the export→re-import round-trip). Reattaching here lets the
-    existing ``blob_ref``-keyed export machinery treat guided sources exactly like
-    freeform blob-bound ones. Mirrors the snapshot cross-reference in
+    reviewed source snapshot. Public-YAML storage-path omission and live custody
+    verification both key off ``source.options["blob_ref"]``, so without this a
+    guided blob source leaks its absolute storage path or bypasses verification.
+    Reattaching here lets the existing ``blob_ref``-keyed export machinery treat
+    guided sources exactly like freeform blob-bound ones while verifying custody
+    before public export. Mirrors the snapshot cross-reference in
     ``redact_guided_snapshot_storage_paths``; never mutates ``state``.
 
     Private-path snapshots use stable source name plus exact path equality. Public
@@ -949,13 +947,13 @@ async def get_state_yaml(
         )
     # elspeth-b5ee205720: reconstitute blob_ref for guided blob-backed sources
     # (stripped from committed options; retained only in the GuidedSession
-    # snapshot) so BOTH export egress channels below — the public-YAML storage-path
-    # omission and the source_blob_ids sidecar — treat them as blob-bound. Kept
+    # snapshot) so public-YAML path omission and live custody verification treat
+    # them as blob-bound. Kept
     # AFTER preflight: blob_ref is extra=forbid for plugin configs and must not
     # reach plugin instantiation. Preflight ran on the raw `state`; export uses
     # the reattached copy.
     export_state = _reattach_guided_blob_refs(state)
-    source_blob_ids = await _verified_yaml_export_blob_ids(
+    await _verified_yaml_export_blob_ids(
         export_state,
         request=request,
         session_id=session.id,
@@ -1000,7 +998,4 @@ async def get_state_yaml(
         completion_verb="export_yaml",
     )
 
-    response: StateYamlResponse = {"yaml": yaml_str}
-    if source_blob_ids:
-        response["source_blob_ids"] = source_blob_ids
-    return response
+    return {"yaml": yaml_str}

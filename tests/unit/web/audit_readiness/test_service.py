@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -1188,6 +1189,79 @@ def test_secrets_not_applicable_when_no_ref_check_has_unrelated_inventory():
     row = _row(snap, "secrets")
     assert row.status == "not_applicable"
     assert row.summary == "No secret references in this composition"
+
+
+def test_resolved_secret_row_is_invariant_to_unrelated_owner_inventory():
+    """Shared readiness is composition-scoped, never an owner inventory report."""
+    result = ValidationResult(
+        is_valid=True,
+        checks=[
+            ValidationCheck(
+                name="secret_refs",
+                passed=True,
+                detail="All referenced secrets resolved",
+                affected_nodes=("llm",),
+                outcome_code="secret_refs.resolved",
+            )
+        ],
+        errors=[],
+        readiness=_ready_readiness(),
+        semantic_contracts=[],
+    )
+    inventories = (
+        (SecretInventoryItem(name="PIPELINE_KEY", scope="user", available=True),),
+        (
+            SecretInventoryItem(name="PIPELINE_KEY", scope="user", available=True),
+            SecretInventoryItem(name="UNRELATED_ONE", scope="user", available=True),
+            SecretInventoryItem(name="UNRELATED_TWO", scope="server", available=True),
+        ),
+    )
+
+    rows = []
+    for inventory in inventories:
+        snapshot = asyncio.run(
+            _make_service(_state(), result, inventory=inventory).compute_snapshot(
+                session_id=UUID("11111111-1111-1111-1111-111111111111"),
+                user_id="alice",
+            )
+        )
+        rows.append(_row(snapshot, "secrets"))
+
+    assert rows[0] == rows[1]
+    assert rows[0].status == "ok"
+    assert rows[0].summary == "All secret references resolve"
+    assert rows[0].detail is None
+
+
+def test_absent_secret_check_is_inventory_invariant_and_does_not_read_inventory():
+    """An absent composition check cannot be inferred from owner-global refs."""
+    inventories = (
+        (),
+        (
+            SecretInventoryItem(name="UNRELATED_ONE", scope="user", available=True),
+            SecretInventoryItem(name="UNRELATED_TWO", scope="server", available=True),
+        ),
+    )
+    services = [_make_service(_state(), _OK, inventory=inventory) for inventory in inventories]
+    rows = []
+    for service in services:
+        snapshot = asyncio.run(
+            service.compute_snapshot(
+                session_id=UUID("11111111-1111-1111-1111-111111111111"),
+                user_id="alice",
+            )
+        )
+        rows.append(_row(snapshot, "secrets"))
+
+    content = [row.model_dump_json() for row in rows]
+    digests = [hashlib.sha256(item.encode()).hexdigest() for item in content]
+    assert content[0] == content[1]
+    assert digests[0] == digests[1]
+    assert rows[0].summary == "Secret reference check did not run"
+    for service in services:
+        resolver = service._scoped_secret_resolver
+        assert isinstance(resolver, _ScopedSecretResolverDouble)
+        assert resolver.list_refs.calls == []
 
 
 def test_secrets_error_on_missing_refs():

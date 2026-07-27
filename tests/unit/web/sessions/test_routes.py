@@ -7071,8 +7071,8 @@ sinks:
         assert "csv" in body["yaml"]
 
     @pytest.mark.asyncio
-    async def test_yaml_response_preserves_source_blob_identity_outside_engine_yaml(self, tmp_path) -> None:
-        """Final YAML artifacts must retain blob custody even though YAML strips blob_ref."""
+    async def test_yaml_response_omits_source_blob_identity_sidecar(self, tmp_path) -> None:
+        """Public YAML export must not expose blob UUIDs beside scrubbed YAML."""
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         blob_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
@@ -7125,7 +7125,8 @@ sinks:
 
         assert resp.status_code == 200
         body = resp.json()
-        assert body["source_blob_ids"] == {"source": blob_id}
+        assert "source_blob_ids" not in body
+        assert blob_id not in json.dumps(body, sort_keys=True)
         assert blob_id not in body["yaml"]
         assert "/data/blobs/session/contact_form_submissions.csv" not in body["yaml"]
         exported_source_options = yaml.safe_load(body["yaml"])["sources"]["source"]["options"]
@@ -7134,7 +7135,7 @@ sinks:
         assert exported_source_options["schema"] == {"mode": "observed"}
 
     @pytest.mark.asyncio
-    async def test_yaml_round_trip_restores_guided_blob_from_reviewed_public_sentinel(self, tmp_path: Path) -> None:
+    async def test_yaml_export_scrubs_guided_blob_from_reviewed_public_sentinel(self, tmp_path: Path) -> None:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         blob_id = uuid.UUID("98b1357d-5aab-4fb3-85b4-5ad643912e84")
@@ -7191,19 +7192,19 @@ sinks:
 
         with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
             exported = client.get(f"/api/sessions/{session.id}/state/yaml")
-            imported = client.post(f"/api/sessions/{session.id}/state/yaml", json=exported.json())
 
         assert exported.status_code == 200, exported.text
-        assert exported.json()["source_blob_ids"] == {"source": str(blob_id)}
-        assert storage_path not in exported.json()["yaml"]
-        assert imported.status_code == 200, imported.text
+        assert "source_blob_ids" not in exported.json()
+        assert str(blob_id) not in exported.text
+        assert storage_path not in exported.text
+        assert get_blob.await_count == 1
+        assert get_blob.await_args.args == (blob_id,)
         record = await service.get_current_state(session.id)
         assert record is not None
-        assert record.sources["source"]["options"]["blob_ref"] == str(blob_id)
         assert record.sources["source"]["options"]["path"] == storage_path
 
     @pytest.mark.asyncio
-    async def test_yaml_export_after_guided_exit_uses_current_freeform_blob_binding(self, tmp_path: Path) -> None:
+    async def test_yaml_export_after_guided_exit_verifies_but_scrubs_current_blob_binding(self, tmp_path: Path) -> None:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         current_blob_id = uuid.UUID("98b1357d-5aab-4fb3-85b4-5ad643912e84")
@@ -7272,9 +7273,12 @@ sinks:
             response = client.get(f"/api/sessions/{session.id}/state/yaml")
 
         assert response.status_code == 200, response.text
-        assert response.json()["source_blob_ids"] == {"source": str(current_blob_id)}
+        assert "source_blob_ids" not in response.json()
+        assert str(current_blob_id) not in response.text
         assert stale_blob_id not in response.text
-        assert current_storage_path not in response.json()["yaml"]
+        assert current_storage_path not in response.text
+        assert app.state.blob_service.get_blob.await_count == 1
+        assert app.state.blob_service.get_blob.await_args.args == (current_blob_id,)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

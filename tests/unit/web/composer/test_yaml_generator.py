@@ -547,6 +547,128 @@ class TestGenerateYaml:
         assert "/data/blobs/session/20b944e3_input.txt" not in public_yaml
         assert generate_pipeline_dict(state)["sources"]["source"]["options"]["path"] == "/data/blobs/session/20b944e3_input.txt"
 
+    def test_public_projection_recursively_strips_all_source_custody_data(self) -> None:
+        """Public dict/YAML must not depend on blob_ref truthiness.
+
+        A blob binding, an explicit-null binding, and a path-only source all
+        cross the same public projection. Nested authoring metadata is removed
+        as a unit so its private path/blob facts cannot survive indirectly.
+        """
+        private_values = {
+            "/private/blob-backed.csv",
+            "/private/explicit-null.csv",
+            "/private/path-only.csv",
+            "/private/nested.csv",
+            "/private/source-index",
+            "/private/vector-index",
+            "/private/node-input.csv",
+            "/private/output.csv",
+            "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+            "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+            "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+        }
+        state = CompositionState(
+            sources={
+                "blob_backed": SourceSpec(
+                    plugin="csv",
+                    on_success="out",
+                    options={
+                        "path": "/private/blob-backed.csv",
+                        "blob_ref": "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "explicit_null": SourceSpec(
+                    plugin="csv",
+                    on_success="out",
+                    options={
+                        "path": "/private/explicit-null.csv",
+                        "blob_ref": None,
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "path_only": SourceSpec(
+                    plugin="csv",
+                    on_success="out",
+                    options={
+                        "file": "/private/path-only.csv",
+                        SOURCE_AUTHORING_KEY: {
+                            "path": "/private/nested.csv",
+                            "blob_ref": "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+                        },
+                        "custody": {
+                            "persist_directory": "/private/source-index",
+                            "blob_id": "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+                        },
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+            },
+            nodes=(
+                NodeSpec(
+                    id="pass",
+                    node_type="transform",
+                    plugin="llm",
+                    input="out",
+                    on_success="out",
+                    on_error="discard",
+                    options={
+                        "profile": "operator-owned-alias",
+                        "prompt_template": "{{ lookup.path }} {{ lookup.file }} {{ lookup.mode }}",
+                        "lookup": {
+                            "path": "north",
+                            "file": "case.txt",
+                            "mode": "bind_source",
+                            "safe": "kept",
+                        },
+                        "provider_config": {
+                            "persist_directory": "/private/vector-index",
+                            "nested": {"path": "/private/node-input.csv"},
+                        },
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="out",
+                    plugin="csv",
+                    options={"path": "/private/output.csv"},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        public_dict = generate_public_pipeline_dict(state)
+        public_yaml = generate_public_yaml(state)
+        serialized = yaml.safe_dump(public_dict)
+
+        assert public_dict == yaml.safe_load(public_yaml)
+        assert all(value not in serialized for value in private_values)
+        assert "blob_ref" not in serialized
+        assert "blob_id" not in serialized
+        assert SOURCE_AUTHORING_KEY not in serialized
+        assert set(public_dict["sources"]) == {"blob_backed", "explicit_null", "path_only"}
+        assert all(source["plugin"] == "csv" for source in public_dict["sources"].values())
+        assert public_dict["transforms"][0]["options"]["lookup"] == {
+            "path": "north",
+            "file": "case.txt",
+            "mode": "bind_source",
+            "safe": "kept",
+        }
+
     def test_public_yaml_strips_guided_blob_storage_path_without_committed_blob_ref(self) -> None:
         blob_path = "/home/john/elspeth/data/blobs/session/20b944e3_project_pages.json"
         blob_ref = "20b944e3-fd46-434f-b9a2-4fb508db30f0"

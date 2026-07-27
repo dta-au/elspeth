@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -40,9 +40,11 @@ import yaml
 from sqlalchemy import select, text
 
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot, ReadinessRow
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
+from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     composer_completion_events_table,
@@ -56,7 +58,7 @@ from elspeth.web.shareable_reviews.service import (
     CompositionNotRunnableError,
     ShareableReviewService,
 )
-from elspeth.web.shareable_reviews.signer import InvalidToken, ShareTokenSigner
+from elspeth.web.shareable_reviews.signer import InvalidToken, ShareTokenPayload, ShareTokenSigner
 
 _VALID_SIGNING_KEY = b"k" * 32
 
@@ -515,6 +517,220 @@ async def test_mark_ready_for_review_yaml_strips_blob_bound_source_storage_path(
 
 
 @pytest.mark.asyncio
+async def test_share_snapshot_uses_one_recursive_public_projection(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+):
+    """Every stored/resolved representation must exclude private source facts.
+
+    The three named sources pin all producer branches: a real blob binding,
+    an explicit-null blob_ref, and a path-only source. The nested authoring
+    metadata canary proves the projection is recursive rather than a shallow
+    top-level key filter.
+    """
+    private_paths = {
+        "/srv/elspeth/blobs/alice/blob-backed.csv",
+        "/srv/elspeth/blobs/alice/explicit-null.csv",
+        "/srv/elspeth/blobs/alice/path-only.csv",
+        "/srv/elspeth/blobs/alice/nested-authoring.csv",
+        "/srv/elspeth/indexes/alice/source-index",
+        "/srv/elspeth/indexes/alice/vector-index",
+        "/srv/elspeth/inputs/alice/node-input.csv",
+        "/srv/elspeth/outputs/alice/out.csv",
+    }
+    blob_ids = {
+        "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+        "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+        "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+    }
+    canary_record = replace(
+        state_record,
+        source=None,
+        sources={
+            "blob_backed": {
+                "plugin": "csv",
+                "on_success": "main",
+                "options": {
+                    "path": "/srv/elspeth/blobs/alice/blob-backed.csv",
+                    "blob_ref": "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+                    "mode": "bind_source",
+                    "schema": {"mode": "observed"},
+                },
+                "on_validation_failure": "discard",
+            },
+            "explicit_null": {
+                "plugin": "csv",
+                "on_success": "main",
+                "options": {
+                    "path": "/srv/elspeth/blobs/alice/explicit-null.csv",
+                    "blob_ref": None,
+                    "schema": {"mode": "observed"},
+                },
+                "on_validation_failure": "discard",
+            },
+            "path_only": {
+                "plugin": "csv",
+                "on_success": "main",
+                "options": {
+                    "file": "/srv/elspeth/blobs/alice/path-only.csv",
+                    SOURCE_AUTHORING_KEY: {
+                        "path": "/srv/elspeth/blobs/alice/nested-authoring.csv",
+                        "blob_ref": "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+                    },
+                    "custody": {
+                        "persist_directory": "/srv/elspeth/indexes/alice/source-index",
+                        "blob_id": "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+                    },
+                    "schema": {"mode": "observed"},
+                },
+                "on_validation_failure": "discard",
+            },
+        },
+        nodes=[
+            {
+                "id": "pass",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "main",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {
+                    "profile": "operator-owned-alias",
+                    "prompt_template": "{{ lookup.path }} {{ lookup.file }} {{ lookup.mode }}",
+                    "lookup": {
+                        "path": "north",
+                        "file": "case.txt",
+                        "mode": "bind_source",
+                        "safe": "kept",
+                    },
+                    "provider_config": {
+                        "persist_directory": "/srv/elspeth/indexes/alice/vector-index",
+                        "nested": {"path": "/srv/elspeth/inputs/alice/node-input.csv"},
+                    },
+                },
+            }
+        ],
+        outputs=[
+            {
+                "name": "main",
+                "plugin": "csv",
+                "options": {
+                    "path": "/srv/elspeth/outputs/alice/out.csv",
+                    "schema": {"mode": "observed"},
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+    )
+    readiness = _readiness_snapshot(session_record.id)
+    secret_row = ReadinessRow(
+        id="secrets",
+        label="Secrets",
+        status="ok",
+        summary="All secret references resolve",
+        detail="17 secret(s) in your inventory",
+        component_ids=(),
+    )
+    readiness = readiness.model_copy(update={"rows": (*readiness.rows[:-1], secret_row)})
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=canary_record,
+        validation=_ok_validation(),
+        readiness=readiness,
+    )
+
+    marked = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    stored = json.loads(payload_store.retrieve(marked.payload_digest.removeprefix("sha256:")))
+    resolved = await service.resolve_token(token=marked.token, requesting_user_id="reviewer")
+    representations = (
+        stored,
+        resolved.model_dump(mode="json"),
+        yaml.safe_load(stored["yaml"]),
+        stored["composition_snapshot"],
+    )
+
+    for representation in representations:
+        serialized = json.dumps(representation, sort_keys=True)
+        assert private_paths.isdisjoint(serialized.split('"'))
+        assert blob_ids.isdisjoint(serialized.split('"'))
+        assert "blob_ref" not in serialized
+        assert "blob_id" not in serialized
+        assert SOURCE_AUTHORING_KEY not in serialized
+        assert "secret(s) in your inventory" not in serialized
+
+    public_sources = stored["composition_snapshot"]["sources"]
+    assert set(public_sources) == {"blob_backed", "explicit_null", "path_only"}
+    assert all(source["plugin"] == "csv" for source in public_sources.values())
+    assert all(source["on_success"] == "main" for source in public_sources.values())
+    assert stored["composition_snapshot"]["outputs"][0]["name"] == "main"
+    expected_lookup = {
+        "path": "north",
+        "file": "case.txt",
+        "mode": "bind_source",
+        "safe": "kept",
+    }
+    assert stored["composition_snapshot"]["nodes"][0]["options"]["lookup"] == expected_lookup
+    assert yaml.safe_load(stored["yaml"])["transforms"][0]["options"]["lookup"] == expected_lookup
+    assert resolved.composition_snapshot.nodes[0].options["lookup"] == expected_lookup
+
+
+@pytest.mark.asyncio
+async def test_share_content_is_invariant_to_unrelated_owner_secret_inventory(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+):
+    """Owner-global inventory changes must not alter composition-scoped shares."""
+
+    def readiness_with_inventory_count(count: int) -> AuditReadinessSnapshot:
+        snapshot = _readiness_snapshot(session_record.id)
+        secret_row = ReadinessRow(
+            id="secrets",
+            label="Secrets",
+            status="ok",
+            summary="All secret references resolve",
+            detail=f"{count} secret(s) in your inventory",
+            component_ids=(),
+        )
+        return snapshot.model_copy(update={"rows": (*snapshot.rows[:-1], secret_row)})
+
+    before, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=readiness_with_inventory_count(1),
+    )
+    before_mark = await before.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+
+    after, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=readiness_with_inventory_count(9),
+    )
+    after_mark = await after.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+
+    assert after_mark.payload_digest == before_mark.payload_digest
+    assert payload_store.retrieve(after_mark.payload_digest.removeprefix("sha256:")) == payload_store.retrieve(
+        before_mark.payload_digest.removeprefix("sha256:")
+    )
+
+
+@pytest.mark.asyncio
 async def test_mark_ready_for_review_fails_validation(session_engine_with_row, payload_store, signer, session_record, state_record):
     service, *_ = _build_service(
         engine=session_engine_with_row,
@@ -834,6 +1050,104 @@ async def test_resolve_token_returns_frozen_snapshot(
     assert resolved.audit_readiness.composition_version == 3
     # The readiness service was NOT called during resolve.
     assert readiness_service.compute_snapshot_await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_token_projects_legacy_signed_blob_without_mutating_evidence(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+):
+    """Outstanding pre-fix blobs are projected only after signature/digest verification."""
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+    private_path = "/srv/elspeth/blobs/alice/legacy.csv"
+    private_output = "/srv/elspeth/outputs/alice/legacy.csv"
+    private_index = "/srv/elspeth/indexes/alice/legacy"
+    blob_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
+    legacy_readiness = _readiness_snapshot(session_record.id)
+    secret_row = legacy_readiness.rows[-1].model_copy(update={"detail": "17 secret(s) in your inventory"})
+    legacy_readiness = legacy_readiness.model_copy(update={"rows": (*legacy_readiness.rows[:-1], secret_row)})
+    legacy_blob = {
+        "pipeline_metadata": {"name": "Legacy", "description": ""},
+        "composition_snapshot": {
+            "version": 3,
+            "metadata": {"name": "Legacy", "description": ""},
+            "sources": {
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "llm_in",
+                    "options": {
+                        "path": private_path,
+                        "blob_ref": blob_id,
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    "on_validation_failure": "discard",
+                }
+            },
+            "nodes": [
+                {
+                    "id": "llm",
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": "llm_in",
+                    "on_success": "main",
+                    "on_error": "discard",
+                    "options": {
+                        "prompt_template": "{{ lookup.path }}",
+                        "lookup": {"path": "north", "file": "case.txt", "mode": "bind_source"},
+                        "provider_config": {"persist_directory": private_index},
+                    },
+                }
+            ],
+            "edges": [],
+            "outputs": [
+                {
+                    "name": "main",
+                    "plugin": "csv",
+                    "options": {"path": private_output},
+                    "on_write_failure": "discard",
+                }
+            ],
+        },
+        "yaml": f"legacy_path: {private_path}\nlegacy_blob: {blob_id}\n",
+        "audit_readiness": legacy_readiness.model_dump(mode="json"),
+        "created_by_user_id": "alice",
+    }
+    legacy_bytes = canonical_json(legacy_blob).encode()
+    digest_hex = payload_store.store(legacy_bytes)
+    token = signer.sign(
+        ShareTokenPayload(
+            version=1,
+            session_id=session_record.id,
+            state_id=state_record.id,
+            created_at=datetime.now(UTC),
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+            nonce_hex="ab" * 16,
+            payload_digest=f"sha256:{digest_hex}",
+            created_by_user_id="alice",
+        )
+    )
+
+    resolved = await service.resolve_token(token=token, requesting_user_id="reviewer")
+
+    serialized = resolved.model_dump_json()
+    for private_value in (private_path, private_output, private_index, blob_id, "17 secret(s) in your inventory"):
+        assert private_value not in serialized
+    expected_lookup = {"path": "north", "file": "case.txt", "mode": "bind_source"}
+    assert resolved.composition_snapshot.nodes[0].options["lookup"] == expected_lookup
+    assert yaml.safe_load(resolved.yaml)["transforms"][0]["options"]["lookup"] == expected_lookup
+    assert payload_store.retrieve(digest_hex) == legacy_bytes
 
 
 @pytest.mark.asyncio
