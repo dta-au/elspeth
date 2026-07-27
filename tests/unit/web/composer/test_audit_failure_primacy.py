@@ -334,6 +334,15 @@ async def test_compose_loop_rejects_unwind_audit_failure_without_plugin_crash(
                 updated_at=datetime.now(UTC),
             )
 
+        async def get_messages(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+            return []
+
+        async def list_composition_proposals(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+            return []
+
+        async def list_interpretation_events(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+            return []
+
         async def persist_compose_turn_async(self, **_kwargs: Any) -> AuditOutcome:
             return AuditOutcome(assistant_id=None, unwind_audit_failed=True)
 

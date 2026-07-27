@@ -1182,6 +1182,7 @@ def test_normalizer_revalidates_for_a_different_snapshot_and_preserves_rejection
         selected_profile_aliases=original.selected_profile_aliases,
         control_modes=original.control_modes,
         binding_generation_fingerprint=original.binding_generation_fingerprint,
+        authority=original.authority,
     )
     other_catalog = _FinalValidationRejectingCatalog.for_trained_operator(full, other_snapshot)
     other_catalog.validated_states = []

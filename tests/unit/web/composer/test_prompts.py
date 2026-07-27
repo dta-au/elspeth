@@ -317,6 +317,7 @@ class TestBuildContextString:
             selected_profile_aliases=(),
             binding_generation_fingerprint=base.binding_generation_fingerprint,
             control_modes=((PluginCapability.LLM, ControlMode.REQUIRED),),
+            authority=base.authority,
         )
         view = PolicyCatalogView.for_trained_operator(catalog, snapshot)
 

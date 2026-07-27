@@ -215,7 +215,7 @@ def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _
                     "VALUES (:id, :session_id, 'user', 'prior', NULL, NULL, NULL, 1, "
                     "        'route_user_message', CURRENT_TIMESTAMP, NULL, NULL)"
                 ),
-                {"id": f"prior_{uuid.uuid4().hex}", "session_id": session_id},
+                {"id": str(uuid.uuid4()), "session_id": session_id},
             )
     return _Harness(service=service, sessions_service=sessions_service, session_id=session_id)
 

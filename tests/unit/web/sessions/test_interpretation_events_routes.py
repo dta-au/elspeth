@@ -534,14 +534,29 @@ async def test_09_list_status_pending_returns_only_pending_events(
     seeded = await _seed_session_with_pending_event(test_client)
     session_id = seeded["session_id"]
 
-    # Add a second pending event then resolve the first.
+    # Add an unrelated review site, surface its pending event, then resolve the
+    # first. Re-surfacing the same site is now content-identity idempotent and
+    # correctly returns the original event rather than creating a duplicate.
     service: SessionServiceImpl = test_client.app.state.session_service
+    second_node = _llm_node(node_id="llm_transform_2", user_term="warm")
+    state_with_second_site = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=seeded["state"].sources,
+            nodes=[*(seeded["state"].nodes or ()), second_node],
+            edges=seeded["state"].edges,
+            outputs=seeded["state"].outputs,
+            metadata_=seeded["state"].metadata_,
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
     second = await service.create_pending_interpretation_event(
         session_id=session_id,
-        composition_state_id=seeded["state"].id,
-        affected_node_id="llm_transform_1",
+        composition_state_id=state_with_second_site.id,
+        affected_node_id="llm_transform_2",
         tool_call_id="call_43",
-        user_term="cool",
+        user_term="warm",
         kind=InterpretationKind.VAGUE_TERM,
         llm_draft="Second draft",
         model_identifier="anthropic/claude-opus-4-7",
