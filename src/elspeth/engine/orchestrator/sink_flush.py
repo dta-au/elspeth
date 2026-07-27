@@ -14,7 +14,7 @@ Dependencies held by the coordinator:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import (
@@ -136,6 +136,7 @@ class SinkFlushCoordinator:
         on_token_written_factory: _CheckpointFactory | None = None,
         scheduler_terminalizer: SchedulerTerminalizer | None = None,
         worker_id: str | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
     ) -> DiversionCounts:
         """Write pending tokens to sinks using SinkExecutor.
 
@@ -163,6 +164,18 @@ class SinkFlushCoordinator:
 
         from elspeth.engine.executors.sink import DiversionCounts, SinkExecutor
 
+        def _shutdown_during_sink_effect_wait() -> GracefulShutdownError:
+            return GracefulShutdownError(
+                rows_processed=counters.rows_processed,
+                run_id=run_id,
+                rows_succeeded=counters.rows_succeeded,
+                rows_failed=counters.rows_failed,
+                rows_quarantined=counters.rows_quarantined,
+                rows_routed_success=counters.rows_routed_success,
+                rows_routed_failure=counters.rows_routed_failure,
+                routed_destinations=dict(counters.routed_destinations),
+            )
+
         sink_executor = SinkExecutor(
             factory.execution,
             factory.data_flow,
@@ -170,6 +183,9 @@ class SinkFlushCoordinator:
             run_id,
             factory=factory,
             worker_id=worker_id,
+            shutdown_event=getattr(ctx, "shutdown_event", None),
+            check_coordination_latch=check_coordination_latch,
+            make_shutdown_error=_shutdown_during_sink_effect_wait,
         )
         step = sink_step
         total_diversions = DiversionCounts()
@@ -297,6 +313,7 @@ class SinkFlushCoordinator:
         *,
         on_token_written_factory: _CheckpointFactory | None = None,
         scheduler_terminalizer: SchedulerTerminalizer | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
     ) -> None:
         """Write all pending tokens to sinks and handle post-loop bookkeeping.
 
@@ -323,6 +340,7 @@ class SinkFlushCoordinator:
             on_token_written_factory=on_token_written_factory,
             scheduler_terminalizer=scheduler_terminalizer,
             worker_id=(loop_ctx.processor.coordination_token.worker_id if loop_ctx.processor.coordination_token is not None else None),
+            check_coordination_latch=check_coordination_latch,
         )
         # ADR-019: failsink-mode diversions are TRANSIENT structural evidence;
         # discard-mode diversions are FAILURE predicate inputs as well.

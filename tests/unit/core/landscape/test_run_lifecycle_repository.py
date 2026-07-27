@@ -923,6 +923,93 @@ class TestSetExportStatus:
             repo.set_export_status("ghost-run", ExportStatus.FAILED, error="oops")
 
 
+class TestExportStatusCompletedWinnerCompareAndSet:
+    """Resume status writes cannot regress durable peer completion."""
+
+    def test_pending_records_resume_metadata_before_completion(self) -> None:
+        _, repo = _make_repo()
+        repo.set_export_status("run-1", ExportStatus.FAILED, error="retry me")
+
+        assert repo.set_export_pending_unless_completed(
+            "run-1",
+            export_format="json",
+            export_sink="output",
+        )
+
+        run = repo.get_run("run-1")
+        assert run is not None
+        assert run.export_status is ExportStatus.PENDING
+        assert run.exported_at is None
+        assert run.export_error is None
+        assert run.export_format == "json"
+        assert run.export_sink == "output"
+
+    def test_pending_preserves_concurrent_completion(self) -> None:
+        _, repo = _make_repo()
+        repo.set_export_status("run-1", ExportStatus.COMPLETED)
+        completed = repo.get_run("run-1")
+        assert completed is not None and completed.exported_at is not None
+
+        assert not repo.set_export_pending_unless_completed(
+            "run-1",
+            export_format="csv",
+            export_sink="changed",
+        )
+
+        run = repo.get_run("run-1")
+        assert run is not None
+        assert run.export_status is ExportStatus.COMPLETED
+        assert run.exported_at == completed.exported_at
+        assert run.export_format is None
+        assert run.export_sink is None
+
+    def test_failed_records_error_before_completion(self) -> None:
+        _, repo = _make_repo()
+
+        assert repo.set_export_failed_unless_completed("run-1", error="lease timed out")
+
+        run = repo.get_run("run-1")
+        assert run is not None
+        assert run.export_status is ExportStatus.FAILED
+        assert run.exported_at is None
+        assert run.export_error == "lease timed out"
+
+    def test_failed_preserves_empty_error_compatibility(self) -> None:
+        _, repo = _make_repo()
+
+        assert repo.set_export_failed_unless_completed("run-1", error="")
+
+        run = repo.get_run("run-1")
+        assert run is not None
+        assert run.export_status is ExportStatus.FAILED
+        assert run.exported_at is None
+        assert run.export_error == ""
+
+    def test_failed_preserves_concurrent_completion(self) -> None:
+        _, repo = _make_repo()
+        repo.set_export_status("run-1", ExportStatus.COMPLETED)
+        completed = repo.get_run("run-1")
+        assert completed is not None and completed.exported_at is not None
+
+        assert not repo.set_export_failed_unless_completed("run-1", error="late timeout")
+
+        run = repo.get_run("run-1")
+        assert run is not None
+        assert run.export_status is ExportStatus.COMPLETED
+        assert run.exported_at == completed.exported_at
+        assert run.export_error is None
+
+    @pytest.mark.parametrize("method", ("pending", "failed"))
+    def test_missing_run_fails_closed(self, method: str) -> None:
+        _, repo = _make_repo()
+        if method == "pending":
+            with pytest.raises(AuditIntegrityError, match="not found"):
+                repo.set_export_pending_unless_completed("ghost-run")
+        else:
+            with pytest.raises(AuditIntegrityError, match="not found"):
+                repo.set_export_failed_unless_completed("ghost-run", error="oops")
+
+
 # ---------------------------------------------------------------------------
 # record_secret_resolutions — atomicity
 # ---------------------------------------------------------------------------

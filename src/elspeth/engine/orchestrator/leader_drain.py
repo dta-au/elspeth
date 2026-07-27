@@ -295,6 +295,7 @@ class LeaderDrainCoordinator:
                 loop_result.interrupted,
                 on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(run_id, run_ctx.processor),
                 scheduler_terminalizer=run_ctx.processor,
+                check_coordination_latch=check_coordination_latch,
             )
 
             # 4b. ADR-030 multi-worker: after the leader's own sink writes are done
@@ -335,6 +336,7 @@ class LeaderDrainCoordinator:
                         interrupted_by_shutdown=False,
                         on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(run_id, run_ctx.processor),
                         scheduler_terminalizer=run_ctx.processor,
+                        check_coordination_latch=check_coordination_latch,
                     )
                     return True
 

@@ -383,12 +383,13 @@ def resume_audit_export(
     if refusal is not None:
         raise ValueError(refusal)
 
-    factory.run_lifecycle.set_export_status(
+    pending_recorded = factory.run_lifecycle.set_export_pending_unless_completed(
         run_id,
-        status=ExportStatus.PENDING,
         export_format=export_config.format,
         export_sink=export_config.sink,
     )
+    if not pending_recorded:
+        return
     try:
         export_landscape(
             db,
@@ -401,15 +402,19 @@ def resume_audit_export(
             worker_id=worker_id,
         )
     except Exception as export_error:
+        from elspeth.engine.executors.sink_effects import SinkEffectLeaseHeld
+
+        failure_recorded: bool | None = None
         with best_effort(
             "Export status FAILED recording on resume",
             run_id=run_id,
             original_error=type(export_error).__name__,
         ):
-            factory.run_lifecycle.set_export_status(
+            failure_recorded = factory.run_lifecycle.set_export_failed_unless_completed(
                 run_id,
-                status=ExportStatus.FAILED,
                 error=str(export_error),
             )
+        if failure_recorded is False and isinstance(export_error, SinkEffectLeaseHeld):
+            return
         raise
     factory.run_lifecycle.set_export_status(run_id, status=ExportStatus.COMPLETED)

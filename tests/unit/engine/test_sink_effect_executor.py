@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import threading
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -29,12 +29,14 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
 )
+from elspeth.core.landscape.execution import sink_effect_lifecycle
 from elspeth.core.landscape.execution.sink_effect_attempt_results import encode_sink_effect_returned_result
 from elspeth.core.landscape.execution.sink_effect_finalization import SinkEffectFinalizationMember
 from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity
 from elspeth.core.landscape.execution.sink_effect_lifecycle import SinkEffectAttemptRequest, SinkEffectAttemptResult
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import node_states_table, sink_effect_attempts_table
+from elspeth.engine.clock import MockClock
 from elspeth.engine.executors.sink_effects import (
     SinkEffectCoordinator,
     SinkEffectExecutionRequest,
@@ -699,7 +701,9 @@ def test_precomputed_response_loss_reconciles_with_durable_diversion_partition()
         db.close()
 
 
-def test_takeover_closes_stale_abandoned_intent_before_new_generation_call() -> None:
+def test_takeover_closes_stale_abandoned_intent_before_new_generation_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     db = make_landscape_db()
     try:
         factory = make_factory(db)
@@ -707,6 +711,9 @@ def test_takeover_closes_stale_abandoned_intent_before_new_generation_call() -> 
         target = _CumulativeTarget()
         sink = _CumulativeObservableSink(target)
         request = _execution_request(run_id, sink_id, members)
+        clock = MockClock(start=datetime.now(UTC).timestamp())
+        lease_ttl = timedelta(seconds=2)
+        monkeypatch.setattr(sink_effect_lifecycle, "now", clock.now_utc)
 
         def fail_before_effect(seam: SinkEffectExecutionSeam) -> None:
             if seam is SinkEffectExecutionSeam.BEFORE_EFFECT:
@@ -716,10 +723,12 @@ def test_takeover_closes_stale_abandoned_intent_before_new_generation_call() -> 
             SinkEffectCoordinator(
                 factory=factory,
                 worker_id="worker-a",
-                lease_ttl=timedelta(microseconds=1),
+                lease_ttl=lease_ttl,
                 fault_hook=fail_before_effect,
+                clock=clock,
             ).execute(request, sink)
-        SinkEffectCoordinator(factory=factory, worker_id="worker-b").execute(request, sink)
+        clock.advance(lease_ttl.total_seconds() + 1)
+        SinkEffectCoordinator(factory=factory, worker_id="worker-b", clock=clock).execute(request, sink)
 
         with db.read_only_connection() as conn:
             commits = conn.execute(
@@ -736,7 +745,10 @@ def test_takeover_closes_stale_abandoned_intent_before_new_generation_call() -> 
 
 
 @pytest.mark.parametrize("takeover", (False, True))
-def test_retry_consumes_returned_commit_without_another_reconcile(takeover: bool) -> None:
+def test_retry_consumes_returned_commit_without_another_reconcile(
+    takeover: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     db = make_landscape_db()
     try:
         factory = make_factory(db)
@@ -744,6 +756,9 @@ def test_retry_consumes_returned_commit_without_another_reconcile(takeover: bool
         target = _CumulativeTarget()
         sink = _CumulativeObservableSink(target)
         request = _execution_request(run_id, sink_id, members)
+        clock = MockClock(start=datetime.now(UTC).timestamp())
+        takeover_ttl = timedelta(seconds=2)
+        monkeypatch.setattr(sink_effect_lifecycle, "now", clock.now_utc)
 
         def fail_after_return(seam: SinkEffectExecutionSeam) -> None:
             if seam is SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE:
@@ -753,12 +768,16 @@ def test_retry_consumes_returned_commit_without_another_reconcile(takeover: bool
             SinkEffectCoordinator(
                 factory=factory,
                 worker_id="worker-a",
-                lease_ttl=timedelta(microseconds=1) if takeover else timedelta(seconds=30),
+                lease_ttl=takeover_ttl if takeover else timedelta(seconds=30),
                 fault_hook=fail_after_return,
+                clock=clock,
             ).execute(request, sink)
+        if takeover:
+            clock.advance(takeover_ttl.total_seconds() + 1)
         SinkEffectCoordinator(
             factory=factory,
             worker_id="worker-b" if takeover else "worker-a",
+            clock=clock,
         ).execute(request, sink)
 
         assert sink.commit_calls == 1

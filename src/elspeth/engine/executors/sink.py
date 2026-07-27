@@ -72,6 +72,8 @@ from elspeth.engine.spans import SpanFactory
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    import threading
+
     from elspeth.core.landscape.factory import RecorderFactory
 
 
@@ -153,6 +155,9 @@ class SinkExecutor:
         factory: RecorderFactory | None = None,
         worker_id: str | None = None,
         sink_effect_fault_hook: Callable[[SinkEffectExecutionSeam], None] | None = None,
+        shutdown_event: threading.Event | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
+        make_shutdown_error: Callable[[], BaseException] | None = None,
     ) -> None:
         """Initialize executor.
 
@@ -173,6 +178,9 @@ class SinkExecutor:
         # executor callers still receive a process-unique owner.
         self._worker_id = worker_id or f"sink-effects:{run_id}:{uuid.uuid4().hex}"
         self._sink_effect_fault_hook = sink_effect_fault_hook
+        self._shutdown_event = shutdown_event
+        self._check_coordination_latch = check_coordination_latch
+        self._make_shutdown_error = make_shutdown_error
 
     def _complete_states_failed(
         self,
@@ -652,7 +660,10 @@ class SinkExecutor:
             factory=self._factory,
             worker_id=self._worker_id,
             fault_hook=self._sink_effect_fault_hook,
-        ).execute(
+            shutdown_event=self._shutdown_event,
+            check_coordination_latch=self._check_coordination_latch,
+            make_shutdown_error=self._make_shutdown_error,
+        ).execute_with_lease_wait(
             SinkEffectExecutionRequest(
                 reservation=reservation,
                 effect_input=SinkEffectPipelineMembersInput(
@@ -901,7 +912,10 @@ class SinkExecutor:
             factory=self._factory,
             worker_id=self._worker_id,
             fault_hook=self._sink_effect_fault_hook,
-        ).execute(
+            shutdown_event=self._shutdown_event,
+            check_coordination_latch=self._check_coordination_latch,
+            make_shutdown_error=self._make_shutdown_error,
+        ).execute_with_lease_wait(
             SinkEffectExecutionRequest(
                 reservation=reservation,
                 effect_input=SinkEffectPipelineMembersInput(members=identity.members, target_snapshot_members=identity.members),

@@ -45,6 +45,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReservationRequest,
     SinkEffectRole,
 )
+from elspeth.core.clock import Clock
 from elspeth.core.config import LandscapeExportSettings
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.execution.audit_export_snapshots import (
@@ -54,6 +55,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import compute_audit_
 from elspeth.core.landscape.export_read_model import open_export_read_transaction
 from elspeth.core.landscape.exporter import LandscapeExporter
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.sink_effects import (
     SinkEffectCoordinator,
     SinkEffectExecutionRequest,
@@ -442,6 +444,9 @@ def execute_audit_export_effect(
     worker_id: str,
     lease_ttl: timedelta = timedelta(minutes=5),
     fault_hook: Callable[[SinkEffectExecutionSeam], None] | None = None,
+    clock: Clock = DEFAULT_CLOCK,
+    sleep: Callable[[float], None] | None = None,
+    poll_interval: float = 0.5,
 ) -> SinkEffectFinalizationResult:
     """Reserve and execute one zero-member audit-export snapshot effect."""
     identity = compute_audit_export_effect_identity(
@@ -471,9 +476,12 @@ def execute_audit_export_effect(
         worker_id=worker_id,
         lease_ttl=lease_ttl,
         fault_hook=fault_hook,
+        clock=clock,
+        sleep=sleep,
+        poll_interval=poll_interval,
     )
     # Capability preflight owns structural validation of the delayed adapter.
-    return coordinator.execute(request, cast(Any, sink))
+    return coordinator.execute_with_lease_wait(request, cast(Any, sink))
 
 
 __all__ = ["execute_audit_export_effect", "prepare_audit_export_snapshot"]

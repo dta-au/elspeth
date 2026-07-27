@@ -1299,6 +1299,7 @@ class ResumeCoordinator:
                     interrupted,
                     on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(run_id, run_ctx.processor),
                     scheduler_terminalizer=run_ctx.processor,
+                    check_coordination_latch=check_coordination_latch,
                 )
 
                 # ADR-019 Phase 4: resumed row processing reaches stable I1a/I1b

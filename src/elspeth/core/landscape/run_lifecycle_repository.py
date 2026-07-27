@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Any, Final
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -1529,6 +1529,89 @@ class RunLifecycleRepository:
             self._ops.execute_update(stmt, context=f"set_export_status run_id={run_id} status={status.value}")
         except LandscapeRecordNotFoundError as exc:
             raise AuditIntegrityError(f"Cannot set export status to {status.value!r}: run {run_id} not found") from exc
+
+    def set_export_failed_unless_completed(self, run_id: str, *, error: str) -> bool:
+        """Record FAILED unless a concurrent exporter already completed.
+
+        Returns ``True`` when FAILED was recorded and ``False`` when an
+        existing COMPLETED status won the race. The compare-and-set and the
+        winner read share one write transaction, so a timeout path cannot
+        regress durable completion evidence.
+        """
+        if type(error) is not str:
+            raise TypeError("error must be an exact string")
+        with self._db.write_connection() as conn:
+            updated = conn.execute(
+                runs_table.update()
+                .where(
+                    runs_table.c.run_id == run_id,
+                    or_(
+                        runs_table.c.export_status.is_(None),
+                        runs_table.c.export_status != ExportStatus.COMPLETED.value,
+                    ),
+                )
+                .values(
+                    export_status=ExportStatus.FAILED.value,
+                    exported_at=None,
+                    export_error=error,
+                )
+            )
+            if updated.rowcount == 1:
+                return True
+            current_status = conn.scalar(select(runs_table.c.export_status).where(runs_table.c.run_id == run_id))
+            if current_status is None:
+                raise AuditIntegrityError(f"Cannot set export status to 'failed': run {run_id} not found")
+            if current_status != ExportStatus.COMPLETED.value:
+                raise AuditIntegrityError(
+                    f"Cannot set export status to 'failed': run {run_id} changed to unsupported status {current_status!r}"
+                )
+            return False
+
+    def set_export_pending_unless_completed(
+        self,
+        run_id: str,
+        *,
+        export_format: str | None = None,
+        export_sink: str | None = None,
+    ) -> bool:
+        """Record PENDING unless a concurrent exporter already completed.
+
+        Returns ``True`` when PENDING was recorded and ``False`` when durable
+        COMPLETED status won the race. This is the resume admission CAS: a
+        delayed recovery worker cannot regress peer completion after its
+        earlier eligibility read.
+        """
+        updates: dict[str, Any] = {
+            "export_status": ExportStatus.PENDING.value,
+            "exported_at": None,
+            "export_error": None,
+        }
+        if export_format is not None:
+            updates["export_format"] = export_format
+        if export_sink is not None:
+            updates["export_sink"] = export_sink
+        with self._db.write_connection() as conn:
+            updated = conn.execute(
+                runs_table.update()
+                .where(
+                    runs_table.c.run_id == run_id,
+                    or_(
+                        runs_table.c.export_status.is_(None),
+                        runs_table.c.export_status != ExportStatus.COMPLETED.value,
+                    ),
+                )
+                .values(**updates)
+            )
+            if updated.rowcount == 1:
+                return True
+            current_status = conn.scalar(select(runs_table.c.export_status).where(runs_table.c.run_id == run_id))
+            if current_status is None:
+                raise AuditIntegrityError(f"Cannot set export status to 'pending': run {run_id} not found")
+            if current_status != ExportStatus.COMPLETED.value:
+                raise AuditIntegrityError(
+                    f"Cannot set export status to 'pending': run {run_id} changed to unsupported status {current_status!r}"
+                )
+            return False
 
     def finalize_run(self, run_id: str, status: RunStatus, *, token: CoordinationToken | None = None) -> Run:
         """Finalize a run by computing grade and completing it.

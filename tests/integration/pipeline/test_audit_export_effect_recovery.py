@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -31,12 +31,14 @@ from elspeth.contracts.sink_effects import (
     SinkEffectAuditExportSnapshotInput,
     SinkEffectCommitResult,
     SinkEffectDescriptorMode,
+    SinkEffectInputKind,
     SinkEffectInspection,
     SinkEffectInspectionMode,
     SinkEffectInspectionRequest,
     SinkEffectPlan,
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
+    SinkEffectState,
 )
 from elspeth.core.audit_export_content_store import FilesystemAuditExportContentStore
 from elspeth.core.config import AuditExportContentStoreSettings, LandscapeExportSettings
@@ -818,6 +820,9 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
     effect is reconciled without republication, and export status converges
     to COMPLETED."""
     from elspeth.contracts import ExportStatus
+    from elspeth.core.landscape.execution import sink_effect_lifecycle
+    from elspeth.engine.clock import MockClock
+    from elspeth.engine.orchestrator import audit_export_effects
     from elspeth.engine.orchestrator.export import resume_audit_export
     from elspeth.plugins.sinks import _local_file_effects
 
@@ -840,6 +845,27 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         }
         settings = _resume_settings_bundle(sink_options, _config())
         sink_factory = _json_sink_factory(sink_options)
+        lease_ttl = timedelta(seconds=2)
+        clock = MockClock(start=datetime.now(UTC).timestamp())
+        poll_sleeps: list[float] = []
+        original_execute = audit_export_effects.execute_audit_export_effect
+
+        def advance_clock(seconds: float) -> None:
+            assert seconds > 0.0
+            poll_sleeps.append(seconds)
+            clock.advance(seconds)
+
+        def execute_with_deterministic_lease(**kwargs: object):  # type: ignore[no-untyped-def]
+            return original_execute(
+                **kwargs,
+                lease_ttl=lease_ttl,
+                clock=clock,
+                sleep=advance_clock,
+                poll_interval=0.25,
+            )
+
+        monkeypatch.setattr(sink_effect_lifecycle, "now", clock.now_utc)
+        monkeypatch.setattr(audit_export_effects, "execute_audit_export_effect", execute_with_deterministic_lease)
 
         # Attempt 1: the publication lands durably but the response is lost.
         def lose_response(_target: Path) -> None:
@@ -862,19 +888,14 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         assert run is not None
         assert run.export_status is ExportStatus.FAILED
         assert run.export_error is not None and "publication response lost" in run.export_error
-
-        # The crashed worker never released its effect lease; model the
-        # production recovery window by letting the lease lapse (a live lease
-        # correctly refuses takeover — SinkEffectLeaseHeld).
-        with db.engine.begin() as connection:
-            connection.execute(
-                sink_effects_table.update()
-                .where(sink_effects_table.c.run_id == "run-export")
-                .values(
-                    lease_expires_at=datetime(2020, 1, 1, tzinfo=UTC),
-                    lease_heartbeat_at=datetime(2020, 1, 1, tzinfo=UTC),
-                )
-            )
+        factory = RecorderFactory(db)
+        (effect_before,) = factory.execution.sink_effects.get_effects_for_run("run-export")
+        assert effect_before.state is SinkEffectState.IN_FLIGHT
+        assert effect_before.input_kind is SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT
+        assert effect_before.required_snapshot_slot == 0
+        assert effect_before.required_member_ordinal is None
+        assert effect_before.lease_expires_at is not None
+        assert effect_before.lease_expires_at.replace(tzinfo=UTC) > clock.now_utc()
 
         # Attempt 2: resume reconciles the applied effect without republishing.
         republications: list[Path] = []
@@ -894,6 +915,19 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         assert run is not None
         assert run.export_status is ExportStatus.COMPLETED
         assert republications == [], "reconciled effect must not republish"
+        factory = RecorderFactory(db)
+        (effect_after,) = factory.execution.sink_effects.get_effects_for_run("run-export")
+        assert effect_after.state is SinkEffectState.FINALIZED
+        assert effect_after.effect_id == effect_before.effect_id
+        assert effect_after.artifact_id == effect_before.artifact_id
+        assert effect_after.input_kind is effect_before.input_kind
+        assert effect_after.config_hash == effect_before.config_hash
+        assert effect_after.membership_or_manifest_hash == effect_before.membership_or_manifest_hash
+        assert effect_after.group_payload_hash == effect_before.group_payload_hash
+        assert effect_after.target_json == effect_before.target_json
+        assert poll_sleeps
+        assert all(0.0 < seconds <= 0.25 for seconds in poll_sleeps)
+        assert sum(poll_sleeps) <= lease_ttl.total_seconds() + 0.25
         snapshot = prepare_audit_export_snapshot(
             db,
             run_id="run-export",
@@ -902,8 +936,122 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
             content_store=store,
             content_store_resolver=resolver,
         )
+        assert effect_after.group_payload_hash == snapshot.snapshot_hash
+        assert effect_after.membership_or_manifest_hash == snapshot.manifest_hash
         expected = b"".join(snapshot.reader.iter_verified_chunks()) + snapshot.reader.read_verified_signed_manifest()
         assert output.read_bytes() == expected
+    finally:
+        db.close()
+
+
+def test_resume_audit_export_adopts_completion_won_during_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed resume worker cannot regress COMPLETED after its stale read."""
+    from elspeth.contracts import ExportStatus
+    from elspeth.engine.orchestrator import export as export_module
+
+    monkeypatch.chdir(tmp_path)
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'resume-admission-race.db'}")
+    store = _MemoryContentStore()
+    resolver = AuditExportContentStoreResolver()
+    resolver.register(store)
+    sink_options: dict[str, object] = {
+        "path": str(tmp_path / "audit.jsonl"),
+        "format": "jsonl",
+        "mode": "write",
+        "schema": {"mode": "observed"},
+    }
+    try:
+        _insert_terminal_run(db)
+        _set_export_status_row(db, "run-export", "pending")
+
+        def complete_during_target_check(*_args: object, **_kwargs: object) -> None:
+            RecorderFactory(db).run_lifecycle.set_export_status("run-export", ExportStatus.COMPLETED)
+            return None
+
+        monkeypatch.setattr(export_module, "_audit_export_resume_target_refusal", complete_during_target_check)
+        monkeypatch.setattr(
+            export_module,
+            "export_landscape",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("completed loser must not export")),
+        )
+
+        export_module.resume_audit_export(
+            db,
+            "run-export",
+            _resume_settings_bundle(sink_options, _config()),
+            _json_sink_factory(sink_options),
+            payload_store=object(),
+            audit_export_content_store=store,
+            audit_export_content_store_resolver=resolver,
+            worker_id="audit-export-loser",
+        )
+
+        run = RecorderFactory(db).run_lifecycle.get_run("run-export")
+        assert run is not None
+        assert run.export_status is ExportStatus.COMPLETED
+        assert run.exported_at is not None
+        assert run.export_error is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("lease_contention", (True, False))
+def test_resume_audit_export_only_adopts_peer_completion_for_lease_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lease_contention: bool,
+) -> None:
+    """Peer completion is equivalent success only for the typed lease loser."""
+    from elspeth.contracts import ExportStatus
+    from elspeth.engine.executors.sink_effects import SinkEffectLeaseHeld
+    from elspeth.engine.orchestrator import export as export_module
+
+    monkeypatch.chdir(tmp_path)
+    db = LandscapeDB(f"sqlite:///{tmp_path / f'resume-failure-race-{lease_contention}.db'}")
+    store = _MemoryContentStore()
+    resolver = AuditExportContentStoreResolver()
+    resolver.register(store)
+    sink_options: dict[str, object] = {
+        "path": str(tmp_path / "audit.jsonl"),
+        "format": "jsonl",
+        "mode": "write",
+        "schema": {"mode": "observed"},
+    }
+    try:
+        _insert_terminal_run(db)
+        _set_export_status_row(db, "run-export", "failed", "retry me")
+
+        def completed_peer_then_fail(*_args: object, **_kwargs: object) -> None:
+            RecorderFactory(db).run_lifecycle.set_export_status("run-export", ExportStatus.COMPLETED)
+            if lease_contention:
+                raise SinkEffectLeaseHeld("peer still owns the sink-effect lease")
+            raise RuntimeError("unrelated export corruption")
+
+        monkeypatch.setattr(export_module, "export_landscape", completed_peer_then_fail)
+        call = lambda: export_module.resume_audit_export(  # noqa: E731
+            db,
+            "run-export",
+            _resume_settings_bundle(sink_options, _config()),
+            _json_sink_factory(sink_options),
+            payload_store=object(),
+            audit_export_content_store=store,
+            audit_export_content_store_resolver=resolver,
+            worker_id="audit-export-loser",
+        )
+        if lease_contention:
+            call()
+        else:
+            with pytest.raises(RuntimeError, match="unrelated export corruption"):
+                call()
+
+        run = RecorderFactory(db).run_lifecycle.get_run("run-export")
+        assert run is not None
+        assert run.export_status is ExportStatus.COMPLETED
+        assert run.exported_at is not None
+        assert run.export_error is None
     finally:
         db.close()
 

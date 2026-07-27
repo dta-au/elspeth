@@ -82,3 +82,39 @@ def test_no_indirect_sink_write_or_flush_aliases_escape_the_ast_inventory() -> N
     )
     assert diagnostic.returncode == 1, diagnostic.stdout
     assert diagnostic.stdout == ""
+
+
+def _coordinator_callers(path: str, method: str) -> list[str]:
+    source_path = _ROOT / path
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.functions: list[str] = []
+            self.matches: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.functions.append(node.name)
+            self.generic_visit(node)
+            self.functions.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Attribute) and node.func.attr == method:
+                self.matches.append(self.functions[-1])
+            self.generic_visit(node)
+
+    visitor = _Visitor()
+    visitor.visit(tree)
+    return visitor.matches
+
+
+def test_all_production_sink_effect_callers_use_shared_bounded_wait() -> None:
+    assert _coordinator_callers("src/elspeth/engine/executors/sink.py", "execute_with_lease_wait") == [
+        "_write_primary_effect",
+        "_handle_failsink_effect_diversions",
+    ]
+    assert _coordinator_callers("src/elspeth/engine/orchestrator/audit_export_effects.py", "execute_with_lease_wait") == [
+        "execute_audit_export_effect"
+    ]
+    assert _coordinator_callers("src/elspeth/engine/executors/sink.py", "execute") == []
+    assert _coordinator_callers("src/elspeth/engine/orchestrator/audit_export_effects.py", "execute") == []
