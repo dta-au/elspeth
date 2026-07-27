@@ -25,3 +25,21 @@ provider "aws" {
     }
   }
 }
+
+provider "aws" {
+  alias               = "iam_lifecycle"
+  region              = var.aws_region
+  profile             = var.iam_lifecycle_aws_profile
+  allowed_account_ids = [var.aws_account_id]
+
+  default_tags {
+    tags = {
+      ACCEPTANCE_RUN_ID = var.run_id
+      Owner             = var.owner
+      Purpose           = var.purpose
+      RunId             = var.run_id
+      CleanupDeadline   = var.cleanup_deadline
+      ManagedBy         = "terraform"
+    }
+  }
+}

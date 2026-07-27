@@ -75,6 +75,26 @@ variable "aws_profile" {
   }
 }
 
+variable "iam_lifecycle_aws_profile" {
+  type        = string
+  description = "AWS profile for the separate principal that owns IAM role lifecycle only."
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", var.iam_lifecycle_aws_profile))
+    error_message = "iam_lifecycle_aws_profile must be an explicit shell-safe AWS profile name."
+  }
+}
+
+variable "iam_permissions_boundary_arn" {
+  type        = string
+  description = "Narrow run-scoped boundary output by bootstrap and required on every generated ECS role."
+
+  validation {
+    condition     = can(regex("^arn:aws:iam::${var.aws_account_id}:policy/elspeth-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-ecs-boundary$", var.iam_permissions_boundary_arn))
+    error_message = "iam_permissions_boundary_arn must be a run-scoped boundary output by bootstrap in aws_account_id."
+  }
+}
+
 variable "target_platform" {
   type    = string
   default = "linux/amd64"

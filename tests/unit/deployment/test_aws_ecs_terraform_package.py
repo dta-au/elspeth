@@ -30,6 +30,7 @@ EXPECTED_FILES = {
     "examples/scenario-b.s3.tfbackend.example",
     "examples/scenario-b.tfvars.example",
     "iam/installer-policy.json.tftpl",
+    "iam/lifecycle-policy.json.tftpl",
     "modules/scenario/database_bootstrap.tf",
     "modules/scenario/ecs.tf",
     "modules/scenario/iam_observability.tf",
@@ -452,22 +453,29 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     ]
     assert "acm:GetCertificate" in statements["ReadDiscovery"]["Action"]
 
-    create_role = statements["CreateRunScopedRolesWithBoundary"]
-    assert create_role["Resource"] == [
-        "arn:aws:iam::123456789012:role/a-*-task-role",
-        "arn:aws:iam::123456789012:role/a-*-execution-role",
-        "arn:aws:iam::123456789012:role/b-*-task-role",
-        "arn:aws:iam::123456789012:role/b-*-execution-role",
-    ]
-    assert create_role["Condition"]["StringEquals"] == {
-        "aws:RequestTag/ACCEPTANCE_RUN_ID": values["run_id"],
-        "iam:PermissionsBoundary": "arn:aws:iam::aws:policy/PowerUserAccess",
-    }
+    assert "CreateRunScopedRolesWithBoundary" not in statements
     pass_role = statements["PassRunScopedRolesToEcsTasksOnly"]
     assert pass_role["Condition"]["StringEquals"]["iam:PassedToService"] == "ecs-tasks.amazonaws.com"
-    managed_roles = statements["ManageRunScopedRoles"]
-    assert "iam:DeleteRolePermissionsBoundary" in managed_roles["Action"]
-    assert "iam:PutRolePermissionsBoundary" not in mutation_actions
+    inline_roles = statements["ManageRunScopedInlinePolicies"]
+    assert set(inline_roles["Action"]) == {"iam:DeleteRolePolicy", "iam:PutRolePolicy"}
+    managed_attachment = statements["ManageKnownExecutionRoleAttachment"]
+    assert set(managed_attachment["Action"]) == {"iam:AttachRolePolicy", "iam:DetachRolePolicy"}
+    assert managed_attachment["Resource"] == [
+        "arn:aws:iam::123456789012:role/a-*-execution-role",
+        "arn:aws:iam::123456789012:role/b-*-execution-role",
+    ]
+    assert managed_attachment["Condition"]["ArnEquals"]["iam:PolicyARN"] == (
+        "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+    )
+    assert not {
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:PutRolePermissionsBoundary",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:UpdateAssumeRolePolicy",
+    }.intersection(mutation_actions)
     assert "iam:CreateServiceLinkedRole" in statements["CreateRequiredServiceLinkedRoles"]["Action"]
     assert statements["CreateRequiredServiceLinkedRoles"]["Condition"]["StringEquals"]["iam:AWSServiceName"] == [
         "ecs.amazonaws.com",
@@ -475,16 +483,14 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "rds.amazonaws.com",
     ]
 
-    module_variables = _text("modules/scenario/variables.tf")
-    assert re.search(
-        r'variable "iam_permissions_boundary_arn".*?default\s*=\s*"arn:aws:iam::aws:policy/PowerUserAccess"',
-        module_variables,
-        re.DOTALL,
-    )
     for relative in ("scenario-a/variables.tf", "scenario-b/variables.tf"):
-        assert 'variable "iam_permissions_boundary_arn"' not in _text(relative)
+        root_variables = _text(relative)
+        assert 'variable "iam_permissions_boundary_arn"' in root_variables
+        assert 'variable "iam_lifecycle_aws_profile"' in root_variables
     for relative in ("examples/scenario-a.tfvars.example", "examples/scenario-b.tfvars.example"):
-        assert "iam_permissions_boundary_arn" not in _text(relative)
+        example = _text(relative)
+        assert "iam_permissions_boundary_arn" in example
+        assert "iam_lifecycle_aws_profile" in example
     iam = _text("modules/scenario/iam_observability.tf")
     assert iam.count("permissions_boundary = var.iam_permissions_boundary_arn") == 2
     assert '"${aws_cloudwatch_log_group.operator.arn}:log-stream:*"' in iam
@@ -505,8 +511,10 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         )
     bootstrap = _text("bootstrap/main.tf")
     bootstrap_outputs = _text("bootstrap/outputs.tf")
-    assert 'resource "aws_iam_policy" "ecs_permissions_boundary"' not in bootstrap
-    assert 'output "iam_permissions_boundary_arn"' not in bootstrap_outputs
+    assert 'resource "aws_iam_policy" "ecs_permissions_boundary"' in bootstrap
+    assert 'output "iam_permissions_boundary_arn"' in bootstrap_outputs
+    assert '"${aws_cloudwatch_log_group.operator.arn}:log-stream:*"' in iam
+    assert '"arn:aws:bedrock:*::foundation-model/*"' in bootstrap
     assert statements["DedicatedAccountOnlyUntaggedMutations"]["Action"] == [
         "logs:DeleteResourcePolicy",
         "logs:PutResourcePolicy",
@@ -538,14 +546,95 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     assert "not supported in a shared account" in readme
 
 
+def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permissions() -> None:
+    template = _text("iam/lifecycle-policy.json.tftpl")
+    values = {
+        "aws_account_id": "123456789012",
+        "run_id": "12345678-1234-4123-8123-123456789abc",
+        "iam_permissions_boundary_arn": ("arn:aws:iam::123456789012:policy/elspeth-12345678-1234-4123-8123-123456789abc-ecs-boundary"),
+    }
+    rendered = template
+    for name, value in values.items():
+        rendered = rendered.replace(f"${{{name}}}", value)
+    assert "${" not in rendered
+    policy = json.loads(rendered)
+    statements = {statement["Sid"]: statement for statement in policy["Statement"]}
+
+    create_boundary = statements["CreateRunBoundary"]
+    manage_boundary = statements["ManageRunBoundary"]
+    assert create_boundary["Resource"] == values["iam_permissions_boundary_arn"]
+    assert manage_boundary["Resource"] == values["iam_permissions_boundary_arn"]
+    assert {
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+    }.issubset(manage_boundary["Action"])
+
+    role_resources = [
+        "arn:aws:iam::123456789012:role/a-*-task-role",
+        "arn:aws:iam::123456789012:role/a-*-execution-role",
+        "arn:aws:iam::123456789012:role/b-*-task-role",
+        "arn:aws:iam::123456789012:role/b-*-execution-role",
+    ]
+    create_roles = statements["CreateRunRolesWithNarrowBoundary"]
+    assert create_roles["Resource"] == role_resources
+    assert create_roles["Condition"]["StringEquals"] == {
+        "aws:RequestTag/ACCEPTANCE_RUN_ID": values["run_id"],
+        "iam:PermissionsBoundary": values["iam_permissions_boundary_arn"],
+    }
+    delete_roles = statements["DeleteRunRoleLifecycle"]
+    assert delete_roles["Resource"] == role_resources
+    assert delete_roles["Condition"]["StringEquals"] == {"aws:ResourceTag/ACCEPTANCE_RUN_ID": values["run_id"]}
+    assert {
+        "iam:DeleteRole",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:TagRole",
+        "iam:UntagRole",
+    }.issubset(delete_roles["Action"])
+
+    forbidden = {
+        "ecs:RunTask",
+        "iam:AttachRolePolicy",
+        "iam:PassRole",
+        "iam:PutRolePolicy",
+        "iam:PutRolePermissionsBoundary",
+        "iam:UpdateAssumeRolePolicy",
+        "sts:AssumeRole",
+    }
+    allowed_actions = {action for statement in policy["Statement"] if statement["Effect"] == "Allow" for action in statement["Action"]}
+    denied_actions = {action for statement in policy["Statement"] if statement["Effect"] == "Deny" for action in statement["Action"]}
+    assert not forbidden.intersection(allowed_actions)
+    assert forbidden.issubset(denied_actions)
+
+    bootstrap_versions = _text("bootstrap/versions.tf")
+    module_versions = _text("modules/scenario/versions.tf")
+    iam_resources = _text("modules/scenario/iam_observability.tf")
+    assert 'alias               = "iam_lifecycle"' in bootstrap_versions
+    assert "configuration_aliases = [aws.iam_lifecycle]" in module_versions
+    assert iam_resources.count("provider             = aws.iam_lifecycle") == 2
+    for scenario in ("scenario-a", "scenario-b"):
+        versions = _text(f"{scenario}/versions.tf")
+        main = _text(f"{scenario}/main.tf")
+        assert 'alias               = "iam_lifecycle"' in versions
+        assert "aws.iam_lifecycle = aws.iam_lifecycle" in main
+    readme = _text("README.md")
+    assert "separate IAM lifecycle principal" in readme
+    assert "terraform destroy" in readme
+    assert "-target" not in readme
+    assert "terraform state rm" not in readme
+
+
 def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs() -> None:
     native_test = PACKAGE / "scenario-a" / "codeblind.tftest.hcl"
     assert native_test.is_file()
     content = native_test.read_text(encoding="utf-8")
     for provider in ("aws", "random", "tls"):
         assert f'mock_provider "{provider}"' in content
+    assert 'alias = "iam_lifecycle"' in content
+    assert "iam_lifecycle_aws_profile" in content
+    assert "iam_permissions_boundary_arn" in content
     for forbidden in (
-        "iam_permissions_boundary_arn",
         "rollback_baseline_image",
         "rollback_baseline_sha",
         "scenario_tf_dir",

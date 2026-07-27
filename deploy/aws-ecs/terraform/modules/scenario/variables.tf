@@ -77,12 +77,11 @@ variable "aws_profile" {
 
 variable "iam_permissions_boundary_arn" {
   type        = string
-  default     = "arn:aws:iam::aws:policy/PowerUserAccess"
-  description = "Installer-immutable AWS-managed permissions boundary required on all generated ECS roles."
+  description = "Narrow run-scoped boundary output by bootstrap and required on all generated ECS roles."
 
   validation {
-    condition     = var.iam_permissions_boundary_arn == "arn:aws:iam::aws:policy/PowerUserAccess"
-    error_message = "iam_permissions_boundary_arn must remain the AWS-managed PowerUserAccess policy."
+    condition     = can(regex("^arn:aws:iam::${var.aws_account_id}:policy/elspeth-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-ecs-boundary$", var.iam_permissions_boundary_arn))
+    error_message = "iam_permissions_boundary_arn must be a run-scoped boundary output by bootstrap in aws_account_id."
   }
 }
 

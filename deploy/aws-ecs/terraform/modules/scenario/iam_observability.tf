@@ -11,6 +11,7 @@ data "aws_iam_policy_document" "ecs_tasks_assume" {
 
 resource "aws_iam_role" "task" {
   name                 = "${local.namespace}-task-role"
+  provider             = aws.iam_lifecycle
   assume_role_policy   = data.aws_iam_policy_document.ecs_tasks_assume.json
   permissions_boundary = var.iam_permissions_boundary_arn
 
@@ -19,6 +20,7 @@ resource "aws_iam_role" "task" {
 
 resource "aws_iam_role" "execution" {
   name                 = "${local.namespace}-execution-role"
+  provider             = aws.iam_lifecycle
   assume_role_policy   = data.aws_iam_policy_document.ecs_tasks_assume.json
   permissions_boundary = var.iam_permissions_boundary_arn
 

@@ -30,6 +30,16 @@ variable "aws_profile" {
   }
 }
 
+variable "iam_lifecycle_aws_profile" {
+  type        = string
+  description = "AWS profile for the separate principal that owns IAM boundary and role lifecycle only."
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", var.iam_lifecycle_aws_profile))
+    error_message = "iam_lifecycle_aws_profile must be an explicit shell-safe AWS profile name."
+  }
+}
+
 variable "backend_state_bucket" {
   type = string
 

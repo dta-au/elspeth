@@ -30,36 +30,54 @@ temporarily; this is not a production certificate strategy.
 ## Prerequisites and identity checks
 
 - Terraform `>= 1.14, < 2.0`.
-- An explicit AWS profile, account, and region chosen by the operator.
-- AWS credentials available through that named SDK/CLI profile.
+- Explicit normal-installer and IAM-lifecycle AWS profiles, plus the account and
+  region chosen by the operator.
+- AWS credentials available through both named SDK/CLI profiles.
 - A digest-pinned ELSPETH application image.
 - Two distinct `bedrock/...` provider IDs plus the exact inference-profile and
   foundation-model ARNs those IDs may invoke.
+
+The normal provider still requires an explicit AWS profile, account, and region;
+the lifecycle provider adds a second explicit profile for the same account and
+region.
 
 Before every init, apply, or destroy, verify the named profile, identity, and
 region explicitly:
 
 ```sh
 export AWS_PROFILE=REPLACE_WITH_AWS_PROFILE
+export IAM_LIFECYCLE_AWS_PROFILE=REPLACE_WITH_DISTINCT_IAM_LIFECYCLE_AWS_PROFILE
 export AWS_REGION=REPLACE_WITH_AWS_REGION
 aws --profile "$AWS_PROFILE" --region "$AWS_REGION" sts get-caller-identity
+aws --profile "$IAM_LIFECYCLE_AWS_PROFILE" --region "$AWS_REGION" sts get-caller-identity
 aws --profile "$AWS_PROFILE" configure get region
+aws --profile "$IAM_LIFECYCLE_AWS_PROFILE" configure get region
 ```
 
-Compare the returned account with `aws_account_id` and the configured region
-with `aws_region`. Set the same required `aws_profile` value in the bootstrap
-and scenario tfvars. Do not rely on an implicit profile, region, or remembered
-account. The providers bind all AWS resources to that profile while
-`allowed_account_ids` independently protects the account boundary.
+Compare both returned accounts with `aws_account_id` and both configured
+regions with `aws_region`. Set the same required `aws_profile` and
+`iam_lifecycle_aws_profile` values in the bootstrap and scenario tfvars. Do not
+rely on an implicit profile, region, or remembered account. Each provider binds
+its resources to its explicit profile while `allowed_account_ids`
+independently protects the account boundary.
 
 ### Installer policy and task-role boundary
 
-`iam/installer-policy.json.tftpl` is the Terraform installer policy template.
-It separates discovery reads from mutations, limits named resources and IAM
-roles, requires the run tag where the AWS action supports request or resource
-tags, and permits `iam:PassRole` only to `ecs-tasks.amazonaws.com`. Render it
-for one account, region, and run before attaching it to the installer
-principal:
+The package deliberately splits IAM authority across two principals:
+
+- `iam/installer-policy.json.tftpl` is for the normal installer. It separates
+  discovery reads from mutations, limits named resources, manages only the
+  known inline and managed role-policy bindings, and permits `iam:PassRole`
+  only to `ecs-tasks.amazonaws.com`. It cannot create or delete the generated
+  roles, change their trust or boundary, or manage the boundary policy.
+- `iam/lifecycle-policy.json.tftpl` is for a separate IAM lifecycle principal.
+  It can create, tag, and delete only the four bounded scenario-role patterns
+  and can create, version, and delete only the exact run boundary. Explicit
+  denies prevent it from adding role permissions, passing or assuming a role,
+  or starting an ECS task.
+
+Render both policies for one account, region, and run before attaching them to
+their respective principals:
 
 ```sh
 export aws_account_id=REPLACE_WITH_12_DIGIT_ACCOUNT
@@ -68,6 +86,7 @@ export run_id=REPLACE_WITH_LOWERCASE_UUID
 export backend_state_bucket=REPLACE_WITH_EXACT_BOOTSTRAP_STATE_BUCKET
 export ecr_repository=REPLACE_WITH_EXACT_BOOTSTRAP_APP_REPOSITORY
 export cloudwatch_agent_ecr_repository=REPLACE_WITH_EXACT_BOOTSTRAP_AGENT_REPOSITORY
+export iam_permissions_boundary_arn="arn:aws:iam::${aws_account_id}:policy/elspeth-${run_id}-ecs-boundary"
 scenario_a_namespace="a-$(printf '%s\0A' "$run_id" | sha256sum | cut -c1-20)"
 scenario_b_namespace="b-$(printf '%s\0B' "$run_id" | sha256sum | cut -c1-20)"
 compact_run_id="$(printf '%s' "$run_id" | tr -d '-')"
@@ -77,13 +96,20 @@ mkdir -p bootstrap/.terraform
 envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_bucket} ${scenario_b_bucket}' \
   < iam/installer-policy.json.tftpl \
   > bootstrap/.terraform/installer-policy.json
+envsubst '${aws_account_id} ${run_id} ${iam_permissions_boundary_arn}' \
+  < iam/lifecycle-policy.json.tftpl \
+  > bootstrap/.terraform/iam-lifecycle-policy.json
 ```
 
-Inspect the rendered JSON and attach it using the account's normal IAM
-administration path. If an account-specific prerequisite is missing, use a
-trusted administrator only to install or amend this policy in the dedicated
-disposable account; do not run Terraform with an account-administrator
-wildcard policy.
+Inspect the rendered JSON and attach each policy using the account's normal IAM
+administration path. Keep the two profiles backed by distinct principals for
+the supported least-privilege installation. A purpose-built root acceptance
+profile may set both provider variables to `elspeth-acceptance` for a smoke
+exercise, but that deliberately gives up the privilege separation and is not
+the supported least-privilege posture. If an account-specific prerequisite is
+missing, use a trusted administrator only to install or amend these policies in
+the dedicated disposable account; do not run Terraform with an
+account-administrator wildcard policy.
 
 The bucket derivation above is the same deterministic formula used by the
 scenario module. The rendered policy consequently limits S3 bucket/object
@@ -91,14 +117,17 @@ mutations and ECR image push or force-delete operations to the exact bootstrap,
 Scenario A, and Scenario B names for this run. The three bootstrap names must
 match `examples/bootstrap.tfvars` exactly.
 
-Both generated ECS roles must use the AWS-managed
-`arn:aws:iam::aws:policy/PowerUserAccess` permissions boundary. The installer
-can attach that boundary but cannot create, version, replace, or delete any
-managed policy. This prevents it from widening the boundary before adding
-inline role permissions and passing a role to ECS. Effective task permissions
-remain the intersection of the installer-immutable boundary and this package's
-narrow task/execution policies, including the exact cross-region Bedrock
-foundation-model ARNs supplied in scenario inputs.
+Bootstrap creates the custom run-scoped boundary named by
+`iam_permissions_boundary_arn`; copy the `iam_permissions_boundary_arn`
+bootstrap output into each scenario tfvars file. Both generated ECS roles must
+use that boundary. The normal installer can add the package's narrow role
+policies and pass the roles but cannot widen or remove their boundary. The
+lifecycle principal can create or delete the bounded roles but cannot add
+permissions or activate them. Effective task permissions remain the
+intersection of the lifecycle-principal-controlled boundary and the normal
+installer's task/execution policies. The boundary permits only the package
+runtime surfaces, including destination foundation models needed by the exact
+cross-region Bedrock inference-profile inputs.
 
 Networking relationships, EFS mount targets, Cognito children, EventBridge
 targets, and X-Ray resources use supported ARN and run-tag conditions. The
@@ -117,12 +146,14 @@ Copy `examples/bootstrap.tfvars.example` to an ignored
 ```sh
 terraform -chdir=bootstrap init
 terraform -chdir=bootstrap apply -var-file=../examples/bootstrap.tfvars
+terraform -chdir=bootstrap output -raw iam_permissions_boundary_arn
 ```
 
 Bootstrap state is local by design because it creates the remote state bucket.
-Preserve that state until both scenario states have been destroyed. Destroy
-Scenario A and Scenario B first, then destroy bootstrap last so the state
-bucket and repositories remain available throughout scenario teardown.
+Preserve that state until both scenario states have been destroyed. Keep both
+credential profiles available for the entire lifecycle. Destroy Scenario A and
+Scenario B first, then destroy bootstrap last so the boundary, state bucket,
+and repositories remain available throughout scenario teardown.
 
 The bootstrap creates separate ECR repositories for ELSPETH and the
 shell-bearing CloudWatch agent. Temporary application tags may expire. The
@@ -273,13 +304,24 @@ and a teardown reminder. These are intended to be useful without reading the
 Terraform source.
 
 For teardown, select the same backend config and exact workspace used for
-installation, verify the explicit AWS profile, account, and region again, and
-run:
+installation, verify both explicit AWS profiles, account, and region again,
+and run the ordinary full destroy:
 
 ```sh
 terraform -chdir=scenario-a destroy \
   -var-file=../examples/scenario-a.tfvars
 ```
 
-Use `scenario-b` and its inputs for the B variant. Destroy scenarios before
-destroying bootstrap resources.
+Use `scenario-b` and its inputs for the B variant. Once every scenario state is
+empty, destroy bootstrap last with the same two profiles:
+
+```sh
+terraform -chdir=bootstrap destroy \
+  -var-file=../examples/bootstrap.tfvars
+```
+
+Terraform's provider split and resource dependencies ensure the normal
+installer removes inline policies and the known managed attachment before the
+lifecycle principal deletes each role. The lifecycle principal then deletes
+the custom boundary only during the final bootstrap destroy. Repeated apply
+and full `terraform destroy` commands remain the supported idempotent workflow.

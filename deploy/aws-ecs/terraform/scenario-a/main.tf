@@ -8,6 +8,11 @@ locals {
 module "scenario" {
   source = "../modules/scenario"
 
+  providers = {
+    aws               = aws
+    aws.iam_lifecycle = aws.iam_lifecycle
+  }
+
   run_id                             = var.run_id
   scenario_id                        = var.scenario_id
   candidate_sha                      = var.candidate_sha
@@ -17,6 +22,7 @@ module "scenario" {
   aws_account_id                     = var.aws_account_id
   aws_region                         = var.aws_region
   aws_profile                        = var.aws_profile
+  iam_permissions_boundary_arn       = var.iam_permissions_boundary_arn
   target_platform                    = var.target_platform
   owner                              = var.owner
   purpose                            = var.purpose

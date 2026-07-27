@@ -11,6 +11,9 @@ mock_provider "aws" {
     }
   }
 }
+mock_provider "aws" {
+  alias = "iam_lifecycle"
+}
 mock_provider "random" {}
 mock_provider "tls" {}
 
@@ -18,13 +21,19 @@ run "standalone_codeblind_plan" {
   command = plan
 
   variables {
-    run_id                 = "12345678-1234-4123-8123-123456789abc"
-    scenario_id            = "A"
-    candidate_sha          = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    candidate_image        = format("%s.dkr.ecr.ap-southeast-1.amazonaws.com/elspeth-web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join("", ["123456", "789012"]))
-    aws_account_id         = join("", ["123456", "789012"])
-    aws_region             = "ap-southeast-1"
-    aws_profile            = "mock-test"
+    run_id                    = "12345678-1234-4123-8123-123456789abc"
+    scenario_id               = "A"
+    candidate_sha             = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    candidate_image           = format("%s.dkr.ecr.ap-southeast-1.amazonaws.com/elspeth-web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join("", ["123456", "789012"]))
+    aws_account_id            = join("", ["123456", "789012"])
+    aws_region                = "ap-southeast-1"
+    aws_profile               = "mock-test"
+    iam_lifecycle_aws_profile = "mock-iam-lifecycle"
+    iam_permissions_boundary_arn = format(
+      "arn:aws:iam::%s:policy/elspeth-%s-ecs-boundary",
+      join("", ["123456", "789012"]),
+      "12345678-1234-4123-8123-123456789abc",
+    )
     owner                  = "terraform-test"
     purpose                = "Standalone Scenario A mocked plan"
     cleanup_deadline       = "2030-01-01T00:00:00Z"

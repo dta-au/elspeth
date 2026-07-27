@@ -114,37 +114,11 @@
       ]
     },
     {
-      "Sid": "CreateRunScopedRolesWithBoundary",
+      "Sid": "ManageRunScopedInlinePolicies",
       "Effect": "Allow",
       "Action": [
-        "iam:CreateRole",
-        "iam:TagRole"
-      ],
-      "Resource": [
-        "arn:aws:iam::${aws_account_id}:role/a-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/a-*-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-execution-role"
-      ],
-      "Condition": {
-        "StringEquals": {
-          "aws:RequestTag/ACCEPTANCE_RUN_ID": "${run_id}",
-          "iam:PermissionsBoundary": "arn:aws:iam::aws:policy/PowerUserAccess"
-        }
-      }
-    },
-    {
-      "Sid": "ManageRunScopedRoles",
-      "Effect": "Allow",
-      "Action": [
-        "iam:AttachRolePolicy",
-        "iam:DeleteRole",
         "iam:DeleteRolePolicy",
-        "iam:DeleteRolePermissionsBoundary",
-        "iam:DetachRolePolicy",
-        "iam:PutRolePolicy",
-        "iam:UntagRole",
-        "iam:UpdateAssumeRolePolicy"
+        "iam:PutRolePolicy"
       ],
       "Resource": [
         "arn:aws:iam::${aws_account_id}:role/a-*-task-role",
@@ -155,6 +129,26 @@
       "Condition": {
         "StringEquals": {
           "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}"
+        }
+      }
+    },
+    {
+      "Sid": "ManageKnownExecutionRoleAttachment",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::${aws_account_id}:role/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/b-*-execution-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}"
+        },
+        "ArnEquals": {
+          "iam:PolicyARN": "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
         }
       }
     },
