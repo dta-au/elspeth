@@ -582,6 +582,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     secret_service: WebSecretResolver | None = None,
     max_discovery_iters: int | None = None,
+    max_tool_calls_per_turn: int | None = None,
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
     progress: ComposerProgressSink | None = None,
@@ -593,9 +594,10 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     sink discovery-tool loop in :func:`maybe_resolve_step_2_sink_chat`; the
     route always threads them so the composer model can ``list_sinks`` /
     ``get_plugin_schema`` before resolving. ``max_discovery_iters`` bounds the
-    loop (the route passes ``settings.composer_max_discovery_turns``); ``None``
-    defers to the solver's own default. ``context_block`` threads straight
-    through so a declined-to-prose reply (returned as
+    loop and ``max_tool_calls_per_turn`` bounds each discovery batch (the route
+    passes both configured limits); ``None`` defers to the solver's own
+    defaults. ``context_block`` threads straight through so a declined-to-prose
+    reply (returned as
     ``GuidedStepChatOnlyResult``) is grounded in the same "current build"
     context a second, tool-less call would otherwise have supplied.
     """
@@ -614,6 +616,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
             secret_service=secret_service,
             user_id=user_id,
             max_discovery_iters=max_discovery_iters,
+            max_tool_calls_per_turn=max_tool_calls_per_turn,
             timeout_seconds=timeout_seconds,
             context_block=context_block,
             progress=progress,

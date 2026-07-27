@@ -254,6 +254,7 @@ async def run_guided_chat_provider_attempt(
             plugin_snapshot=plugin_snapshot,
             secret_service=secret_service,
             max_discovery_iters=settings.composer_max_discovery_turns,
+            max_tool_calls_per_turn=settings.composer_max_tool_calls_per_turn,
             timeout_seconds=settings.composer_timeout_seconds,
             context_block=context_block,
             progress=progress,

@@ -1919,6 +1919,13 @@ keeps direct callers (and tests) bounded. Reaching the cap returns ``None``
 (advisory fallback), never raises.
 """
 
+_DEFAULT_MAX_TOOL_CALLS_PER_TURN: Final[int] = 16
+"""Fallback discovery-call cap when the route does not pass one.
+
+Production threads ``settings.composer_max_tool_calls_per_turn``; this keeps
+direct callers bounded at the same default as :class:`WebSettings`.
+"""
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Step2SinkResolvedOutcome:
@@ -1955,6 +1962,7 @@ async def maybe_resolve_step_2_sink_chat(
     secret_service: WebSecretResolver | None = None,
     user_id: str | None = None,
     max_discovery_iters: int | None = None,
+    max_tool_calls_per_turn: int | None = None,
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
     progress: ComposerProgressSink | None = None,
@@ -2010,6 +2018,7 @@ async def maybe_resolve_step_2_sink_chat(
     tools = [_STEP_2_SINK_TOOL, _DEFERRED_INTENT_TOOL, _DEFERRED_INTENT_MANAGEMENT_TOOL, *discovery_defs]
     actor = user_id or "guided-composer"
     iteration_cap = max_discovery_iters if max_discovery_iters is not None else _DEFAULT_MAX_DISCOVERY_ITERS
+    tool_call_cap = max_tool_calls_per_turn if max_tool_calls_per_turn is not None else _DEFAULT_MAX_TOOL_CALLS_PER_TURN
 
     # NO Anthropic prompt-cache marker here (deliberate skip, not an oversight):
     # the step_2 sink skill is ~915 tokens, below Anthropic's 1024-token cache
@@ -2125,6 +2134,8 @@ async def maybe_resolve_step_2_sink_chat(
             if not discovery_calls or len(discovery_calls) != len(tool_calls):
                 status = ComposerLLMCallStatus.SUCCESS
                 return GuidedChatEmptyOutcome()
+            if len(discovery_calls) > tool_call_cap:
+                raise GuidedToolArgumentShapeError("step-2 discovery response exceeds the per-turn tool call limit")
 
             # Thread the assistant tool-call request once, then answer every
             # call id with its result, or the next round 400s.

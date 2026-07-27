@@ -22,11 +22,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.guided.chat_solver import GuidedChatEmptyOutcome, maybe_resolve_step_2_sink_chat
+from elspeth.web.composer.guided.chat_solver import (
+    GuidedChatEmptyOutcome,
+    GuidedToolArgumentShapeError,
+    maybe_resolve_step_2_sink_chat,
+)
 from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
@@ -223,6 +228,7 @@ async def test_sink_loop_threads_parallel_tool_calls() -> None:
             catalog=_POLICY_CATALOG,
             plugin_snapshot=_PLUGIN_SNAPSHOT,
             user_id="u1",
+            max_tool_calls_per_turn=2,
         )
 
     assert result.sink is not None
@@ -236,6 +242,47 @@ async def test_sink_loop_threads_parallel_tool_calls() -> None:
     assert {tc["id"] for tc in assistant_msgs[0]["tool_calls"]} == {"c1", "c2"}
     # Both discovery calls were audited.
     assert {inv.tool_name for inv in recorder.invocations} == {"list_sinks", "get_plugin_schema"}
+
+
+@pytest.mark.asyncio
+async def test_sink_loop_rejects_over_limit_batch_before_any_dispatch() -> None:
+    """An oversized allowed batch is one malformed response, not partial work."""
+    response = _response(
+        tool_calls=[
+            _tool_call("c1", "list_sinks", {}),
+            _tool_call("c2", "get_plugin_schema", {"plugin_type": "sink", "name": "json"}),
+            _tool_call("c3", "list_sinks", {}),
+        ]
+    )
+    recorder = BufferingRecorder()
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        return response
+
+    with (
+        patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake),
+        patch("elspeth.web.composer.guided._discovery.execute_tool", autospec=True) as execute_tool_spy,
+        pytest.raises(GuidedToolArgumentShapeError, match="per-turn tool call limit"),
+    ):
+        await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="inspect every sink",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            recorder=recorder,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+            max_tool_calls_per_turn=2,
+        )
+
+    execute_tool_spy.assert_not_called()
+    assert recorder.invocations == ()
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].status is ComposerLLMCallStatus.MALFORMED_RESPONSE
 
 
 @pytest.mark.asyncio
