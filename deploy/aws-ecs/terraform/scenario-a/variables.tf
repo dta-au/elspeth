@@ -34,24 +34,6 @@ variable "candidate_image" {
   }
 }
 
-variable "rollback_baseline_image" {
-  type = string
-
-  validation {
-    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.rollback_baseline_image))
-    error_message = "rollback_baseline_image must be immutable by digest."
-  }
-}
-
-variable "rollback_baseline_sha" {
-  type = string
-
-  validation {
-    condition     = can(regex("^[0-9a-f]{40}$", var.rollback_baseline_sha))
-    error_message = "rollback_baseline_sha must be a full Git SHA."
-  }
-}
-
 variable "aws_account_id" {
   type      = string
   sensitive = true
@@ -72,6 +54,18 @@ variable "aws_profile" {
   validation {
     condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", var.aws_profile))
     error_message = "aws_profile must be an explicit shell-safe AWS profile name."
+  }
+}
+
+variable "iam_permissions_boundary_arn" {
+  type = string
+
+  validation {
+    condition = can(regex(
+      "^arn:aws:iam::[0-9]{12}:policy/elspeth-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-ecs-boundary$",
+      var.iam_permissions_boundary_arn,
+    ))
+    error_message = "iam_permissions_boundary_arn must be the run-scoped boundary ARN output by bootstrap."
   }
 }
 
@@ -137,22 +131,6 @@ variable "bedrock_inference_profile_arns" {
 
 variable "bedrock_foundation_model_arns" {
   type = set(string)
-}
-
-variable "scenario_tf_dir" {
-  type = string
-}
-
-variable "scenario_tf_vars" {
-  type = string
-}
-
-variable "scenario_tf_binding_file" {
-  type = string
-}
-
-variable "transaction_search_baseline_sha256" {
-  type = string
 }
 
 variable "cognito_subject_sub" {

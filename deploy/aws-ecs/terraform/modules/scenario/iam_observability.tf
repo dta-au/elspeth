@@ -10,15 +10,17 @@ data "aws_iam_policy_document" "ecs_tasks_assume" {
 }
 
 resource "aws_iam_role" "task" {
-  name               = "${local.namespace}-task-role"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  name                 = "${local.namespace}-task-role"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_tasks_assume.json
+  permissions_boundary = var.iam_permissions_boundary_arn
 
   tags = local.tags
 }
 
 resource "aws_iam_role" "execution" {
-  name               = "${local.namespace}-execution-role"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  name                 = "${local.namespace}-execution-role"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_tasks_assume.json
+  permissions_boundary = var.iam_permissions_boundary_arn
 
   tags = local.tags
 }

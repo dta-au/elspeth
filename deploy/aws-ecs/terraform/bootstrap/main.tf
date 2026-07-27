@@ -101,3 +101,105 @@ resource "aws_ecr_lifecycle_policy" "cloudwatch_agent" {
     }]
   })
 }
+
+data "aws_iam_policy_document" "ecs_permissions_boundary" {
+  statement {
+    sid = "PullElspethImages"
+    actions = [
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:BatchGetImage",
+      "ecr:GetDownloadUrlForLayer",
+    ]
+    resources = ["arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/elspeth-*"]
+  }
+
+  statement {
+    sid       = "AuthenticateToEcr"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "UseElspethLogs"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:DescribeLogStreams",
+      "logs:PutLogEvents",
+    ]
+    resources = ["arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:/aws/ecs/*"]
+  }
+
+  statement {
+    sid     = "ReadRunSecrets"
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = [
+      "arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:a-*-database-*",
+      "arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:b-*-database-*",
+    ]
+  }
+
+  statement {
+    sid = "UseElspethObjects"
+    actions = [
+      "s3:DeleteObject",
+      "s3:GetObject",
+      "s3:PutObject",
+    ]
+    resources = ["arn:aws:s3:::elspeth-*/*"]
+  }
+
+  statement {
+    sid     = "InvokeBedrockModels"
+    actions = ["bedrock:InvokeModel"]
+    resources = [
+      "arn:aws:bedrock:${var.aws_region}:${var.aws_account_id}:inference-profile/*",
+      # Cross-region inference profiles invoke destination foundation models.
+      # The resource type has no account component, so only its region varies.
+      "arn:aws:bedrock:*::foundation-model/*",
+    ]
+  }
+
+  statement {
+    sid       = "ApplyRunGuardrails"
+    actions   = ["bedrock:ApplyGuardrail", "bedrock:GetGuardrail"]
+    resources = ["arn:aws:bedrock:${var.aws_region}:${var.aws_account_id}:guardrail/*"]
+  }
+
+  statement {
+    sid = "MountRunFileSystems"
+    actions = [
+      "elasticfilesystem:ClientMount",
+      "elasticfilesystem:ClientWrite",
+    ]
+    resources = ["arn:aws:elasticfilesystem:${var.aws_region}:${var.aws_account_id}:file-system/*"]
+  }
+
+  statement {
+    sid = "UseEcsExecChannels"
+    actions = [
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "PublishAndReadRunTelemetry"
+    actions = [
+      "cloudwatch:GetMetricData",
+      "xray:BatchGetTraces",
+      "xray:PutTelemetryRecords",
+      "xray:PutTraceSegments",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "ecs_permissions_boundary" {
+  name        = "elspeth-${var.run_id}-ecs-boundary"
+  description = "Maximum permissions for disposable ELSPETH ECS task and execution roles."
+  policy      = data.aws_iam_policy_document.ecs_permissions_boundary.json
+  tags        = { ACCEPTANCE_RUN_ID = var.run_id }
+}

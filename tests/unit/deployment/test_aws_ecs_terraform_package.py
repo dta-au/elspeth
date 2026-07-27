@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -28,7 +29,7 @@ EXPECTED_FILES = {
     "examples/scenario-a.tfvars.example",
     "examples/scenario-b.s3.tfbackend.example",
     "examples/scenario-b.tfvars.example",
-    "iam/installer-policy.json",
+    "iam/installer-policy.json.tftpl",
     "modules/scenario/database_bootstrap.tf",
     "modules/scenario/ecs.tf",
     "modules/scenario/iam_observability.tf",
@@ -39,6 +40,8 @@ EXPECTED_FILES = {
     "modules/scenario/variables.tf",
     "modules/scenario/versions.tf",
     "scenario-a/.terraform.lock.hcl",
+    "scenario-a/codeblind-compatibility.json",
+    "scenario-a/codeblind.tftest.hcl",
     "scenario-a/main.tf",
     "scenario-a/outputs.tf",
     "scenario-a/variables.tf",
@@ -85,6 +88,10 @@ def _hcl_map_keys(text: str, assignment: str) -> frozenset[str]:
                 keys.add(key_match.group(1))
         raise AssertionError(f"unterminated HCL map: {assignment}")
     raise AssertionError(f"HCL map not found: {assignment}")
+
+
+def _hcl_variable_names(text: str) -> frozenset[str]:
+    return frozenset(re.findall(r'^variable "([^"]+)"', text, re.MULTILINE))
 
 
 def test_package_contains_only_the_supported_source_and_operator_inputs() -> None:
@@ -301,6 +308,186 @@ def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
     assert "resolved_inventory" in outputs
 
 
+def test_scenario_a_codeblind_inputs_have_no_acceptance_coordinator_dependencies() -> None:
+    main = _text("scenario-a/main.tf")
+    variables = _text("scenario-a/variables.tf")
+    example = _text("examples/scenario-a.tfvars.example")
+    readme_scenario_a = _text("README.md").split("## Scenario B", 1)[0]
+    scenario_b_variables = _text("scenario-b/variables.tf")
+    compatibility_path = PACKAGE / "scenario-a" / "codeblind-compatibility.json"
+    assert compatibility_path.is_file()
+    compatibility = json.loads(compatibility_path.read_text(encoding="utf-8"))
+
+    forbidden = {
+        "rollback_baseline_image",
+        "rollback_baseline_sha",
+        "scenario_tf_dir",
+        "scenario_tf_vars",
+        "scenario_tf_binding_file",
+        "transaction_search_baseline_sha256",
+    }
+    assert not forbidden.intersection(_hcl_variable_names(variables))
+    for name in forbidden:
+        assert name not in example
+        assert name not in readme_scenario_a
+    assert forbidden.intersection(_hcl_variable_names(scenario_b_variables)) == forbidden
+
+    assert "rollback_baseline_image            = var.candidate_image" in main
+    assert "rollback_baseline_sha              = var.candidate_sha" in main
+    expected_assignments = {
+        "codeblind_compatibility_file": 'abspath("${path.root}/codeblind-compatibility.json")',
+        "scenario_tf_dir": "abspath(path.root)",
+        "scenario_tf_vars": 'abspath("${path.root}/../examples/scenario-a.tfvars.example")',
+        "scenario_tf_binding_file": "local.codeblind_compatibility_file",
+        "scenario_tf_binding_sha": "local.codeblind_compatibility_sha256",
+        "transaction_search_baseline_sha256": "local.codeblind_transaction_search_sha256",
+    }
+    for name, value in expected_assignments.items():
+        assert re.search(rf"\b{re.escape(name)}\s*=\s*{re.escape(value)}", main)
+    assert compatibility == {
+        "schema": "elspeth.aws-ecs-codeblind-compatibility.v1",
+        "scenario_id": "A",
+        "purpose": "Tracked package facts for standalone cold-install inventory compatibility; not acceptance evidence.",
+        "terraform_root": "scenario-a",
+        "tfvars_example": "examples/scenario-a.tfvars.example",
+        "transaction_search_baseline": {
+            "state": "not-captured",
+            "reason": "Standalone first-account installation has no pre-existing transaction-search baseline.",
+        },
+    }
+
+
+def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
+    template_path = PACKAGE / "iam" / "installer-policy.json.tftpl"
+    assert template_path.is_file()
+    template = template_path.read_text(encoding="utf-8")
+    rendered = template
+    values = {
+        "aws_account_id": "123456789012",
+        "aws_region": "ap-southeast-1",
+        "run_id": "12345678-1234-4123-8123-123456789abc",
+        "iam_permissions_boundary_arn": ("arn:aws:iam::123456789012:policy/elspeth-12345678-1234-4123-8123-123456789abc-ecs-boundary"),
+    }
+    for name, value in values.items():
+        rendered = rendered.replace(f"${{{name}}}", value)
+    assert "${" not in rendered
+    policy = json.loads(rendered)
+    statements = {statement["Sid"]: statement for statement in policy["Statement"]}
+
+    assert "ManageElspethInfrastructure" not in statements
+    assert "ReadDiscovery" in statements
+    assert all(
+        action.startswith(("sts:Get", "acm:Describe", "bedrock:Get", "cloudwatch:Describe", "cognito-idp:Describe"))
+        or any(verb in action for verb in (":Get", ":List", ":Describe"))
+        for action in statements["ReadDiscovery"]["Action"]
+    )
+    mutation_actions = {action for sid, statement in statements.items() if sid != "ReadDiscovery" for action in statement["Action"]}
+    assert not any(action.endswith(":*") for action in mutation_actions)
+
+    push_images = statements["PushAndCleanElspethImages"]
+    assert {
+        "ecr:BatchDeleteImage",
+        "ecr:CompleteLayerUpload",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:UploadLayerPart",
+    }.issubset(push_images["Action"])
+    assert push_images["Resource"] == "arn:aws:ecr:ap-southeast-1:123456789012:repository/elspeth-*"
+    assert statements["AuthenticateForEcrPush"]["Action"] == ["ecr:GetAuthorizationToken"]
+    assert statements["AuthenticateForEcrPush"]["Condition"]["StringEquals"]["aws:RequestedRegion"] == values["aws_region"]
+
+    run_tasks = statements["RunScenarioTasks"]
+    assert run_tasks["Action"] == ["ecs:RunTask"]
+    assert run_tasks["Resource"] == [
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/a-*:*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/b-*:*",
+    ]
+    assert run_tasks["Condition"]["ArnLike"]["ecs:cluster"] == [
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-*",
+    ]
+    assert statements["ReadScenarioSecretValues"]["Action"] == ["secretsmanager:GetSecretValue"]
+
+    dashboards = statements["ManageRunDashboards"]
+    assert dashboards["Resource"] == [
+        "arn:aws:cloudwatch::123456789012:dashboard/a-*",
+        "arn:aws:cloudwatch::123456789012:dashboard/b-*",
+    ]
+    assert {"cloudwatch:PutDashboard", "cloudwatch:DeleteDashboards"} == set(dashboards["Action"])
+    assert not {"cloudwatch:PutDashboard", "cloudwatch:DeleteDashboards"}.intersection(
+        statements["MutateRunTaggedRegionalResources"]["Action"]
+    )
+    assert {"s3:ListBucketVersions", "s3:DeleteBucketPublicAccessBlock"}.issubset(statements["ManageElspethNamedBuckets"]["Action"])
+    assert "s3:DeleteObjectVersion" in statements["ManageElspethNamedBucketObjects"]["Action"]
+    assert "acm:GetCertificate" in statements["ReadDiscovery"]["Action"]
+
+    create_role = statements["CreateRunScopedRolesWithBoundary"]
+    assert create_role["Resource"] == [
+        "arn:aws:iam::123456789012:role/a-*-task-role",
+        "arn:aws:iam::123456789012:role/a-*-execution-role",
+        "arn:aws:iam::123456789012:role/b-*-task-role",
+        "arn:aws:iam::123456789012:role/b-*-execution-role",
+    ]
+    assert create_role["Condition"]["StringEquals"] == {
+        "aws:RequestTag/ACCEPTANCE_RUN_ID": values["run_id"],
+        "iam:PermissionsBoundary": values["iam_permissions_boundary_arn"],
+    }
+    pass_role = statements["PassRunScopedRolesToEcsTasksOnly"]
+    assert pass_role["Condition"]["StringEquals"]["iam:PassedToService"] == "ecs-tasks.amazonaws.com"
+    assert statements["ManageRunPermissionsBoundary"]["Resource"] == values["iam_permissions_boundary_arn"]
+    assert "iam:CreateServiceLinkedRole" in statements["CreateRequiredServiceLinkedRoles"]["Action"]
+    assert statements["CreateRequiredServiceLinkedRoles"]["Condition"]["StringEquals"]["iam:AWSServiceName"] == [
+        "ecs.amazonaws.com",
+        "elasticloadbalancing.amazonaws.com",
+        "rds.amazonaws.com",
+    ]
+
+    for relative in (
+        "modules/scenario/variables.tf",
+        "scenario-a/variables.tf",
+        "scenario-b/variables.tf",
+    ):
+        assert 'variable "iam_permissions_boundary_arn"' in _text(relative)
+    for relative in ("examples/scenario-a.tfvars.example", "examples/scenario-b.tfvars.example"):
+        assert "iam_permissions_boundary_arn" in _text(relative)
+    iam = _text("modules/scenario/iam_observability.tf")
+    assert iam.count("permissions_boundary = var.iam_permissions_boundary_arn") == 2
+    bootstrap = _text("bootstrap/main.tf")
+    bootstrap_outputs = _text("bootstrap/outputs.tf")
+    assert 'resource "aws_iam_policy" "ecs_permissions_boundary"' in bootstrap
+    assert '"arn:aws:bedrock:*::foundation-model/*"' in bootstrap
+    assert '"arn:aws:bedrock:${var.aws_region}:${var.aws_account_id}:inference-profile/*"' in bootstrap
+    assert 'output "iam_permissions_boundary_arn"' in bootstrap_outputs
+    assert "Unavoidable Resource `*` mutations" in _text("README.md")
+
+
+def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs() -> None:
+    native_test = PACKAGE / "scenario-a" / "codeblind.tftest.hcl"
+    assert native_test.is_file()
+    content = native_test.read_text(encoding="utf-8")
+    for provider in ("aws", "random", "tls"):
+        assert f'mock_provider "{provider}"' in content
+    for forbidden in (
+        "rollback_baseline_image",
+        "rollback_baseline_sha",
+        "scenario_tf_dir",
+        "scenario_tf_vars",
+        "scenario_tf_binding_file",
+        "transaction_search_baseline_sha256",
+    ):
+        assert forbidden not in content
+
+    result = subprocess.run(
+        ["terraform", f"-chdir={PACKAGE / 'scenario-a'}", "test", "-filter=codeblind.tftest.hcl", "-no-color"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Success!" in result.stdout
+
+
 def test_networking_has_long_request_support_and_correct_listener_target() -> None:
     network = _text("modules/scenario/network.tf")
     assert re.search(r"idle_timeout\s+=\s+300", network)
@@ -509,7 +696,6 @@ def test_certificate_limit_and_code_blind_outputs_are_explicit() -> None:
 
 
 def test_examples_and_policy_are_parseable_and_contain_no_local_or_account_data() -> None:
-    json.loads(_text("iam/installer-policy.json"))
     json.loads(_text("telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.json"))
     otel = yaml.safe_load(_text("telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.otel.yaml"))
     assert isinstance(otel, dict)

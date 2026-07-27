@@ -32,14 +32,29 @@ variable "aws_profile" {
 
 variable "backend_state_bucket" {
   type = string
+
+  validation {
+    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.backend_state_bucket))
+    error_message = "backend_state_bucket must use the elspeth- prefix and a valid lowercase S3 bucket name."
+  }
 }
 
 variable "ecr_repository" {
   type = string
+
+  validation {
+    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.ecr_repository))
+    error_message = "ecr_repository must use the elspeth- prefix."
+  }
 }
 
 variable "cloudwatch_agent_ecr_repository" {
   type = string
+
+  validation {
+    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.cloudwatch_agent_ecr_repository))
+    error_message = "cloudwatch_agent_ecr_repository must use the elspeth- prefix."
+  }
 }
 
 variable "owner" {

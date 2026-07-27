@@ -52,6 +52,45 @@ and scenario tfvars. Do not rely on an implicit profile, region, or remembered
 account. The providers bind all AWS resources to that profile while
 `allowed_account_ids` independently protects the account boundary.
 
+### Installer policy and task-role boundary
+
+`iam/installer-policy.json.tftpl` is the Terraform installer policy template.
+It separates discovery reads from mutations, limits named resources and IAM
+roles, requires the run tag where the AWS action supports request or resource
+tags, and permits `iam:PassRole` only to `ecs-tasks.amazonaws.com`. Render it
+for one account, region, and run before attaching it to the installer
+principal:
+
+```sh
+export aws_account_id=REPLACE_WITH_12_DIGIT_ACCOUNT
+export aws_region=REPLACE_WITH_AWS_REGION
+export run_id=REPLACE_WITH_LOWERCASE_UUID
+export iam_permissions_boundary_arn="arn:aws:iam::${aws_account_id}:policy/elspeth-${run_id}-ecs-boundary"
+mkdir -p bootstrap/.terraform
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${iam_permissions_boundary_arn}' \
+  < iam/installer-policy.json.tftpl \
+  > bootstrap/.terraform/installer-policy.json
+```
+
+Inspect the rendered JSON and attach it using the account's normal IAM
+administration path. If an account-specific prerequisite is missing, use a
+trusted administrator only to install or amend this policy in the dedicated
+disposable account; do not run Terraform with an account-administrator
+wildcard policy.
+
+The bootstrap owns a run-scoped permissions boundary and outputs its exact
+ARN. Copy `iam_permissions_boundary_arn` into each scenario tfvars file. Both
+generated task roles must carry that boundary. The boundary permits the
+current-region inference profile and foundation-model destinations in other
+regions because Bedrock cross-region inference may route there; it does not
+broaden other resource types across regions.
+
+The template's **Unavoidable Resource `*` mutations** are an explicit,
+action-by-action residual list for APIs whose association, child-resource, or
+service policy calls cannot be usefully constrained to the Terraform-created
+ARN at authorization time. They remain limited to the selected region and do
+not include wildcard service actions.
+
 ## 1. Bootstrap state and image repositories
 
 Copy `examples/bootstrap.tfvars.example` to an ignored
@@ -63,7 +102,10 @@ terraform -chdir=bootstrap apply -var-file=../examples/bootstrap.tfvars
 ```
 
 Bootstrap state is local by design because it creates the remote state bucket.
-Preserve that state until both scenario states have been destroyed.
+Preserve that state until both scenario states have been destroyed. Destroy
+Scenario A and Scenario B first, then destroy bootstrap last so the state
+bucket, repositories, and run permissions boundary remain available throughout
+scenario teardown.
 
 The bootstrap creates separate ECR repositories for ELSPETH and the
 shell-bearing CloudWatch agent. Temporary application tags may expire. The
@@ -96,12 +138,12 @@ Copy `examples/scenario-a.tfvars.example` to an ignored
 `examples/scenario-a.tfvars`, replace every placeholder, and check that both
 Bedrock provider IDs are present and distinct.
 
-The current runtime inventory validator also requires the absolute scenario
-directory, tfvars path, canonical Terraform-binding JSON path, and the
-transaction-search baseline SHA-256. Supply those existing operator inputs in
-the four `scenario_tf_*` / `transaction_search_baseline_sha256` fields. The
-package hashes the canonical binding JSON and does not copy any of those
-operator files into this source tree.
+Scenario A has no rollback or acceptance-coordinator inputs. Its compatibility
+inventory derives the candidate baseline and absolute tracked source paths from
+the package itself. `scenario-a/codeblind-compatibility.json` records the
+standalone-install facts and the absence of a pre-existing transaction-search
+baseline. It is deterministic package metadata, not an acceptance binding
+artifact. Scenario B retains its acceptance-only inputs.
 
 ```sh
 terraform -chdir=scenario-a init \
