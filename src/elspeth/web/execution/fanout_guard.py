@@ -18,7 +18,7 @@ from typing import Any, Literal, TypedDict
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
 from elspeth.web.paths import resolve_data_path
 
 FANOUT_GUARD_ERROR_TYPE = "execution_fanout_ack_required"
@@ -384,7 +384,7 @@ def _trace_upstream_fanout(
         if node.node_type == "coalesce":
             if node.input:
                 walk_label(node.input)
-            for branch in node.branches or ():
+            for branch in _coalesce_branch_connections(node.branches):
                 walk_label(branch)
             return
 

@@ -1179,6 +1179,32 @@ def _fanout_llm_node(input_label: str, node_id: str = "classify") -> Any:
     )
 
 
+def _coalesce_node(
+    *,
+    node_id: str,
+    on_success: str,
+    branches: dict[str, str],
+) -> Any:
+    """Coalesce node whose branch identities may differ from connections."""
+    from elspeth.web.composer.state import NodeSpec
+
+    return NodeSpec(
+        id=node_id,
+        node_type="coalesce",
+        plugin=None,
+        input=f"{node_id}_compatibility_input",
+        on_success=on_success,
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=branches,
+        policy="all",
+        merge="row_union",
+    )
+
+
 def _queue_fan_in_state(*, sources: dict[str, Any], extra_nodes: tuple[Any, ...] = ()) -> Any:
     """CompositionState: ``sources`` fan into queue ``inbound`` feeding an LLM."""
     from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -1453,6 +1479,43 @@ class TestExecutionFanoutGuard:
         assert risk.estimated_provider_calls == 101
         assert risk.upstream_fanout == ("source:refunds:text:estimated_rows=101",)
         assert mock_session_service.create_run.await_count == 0
+
+    def test_coalesce_mapping_traverses_values_once_across_nesting_and_cycles(self, tmp_path: Path) -> None:
+        """Mapping values remain reachable and duplicate/cyclic paths are visited once."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        rows = tmp_path / "rows.txt"
+        rows.write_text("\n".join(f"row-{i}" for i in range(101)) + "\n", encoding="utf-8")
+        inner = _coalesce_node(
+            node_id="inner",
+            on_success="inner_rows",
+            branches={
+                "primary_branch": "actual_source_rows",
+                "duplicate_branch": "actual_source_rows",
+                "cycle_branch": "outer_rows",
+            },
+        )
+        outer = _coalesce_node(
+            node_id="outer",
+            on_success="outer_rows",
+            branches={"nested_branch": "inner_rows"},
+        )
+        state = CompositionState(
+            sources={"rows": _text_source(rows, "actual_source_rows")},
+            nodes=(inner, outer, _fanout_llm_node("outer_rows")),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None, "101 reachable rows must require a guard"
+        risk = guard.risks[0]
+        assert risk.estimated_provider_calls == 101
+        assert risk.upstream_fanout == ("source:rows:text:estimated_rows=101",)
 
     # ── Queue fan-in provider-cost guard (elspeth-6421ffa028) ───────────
     # A declared queue fans multiple upstream sources into one LLM. The
