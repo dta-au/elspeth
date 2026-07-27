@@ -113,6 +113,65 @@ async function isolateAuditReadinessSideRail(
 
 test.describe("composer-guided — source/output live walk", () => {
   test(
+    "current decision settles at the bottom in the regular chat measure",
+    async ({ page }) => {
+      await page.setViewportSize({ width: 1600, height: 600 });
+
+      const storageState = await page.context().storageState();
+      const token = tokenFromStorageState(storageState);
+      const ctx = await authedContext(token);
+
+      let sessionId: string | undefined;
+      try {
+        const session = await createSession(ctx, "playwright-guided-current-decision");
+        sessionId = session.id;
+
+        const composer = new ComposerPage(page);
+        await composer.goto(sessionId);
+        await composer.waitForChatReady();
+        await page.getByRole("button", { name: "Switch to guided" }).click();
+        await expect(page.getByRole("button", { name: "CSV", exact: true })).toBeVisible();
+
+        const geometry = await page
+          .locator(".guided-workspace-scroll")
+          .evaluate((scroll) => {
+            const decision = scroll.querySelector(".guided-current-decision");
+            if (!(decision instanceof HTMLElement)) {
+              throw new Error("Current Decision panel is missing");
+            }
+
+            const scrollRect = scroll.getBoundingClientRect();
+            const decisionRect = decision.getBoundingClientRect();
+            const rootFontSize = Number.parseFloat(
+              getComputedStyle(document.documentElement).fontSize,
+            );
+            return {
+              remainingScroll:
+                scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight,
+              decisionWidth: decisionRect.width,
+              regularChatWidth: 56 * rootFontSize,
+              leftInset: decisionRect.left - scrollRect.left,
+              rightInset: scrollRect.right - decisionRect.right,
+            };
+          });
+
+        expect(geometry.remainingScroll).toBe(0);
+        expect(geometry.decisionWidth).toBeLessThanOrEqual(
+          geometry.regularChatWidth + 1,
+        );
+        expect(Math.abs(geometry.leftInset - geometry.rightInset)).toBeLessThanOrEqual(
+          1,
+        );
+      } finally {
+        if (sessionId !== undefined) {
+          await deleteSession(ctx, sessionId);
+        }
+        await ctx.dispose();
+      }
+    },
+  );
+
+  test(
     "guided demo: CSV source → reviewed JSONL output",
     async ({ page }) => {
       // ── Out-of-band setup ──────────────────────────────────────────────────

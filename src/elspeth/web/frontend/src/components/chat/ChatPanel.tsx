@@ -1679,7 +1679,16 @@ export function ChatPanel({
       block: "nearest",
     });
     const first = guidedLogRef.current.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
-    first?.focus();
+    first?.focus({ preventScroll: true });
+    // scrollIntoView targets the turn log, which ends before the decision
+    // footer. On short viewports that can leave a few pixels of the decision
+    // card below the fold. Preserve the reader-scrolled-up guard, but when the
+    // conversation was already live at the bottom, finish at the actual end
+    // after focus has settled.
+    const container = guidedWorkspaceScrollRef.current;
+    if (container && guidedWorkspaceAtBottomRef.current) {
+      container.scrollTop = container.scrollHeight;
+    }
   }, [guidedNextTurn?.step_index, guidedNextTurn?.type]);
 
   // Present the respond-rejection when it lands. A failed respond (e.g. a

@@ -250,6 +250,16 @@
   margin-inline: var(--space-lg);
 }
 
+/* Current Decision is part of the conversation, so keep it on the same 56rem
+   centred measure as .message-row instead of stretching across the whole
+   workspace column. The explicit narrow-width calculation preserves the
+   ordinary chat gutters before the max-width cap engages. */
+.guided-workspace-scroll > .guided-current-decision {
+  width: calc(100% - var(--space-lg) - var(--space-lg));
+  max-width: 56rem;
+  margin-inline: auto;
+}
+
 /* Narrow screens: single column with the rail collapsed to a compact strip
    ABOVE the conversation (order:-1 — the strip is ambient context the learner
    should pass before the transcript). DOM order stays stream-first, so visual
