@@ -150,7 +150,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "pass",
-        "unknown",
+        "pass",
         "unknown",
         "pass",
         "fail",
@@ -407,8 +407,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "aeaeb4745a85da61e5e440fb90586177a3e28dcd7ef7f77afed09ee95ed97b87"
-EXPECTED_CASE_REGISTRY_SHA256 = "dd180f5e7aa049e278951b0819a208351b94dae3da2fc4f6ea9e58c818e9d112"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "874d42ee550ac125f9e3d5694a96799a7a3d320ca97e44f13fbf4514098e2041"
+EXPECTED_CASE_REGISTRY_SHA256 = "5cd3814aafe7f7a74aef471a94aa62c80da41f1ce831ea986246f706a407a3c4"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -441,6 +441,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "multi-source-queue-fan-in:queued-fan-in": "ccff919ce91062633679fcbe577194b4ce3c852a90c1f8f97622ac371b377c4e",
     "multi-source-queue-fan-in:queued-fan-in-reopen-resume": "ccff919ce91062633679fcbe577194b4ce3c852a90c1f8f97622ac371b377c4e",
     "conditional-routing:two-way-gate": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
+    "conditional-routing:route-reopen-resume": "e8b931a998d752ca7a461abb7b41edeb3f3251542d4349ebc66e9f450c316720",
     "conditional-routing:error-route-and-discard": "27dbf1f2d1908a6f6f3df8166bff152e56977d93ffc4061c91c48871c26a282b",
     "fork-multiple-terminals-partial-failure:one-terminal-fails": "e0505f84e778047f4d68a47e27f442d82824b898cf58fe5cb084842cfbbdb925",
     "fork-coalesce-policies:require-all-union": "aeb887b17d3f6acc17e1fe71e24d1bad8314f6dbe34649e69930d09ff7b31404",
@@ -523,6 +524,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-conditional-routing-error-route-and-discard",
         "conditional-routing:error-route-and-discard",
         ("config", "build", "runtime", "audit"),
+    ),
+    (
+        "harness-conditional-routing-route-reopen-resume",
+        "conditional-routing:route-reopen-resume",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
     (
         "harness-fork-multiple-terminals-partial-failure-one-terminal-fails",
@@ -4789,6 +4795,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
+        ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
@@ -4818,11 +4825,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 103
+    assert len(manifest.evidence) == 104
     assert len(assessment_evidence) == 61
-    assert len(harness_evidence) == 42
-    assert len({reference.id for reference in manifest.evidence}) == 103
-    assert len({reference.locator for reference in manifest.evidence}) == 103
+    assert len(harness_evidence) == 43
+    assert len({reference.id for reference in manifest.evidence}) == 104
+    assert len({reference.locator for reference in manifest.evidence}) == 104
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4843,6 +4850,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
+        ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
@@ -4908,6 +4916,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("conditional-routing", "runtime"),
             ("conditional-routing", "audit"),
         ),
+        "harness-conditional-routing-route-reopen-resume": (("conditional-routing", "recovery"),),
         "harness-fork-multiple-terminals-partial-failure-one-terminal-fails": (
             ("fork-multiple-terminals-partial-failure", "runtime"),
             ("fork-multiple-terminals-partial-failure", "audit"),
@@ -5239,6 +5248,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("multi-source-queue-fan-in", "queued-fan-in-reopen-resume"),
         ("conditional-routing", "two-way-gate"),
         ("conditional-routing", "error-route-and-discard"),
+        ("conditional-routing", "route-reopen-resume"),
         ("fork-multiple-terminals-partial-failure", "one-terminal-fails"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_CASE_IDS),
         ("checkpoint-deterministic-resume", "reopen-resume"),

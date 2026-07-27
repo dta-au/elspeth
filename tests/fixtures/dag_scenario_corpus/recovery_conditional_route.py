@@ -25,7 +25,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from tests.fixtures.dag_scenario_corpus import harness as corpus_harness
-from tests.fixtures.dag_scenario_corpus.loader import load_manifest
+from tests.fixtures.dag_scenario_corpus.loader import iter_harness_cases, load_manifest
 from tests.fixtures.dag_scenario_corpus.schema import (
     HarnessCaseSpec,
     ScenarioRunEvidence,
@@ -77,44 +77,15 @@ class ConditionalRouteRecoveryResult:
 
 
 def _recovery_declaration() -> tuple[ScenarioSpec, HarnessCaseSpec]:
-    scenario = next(item for item in load_manifest().scenarios if item.id == "conditional-routing")
-    case = HarnessCaseSpec.model_validate(
-        {
-            "id": "route-reopen-resume",
-            "workflow": "recovery",
-            "recovery_kind": "sink_boundary",
-            "recovery_fault": {
-                "kind": "sink_effect",
-                "seam": "before_effect",
-                "sink_name": "accepted",
-                "occurrence": 1,
-            },
-            "fixture": "conditional-routing/route-reopen-resume.yaml",
-            "input_fixtures": {"primary": "conditional-routing/input.csv"},
-            "output_artifacts": {
-                "accepted": "accepted.jsonl",
-                "rejected": "rejected.jsonl",
-            },
-            "expected": {
-                "kind": "summary",
-                "status": "completed",
-                "output_rows": 3,
-                "required_audit_record_types": [
-                    "artifact",
-                    "operation",
-                    "routing_event",
-                    "row",
-                    "run",
-                    "scheduler_event",
-                    "sink_effect",
-                    "sink_effect_member",
-                    "token",
-                    "token_outcome",
-                ],
-            },
-        }
+    return next(
+        (scenario, case)
+        for scenario, case in iter_harness_cases(load_manifest())
+        if (scenario.id, case.id)
+        == (
+            "conditional-routing",
+            "route-reopen-resume",
+        )
     )
-    return scenario, case
 
 
 def _token_source_rows(connection: Any, *, run_id: str) -> dict[str, int]:

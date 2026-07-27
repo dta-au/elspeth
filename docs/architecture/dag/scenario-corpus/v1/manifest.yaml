@@ -320,6 +320,11 @@ evidence:
     locator: conditional-routing:error-route-and-discard
     claim: The error-route-and-discard corpus case executes exact gate discard and routed error dispositions, error artifacts, route labels, and durable and portable audit evidence.
     stages: [config, build, runtime, audit]
+  - id: harness-conditional-routing-route-reopen-resume
+    kind: harness
+    locator: conditional-routing:route-reopen-resume
+    claim: A declared accepted-sink BEFORE_EFFECT interruption after source exhaustion preserves exact 2/1 conditional routes, dispositions, scheduler work, and the accepted effect/member identities across a fresh public resume; the same pre-effect commit intent becomes canonical response-lost evidence, accepted and rejected artifacts publish once in declaration order, work and outcomes terminalize, the checkpoint is removed, and durable/export parity holds; this single-process pre-platform evidence is provisional until the deferred-platform rebase.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-fork-multiple-terminals-partial-failure-one-terminal-fails
     kind: harness
     locator: fork-multiple-terminals-partial-failure:one-terminal-fails
@@ -3329,6 +3334,35 @@ scenarios:
             "source_operation_count": 1,
             "status": "completed_with_failures"
           }
+      - id: route-reopen-resume
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: accepted
+          occurrence: 1
+        fixture: conditional-routing/route-reopen-resume.yaml
+        input_fixtures:
+          primary: conditional-routing/input.csv
+        output_artifacts:
+          accepted: accepted.jsonl
+          rejected: rejected.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 3
+          required_audit_record_types:
+            - artifact
+            - operation
+            - routing_event
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_member
+            - token
+            - token_outcome
     dimensions:
       config:
         status: pass
@@ -3357,11 +3391,9 @@ scenarios:
         evidence:
           - harness-conditional-routing-two-way-gate
           - harness-conditional-routing-error-route-and-discard
-      recovery: &recovery_unknown
-        status: unknown
-        reason: No complete database-reopen recovery case exists for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
+      recovery:
+        status: pass
+        evidence: [harness-conditional-routing-route-reopen-resume]
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: *guided_fail
@@ -3395,7 +3427,11 @@ scenarios:
       audit:
         status: pass
         evidence: [harness-fork-multiple-terminals-partial-failure-one-terminal-fails]
-      recovery: *recovery_unknown
+      recovery: &recovery_unknown
+        status: unknown
+        reason: No complete database-reopen recovery case exists for this scenario.
+        owner_issue: elspeth-ef29ef6ba4
+        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: *guided_fail
