@@ -55,6 +55,12 @@ The follower invocation inside `run.sh` is:
 **There is no `--execute` flag on `elspeth join`** — join executes
 unconditionally. Only `elspeth run` takes `--execute`.
 
+The launcher also sources `examples/chaosllm_env.sh`. In a clean checkout it
+generates one process-scoped `ELSPETH_FINGERPRINT_KEY` before starting the
+leader, so the leader and every follower inherit the same audit-fingerprinting
+key. The inline ChaosLLM token is fake and the endpoint is local; no real
+OpenRouter credential or service is used.
+
 ## Join-window timing (design risk)
 
 A follower can only attach while the run is `running`. The poll loop requires

@@ -1,11 +1,10 @@
 # multi_worker_showcase
 
-A 4-worker swarm spectacle demonstrating `elspeth join` at scale — two named
-CSV sources fan in ~200 rows, and four cooperating OS processes (1 epoch-fenced
-leader + 3 claim-only followers) divide the work over a single RUNNING run.
-
-**This is a demo to watch, not a proof.** For the rigorous self-verifying
-check with a PASS/FAIL assertion, see [`examples/multi_worker/`](../multi_worker/).
+A self-verifying 4-worker swarm demonstrating `elspeth join` at scale. Ten
+JSONL batches fan out into 200 durable child work items, and four cooperating
+OS processes (1 epoch-fenced leader + 3 claim-only followers) divide them over
+a single RUNNING run. The launcher fails unless at least two workers actually
+process outcomes.
 
 ---
 
@@ -22,13 +21,16 @@ and are admitted if they present an identical `config_hash` (same `settings.yaml
 ### Pipeline DAG
 
 ```
-feed_a.csv (100 rows) ─┐
-                       ├─> [queue: source_out] ─> (llm: sentiment) ─> output/results.json
-feed_b.csv (100 rows) ─┘                                            └─> output/quarantined.json
+input.jsonl (10 batches × 20 texts)
+  └─> json_explode ─> 200 READY child items ─> (llm: sentiment)
+                                                ├─> output/results.json
+                                                └─> output/quarantined.json
 ```
 
-The explicit `queues: {source_out: {}}` node makes the two-producer fan-in
-legal — without it the DAG validator rejects the pipeline at startup.
+The fan-out is operationally important. Source rows are atomically claimed by
+the leader as they are ingested, so many direct source rows do not form a
+follower-visible READY backlog. `json_explode` creates new durable child work
+items; those committed children are what the followers can claim.
 
 ---
 
@@ -40,30 +42,33 @@ WORKERS=1 ./examples/multi_worker_showcase/run.sh  # smaller swarm for quick dev
 ```
 
 The script:
-1. Starts a ChaosLLM mock server (`--workers 1`) on port 8199.
+1. Generates a process-scoped audit fingerprint key when the operator has not
+   already configured one, then starts ChaosLLM (`--workers 1`) on port 8199.
 2. Backgrounds the **leader** with `elspeth run --settings ... --execute`.
 3. Polls the audit DB (read-only) until the run is `RUNNING` with ≥1 claimed
    work item, then launches `WORKERS` **followers** with
    `elspeth join "$RUN_ID" --settings "$PIPELINE_CONFIG"` (no `--execute` —
    `join` executes unconditionally; `--execute` is only a flag on `elspeth run`).
 4. Tails live `token_work_items` status counts every ~2s while the leader runs.
-5. Reaps all PIDs and renders an ASCII stats card.
+5. Reaps all PIDs, renders an ASCII stats card, and asserts that every process
+   exited cleanly and at least two workers processed outcomes.
 
-Expected output: exit 0 + a stats card showing workers spawned ≈ 4, total
-completed outcomes ≈ 200 (successful plus failed), rows/sec, and per-worker
-attribution.
+Expected output: exit 0, `✓ PASS`, a stats card showing four registered
+workers, 200 completed outcomes (successful plus failed), rows/sec, and
+per-worker attribution. An admitted-but-idle swarm now exits non-zero.
+
+The fake inline token is required by the OpenAI-compatible client but is sent
+only to `127.0.0.1`. No real OpenRouter credential or service is used.
 
 ---
 
 ## Join-Window Timing
 
 The follower can only attach while the run is `RUNNING`. The script polls for
-`RUNNING ∧ ≥1 leased item` before joining, and the 200-row input plus ChaosLLM
-latency (`base_ms: 30`, `jitter_ms: 20`, plus `slow_response_pct: 1.0`) keeps
-the window wide enough that followers consistently join. If the leader drains
-before any follower attaches (rare on typical hardware), the stats card still
-renders but may show fewer than 4 workers — this is the intrinsic fast-drain
-race described in ADR-030 and is non-fatal here (no assertion).
+`RUNNING ∧ ≥1 leased item` before joining. Each `json_explode` batch creates 20
+claimable children and ChaosLLM latency keeps the window wide enough for
+followers to attach and share them. If timing or admission prevents sharing,
+the final assertion reports the worker counts and exits non-zero.
 
 ---
 
@@ -82,7 +87,7 @@ from the 0.6.0 design spec's exit-code list — a spec erratum, intentionally
 retained here.*
 
 The `run.sh` cleanup trap kills any still-running followers and the ChaosLLM
-server on exit, so non-zero follower exits are logged but do not fail the script.
+server on exit. Any non-zero leader or follower exit fails the launcher.
 
 ---
 
@@ -102,15 +107,16 @@ Both files plus the audit DB are git-ignored (`examples/**/output/*` +
   sharing one WAL SQLite audit DB over a single run
 - **`elspeth join`** — follower admission: verifies `config_hash` match,
   requires `status='running'` and live leader heartbeat
-- **Multi-source fan-in via named queue** — explicit `queues:` node is required
-  for two sources publishing to the same connection name
-- **Demonstrative, not self-verifying** — for a rigorous `✓ PASS`/`✗ FAIL`
-  check, use `examples/multi_worker/`
+- **Durable fan-out** — `json_explode` turns leader-preclaimed source batches
+  into follower-claimable READY child items
+- **Self-verifying swarm** — the launcher requires clean child exits and at
+  least two distinct processing owners
 
 ---
 
 ## CI / Dogfood Note
 
-`multi_worker_showcase` is the heaviest example (~200 rows × 4 workers).
+`multi_worker_showcase` is the heaviest multi-worker example (200 outcomes
+across four processes).
 Do not gate dogfood completion on this example. Use `examples/multi_worker/`
 (leader + 1 follower, 120 rows) for bounded smoke testing.

@@ -16,6 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
+source "$PROJECT_ROOT/examples/chaosllm_env.sh"
 
 CHAOS_CONFIG="examples/multi_worker/chaos_config.yaml"
 PIPELINE_CONFIG="examples/multi_worker/settings.yaml"

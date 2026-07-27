@@ -56,6 +56,12 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 These need a ChaosLLM server running. Start it BEFORE the pipeline:
 
 ```bash
+# Local configs contain a fake api_key, which ELSPETH still fingerprints before
+# writing the audit-safe config. This is not a provider credential.
+export ELSPETH_FINGERPRINT_KEY="$(
+  .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
+)"
+
 # Start server (must use --workers=1 due to errorworks bug with multi-worker presets)
 chaosllm serve --port 8199 --preset=realistic --workers=1 &
 sleep 3
@@ -154,14 +160,15 @@ If a pipeline is interrupted, resume with the command shown in the output.
 
 `concurrent_scheduler` is pure-data (no server). `multi_worker` and
 `multi_worker_showcase` start their own ChaosLLM server inside `run.sh` (with
-`--workers 1`) and orchestrate a leader + `elspeth join` follower(s); run them
-via their `run.sh`, not a bare `elspeth run`. (`elspeth join` takes no
-`--execute` flag — only `elspeth run` does.)
+`--workers 1`), establish a process-scoped fingerprint key when needed, and
+orchestrate a leader + `elspeth join` follower(s); run them via their `run.sh`,
+not a bare `elspeth run`. (`elspeth join` takes no `--execute` flag — only
+`elspeth run` does.)
 
 ```bash
 .venv/bin/elspeth run --settings examples/concurrent_scheduler/settings.yaml --execute
 ./examples/multi_worker/run.sh                      # leader + 1 follower (self-verifying)
-WORKERS=3 ./examples/multi_worker_showcase/run.sh   # 1 leader + 3 followers = 4-way (demo only)
+WORKERS=3 ./examples/multi_worker_showcase/run.sh   # 4-way, asserts shared work
 ```
 
 Do not gate dogfood completion on `multi_worker_showcase` (~200 rows × 4
@@ -172,4 +179,4 @@ workers — the heaviest of the three). For a bounded smoke, run `multi_worker`
 |---------|-------------------|-------|
 | `concurrent_scheduler` | 6 (2×3 CSV rows) | Count-6 rendezvous; proves concurrent scheduling; `elspeth run` only |
 | `multi_worker` | ~600 (1 JSONL row → 600 exploded items) | `elspeth join` leader+follower; asserts ≥2 workers shared rows; `WORKERS` env |
-| `multi_worker_showcase` | ~200 (2×100 CSV rows) | 4-worker swarm + stats card; demonstrative only; NOT for dogfood gate |
+| `multi_worker_showcase` | 200 (10×20 exploded items) | 4-worker swarm + stats card; asserts ≥2 workers shared outcomes; NOT for dogfood gate |
