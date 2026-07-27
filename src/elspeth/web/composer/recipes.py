@@ -656,7 +656,6 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
     # Function-level imports keep the recipe builder's dependency boundary
     # narrow and avoid circular imports with the tools plane.
     from elspeth.contracts.composer_interpretation import InterpretationKind
-    from elspeth.web.composer.tools._common import _pending_interpretation_requirement
     from elspeth.web.interpretation_state import (
         INTERPRETATION_REQUIREMENTS_KEY,
         RAW_HTML_CLEANUP_REVIEW_DRAFT,
@@ -665,12 +664,11 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
 
     content_field = "content"
     fingerprint_field = "content_fingerprint"
-    cleanup_requirement = _pending_interpretation_requirement(
-        requirement_id="drop_raw_html_review",
-        kind=InterpretationKind.PIPELINE_DECISION,
-        user_term=RAW_HTML_CLEANUP_USER_TERM,
-        draft=RAW_HTML_CLEANUP_REVIEW_DRAFT,
-    )
+    cleanup_requirement = {
+        "kind": InterpretationKind.PIPELINE_DECISION.value,
+        "user_term": RAW_HTML_CLEANUP_USER_TERM,
+        "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
+    }
     web_scrape_options: dict[str, Any] = {
         "schema": {"mode": "observed"},
         "url_field": "url",

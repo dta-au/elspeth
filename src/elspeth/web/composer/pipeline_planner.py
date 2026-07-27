@@ -914,14 +914,9 @@ async def _build_valid_pipeline_plan(
 ) -> PipelinePlanResult:
     """Validate, settle custody, revalidate, and seal one exact pipeline."""
 
-    # Canonicalise skill-authored short-form node reviews (``{kind, user_term,
-    # draft}``) into the full ``_coerce_requirement`` shape BEFORE the pipeline
-    # is hashed, validated, or sealed into the proposal — the same normalisation
-    # ``build_set_pipeline_candidate`` applies, hoisted here so the value that
-    # becomes ``safe_pipeline`` (and the durable proposal) is canonical too, not
-    # only the transient candidate ``updated_state``.
-    pipeline = canonicalize_authored_node_review_requirements(pipeline)
-
+    # Validate the exact provider-authored payload before adding server-owned
+    # interpretation identity/status. Otherwise a forged canonical-looking row
+    # would be indistinguishable from the trusted canonicalizer's output.
     candidate_context = replace(terminal_context, tool_arguments_hash=stable_hash({"pipeline": pipeline}))
     try:
         candidate = await run_sync(
@@ -942,6 +937,23 @@ async def _build_valid_pipeline_plan(
         ) from exc
     if not candidate.acceptable:
         raise _PipelineCandidateRejected(candidate.result)
+
+    # Seal and hash the canonical server-owned representation only after the
+    # raw authoring boundary accepted the compact review shells.
+    pipeline = canonicalize_authored_node_review_requirements(pipeline, current_state=current_state)
+    candidate_context = replace(
+        terminal_context,
+        tool_arguments_hash=stable_hash({"pipeline": pipeline}),
+        _interpretation_requirements_are_internal=True,
+    )
+    candidate = await run_sync(
+        build_set_pipeline_candidate,
+        pipeline,
+        current_state,
+        candidate_context,
+    )
+    if not candidate.acceptable:
+        raise AuditIntegrityError("canonical interpretation requirements failed candidate revalidation")
     covered_deferred_intent_ids = (
         claim_evaluator(candidate.result.updated_state, claimed_deferred_intent_ids)
         if claimed_deferred_intent_ids and claim_evaluator is not None
@@ -976,7 +988,11 @@ async def _build_valid_pipeline_plan(
             )
         )
         safe_pipeline = cast(dict[str, Any], deep_thaw(preparation.arguments))
-        safe_context = replace(terminal_context, tool_arguments_hash=stable_hash({"pipeline": safe_pipeline}))
+        safe_context = replace(
+            terminal_context,
+            tool_arguments_hash=stable_hash({"pipeline": safe_pipeline}),
+            _interpretation_requirements_are_internal=True,
+        )
         safe_candidate = await run_sync(
             build_set_pipeline_candidate,
             safe_pipeline,

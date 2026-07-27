@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
@@ -157,10 +158,8 @@ def test_exact_authoring_payload_validates_and_omits_server_owned_review_fields(
     assert "resolved_prompt_template_hash" not in options
     shell = options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert shell == {
-        "id": "model_choice_review:model",
         "kind": InterpretationKind.LLM_MODEL_CHOICE.value,
         "user_term": "llm_model_choice:model",
-        "status": "pending",
         "draft": model,
     }
 
@@ -410,7 +409,7 @@ def test_exact_payload_round_trips_through_real_set_pipeline_with_authoritative_
     previous = _state(nodes=(replace(node, options={**options, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}),))
     exact = _exact_arguments(previous)
 
-    result = _execute_set_pipeline(exact.data, previous, _trained_context())
+    result = _execute_set_pipeline(deep_thaw(exact.data), previous, _trained_context())
 
     assert result.success, result.data
     carried = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
@@ -864,7 +863,7 @@ def test_unknown_pipeline_decision_user_term_fails_closed() -> None:
     with pytest.raises(ValueError, match="not a registered decision kind"):
         reconcile_authoritative_reviews(previous, proposed)
 
-    result = _execute_set_pipeline(_exact_arguments(previous).data, previous, _trained_context())
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(previous).data), previous, _trained_context())
     assert not result.success
     assert result.updated_state is previous
     assert result.updated_state.version == previous.version

@@ -1170,6 +1170,96 @@ async def test_prepare_pipeline_commit_revalidates_and_audits_exact_arguments_wi
 
 
 @pytest.mark.asyncio
+async def test_prepare_pipeline_commit_accepts_server_canonical_review_rows_in_preflight_and_audited_execution(
+    service: SessionServiceImpl,
+    tmp_path,
+) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    pipeline = _runnable_pipeline(tmp_path, session_id)
+    pipeline["source"]["options"]["interpretation_requirements"] = [
+        {
+            "id": "trusted-source-review",
+            "kind": "invented_source",
+            "user_term": "inline_source_data",
+            "status": "pending",
+            "draft": "Review the generated source rows.",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        }
+    ]
+    plan = PipelinePlanResult(
+        proposal=PipelineProposal.create(
+            pipeline=pipeline,
+            base=AbsentBase(),
+            reviewed_facts={},
+            surface=PlannerSurface.FREEFORM,
+            repair_count=0,
+            skill_hash=stable_hash("skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+        tool_call_id="planner-terminal-call",
+        custody_result="not_required",
+        model_identifier="planner-model",
+        model_version="planner-model-v1",
+        provider="test",
+    )
+    row = await service.create_pipeline_composition_proposal(
+        session_id=session_id,
+        plan=plan,
+        summary="Replace the pipeline.",
+        rationale="Requested by the operator.",
+        affects=("graph", "validation"),
+        arguments_redacted_json=_redacted_pipeline(pipeline),
+        actor="composer-web:user:alice",
+        composer_model_identifier="planner-model",
+        composer_model_version="planner-model-v1",
+        composer_provider="provider",
+    )
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    recorder = BufferingRecorder()
+    current = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+    prepared = await prepare_pipeline_proposal_commit(
+        authority=authority,
+        reviewed_facts={},
+        current_state=current,
+        current_state_id=None,
+        policy_catalog=policy,
+        plugin_snapshot=snapshot,
+        config=PipelineCommitConfig(
+            data_dir=str(tmp_path),
+            session_engine=service._engine,
+            secret_service=None,
+            user_id="alice",
+            user_message_content=None,
+            max_blob_storage_per_session_bytes=1_000_000,
+            runtime_preflight=None,
+            timeout_seconds=5.0,
+        ),
+        recorder=recorder,
+        actor="user:alice",
+        settlement_surface="generic",
+    )
+
+    requirement = prepared.result.updated_state.sources["source"].options["interpretation_requirements"][0]
+    assert requirement["id"] == "trusted-source-review"
+    assert requirement["status"] == "pending"
+    assert prepared.candidate_content_hash == prepared.executor_content_hash
+    assert len(recorder.invocations) == 1
+
+
+@pytest.mark.asyncio
 async def test_prepare_pipeline_commit_runs_blocking_policy_validation_off_event_loop(
     service: SessionServiceImpl,
     tmp_path,

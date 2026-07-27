@@ -532,10 +532,13 @@ def _pending_interpretation_review_repair_message(
         "draft as llm_draft. For llm_prompt_template, llm_draft must equal the current "
         "options.prompt_template. For invented_source, llm_draft must equal the "
         "source requirement draft. For pipeline_decision, llm_draft must equal "
-        "the target node's requirement draft. If a pipeline_decision site has no "
+        "the target node's requirement draft. When patching interpretation_requirements, "
+        "author exactly the public shell fields kind, user_term, and draft; never "
+        "author id, status, or resolver-owned evidence fields. If a pipeline_decision site has no "
         f"matching requirement and user_term is {RAW_HTML_CLEANUP_USER_TERM!r}, patch "
         "the target field_mapper node first with an interpretation_requirements "
-        "entry whose kind is 'pipeline_decision', status is 'pending', and draft is "
+        "entry whose kind is 'pipeline_decision', user_term is "
+        f"{RAW_HTML_CLEANUP_USER_TERM!r}, and draft is "
         f"{RAW_HTML_CLEANUP_REVIEW_DRAFT!r}. "
         # B-vs-C is resolved deterministically at the wire-stage route
         # (azure_prompt_shield_available; see routes/composer/guided.py). The repair
@@ -545,7 +548,7 @@ def _pending_interpretation_review_repair_message(
         # State B where the secret is reachable.
         f"If user_term is {PROMPT_SHIELD_USER_TERM!r}, patch the target LLM node first "
         "with an interpretation_requirements entry whose kind is 'pipeline_decision', "
-        f"status is 'pending', and draft is {PROMPT_SHIELD_WARNING_DRAFT!r}; if the "
+        f"user_term is {PROMPT_SHIELD_USER_TERM!r}, and draft is {PROMPT_SHIELD_WARNING_DRAFT!r}; if the "
         "workflow cannot add the shield, keep going with the warning instead of blocking. "
         f"This is forced repair turn {next_turn} of {_MAX_REPAIR_TURNS}."
     )

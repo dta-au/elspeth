@@ -866,10 +866,8 @@ class TestPromoteSetPipelineArgErrorRouting:
     def test_set_pipeline_rejects_raw_cleanup_review_on_llm_node(self) -> None:
         """A raw-cleanup review must be attached to the field_mapper doing the cleanup."""
         cleanup_requirement = {
-            "id": "drop_raw_html_review",
             "kind": "pipeline_decision",
             "user_term": "drop_raw_html_fields",
-            "status": "pending",
             "draft": "Drop the scraped raw HTML and fingerprint fields before saving the JSON output.",
         }
         args = {
@@ -1009,15 +1007,9 @@ class TestPromoteSetPipelineArgErrorRouting:
                     "schema": {"mode": "observed"},
                     INTERPRETATION_REQUIREMENTS_KEY: [
                         {
-                            "id": "source_review",
                             "kind": "invented_source",
                             "user_term": "inline_source_url_list",
-                            "status": "pending",
                             "draft": "url\nhttps://example.test\n",
-                            "event_id": None,
-                            "accepted_value": None,
-                            "accepted_artifact_hash": None,
-                            "resolved_prompt_template_hash": None,
                         }
                     ],
                 },

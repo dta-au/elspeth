@@ -50,13 +50,33 @@ from elspeth.web.composer.pipeline_planner import (
     plan_pipeline,
     planner_tool_definitions,
 )
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+from elspeth.web.composer.pipeline_proposal import (
+    AbsentBase,
+    PipelineProposal,
+    PlannerSurface,
+    pipeline_draft_hash,
+)
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
 from elspeth.web.composer.prompts import build_system_prompt
-from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
+from elspeth.web.composer.state import (
+    CompositionState,
+    NodeSpec,
+    OutputSpec,
+    PipelineMetadata,
+    SourceSpec,
+    ValidationEntry,
+    ValidationSummary,
+)
 from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
+from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    RAW_HTML_CLEANUP_REVIEW_DRAFT,
+    RAW_HTML_CLEANUP_USER_TERM,
+    pipeline_decision_artifact_hash,
+)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
@@ -577,6 +597,298 @@ async def test_authored_short_form_node_review_is_canonicalized_into_the_sealed_
     shield = next(item for item in requirements if item["user_term"] == "prompt_injection_shield_recommendation")
     assert shield["id"] == "prompt_injection_shield_recommendation:summarise"
     assert shield["status"] == "pending"
+
+
+def test_state_aware_canonicalization_uses_trusted_existing_source_and_node_ids() -> None:
+    source_requirement = {
+        "id": "trusted-source-custom-id",
+        "kind": "invented_source",
+        "user_term": "inline_source_data",
+        "status": "resolved",
+        "draft": "name,score\nada,42\n",
+        "event_id": "source-event",
+        "accepted_value": "approved",
+        "accepted_artifact_hash": "a" * 64,
+        "resolved_prompt_template_hash": None,
+    }
+    node_requirement = {
+        "id": "trusted-node-custom-id",
+        "kind": "pipeline_decision",
+        "user_term": RAW_HTML_CLEANUP_USER_TERM,
+        "status": "resolved",
+        "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
+        "event_id": "node-event",
+        "accepted_value": "approved",
+        "accepted_artifact_hash": "b" * 64,
+        "resolved_prompt_template_hash": None,
+    }
+    current = CompositionState(
+        sources={
+            "orders": SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [source_requirement],
+                },
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="cleanup",
+                node_type="transform",
+                plugin="field_mapper",
+                input="rows",
+                on_success="clean",
+                on_error="discard",
+                options={
+                    "schema": {"mode": "observed"},
+                    "mapping": {"name": "name"},
+                    "select_only": True,
+                    INTERPRETATION_REQUIREMENTS_KEY: [node_requirement],
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=4,
+    )
+    pipeline = {
+        "sources": {
+            "orders": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": "invented_source",
+                            "user_term": "inline_source_data",
+                            "draft": "name,score\nada,42\n",
+                        }
+                    ],
+                },
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "cleanup",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "rows",
+                "on_success": "clean",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "mapping": {"name": "name"},
+                    "select_only": True,
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": "pipeline_decision",
+                            "user_term": RAW_HTML_CLEANUP_USER_TERM,
+                            "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
+                        }
+                    ],
+                },
+            }
+        ],
+        "edges": [],
+        "outputs": [],
+    }
+
+    canonical = canonicalize_authored_node_review_requirements(pipeline, current_state=current)
+
+    source = canonical["sources"]["orders"]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
+    node = canonical["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert source == {
+        "kind": "invented_source",
+        "user_term": "inline_source_data",
+        "draft": "name,score\nada,42\n",
+        "id": "trusted-source-custom-id",
+        "status": "pending",
+        "event_id": None,
+        "accepted_value": None,
+        "accepted_artifact_hash": None,
+        "resolved_prompt_template_hash": None,
+    }
+    assert node == {
+        "kind": "pipeline_decision",
+        "user_term": RAW_HTML_CLEANUP_USER_TERM,
+        "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
+        "id": "trusted-node-custom-id",
+        "status": "pending",
+        "event_id": None,
+        "accepted_value": None,
+        "accepted_artifact_hash": None,
+        "resolved_prompt_template_hash": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_plan_preserves_custom_review_identity_through_internal_reconciliation_and_draft_hash(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    source_options = {
+        "path": str(tmp_path / "blobs" / _TEST_SESSION_ID / "input.csv"),
+        "schema": {"mode": "observed"},
+    }
+    node_options = {
+        "schema": {"mode": "observed"},
+        "mapping": {"name": "name"},
+        "select_only": True,
+    }
+    node = NodeSpec(
+        id="cleanup",
+        node_type="transform",
+        plugin="field_mapper",
+        input="rows",
+        on_success="clean",
+        on_error="discard",
+        options=node_options,
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    resolved = {
+        "id": "trusted-node-custom-id",
+        "kind": "pipeline_decision",
+        "user_term": RAW_HTML_CLEANUP_USER_TERM,
+        "status": "resolved",
+        "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
+        "event_id": "node-event",
+        "accepted_value": "approved",
+        "accepted_artifact_hash": pipeline_decision_artifact_hash(
+            node,
+            (node,),
+            user_term=RAW_HTML_CLEANUP_USER_TERM,
+        ),
+        "resolved_prompt_template_hash": None,
+    }
+    current = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options=source_options,
+            on_validation_failure="discard",
+        ),
+        nodes=(replace(node, options={**node_options, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}),),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="clean",
+                plugin="json",
+                options={
+                    "path": "outputs/result.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=7,
+    )
+    pipeline = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": source_options,
+            "on_validation_failure": "discard",
+        },
+        "nodes": [
+            {
+                "id": "cleanup",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "rows",
+                "on_success": "clean",
+                "on_error": "discard",
+                "options": {
+                    **node_options,
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": "pipeline_decision",
+                            "user_term": RAW_HTML_CLEANUP_USER_TERM,
+                            "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
+                        }
+                    ],
+                },
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "clean",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/result.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+    }
+    observed_statuses: list[str] = []
+    claim_id = "00000000-0000-4000-8000-000000000413"
+
+    def evaluate(candidate_state: CompositionState, claimed_ids: tuple[str, ...]) -> tuple[str, ...]:
+        requirement = candidate_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+        observed_statuses.append(requirement["status"])
+        return claimed_ids
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=_ScriptedCompletion(
+            _response(
+                (
+                    "emit_pipeline_proposal",
+                    {
+                        "pipeline": pipeline,
+                        "claimed_deferred_intent_ids": [claim_id],
+                    },
+                )
+            )
+        ),
+        current_state=current,
+        eligible_deferred_intent_ids=(claim_id,),
+        claim_evaluator=evaluate,
+        surface=PlannerSurface.GUIDED_STAGED,
+    )
+
+    sealed = deep_thaw(proposal.proposal.pipeline)
+    requirement = sealed["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert requirement["id"] == "trusted-node-custom-id"
+    assert requirement["status"] == "pending"
+    assert observed_statuses == ["resolved"]
+    assert proposal.proposal.draft_hash == pipeline_draft_hash(
+        pipeline=sealed,
+        base=proposal.proposal.base,
+        reviewed_anchor_hash=proposal.proposal.reviewed_anchor_hash,
+        surface=proposal.proposal.surface,
+        repair_count=proposal.proposal.repair_count,
+        skill_hash=proposal.proposal.skill_hash,
+        covered_deferred_intent_ids=proposal.proposal.covered_deferred_intent_ids,
+        supersedes_draft_hash=proposal.proposal.supersedes_draft_hash,
+    )
 
 
 @pytest.mark.asyncio

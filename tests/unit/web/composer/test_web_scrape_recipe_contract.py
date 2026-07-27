@@ -24,6 +24,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     RAW_HTML_CLEANUP_USER_TERM,
@@ -62,7 +63,7 @@ def _node_from_args(node_args: dict[str, Any]) -> NodeSpec:
 def _state_from_recipe() -> CompositionState:
     # apply_recipe runs validate_slots, which injects the rating_template /
     # output_path defaults the builder reads.
-    args = apply_recipe("web-scrape-llm-rate-jsonl", _SLOTS)
+    args = canonicalize_authored_node_review_requirements(apply_recipe("web-scrape-llm-rate-jsonl", _SLOTS))
     src = args["source"]
     source = SourceSpec(
         plugin=src["plugin"],

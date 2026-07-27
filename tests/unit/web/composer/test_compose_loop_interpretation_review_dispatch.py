@@ -1683,6 +1683,8 @@ def test_pending_interpretation_repair_message_requires_one_call_per_site() -> N
 
     assert "one request_interpretation_review tool call per listed handoff" in message
     assert "in this same assistant turn before stopping" in message
+    assert "author exactly the public shell fields kind, user_term, and draft" in message
+    assert "status is 'pending'" not in message
 
 
 @pytest.mark.asyncio

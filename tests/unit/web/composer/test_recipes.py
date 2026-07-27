@@ -770,9 +770,11 @@ class TestWebScrapeRecipeBuild:
         fm = next(n for n in args["nodes"] if n["plugin"] == "field_mapper")
         reqs = fm["options"][INTERPRETATION_REQUIREMENTS_KEY]
         decision = next(r for r in reqs if r["kind"] == "pipeline_decision")
-        assert decision["user_term"] == RAW_HTML_CLEANUP_USER_TERM
-        assert decision["draft"] == RAW_HTML_CLEANUP_REVIEW_DRAFT
-        assert decision["status"] == "pending"
+        assert decision == {
+            "kind": "pipeline_decision",
+            "user_term": RAW_HTML_CLEANUP_USER_TERM,
+            "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
+        }
 
     def test_web_scrape_node_declares_content_and_fingerprint_fields(self) -> None:
         """web_scrape must name content_field/fingerprint_field so

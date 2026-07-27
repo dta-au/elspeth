@@ -19,6 +19,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
@@ -56,12 +57,16 @@ from elspeth.web.composer.tools._common import (
     ReviewedSourceAuthority,
     ToolContext,
     ToolResult,
+    _canonical_interpretation_requirement_error,
+    _canonicalize_authored_interpretation_requirements,
+    _composition_canonical_interpretation_requirement_error,
     _credential_wiring_contract_failure,
     _discovery_result,
     _failure_result,
     _graph_repair_suggestions,
     _missing_output_options_repair_error,
     _mutation_result,
+    _normalize_trusted_legacy_interpretation_requirements,
     _options_with_default_llm_reviews,
     _plugin_policy_failure,
     _prevalidate_sink,
@@ -201,17 +206,24 @@ def _validate_source_artifact_review_content(value: str) -> None:
 def _options_with_inline_blob_source_review(
     options: Mapping[str, Any],
     prepared_blob: _PreparedBlobCreate,
+    *,
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Ensure LLM-authored inline source blobs carry a Class 2 review gate."""
     return _options_with_source_blob_review(
         options,
         mime_type=prepared_blob.mime_type,
         content=prepared_blob.content_bytes.decode("utf-8"),
+        existing_options=existing_options,
     )
 
 
-def canonicalize_authored_node_review_requirements(pipeline: Mapping[str, Any]) -> dict[str, JsonValue]:
-    """Fill the two server-owned interpretation-review fields the skill omits.
+def canonicalize_authored_node_review_requirements(
+    pipeline: Mapping[str, Any],
+    *,
+    current_state: CompositionState | None = None,
+) -> dict[str, JsonValue]:
+    """Fill the server-owned pending identity/status fields the skill omits.
 
     The composer skill instructs the planner to stage a ``pipeline_decision``
     review as ``{kind, user_term, draft}`` — the raw-HTML-cleanup guidance in
@@ -239,6 +251,7 @@ def canonicalize_authored_node_review_requirements(pipeline: Mapping[str, Any]) 
     its unaffected nodes are never mutated. Idempotent: a row that already
     carries ``id`` and ``status`` is left untouched.
     """
+    current_nodes = {node.id: node for node in current_state.nodes} if current_state is not None else {}
     nodes = pipeline["nodes"] if "nodes" in pipeline else None
     if not isinstance(nodes, (list, tuple)):
         return cast(dict[str, JsonValue], dict(pipeline))
@@ -258,32 +271,68 @@ def canonicalize_authored_node_review_requirements(pipeline: Mapping[str, Any]) 
             new_nodes.append(node)
             continue
         node_id = node["id"] if "id" in node else None
-        new_requirements: list[Any] = []
-        requirements_changed = False
-        for requirement in requirements:
-            if not isinstance(requirement, Mapping) or ("id" in requirement and "status" in requirement):
-                new_requirements.append(requirement)
-                continue
-            canonical = dict(requirement)
-            user_term = canonical.get("user_term")
-            if "id" not in canonical and isinstance(user_term, str) and user_term.strip() and isinstance(node_id, str) and node_id.strip():
-                canonical["id"] = f"{user_term}:{node_id}"
-            if "status" not in canonical:
-                canonical["status"] = "pending"
-            new_requirements.append(canonical)
-            requirements_changed = True
-        if not requirements_changed:
+        if not isinstance(node_id, str) or not node_id.strip():
             new_nodes.append(node)
             continue
-        new_options = dict(cast(Mapping[str, Any], options))
-        new_options[INTERPRETATION_REQUIREMENTS_KEY] = new_requirements
+        canonical_options = _canonicalize_authored_interpretation_requirements(
+            cast(Mapping[str, Any], options),
+            component_id=node_id,
+            existing_options=current_nodes[node_id].options if node_id in current_nodes else None,
+        )
+        if canonical_options is options:
+            new_nodes.append(node)
+            continue
         new_node = dict(node)
-        new_node["options"] = new_options
+        new_node["options"] = canonical_options
         new_nodes.append(new_node)
         nodes_changed = True
     normalized = dict(pipeline)
     if nodes_changed:
         normalized["nodes"] = new_nodes
+
+    def _canonicalize_source_block(source_block: Any, *, source_name: str) -> Any:
+        if not isinstance(source_block, Mapping):
+            return source_block
+        options = source_block["options"] if "options" in source_block else None
+        if not isinstance(options, Mapping):
+            return source_block
+        admission_error = _resolver_owned_interpretation_requirement_error(
+            options,
+            tool_name="set_pipeline",
+            component_id=_source_component_id(source_name),
+            source=True,
+        )
+        if admission_error is not None:
+            # Reviewed source authority may intentionally carry canonical
+            # resolver output. The raw candidate boundary decides whether that
+            # authority is trusted; never rewrite it here.
+            return source_block
+        canonical_options = _canonicalize_authored_interpretation_requirements(
+            options,
+            component_id=_source_component_id(source_name),
+            source=True,
+            existing_options=(
+                current_state.sources[source_name].options if current_state is not None and source_name in current_state.sources else None
+            ),
+        )
+        if canonical_options is options:
+            return source_block
+        canonical_source = dict(source_block)
+        canonical_source["options"] = canonical_options
+        return canonical_source
+
+    if "source" in normalized:
+        canonical_source = _canonicalize_source_block(normalized["source"], source_name="source")
+        if canonical_source is not normalized["source"]:
+            normalized["source"] = canonical_source
+    sources = normalized["sources"] if "sources" in normalized else None
+    if isinstance(sources, Mapping):
+        canonical_sources = {
+            source_name: _canonicalize_source_block(source_block, source_name=str(source_name))
+            for source_name, source_block in sources.items()
+        }
+        if any(canonical_sources[name] is not sources[name] for name in sources):
+            normalized["sources"] = canonical_sources
     return cast(dict[str, JsonValue], normalized)
 
 
@@ -386,12 +435,13 @@ def build_set_pipeline_candidate(
     (type vs semantic) — same pattern as
     :class:`SetSourceArgumentsModel` plugin-not-in-catalog handling.
     """
-    args = canonicalize_authored_node_review_requirements(arguments)
+    args = dict(arguments)
     catalog = context.catalog
     data_dir = context.data_dir
     session_engine = context.session_engine
     session_id = context.session_id
     user_message_id = context.user_message_id
+    interpretation_requirements_are_internal = context._interpretation_requirements_are_internal
     prepared_inline_blob: _PreparedBlobCreate | None = None
 
     def _candidate(result: ToolResult) -> SetPipelineCandidate:
@@ -414,25 +464,25 @@ def build_set_pipeline_candidate(
     ) -> SetPipelineCandidate:
         return _candidate(_tool_plugin_policy_failure(rejected_state, violation, component=component))
 
-    def _matches_reviewed_source(
+    def _reviewed_source_options(
         *,
         source_name: str,
         plugin: str,
         options: Mapping[str, Any],
         on_validation_failure: str,
-    ) -> bool:
+    ) -> Mapping[str, Any] | None:
         authority = context.reviewed_source_authority
         if (
             type(authority) is not ReviewedSourceAuthority
             or type(context.session_id) is not str
             or authority.session_id != context.session_id
         ):
-            return False
+            return None
         matches = [
             value for value in authority.reviewed_sources.values() if isinstance(value, Mapping) and value.get("name") == source_name
         ]
         if len(matches) != 1:
-            return False
+            return None
         reviewed = matches[0]
         if set(reviewed) != {
             "name",
@@ -442,7 +492,7 @@ def build_set_pipeline_candidate(
             "sample_rows",
             "on_validation_failure",
         }:
-            return False
+            return None
         reviewed_binding = {
             "name": reviewed["name"],
             "plugin": reviewed["plugin"],
@@ -456,12 +506,15 @@ def build_set_pipeline_candidate(
             "on_validation_failure": on_validation_failure,
         }
         if stable_hash(reviewed_binding) != stable_hash(candidate_binding):
-            return False
-        return all(
+            return None
+        if not all(
             value in authority.verified_blob_paths
             for name, value in options.items()
             if name in {"path", "file"} and type(value) is str and value.startswith("blob:")
-        )
+        ):
+            return None
+        reviewed_options = reviewed["options"]
+        return reviewed_options if isinstance(reviewed_options, Mapping) else None
 
     try:
         validated = SetPipelineArgumentsModel.model_validate(args)
@@ -494,19 +547,62 @@ def build_set_pipeline_candidate(
             src_plugin = source_model.plugin
             src_options = dict(source_model.options)
             src_on_vf = source_model.on_validation_failure or _DEFAULT_SOURCE_VALIDATION_FAILURE
-            reviewed_source = _matches_reviewed_source(
+            reviewed_options = _reviewed_source_options(
                 source_name=source_name,
                 plugin=src_plugin,
                 options=src_options,
                 on_validation_failure=src_on_vf,
             )
+            reviewed_source = reviewed_options is not None
             if reviewed_source:
                 authority = context.reviewed_source_authority
                 assert type(authority) is ReviewedSourceAuthority
+                # Rehydrate the hash-matched trusted binding. Provider-echoed
+                # canonical review rows are evidence for the match only, never
+                # the persisted authority.
+                assert reviewed_options is not None
+                src_options = cast(dict[str, Any], deep_thaw(reviewed_options))
                 for option_name in ("path", "file"):
                     option_value = src_options[option_name] if option_name in src_options else None
                     if type(option_value) is str and option_value.startswith("blob:"):
                         src_options[option_name] = authority.verified_blob_paths[option_value]
+            review_metadata_error = (
+                None
+                if reviewed_source or interpretation_requirements_are_internal
+                else _resolver_owned_interpretation_requirement_error(
+                    src_options,
+                    tool_name="set_pipeline",
+                    component_id=_source_component_id(source_name),
+                    source=True,
+                )
+            )
+            if review_metadata_error is not None:
+                return _failure_result(state, f"Source '{source_name}': {review_metadata_error}")
+            if not reviewed_source and not interpretation_requirements_are_internal:
+                src_options = dict(
+                    _canonicalize_authored_interpretation_requirements(
+                        src_options,
+                        component_id=_source_component_id(source_name),
+                        source=True,
+                        existing_options=state.sources[source_name].options if source_name in state.sources else None,
+                    )
+                )
+            else:
+                src_options = dict(
+                    _normalize_trusted_legacy_interpretation_requirements(
+                        src_options,
+                    )
+                )
+            canonical_error = _canonical_interpretation_requirement_error(
+                src_options,
+                tool_name="set_pipeline",
+            )
+            if canonical_error is not None:
+                return _failure_result(
+                    state,
+                    f"Source '{source_name}': {canonical_error}",
+                    error_code="interpretation_requirements_invalid",
+                )
             endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(src_plugin, src_options)
             if endpoint_policy_error is not None:
                 return _failure_result(state, endpoint_policy_error)
@@ -519,11 +615,6 @@ def build_set_pipeline_candidate(
             manual_authoring_error = None if reviewed_source else _reject_manual_source_authoring(src_options, tool_name="set_pipeline")
             if manual_authoring_error is not None:
                 return _failure_result(state, f"Source '{source_name}': {manual_authoring_error}")
-            review_metadata_error = (
-                None if reviewed_source else _resolver_owned_interpretation_requirement_error(src_options, tool_name="set_pipeline")
-            )
-            if review_metadata_error is not None:
-                return _failure_result(state, f"Source '{source_name}': {review_metadata_error}")
             credential_error = _credential_wiring_contract_failure(
                 state,
                 component_id=_source_component_id(source_name),
@@ -552,12 +643,6 @@ def build_set_pipeline_candidate(
             raise AssertionError("validated.source unexpectedly None after source/sources gate")
         src_plugin = legacy_source_model.plugin
         legacy_src_options: Mapping[str, Any] = dict(legacy_source_model.options)
-        endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(src_plugin, legacy_src_options)
-        if endpoint_policy_error is not None:
-            return _failure_result(state, endpoint_policy_error)
-        plugin_error = _validate_plugin_name(context, "source", src_plugin)
-        if plugin_error is not None:
-            return _plugin_policy_failure(state, plugin_error)
 
         # Inline user-provided source data can be materialised as a blob inside
         # this same atomic pipeline mutation. The generated path/blob_ref are
@@ -574,19 +659,29 @@ def build_set_pipeline_candidate(
         manual_authoring_error = _reject_manual_source_authoring(legacy_src_options, tool_name="set_pipeline")
         if manual_authoring_error is not None:
             return _failure_result(state, manual_authoring_error)
-        review_metadata_error = _resolver_owned_interpretation_requirement_error(legacy_src_options, tool_name="set_pipeline")
+        review_metadata_error = (
+            None
+            if interpretation_requirements_are_internal
+            else _resolver_owned_interpretation_requirement_error(
+                legacy_src_options,
+                tool_name="set_pipeline",
+                component_id="source",
+                source=True,
+            )
+        )
         if review_metadata_error is not None:
             return _failure_result(state, review_metadata_error)
-        credential_error = _credential_wiring_contract_failure(
-            state,
-            component_id="source",
-            component_type="source",
-            plugin_type="source",
-            plugin_name=src_plugin,
-            options=legacy_src_options,
-        )
-        if credential_error is not None:
-            return _candidate(credential_error)
+        if not interpretation_requirements_are_internal:
+            legacy_src_options = _canonicalize_authored_interpretation_requirements(
+                legacy_src_options,
+                component_id="source",
+                source=True,
+                existing_options=state.sources["source"].options if "source" in state.sources else None,
+            )
+        else:
+            legacy_src_options = _normalize_trusted_legacy_interpretation_requirements(
+                legacy_src_options,
+            )
         source_blob_id = legacy_source_model.blob_id
         inline_blob = legacy_source_model.inline_blob
         src_on_vf = legacy_source_model.on_validation_failure or _DEFAULT_SOURCE_VALIDATION_FAILURE
@@ -604,6 +699,7 @@ def build_set_pipeline_candidate(
                 session_engine=session_engine,
                 session_id=session_id,
                 tool_name="set_pipeline",
+                existing_options=state.sources["source"].options if "source" in state.sources else None,
             )
             if isinstance(resolved, ToolResult):
                 return _candidate(resolved)
@@ -668,11 +764,38 @@ def build_set_pipeline_candidate(
                 "blob_ref": prepared_inline_blob.blob_id,
                 **_source_authoring_options(prepared_inline_blob.creation_modality, prepared_inline_blob.content_hash),
             }
-            legacy_src_options = _options_with_inline_blob_source_review(legacy_src_options, prepared_inline_blob)
+            legacy_src_options = _options_with_inline_blob_source_review(
+                legacy_src_options,
+                prepared_inline_blob,
+                existing_options=state.sources["source"].options if "source" in state.sources else None,
+            )
 
+        canonical_error = _canonical_interpretation_requirement_error(
+            legacy_src_options,
+            tool_name="set_pipeline",
+        )
+        if canonical_error is not None:
+            return _failure_result(
+                state,
+                canonical_error,
+                error_code="interpretation_requirements_invalid",
+            )
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(src_plugin, legacy_src_options)
         if endpoint_policy_error is not None:
             return _failure_result(state, endpoint_policy_error)
+        plugin_error = _validate_plugin_name(context, "source", src_plugin)
+        if plugin_error is not None:
+            return _plugin_policy_failure(state, plugin_error)
+        credential_error = _credential_wiring_contract_failure(
+            state,
+            component_id="source",
+            component_type="source",
+            plugin_type="source",
+            plugin_name=src_plugin,
+            options=legacy_src_options,
+        )
+        if credential_error is not None:
+            return _candidate(credential_error)
 
         path_error = _validate_source_path(legacy_src_options, data_dir, session_id=session_id)
         if path_error is not None:
@@ -693,24 +816,63 @@ def build_set_pipeline_candidate(
         )
 
     # 2. Validate node plugins and options
-    for node in validated.nodes:
+    canonical_node_options: dict[int, Mapping[str, Any]] = {}
+    current_nodes = {node.id: node for node in state.nodes}
+    for node_index, node in enumerate(validated.nodes):
         node_id = node.id
         node_type = node.node_type
         node_plugin = node.plugin
-        node_options = node.options
+        node_options: Mapping[str, Any] = node.options
         runtime_owned_error = _runtime_owned_llm_option_error(
             node_plugin,
             node_options,
             tool_name="set_pipeline",
+            interpretation_requirements_are_internal=interpretation_requirements_are_internal,
+            component_id=node_id,
         )
         if runtime_owned_error is not None:
-            return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
+            error_code = (
+                "interpretation_requirements_invalid"
+                if f"options.{INTERPRETATION_REQUIREMENTS_KEY} must be a list of review entry objects" in runtime_owned_error
+                else None
+            )
+            return _failure_result(
+                state,
+                f"Node '{node_id}': {runtime_owned_error}",
+                error_code=error_code,
+            )
+        if not interpretation_requirements_are_internal:
+            node_options = _canonicalize_authored_interpretation_requirements(
+                node_options,
+                component_id=node_id,
+                existing_options=current_nodes[node_id].options if node_id in current_nodes else None,
+            )
+        else:
+            node_options = _normalize_trusted_legacy_interpretation_requirements(
+                node_options,
+            )
+        review_options = _options_with_default_llm_reviews(
+            node_id=node_id,
+            plugin=node_plugin,
+            options=node_options,
+            existing_options=current_nodes[node_id].options if node_id in current_nodes else None,
+        )
+        canonical_error = _canonical_interpretation_requirement_error(
+            review_options,
+            tool_name="set_pipeline",
+        )
+        if canonical_error is not None:
+            return _failure_result(
+                state,
+                f"Node '{node_id}': {canonical_error}",
+                error_code="interpretation_requirements_invalid",
+            )
         # A review row the canonicalizer could not complete (no usable
         # user_term → no synthesizable id) would otherwise escape
         # CompositionState.validate's unguarded prompt-shield walk as a raw
         # KeyError('id') — reject it here as a planner-repairable failure
         # with a closed, explainable error_code instead.
-        review_parse_error = authored_node_interpretation_requirement_parse_error(node_id, node_options)
+        review_parse_error = authored_node_interpretation_requirement_parse_error(node_id, review_options)
         if review_parse_error is not None:
             return _failure_result(state, review_parse_error, error_code="interpretation_requirements_invalid")
         credential_error = _credential_wiring_contract_failure(
@@ -719,7 +881,7 @@ def build_set_pipeline_candidate(
             component_type="node",
             plugin_type="transform" if node_plugin is not None else None,
             plugin_name=node_plugin,
-            options=node_options,
+            options=review_options,
         )
         if credential_error is not None:
             return _candidate(credential_error)
@@ -730,15 +892,10 @@ def build_set_pipeline_candidate(
             batch_placement_error = _batch_aware_placement_error(node_id, node_type, node_plugin, node.output_mode)
             if batch_placement_error is not None:
                 return _failure_result(state, f"Node '{node_id}': {batch_placement_error}")
-            batch_required_error = _batch_aware_required_input_fields_error(node_id, node_plugin, node_options)
+            batch_required_error = _batch_aware_required_input_fields_error(node_id, node_plugin, review_options)
             if batch_required_error is not None:
                 return _failure_result(state, f"Node '{node_id}': {batch_required_error}")
 
-            review_options = _options_with_default_llm_reviews(
-                node_id=node_id,
-                plugin=node_plugin,
-                options=node_options,
-            )
             node_prevalidation = _prevalidate_transform_for_context(context, node_plugin, review_options)
             if node_prevalidation is not None:
                 return _failure_result(state, f"Node '{node_id}': {node_prevalidation}", error_code="plugin_options_invalid")
@@ -765,8 +922,8 @@ def build_set_pipeline_candidate(
             # rejects any option outside that public schema before this line. The
             # executable — where the profile injects the real provider binding —
             # is the authority for profiled nodes.
-            if "profile" not in node_options:
-                provider_policy_error = _validate_transform_provider_config_policy(node_options, plugin=node_plugin)
+            if "profile" not in review_options:
+                provider_policy_error = _validate_transform_provider_config_policy(review_options, plugin=node_plugin)
                 if provider_policy_error is not None:
                     return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
 
@@ -774,10 +931,9 @@ def build_set_pipeline_candidate(
             # retrieval). Parity with the per-output sink-path check below so
             # a bulk set_pipeline cannot wave through an escaping transform
             # path while rejecting an escaping sink path.
-            provider_path_error = _validate_transform_provider_config_path(node_options, data_dir, session_id=session_id)
+            provider_path_error = _validate_transform_provider_config_path(review_options, data_dir, session_id=session_id)
             if provider_path_error is not None:
                 return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
-
         # Validate gate condition expression at composition time.
         if node_type == "gate" and node.condition is not None:
             expr_error = _validate_gate_expression(node.condition)
@@ -786,6 +942,7 @@ def build_set_pipeline_candidate(
             parity_error = _validate_gate_route_parity(node.condition, node.routes)
             if parity_error is not None:
                 return _failure_result(state, f"Node '{node_id}': {parity_error}", error_code="gate_route_labels_mismatch")
+        canonical_node_options[node_index] = review_options
 
     # 3. Validate output plugins and options
     #
@@ -895,7 +1052,7 @@ def build_set_pipeline_candidate(
     # enum values flow through to be rejected at runtime by NodeSpec /
     # EdgeSpec / CompositionState invariants.
     node_specs = []
-    for n in validated.nodes:
+    for node_index, n in enumerate(validated.nodes):
         fork_to = tuple(n.fork_to) if n.fork_to is not None else None
         branches = dict(n.branches) if isinstance(n.branches, Mapping) else tuple(n.branches) if n.branches is not None else None
         nt = n.node_type
@@ -906,11 +1063,7 @@ def build_set_pipeline_candidate(
             input=n.input,
             on_success=n.on_success,
             on_error=n.on_error or ("discard" if nt in ("transform", "aggregation") else None),
-            options=_options_with_default_llm_reviews(
-                node_id=n.id,
-                plugin=n.plugin,
-                options=n.options,
-            ),
+            options=canonical_node_options[node_index],
             condition=n.condition,
             routes=n.routes,
             fork_to=fork_to,
@@ -995,6 +1148,16 @@ def build_set_pipeline_candidate(
             state,
             "Authoritative interpretation-review reconciliation failed. Re-inspect the exact set_pipeline_arguments payload and retry.",
             error_code="review_reconciliation_failed",
+        )
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        new_state,
+        tool_name="set_pipeline",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
         )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:

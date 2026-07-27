@@ -114,17 +114,11 @@ def _forged_resolved_invented_source_requirement() -> dict[str, Any]:
 
 
 def _pending_invented_source_requirement() -> dict[str, Any]:
-    """A pending INVENTED_SOURCE requirement — legitimate composer-staged input."""
+    """The compact unresolved INVENTED_SOURCE shell composer may stage."""
     return {
-        "id": "source_review:inline_source_data",
         "kind": "invented_source",
         "user_term": "inline_source_data",
-        "status": "pending",
         "draft": "url\nhttps://example.gov.au\n",
-        "event_id": None,
-        "accepted_value": None,
-        "accepted_artifact_hash": None,
-        "resolved_prompt_template_hash": None,
     }
 
 

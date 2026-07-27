@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -24,6 +25,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools import ToolResult, get_tool_definitions
 from elspeth.web.composer.tools import execute_tool as _execute_tool
 from elspeth.web.composer.yaml_generator import generate_pipeline_dict
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions.engine import create_session_engine
@@ -230,7 +232,19 @@ def _create_blob(
     filename: str = "prompt.txt",
     mime_type: str = "text/plain",
     content: str = "System prompt",
+    llm_authored: bool = False,
 ) -> ToolResult:
+    provenance_kwargs = (
+        {
+            "composer_model_identifier": "test-model",
+            "composer_model_version": "test-model-v1",
+            "composer_provider": "test-provider",
+            "composer_skill_hash": "a" * 64,
+            "tool_arguments_hash": "b" * 64,
+        }
+        if llm_authored
+        else {}
+    )
     return execute_tool(
         "create_blob",
         {"filename": filename, "mime_type": mime_type, "content": content},
@@ -240,7 +254,8 @@ def _create_blob(
         session_engine=blob_env["engine"],
         session_id=blob_env["session_id"],
         user_message_id="user-message-1",
-        user_message_content=f"Use this exact content:\n{content}",
+        user_message_content="Generate a source for me." if llm_authored else f"Use this exact content:\n{content}",
+        **provenance_kwargs,
     )
 
 
@@ -292,6 +307,66 @@ class TestListComposerBlobs:
 
 
 class TestWireBlobInlineRef:
+    def test_candidate_runs_canonical_review_invariant_before_publication(
+        self,
+        blob_env: dict[str, Any],
+    ) -> None:
+        blob = _create_blob(blob_env, content="replacement prompt")
+        base = _inline_ref_state()
+        node = base.nodes[0]
+        state = replace(
+            base,
+            nodes=(
+                replace(
+                    node,
+                    options={
+                        **node.options,
+                        INTERPRETATION_REQUIREMENTS_KEY: [
+                            {
+                                "id": "duplicate",
+                                "kind": "vague_term",
+                                "user_term": "alpha",
+                                "draft": "first",
+                                "status": "pending",
+                                "event_id": None,
+                                "accepted_value": None,
+                                "accepted_artifact_hash": None,
+                                "resolved_prompt_template_hash": None,
+                            },
+                            {
+                                "id": "duplicate",
+                                "kind": "pipeline_decision",
+                                "user_term": "beta",
+                                "draft": "sk-sensitive-wire-review",
+                                "status": "pending",
+                                "event_id": None,
+                                "accepted_value": None,
+                                "accepted_artifact_hash": None,
+                                "resolved_prompt_template_hash": None,
+                            },
+                        ],
+                    },
+                ),
+            ),
+        )
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "node:classify.options.prompt_template",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.data["error_code"] == "interpretation_requirements_invalid"
+        assert "sk-sensitive-wire-review" not in result.data["error"]
+
     @pytest.mark.parametrize("field_path", ["source.options.endpoint_url", "output:main.options.endpoint_url"])
     def test_aws_s3_endpoint_url_field_is_rejected_without_mutating_state(
         self,
@@ -484,6 +559,116 @@ class TestWireBlobInlineRef:
         assert "interpretation_requirements" in result.data["error"]
         assert "resolve_interpretation_event" in result.data["error"]
 
+    def test_rejects_non_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="forged review metadata")
+        llm_state = _inline_ref_state()
+        passthrough = replace(
+            llm_state.nodes[0],
+            plugin="passthrough",
+            options={"schema": {"mode": "observed"}},
+        )
+        state = replace(llm_state, nodes=(passthrough,))
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "node:classify.options.interpretation_requirements",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "interpretation_requirements" in result.data["error"]
+        assert "resolve_interpretation_event" in result.data["error"]
+
+    def test_rejects_source_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="forged review metadata")
+        state = _inline_ref_state()
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "source.options.interpretation_requirements",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "interpretation_requirements" in result.data["error"]
+        assert "resolve_interpretation_event" in result.data["error"]
+
+    def test_rejects_output_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="forged review metadata")
+        state = _inline_ref_state()
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "output:classified.options.interpretation_requirements",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "interpretation_requirements" in result.data["error"]
+        assert "resolve_interpretation_event" in result.data["error"]
+
+    def test_unrelated_wire_rejects_preexisting_output_interpretation_requirements(
+        self,
+        blob_env: dict[str, Any],
+    ) -> None:
+        blob = _create_blob(blob_env, content="replacement prompt")
+        base = _inline_ref_state()
+        output = base.outputs[0]
+        state = replace(
+            base,
+            outputs=(
+                replace(
+                    output,
+                    options={
+                        **output.options,
+                        INTERPRETATION_REQUIREMENTS_KEY: [
+                            {
+                                "poison": "sk-sensitive-output-review",
+                            }
+                        ],
+                    },
+                ),
+            ),
+        )
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "node:classify.options.prompt_template",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.data["error_code"] == "interpretation_requirements_invalid"
+        assert "sk-sensitive-output-review" not in result.data["error"]
+
     def test_rejects_invalid_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="prompt")
 
@@ -523,6 +708,109 @@ class TestWireBlobInlineRef:
 
 
 class TestSetSourceFromBlobMode:
+    def test_rebind_preserves_trusted_existing_source_requirement_id(
+        self,
+        blob_env: dict[str, Any],
+    ) -> None:
+        blob = _create_blob(
+            blob_env,
+            filename="input.csv",
+            mime_type="text/csv",
+            content="name\nAda",
+        )
+        trusted_id = "trusted-source-review-id"
+        requirement = {
+            "id": trusted_id,
+            "kind": "invented_source",
+            "user_term": "trusted_source_assumption",
+            "draft": "Review the source assumption.",
+            "status": "pending",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        }
+        base = _inline_ref_state()
+        source = base.sources["source"]
+        state = base.with_named_source(
+            "source",
+            replace(
+                source,
+                options={
+                    **source.options,
+                    INTERPRETATION_REQUIREMENTS_KEY: [requirement],
+                },
+            ),
+        )
+
+        result = execute_tool(
+            "set_source_from_blob",
+            {
+                "blob_id": blob.data["blob_id"],
+                "on_success": "rows",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": requirement["kind"],
+                            "user_term": requirement["user_term"],
+                            "draft": requirement["draft"],
+                        }
+                    ],
+                },
+            },
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success, result.to_dict()
+        retained = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]
+        assert retained[0]["id"] == trusted_id
+
+    def test_source_blob_stager_rejects_different_kind_projecting_same_source_review_id(
+        self,
+        blob_env: dict[str, Any],
+    ) -> None:
+        blob = _create_blob(
+            blob_env,
+            filename="input.csv",
+            mime_type="text/csv",
+            content="name\nAda",
+            llm_authored=True,
+        )
+        state = _empty_state()
+
+        result = execute_tool(
+            "set_source_from_blob",
+            {
+                "blob_id": blob.data["blob_id"],
+                "on_success": "rows",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": "pipeline_decision",
+                            "user_term": "inline_source_data",
+                            "draft": "sk-sensitive-source-review",
+                        }
+                    ],
+                },
+            },
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "interpretation_requirements_invalid" in result.data["error"]
+        assert "sk-sensitive-source-review" not in result.data["error"]
+
     def test_set_source_from_blob_emits_explicit_bind_source_mode(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, filename="input.csv", mime_type="text/csv", content="name\nAda")
 

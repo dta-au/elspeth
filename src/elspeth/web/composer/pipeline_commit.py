@@ -314,6 +314,7 @@ async def prepare_pipeline_proposal_commit(
             reviewed_facts=reviewed_facts,
             expected_reviewed_anchor_hash=authority.proposal.reviewed_anchor_hash,
         ),
+        _interpretation_requirements_are_internal=True,
     )
 
     candidate = await bounded(
@@ -376,6 +377,7 @@ async def prepare_pipeline_proposal_commit(
                 tool_arguments_hash=authority.row.tool_arguments_hash,
                 reviewed_source_authority=context.reviewed_source_authority,
                 raise_schema_argument_errors=True,
+                _interpretation_requirements_are_internal=True,
             ),
         )
 

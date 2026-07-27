@@ -75,6 +75,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     SOURCE_AUTHORING_KEY,
     InterpretationRequirement,
+    parse_interpretation_requirements,
     serialize_authoring_review_options,
     strip_authoring_options,
 )
@@ -103,12 +104,64 @@ _DATA_ERROR_KEY: Final[str] = "error"
 _RUNTIME_OWNED_LLM_OPTION_KEYS: Final[frozenset[str]] = frozenset({"resolved_prompt_template_hash"})
 _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
     {
+        "id",
+        "status",
         "event_id",
         "accepted_value",
         "accepted_artifact_hash",
         "resolved_prompt_template_hash",
     }
 )
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "kind",
+        "user_term",
+        "draft",
+    }
+)
+_CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "id",
+        "kind",
+        "user_term",
+        "draft",
+        "status",
+        "event_id",
+        "accepted_value",
+        "accepted_artifact_hash",
+        "resolved_prompt_template_hash",
+    }
+)
+
+
+def _authored_interpretation_requirement_id(
+    *,
+    component_id: str,
+    user_term: str,
+    source: bool = False,
+) -> str:
+    """Project one admitted author shell onto its canonical server-owned ID."""
+    normalized_user_term = user_term.strip()
+    return f"source_review:{normalized_user_term}" if source else f"{normalized_user_term}:{component_id}"
+
+
+def _source_review_requirement_id(user_term: str) -> str:
+    """Return the canonical source-review ID for one normalized review term."""
+    return _authored_interpretation_requirement_id(
+        component_id="source",
+        user_term=user_term,
+        source=True,
+    )
+
+
+def _prompt_template_review_requirement_id(node_id: str) -> str:
+    """Return the canonical ID used by prompt-template auto-staging."""
+    return f"prompt_template_review:{node_id}"
+
+
+def _model_choice_review_requirement_id(node_id: str) -> str:
+    """Return the canonical ID used by model-choice auto-staging."""
+    return f"model_choice_review:{node_id}"
 
 
 def _pending_interpretation_requirement(
@@ -150,12 +203,30 @@ def _requirement_matches_field_value(requirement: Mapping[str, Any], field_value
     return requirement.get("resolved_prompt_template_hash") == stable_hash(field_value)
 
 
+def _trusted_requirement_id_for_kind(
+    existing_options: Mapping[str, Any] | None,
+    kind: InterpretationKind,
+) -> str | None:
+    """Return one unambiguous trusted current ID for an auto-staged kind."""
+    if existing_options is None:
+        return None
+    try:
+        existing_requirements = parse_interpretation_requirements(existing_options)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if existing_requirements is None:
+        return None
+    matching_ids = [requirement["id"] for requirement in existing_requirements if requirement["kind"] == kind.value]
+    return matching_ids[0] if len(matching_ids) == 1 else None
+
+
 def _options_with_pending_requirement(
     options: Mapping[str, Any],
     *,
     requirement: Mapping[str, Any],
     replace_kind: InterpretationKind | None = None,
     current_field_value: str | None = None,
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Append or refresh a pending requirement without mutating ``options``.
 
@@ -169,6 +240,11 @@ def _options_with_pending_requirement(
     requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
     if requirements_value is not None and not isinstance(requirements_value, (list, tuple)):
         return dict(options)
+
+    if replace_kind is not None:
+        trusted_id = _trusted_requirement_id_for_kind(existing_options, replace_kind)
+        if trusted_id is not None:
+            requirement = {**requirement, "id": trusted_id}
 
     requirements: list[Any] = list(requirements_value or ())
     if replace_kind is not None:
@@ -200,6 +276,7 @@ def _options_with_default_prompt_template_review(
     node_id: str,
     plugin: str | None,
     options: Mapping[str, Any],
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Ensure LLM-authored prompt templates carry a Class 3 review gate."""
     if plugin != "llm":
@@ -208,7 +285,7 @@ def _options_with_default_prompt_template_review(
     if not isinstance(prompt_template, str) or not prompt_template:
         return options
     requirement = _pending_interpretation_requirement(
-        requirement_id=f"prompt_template_review:{node_id}",
+        requirement_id=_prompt_template_review_requirement_id(node_id),
         kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
         user_term=f"llm_prompt_template:{node_id}",
         draft=prompt_template,
@@ -218,6 +295,7 @@ def _options_with_default_prompt_template_review(
         requirement=requirement,
         replace_kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
         current_field_value=prompt_template,
+        existing_options=existing_options,
     )
 
 
@@ -226,6 +304,7 @@ def _options_with_default_model_choice_review(
     node_id: str,
     plugin: str | None,
     options: Mapping[str, Any],
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Ensure LLM-authored model choices carry a review gate.
 
@@ -256,7 +335,7 @@ def _options_with_default_model_choice_review(
     if not isinstance(model, str) or not model:
         return options
     requirement = _pending_interpretation_requirement(
-        requirement_id=f"model_choice_review:{node_id}",
+        requirement_id=_model_choice_review_requirement_id(node_id),
         kind=InterpretationKind.LLM_MODEL_CHOICE,
         user_term=f"llm_model_choice:{node_id}",
         draft=model,
@@ -266,6 +345,7 @@ def _options_with_default_model_choice_review(
         requirement=requirement,
         replace_kind=InterpretationKind.LLM_MODEL_CHOICE,
         current_field_value=model,
+        existing_options=existing_options,
     )
 
 
@@ -343,6 +423,7 @@ def _options_with_default_llm_reviews(
     node_id: str,
     plugin: str | None,
     options: Mapping[str, Any],
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Apply every default review auto-stager for an LLM node, in order.
 
@@ -355,8 +436,18 @@ def _options_with_default_llm_reviews(
     Adding a new default auto-stager here is the canonical extension point —
     callers stay on the composite and acquire the new gate automatically.
     """
-    staged = _options_with_default_prompt_template_review(node_id=node_id, plugin=plugin, options=options)
-    staged = _options_with_default_model_choice_review(node_id=node_id, plugin=plugin, options=staged)
+    staged = _options_with_default_prompt_template_review(
+        node_id=node_id,
+        plugin=plugin,
+        options=options,
+        existing_options=existing_options,
+    )
+    staged = _options_with_default_model_choice_review(
+        node_id=node_id,
+        plugin=plugin,
+        options=staged,
+        existing_options=existing_options,
+    )
     staged = _options_with_ascii_safe_scrape_headers(plugin=plugin, options=staged)
     return staged
 
@@ -1640,14 +1731,16 @@ def _resolver_owned_interpretation_requirement_error(
     options: Mapping[str, Any],
     *,
     tool_name: str,
+    component_id: str | None = None,
+    source: bool = False,
 ) -> str | None:
-    """Reject LLM-supplied ``interpretation_requirements`` carrying resolver-owned review metadata.
+    """Validate the complete authoring shape for ``interpretation_requirements``.
 
-    Composer tool input may stage only PENDING review requirements; a resolved
-    ``status`` or any resolver-owned field (``event_id`` / ``accepted_value`` /
-    ``accepted_artifact_hash`` / ``resolved_prompt_template_hash``) may be written
-    ONLY by ``resolve_interpretation_event``, which records a real human
-    resolution in the interpretation-events audit DB.
+    Composer input may supply only the compact unresolved shell
+    ``{kind, user_term, draft}``. Identity, status, event linkage, accepted
+    values, and artifact hashes are all resolver-owned even when the supplied
+    value is null. Presence is therefore the authority violation; inspecting
+    or reflecting the untrusted value would create a tool-error leak channel.
 
     This check is PLUGIN-AGNOSTIC and must guard every write path to a spec's
     ``options`` — both LLM-node options (``vague_term`` / ``llm_prompt_template``
@@ -1661,33 +1754,331 @@ def _resolver_owned_interpretation_requirement_error(
     LLM-SUPPLIED delta (full options on a create, the ``patch`` on a merge) so a
     legitimately-resolved requirement already in stored state is not re-flagged.
     """
-    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
-    if not isinstance(requirements_value, (list, tuple)):
+    if INTERPRETATION_REQUIREMENTS_KEY not in options:
         return None
+    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
+    malformed_error = (
+        f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY} must be a list of "
+        "review entry objects, each carrying non-empty string fields kind, user_term, "
+        "and draft. Omit the field entirely when no review is being staged; canonical "
+        "review metadata is written only by resolve_interpretation_event."
+    )
+    if type(requirements_value) is not list:
+        return malformed_error
 
+    seen_kind_terms: set[tuple[str, str]] = set()
+    seen_normalized_user_terms: set[str] = set()
+    seen_projected_ids: set[str] = set()
+    collision_error = (
+        f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY} contains duplicate or "
+        "colliding interpretation requirement identities. Each authored row must "
+        "have a unique normalized kind/user_term and server-projected ID; remove "
+        "duplicate or colliding rows and retry."
+    )
     for index, requirement in enumerate(requirements_value):
         if not isinstance(requirement, Mapping):
-            continue
+            return malformed_error
         status = requirement["status"] if "status" in requirement else None
-        if status not in (None, "pending"):
+        if type(status) is str and status == "resolved":
+            # Preserve the established repair text for the common resolved-row
+            # exploit without reflecting arbitrary untrusted status values.
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
-                f"resolver-owned status {status!r}. Composer tool input may stage pending "
+                "resolver-owned status 'resolved'. Composer tool input may stage pending "
                 "review requirements only; resolved review metadata may only be written by "
                 "resolve_interpretation_event."
             )
-        resolver_owned_fields = sorted(
-            field for field in _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS if requirement.get(field) is not None
-        )
+        resolver_owned_fields = sorted(field for field in _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS if field in requirement)
         if resolver_owned_fields:
             field_names = ", ".join(resolver_owned_fields)
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
-                f"resolver-owned field(s): {field_names}. Composer tool input may stage "
-                "pending review requirements only; resolved review metadata may only be "
-                "written by resolve_interpretation_event."
+                f"resolver-owned field(s): {field_names}. Composer tool input may supply "
+                "only kind, user_term, and draft; resolver-owned review metadata may only "
+                "be written by resolve_interpretation_event."
             )
+        if set(requirement) != _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
+            return malformed_error
+        kind = requirement["kind"]
+        user_term = requirement["user_term"]
+        draft = requirement["draft"]
+        if (
+            type(kind) is not str
+            or not kind.strip()
+            or type(user_term) is not str
+            or not user_term.strip()
+            or type(draft) is not str
+            or not draft.strip()
+        ):
+            return malformed_error
+        try:
+            InterpretationKind(kind)
+        except ValueError:
+            return malformed_error
+        normalized_user_term = user_term.strip()
+        kind_term = (kind, normalized_user_term)
+        if kind_term in seen_kind_terms:
+            return collision_error
+        seen_kind_terms.add(kind_term)
+        if component_id is None and normalized_user_term in seen_normalized_user_terms:
+            # Without a component ID the exact projection suffix is unknown,
+            # but the projection omits kind, so equal normalized terms always
+            # collide for every component.
+            return collision_error
+        seen_normalized_user_terms.add(normalized_user_term)
+        if component_id is not None:
+            projected_id = _authored_interpretation_requirement_id(
+                component_id=component_id,
+                user_term=user_term,
+                source=source,
+            )
+            if projected_id in seen_projected_ids:
+                return collision_error
+            seen_projected_ids.add(projected_id)
     return None
+
+
+def _canonical_interpretation_requirement_error(
+    options: Mapping[str, Any],
+    *,
+    tool_name: str,
+) -> str | None:
+    """Enforce the canonical per-component interpretation-review invariant.
+
+    This is stage B of authoring admission. Unlike the raw compact-shell gate,
+    it is unconditional: public writes, trusted proposal replay, reviewed
+    sources, and internal reconciliation must all pass after canonicalization,
+    merging, and automatic review staging.
+    """
+    if INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return None
+
+    error = f"{tool_name}: interpretation_requirements_invalid: canonical interpretation requirements failed invariant validation."
+    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
+    if type(requirements_value) not in (list, tuple):
+        return error
+
+    for requirement in requirements_value:
+        if not isinstance(requirement, Mapping):
+            return error
+        if set(requirement) != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
+            return error
+        if type(requirement["id"]) is not str or not requirement["id"].strip():
+            return error
+        if type(requirement["kind"]) is not str:
+            return error
+        if type(requirement["user_term"]) is not str or not requirement["user_term"].strip():
+            return error
+        if type(requirement["status"]) is not str:
+            return error
+        draft = requirement["draft"]
+        if draft is not None and type(draft) is not str:
+            return error
+        for field_name in (
+            "event_id",
+            "accepted_value",
+            "accepted_artifact_hash",
+            "resolved_prompt_template_hash",
+        ):
+            field_value = requirement[field_name]
+            if field_value is not None and type(field_value) is not str:
+                return error
+
+    try:
+        requirements = parse_interpretation_requirements(options)
+    except (KeyError, TypeError, ValueError):
+        return error
+    if requirements is None:
+        return error
+
+    seen_ids: set[str] = set()
+    seen_kind_terms: set[tuple[str, str]] = set()
+    for requirement in requirements:
+        requirement_id = requirement["id"]
+        kind_term = (requirement["kind"], requirement["user_term"].strip())
+        if requirement_id in seen_ids or kind_term in seen_kind_terms:
+            return error
+        seen_ids.add(requirement_id)
+        seen_kind_terms.add(kind_term)
+
+        if requirement["status"] == "pending":
+            if type(requirement["draft"]) is not str or not requirement["draft"].strip():
+                return error
+            if (
+                requirement["event_id"] is not None
+                or requirement["accepted_value"] is not None
+                or requirement["accepted_artifact_hash"] is not None
+                or requirement["resolved_prompt_template_hash"] is not None
+            ):
+                return error
+            continue
+
+        if type(requirement["event_id"]) is not str or not requirement["event_id"].strip():
+            return error
+        if type(requirement["accepted_value"]) is not str:
+            return error
+        kind = InterpretationKind(requirement["kind"])
+        if kind in (
+            InterpretationKind.INVENTED_SOURCE,
+            InterpretationKind.PIPELINE_DECISION,
+        ):
+            if (
+                type(requirement["accepted_artifact_hash"]) is not str
+                or not requirement["accepted_artifact_hash"].strip()
+                or requirement["resolved_prompt_template_hash"] is not None
+            ):
+                return error
+        elif (
+            type(requirement["resolved_prompt_template_hash"]) is not str
+            or not requirement["resolved_prompt_template_hash"].strip()
+            or requirement["accepted_artifact_hash"] is not None
+        ):
+            return error
+
+    return None
+
+
+def _composition_canonical_interpretation_requirement_error(
+    state: CompositionState,
+    *,
+    tool_name: str,
+) -> str | None:
+    """Apply canonical invariant B to every review-bearing component."""
+    for source in state.sources.values():
+        error = _canonical_interpretation_requirement_error(
+            source.options,
+            tool_name=tool_name,
+        )
+        if error is not None:
+            return error
+    for node in state.nodes:
+        error = _canonical_interpretation_requirement_error(
+            node.options,
+            tool_name=tool_name,
+        )
+        if error is not None:
+            return error
+    for output in state.outputs:
+        if INTERPRETATION_REQUIREMENTS_KEY in output.options:
+            return f"{tool_name}: interpretation_requirements_invalid: canonical interpretation requirements failed invariant validation."
+    return None
+
+
+def _normalize_trusted_legacy_interpretation_requirements(
+    options: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Expand trusted legacy pending rows to the exact canonical shape once.
+
+    Only rows whose keys are a strict subset of the canonical schema and that
+    already carry the five historical identity/state fields are eligible.
+    Public input never reaches this helper. Any unknown field or parse failure
+    is preserved unchanged so unconditional invariant B rejects it.
+    """
+    if INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return options
+    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
+    if type(requirements_value) not in (list, tuple):
+        return options
+    required_legacy_fields = {"id", "kind", "user_term", "draft", "status"}
+    needs_normalization = False
+    for requirement in requirements_value:
+        if not isinstance(requirement, Mapping):
+            return options
+        fields = set(requirement)
+        if not required_legacy_fields <= fields or not fields <= _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
+            return options
+        needs_normalization = needs_normalization or fields != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS
+    if not needs_normalization:
+        return options
+    try:
+        requirements = parse_interpretation_requirements(options)
+    except (KeyError, TypeError, ValueError):
+        return options
+    if requirements is None:
+        return options
+    normalized = dict(options)
+    normalized[INTERPRETATION_REQUIREMENTS_KEY] = [dict(requirement) for requirement in requirements]
+    return normalized
+
+
+def _canonicalize_authored_interpretation_requirements(
+    options: Mapping[str, Any],
+    *,
+    component_id: str,
+    source: bool = False,
+    existing_options: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    """Fill resolver-owned pending identity after authoring admission.
+
+    Callers must run :func:`_resolver_owned_interpretation_requirement_error`
+    against the untrusted delta first. This function is the trusted transition
+    from the compact authoring shell to the canonical persisted pending shape;
+    the resolver's later resolved output never passes back through authoring
+    admission.
+    """
+    if INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return options
+    requirements = options[INTERPRETATION_REQUIREMENTS_KEY]
+    if type(requirements) is not list:
+        raise AssertionError("interpretation requirements must be admitted before canonicalization")
+    existing_ids: dict[tuple[str, str], str] = {}
+    ambiguous_existing_keys: set[tuple[str, str]] = set()
+    existing_requirements = (
+        existing_options[INTERPRETATION_REQUIREMENTS_KEY]
+        if existing_options is not None and INTERPRETATION_REQUIREMENTS_KEY in existing_options
+        else None
+    )
+    if isinstance(existing_requirements, (list, tuple)):
+        for existing in existing_requirements:
+            if not isinstance(existing, Mapping):
+                continue
+            existing_kind = existing.get("kind")
+            existing_user_term = existing.get("user_term")
+            existing_id = existing.get("id")
+            if type(existing_kind) is not str or not existing_kind.strip():
+                continue
+            if type(existing_user_term) is not str or not existing_user_term.strip():
+                continue
+            if type(existing_id) is not str or not existing_id.strip():
+                continue
+            key = (existing_kind, existing_user_term.strip())
+            if key in existing_ids and existing_ids[key] != existing_id:
+                ambiguous_existing_keys.add(key)
+                continue
+            existing_ids[key] = existing_id
+    for key in ambiguous_existing_keys:
+        del existing_ids[key]
+
+    canonical_requirements: list[InterpretationRequirement] = []
+    for requirement in requirements:
+        if not isinstance(requirement, Mapping):
+            raise AssertionError("interpretation requirement entries must be admitted before canonicalization")
+        kind = requirement["kind"]
+        user_term = requirement["user_term"]
+        if type(kind) is not str or type(user_term) is not str:
+            raise AssertionError("interpretation requirement kind/user_term must be admitted before canonicalization")
+        requirement_id = existing_ids.get(
+            (kind, user_term.strip()),
+            _authored_interpretation_requirement_id(
+                component_id=component_id,
+                user_term=user_term,
+                source=source,
+            ),
+        )
+        draft = requirement["draft"]
+        if type(draft) is not str:
+            raise AssertionError("interpretation requirement draft must be admitted before canonicalization")
+        canonical_requirements.append(
+            _pending_interpretation_requirement(
+                requirement_id=requirement_id,
+                kind=InterpretationKind(kind),
+                user_term=user_term,
+                draft=draft,
+            )
+        )
+    canonical_options = dict(options)
+    canonical_options[INTERPRETATION_REQUIREMENTS_KEY] = canonical_requirements
+    return canonical_options
 
 
 def _runtime_owned_llm_option_error(
@@ -1695,6 +2086,8 @@ def _runtime_owned_llm_option_error(
     options: Mapping[str, Any],
     *,
     tool_name: str,
+    interpretation_requirements_are_internal: bool = False,
+    component_id: str | None = None,
 ) -> str | None:
     """Reject composer-authored writes to runtime-owned LLM audit fields.
 
@@ -1705,6 +2098,14 @@ def _runtime_owned_llm_option_error(
     guards source write paths via
     :func:`_resolver_owned_interpretation_requirement_error`.
     """
+    if not interpretation_requirements_are_internal:
+        interpretation_error = _resolver_owned_interpretation_requirement_error(
+            options,
+            tool_name=tool_name,
+            component_id=component_id,
+        )
+        if interpretation_error is not None:
+            return interpretation_error
     if plugin_name != "llm":
         return None
     supplied = sorted(key for key in _RUNTIME_OWNED_LLM_OPTION_KEYS if key in options)
@@ -1716,7 +2117,7 @@ def _runtime_owned_llm_option_error(
             "not by composer tool input."
         )
 
-    return _resolver_owned_interpretation_requirement_error(options, tool_name=tool_name)
+    return None
 
 
 def _secret_ref_placement_error(
@@ -2071,6 +2472,10 @@ class ToolContext:
         reviewed_source_authority: Private session-bound reviewed source
             authority. Generic/manual callers leave this unset and therefore
             remain subject to the normal fail-closed custody checks.
+        _interpretation_requirements_are_internal: Private server-owned
+            allowance for revalidating a proposal that already crossed the
+            public compact-shell admission boundary. Public tool arguments
+            cannot set context fields.
     """
 
     catalog: PolicyCatalogView
@@ -2093,6 +2498,7 @@ class ToolContext:
     composer_skill_hash: str | None = None
     tool_arguments_hash: str | None = None
     reviewed_source_authority: ReviewedSourceAuthority | None = None
+    _interpretation_requirements_are_internal: bool = False
 
 
 ToolHandler = Callable[
@@ -2151,8 +2557,21 @@ class _SetPipelineNodePayload(TypedDict):
 
 
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:
-    """Strip resolver-owned review evidence while retaining pending shells."""
-    return cast(dict[str, JsonValue], deep_thaw(serialize_authoring_review_options(options)))
+    """Strip all resolver-owned review fields from public authoring shells."""
+    serialized = cast(dict[str, JsonValue], deep_thaw(serialize_authoring_review_options(options)))
+    requirements = serialized.get(INTERPRETATION_REQUIREMENTS_KEY)
+    if isinstance(requirements, list):
+        serialized[INTERPRETATION_REQUIREMENTS_KEY] = [
+            {
+                "kind": requirement["kind"],
+                "user_term": requirement["user_term"],
+                "draft": requirement["draft"],
+            }
+            if isinstance(requirement, Mapping)
+            else requirement
+            for requirement in requirements
+        ]
+    return serialized
 
 
 def _serialize_set_pipeline_node(node: NodeSpec) -> _SetPipelineNodePayload:

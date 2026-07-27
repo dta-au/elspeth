@@ -198,6 +198,125 @@ def test_splice_transform_identical_review_staged_replay_is_same_object() -> Non
     assert replay.updated_state.version == first.updated_state.version
 
 
+def test_splice_transform_replay_preserves_all_trusted_requirement_ids() -> None:
+    state = _state()
+    arguments = {
+        **_arguments(),
+        "node": {
+            "id": "inserted",
+            "plugin": "llm",
+            "options": {
+                "provider": "openrouter",
+                "model": "openai/gpt-4o-mini",
+                "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "prompt_template": "Summarise using {{interpretation:summary_style}}: {{ row.text }}.",
+                "schema": {"mode": "observed"},
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    {
+                        "kind": "vague_term",
+                        "user_term": "summary_style",
+                        "draft": "Use one concise sentence.",
+                    }
+                ],
+            },
+            "on_error": "discard",
+        },
+    }
+    first = _execute_splice_transform(arguments, state, _context())
+    assert first.success, first.data
+    before, inserted, after = first.updated_state.nodes
+    custom_ids = {
+        "vague_term": "trusted-authored-review-id",
+        "llm_prompt_template": "trusted-prompt-review-id",
+        "llm_model_choice": "trusted-model-review-id",
+    }
+    trusted_requirements = [
+        {
+            **requirement,
+            "id": custom_ids[requirement["kind"]],
+        }
+        for requirement in inserted.options[INTERPRETATION_REQUIREMENTS_KEY]
+    ]
+    retained = replace(
+        first.updated_state,
+        nodes=(
+            before,
+            replace(
+                inserted,
+                options={
+                    **inserted.options,
+                    INTERPRETATION_REQUIREMENTS_KEY: trusted_requirements,
+                },
+            ),
+            after,
+        ),
+    )
+
+    replay = _execute_splice_transform(arguments, retained, _context())
+
+    assert replay.success, replay.data
+    assert replay.data["already_applied"] is True
+    assert replay.updated_state is retained
+    requirements = replay.updated_state.nodes[1].options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert {requirement["kind"]: requirement["id"] for requirement in requirements} == custom_ids
+
+
+def test_splice_transform_identical_replay_rejects_noncanonical_retained_requirements() -> None:
+    state = _state()
+    arguments = {
+        **_arguments(),
+        "node": {
+            "id": "inserted",
+            "plugin": "llm",
+            "options": {
+                "provider": "openrouter",
+                "model": "openai/gpt-4o-mini",
+                "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "prompt_template": "Summarise {{ row.text }}.",
+                "schema": {"mode": "observed"},
+            },
+            "on_error": "discard",
+        },
+    }
+    first = _execute_splice_transform(arguments, state, _context())
+    assert first.success, first.data
+    before, inserted, after = first.updated_state.nodes
+    legacy_requirements = [
+        {
+            field: requirement[field]
+            for field in (
+                "id",
+                "kind",
+                "user_term",
+                "status",
+                "draft",
+            )
+        }
+        for requirement in inserted.options[INTERPRETATION_REQUIREMENTS_KEY]
+    ]
+    retained = replace(
+        first.updated_state,
+        nodes=(
+            before,
+            replace(
+                inserted,
+                options={
+                    **inserted.options,
+                    INTERPRETATION_REQUIREMENTS_KEY: legacy_requirements,
+                },
+            ),
+            after,
+        ),
+    )
+
+    replay = _execute_splice_transform(arguments, retained, _context())
+
+    assert not replay.success
+    assert replay.data["error_code"] == "interpretation_requirements_invalid"
+    assert replay.updated_state is retained
+    assert replay.updated_state.version == retained.version
+
+
 def test_splice_transform_same_id_divergent_retry_is_atomic() -> None:
     first = _execute_splice_transform(_arguments(), _state(), _context())
     assert first.success
