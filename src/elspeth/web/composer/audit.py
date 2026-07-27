@@ -968,6 +968,67 @@ def _result_to_audit_payload(result: Any) -> Mapping[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_MAX_PYDANTIC_CAUSE_ERRORS = 8
+_MAX_PYDANTIC_CAUSE_LOC_DEPTH = 4
+_SAFE_PYDANTIC_CAUSE_LOC_FIELDS = frozenset(
+    {
+        "affected_node_id",
+        "blob_id",
+        "branches",
+        "condition",
+        "content",
+        "count",
+        "description",
+        "edge_type",
+        "edges",
+        "expected_output_count",
+        "filename",
+        "fork_to",
+        "from_node",
+        "id",
+        "inline_blob",
+        "input",
+        "kind",
+        "label",
+        "llm_draft",
+        "merge",
+        "metadata",
+        "mime_type",
+        "name",
+        "node",
+        "node_id",
+        "node_type",
+        "nodes",
+        "on_error",
+        "on_success",
+        "on_validation_failure",
+        "on_write_failure",
+        "option_key",
+        "options",
+        "output_mode",
+        "outputs",
+        "patch",
+        "plugin",
+        "policy",
+        "predecessor_id",
+        "recipe_name",
+        "routes",
+        "sink_name",
+        "slots",
+        "source",
+        "source_name",
+        "sources",
+        "successor_id",
+        "target",
+        "target_id",
+        "timeout_seconds",
+        "to_node",
+        "trigger",
+        "user_term",
+    }
+)
+
+
 def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any]] | None:
     """Canonicalize a Pydantic ``ValidationError`` chained on ``__cause__``.
 
@@ -981,11 +1042,13 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
     with no audit value, and ``ctx`` may carry the rejected value in
     its context dict.
 
-    This helper produces a leak-safe canonical projection: a fresh list
-    of dicts containing ONLY ``loc`` (stringified), ``msg`` (the
-    Pydantic-generated message — NOT user-supplied), and ``type`` (the
-    Pydantic error-type discriminator like ``"int_parsing"``,
-    ``"missing"``, ``"value_error"``).
+    This helper produces a closed, bounded projection. Raw Pydantic
+    locations, messages, and type strings are all Tier-3 values:
+    validators can embed rejected values in messages and typed mappings
+    can place user-controlled keys in locations. The projection therefore
+    emits only closed schema-owned field names or generic path tokens,
+    fixed error codes, and fixed messages. At most eight errors and four
+    location components per error survive.
 
     Behaviour
     ---------
@@ -997,27 +1060,16 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
       ValidationError but defensively) → ``None`` (recording
       ``validation_errors: []`` has no audit value; the absence of the
       key is the signal).
-    - Otherwise → ``list[dict[str, Any]]`` with one dict per error.
-
-    Loc-safety note
-    ---------------
-    The ``loc`` tuple contains field-path elements (model field names
-    for typed fields, list indices for sequence fields). For
-    ``dict[str, Any]`` fields, Pydantic only validates dict shape and
-    does NOT descend into values, so ``loc`` paths cannot contain
-    user-supplied dict keys under the current MANIFEST convention
-    (``dict[str, Any]`` for all unknown-shape fields). If a future
-    model introduces ``dict[str, TypedSubmodel]``, Pydantic WILL
-    descend and ``loc`` may then contain user-supplied keys — the
-    safety analysis here MUST be re-evaluated at that point.
+    - More than eight errors → one fixed ``truncated`` diagnostic,
+      selected via ``error_count()`` without materializing ``errors()``.
+    - Otherwise → at most eight closed diagnostic dictionaries.
 
     Tier discipline
     ---------------
-    Pydantic's ``__cause__`` is a Tier-3 boundary input (the LLM's
-    tool-call shape). This helper sits at the Tier-3 → Tier-1
-    audit-record boundary, so defensive handling (the ``isinstance``
-    check, the stringification of non-``str`` loc elements) is the
-    correct discipline. ``exc.errors()`` itself is NOT wrapped in a
+    Pydantic's ``__cause__`` is a Tier-3 boundary input. This helper sits
+    at the Tier-3 → Tier-1 audit-record boundary, so the defensive closed
+    projection is the correct discipline. ``exc.errors()`` itself is not
+    wrapped in a
     ``try/except`` — if Pydantic's own ``errors()`` raises, that is a
     Pydantic-internal bug and must propagate (offensive programming).
     """
@@ -1025,21 +1077,66 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
         return None
     if not isinstance(exc, ValidationError):
         return None
+    error_count = exc.error_count()
+    if error_count == 0:
+        return None
+    if error_count > _MAX_PYDANTIC_CAUSE_ERRORS:
+        return [
+            {
+                "loc": [],
+                "msg": f"Validation produced more than {_MAX_PYDANTIC_CAUSE_ERRORS} errors",
+                "type": "truncated",
+            }
+        ]
     raw_errors = exc.errors()
     if not raw_errors:
         return None
+    type_messages = {
+        "invalid": "Validation failed",
+        "invalid_choice": "Value is not an allowed choice",
+        "invalid_type": "Value has invalid type",
+        "invalid_value": "Value is invalid",
+        "missing": "Required value is missing",
+        "out_of_bounds": "Value is outside allowed bounds",
+        "unexpected": "Unexpected value",
+    }
+
+    def error_code(raw_type: object) -> str:
+        value = raw_type if type(raw_type) is str and len(raw_type) <= 128 else ""
+        if value == "missing":
+            return "missing"
+        if value == "extra_forbidden":
+            return "unexpected"
+        if value in {"enum", "literal_error"}:
+            return "invalid_choice"
+        if any(marker in value for marker in ("greater_than", "less_than", "multiple_of", "too_long", "too_short")):
+            return "out_of_bounds"
+        if "parsing" in value or value.endswith("_type"):
+            return "invalid_type"
+        if value in {"assertion_error", "value_error"}:
+            return "invalid_value"
+        return "invalid"
+
     canonicalized: list[dict[str, Any]] = []
-    for err in raw_errors:
-        # Stringify every loc element. Pydantic produces ``tuple[int |
-        # str, ...]`` (ints for list-index errors); coerce to ``list[str]``
-        # so the recorded shape is uniform and downstream audit consumers
-        # don't have to branch on element type.
-        loc_stringified = [str(piece) for piece in err["loc"]]
+    for err in raw_errors[:_MAX_PYDANTIC_CAUSE_ERRORS]:
+        code = error_code(err.get("type"))
+        loc = [
+            (
+                "index"
+                if type(piece) is int
+                else piece
+                if type(piece) is str and piece in _SAFE_PYDANTIC_CAUSE_LOC_FIELDS
+                else "field"
+                if position == 0
+                else "item"
+            )
+            for position, piece in enumerate(err.get("loc", ())[:_MAX_PYDANTIC_CAUSE_LOC_DEPTH])
+        ]
         canonicalized.append(
             {
-                "loc": loc_stringified,
-                "msg": err["msg"],
-                "type": err["type"],
+                "loc": loc,
+                "msg": type_messages[code],
+                "type": code,
             }
         )
     return canonicalized

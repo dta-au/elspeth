@@ -32,8 +32,7 @@ def unknown_tool_response_redaction() -> Mapping[str, Any]:
 
 def arg_error_payload(exc: ToolArgumentError, tool_name: str) -> Mapping[str, Any]:
     """Build the structured payload for an ARG_ERROR audit record and LLM tool message."""
-    safe_message = exc.args[0] if exc.args else "tool argument error"
-    payload: dict[str, Any] = {"error": f"Tool '{tool_name}' failed: {safe_message}"}
+    payload: dict[str, Any] = {"error": f"Tool '{tool_name}' failed: {exc.safe_message}"}
     validation_errors = canonicalize_pydantic_cause(exc.__cause__)
     if validation_errors is not None:
         payload["validation_errors"] = validation_errors

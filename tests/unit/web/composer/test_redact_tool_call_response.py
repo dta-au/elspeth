@@ -22,14 +22,350 @@ from pydantic import BaseModel, ConfigDict
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.tier_registry import _TIER_1_ERRORS_VIEW
 from elspeth.web.composer.redaction import (
+    MANIFEST,
     REDACTED_UNKNOWN_RESPONSE_KEY,
     HandlesNoSensitiveDataReason,
     Sensitive,
     ToolRedaction,
     ToolRedactionPolicy,
+    redact_arg_error_response,
     redact_tool_call_response,
 )
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+
+_TYPE_DRIVEN_TOOL_RESULT_TOOLS = (
+    "set_source",
+    "create_blob",
+    "update_blob",
+    "set_source_from_blob",
+    "set_pipeline",
+    "apply_pipeline_recipe",
+    "patch_source_options",
+    "patch_node_options",
+    "patch_output_options",
+    "splice_transform",
+)
+
+_EXTERNAL_SCALAR_CANARY = "RAW_RESPONSE_CANARY_/private/operator/path_sk-secret"
+_KNOWN_ARG_ERROR_CLASSES = (
+    "CanonicalizationError",
+    "FloatDomainError",
+    "IntegerDomainError",
+    "JSONDecodeError",
+    "JsonBoundaryError",
+    "MissingRequiredPaths",
+    "ToolArgumentError",
+    "TypeError",
+    "ValidationError",
+    "ValueError",
+)
+
+
+def _tool_result_canary_response(*, success: bool) -> dict[str, Any]:
+    return {
+        "success": success,
+        "validation": {
+            "is_valid": False,
+            "errors": [
+                {
+                    "component": _EXTERNAL_SCALAR_CANARY,
+                    "message": _EXTERNAL_SCALAR_CANARY,
+                    "severity": "high",
+                    "error_code": _EXTERNAL_SCALAR_CANARY,
+                }
+            ],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [_EXTERNAL_SCALAR_CANARY],
+        "version": 7,
+        "data": {
+            "error": _EXTERNAL_SCALAR_CANARY,
+            "nested": {"provider": _EXTERNAL_SCALAR_CANARY},
+        },
+        "runtime_preflight": {
+            "errors": [{"message": _EXTERNAL_SCALAR_CANARY}],
+        },
+        "validation_delta": {
+            "new_errors": [{"message": _EXTERNAL_SCALAR_CANARY}],
+        },
+        "post_call_hints": [_EXTERNAL_SCALAR_CANARY],
+        "plugin_schemas": {
+            _EXTERNAL_SCALAR_CANARY: {
+                "description": _EXTERNAL_SCALAR_CANARY,
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize("error_class", _KNOWN_ARG_ERROR_CLASSES)
+def test_arg_error_projection_preserves_every_known_producer_class(error_class: str) -> None:
+    result = redact_arg_error_response(
+        error_class=error_class,
+        error_message="fixed producer diagnostic",
+    )
+
+    assert result["error_class"] == error_class
+
+
+def test_every_type_driven_manifest_entry_declares_a_response_model() -> None:
+    missing = [name for name, entry in MANIFEST.items() if entry.argument_model is not None and entry.response_model is None]
+
+    assert missing == []
+
+
+@pytest.mark.parametrize("tool_name", _TYPE_DRIVEN_TOOL_RESULT_TOOLS)
+@pytest.mark.parametrize("success", [True, False], ids=["success", "error"])
+def test_type_driven_tool_result_responses_fail_closed_without_losing_public_status(
+    tool_name: str,
+    success: bool,
+) -> None:
+    response = _tool_result_canary_response(success=success)
+
+    result = redact_tool_call_response(
+        tool_name,
+        response,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    serialized = json.dumps(result, sort_keys=True)
+
+    assert result["success"] is success
+    assert result["version"] == 7
+    assert result["validation"]["is_valid"] is False
+    assert result["validation"]["errors"][0]["severity"] == "high"
+    assert set(result) == set(response)
+    assert _EXTERNAL_SCALAR_CANARY not in serialized
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "response_key"),
+    [
+        (tool_name, response_key)
+        for tool_name in ("upsert_node", "set_metadata", "set_output", "request_advisor_hint")
+        for response_key in MANIFEST[tool_name].policy.known_response_keys  # type: ignore[union-attr]
+    ],
+)
+def test_declarative_known_response_key_never_trusts_an_arbitrary_scalar(
+    tool_name: str,
+    response_key: str,
+) -> None:
+    result = redact_tool_call_response(
+        tool_name,
+        {response_key: _EXTERNAL_SCALAR_CANARY},
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert response_key in result
+    assert _EXTERNAL_SCALAR_CANARY not in json.dumps(result, sort_keys=True)
+
+
+def test_declarative_nested_tool_result_envelopes_scrub_external_scalars() -> None:
+    response = _tool_result_canary_response(success=False)
+
+    result = redact_tool_call_response(
+        "upsert_node",
+        response,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    serialized = json.dumps(result, sort_keys=True)
+
+    assert result["success"] is False
+    assert result["version"] == 7
+    assert result["validation"]["is_valid"] is False
+    assert result["validation"]["errors"][0]["severity"] == "high"
+    assert set(result) == set(response)
+    assert _EXTERNAL_SCALAR_CANARY not in serialized
+
+
+@pytest.mark.parametrize("tool_name", ["set_source", "upsert_node"])
+def test_repair_argument_summary_never_exposes_arbitrary_key_names(tool_name: str) -> None:
+    key_canary = "RAW_KEY_CANARY_/private/operator/path_sk-secret"
+    response = {
+        "success": False,
+        "validation": {
+            "is_valid": False,
+            "errors": [],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [
+                {
+                    "code": "repair_required",
+                    "connection": "source_to_transform",
+                    "strategy": "repair",
+                    "reason": "A repair is required.",
+                    "affected_consumers": [],
+                    "tool_sequence": [
+                        {
+                            "tool": "upsert_node",
+                            "arguments": {key_canary: "secret value"},
+                        }
+                    ],
+                }
+            ],
+        },
+        "affected_nodes": [],
+        "version": 3,
+        "data": {"error": "repair required"},
+    }
+
+    result = redact_tool_call_response(
+        tool_name,
+        response,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    arguments_summary = result["validation"]["graph_repair_suggestions"][0]["tool_sequence"][0]["arguments"]
+
+    assert arguments_summary == "<redacted-repair-arguments>"
+    assert key_canary not in json.dumps(result, sort_keys=True)
+
+
+def test_declarative_projection_rejects_excessive_depth_without_recursion() -> None:
+    nested: object = "leaf"
+    for _ in range(1200):
+        nested = {"items": nested}
+
+    result = redact_tool_call_response(
+        "upsert_node",
+        {"data": nested},
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert result == {"_redaction_status": "response_projection_limit"}
+
+
+def test_declarative_projection_rejects_excessive_width_without_amplification() -> None:
+    result = redact_tool_call_response(
+        "upsert_node",
+        {"data": ["external"] * 20_000},
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert result == {"_redaction_status": "response_projection_limit"}
+    assert len(json.dumps(result)) < 256
+
+
+def test_declarative_projection_rejects_excessive_total_nodes() -> None:
+    result = redact_tool_call_response(
+        "upsert_node",
+        {"data": [[False] * 32 for _ in range(32)]},
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert result == {"_redaction_status": "response_projection_limit"}
+
+
+def test_type_driven_projection_rejects_oversized_validation_list_before_model_validation() -> None:
+    response = _tool_result_canary_response(success=False)
+    response["validation"]["errors"] = [
+        {
+            "component": "component",
+            "message": "message",
+            "severity": "high",
+            "error_code": "error_code",
+        }
+    ] * 20_000
+
+    result = redact_tool_call_response(
+        "set_source",
+        response,
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert result == {"_redaction_status": "response_projection_limit"}
+
+
+def test_largest_admitted_projection_stays_below_output_budget() -> None:
+    result = redact_tool_call_response(
+        "upsert_node",
+        {"data": [[False] * 30 for _ in range(30)]},
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert result != {"_redaction_status": "response_projection_limit"}
+    assert len(json.dumps(result).encode("utf-8")) <= 65_536
+
+
+@pytest.mark.parametrize("tool_name", ["set_source", "upsert_node"])
+def test_response_projection_is_a_fixed_point(tool_name: str) -> None:
+    response = _tool_result_canary_response(success=False)
+
+    once = redact_tool_call_response(
+        tool_name,
+        response,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    twice = redact_tool_call_response(
+        tool_name,
+        once,
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert twice == once
+
+
+def test_existing_response_models_scrub_free_form_failure_and_diagnostic_text() -> None:
+    blob_response = {
+        "success": False,
+        "validation": {
+            "is_valid": False,
+            "errors": [
+                {
+                    "component": _EXTERNAL_SCALAR_CANARY,
+                    "message": _EXTERNAL_SCALAR_CANARY,
+                    "severity": "high",
+                    "error_code": _EXTERNAL_SCALAR_CANARY,
+                }
+            ],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [_EXTERNAL_SCALAR_CANARY],
+        "version": 3,
+        "data": {"error": _EXTERNAL_SCALAR_CANARY},
+    }
+    review_response = {
+        "success": True,
+        "validation": {
+            "is_valid": True,
+            "errors": [],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [_EXTERNAL_SCALAR_CANARY],
+        "version": 4,
+        "data": {
+            "_kind": "interpretation_review_pending",
+            "event_id": _EXTERNAL_SCALAR_CANARY,
+            "affected_node_id": _EXTERNAL_SCALAR_CANARY,
+            "kind": "vague_term",
+            "interpretation_source": _EXTERNAL_SCALAR_CANARY,
+            "message": _EXTERNAL_SCALAR_CANARY,
+        },
+    }
+
+    blob_result = redact_tool_call_response(
+        "get_blob_content",
+        blob_response,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    review_result = redact_tool_call_response(
+        "request_interpretation_review",
+        review_response,
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert blob_result["success"] is False
+    assert review_result["data"]["_kind"] == "interpretation_review_pending"
+    assert _EXTERNAL_SCALAR_CANARY not in json.dumps(blob_result, sort_keys=True)
+    assert _EXTERNAL_SCALAR_CANARY not in json.dumps(review_result, sort_keys=True)
+
 
 # ---------------------------------------------------------------------------
 # Helpers: construct temporary manifest-like entries for test isolation.
@@ -187,10 +523,7 @@ def test_sensitive_key_with_summarizer_uses_summarizer_output(
 def test_unknown_key_becomes_fixed_sentinel_with_telemetry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Declarative entry: a key in the response that is neither in
-    sensitive_response_keys nor known_response_keys is substituted with
-    REDACTED_UNKNOWN_RESPONSE_KEY (exact string equality) and increments
-    the unknown_response_key_redacted counter once per unknown key."""
+    """A declarative unknown key is aggregated without retaining its name."""
     tool = "t_unknown_key"
     entry = _declarative_entry(
         sensitive_response_keys=(),
@@ -203,9 +536,10 @@ def test_unknown_key_becomes_fixed_sentinel_with_telemetry(
     result = redact_tool_call_response(tool, response, telemetry=tel)
 
     assert result["status"] == "ok"
-    assert result["unknown_field"] == REDACTED_UNKNOWN_RESPONSE_KEY
+    assert "unknown_field" not in result
+    assert result["_unknown_response"] == REDACTED_UNKNOWN_RESPONSE_KEY
     # Exact string equality, not regex/prefix
-    assert result["unknown_field"] == "<redacted-unknown-response-key>"
+    assert result["_unknown_response"] == "<redacted-unknown-response-key>"
     # Counter fires once per unknown key
     assert tel.unknown_response_key_calls == [{"tool_name": tool}]
 
@@ -225,9 +559,29 @@ def test_unknown_key_counter_fires_once_per_unknown_key(
     response = {"status": "ok", "x": 1, "y": 2}
     result = redact_tool_call_response(tool, response, telemetry=tel)
 
-    assert result["x"] == REDACTED_UNKNOWN_RESPONSE_KEY
-    assert result["y"] == REDACTED_UNKNOWN_RESPONSE_KEY
+    assert result == {
+        "status": "ok",
+        "_unknown_response": REDACTED_UNKNOWN_RESPONSE_KEY,
+    }
     assert len(tel.unknown_response_key_calls) == 2
+
+
+def test_declarative_unknown_top_level_key_name_is_aggregated_without_leaking() -> None:
+    key_canary = "RAW_TOP_LEVEL_KEY_/private/operator/path_sk-secret"
+    result = redact_tool_call_response(
+        "upsert_node",
+        {
+            "success": True,
+            key_canary: "untrusted value",
+        },
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert result == {
+        "success": True,
+        "_unknown_response": REDACTED_UNKNOWN_RESPONSE_KEY,
+    }
+    assert key_canary not in json.dumps(result, sort_keys=True)
 
 
 # ---------------------------------------------------------------------------
@@ -294,12 +648,12 @@ def test_get_blob_content_redacts_tool_result_envelope_content() -> None:
 
     result = redact_tool_call_response("get_blob_content", response, telemetry=NoopRedactionTelemetry())
 
-    assert result["data"]["content"] == "<blob-content:15-bytes>"
+    assert result["data"]["content"] == "<redacted-blob-content>"
     assert "secret,row" not in str(result)
 
 
 def test_get_blob_content_redacts_tool_result_failure_envelope() -> None:
-    """Recoverable failures have no content leaf and must not crash redaction."""
+    """Recoverable failure text is summarized without losing public status."""
 
     response = {
         "success": False,
@@ -318,11 +672,14 @@ def test_get_blob_content_redacts_tool_result_failure_envelope() -> None:
 
     result = redact_tool_call_response("get_blob_content", response, telemetry=NoopRedactionTelemetry())
 
-    assert result == response
+    assert result["success"] is False
+    assert result["version"] == 2
+    assert result["data"]["error"] == "<redacted-response-text>"
+    assert "blob-1" not in json.dumps(result, sort_keys=True)
 
 
-def test_get_blob_content_populated_validation_envelope_redacts_only_repair_arguments() -> None:
-    """A fully-populated validation envelope round-trips with only ``arguments`` redacted.
+def test_get_blob_content_populated_validation_envelope_redacts_external_scalars() -> None:
+    """A fully-populated validation envelope retains status and safe summaries.
 
     Mechanically pins that ``GetBlobContentValidationModel`` (and its nested
     shadow models) matches the real ``ToolResult.to_dict()`` validation-envelope
@@ -333,12 +690,9 @@ def test_get_blob_content_populated_validation_envelope_redacts_only_repair_argu
     element, so a key-name drift between the builder and the shadow model would
     pass them silently; this test fails loudly on such drift.
 
-    It also confirms the ONE Sensitive leaf — the heterogeneous repair-tool-call
-    ``arguments`` mapping — is summarized to the structural sketch while every
-    surrounding structural scalar (component, message, severity, edge-contract
-    fields, repair codes, affected-consumer ids) passes through verbatim. The
-    non-sensitive validation metadata MUST survive redaction; only ``arguments``
-    is collapsed.
+    It also confirms the heterogeneous repair-tool-call ``arguments`` mapping
+    keeps its dedicated structural sketch while surrounding externally derived
+    text is summarized. Closed booleans, severity, and counts remain useful.
     """
     response = {
         "success": True,
@@ -406,20 +760,21 @@ def test_get_blob_content_populated_validation_envelope_redacts_only_repair_argu
     result = redact_tool_call_response("get_blob_content", response, telemetry=NoopRedactionTelemetry())
 
     # Blob bytes redacted (existing behaviour).
-    assert result["data"]["content"] == "<blob-content:15-bytes>"
+    assert result["data"]["content"] == "<redacted-blob-content>"
 
-    # The single Sensitive repair-arguments leaf is summarized to sorted keys.
+    # The single Sensitive repair-arguments leaf is summarized to key count.
     repair = result["validation"]["graph_repair_suggestions"][0]
-    assert repair["tool_sequence"][0]["arguments"] == "<repair-args:id,input,node_type>"
-    assert repair["tool_sequence"][1]["arguments"] == "<repair-args:>"
+    assert repair["tool_sequence"][0]["arguments"] == "<redacted-repair-arguments>"
+    assert repair["tool_sequence"][1]["arguments"] == "<redacted-repair-arguments>"
 
-    # All surrounding non-sensitive validation metadata survives verbatim.
+    # Public status survives while free-form/provider/operator text is summarized.
     assert result["validation"]["is_valid"] is False
-    assert result["validation"]["errors"][0]["message"] == "Duplicate consumer for connection shared"
+    assert result["validation"]["errors"][0]["severity"] == "high"
+    assert result["validation"]["errors"][0]["message"] == "<redacted-response-text>"
     assert result["validation"]["semantic_contracts"][1]["producer_plugin"] is None
-    assert result["validation"]["semantic_contracts"][0]["requirement_code"] == "REQ-001"
-    assert repair["affected_consumers"][0]["new_input"] == "shared_to_t1"
-    assert repair["code"] == "duplicate_consumer_connection"
+    assert result["validation"]["semantic_contracts"][0]["requirement_code"] == "<redacted-response-text>"
+    assert repair["affected_consumers"][0]["new_input"] == "<redacted-response-text>"
+    assert repair["code"] == "<redacted-response-text>"
 
     # The repair-argument VALUES never reach the redacted output (only the
     # affected_consumers descriptor — a non-sensitive structural field — may
@@ -490,10 +845,18 @@ def test_declarative_tool_result_redacts_nested_repair_arguments() -> None:
 
     result = redact_tool_call_response("upsert_node", response, telemetry=NoopRedactionTelemetry())
 
-    assert result["validation"]["graph_repair_suggestions"][0]["tool_sequence"][0]["arguments"] == "<repair-args:id,options>"
+    assert result["validation"]["graph_repair_suggestions"][0]["tool_sequence"][0]["arguments"] == "<redacted-repair-arguments>"
     repair = result["data"]["repair"]
-    assert repair["tool_sequence"][0]["arguments"] == "<repair-args:name,option_key,proof,target,target_id>"
-    assert repair["arguments"] == "<repair-args:api_key>"
+    projected_arguments = repair["tool_sequence"][0]["arguments"]
+    assert isinstance(projected_arguments, dict)
+    assert set(projected_arguments) == {
+        "_redacted_response_field_1",
+        "_redacted_response_field_2",
+        "_redacted_response_field_3",
+        "_redacted_response_field_4",
+        "_redacted_response_field_5",
+    }
+    assert isinstance(repair["arguments"], dict)
     assert sentinel not in json.dumps(result, sort_keys=True)
 
 
@@ -524,8 +887,9 @@ def test_declarative_tool_result_preserves_shared_optional_envelope_keys() -> No
 
     result = redact_tool_call_response("upsert_node", response, telemetry=NoopRedactionTelemetry())
 
-    assert result["post_call_hints"] == response["post_call_hints"]
-    assert result["plugin_schemas"] == response["plugin_schemas"]
+    assert result["post_call_hints"] == ["<redacted-response-text>"]
+    assert "source/csv" not in result["plugin_schemas"]
+    assert result["plugin_schemas"]["_redacted_response_field_1"]["type"] == "<redacted-response-text>"
     assert REDACTED_UNKNOWN_RESPONSE_KEY not in json.dumps(result, sort_keys=True)
 
 
@@ -641,7 +1005,7 @@ def test_missing_manifest_entry_yields_audit_integrity_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 9: empty known_response_keys → every response key sentinelised
+# Test 9: empty known_response_keys → unknown response keys aggregated
 # ---------------------------------------------------------------------------
 
 
@@ -649,8 +1013,8 @@ def test_empty_known_response_keys_sentinelises_every_response_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Declarative entry with handles_no_sensitive_data=True and
-    known_response_keys=(): every response key is unknown → all get the
-    fixed sentinel (fail-closed; rev-3 W8c / rev-4 W8c).
+    known_response_keys=(): every response key is unknown → names are removed
+    and one fixed aggregate sentinel remains.
 
     Task 6's ToolRedactionPolicy validator forbids known_response_keys=()
     when handles_no_sensitive_data=False. This fixture therefore uses
@@ -674,10 +1038,7 @@ def test_empty_known_response_keys_sentinelises_every_response_key(
     response = {"alpha": "a", "beta": "b"}
     result = redact_tool_call_response(tool, response, telemetry=tel)
 
-    assert result == {
-        "alpha": REDACTED_UNKNOWN_RESPONSE_KEY,
-        "beta": REDACTED_UNKNOWN_RESPONSE_KEY,
-    }
+    assert result == {"_unknown_response": REDACTED_UNKNOWN_RESPONSE_KEY}
     # Counter fires once per unknown key
     assert len(tel.unknown_response_key_calls) == 2
 
@@ -836,10 +1197,11 @@ def test_tool_result_envelope_keys_are_implicitly_known_for_declarative_entries(
     result = redact_tool_call_response(tool, response, telemetry=tel)
 
     assert result["success"] is False
-    assert result["validation"] == validation
+    assert result["validation"] == "<redacted-response-mapping>"
     assert result["version"] == 3
-    assert result["summary"] == "s"
-    assert result["data"] == REDACTED_UNKNOWN_RESPONSE_KEY
+    assert result["summary"] == "<redacted-response-text>"
+    assert "data" not in result
+    assert result["_unknown_response"] == REDACTED_UNKNOWN_RESPONSE_KEY
     assert "SECRET-CONTENT" not in str(result)
     assert len(tel.unknown_response_key_calls) == 1
 

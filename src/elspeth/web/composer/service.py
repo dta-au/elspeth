@@ -41,7 +41,7 @@ from sqlalchemy import Engine, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
-from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
@@ -336,7 +336,8 @@ _last_mutation_was_pending_proposal = _no_tool_policy.last_mutation_was_pending_
 _no_mutation_empty_state_validation = _no_tool_policy.no_mutation_empty_state_validation
 _pre_state_interpretation_review_repair_message = _no_tool_policy.pre_state_interpretation_review_repair_message
 _state_is_structurally_empty = _no_tool_policy.state_is_structurally_empty
-_user_request_expects_pipeline_mutation = _no_tool_policy.user_request_expects_pipeline_mutation
+_classify_pipeline_mutation_intent = _no_tool_policy.classify_pipeline_mutation_intent
+_PipelineMutationIntentDecision = _no_tool_policy.PipelineMutationIntentDecision
 _arg_error_payload = _tool_error_payloads.arg_error_payload
 _INVALID_TOOL_ARGUMENTS_REDACTION_STATUS = _tool_error_payloads.INVALID_TOOL_ARGUMENTS_REDACTION_STATUS
 
@@ -1405,6 +1406,7 @@ class ComposerServiceImpl:
         outcome: _ToolOutcome,
         *,
         telemetry: Any,
+        failure_status: ComposerToolStatus | None = None,
     ) -> str:
         """Serialize one Step 1 outcome through the redaction response walker."""
 
@@ -1412,7 +1414,12 @@ class ComposerServiceImpl:
         # already load-order sensitive and these walkers are cold-path helpers.
         from elspeth.contracts.freeze import deep_thaw
         from elspeth.core.canonical import canonical_json
-        from elspeth.web.composer.redaction import MANIFEST, redact_tool_call_response
+        from elspeth.web.composer.redaction import (
+            MANIFEST,
+            redact_arg_error_response,
+            redact_failure_response,
+            redact_tool_call_response,
+        )
         from elspeth.web.composer.tool_error_payloads import unknown_tool_response_redaction
 
         if outcome.error_class is None:
@@ -1440,12 +1447,20 @@ class ComposerServiceImpl:
                 telemetry=telemetry,
             )
             return canonical_json(redacted)
-        return canonical_json(
-            {
-                "error_class": outcome.error_class,
-                "error_message": outcome.error_message,
-            }
+        status = ComposerToolStatus.ARG_ERROR if failure_status is None else failure_status
+        projection = (
+            redact_arg_error_response(
+                error_class=outcome.error_class,
+                error_message=outcome.error_message,
+            )
+            if status is ComposerToolStatus.ARG_ERROR
+            else redact_failure_response(
+                status=status.value,
+                error_class=outcome.error_class,
+                error_message=outcome.error_message,
+            )
         )
+        return canonical_json(projection)
 
     def _state_payload_for_compose_turn_for_test(
         self,
@@ -2195,7 +2210,7 @@ class ComposerServiceImpl:
         try:
             if (
                 _state_is_structurally_empty(state)
-                and _user_request_expects_pipeline_mutation(message)
+                and _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
                 and guided_terminal is None
                 and self._sessions_service is not None
                 and session_id is not None
@@ -3484,7 +3499,7 @@ class ComposerServiceImpl:
         """
         if (
             repair_turns_used < _MAX_REPAIR_TURNS
-            and _user_request_expects_pipeline_mutation(message)
+            and _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
             and _state_is_structurally_empty(state)
             and _last_failure_was_pre_state_interpretation_review(recorder.invocations)
         ):

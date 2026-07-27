@@ -152,6 +152,13 @@ type ToolCallObject = dict[str, JsonValue]
 type ToolCallList = list[ToolCallObject]
 
 
+class ChatMessageSegmentResponse(_StrictResponse):
+    """One provenance-bearing visible segment in a chat message."""
+
+    kind: Literal["text", "trusted_system_notice"]
+    content: str
+
+
 class ChatMessageResponse(_StrictResponse):
     """Response for a single chat message.
 
@@ -174,6 +181,7 @@ class ChatMessageResponse(_StrictResponse):
     role: str
     content: str
     raw_content: str | None = None
+    segments: list[ChatMessageSegmentResponse]
     tool_calls: ToolCallList | None = None
     created_at: datetime
     composition_state_id: str | None = None

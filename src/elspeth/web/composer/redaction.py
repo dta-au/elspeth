@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 
 from elspeth.contracts.blobs import AllowedMimeType
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -45,6 +45,7 @@ _REDACTED_OPTION_VALUE = "<redacted-option-value>"
 # MUST compare by ==, not by prefix or regex.  No length disclosure
 # (closes W6 / spec §8.1 RSK-03 weak echo).
 REDACTED_UNKNOWN_RESPONSE_KEY = "<redacted-unknown-response-key>"
+REDACTED_UNKNOWN_RESPONSE_FIELD = "_unknown_response"
 
 # The closed ToolResult dispatch envelope: engine-produced framing present on
 # every serialized tool result.  Implicitly known (never sentinel'd) for
@@ -69,6 +70,350 @@ REDACTED_UNKNOWN_ARGUMENTS_FIELD = "_unknown_arguments"
 # distinguish "known sensitive, no summarizer" from "unknown key, fail-closed".
 REDACTED_SENSITIVE_NO_SUMMARIZER = "<redacted>"
 
+_REDACTED_RESPONSE_TEXT = "<redacted-response-text>"
+_REDACTED_RESPONSE_INTEGER = "<redacted-response-integer>"
+_REDACTED_RESPONSE_NUMBER = "<redacted-response-number>"
+_REDACTED_RESPONSE_VALUE = "<redacted-response-value>"
+_REDACTED_RESPONSE_MAPPING = "<redacted-response-mapping>"
+_REDACTED_RESPONSE_SEQUENCE = "<redacted-response-sequence>"
+_REDACTED_RESPONSE_BOOLEAN = "<redacted-response-boolean>"
+_REDACTED_RESPONSE_NULL = "<redacted-response-null>"
+_REDACTED_ARG_ERROR_CLASS = "<redacted-arg-error-class>"
+_REDACTED_PLUGIN_CRASH_CLASS = "<redacted-plugin-crash-class>"
+_REDACTED_FAILURE_MESSAGE = "<redacted-failure-message>"
+_ARG_ERROR_REDACTION_STATUS = "arg_error"
+_RESPONSE_PROJECTION_LIMIT = MappingProxyType({"_redaction_status": "response_projection_limit"})
+
+RESPONSE_PROJECTION_MAX_DEPTH = 32
+RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH = 64
+RESPONSE_PROJECTION_MAX_NODES = 1024
+RESPONSE_PROJECTION_MAX_OUTPUT_BYTES = 65_536
+
+_SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "severity": frozenset({"high", "medium", "low"}),
+        "status": frozenset(
+            {
+                "ok",
+                "healthy",
+                "SUCCESS",
+                "ARG_ERROR",
+                "BUDGET_EXHAUSTED",
+                "COMPOSE_TIMEOUT",
+                "DEADLINE_TOO_CLOSE",
+                "ADVISOR_ERROR",
+            }
+        ),
+        "_kind": frozenset(
+            {
+                "interpretation_review_pending",
+                "interpretation_review_pending_idempotent",
+                "interpretation_review_suppressed_by_opt_out",
+            }
+        ),
+        "kind": frozenset(kind.value for kind in InterpretationKind),
+        "pipeline_content_hash_schema": frozenset({"composer.pipeline-dispatch-result.v1"}),
+    }
+)
+_SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
+    {
+        "version",
+        "count",
+        "size_bytes",
+        "budget_used",
+        "budget_remaining",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_prompt_tokens",
+        "advisor_latency_ms",
+    }
+)
+_SAFE_ARG_ERROR_CLASSES = frozenset(
+    {
+        "CanonicalizationError",
+        "FloatDomainError",
+        "IntegerDomainError",
+        "JSONDecodeError",
+        "JsonBoundaryError",
+        "MissingRequiredPaths",
+        "ToolArgumentError",
+        "TypeError",
+        "ValidationError",
+        "ValueError",
+    }
+)
+_SAFE_PLUGIN_CRASH_CLASSES = frozenset(
+    {
+        "AssertionError",
+        "AuditIntegrityError",
+        "KeyError",
+        "MemoryError",
+        "RecursionError",
+        "RuntimeError",
+        "SystemError",
+        "TypeError",
+        "UnicodeError",
+        "ValueError",
+    }
+)
+_SAFE_CANCELLATION_REASONS = frozenset({"cancelled", "coordinator_cancelled", "sibling_failure"})
+_SAFE_UNTRUSTED_RESPONSE_STRUCTURE_KEYS = frozenset(
+    {
+        "additionalProperties",
+        "arguments",
+        "components",
+        "credential_fields",
+        "description",
+        "error",
+        "items",
+        "message",
+        "properties",
+        "repair",
+        "required",
+        "tool",
+        "tool_sequence",
+        "type",
+    }
+)
+
+
+class _TrustedRedactionSummary(str):
+    """Marker for a value produced by a trusted schema summarizer."""
+
+
+_STABLE_RESPONSE_SENTINELS = frozenset(
+    {
+        REDACTED_SENSITIVE_NO_SUMMARIZER,
+        REDACTED_UNKNOWN_RESPONSE_KEY,
+        _REDACTED_RESPONSE_TEXT,
+        _REDACTED_RESPONSE_INTEGER,
+        _REDACTED_RESPONSE_NUMBER,
+        _REDACTED_RESPONSE_VALUE,
+        _REDACTED_RESPONSE_MAPPING,
+        _REDACTED_RESPONSE_SEQUENCE,
+        _REDACTED_RESPONSE_BOOLEAN,
+        _REDACTED_RESPONSE_NULL,
+        "<redacted-blob-content>",
+        "<redacted-interpretation-text>",
+        "<redacted-repair-arguments>",
+    }
+)
+
+
+def _response_within_projection_budget(value: object) -> bool:
+    """Iteratively reject response structures that exceed persistence budgets."""
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > RESPONSE_PROJECTION_MAX_NODES or depth > RESPONSE_PROJECTION_MAX_DEPTH:
+            return False
+        if isinstance(current, Mapping):
+            if len(current) > RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH:
+                return False
+            stack.extend((child, depth + 1) for child in current.values())
+        elif isinstance(current, (list, tuple)):
+            if len(current) > RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH:
+                return False
+            stack.extend((child, depth + 1) for child in current)
+    return True
+
+
+def _bounded_projection_result(result: Mapping[str, object]) -> dict[str, object]:
+    projected = dict(result)
+    encoded = json.dumps(projected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > RESPONSE_PROJECTION_MAX_OUTPUT_BYTES:
+        return dict(_RESPONSE_PROJECTION_LIMIT)
+    return projected
+
+
+def _summarize_external_response_value(value: object) -> str:
+    """Return a deterministic, value-free summary for one response value.
+
+    The summary exposes only JSON shape or scalar length. Mapping keys are
+    deliberately omitted because provider/operator-controlled keys can carry
+    the same path, diagnostic, or secret material as values.
+    """
+    if isinstance(value, str) and value in _STABLE_RESPONSE_SENTINELS:
+        return value
+    if isinstance(value, Mapping):
+        return _REDACTED_RESPONSE_MAPPING
+    if isinstance(value, (list, tuple)):
+        return _REDACTED_RESPONSE_SEQUENCE
+    if isinstance(value, str):
+        return _REDACTED_RESPONSE_TEXT
+    if type(value) is bool:
+        return _REDACTED_RESPONSE_BOOLEAN
+    if type(value) is int:
+        return _REDACTED_RESPONSE_INTEGER
+    if type(value) is float:
+        return _REDACTED_RESPONSE_NUMBER
+    if value is None:
+        return _REDACTED_RESPONSE_NULL
+    return _REDACTED_RESPONSE_VALUE
+
+
+def _summarize_arg_error_text(value: str | None, *, label: str) -> str | None:
+    if value is None:
+        return None
+    return f"<redacted-arg-error-{label}>"
+
+
+def redact_arg_error_response(
+    *,
+    error_class: str | None,
+    error_message: str | None,
+    result: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return the closed persistence projection for an ARG_ERROR outcome.
+
+    ARG_ERROR payloads are not ToolResult responses and must not validate
+    against a tool's success response model. Preserve only a closed exception
+    class and bounded diagnostic shape; arbitrary messages, result values, and
+    result keys never cross the persistence boundary.
+    """
+    safe_error_class: str | None
+    if error_class is None or error_class in _SAFE_ARG_ERROR_CLASSES:
+        safe_error_class = error_class
+    else:
+        safe_error_class = _REDACTED_ARG_ERROR_CLASS
+
+    projection: dict[str, object] = {
+        "_redaction_status": _ARG_ERROR_REDACTION_STATUS,
+        "error_class": safe_error_class,
+        "error_message": _summarize_arg_error_text(error_message, label="message"),
+    }
+    if result is not None:
+        result_projection: dict[str, object] = {"field_count": len(result)}
+        raw_error = result.get("error")
+        if isinstance(raw_error, str):
+            result_projection["error"] = _summarize_arg_error_text(raw_error, label="payload")
+        validation_errors = result.get("validation_errors")
+        if isinstance(validation_errors, (list, tuple)):
+            result_projection["validation_error_count"] = len(validation_errors)
+        projection["result"] = result_projection
+    return projection
+
+
+def redact_failure_response(
+    *,
+    status: str,
+    error_class: str | None,
+    error_message: str | None,
+) -> dict[str, object]:
+    """Return one status-specific, value-free failure persistence projection."""
+    if status == "cancelled":
+        return {
+            "_redaction_status": "cancelled",
+            "error_class": "CancelledError" if error_class == "CancelledError" else "<redacted-cancelled-class>",
+            "error_message": error_message if error_message in _SAFE_CANCELLATION_REASONS else "cancelled",
+        }
+    if status == "plugin_crash":
+        return {
+            "_redaction_status": "plugin_crash",
+            "error_class": error_class if error_class in _SAFE_PLUGIN_CRASH_CLASSES else _REDACTED_PLUGIN_CRASH_CLASS,
+            "error_message": _REDACTED_FAILURE_MESSAGE,
+        }
+    return {
+        "_redaction_status": "failure",
+        "error_class": "<redacted-failure-class>",
+        "error_message": _REDACTED_FAILURE_MESSAGE,
+    }
+
+
+def _coerce_external_response_value_to_summary(value: object) -> str | None:
+    """Pydantic pre-validator for open ToolResult payload carriers."""
+    if value is None:
+        return None
+    return _summarize_external_response_value(value)
+
+
+def _preserve_external_response_summary(value: str | None) -> str:
+    """Sensitive summarizer for an already value-free pre-validation summary."""
+    return _REDACTED_RESPONSE_NULL if value is None else value
+
+
+def _project_validated_response_scalars(
+    value: object,
+    *,
+    path: tuple[str, ...] = (),
+) -> object:
+    """Scrub free-form scalars after a response model validates structure.
+
+    Model validation makes mapping keys trusted schema vocabulary. Values
+    still require a separate disposition: a known field name does not make an
+    arbitrary provider/operator value safe. Closed booleans, public counters,
+    and validated status discriminants survive; other scalars are summarized.
+    """
+    if len(path) > RESPONSE_PROJECTION_MAX_DEPTH:
+        return _REDACTED_RESPONSE_VALUE
+    if isinstance(value, Mapping):
+        return {key: _project_validated_response_scalars(child, path=(*path, str(key))) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_project_validated_response_scalars(child, path=path) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_project_validated_response_scalars(child, path=path) for child in value)
+    if value is None or type(value) is bool:
+        return value
+
+    field_name = path[-1] if path else ""
+    if type(value) is int:
+        if field_name in _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS:
+            return value
+        return _REDACTED_RESPONSE_INTEGER
+    if type(value) is float:
+        return _REDACTED_RESPONSE_NUMBER
+    if isinstance(value, _TrustedRedactionSummary):
+        return value
+    if isinstance(value, str):
+        if value in _STABLE_RESPONSE_SENTINELS:
+            return value
+        safe_values = _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD.get(field_name)
+        if safe_values is not None and value in safe_values:
+            return value
+        return _summarize_external_response_value(value)
+    return _REDACTED_RESPONSE_VALUE
+
+
+def _project_untrusted_response_structure(
+    value: object,
+    *,
+    path: tuple[str, ...] = (),
+) -> object:
+    """Retain container shape without trusting arbitrary keys or scalars."""
+    if len(path) > RESPONSE_PROJECTION_MAX_DEPTH:
+        return _REDACTED_RESPONSE_VALUE
+    if isinstance(value, Mapping):
+        projected: dict[str, object] = {}
+        hidden_index = 0
+        for raw_key, child in value.items():
+            key = str(raw_key)
+            if key in _SAFE_UNTRUSTED_RESPONSE_STRUCTURE_KEYS:
+                projected_key = key
+            else:
+                hidden_index += 1
+                projected_key = f"_redacted_response_field_{hidden_index}"
+            projected[projected_key] = _project_untrusted_response_structure(
+                child,
+                path=(*path, projected_key),
+            )
+        return projected
+    if isinstance(value, list):
+        return [_project_untrusted_response_structure(child, path=path) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_project_untrusted_response_structure(child, path=path) for child in value)
+    if value is None or type(value) is bool:
+        return value
+    field_name = path[-1] if path else ""
+    if type(value) is int:
+        if field_name in _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS:
+            return value
+        return _REDACTED_RESPONSE_INTEGER
+    if type(value) is float:
+        return _REDACTED_RESPONSE_NUMBER
+    return _summarize_external_response_value(value)
+
 
 class _SensitiveMarker:
     """Annotated metadata marker (spec §4.2.2).
@@ -88,6 +433,13 @@ class _SensitiveMarker:
 def Sensitive(*, summarizer: Callable[[Any], str] | None = None) -> _SensitiveMarker:
     """Field-level annotation requesting redaction (§4.2.2)."""
     return _SensitiveMarker(summarizer=summarizer)
+
+
+_SafeResponseEnvelope = Annotated[
+    str | None,
+    BeforeValidator(_coerce_external_response_value_to_summary),
+    Sensitive(summarizer=_preserve_external_response_summary),
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -692,8 +1044,9 @@ class ToolRedactionPolicy:
       per-key response summarizers; argument_summarizers covers only
       argument keys).
     - Keys in ``known_response_keys`` that are NOT in
-      ``sensitive_response_keys`` → passthrough; the value reaches the
-      audit-table record unchanged.
+      ``sensitive_response_keys`` → a closed type/value projection. Public
+      framing values survive; externally derived keys and scalars are
+      summarized.
     - Keys in NEITHER set → substituted with the fixed sentinel
       ``REDACTED_UNKNOWN_RESPONSE_KEY``. This is the **fail-closed
       default**: a key the policy author did not declare is sentinel'd,
@@ -970,27 +1323,16 @@ def _summarize_interpretation_term(text: str) -> str:
     """Summarizer for ``request_interpretation_review.user_term`` and
     ``request_interpretation_review.llm_draft`` (F-34).
 
-    Returns the input collapsed to a fixed-form ``<interpretation-term:N-chars>``
-    or ``<interpretation-term:N-chars:truncated>`` shape where ``N`` is the
-    code-point length of the original string. The fixed-form scalar is
-    structurally distinguishable from the raw value at every reachable
-    input (including the empty string) so the redaction-completeness
-    property test can assert ``redacted_value != raw_value`` uniformly.
-
-    The 64-character truncation guard documented in the spec is preserved
-    via the ``:truncated`` suffix when the original exceeded the cap —
-    auditors can distinguish "long value redacted" from "short value
-    redacted" without seeing either. The authoritative value of the term
-    still lives in the ``interpretation_events`` row (``user_term`` /
-    ``llm_draft`` columns); the audit-side row in
-    ``chat_messages.tool_calls`` carries only this fixed-form scalar.
+    Returns a stable fixed sentinel with no value-derived length signal. The
+    authoritative text remains in the ``interpretation_events`` row; the
+    audit-side row in ``chat_messages.tool_calls`` carries only the sentinel.
 
     Naming follows ``_summarize_inline_blob_content`` (American
     spelling). Contract: MUST NOT raise on any reachable input; MUST
     return ``str``.
     """
-    truncated = ":truncated" if len(text) > 64 else ""
-    return f"<interpretation-term:{len(text)}-chars{truncated}>"
+    del text
+    return "<redacted-interpretation-text>"
 
 
 def _summarize_inline_blob_content(content: str) -> str:
@@ -1829,7 +2171,7 @@ def _redact_via_schema(
                 raise AuditIntegrityError(
                     f"Summarizer for {_tool_name!r} path {_path!r} returned {type(summary).__name__}, expected str (spec §4.2.6)."
                 )
-            return summary
+            return _TrustedRedactionSummary(summary)
 
         node.substitute_provider(dumped, _apply)
     return dumped
@@ -2387,17 +2729,20 @@ _GET_BLOB_METADATA_REASON = HandlesNoSensitiveDataReason(
 def _summarize_blob_content(content: str) -> str:
     """Summarizer for ``get_blob_content.content``.
 
-    Discloses only the byte-length of the UTF-8 encoded content, never the
-    bytes themselves.  Mirrors :func:`_summarize_inline_blob_content` in form
-    so the audit trail's content-length signal is uniform across blob-write
-    and blob-read tools (the LLM may funnel the same payload through
-    create_blob / update_blob / get_blob_content).
+    Collapses content to a stable fixed sentinel with no value-derived length
+    signal, so projecting an already-redacted response is idempotent.
 
     Contract (spec §4.2.6, §9 RSK-03):
       * MUST NOT raise on any reachable input value.
       * MUST return ``str``.
     """
-    return f"<blob-content:{len(content.encode('utf-8'))}-bytes>"
+    del content
+    return "<redacted-blob-content>"
+
+
+def _restore_fixed_repair_arguments_for_validation(value: object) -> object:
+    """Admit only our exact fixed sentinel on an idempotent second projection."""
+    return {} if value == "<redacted-repair-arguments>" else value
 
 
 def _summarize_repair_arguments(arguments: Mapping[str, object]) -> str:
@@ -2412,21 +2757,18 @@ def _summarize_repair_arguments(arguments: Mapping[str, object]) -> str:
     derived, advisory repair guidance — so summarizing it to a structural sketch
     in ``chat_messages.tool_calls`` does not break attributability.
 
-    The summary discloses only the SORTED argument key names, never their
-    values. Keys are pipeline-structural identifiers (e.g. ``field_path``,
-    ``node_id``) chosen by the composer's own repair planner, not operator
-    payload, so naming them is non-sensitive and aids audit readability.
+    The mapping is an open carrier: both keys and values may be externally
+    derived. The summary therefore discloses neither names, values, nor count.
 
     Contract (spec §4.2.6, §9 RSK-03):
       * MUST NOT raise on any reachable input value.
       * MUST return ``str``.
 
-    Pydantic's ``Mapping[str, object]`` validation guarantees a real mapping
-    with string keys before this runs, so ``sorted(arguments)`` cannot raise on
-    a mixed-key set. An empty mapping yields ``<repair-args:>`` which is a valid
-    structural signal (the repair tool takes no arguments).
+    Pydantic validation guarantees a mapping or the stable fixed sentinel
+    before this runs.
     """
-    return f"<repair-args:{','.join(sorted(arguments))}>"
+    del arguments
+    return "<redacted-repair-arguments>"
 
 
 class _RepairToolCallShadowModel(BaseModel):
@@ -2437,11 +2779,16 @@ class _RepairToolCallShadowModel(BaseModel):
     leaf in the entire ``get_blob_content`` validation envelope that cannot be
     closed-typed, so it carries a :class:`Sensitive` marker with a structural
     summarizer (:func:`_summarize_repair_arguments`). It is advisory repair
-    guidance, not source-data lineage, so summarizing its keys is sound.
+    guidance, not source-data lineage, so retaining only its key count is
+    sufficient for audit shape.
     """
 
     tool: str
-    arguments: Annotated[Mapping[str, object], Sensitive(summarizer=_summarize_repair_arguments)]
+    arguments: Annotated[
+        Mapping[str, object],
+        BeforeValidator(_restore_fixed_repair_arguments_for_validation),
+        Sensitive(summarizer=_summarize_repair_arguments),
+    ]
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2526,8 +2873,8 @@ class _ValidationEntryShadowModel(BaseModel):
     ``Severity`` literal alias to its string value); ``error_code`` is the
     closed machine-readable discriminant, emitted only when set, and
     ``contract`` the structured schema-contract facts, emitted only for the
-    schema-contract family. None carries operator payload — these are
-    composer-authored diagnostics about pipeline shape.
+    schema-contract family. The response scalar projection preserves the
+    closed severity value and summarizes all free-form diagnostic text.
     """
 
     component: str
@@ -2548,11 +2895,11 @@ class GetBlobContentValidationModel(BaseModel):
     :class:`GetBlobContentResponseModel`, which was an ``Any``-typed
     redaction-bypass surface the adequacy guard (§4.4.2) fails closed on.
 
-    The validation envelope is NON-sensitive pipeline-validation metadata, not
-    blob bytes, so the field as a whole is intentionally NOT marked Sensitive —
-    redacting it would wrongly strip useful diagnostics from the audit trail.
-    Every leaf here is a closed scalar EXCEPT the single
-    ``graph_repair_suggestions[*].tool_sequence[*].arguments`` mapping, which
+    The validation envelope is structural pipeline-validation metadata, not
+    blob bytes, so the field as a whole is intentionally NOT marked Sensitive.
+    A post-validation scalar projection preserves closed public framing while
+    summarizing free-form text. The
+    ``graph_repair_suggestions[*].tool_sequence[*].arguments`` mapping also
     carries its own Sensitive structural summarizer in
     :class:`_RepairToolCallShadowModel`.
     """
@@ -2691,6 +3038,29 @@ class GetBlobContentResponseModel(BaseModel):
     affected_nodes: list[str]
     version: int
     data: GetBlobContentDataModel | GetBlobContentFailureDataModel
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _ToolResultResponseModel(BaseModel):
+    """Fail-closed response projection shared by type-driven mutation tools.
+
+    Engine-owned ToolResult framing stays typed and queryable. Open payload
+    carriers are explicitly Sensitive and collapse to value-free shape
+    summaries, so new handler diagnostics cannot become persistence bypasses.
+    """
+
+    success: bool
+    validation: GetBlobContentValidationModel
+    affected_nodes: list[str]
+    version: int
+    data: _SafeResponseEnvelope = None
+    runtime_preflight: _SafeResponseEnvelope = None
+    validation_delta: _SafeResponseEnvelope = None
+    post_call_hints: _SafeResponseEnvelope = None
+    plugin_schemas: _SafeResponseEnvelope = None
+    pipeline_content_hash_schema: Literal["composer.pipeline-dispatch-result.v1"] | None = None
+    pipeline_content_hash: Annotated[str | None, Sensitive(summarizer=_summarize_external_response_value)] = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2916,18 +3286,45 @@ def _tool_result_response_keys(*, data: bool) -> tuple[str, ...]:
 MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
     {
         # set_source.
-        "set_source": ToolRedaction(argument_model=SetSourceArgumentsModel),
+        "set_source": ToolRedaction(
+            argument_model=SetSourceArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
         # blob-write tools.
-        "create_blob": ToolRedaction(argument_model=CreateBlobArgumentsModel),
-        "update_blob": ToolRedaction(argument_model=UpdateBlobArgumentsModel),
-        "set_source_from_blob": ToolRedaction(argument_model=SetSourceFromBlobArgumentsModel),
+        "create_blob": ToolRedaction(
+            argument_model=CreateBlobArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "update_blob": ToolRedaction(
+            argument_model=UpdateBlobArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "set_source_from_blob": ToolRedaction(
+            argument_model=SetSourceFromBlobArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
         # full-pipeline mutations.
-        "set_pipeline": ToolRedaction(argument_model=SetPipelineArgumentsModel),
-        "apply_pipeline_recipe": ToolRedaction(argument_model=ApplyPipelineRecipeArgumentsModel),
+        "set_pipeline": ToolRedaction(
+            argument_model=SetPipelineArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "apply_pipeline_recipe": ToolRedaction(
+            argument_model=ApplyPipelineRecipeArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
         # option-patch tools.
-        "patch_source_options": ToolRedaction(argument_model=PatchSourceOptionsArgumentsModel),
-        "patch_node_options": ToolRedaction(argument_model=PatchNodeOptionsArgumentsModel),
-        "patch_output_options": ToolRedaction(argument_model=PatchOutputOptionsArgumentsModel),
+        "patch_source_options": ToolRedaction(
+            argument_model=PatchSourceOptionsArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "patch_node_options": ToolRedaction(
+            argument_model=PatchNodeOptionsArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "patch_output_options": ToolRedaction(
+            argument_model=PatchOutputOptionsArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
         # _DISCOVERY_TOOLS, 12 declarative entries.
         "list_sources": ToolRedaction(
             policy=ToolRedactionPolicy(
@@ -3272,36 +3669,35 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
 )
 
 
-def _is_declarative_response_repair_arguments_path(path: tuple[str, ...]) -> bool:
-    if not path or path[-1] != "arguments":
-        return False
-    if path[0] == "validation" and "graph_repair_suggestions" in path and "tool_sequence" in path:
-        return True
-    return len(path) >= 3 and path[0] == "data" and path[1] == "repair"
-
-
-def _redact_declarative_known_response_value(value: Any, *, path: tuple[str, ...]) -> Any:
-    """Scrub nested repair-argument payloads inside declarative ToolResult keys.
-
-    Declarative response policies close only the top-level ToolResult envelope
-    (``success`` / ``validation`` / ``data`` / etc.). Some known envelopes carry
-    nested, open repair-tool-call argument mappings. Those are structurally
-    useful audit metadata, but the values can contain credential/config payload,
-    so they reuse the same structural ``<repair-args:...>`` summarizer as the
-    type-driven validation shadow model.
-    """
-    if _is_declarative_response_repair_arguments_path(path):
-        if isinstance(value, Mapping):
-            argument_keys: dict[str, object] = {str(key): child for key, child in value.items()}
-            return _summarize_repair_arguments(argument_keys)
-        return REDACTED_SENSITIVE_NO_SUMMARIZER
-    if isinstance(value, Mapping):
-        return {key: _redact_declarative_known_response_value(child, path=(*path, str(key))) for key, child in value.items()}
-    if isinstance(value, list):
-        return [_redact_declarative_known_response_value(item, path=(*path, "*")) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_declarative_known_response_value(item, path=(*path, "*")) for item in value)
-    return value
+def _redact_declarative_known_response_value(
+    value: Any,
+    *,
+    field_name: str,
+    tool_name: str,
+    telemetry: RedactionTelemetry,
+) -> Any:
+    """Apply a type/value disposition after declarative key admission."""
+    if field_name == "success":
+        return value if type(value) is bool else _summarize_external_response_value(value)
+    if field_name in _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS:
+        return value if type(value) is int else _summarize_external_response_value(value)
+    if field_name == "status":
+        if isinstance(value, str) and value in _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD["status"]:
+            return value
+        return _summarize_external_response_value(value)
+    if field_name == "validation" and isinstance(value, Mapping):
+        try:
+            validated = GetBlobContentValidationModel.model_validate(value)
+        except ValidationError:
+            return _summarize_external_response_value(value)
+        redacted = _redact_via_schema(
+            tool_name,
+            validated,
+            GetBlobContentValidationModel,
+            telemetry=telemetry,
+        )
+        return _project_validated_response_scalars(redacted)
+    return _project_untrusted_response_structure(value, path=(field_name,))
 
 
 def redact_tool_call_response(
@@ -3322,16 +3718,20 @@ def redact_tool_call_response(
       containing ``.``, ``[``, or ``{``.
 
     **Type-driven entry without response_model:**
-      No response-surface declared; return a shallow copy (passthrough).
+      Raise ``AuditIntegrityError``. A type-driven response without an
+      explicit projection is a manifest integrity defect and must never be
+      persisted.
 
     **Declarative entry:**
       Walk ``response.keys()``; each key is one of:
         - In ``policy.sensitive_response_keys`` → ``REDACTED_SENSITIVE_NO_SUMMARIZER``
           (declarative entries have no response_summarizers; the argument_summarizers
           mapping covers only argument keys).
-        - In ``policy.known_response_keys`` but not sensitive → passthrough after
-          bounded repair-guidance scrubbing.
-        - In neither → ``REDACTED_UNKNOWN_RESPONSE_KEY`` (fail-closed; counter fires).
+        - In ``policy.known_response_keys`` but not sensitive → closed
+          type/value projection; public framing survives while externally
+          derived keys and scalars are summarized.
+        - In neither → aggregate under ``REDACTED_UNKNOWN_RESPONSE_FIELD``
+          with ``REDACTED_UNKNOWN_RESPONSE_KEY`` (fail-closed; counter fires).
 
     **Failure modes (all raise AuditIntegrityError):**
       - Manifest entry missing for ``tool_name`` (registry-consistency invariant).
@@ -3352,28 +3752,43 @@ def redact_tool_call_response(
             "verify that the dispatch path passes the correct tool name."
         )
     entry = MANIFEST[tool_name]
+    telemetry.manifest_dispatch(
+        tool_name=tool_name,
+        shape="type_driven" if entry.argument_model is not None else "declarative",
+    )
+    if response == _RESPONSE_PROJECTION_LIMIT:
+        return dict(_RESPONSE_PROJECTION_LIMIT)
+    if not _response_within_projection_budget(response):
+        return dict(_RESPONSE_PROJECTION_LIMIT)
 
     # --- Type-driven path ---
     if entry.argument_model is not None:
         # Spec §4.2.4: manifest_dispatch is a per-invocation, walker-wide beacon.
         # Emit regardless of whether a response_model is declared — the dispatch
         # happened and the shape is type_driven in both sub-cases.
-        telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
         if entry.response_model is None:
-            # No response surface declared: nothing to redact.
-            return dict(response)
+            raise AuditIntegrityError(
+                f"Type-driven redaction entry {tool_name!r} has no response_model; refusing to persist an undeclared response surface."
+            )
         # Walk the response via its Pydantic model schema.
         # model_validate coerces the raw response dict to the declared shape;
         # unknown keys raise ValidationError if extra="forbid" is set on the
         # model, but that is a model-design choice, not enforced here.
         validated = entry.response_model.model_validate(response)
-        return _redact_via_schema(tool_name, validated, entry.response_model, telemetry=telemetry)
+        schema_redacted = _redact_via_schema(
+            tool_name,
+            validated,
+            entry.response_model,
+            telemetry=telemetry,
+        )
+        projected = _project_validated_response_scalars(schema_redacted)
+        assert isinstance(projected, Mapping)
+        return _bounded_projection_result({key: projected[key] for key in response})
 
     # --- Declarative path ---
     # entry.policy is not None (ToolRedaction.__post_init__ guarantees exactly
     # one of {argument_model, policy} is set).
     # Spec §4.2.4: emit the manifest_dispatch beacon for the declarative branch too.
-    telemetry.manifest_dispatch(tool_name=tool_name, shape="declarative")
     policy = entry.policy
     assert policy is not None  # offensive: satisfies the type-checker contract
 
@@ -3385,21 +3800,27 @@ def redact_tool_call_response(
             # the no-summarizer sentinel.
             redacted[key] = REDACTED_SENSITIVE_NO_SUMMARIZER
         elif key in policy.known_response_keys or key in _TOOL_RESULT_ENVELOPE_KEYS:
-            # Known, non-sensitive: preserve the declared ToolResult envelope
-            # while scrubbing nested repair-tool-call arguments.  The closed
+            # Known, non-sensitive: preserve the declared ToolResult structure
+            # while applying the closed type/value projection. The closed
             # dispatch-envelope keys are implicitly known for every
             # declarative entry — they are engine-produced framing (bool
             # success, structural validation summary, int state version),
             # never tool payload, and sentinel-ing them leaves audit rows
             # blind to every tool outcome.  ``data`` and all other keys stay
             # policy-declared / fail-closed.
-            redacted[key] = _redact_declarative_known_response_value(value, path=(key,))
+            redacted[key] = _redact_declarative_known_response_value(
+                value,
+                field_name=key,
+                tool_name=tool_name,
+                telemetry=telemetry,
+            )
         else:
-            # Unknown key: fail-closed sentinel + telemetry counter (W6).
-            redacted[key] = REDACTED_UNKNOWN_RESPONSE_KEY
+            # Unknown key: aggregate under a fixed field so externally supplied
+            # key names cannot become a second response-value channel.
+            redacted[REDACTED_UNKNOWN_RESPONSE_FIELD] = REDACTED_UNKNOWN_RESPONSE_KEY
             telemetry.unknown_response_key_redacted(tool_name=tool_name)
 
-    return redacted
+    return _bounded_projection_result(redacted)
 
 
 def redact_source_storage_path(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -3711,6 +4132,9 @@ class SpliceTransformArgumentsModel(BaseModel):
 MANIFEST = MappingProxyType(
     {
         **MANIFEST,
-        "splice_transform": ToolRedaction(argument_model=SpliceTransformArgumentsModel),
+        "splice_transform": ToolRedaction(
+            argument_model=SpliceTransformArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
     }
 )

@@ -23,6 +23,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 
 
 def _empty_state() -> CompositionState:
@@ -776,6 +777,151 @@ class TestDispatchTool:
         assert "blob_ref" not in options
         assert "mode" not in options
         assert options["schema"] == {"mode": "observed"}
+
+    def test_generate_yaml_projects_adjacent_state_through_public_boundary(self, scratch_dir: Path) -> None:
+        """The MCP result's adjacent state must be as public as its YAML data."""
+        private_values = {
+            "/private/blob-backed.csv",
+            "/private/explicit-null.csv",
+            "/private/path-only.csv",
+            "/private/nested.csv",
+            "/private/source-index",
+            "/private/vector-index",
+            "/private/node-input.csv",
+            "/private/blob-output.csv",
+            "/private/null-output.csv",
+            "/private/output.csv",
+            "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+            "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+            "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+        }
+        state = CompositionState(
+            sources={
+                "blob_backed": SourceSpec(
+                    plugin="csv",
+                    on_success="blob_out",
+                    options={
+                        "path": "/private/blob-backed.csv",
+                        "blob_ref": "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "explicit_null": SourceSpec(
+                    plugin="csv",
+                    on_success="null_out",
+                    options={
+                        "path": "/private/explicit-null.csv",
+                        "blob_ref": None,
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "path_only": SourceSpec(
+                    plugin="csv",
+                    on_success="pass_in",
+                    options={
+                        "file": "/private/path-only.csv",
+                        SOURCE_AUTHORING_KEY: {
+                            "path": "/private/nested.csv",
+                            "blob_ref": "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+                        },
+                        "custody": {
+                            "persist_directory": "/private/source-index",
+                            "blob_id": "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+                        },
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+            },
+            nodes=(
+                NodeSpec(
+                    id="pass",
+                    node_type="transform",
+                    plugin="llm",
+                    input="pass_in",
+                    on_success="main",
+                    on_error="discard",
+                    options={
+                        "profile": "operator-owned-alias",
+                        "prompt_template": "{{ lookup.path }} {{ lookup.file }} {{ lookup.mode }}",
+                        "lookup": {
+                            "path": "north",
+                            "file": "case.txt",
+                            "mode": "bind_source",
+                            "safe": "kept",
+                        },
+                        "provider_config": {
+                            "persist_directory": "/private/vector-index",
+                            "nested": {"path": "/private/node-input.csv"},
+                        },
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="blob_out",
+                    plugin="csv",
+                    options={
+                        "path": "/private/blob-output.csv",
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                ),
+                OutputSpec(
+                    name="null_out",
+                    plugin="csv",
+                    options={
+                        "path": "/private/null-output.csv",
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                ),
+                OutputSpec(
+                    name="main",
+                    plugin="csv",
+                    options={
+                        "path": "/private/output.csv",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = _dispatch_session_once("generate_yaml", {}, state, scratch_dir)
+        serialized = yaml.safe_dump(result)
+
+        assert result["success"] is True, result
+        assert all(value not in serialized for value in private_values)
+        assert "blob_ref" not in serialized
+        assert "blob_id" not in serialized
+        assert SOURCE_AUTHORING_KEY not in serialized
+        assert set(result["state"]["sources"]) == {"blob_backed", "explicit_null", "path_only"}
+        assert all(source["plugin"] == "csv" for source in result["state"]["sources"].values())
+        expected_lookup = {
+            "path": "north",
+            "file": "case.txt",
+            "mode": "bind_source",
+            "safe": "kept",
+        }
+        assert result["state"]["nodes"][0]["options"]["lookup"] == expected_lookup
+        assert yaml.safe_load(result["data"])["transforms"][0]["options"]["lookup"] == expected_lookup
 
     def test_generate_yaml_rejects_state_missing_file_sink_collision_policy(self, scratch_dir: Path) -> None:
         state = CompositionState(

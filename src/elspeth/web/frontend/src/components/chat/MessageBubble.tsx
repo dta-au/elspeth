@@ -1,5 +1,5 @@
 // src/components/chat/MessageBubble.tsx
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import type {
   ChatMessage,
   CompositionProposal,
@@ -57,6 +57,13 @@ export function MessageBubble({
   const [toolsExpanded, setToolsExpanded] = useState(false);
   const hasToolCalls = !!(message.tool_calls && message.tool_calls.length > 0);
   const hasSourcesCreated = !!(sourcesCreated && sourcesCreated.length > 0);
+  const visibleSegments = useMemo(
+    () =>
+      message.segments ?? [
+        { kind: "text" as const, content: message.content },
+      ],
+    [message.content, message.segments],
+  );
   const [copied, setCopied] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(message.content);
@@ -69,13 +76,20 @@ export function MessageBubble({
 
   const handleCopy = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(message.content);
+      const plainText = visibleSegments
+        .map((segment) =>
+          segment.kind === "trusted_system_notice"
+            ? `System note: ${segment.content}`
+            : segment.content,
+        )
+        .join("\n\n");
+      await navigator.clipboard.writeText(plainText);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
       // Clipboard API may fail in insecure contexts
     }
-  }, [message.content]);
+  }, [visibleSegments]);
 
   const handleEditStart = useCallback(() => {
     setEditContent(message.content);
@@ -186,10 +200,26 @@ export function MessageBubble({
               </button>
             </div>
           </div>
-        ) : isUser ? (
-          message.content
         ) : (
-          <MarkdownRenderer content={message.content} />
+          visibleSegments.map((segment, index) =>
+            segment.kind === "trusted_system_notice" ? (
+              <div
+                key={`trusted-system-notice-${index}`}
+                className="trusted-system-notice"
+                role="status"
+              >
+                <span className="sr-only">System note:</span>
+                <MarkdownRenderer content={segment.content} />
+              </div>
+            ) : isUser ? (
+              <span key={`message-text-${index}`}>{segment.content}</span>
+            ) : (
+              <MarkdownRenderer
+                key={`message-text-${index}`}
+                content={segment.content}
+              />
+            ),
+          )
         )}
 
         {/* Edit/fork button — user messages only, not pending/failed */}

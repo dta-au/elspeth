@@ -58,7 +58,10 @@ from elspeth.web.composer.tools import (
     validate_composer_file_sink_collision_policy,
 )
 from elspeth.web.composer.tools._dispatch import _validate_tool_arguments
-from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.composer.yaml_generator import (
+    generate_public_composition_dict,
+    generate_public_yaml,
+)
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
     RuntimePreflightFailure,
@@ -591,7 +594,7 @@ def _dispatch_session_tool(
             return {
                 "success": False,
                 "error": control_error,
-                "state": state.to_dict(),
+                "state": generate_public_composition_dict(state),
             }
         validation = state.validate()
         if not validation.is_valid:
@@ -599,13 +602,13 @@ def _dispatch_session_tool(
                 "success": False,
                 "error": "Current composition state is invalid. Fix validation errors before calling generate_yaml.",
                 "validation": _validation_to_dict(validation),
-                "state": state.to_dict(),
+                "state": generate_public_composition_dict(state),
             }
         yaml_str = generate_public_yaml(state)
         return {
             "success": True,
             "data": yaml_str,
-            "state": state.to_dict(),
+            "state": generate_public_composition_dict(state),
         }
 
     # Should not be reachable — _SESSION_TOOL_NAMES is derived from
@@ -837,7 +840,12 @@ def create_server(
             try:
                 if "state" in result_dict:
                     new_state = CompositionState.from_dict(result_dict["state"])
-                    state_ref[0] = new_state
+                    # generate_yaml is a read-only public-export operation.
+                    # Its adjacent state is intentionally the scrubbed public
+                    # projection, so never replace the private working state
+                    # with that projection after validating its wire shape.
+                    if name != "generate_yaml":
+                        state_ref[0] = new_state
                     # Capture baseline when session is created or loaded.
                     # load_session can return success=False on SessionNotFoundError;
                     # in that case, leave session_id_ref unchanged so the scratch
@@ -857,7 +865,10 @@ def create_server(
                         active_checkout = session_checkout_ref[0]
                         clear_session_after_audit = active_checkout is not None and active_checkout.session_id == deleted_sid
                     # B4: Redact storage paths from the response sent to the agent.
-                    result_dict["state"] = redact_source_storage_path(result_dict["state"])
+                    if name == "generate_yaml":
+                        result_dict["state"] = generate_public_composition_dict(state_ref[0])
+                    else:
+                        result_dict["state"] = redact_source_storage_path(result_dict["state"])
                 response_text = json.dumps(result_dict, indent=2)
             except (KeyError, TypeError, ValueError) as readback_exc:
                 # Tier-1 read-back failure on our own dispatch output.

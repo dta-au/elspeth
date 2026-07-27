@@ -21,7 +21,6 @@ from elspeth.contracts.plugin_protocols import SinkProtocol, SourceProtocol, Tra
 from elspeth.contracts.secrets import SecretInventoryItem
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.sink_effect_diagnostics import load_sink_effect_recovery_history
-from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.audit_readiness.models import (
     AuditReadinessSnapshot,
     PluginPolicyReadinessRow,
@@ -528,10 +527,6 @@ class ReadinessService:
         composition_state_id: UUID = record.id
         state: CompositionState = self._state_from_record(record)
         validation = await self._execution_service.validate_state(state, user_id=user_id, session_id=session_id)
-        inventory = await run_sync_in_worker(
-            self._scoped_secret_resolver.list_refs,
-            user_id,  # scoped_secret_resolver.list_refs takes user_id only
-        )
         # Pre-fetch interpretation-event signal for the llm_interpretations
         # row. Two separate reads because:
         #
@@ -576,7 +571,7 @@ class ReadinessService:
                 opted_out=opted_out,
                 events=interpretation_events,
             ),
-            _build_secrets_row(validation, inventory),
+            _build_secrets_row(validation),
         )
         policy_readiness = None
         if self._web_plugin_policy is not None and self._plugin_snapshot_factory is not None:
@@ -1001,7 +996,7 @@ def _build_llm_interpretations_row(
 _SECRET_ERROR_CODES: frozenset[str] = frozenset({"missing_secret_ref", "fabricated_secret", "disallowed_secret_ref"})
 
 
-def _build_secrets_row(validation: ValidationResult, inventory: list[SecretInventoryItem]) -> ReadinessRow:
+def _build_secrets_row(validation: ValidationResult) -> ReadinessRow:
     """error/ok/not_applicable per secret ref resolution.
     Keyed on ValidationError.error_code, not message substring.
     """
@@ -1020,15 +1015,6 @@ def _build_secrets_row(validation: ValidationResult, inventory: list[SecretInven
         None,
     )
     if secret_check is not None and secret_check.outcome_code == CHECK_OUTCOME_SECRET_REFS_NO_REFS:
-        return ReadinessRow(
-            id="secrets",
-            label="Secrets",
-            status="not_applicable",
-            summary="No secret references in this composition",
-            detail=None,
-            component_ids=(),
-        )
-    if secret_check is None and not inventory:
         return ReadinessRow(
             id="secrets",
             label="Secrets",
@@ -1065,7 +1051,9 @@ def _build_secrets_row(validation: ValidationResult, inventory: list[SecretInven
         label="Secrets",
         status="ok",
         summary="All secret references resolve",
-        detail=(f"{len(inventory)} secret(s) in your inventory" if inventory else "Composition references no secrets"),
+        # Readiness is composition-scoped. Owner-global inventory size is
+        # unrelated to this pipeline and must not perturb share snapshots.
+        detail=None,
         component_ids=(),
     )
 

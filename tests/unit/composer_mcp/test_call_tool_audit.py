@@ -22,6 +22,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.composer_mcp.server import create_server
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.dependencies import create_catalog_service
 
@@ -280,6 +281,33 @@ async def test_arg_error_payload_recorded_for_audit_replay() -> None:
     payload = _json.loads(inv.result_canonical)
     assert payload["isError"] is True
     assert "session_id" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_reflectively_corrupted_tool_argument_error_is_safe_in_mcp_and_audit() -> None:
+    """MCP's existing args consumer sees the closed read projection."""
+    canary = "MCP_TOOL_ARGUMENT_PRIVATE_CANARY_sk_live_4Nf7_/etc/private"
+    exc = ToolArgumentError(
+        argument="session_id",
+        expected="a 12-character lowercase hex string",
+        actual_type="invalid_session_id",
+    )
+    for name in ("_safe_argument", "_safe_expected", "_safe_actual_type", "_safe_code"):
+        BaseException.__setattr__(exc, name, canary)
+    BaseException.__setattr__(exc, "_tool_argument_error_sealed", False)
+
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        probe = _ProbeRecorder()
+        server = create_server(catalog, Path(td), recorder=probe)
+        with patch("elspeth.composer_mcp.server._dispatch_tool", side_effect=exc):
+            response = await _call_handler(server.request_handlers, "load_session", {"session_id": "bad"})
+
+    response_text = response.root.content[0].text
+    audit_text = probe.invocations[0].result_canonical
+    assert canary not in response_text
+    assert audit_text is not None
+    assert canary not in audit_text
 
 
 @pytest.mark.asyncio

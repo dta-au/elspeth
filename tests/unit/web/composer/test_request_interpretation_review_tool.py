@@ -51,6 +51,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.composer.tool_error_payloads import arg_error_payload
 from elspeth.web.composer.tools import (
     _BLOB_DISCOVERY_TOOLS,
     _BLOB_MUTATION_TOOLS,
@@ -69,6 +70,7 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools.sessions import (
     DUPLICATE_RESOLVED_INTERPRETATION_CODE,
     _assert_affected_component,
+    _find_node_or_raise,
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -1241,6 +1243,19 @@ def test_03_missing_affected_node_id_raises() -> None:
         _assert_affected_component(state, "absent_node", InterpretationKind.VAGUE_TERM, "cool")
 
 
+def test_03b_missing_affected_node_canary_is_absent_from_payload_and_args() -> None:
+    """A real dynamic producer cannot copy its model-supplied id downstream."""
+    canary = "TOOL_ARGUMENT_NODE_CANARY_sk_live_6Nz2"
+    state = _state_with(_llm_node(node_id="present_node"))
+
+    with pytest.raises(ToolArgumentError) as exc_info:
+        _find_node_or_raise(state, canary)
+
+    payload = arg_error_payload(exc_info.value, "request_interpretation_review")
+    serialized = repr({"args": exc_info.value.args, "payload": payload})
+    assert canary not in serialized
+
+
 def test_04_wrong_kind_node_raises() -> None:
     """Spec test 4: node with non-LLM plugin raises ToolArgumentError."""
     non_llm = NodeSpec(
@@ -1361,7 +1376,7 @@ def test_pipeline_decision_boundary_rejects_raw_html_mapping_preservation() -> N
     }
     state = _state_with(replace(node, options=options))
 
-    with pytest.raises(ToolArgumentError, match=r"preserves raw HTML/fingerprint field"):
+    with pytest.raises(ToolArgumentError, match=r"without preserved raw HTML/fingerprint fields"):
         _assert_affected_component(state, "drop_raw_html", InterpretationKind.PIPELINE_DECISION, "drop_raw_html_fields")
 
 
@@ -1380,7 +1395,7 @@ def test_pipeline_decision_boundary_rejects_custom_raw_field_preservation() -> N
         fingerprint_field="page_hash",
     )
 
-    with pytest.raises(ToolArgumentError, match=r"page_body|page_hash"):
+    with pytest.raises(ToolArgumentError, match=r"without preserved raw HTML/fingerprint fields"):
         _assert_affected_component(state, "drop_raw_html", InterpretationKind.PIPELINE_DECISION, "drop_raw_html_fields")
 
 

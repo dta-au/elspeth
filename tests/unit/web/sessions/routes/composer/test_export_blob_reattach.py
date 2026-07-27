@@ -2,12 +2,11 @@
 
 A guided blob-backed source has ``blob_ref`` stripped from its committed
 options (the manual set_source path can't prove ``path == storage_path``); it
-survives only in the schema-8 GuidedSession ``reviewed_sources`` snapshot. The export
-sidecar and the public-YAML path-omit both key off ``source.options["blob_ref"]``,
-so without reattachment the export leaks the raw storage path AND emits no
-``source_blob_ids`` (breaking the re-import round-trip). This helper reconstitutes
-``blob_ref`` into the export's working copy from the snapshot, mirroring the
-cross-reference in redact_guided_snapshot_storage_paths.
+survives only in the schema-8 GuidedSession ``reviewed_sources`` snapshot. Public
+export custody verification and path omission key off
+``source.options["blob_ref"]``. This helper reconstitutes ``blob_ref`` into the
+private export working copy from the snapshot, mirroring the cross-reference in
+redact_guided_snapshot_storage_paths; the public response still omits the UUID.
 """
 
 from __future__ import annotations
@@ -109,7 +108,7 @@ def test_rejects_public_blob_sentinel_that_differs_from_retained_blob_ref() -> N
         _reattach_guided_blob_refs(state)
 
 
-def test_reattached_state_omits_path_and_yields_sidecar() -> None:
+def test_reattached_state_omits_path_and_blob_identity_from_public_projection() -> None:
     state = _state(
         source_options={"path": BLOB_PATH, "schema": {"mode": "observed"}},
         guided_session=_guided_with_snapshot(blob_ref=BLOB_REF, path=BLOB_PATH),
@@ -121,9 +120,9 @@ def test_reattached_state_omits_path_and_yields_sidecar() -> None:
     src_opts = doc["sources"]["source"]["options"]
     assert "path" not in src_opts
     assert "blob_ref" not in src_opts
-    # The export sidecar comprehension now finds a blob_ref to emit.
-    sidecar = {name: str(s.options["blob_ref"]) for name, s in out.sources.items() if "blob_ref" in s.options}
-    assert sidecar == {"source": BLOB_REF}
+    # Reattachment remains private input to custody verification and projection.
+    assert out.sources["source"].options["blob_ref"] == BLOB_REF
+    assert BLOB_REF not in repr(src_opts)
 
 
 def test_untouched_without_guided_session() -> None:
@@ -149,7 +148,7 @@ def test_rejects_operator_typed_source_reusing_reviewed_name() -> None:
         _reattach_guided_blob_refs(state)
 
 
-def test_exited_guided_session_does_not_shadow_freeform_source_replacement() -> None:
+def test_exited_guided_session_does_not_leak_freeform_source_replacement() -> None:
     freeform_path = "/tmp/operator/replacement.csv"
     guided = replace(
         _guided_with_snapshot(blob_ref=BLOB_REF, path=BLOB_PATH),
@@ -165,11 +164,12 @@ def test_exited_guided_session_does_not_shadow_freeform_source_replacement() -> 
     )
 
     assert _reattach_guided_blob_refs(state) is state
-    assert generate_public_pipeline_dict(state)["sources"]["source"]["options"] == {
-        "path": freeform_path,
+    public_options = generate_public_pipeline_dict(state)["sources"]["source"]["options"]
+    assert public_options == {
         "schema": {"mode": "observed"},
         "on_validation_failure": "discard",
     }
+    assert freeform_path not in repr(public_options)
 
 
 def test_completed_guided_session_retains_reviewed_source_authority() -> None:

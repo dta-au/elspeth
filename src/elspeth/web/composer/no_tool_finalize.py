@@ -17,7 +17,13 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.no_tool_policy import (
+    PipelineMutationIntentDecision as _PipelineMutationIntentDecision,
+)
+from elspeth.web.composer.no_tool_policy import (
     blocking_result_from_tool_invocations as _blocking_result_from_tool_invocations,
+)
+from elspeth.web.composer.no_tool_policy import (
+    classify_pipeline_mutation_intent as _classify_pipeline_mutation_intent,
 )
 from elspeth.web.composer.no_tool_policy import (
     compose_empty_state_message as _compose_empty_state_message,
@@ -39,9 +45,6 @@ from elspeth.web.composer.no_tool_policy import (
 )
 from elspeth.web.composer.no_tool_policy import (
     state_is_structurally_empty as _state_is_structurally_empty,
-)
-from elspeth.web.composer.no_tool_policy import (
-    user_request_expects_pipeline_mutation as _user_request_expects_pipeline_mutation,
 )
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.state import CompositionState
@@ -157,7 +160,7 @@ async def finalize_no_tool_response(
     path — they are not caught here.
     """
     if (
-        _user_request_expects_pipeline_mutation(user_message)
+        _classify_pipeline_mutation_intent(user_message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
         and not mutation_success_seen
         and _state_is_structurally_empty(state)
         and not _last_mutation_was_pending_proposal(tool_invocations)

@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, final
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -536,6 +536,275 @@ class ComposerRuntimePreflightError(ComposerServiceError):
         )
 
 
+_TOOL_ARGUMENT_ERROR_CODES = frozenset(
+    {
+        "DISCOVERY_ONLY",
+        "DUPLICATE_RESOLVED_INTERPRETATION",
+        "RATE_CAP_PER_SESSION_DAY",
+        "RATE_CAP_PER_TERM",
+        "SCHEMA_VALIDATION",
+    }
+)
+
+_MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS = 4096
+
+_SAFE_TOOL_ARGUMENT_NAMES = frozenset(
+    {
+        "affected_node_id",
+        "apply_pipeline_recipe arguments",
+        "clear_source arguments",
+        "composition_state_id",
+        "content",
+        "create_blob arguments",
+        "filename",
+        "inspect_source arguments",
+        "kind",
+        "llm_draft",
+        "mime_type",
+        "name",
+        "nodes[].options.prompt_template",
+        "patch_node_options arguments",
+        "patch_output_options arguments",
+        "patch_source_options arguments",
+        "plugin",
+        "remove_edge arguments",
+        "remove_node arguments",
+        "remove_output arguments",
+        "request_interpretation_review arguments",
+        "set_metadata arguments",
+        "set_output arguments",
+        "set_pipeline arguments",
+        "set_source arguments",
+        "set_source_from_blob arguments",
+        "session_id",
+        "source_name",
+        "splice_transform arguments",
+        "tool_name",
+        "upsert_edge arguments",
+        "upsert_node arguments",
+        "update_blob arguments",
+        "update_blob content",
+        "user_term",
+        "validate_secret_ref arguments",
+        "wire_secret_ref arguments",
+    }
+)
+
+_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS = MappingProxyType(
+    {
+        "apply_pipeline_recipe arguments": "object conforming to ApplyPipelineRecipeArgumentsModel",
+        "create_blob arguments": "object conforming to CreateBlobArgumentsModel",
+        "inspect_source arguments": "object conforming to InspectSourceArgumentsModel",
+        "patch_node_options arguments": "object conforming to PatchNodeOptionsArgumentsModel",
+        "patch_output_options arguments": "object conforming to PatchOutputOptionsArgumentsModel",
+        "patch_source_options arguments": "object conforming to PatchSourceOptionsArgumentsModel",
+        "remove_edge arguments": "object conforming to _RemoveByIdArgumentsModel",
+        "remove_node arguments": "object conforming to _RemoveByIdArgumentsModel",
+        "remove_output arguments": "object conforming to _RemoveOutputArgumentsModel",
+        "request_interpretation_review arguments": "object conforming to _RequestInterpretationReviewArgumentsModel",
+        "set_metadata arguments": "object conforming to _SetMetadataArgumentsModel",
+        "set_output arguments": "object conforming to _SetOutputArgumentsModel",
+        "set_pipeline arguments": "object conforming to SetPipelineArgumentsModel",
+        "set_source arguments": "object conforming to SetSourceArgumentsModel",
+        "set_source_from_blob arguments": "object conforming to SetSourceFromBlobArgumentsModel",
+        "splice_transform arguments": "object conforming to SpliceTransformArgumentsModel",
+        "upsert_edge arguments": "object conforming to _UpsertEdgeArgumentsModel",
+        "upsert_node arguments": "object conforming to _UpsertNodeArgumentsModel",
+        "update_blob arguments": "object conforming to UpdateBlobArgumentsModel",
+        "validate_secret_ref arguments": "object conforming to _ValidateSecretRefArgumentsModel",
+        "wire_secret_ref arguments": "object conforming to _WireSecretRefArgumentsModel",
+    }
+)
+
+_SAFE_TOOL_ARGUMENT_EXPECTATIONS = frozenset(
+    {
+        "'source' for invented_source or 'source:<name>' for a named source",
+        "a declared read-only discovery tool",
+        (
+            "a fresh interpretation review (this kind+user_term+affected_node_id "
+            "tuple has already been resolved in this composition branch — carry "
+            "the resolved value forward, do not re-stage)"
+        ),
+        "a non-empty string",
+        "a 12-character lowercase hex string",
+        (
+            "a persisted composition state; call set_pipeline or another "
+            "state-staging tool successfully, wait for its tool result, "
+            "then call request_interpretation_review"
+        ),
+        "a sanitizable filename (no path separators, non-empty after stripping)",
+        "a string",
+        "a valid composer source name",
+        "content that does not match a known credential shape",
+        "content without template metacharacters, control characters, or credential patterns",
+        "id of a node whose plugin is 'llm'",
+        "only the optional 'source_name' key",
+        "source artifact content without template metacharacters, credential patterns, or non-printable controls",
+        "source with composer-authored source metadata",
+        "the exact source review requirement draft staged in source.options.interpretation_requirements",
+        "vague_term, invented_source, pipeline_decision, or llm_model_choice",
+        "valid UTF-8 text",
+        "well-formed interpretation authoring metadata",
+        "a valid value",
+        "an object conforming to the declared argument schema",
+        "a pipeline decision without preserved raw HTML/fingerprint fields",
+        "a pending interpretation requirement",
+        "a pending interpretation requirement or placeholder",
+        "id of an existing LLM transform",
+        "one of: the allowed values",
+        "prompt_template_parts interpretation_ref or placeholder wiring",
+        "the current non-empty options.model",
+        "the current non-empty options.prompt_template",
+        "within the per session per UTC day interpretation request limit",
+        "within the per-term interpretation request limit",
+    }
+) | frozenset(_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values())
+
+_SAFE_TOOL_ARGUMENT_EXPECTATIONS = _SAFE_TOOL_ARGUMENT_EXPECTATIONS | frozenset(
+    f"a pending {kind} interpretation requirement{suffix}"
+    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term")
+    for suffix in ("", " or placeholder")
+)
+
+_SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = frozenset(
+    {
+        "credential-shaped content rejected at the tool boundary",
+        "invalid_schema",
+        "invalid_session_id",
+        "invented_source event draft does not match the source review requirement draft",
+        "llm_prompt_template — surfaced automatically by the backend at turn finalization; do not request it",
+        "missing",
+        "missing current_state_id",
+        "mutation_or_unknown",
+        "node id",
+        "pending vague_term requirement with no resolvable prompt wiring (the operator's resolve would dead-end)",
+        "pipeline_decision node that failed semantic review",
+        "re-staging an already-resolved interpretation review",
+        "rejected by accepted-value content validator",
+        "rejected by source-artifact content validator",
+        "source without metadata",
+        "stale model-choice draft",
+        "stale prompt-template draft",
+        "str (contained non-encodable character, e.g. surrogate)",
+        "unexpected extra keys",
+        "interpretation request limit exceeded",
+        "invalid interpretation metadata",
+        "invalid model state",
+        "invalid prompt_template state",
+        "invalid value",
+        "missing pending interpretation review site",
+        "missing value",
+        "node with incompatible plugin",
+        "unknown id",
+    }
+)
+
+_SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES | frozenset(
+    f"missing pending {kind} review site"
+    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term")
+)
+
+_SAFE_TOOL_ARGUMENT_TYPE_NAMES = frozenset(
+    {
+        "NoneType",
+        "PydanticValidationError",
+        "ValidationError",
+        "bool",
+        "bytes",
+        "dict",
+        "float",
+        "int",
+        "list",
+        "mappingproxy",
+        "str",
+        "tuple",
+    }
+)
+
+
+def _canonical_tool_argument_name(value: object) -> str:
+    """Return only a schema-owned argument label."""
+    if type(value) is not str or not value or len(value) > _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS:
+        return "tool argument"
+    if value in _SAFE_TOOL_ARGUMENT_NAMES:
+        return value
+    if value.endswith(" arguments"):
+        return "tool arguments"
+    return "tool argument"
+
+
+def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
+    """Map caller prose to an operator-owned, bounded expectation."""
+    if type(value) is not str or not value or len(value) > _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS:
+        return "a valid value"
+    if value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS:
+        return value
+
+    lowered = value.casefold()
+    if "object conforming to" in lowered:
+        return _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.get(
+            argument,
+            "an object conforming to the declared argument schema",
+        )
+    if "per session per utc day" in lowered:
+        return "within the per session per UTC day interpretation request limit"
+    if "per term" in lowered and ("at most" in lowered or "limit" in lowered):
+        return "within the per-term interpretation request limit"
+    if "prompt_template_parts" in lowered or "interpretation_ref" in lowered:
+        return "prompt_template_parts interpretation_ref or placeholder wiring"
+    if "preserves raw html/fingerprint field" in lowered:
+        return "a pipeline decision without preserved raw HTML/fingerprint fields"
+    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term"):
+        if "pending" in lowered and kind in lowered:
+            if "placeholder" in lowered:
+                return f"a pending {kind} interpretation requirement or placeholder"
+            return f"a pending {kind} interpretation requirement"
+    if "pending" in lowered and "placeholder" in lowered:
+        return "a pending interpretation requirement or placeholder"
+    if "pending" in lowered and "requirement" in lowered:
+        return "a pending interpretation requirement"
+    if "existing llm transform" in lowered:
+        return "id of an existing LLM transform"
+    if "options.prompt_template" in lowered:
+        return "the current non-empty options.prompt_template"
+    if "options.model" in lowered:
+        return "the current non-empty options.model"
+    if "one of:" in lowered:
+        return "one of: the allowed values"
+    return "a valid value"
+
+
+def _canonical_tool_argument_actual_type(value: object) -> str:
+    """Map caller diagnostics to a closed, value-free failure category."""
+    if type(value) is not str or not value or len(value) > _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS:
+        return "invalid value"
+    if value in _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES or value in _SAFE_TOOL_ARGUMENT_TYPE_NAMES:
+        return value
+
+    lowered = value.casefold()
+    if "unknown id" in lowered:
+        return "unknown id"
+    if "plugin" in lowered:
+        return "node with incompatible plugin"
+    if "invalid interpretation metadata" in lowered:
+        return "invalid interpretation metadata"
+    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term"):
+        if "missing pending" in lowered and kind in lowered:
+            return f"missing pending {kind} review site"
+    if "missing pending" in lowered:
+        return "missing pending interpretation review site"
+    if "prompt_template" in lowered:
+        return "invalid prompt_template state"
+    if "options.model" in lowered:
+        return "invalid model state"
+    if "cap" in lowered or "limit" in lowered or "would record" in lowered:
+        return "interpretation request limit exceeded"
+    if "missing" in lowered:
+        return "missing value"
+    return "invalid value"
+
+
+@final
 class ToolArgumentError(Exception):
     """Raised by a tool handler when LLM-supplied arguments are unusable.
 
@@ -573,32 +842,35 @@ class ToolArgumentError(Exception):
     attacker-controlled strings, because Tier-3 argument values are
     by definition untrusted.
 
-    To make that leak structurally impossible, this class accepts ONLY
-    three keyword-only, safe-by-construction fields:
+    To make that leak structurally impossible, this class accepts only
+    keyword-only fields and canonicalizes them at construction:
 
-    - ``argument``: the parameter name as declared in the tool schema
-      (operator-chosen — safe for echo/audit).
-    - ``expected``: a brief description of the required shape, e.g.
-      ``"a string"`` or ``"a non-empty list"`` (operator-chosen — safe).
-    - ``actual_type``: typically ``type(value).__name__`` — carries
-      only the class name, never the value.
+    - ``argument`` is reduced to a closed schema-owned label.
+    - ``expected`` and ``actual_type`` are reduced to fixed,
+      operator-owned descriptions and failure categories.
+    - ``code`` is either ``None`` or one of the closed internal
+      discriminants used by dispatch.
 
-    There is deliberately no field that can carry the LLM-supplied
-    value. The ``__cause__`` chain still carries full debugging
-    context for auditors (inspectable via ``exc.__cause__`` on the
-    captured exception record) but is NEVER echoed to the LLM: the
-    compose loop reads ``exc.args[0]`` only, and ``args[0]`` is
-    composed from the structured fields above.
+    The projected ``safe_message`` and ``BaseException.args`` are
+    composed on every read from private canonical values. Their data
+    descriptors absorb deliberate ``BaseException.__setattr__`` writes
+    instead of trusting reflected public storage. Private backing slots
+    are themselves revalidated on every read, with fixed fallbacks when
+    missing, malformed, or outside the closed vocabulary. The class rejects
+    subclassing so a hostile override cannot replace those projections.
+    Construction never retains an LLM-supplied value. The ``__cause__``
+    chain remains available to in-process diagnostics, but serializers
+    must never echo it.
 
-    The three declared fields are frozen after construction, matching
+    The declared fields are frozen after construction, matching
     the pattern used by ``ComposerConvergenceError`` and
     ``ComposerPluginCrashError``: each exception flows into an
     immutable audit artefact, so allowing post-construction mutation
     would let an intermediate layer silently rewrite what downstream
     consumers see. Exception-chain dunders
-    (``__cause__``/``__context__``/``__traceback__``/``__notes__``)
-    remain writable so ``raise ... from ...`` and ``add_note()`` work
-    normally.
+    (``__cause__``/``__context__``/``__suppress_context__``/
+    ``__traceback__``) remain writable for Python's raise machinery.
+    Free-form notes and unknown attributes are rejected.
 
     Usage::
 
@@ -613,7 +885,46 @@ class ToolArgumentError(Exception):
     audit, without leaking into the LLM echo.
     """
 
-    _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset({"argument", "expected", "actual_type", "code"})
+    # Slots keep the canonical backing fields out of BaseException's
+    # instance dict, so even deliberate reflective replacement cannot
+    # surface the replacement through ``vars(exc)``. The legacy seal slot
+    # remains as a compatibility target, but the write guard deliberately
+    # does not consult it: resetting or deleting it cannot reopen mutation.
+    __slots__ = (
+        "_safe_actual_type",
+        "_safe_argument",
+        "_safe_code",
+        "_safe_expected",
+        "_tool_argument_error_sealed",
+    )
+
+    _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "_safe_actual_type",
+            "_safe_argument",
+            "_safe_code",
+            "_safe_expected",
+            "_tool_argument_error_sealed",
+            "actual_type",
+            "args",
+            "argument",
+            "code",
+            "expected",
+            "safe_message",
+        }
+    )
+    _RUNTIME_MUTABLE_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "__cause__",
+            "__context__",
+            "__suppress_context__",
+            "__traceback__",
+        }
+    )
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        del cls, kwargs
+        raise TypeError("ToolArgumentError does not support subclassing")
 
     def __init__(
         self,
@@ -623,45 +934,124 @@ class ToolArgumentError(Exception):
         actual_type: str,
         code: str | None = None,
     ) -> None:
-        # Reject empty strings at construction time: a blank field
-        # would produce a nonsensical LLM echo ("'' must be , got ")
-        # and — more importantly — undermines the audit record the
-        # exception lands in (the three fields appear as structured
-        # columns alongside the composed message).
-        if not argument:
+        if type(argument) is not str or not argument:
             raise ValueError("ToolArgumentError.argument must be a non-empty identifier")
-        if not expected:
+        if type(expected) is not str or not expected:
             raise ValueError("ToolArgumentError.expected must be a non-empty description")
-        if not actual_type:
+        if type(actual_type) is not str or not actual_type:
             raise ValueError("ToolArgumentError.actual_type must be a non-empty type name")
-        super().__init__(f"'{argument}' must be {expected}, got {actual_type}")
-        self.argument = argument
-        self.expected = expected
-        self.actual_type = actual_type
-        # Optional internal discriminant for compose-loop dispatch logic. The
-        # ``code`` field is operator-controlled (a fixed string constant chosen
-        # by the handler raising the exception, e.g.
-        # ``"RATE_CAP_PER_TERM"``) — it is NEVER an LLM- or user-supplied
-        # value and is NOT included in ``args[0]`` / the LLM echo. The
-        # compose loop reads it to distinguish branches that need extra
-        # bookkeeping (write an AUTO_INTERPRETED_NO_SURFACES row, emit
-        # operational telemetry) from generic ARG_ERROR. ``None`` means
-        # "no specific dispatch hook" — the default for all existing
-        # raise sites pre Phase 5b Task 5 follow-on.
-        self.code = code
+        if code is not None and (type(code) is not str or code not in _TOOL_ARGUMENT_ERROR_CODES):
+            raise ValueError("ToolArgumentError received an unsupported code")
+
+        safe_argument = _canonical_tool_argument_name(argument)
+        safe_expected = _canonical_tool_argument_expectation(expected, safe_argument)
+        safe_actual_type = _canonical_tool_argument_actual_type(actual_type)
+        safe_message = f"'{safe_argument}' must be {safe_expected}, got {safe_actual_type}"
+
+        BaseException.__setattr__(self, "_safe_argument", safe_argument)
+        BaseException.__setattr__(self, "_safe_expected", safe_expected)
+        BaseException.__setattr__(self, "_safe_actual_type", safe_actual_type)
+        BaseException.__setattr__(self, "_safe_code", code)
+        super().__init__(safe_message)
+        BaseException.__setattr__(self, "_tool_argument_error_sealed", True)
+
+    @property
+    def argument(self) -> str:
+        try:
+            value = BaseException.__getattribute__(self, "_safe_argument")
+        except AttributeError:
+            return "tool argument"
+        return _canonical_tool_argument_name(value)
+
+    @argument.setter
+    def argument(self, value: object) -> None:
+        del value
+
+    @property
+    def expected(self) -> str:
+        try:
+            value = BaseException.__getattribute__(self, "_safe_expected")
+        except AttributeError:
+            return "a valid value"
+        return (
+            value
+            if type(value) is str and len(value) <= _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS and value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS
+            else "a valid value"
+        )
+
+    @expected.setter
+    def expected(self, value: object) -> None:
+        del value
+
+    @property
+    def actual_type(self) -> str:
+        try:
+            value = BaseException.__getattribute__(self, "_safe_actual_type")
+        except AttributeError:
+            return "invalid value"
+        if (
+            type(value) is str
+            and len(value) <= _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS
+            and (value in _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES or value in _SAFE_TOOL_ARGUMENT_TYPE_NAMES)
+        ):
+            return value
+        return "invalid value"
+
+    @actual_type.setter
+    def actual_type(self, value: object) -> None:
+        del value
+
+    @property
+    def code(self) -> str | None:
+        try:
+            value = BaseException.__getattribute__(self, "_safe_code")
+        except AttributeError:
+            return None
+        return (
+            value
+            if type(value) is str and len(value) <= _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS and value in _TOOL_ARGUMENT_ERROR_CODES
+            else None
+        )
+
+    @code.setter
+    def code(self, value: object) -> None:
+        del value
+
+    @property
+    def safe_message(self) -> str:
+        return f"'{self.argument}' must be {self.expected}, got {self.actual_type}"
+
+    @safe_message.setter
+    def safe_message(self, value: object) -> None:
+        del value
+
+    @property
+    def args(self) -> tuple[str]:
+        return (self.safe_message,)
+
+    @args.setter
+    def args(self, value: object) -> None:
+        del value
 
     def __setattr__(self, name: str, value: object) -> None:
-        # Guard only the three declared attributes; exception-chain
-        # dunders (__cause__, __context__, __suppress_context__,
-        # __traceback__, __notes__) must remain writable so
-        # ``raise ... from ...``, structured-log capture, and
-        # ``add_note()`` continue to work. First-time write during
-        # ``__init__`` is allowed; subsequent reassignment raises.
-        if name in type(self)._FROZEN_ATTRS and name in self.__dict__:
+        if name in type(self)._RUNTIME_MUTABLE_ATTRS:
+            super().__setattr__(name, value)
+            return
+        if name in type(self)._FROZEN_ATTRS:
             raise AttributeError(
                 f"{type(self).__name__}.{name} is frozen after construction; exception attributes flow into the LLM echo and Landscape."
             )
-        super().__setattr__(name, value)
+        raise AttributeError(f"{type(self).__name__} is closed after construction; cannot set {name}")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"{type(self).__name__} is closed after construction; cannot delete {name}")
+
+    def add_note(self, note: str) -> None:
+        del note
+        raise TypeError("ToolArgumentError does not accept free-form notes")
+
+    def __str__(self) -> str:
+        return self.safe_message
 
 
 class ComposerSettings(Protocol):

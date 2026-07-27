@@ -15,8 +15,10 @@ import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
+from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.web.composer._compose_loop_carriers import _PersistOutcome, _ToolOutcome
+from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
@@ -72,12 +74,17 @@ async def persist_turn_audit(
         inline_custody_audit_projection,
         inline_custody_manifest_redaction_input,
     )
-    from elspeth.web.composer.redaction import MANIFEST, redact_tool_call_arguments
+    from elspeth.web.composer.redaction import (
+        MANIFEST,
+        redact_arg_error_response,
+        redact_failure_response,
+        redact_tool_call_arguments,
+    )
 
     phase3_self = cast(Any, service)
     redaction_telemetry = phase3_self._redaction_telemetry
     redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...] = ()
-    for tool_outcome in tool_outcomes:
+    for index, tool_outcome in enumerate(tool_outcomes):
         tc = tool_outcome.call
         decoded_args: dict[str, Any]
         persisted_arguments: Mapping[str, Any]
@@ -90,13 +97,39 @@ async def persist_turn_audit(
             # _DispatchOutcome carries frozen args.
             decoded_args = deep_thaw(decoded_args_by_call_id[tc.id])
         elif tool_outcome.error_class is not None:
-            decoded_args = {
-                "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
-                "error_class": tool_outcome.error_class,
-            }
+            try:
+                decoded_json = bounded_json_loads(
+                    tc.function.arguments,
+                    label="composer tool-call arguments",
+                )
+            except (TypeError, ValueError):
+                decoded_args = {
+                    "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                    "error_class": tool_outcome.error_class,
+                }
+            else:
+                decoded_args = (
+                    {"_decoded_non_object": decoded_json}
+                    if not isinstance(decoded_json, dict)
+                    else {
+                        "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                        "error_class": tool_outcome.error_class,
+                    }
+                )
         else:
             decoded_args = {"_raw_arguments": tc.function.arguments}
-        if tc.function.name in MANIFEST:
+        is_arg_error = tool_outcome.error_class is not None and not (plugin_crash is not None and index == len(tool_outcomes) - 1)
+        if is_arg_error:
+            arg_error_projection = redact_arg_error_response(
+                error_class=tool_outcome.error_class,
+                error_message=None,
+            )
+            persisted_arguments = {
+                "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                "error_class": arg_error_projection["error_class"],
+                "field_count": len(decoded_args),
+            }
+        elif tc.function.name in MANIFEST:
             try:
                 redaction_input = (
                     inline_custody_manifest_redaction_input(decoded_args) if tc.function.name == "set_pipeline" else decoded_args
@@ -114,9 +147,15 @@ async def persist_turn_audit(
             except PydanticValidationError:
                 if tool_outcome.error_class is None:
                     raise
+                failure_projection = redact_failure_response(
+                    status=ComposerToolStatus.PLUGIN_CRASH.value,
+                    error_class=tool_outcome.error_class,
+                    error_message=tool_outcome.error_message,
+                )
                 persisted_arguments = {
                     "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
-                    "error_class": tool_outcome.error_class,
+                    "error_class": failure_projection["error_class"],
+                    "field_count": len(decoded_args),
                 }
         else:
             persisted_arguments = unknown_tool_arguments_redaction(telemetry=redaction_telemetry)
@@ -134,14 +173,26 @@ async def persist_turn_audit(
     redacted_tool_rows = tuple(
         RedactedToolRow(
             tool_call_id=tool_outcome.call.id,
-            content=phase3_self._serialize_response_via_walker(tool_outcome, telemetry=redaction_telemetry),
+            content=phase3_self._serialize_response_via_walker(
+                tool_outcome,
+                telemetry=redaction_telemetry,
+                failure_status=(
+                    None
+                    if tool_outcome.error_class is None
+                    else (
+                        ComposerToolStatus.PLUGIN_CRASH
+                        if plugin_crash is not None and index == len(tool_outcomes) - 1
+                        else ComposerToolStatus.ARG_ERROR
+                    )
+                ),
+            ),
             composition_state_payload=(
                 phase3_self._state_payload_for_compose_turn_for_test(tool_outcome.response)
                 if tool_outcome.post_version > tool_outcome.pre_version
                 else None
             ),
         )
-        for tool_outcome in tool_outcomes
+        for index, tool_outcome in enumerate(tool_outcomes)
     )
     service._phase3_last_redacted_assistant_tool_calls = redacted_assistant_tool_calls
     service._phase3_last_redacted_tool_rows = redacted_tool_rows

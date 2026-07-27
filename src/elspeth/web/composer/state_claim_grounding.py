@@ -647,11 +647,15 @@ def check_state_claim_grounding(
     return state_violations + action_violations
 
 
-_CORRECTION_HEADER: Final[str] = (
-    "[ELSPETH-SYSTEM] The composer's prose above contradicts the actual "
+GROUNDING_CORRECTION_HEADER: Final[str] = (
+    "The composer's prose above contradicts the actual "
     "pipeline state. The state below is authoritative; the prose may be "
     "stale or refer to an earlier turn."
 )
+GROUNDING_CORRECTION_INSTRUCTION: Final[str] = (
+    "Re-read the actual state via `get_pipeline_state` before making further claims about pipeline configuration."
+)
+_CORRECTION_HEADER: Final[str] = f"[ELSPETH-SYSTEM] {GROUNDING_CORRECTION_HEADER}"
 
 
 def format_grounding_correction(violations: tuple[GroundingViolation, ...]) -> str:
@@ -669,7 +673,7 @@ def format_grounding_correction(violations: tuple[GroundingViolation, ...]) -> s
     for v in violations:
         lines.append(f"- {v.explanation}")
     lines.append("")
-    lines.append("Re-read the actual state via `get_pipeline_state` before making further claims about pipeline configuration.")
+    lines.append(GROUNDING_CORRECTION_INSTRUCTION)
     return "\n".join(lines)
 
 

@@ -9,7 +9,8 @@ Responsibilities:
 * Record the audit event in ``composer_completion_events_table`` BEFORE
   writing the blob (audit-first ordering).
 * Mint a signed capability token that encodes the content-address.
-* Resolve an inbound token back to the frozen snapshot for the reviewer.
+* Resolve an inbound token to a public view derived from the authenticated
+  frozen snapshot.
 
 Audit-first ordering (load-bearing):
 
@@ -29,12 +30,15 @@ Frozen-at-mark-time discipline (load-bearing):
 * ``get_shareable_link`` may re-mint only when the current
   ``(session, state)`` already has a ``mark_ready_for_review`` audit row
   whose snapshot blob still exists. It does not create a new share decision.
-* ``resolve_token`` reads ``audit_readiness`` directly from the blob; it
+* ``resolve_token`` verifies the token and content digest, reads the frozen
+  evidence blob, then derives the current public projection in memory. It
   never re-calls ``ReadinessService.compute_snapshot``. This means:
-    - The reviewer sees exactly what the owner saw at mark-time, even if
-      the live state has drifted.
-    - The ``payload_digest`` fingerprint covers the readiness panel too —
-      content-addressing is evidentially complete.
+    - Live state drift cannot change the response. Composition, YAML, and
+      readiness are sanitized through the current public boundary, including
+      when the authenticated evidence predates that boundary.
+    - The ``payload_digest`` authenticates the immutable mark-time evidence,
+      including the readiness panel; resolve-time projection does not rewrite
+      the stored blob.
     - The reviewer-vs-owner permission question for the readiness service
       never arises at resolve time.
 
@@ -62,15 +66,20 @@ from sqlalchemy.engine import Engine
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.telemetry_phase8 import (
     SessionsTelemetry,
     record_session_completed,
 )
-from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.composer.yaml_generator import (
+    generate_public_composition_dict,
+    generate_public_yaml,
+)
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.shareable_reviews.models import (
+    CompositionStateResponse,
     MarkReadyForReviewResponse,
     ShareableLinkResponse,
     SharedInspectResponse,
@@ -214,6 +223,12 @@ def _has_error_readiness_row(snapshot: AuditReadinessSnapshot) -> bool:
     return any(row.status == "error" for row in snapshot.rows)
 
 
+def _public_audit_readiness(snapshot: AuditReadinessSnapshot) -> AuditReadinessSnapshot:
+    """Remove owner-global inventory detail from a share-scoped snapshot."""
+    rows = tuple(row.model_copy(update={"detail": None}) if row.id == "secrets" else row for row in snapshot.rows)
+    return snapshot.model_copy(update={"rows": rows})
+
+
 def _build_snapshot(
     *,
     session_id: UUID,
@@ -230,7 +245,7 @@ def _build_snapshot(
     """
     composition_state = state_from_record(state_record)
     yaml_text = generate_public_yaml(composition_state)
-    composition_dict = composition_state.to_dict()
+    composition_dict = generate_public_composition_dict(composition_state)
     # ``metadata`` is normalised to ``{"name", "description"}`` by
     # CompositionState.to_dict — that IS the pipeline_metadata wire shape.
     # Direct indexing per CLAUDE.md offensive programming: ``to_dict``
@@ -250,7 +265,8 @@ def _build_snapshot(
     # composition. Pinning to state.created_at is semantically defensible:
     # the readiness panel describes "what readiness signal accompanied
     # the state when it was committed," not "when was this query run."
-    audit_readiness_dict = audit_readiness.model_dump(mode="json")
+    public_audit_readiness = _public_audit_readiness(audit_readiness)
+    audit_readiness_dict = public_audit_readiness.model_dump(mode="json")
     audit_readiness_dict["checked_at"] = state_record.created_at.isoformat()
     blob: _BlobShape = {
         "pipeline_metadata": pipeline_metadata,
@@ -280,7 +296,7 @@ def _build_snapshot(
         canonical_bytes=canonical_bytes,
         payload_digest=_DIGEST_PREFIX + digest_hex,
         digest_hex=digest_hex,
-        audit_readiness=audit_readiness,
+        audit_readiness=public_audit_readiness,
         state_id=state_record.id,
         created_at=datetime.now(UTC),
     )
@@ -512,18 +528,24 @@ class ShareableReviewService:
         # any tampering on the filesystem path raises IntegrityError
         # before we get here.
         blob_dict = self._parse_blob(blob_bytes)
+        # A valid digest authenticates the immutable evidence blob, but legacy
+        # blobs may predate the public projection. Reconstruct the frozen state
+        # and project it in memory; never rewrite the content-addressed bytes.
+        composition_state = CompositionState.from_dict(blob_dict["composition_snapshot"])
+        public_composition = CompositionStateResponse.model_validate(generate_public_composition_dict(composition_state))
+        public_yaml = generate_public_yaml(composition_state)
         # ``model_validate_json`` (not ``model_validate``) on the
         # audit_readiness sub-tree because the strict-mode model rejects
         # ISO-string datetimes and list-as-tuple after a JSON round-trip.
         # ``model_validate_json`` activates Pydantic's JSON validators
         # which DO coerce wire-format primitives back to native types.
-        audit_readiness = AuditReadinessSnapshot.model_validate_json(json.dumps(blob_dict["audit_readiness"]))
+        audit_readiness = _public_audit_readiness(AuditReadinessSnapshot.model_validate_json(json.dumps(blob_dict["audit_readiness"])))
         return SharedInspectResponse(
             session_id=str(payload.session_id),
             state_id=str(payload.state_id),
             pipeline_metadata=blob_dict["pipeline_metadata"],
-            composition_snapshot=blob_dict["composition_snapshot"],
-            yaml=blob_dict["yaml"],
+            composition_snapshot=public_composition,
+            yaml=public_yaml,
             audit_readiness=audit_readiness,
             created_by_user_id=blob_dict["created_by_user_id"],
             # ``created_at`` lives in the token envelope rather than the blob —

@@ -71,6 +71,11 @@ export interface ToolCall {
   };
 }
 
+/** A visible chat segment whose kind carries its rendering authority. */
+export type ChatMessageSegment =
+  | { kind: "text"; content: string }
+  | { kind: "trusted_system_notice"; content: string };
+
 /** A chat message in a session. */
 export interface ChatMessage {
   id: string;
@@ -78,6 +83,8 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system" | "tool" | "audit";
   content: string;
   raw_content?: string | null;
+  /** Server-authenticated visible segments; absent only on local optimistic rows. */
+  segments?: ChatMessageSegment[];
   tool_calls: ToolCall[] | null;
   created_at: string;
   local_status?: "pending" | "failed";
