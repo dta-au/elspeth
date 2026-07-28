@@ -141,7 +141,23 @@ class AcceptanceState:
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {field: getattr(self, field) for field in _STATE_FIELDS}
+        return {
+            "schema_version": self.schema_version,
+            "session_id": self.session_id,
+            "tutorial_session_id": self.tutorial_session_id,
+            "blob_id": self.blob_id,
+            "run_id": self.run_id,
+            "landscape_run_id": self.landscape_run_id,
+            "artifact_id": self.artifact_id,
+            "uploaded_sha256": self.uploaded_sha256,
+            "blob_sha256": self.blob_sha256,
+            "artifact_sha256": self.artifact_sha256,
+            "run_status": self.run_status,
+            "source_rows": self.source_rows,
+            "failed_tokens": self.failed_tokens,
+            "captured_at": self.captured_at,
+            "completed_at": self.completed_at,
+        }
 
 
 def _state_string(data: Mapping[str, object], field: str) -> str:

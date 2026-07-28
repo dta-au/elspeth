@@ -324,8 +324,10 @@ class SanitizedResourceIdentity:
     cloud_provider: str
 
     def __post_init__(self) -> None:
-        for field in ("service_name", "service_version", "deployment_environment", "cloud_provider"):
-            _bounded_identity(field, getattr(self, field))
+        _bounded_identity("service_name", self.service_name)
+        _bounded_identity("service_version", self.service_version)
+        _bounded_identity("deployment_environment", self.deployment_environment)
+        _bounded_identity("cloud_provider", self.cloud_provider)
         if self.cloud_provider != "aws":
             raise ValueError("cloud_provider must be aws")
 
