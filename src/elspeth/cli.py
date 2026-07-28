@@ -1448,8 +1448,8 @@ def _execute_pipeline_with_instances(
 
     audit_export_content_store = None
     audit_export_content_store_resolver = None
-    export_settings = getattr(config.landscape, "export", None)
-    if export_settings is not None and export_settings.enabled:
+    export_settings = config.landscape.export
+    if export_settings.enabled:
         from elspeth.core.audit_export_content_store import create_audit_export_content_store
 
         audit_export_content_store, audit_export_content_store_resolver = create_audit_export_content_store(export_settings)

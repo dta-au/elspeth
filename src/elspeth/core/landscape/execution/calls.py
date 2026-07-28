@@ -212,8 +212,8 @@ class CallAuditRepository:
     ) -> dict[str, object]:
         """Insert once, remapping only a repository-allocated index collision."""
         proposed_index = values["call_index"]
-        if not isinstance(proposed_index, int):
-            raise FrameworkBugError("prepared call_index must be an integer")
+        if type(proposed_index) is not int:
+            raise FrameworkBugError("prepared call_index must be an exact integer")
 
         try:
             with self._db.write_connection() as conn:

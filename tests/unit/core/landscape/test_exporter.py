@@ -581,6 +581,18 @@ class _ExportReadModelRecorder:
     def get_artifacts(self, run_id: str) -> list[Any]:
         return self._execution.get_artifacts(run_id)
 
+    def get_sink_effect_streams_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effects_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effect_members_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effect_attempts_for_run(self, run_id: str) -> list[Any]:
+        return []
+
     def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]:
         return self._query.iter_rows_for_run(run_id, batch_size=batch_size)
 
@@ -664,6 +676,25 @@ def _make_exporter(
             artifacts=artifacts,
         ),
     )
+
+
+class _IncompleteSinkEffectReadModel:
+    def get_sink_effect_streams_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effects_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effect_members_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+
+def test_sink_effect_export_requires_the_complete_read_model_contract() -> None:
+    exporter = _make_exporter()
+    exporter._read_model = cast(Any, _IncompleteSinkEffectReadModel())
+
+    with pytest.raises(AttributeError, match="get_sink_effect_attempts_for_run"):
+        list(exporter._iter_sink_effect_records("run-1"))
 
 
 def _make_export_read_model(

@@ -809,25 +809,16 @@ class LandscapeExporter:
 
     def _iter_sink_effect_records(self, run_id: str) -> Iterator[ExportRecord]:
         """Yield complete safe recovery history in deterministic family order."""
-        # Preserve compatibility for narrow test/custom read models that
-        # predate epoch 26 and therefore cannot contain sink-effect rows.
-        stream_getter = getattr(self._read_model, "get_sink_effect_streams_for_run", None)
-        effect_getter = getattr(self._read_model, "get_sink_effects_for_run", None)
-        member_getter = getattr(self._read_model, "get_sink_effect_members_for_run", None)
-        attempt_getter = getattr(self._read_model, "get_sink_effect_attempts_for_run", None)
-        if stream_getter is None or effect_getter is None or member_getter is None or attempt_getter is None:
-            return
-
-        for stream in stream_getter(run_id):
+        for stream in self._read_model.get_sink_effect_streams_for_run(run_id):
             yield sink_effect_stream_to_export_record(stream)
-        for effect in effect_getter(run_id):
+        for effect in self._read_model.get_sink_effects_for_run(run_id):
             yield sink_effect_to_export_record(effect)
-        for member in member_getter(run_id):
+        for member in self._read_model.get_sink_effect_members_for_run(run_id):
             yield sink_effect_member_to_export_record(member)
 
         current_effect_id: str | None = None
         attempt_index = 0
-        for attempt in attempt_getter(run_id):
+        for attempt in self._read_model.get_sink_effect_attempts_for_run(run_id):
             if attempt.effect_id != current_effect_id:
                 current_effect_id = attempt.effect_id
                 attempt_index = 0
