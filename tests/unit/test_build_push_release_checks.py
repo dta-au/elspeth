@@ -390,8 +390,14 @@ def test_release_image_bakes_the_reviewed_rds_trust_root() -> None:
     assert "/runtime-root/etc/elspeth/rds/global-bundle.pem" in dockerfile
     assert "chmod 0444" in dockerfile
     assert RDS_BUNDLE_SHA256 in dockerfile
+    assert "chown -R 0:0 /runtime-root/etc/elspeth" in dockerfile
+    assert "find /runtime-root/etc/elspeth -type d -exec chmod 0755 {} +" in dockerfile
     assert 'LABEL io.elspeth.rds-ca-bundle-sha256="$RDS_CA_BUNDLE_SHA256"' in dockerfile
     assert 'LABEL io.elspeth.rds-ca-certificate-identifier="rds-ca-rsa2048-g1"' in dockerfile
+    # The ARG must be redeclared in every stage that consumes it (global default,
+    # builder-stage digest check, runtime-stage LABEL) or the redeclaration is
+    # silently dropped and the value falls back to build-arg-less default scoping.
+    assert dockerfile.count("ARG RDS_CA_BUNDLE_SHA256") == 3
 
 
 def test_release_workflow_verifies_trust_root_under_read_only_rootfs() -> None:
@@ -401,6 +407,11 @@ def test_release_workflow_verifies_trust_root_under_read_only_rootfs() -> None:
 
     for script in (lean, generic):
         assert "io.elspeth.rds-ca-bundle-sha256" in script
+        assert "io.elspeth.rds-ca-certificate-identifier" in script
+        assert "rds-ca-rsa2048-g1" in script
         assert "deploy/aws-ecs/trust/global-bundle.pem.sha256" in script
         assert "verify_aws_rds_trust_bundle" in script
         assert "docker run --rm --read-only" in script
+        assert "stat -c" in script
+        assert "0:0:444" in script
+        assert "sha256sum -c global-bundle.pem.sha256" in script
