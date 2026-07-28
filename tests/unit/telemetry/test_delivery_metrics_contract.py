@@ -67,6 +67,14 @@ def test_delivery_metrics_rejects_bool_counter() -> None:
         _read_metrics(metrics)
 
 
+def test_delivery_metrics_rejects_negative_counter() -> None:
+    metrics = _valid_metrics()
+    metrics["delivered"] = -1
+
+    with pytest.raises(ValueError, match=r"delivered.*non-negative"):
+        _read_metrics(metrics)
+
+
 def test_delivery_metrics_rejects_malformed_container() -> None:
     with pytest.raises(TypeError, match="delivery_metrics"):
         _read_metrics(["not", "a", "mapping"])
@@ -79,6 +87,16 @@ def test_metric_delta_uses_required_keys() -> None:
     after = cast(dict[str, int | None], after_raw)
 
     assert _metric_delta(before, after, "delivered") == 2
+
+
+def test_metric_delta_rejects_counter_regression() -> None:
+    before = cast(dict[str, int | None], _valid_metrics())
+    after_raw = _valid_metrics()
+    after_raw["delivered"] = 4
+    after = cast(dict[str, int | None], after_raw)
+
+    with pytest.raises(ValueError, match=r"delivered.*regressed.*5.*4"):
+        _metric_delta(before, after, "delivered")
 
 
 def test_metric_delta_missing_required_key_raises() -> None:

@@ -757,8 +757,12 @@ def _exporter_delivery_metrics(exporter: ExporterProtocol) -> ExporterDeliveryMe
     for key, value in counters:
         if type(value) is not int:
             raise TypeError(f"delivery_metrics[{key!r}] must be an int")
+        if value < 0:
+            raise ValueError(f"delivery_metrics[{key!r}] must be non-negative")
     if last_success_unix_nano is not None and type(last_success_unix_nano) is not int:
         raise TypeError("delivery_metrics['last_success_unix_nano'] must be an int or None")
+    if last_success_unix_nano is not None and last_success_unix_nano < 0:
+        raise ValueError("delivery_metrics['last_success_unix_nano'] must be non-negative")
 
     return {
         "attempted": attempted,
@@ -785,4 +789,7 @@ def _metric_delta(
         raise TypeError(f"delivery_metrics[{key!r}] before value must be an int")
     if type(new) is not int:
         raise TypeError(f"delivery_metrics[{key!r}] after value must be an int")
-    return max(0, new - old)
+    delta = new - old
+    if delta < 0:
+        raise ValueError(f"delivery_metrics[{key!r}] regressed from {old} to {new}")
+    return delta
