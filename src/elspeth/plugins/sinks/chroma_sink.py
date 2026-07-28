@@ -152,8 +152,10 @@ class ChromaSinkConfig(DataPluginConfig):
         fm = self.field_mapping
 
         # document_field and id_field must exist and be str-compatible
-        for attr_name, label in [("document_field", "document_field"), ("id_field", "id_field")]:
-            field_name = getattr(fm, attr_name)
+        for field_name, label in (
+            (fm.document_field, "document_field"),
+            (fm.id_field, "id_field"),
+        ):
             if field_name not in field_types:
                 raise ValueError(
                     f"field_mapping.{label} references '{field_name}' which is not in the schema. Declared fields: {sorted(field_types)}"
@@ -215,8 +217,10 @@ class ChromaSink(BaseSink):
         del cls
         if purpose is SinkEffectExecutionPurpose.AUDIT_EXPORT:
             return None
-        mode = config.get("on_duplicate", "overwrite")
-        return ResolvedSinkEffectMode(mode) if isinstance(mode, str) else None
+        mode: object = "overwrite"
+        if "on_duplicate" in config:
+            mode = config["on_duplicate"]
+        return ResolvedSinkEffectMode(mode) if type(mode) is str else None
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
@@ -319,7 +323,9 @@ class ChromaSink(BaseSink):
             if isinstance(value, float) and not math.isfinite(value):
                 raise ValueError(f"Chroma effect member metadata field {field_name!r} must be finite")
             metadata[field_name] = value
-        return raw_id, raw_document, metadata or None
+        if not metadata:
+            return raw_id, raw_document, None
+        return raw_id, raw_document, metadata
 
     @property
     def _effect_target(self) -> str:
@@ -523,11 +529,13 @@ class ChromaSink(BaseSink):
         }
 
     @staticmethod
-    def _normalize_metadata_for_comparison(metadata: object) -> object:
-        if not isinstance(metadata, Mapping):
-            return metadata
+    def _normalize_metadata_for_comparison(metadata: Mapping[str, object] | None) -> dict[str, object] | None:
+        if metadata is None:
+            return None
         normalized = {key: value for key, value in metadata.items() if value is not None}
-        return normalized or None
+        if normalized:
+            return normalized
+        return None
 
     def commit_member_effect(
         self,
@@ -574,18 +582,24 @@ class ChromaSink(BaseSink):
             result = self._collection.get(ids=[document_id], include=["documents", "metadatas"])
         except (chromadb.errors.ChromaError, ValueError):
             return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "unverifiable"))
-        ids = result.get("ids")
-        documents = result.get("documents")
-        metadatas = result.get("metadatas")
-        if ids == []:
-            return SinkEffectReconcileResult.not_applied(evidence=self._member_group_evidence(plan, "missing"))
+        if type(result) is not dict or any(field not in result for field in ("ids", "documents", "metadatas")):
+            return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "malformed"))
+        ids = result["ids"]
+        documents = result["documents"]
+        metadatas = result["metadatas"]
         if (
-            ids != [document_id]
-            or not isinstance(documents, list)
-            or len(documents) != 1
-            or not isinstance(metadatas, list)
-            or len(metadatas) != 1
+            type(ids) is not list
+            or type(documents) is not list
+            or type(metadatas) is not list
+            or not (len(ids) == len(documents) == len(metadatas))
+            or any(type(item) is not str or not item for item in ids)
+            or any(type(item) is not str for item in documents)
+            or any(item is not None and type(item) is not dict for item in metadatas)
         ):
+            return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "malformed"))
+        if len(ids) == 0:
+            return SinkEffectReconcileResult.not_applied(evidence=self._member_group_evidence(plan, "missing"))
+        if len(ids) != 1 or ids[0] != document_id:
             return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "ambiguous"))
         actual_metadata = self._normalize_metadata_for_comparison(metadatas[0])
         expected_metadata = self._normalize_metadata_for_comparison(metadata)
@@ -642,7 +656,8 @@ class ChromaSink(BaseSink):
             )
 
     def close(self) -> None:
-        if self._client is not None:
-            self._client.clear_system_cache()
+        client = self._client
         self._client = None
         self._collection = None
+        if client is not None:
+            client.close()  # type: ignore[attr-defined]
