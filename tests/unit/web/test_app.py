@@ -91,7 +91,7 @@ def _external_settings(tmp_path: Path, deployment_target: str, **overrides: obje
         "payload_store_path": payload_dir,
         "session_db_url": "postgresql+psycopg://runtime@db/session",
         "landscape_url": "postgresql+psycopg://runtime@db/landscape",
-        "secret_key": "s" * 40,
+        "secret_key": "this-app-external-startup-secret-is-long-enough",
         "shareable_link_signing_key": SecretBytes(bytes(range(32))),
     }
     if deployment_target == "aws-ecs":
