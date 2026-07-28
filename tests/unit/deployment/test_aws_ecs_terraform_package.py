@@ -323,6 +323,12 @@ def test_cross_region_bedrock_profile_gets_wildcard_region_foundation_model_gran
     assert "bedrock_cross_region_foundation_model_arns" in module_locals
     assert '"arn:aws:bedrock:*::foundation-model/${trimprefix(model_id, prefix)}"' in module_locals
 
+    # Pin the conditional's negative direction: a region-pinned model must map to a null
+    # prefix and be excluded from the wildcard grant. Losing either fragment would silently
+    # turn the wildcard grant into a blanket grant for every configured model.
+    assert "if startswith(model_id, prefix)" in module_locals
+    assert "if prefix != null" in module_locals
+
     bedrock_statement = _statement_body(iam, "InvokeConfiguredBedrockModels")
     # Retention: the region-pinned inference-profile and foundation-model grants must stay —
     # the wildcard grant is additive, not a replacement.
