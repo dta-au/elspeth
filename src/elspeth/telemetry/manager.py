@@ -27,7 +27,7 @@ Thread Safety:
 import queue
 import threading
 from collections import defaultdict
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import structlog
 
@@ -38,7 +38,11 @@ from elspeth.contracts.events import TelemetryEvent
 from elspeth.telemetry.circuit_breaker import CircuitBreaker
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
 from elspeth.telemetry.filtering import should_emit
-from elspeth.telemetry.protocols import ExporterProtocol
+from elspeth.telemetry.protocols import (
+    DeliveryMetricsExporterProtocol,
+    ExporterDeliveryMetrics,
+    ExporterProtocol,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -61,7 +65,7 @@ class HealthMetrics(TypedDict):
     queue_depth: int
     queue_maxsize: int
     circuit_breakers: dict[str, dict[str, int | str]]
-    exporter_delivery: dict[str, dict[str, int | None]]
+    exporter_delivery: dict[str, ExporterDeliveryMetrics]
 
 
 class TelemetryManager:
@@ -723,23 +727,62 @@ class TelemetryManager:
         self._reconcile_deferred_delivery(delivered=delivered_on_close, failed=failed_on_close, dropped=dropped_on_close)
 
 
-def _exporter_delivery_metrics(exporter: ExporterProtocol) -> dict[str, int | None] | None:
-    """Read optional exporter-native delivery facts without widening protocol."""
-    metrics = getattr(exporter, "delivery_metrics", None)
-    if not isinstance(metrics, dict):
+def _exporter_delivery_metrics(exporter: ExporterProtocol) -> ExporterDeliveryMetrics | None:
+    """Read and validate the optional exporter-native delivery capability."""
+    if not isinstance(exporter, DeliveryMetricsExporterProtocol):
         return None
-    return {str(key): value for key, value in metrics.items() if isinstance(value, int) or value is None}
+
+    metrics = exporter.delivery_metrics
+    if type(metrics) is not dict:
+        raise TypeError("delivery_metrics must be a dict")
+
+    attempted = metrics["attempted"]
+    delivered = metrics["delivered"]
+    failed = metrics["failed"]
+    dropped = metrics["dropped"]
+    pending = metrics["pending"]
+    consecutive_failures = metrics["consecutive_failures"]
+    last_success_unix_nano = metrics["last_success_unix_nano"]
+    lifecycle_failures = metrics["lifecycle_failures"]
+
+    counters = (
+        ("attempted", attempted),
+        ("delivered", delivered),
+        ("failed", failed),
+        ("dropped", dropped),
+        ("pending", pending),
+        ("consecutive_failures", consecutive_failures),
+        ("lifecycle_failures", lifecycle_failures),
+    )
+    for key, value in counters:
+        if type(value) is not int:
+            raise TypeError(f"delivery_metrics[{key!r}] must be an int")
+    if last_success_unix_nano is not None and type(last_success_unix_nano) is not int:
+        raise TypeError("delivery_metrics['last_success_unix_nano'] must be an int or None")
+
+    return {
+        "attempted": attempted,
+        "delivered": delivered,
+        "failed": failed,
+        "dropped": dropped,
+        "pending": pending,
+        "consecutive_failures": consecutive_failures,
+        "last_success_unix_nano": last_success_unix_nano,
+        "lifecycle_failures": lifecycle_failures,
+    }
 
 
 def _metric_delta(
-    before: dict[str, int | None] | None,
-    after: dict[str, int | None] | None,
-    key: str,
+    before: ExporterDeliveryMetrics | None,
+    after: ExporterDeliveryMetrics | None,
+    key: Literal["delivered", "failed", "dropped", "lifecycle_failures"],
 ) -> int:
     if before is None or after is None:
         return 0
-    old = before.get(key)
-    new = after.get(key)
-    if not isinstance(old, int) or not isinstance(new, int):
-        return 0
+    old = before[key]
+    new = after[key]
+    if type(old) is not int:
+        raise TypeError(f"delivery_metrics[{key!r}] before value must be an int")
+    if type(new) is not int:
+        raise TypeError(f"delivery_metrics[{key!r}] after value must be an int")
     return max(0, new - old)

@@ -5,10 +5,33 @@ observability platforms (OTLP, Azure Monitor, Datadog, etc.).
 """
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
     from elspeth.contracts.events import TelemetryEvent
+
+
+class ExporterDeliveryMetrics(TypedDict):
+    """Required exporter-native delivery accounting fields."""
+
+    attempted: int
+    delivered: int
+    failed: int
+    dropped: int
+    pending: int
+    consecutive_failures: int
+    last_success_unix_nano: int | None
+    lifecycle_failures: int
+
+
+@runtime_checkable
+class DeliveryMetricsExporterProtocol(Protocol):
+    """Optional capability for exporters with native delivery accounting."""
+
+    @property
+    def delivery_metrics(self) -> ExporterDeliveryMetrics:
+        """Return a complete delivery-accounting snapshot."""
+        ...
 
 
 @runtime_checkable
