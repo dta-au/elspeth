@@ -33,13 +33,15 @@
   qualified digest under this contract's evidence doctrine, so the merge must
   land before the gate that qualifies the digest, and the gate reruns in full
   on the merged tree.
-- OPERATOR DECISION checkpoint before Task 9: the dirty cold-install worktree
+- OPERATOR DECISION (2026-07-28): the dirty cold-install worktree
   (`/home/john/elspeth/.worktrees/aws-cold-install-rc-280726`) holds
   uncommitted edits to `docs/runbooks/aws-ecs-deployment.md`,
   `deploy/aws-ecs/terraform/README.md`, and
   `tests/unit/web/test_aws_ecs_runbook_contract.py` — the exact files Task 9
-  rewrites. Coordinate with that worktree's owner on which edits land first
-  before starting Task 9. Do not read from, copy from, or edit that worktree.
+  rewrites. Operator decision: cold-install worktree suspended; this branch
+  lands first; its uncommitted edits will be reconciled by that effort if/when
+  it resumes. Proceed with Task 9 on this branch. Do not read from, copy from,
+  or edit that worktree.
 - Intentional red windows on this branch — do not improvise early fixes:
   - Between Task 4 and Task 7 the application rejects the Terraform module's
     current generated URLs (they still carry the old downloaded-bundle paths).
@@ -1846,12 +1848,12 @@ git commit -m "test(web): prove immutable trust over PostgreSQL TLS"
 - Modify: `docs/runbooks/aws-ecs-deployment.md`
 - Modify: `tests/unit/web/test_aws_ecs_runbook_contract.py`
 
-**OPERATOR DECISION checkpoint (blocking):** the dirty cold-install worktree
+**OPERATOR DECISION (2026-07-28):** the dirty cold-install worktree
 (`/home/john/elspeth/.worktrees/aws-cold-install-rc-280726`) holds
-uncommitted edits to exactly these three files. Before starting this task,
-confirm with the operator which set of runbook/README/contract-test edits
-lands first and how the loser rebases. Do not read from or copy from that
-worktree.
+uncommitted edits to exactly these three files. Operator decision:
+cold-install worktree suspended; this branch lands first; its uncommitted
+edits will be reconciled by that effort if/when it resumes. Proceed with
+Task 9. Do not read from or copy from that worktree.
 
 - [ ] **Step 1: Add failing documentation contract tests**
 
