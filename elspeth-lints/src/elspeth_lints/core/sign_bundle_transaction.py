@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -75,6 +76,17 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def directory_identity(path: Path) -> dict[str, int]:
+    """Return the stable directory identity used to prove RENAME_EXCHANGE."""
+    try:
+        details = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise SignBundleTransactionError(f"cannot stat allowlist transaction directory {path}: {exc}") from exc
+    if not stat.S_ISDIR(details.st_mode):
+        raise SignBundleTransactionError(f"allowlist transaction path is not a directory: {path}")
+    return {"st_dev": details.st_dev, "st_ino": details.st_ino}
+
+
 def transaction_root(allowlist_dir: Path) -> Path:
     return allowlist_dir.resolve().parent / TRANSACTION_DIRNAME
 
@@ -122,9 +134,11 @@ def create_transaction(
     candidate_parent.mkdir()
     candidate = candidate_parent / active.name
     with allowlist_mutation_lock(active):
+        base_directory_identity = directory_identity(active)
         base_snapshot = tree_snapshot(active)
         shutil.copytree(active, candidate)
-        if tree_snapshot(candidate) != base_snapshot:
+        candidate_directory_identity = directory_identity(candidate)
+        if directory_identity(active) != base_directory_identity or tree_snapshot(candidate) != base_snapshot:
             raise SignBundleTransactionError("active allowlist changed while creating its transaction candidate")
 
     rotation_base = tx_path / "rotation-base.bin"
@@ -144,6 +158,8 @@ def create_transaction(
         "signing_policy": signing_policy,
         "base_snapshot": base_snapshot,
         "candidate_snapshot": tree_snapshot(candidate),
+        "base_directory_identity": base_directory_identity,
+        "candidate_directory_identity": candidate_directory_identity,
         "rotation_base_sha256": file_sha256(rotation_base),
         "rotation_staged_sha256": file_sha256(rotation_staged),
         "checkpoint_snapshot": None,
@@ -191,6 +207,14 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
             raise SignBundleTransactionError(f"transaction manifest field {key!r} must be a string")
     if not isinstance(raw.get("base_snapshot"), dict) or not isinstance(raw.get("candidate_snapshot"), dict):
         raise SignBundleTransactionError("transaction manifest snapshots must be mappings")
+    for key in ("base_directory_identity", "candidate_directory_identity"):
+        identity = raw.get(key)
+        if (
+            not isinstance(identity, dict)
+            or set(identity) != {"st_dev", "st_ino"}
+            or any(type(identity[field]) is not int or identity[field] < 0 for field in ("st_dev", "st_ino"))
+        ):
+            raise SignBundleTransactionError(f"transaction manifest field {key!r} must be a strict directory identity")
     if not isinstance(raw.get("signing_policy"), dict):
         raise SignBundleTransactionError("transaction manifest signing_policy must be a mapping")
     if not isinstance(raw.get("completed_actions"), list):
@@ -260,16 +284,29 @@ def assert_active_unchanged(manifest: dict[str, Any]) -> None:
 
 def publication_disposition(manifest: dict[str, Any]) -> str:
     """Classify the atomic swap, including a kill between exchange and journalling."""
-    active_snapshot = tree_snapshot(Path(manifest["allowlist_dir"]))
-    candidate_snapshot = tree_snapshot(Path(manifest["candidate_dir"]))
-    if active_snapshot == manifest["base_snapshot"] and (
+    active = Path(manifest["allowlist_dir"])
+    candidate = Path(manifest["candidate_dir"])
+    active_snapshot = tree_snapshot(active)
+    candidate_snapshot = tree_snapshot(candidate)
+    active_identity = directory_identity(active)
+    candidate_identity = directory_identity(candidate)
+    original_orientation = (
+        active_identity == manifest["base_directory_identity"]
+        and candidate_identity == manifest["candidate_directory_identity"]
+    )
+    swapped_orientation = (
+        active_identity == manifest["candidate_directory_identity"]
+        and candidate_identity == manifest["base_directory_identity"]
+    )
+    if original_orientation and active_snapshot == manifest["base_snapshot"] and (
         candidate_snapshot == manifest["candidate_snapshot"] or manifest.get("running_action") is not None
     ):
         return "not_published"
-    if active_snapshot == manifest["candidate_snapshot"] and candidate_snapshot == manifest["base_snapshot"]:
+    if swapped_orientation and active_snapshot == manifest["candidate_snapshot"] and candidate_snapshot == manifest["base_snapshot"]:
         return "published"
     if (
-        manifest["candidate_snapshot"] != manifest["base_snapshot"]
+        swapped_orientation
+        and manifest["candidate_snapshot"] != manifest["base_snapshot"]
         and active_snapshot != manifest["base_snapshot"]
         and candidate_snapshot == manifest["base_snapshot"]
         and manifest.get("publish_started_at") is not None

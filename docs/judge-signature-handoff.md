@@ -153,12 +153,14 @@ transaction, and prints a paste-ready command containing
 `--resume <transaction-dir>`. Resume does not trust the scratch copy: it
 authenticates the journal, then re-checks the exact bundle bytes,
 source/bindings, active/candidate state, action evidence, and previously
-produced HMAC signatures before skipping completed judge work. Recovery accepts
-the recorded pre-transaction state, the exact authenticated published
-candidate, or a proven post-publish state where the private candidate contains
-the exact base and the active tree has since advanced under the shared writer
-lock. An ambiguous byte-for-byte return to the base fails closed. Any other tree
-change refuses recovery; re-stage against the new tree instead. On
+produced HMAC signatures before skipping completed judge work. The manifest
+authenticates the original active and candidate directory identities
+(`st_dev`/`st_ino`). Recovery accepts their original orientation before
+publication, or their exact swapped orientation as causal proof that
+`RENAME_EXCHANGE` committed. In the swapped orientation, the active contents may
+equal the authenticated candidate or may have advanced under a later coordinated
+writer while the private candidate still contains the exact base. Any other
+identity or content state refuses recovery. On
 successful completion the
 coherent active tree is diagnosed and the canonical override-rate counter
 snapshot is refreshed. Resume also binds the original non-secret signing policy
@@ -248,12 +250,15 @@ acted on.
 
 ## Recovery versus re-staging
 
-Use the printed `--resume` command when the bundle and live tree are still
-current and the active allowlist still matches the transaction base (or the
-authenticated published candidate awaiting its audit append). This reuses
-accepted authoritative decisions and retries only unfinished work. Do not
-re-run the judge merely because a later action BLOCKed or the process was
-interrupted.
+Use the printed `--resume` command when the bundle and live source/bindings are
+still current and the authenticated directory identities have either their
+original orientation (publication has not happened) or their exact swapped
+orientation (publication committed). In the swapped orientation, resume also
+supports a later coordinated writer having advanced the active contents while
+the private candidate retains the exact base; it finalizes the pending audit
+without repeating judge work. This reuses accepted authoritative decisions and
+retries only unfinished work. Do not re-run the judge merely because a later
+action BLOCKed or the process was interrupted.
 
 A BLOCK decision event is retained in the private transaction even though the
 active allowlist is unchanged. A later successful resume publishes the
@@ -262,10 +267,11 @@ abandoned, its BLOCK evidence remains visible only in that printed transaction
 directory; retain or remove that directory deliberately according to the
 operator's audit policy. `sign-bundle` does not silently prune it.
 
-Re-run `stage_scan` when the live source/bindings or active allowlist changed
-after the transaction began, or when the original preflight itself rejected the
-bundle. A bundle is a point-in-time assertion about the tree. The verify gate
-aborts in two expected situations:
+Re-run `stage_scan` when live source/bindings changed, when pre-publication
+active contents drifted, when directory identities or contents cannot be
+reconciled to one of those two authenticated orientations, or when the original
+preflight itself rejected the bundle. A bundle is a point-in-time assertion
+about the tree. The verify gate aborts in two expected situations:
 
 - **AST-position cascade staleness (by design).** A bundle staged *before* an
   edit that shifts AST positions in a covered `src/elspeth` source — for example

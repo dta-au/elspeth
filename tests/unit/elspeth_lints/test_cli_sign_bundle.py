@@ -789,9 +789,10 @@ def test_sign_bundle_resume_finalizes_rotation_audit_after_published_interruptio
     assert _SPARE_PRE_JUDGE_KEY in (allowlist_dir / "later.yaml").read_text(encoding="utf-8")
 
 
-def test_publication_disposition_rejects_preexchange_candidate_replaced_with_base(
+def test_publication_disposition_rejects_preexchange_writer_and_base_mimic(
     tmp_path: Path,
 ) -> None:
+    import elspeth_lints.core.cli as cli_module
     from elspeth_lints.core import sign_bundle_transaction
 
     active = _build_allowlist_dir(tmp_path)
@@ -808,12 +809,23 @@ def test_publication_disposition_rejects_preexchange_candidate_replaced_with_bas
         "candidate_dir": str(candidate),
         "base_snapshot": sign_bundle_transaction.tree_snapshot(active),
         "candidate_snapshot": sign_bundle_transaction.tree_snapshot(candidate),
+        "base_directory_identity": sign_bundle_transaction.directory_identity(active),
+        "candidate_directory_identity": sign_bundle_transaction.directory_identity(candidate),
         "publish_started_at": datetime.now(UTC).isoformat(),
     }
-    # Candidate==base alone is not proof of publication: model a keyless
-    # scratch replacement after the pre-exchange timestamp but before exchange.
-    shutil.rmtree(candidate)
-    shutil.copytree(active, candidate)
+    # Mimic post-publish bytes without exchanging directory identities: a
+    # scratch writer restores base bytes in-place while a coordinated writer
+    # advances the still-old active tree.
+    for child in candidate.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    shutil.copytree(active, candidate, dirs_exist_ok=True)
+    cli_module._append_entry_to_yaml(
+        active / "later.yaml",
+        "\n".join(_pre_judge_entry_lines(_SPARE_PRE_JUDGE_KEY)) + "\n",
+    )
 
     with pytest.raises(
         sign_bundle_transaction.SignBundleTransactionError,
@@ -853,6 +865,33 @@ def test_create_transaction_fsyncs_each_new_parent_directory_entry(
     tx_root = sign_bundle_transaction.transaction_root(allowlist_dir).resolve()
     candidate_parent = Path(manifest["candidate_dir"]).resolve().parent
     assert fsynced.index(active_parent) < fsynced.index(tx_root) < fsynced.index(candidate_parent)
+
+
+def test_manifest_rejects_authenticated_non_integer_directory_identity(
+    tmp_path: Path,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("{}\n", encoding="utf-8")
+    tx_path, manifest = sign_bundle_transaction.create_transaction(
+        bundle_path=bundle_path,
+        bundle_id="identity-type",
+        root=root,
+        allowlist_dir=allowlist_dir,
+        rotation_log=tmp_path / "rotations.log",
+        signing_policy={"operator_override": False},
+    )
+    manifest["base_directory_identity"]["st_ino"] = True
+    sign_bundle_transaction.save_manifest(tx_path, manifest)
+
+    with pytest.raises(
+        sign_bundle_transaction.SignBundleTransactionError,
+        match="strict directory identity",
+    ):
+        sign_bundle_transaction.load_manifest(tx_path)
 
 
 def test_sign_bundle_rotation_execute_minimal_plan_no_unfiltered_rescan(tmp_path: Path) -> None:
