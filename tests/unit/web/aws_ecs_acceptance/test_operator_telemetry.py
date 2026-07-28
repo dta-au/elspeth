@@ -42,6 +42,11 @@ _CONNECTION_BUDGET_ENV = {
 }
 
 
+def test_operator_metric_dimensions_fails_loudly_for_incomplete_settings_contract() -> None:
+    with pytest.raises(AttributeError, match="operator_telemetry_service_name"):
+        operator_telemetry.operator_metric_dimensions(SimpleNamespace())
+
+
 def test_positive_operator_receipt_creates_and_binds_exact_retained_checkpoint(tmp_path: Path) -> None:
     run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
     manifest_path = tmp_path / "control.json"
@@ -213,6 +218,9 @@ class _TelemetryEmitter:
     def health_degraded(self) -> bool:
         self.events.append("health.degraded")
         return not self.delivery
+
+    def close(self) -> None:
+        pass
 
 
 class _TelemetryQueries:
@@ -706,6 +714,24 @@ def test_verify_connection_budget_live_queries_cluster_metric_and_database_limit
     assert calls[0]["StartTime"] == datetime(2026, 7, 14, 1, 0, tzinfo=UTC)
     assert calls[0]["EndTime"] == datetime(2026, 7, 14, 1, 10, tzinfo=UTC)
     assert calls[-1] == {"closed": True}
+
+    class CloseFailureCloudWatch(CloudWatch):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    with pytest.raises(operator_telemetry.AcceptanceCheckError, match="connection_budget_cloudwatch"):
+        operator_telemetry.verify_connection_budget_live(
+            _CONNECTION_BUDGET_ENV,
+            cluster_id="a-0123456789abcdef0123-db",
+            start_time="2026-07-14T01:00:00Z",
+            approved_budget=20,
+            safety_margin=10,
+            settings_loader=lambda: object(),
+            max_connections_reader=lambda _settings: 100,
+            aws_client_factory=lambda _service, _region: CloseFailureCloudWatch(),
+            now=lambda: datetime(2026, 7, 14, 1, 11, tzinfo=UTC),
+            attempts=1,
+        )
 
 
 def test_verify_connection_budget_live_rejects_non_minute_aligned_start() -> None:

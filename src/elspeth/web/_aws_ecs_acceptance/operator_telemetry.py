@@ -67,6 +67,8 @@ class TelemetrySentinelEmitter(Protocol):
 
     def health_degraded(self) -> bool: ...
 
+    def close(self) -> None: ...
+
 
 class TelemetryQueries(Protocol):
     def metric_observed(self, *, metric_name: str, sentinel_value: int, acceptance_namespace: str) -> bool: ...
@@ -79,11 +81,18 @@ class TelemetryQueries(Protocol):
 def operator_metric_dimensions(settings: Any) -> tuple[tuple[str, str], ...]:
     """Project the exact non-secret resource dimensions exported in ECS."""
 
+    settings_values = {
+        "operator_telemetry_service_name": settings.operator_telemetry_service_name,
+        "operator_telemetry_environment": settings.operator_telemetry_environment,
+        "operator_telemetry_release": settings.operator_telemetry_release,
+        "operator_telemetry_ecs_cluster": settings.operator_telemetry_ecs_cluster,
+        "operator_telemetry_ecs_service": settings.operator_telemetry_ecs_service,
+        "operator_telemetry_task_definition_family": settings.operator_telemetry_task_definition_family,
+        "operator_telemetry_task_definition_revision": settings.operator_telemetry_task_definition_revision,
+    }
     dimensions: list[tuple[str, str]] = []
     for dimension_name, field_name in _OPERATOR_METRIC_DIMENSION_FIELDS:
-        value = getattr(settings, field_name, None)
-        if type(value) is not str:
-            raise OperatorTelemetryAcceptanceError("operator telemetry resource identity is incomplete")
+        value = settings_values[field_name]
         try:
             dimensions.append((dimension_name, _bounded_identity(field_name, value)))
         except ValueError:
@@ -291,7 +300,9 @@ class AWSOperatorTelemetryQueries:
                     status = annotations.get("status")
                     if type(status) is not str or status not in _TERMINAL_RUN_STATUSES:
                         raise ValueError
-                    prior = self._trace_terminal_statuses.get(run_id)
+                    prior = None
+                    if run_id in self._trace_terminal_statuses:
+                        prior = self._trace_terminal_statuses[run_id]
                     if prior is not None and prior != status:
                         raise ValueError
                     self._trace_terminal_statuses[run_id] = status
@@ -301,7 +312,10 @@ class AWSOperatorTelemetryQueries:
             raise OperatorTelemetryAcceptanceError("X-Ray projection was invalid") from None
 
     def trace_terminal_status(self, *, run_id: str) -> str | None:
-        return self._trace_terminal_statuses.get(run_id)
+        status = None
+        if run_id in self._trace_terminal_statuses:
+            status = self._trace_terminal_statuses[run_id]
+        return status
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,7 +383,8 @@ class PublicApiLifecycleAudit:
     ) -> None:
         self._settings = settings
         self._env = dict(env)
-        self._env.pop("ELSPETH_ACCEPTANCE_REGISTER", None)
+        if "ELSPETH_ACCEPTANCE_REGISTER" in self._env:
+            del self._env["ELSPETH_ACCEPTANCE_REGISTER"]
         self._capture_runner = capture_runner
         self._status_reader = status_reader or _read_landscape_terminal_status
         self._started_at_reader = started_at_reader or _read_landscape_started_at
@@ -399,7 +414,10 @@ class PublicApiLifecycleAudit:
             return ""
         if self._verified_status is None:
             self._verified_status = self._status_reader(self._settings, run_id)
-        return self._verified_status or ""
+        verified_status = self._verified_status
+        if verified_status is None:
+            verified_status = ""
+        return verified_status
 
     def started_at(self, run_id: str) -> datetime:
         if self._state is None or run_id != self._state.landscape_run_id:
@@ -443,7 +461,10 @@ class ExistingLandscapeLifecycleAudit:
             return ""
         if self._verified_status is None:
             self._verified_status = self._status_reader(self._settings, run_id)
-        return self._verified_status or ""
+        verified_status = self._verified_status
+        if verified_status is None:
+            verified_status = ""
+        return verified_status
 
     def started_at(self, run_id: str) -> datetime:
         if run_id != self._run_id:
@@ -482,9 +503,7 @@ def _read_landscape_started_at(settings: Any, run_id: str) -> datetime | None:
         raise OperatorTelemetryAcceptanceError("Landscape lifecycle query failed") from None
     if run is None:
         return None
-    started_at = getattr(run, "started_at", None)
-    if not isinstance(started_at, datetime):
-        raise OperatorTelemetryAcceptanceError("Landscape run start is unavailable")
+    started_at = run.started_at
     return started_at.replace(tzinfo=UTC) if started_at.tzinfo is None else _durable_landscape_started_at(started_at)
 
 
@@ -791,9 +810,9 @@ def verify_operator_telemetry_live(
     except Exception:
         raise OperatorTelemetryAcceptanceError("operator telemetry settings load failed") from None
     if (
-        getattr(settings, "deployment_target", None) != "aws-ecs"
-        or getattr(settings, "operator_telemetry", None) != "aws-otlp"
-        or getattr(settings, "operator_pipeline_telemetry_granularity", None) != "lifecycle"
+        settings.deployment_target != "aws-ecs"
+        or settings.operator_telemetry != "aws-otlp"
+        or settings.operator_pipeline_telemetry_granularity != "lifecycle"
     ):
         raise OperatorTelemetryAcceptanceError("operator telemetry AWS ECS posture is invalid")
     dimensions = operator_metric_dimensions(settings)
@@ -873,14 +892,8 @@ def verify_operator_telemetry_live(
         for resource_to_close in (xray, cloudwatch, emitter):
             if resource_to_close is None:
                 continue
-            close = getattr(resource_to_close, "close", None)
-            if not callable(close):
-                if resource_to_close is emitter:
-                    continue
-                close_failed = True
-                continue
             try:
-                close()
+                resource_to_close.close()
             except Exception:
                 close_failed = True
         if close_failed and sys.exc_info()[0] is None:
@@ -1050,17 +1063,13 @@ def verify_connection_budget_live(
         if not points:
             raise AcceptanceCheckError("connection_budget_cloudwatch")
     finally:
+        failure_in_flight = sys.exc_info()[0] is not None
         if cloudwatch is not None:
-            close = getattr(cloudwatch, "close", None)
-            if not callable(close):
-                if sys.exc_info()[0] is None:
-                    raise AcceptanceCheckError("connection_budget_cloudwatch")
-            else:
-                try:
-                    close()
-                except Exception:
-                    if sys.exc_info()[0] is None:
-                        raise AcceptanceCheckError("connection_budget_cloudwatch") from None
+            try:
+                cloudwatch.close()
+            except Exception:
+                if not failure_in_flight:
+                    raise AcceptanceCheckError("connection_budget_cloudwatch") from None
 
     high_water = max(cast(float, point["count"]) for point in points)
     if high_water > approved_budget or maximum - high_water < safety_margin:
