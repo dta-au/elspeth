@@ -4,7 +4,7 @@
 
 **Goal:** Replace runtime RDS CA downloads with a reviewed trust root baked into the immutable ELSPETH image, enforce it before PostgreSQL admission, and qualify one new image digest for production RC use.
 
-**Architecture:** A focused `elspeth.web.aws_rds_trust` module owns the canonical image path, pinned SHA-256, RDS CA identifier, secure file opening, X.509 parsing, and redacted verification result. Docker bakes the reviewed AWS commercial-region bundle into `/etc/elspeth/rds`; Terraform pins the Aurora instance CA, emits only `verify-full` URLs using that path, removes download code, and makes every ELSPETH container root filesystem read-only. Doctor and web startup share the verifier, while doctor also records `pg_stat_ssl` evidence for both logical databases before release admission.
+**Architecture:** A focused `elspeth.web.aws_rds_trust` module owns the canonical image path, pinned SHA-256, RDS CA identifier, secure file opening, X.509 parsing, and redacted verification result. Docker bakes the reviewed AWS commercial-region bundle into `/etc/elspeth/rds`; Terraform pins the Aurora instance CA, emits only `verify-full` URLs using that path, removes download code, and makes every ELSPETH container root filesystem read-only except the web container, whose documented ECS Exec + `/tmp` exemption is compensated by startup digest verification. Doctor and web startup share the verifier, while doctor also records `pg_stat_ssl` evidence for both logical databases before release admission.
 
 **Tech Stack:** Python 3.13, `cryptography` 49, SQLAlchemy 2, psycopg/psycopg2, pytest, Docker/BuildKit, distroless Debian 13, Terraform 1.x with AWS provider 6.54, ECS Fargate, Aurora PostgreSQL 16.13, AWS CLI, Filigree.
 
@@ -25,6 +25,30 @@
 - Do not move the final public RC tag until Task 11 passes in full.
 - A failed live gate produces a new source commit, image digest, and complete
   rerun. Evidence from different attempts is never combined.
+- This branch forked from `069ee12bc` and is behind `release/0.7.2` (verify
+  with `git log --oneline codex/aws-rds-trust-root-hardening..release/0.7.2`).
+  Merge `release/0.7.2` into this branch (`git merge --no-ff release/0.7.2`)
+  at the start of Task 10, before the release gate runs — never after Task 11.
+  A tree change after Task 11 Step 1 freezes the candidate invalidates the
+  qualified digest under this contract's evidence doctrine, so the merge must
+  land before the gate that qualifies the digest, and the gate reruns in full
+  on the merged tree.
+- OPERATOR DECISION checkpoint before Task 9: the dirty cold-install worktree
+  (`/home/john/elspeth/.worktrees/aws-cold-install-rc-280726`) holds
+  uncommitted edits to `docs/runbooks/aws-ecs-deployment.md`,
+  `deploy/aws-ecs/terraform/README.md`, and
+  `tests/unit/web/test_aws_ecs_runbook_contract.py` — the exact files Task 9
+  rewrites. Coordinate with that worktree's owner on which edits land first
+  before starting Task 9. Do not read from, copy from, or edit that worktree.
+- Intentional red windows on this branch — do not improvise early fixes:
+  - Between Task 4 and Task 7 the application rejects the Terraform module's
+    current generated URLs (they still carry the old downloaded-bundle paths).
+    Task 7 reconciles Terraform to the canonical query.
+  - Between Task 5 and Task 8 the AWS testcontainer lane is red (the new
+    `rds_trust_root` prerequisite cannot pass against a host-local test CA
+    until Task 8 adds the test-only overrides).
+  Both windows close on this branch before Task 10's full gate; executors must
+  leave them red until the closing task lands.
 
 Run this preflight before Task 1:
 
@@ -45,9 +69,10 @@ environment is active only through `uv run`.
 
 ### New files
 
-- `deploy/aws-ecs/trust/rds-global-bundle.pem` — reviewed AWS public trust
-  bundle bytes.
-- `deploy/aws-ecs/trust/rds-global-bundle.pem.sha256` — exact offline checksum.
+- `deploy/aws-ecs/trust/global-bundle.pem` — reviewed AWS public trust
+  bundle bytes. The repo filename matches the in-image filename exactly so
+  the one committed sidecar verifies in both places.
+- `deploy/aws-ecs/trust/global-bundle.pem.sha256` — exact offline checksum.
 - `deploy/aws-ecs/trust/README.md` — source, retrieval, inventory, and rotation
   procedure.
 - `src/elspeth/web/aws_rds_trust.py` — canonical constants and fail-closed
@@ -76,7 +101,7 @@ environment is active only through `uv run`.
 - `deploy/aws-ecs/terraform/modules/scenario/storage_identity.tf` — pin the
   Aurora CA and emit canonical URLs.
 - `deploy/aws-ecs/terraform/modules/scenario/ecs.tf` — remove the startup
-  download and make ELSPETH containers read-only.
+  download and make non-web ELSPETH containers read-only.
 - `deploy/aws-ecs/terraform/modules/scenario/database_bootstrap.tf` — use the
   image verifier and read-only root.
 - `tests/unit/deployment/test_aws_ecs_terraform_package.py` — rendered package
@@ -98,6 +123,23 @@ environment is active only through `uv run`.
 - Session and Landscape remain two logical PostgreSQL databases on one Aurora
   cluster.
 - The CloudWatch Agent sidecar keeps its independent filesystem contract.
+- The candidate and rollback web containers do **not** receive
+  `readonlyRootFilesystem = true`. ECS Exec (which the runbook's acceptance
+  checks run inside the web container) is documented by AWS as unsupported
+  with a read-only root filesystem — the SSM agent must write into the
+  container fs — and the web container has traced `/tmp` writers (Starlette
+  multipart spooling for uploads over 1 MB, and
+  `tempfile.TemporaryDirectory()` in
+  `src/elspeth/web/_aws_ecs_acceptance/operator_telemetry.py`). Fargate does
+  not support `linuxParameters.tmpfs`, and EFS mounts only
+  `/var/lib/elspeth`. Trust-root immutability on the web container is
+  enforced by digest verification at startup plus the 0444 root-owned baked
+  file, not by the rootfs flag. Every other ELSPETH container (schema-init
+  doctor, runtime doctor, payload, local-auth, database bootstrap, and the
+  rollback doctor via merge) is read-only.
+- The `ecs_identity_wrapper` keeps its `urllib.request` usage: that is the
+  ECS task-metadata endpoint lookup (`$ECS_CONTAINER_METADATA_URI_V4`), not a
+  trust download, and it stays.
 - No init container, EFS trust file, operating-system trust fallback, S3
   download, or Secrets Manager certificate payload is introduced.
 
@@ -105,8 +147,8 @@ environment is active only through `uv run`.
 
 **Files:**
 
-- Create: `deploy/aws-ecs/trust/rds-global-bundle.pem`
-- Create: `deploy/aws-ecs/trust/rds-global-bundle.pem.sha256`
+- Create: `deploy/aws-ecs/trust/global-bundle.pem`
+- Create: `deploy/aws-ecs/trust/global-bundle.pem.sha256`
 - Create: `deploy/aws-ecs/trust/README.md`
 - Create: `src/elspeth/web/aws_rds_trust.py`
 - Create: `tests/unit/web/test_aws_rds_trust.py`
@@ -135,8 +177,8 @@ from elspeth.web.aws_rds_trust import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SOURCE_BUNDLE = REPO_ROOT / "deploy/aws-ecs/trust/rds-global-bundle.pem"
-SOURCE_CHECKSUM = REPO_ROOT / "deploy/aws-ecs/trust/rds-global-bundle.pem.sha256"
+SOURCE_BUNDLE = REPO_ROOT / "deploy/aws-ecs/trust/global-bundle.pem"
+SOURCE_CHECKSUM = REPO_ROOT / "deploy/aws-ecs/trust/global-bundle.pem.sha256"
 
 
 def test_reviewed_bundle_matches_the_pinned_release_contract() -> None:
@@ -145,7 +187,7 @@ def test_reviewed_bundle_matches_the_pinned_release_contract() -> None:
 
     assert hashlib.sha256(data).hexdigest() == AWS_RDS_GLOBAL_BUNDLE_SHA256
     assert SOURCE_CHECKSUM.read_text(encoding="ascii") == (
-        f"{AWS_RDS_GLOBAL_BUNDLE_SHA256}  rds-global-bundle.pem\n"
+        f"{AWS_RDS_GLOBAL_BUNDLE_SHA256}  global-bundle.pem\n"
     )
     assert len(certificates) == AWS_RDS_GLOBAL_BUNDLE_CERTIFICATE_COUNT == 108
     assert all(
@@ -175,14 +217,14 @@ Run exactly:
 ```bash
 mkdir -p deploy/aws-ecs/trust
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  --output deploy/aws-ecs/trust/rds-global-bundle.pem \
+  --output deploy/aws-ecs/trust/global-bundle.pem \
   https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 test "$(
-  sha256sum deploy/aws-ecs/trust/rds-global-bundle.pem | cut -d' ' -f1
+  sha256sum deploy/aws-ecs/trust/global-bundle.pem | cut -d' ' -f1
 )" = e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3
 test "$(
   rg -c '^-----BEGIN CERTIFICATE-----$' \
-    deploy/aws-ecs/trust/rds-global-bundle.pem
+    deploy/aws-ecs/trust/global-bundle.pem
 )" = 108
 ```
 
@@ -191,11 +233,15 @@ the new certificate inventory and design constants before changing this plan.
 
 - [ ] **Step 4: Add checksum, provenance, constants, and direct dependency**
 
-Create `deploy/aws-ecs/trust/rds-global-bundle.pem.sha256`:
+Create `deploy/aws-ecs/trust/global-bundle.pem.sha256`:
 
 ```text
-e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3  rds-global-bundle.pem
+e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3  global-bundle.pem
 ```
+
+The sidecar names `global-bundle.pem` — the one filename shared by the repo
+asset and the baked image file — so the same sidecar satisfies `sha256sum -c`
+both in-repo and in-image.
 
 Create `deploy/aws-ecs/trust/README.md`:
 
@@ -214,9 +260,23 @@ ELSPETH qualifies Aurora PostgreSQL in the commercial AWS partition with
 
 This file is updated only by a reviewed maintainer change. Build and runtime
 must not download it. To rotate it, retrieve the official bytes into a review
-worktree, inspect every X.509 certificate, update the checksum and application
-constants in the same commit, build a new image digest, and repeat the complete
-source-free AWS production qualification before moving a release tag.
+worktree, inspect every X.509 certificate, update **every** site where the
+SHA-256 (or certificate count) appears — all in the same commit:
+
+- `src/elspeth/web/aws_rds_trust.py` (`AWS_RDS_GLOBAL_BUNDLE_SHA256`,
+  `AWS_RDS_GLOBAL_BUNDLE_CERTIFICATE_COUNT`)
+- `deploy/aws-ecs/trust/global-bundle.pem.sha256` (the sidecar)
+- `Dockerfile` (the `RDS_CA_BUNDLE_SHA256` build-argument default)
+- `tests/unit/test_build_push_release_checks.py` (`RDS_BUNDLE_SHA256`)
+- `docs/runbooks/aws-ecs-deployment.md` (admission section)
+- `deploy/aws-ecs/terraform/README.md` (admission section)
+- `tests/unit/web/test_aws_ecs_runbook_contract.py` (documentation contract)
+- the active implementation-plan document, if one is in flight
+
+`.github/workflows/build-push.yaml` reads the expected digest from the
+committed sidecar and needs no edit. Then build a new image digest and repeat
+the complete source-free AWS production qualification before moving a release
+tag.
 ```
 
 Create the initial `src/elspeth/web/aws_rds_trust.py`:
@@ -239,7 +299,10 @@ AWS_RDS_CA_CERTIFICATE_IDENTIFIER = "rds-ca-rsa2048-g1"
 ```
 
 Add `"cryptography>=49,<50"` to the `aws = [...]` optional-dependency list in
-`pyproject.toml`. Regenerate only lock metadata:
+`pyproject.toml`, and mirror the same pin into the hand-maintained
+`all = [...]` list (under its `# aws dependencies` section, around
+`pyproject.toml:195-251`) per the repo's extras-mirroring convention.
+Regenerate only lock metadata:
 
 ```bash
 env -u VIRTUAL_ENV uv lock --offline
@@ -249,33 +312,49 @@ env -u VIRTUAL_ENV uv sync --frozen --all-extras
 After the last `*.pem` rule in `.gitignore`, add:
 
 ```gitignore
-!deploy/aws-ecs/trust/rds-global-bundle.pem
+!deploy/aws-ecs/trust/global-bundle.pem
 ```
 
 After `*.pem` in `.dockerignore`, add:
 
 ```dockerignore
-!deploy/aws-ecs/trust/rds-global-bundle.pem
+!deploy/aws-ecs/trust/global-bundle.pem
 ```
 
-- [ ] **Step 5: Run the supply-chain test**
+- [ ] **Step 5: Run the supply-chain test and the in-repo checksum proof**
 
 Run:
 
 ```bash
 env -u VIRTUAL_ENV uv run --frozen pytest -n0 -q \
   tests/unit/web/test_aws_rds_trust.py
+(cd deploy/aws-ecs/trust && sha256sum -c global-bundle.pem.sha256)
 ```
 
-Expected: `1 passed`.
+Expected: `1 passed`, and the sidecar verifies in-repo (`global-bundle.pem:
+OK`). Task 3 proves the identical sidecar verifies in-image.
 
-- [ ] **Step 6: Commit the reviewed input**
+- [ ] **Step 6: Dry-run the secret-scan hook, then commit the reviewed input**
+
+The pre-commit secret-scan hook scans the whole staged content of changed
+files; dry-run it against the staged 108-certificate PEM before committing:
 
 ```bash
 git add .gitignore .dockerignore pyproject.toml uv.lock \
   deploy/aws-ecs/trust \
   src/elspeth/web/aws_rds_trust.py \
   tests/unit/web/test_aws_rds_trust.py
+env -u VIRTUAL_ENV uv run --frozen pre-commit run secret-scan
+```
+
+Expected: clean — the bundle contains only public `BEGIN CERTIFICATE` blocks
+and no `PRIVATE KEY` block, so no scanner pattern should fire. If the hook
+does flag the PEM, stop: the per-line `# secret-scan: allow-this-line` marker
+cannot be embedded in PEM content, so surface the finding to the operator and
+extend the hook's exclusion handling in its own reviewed commit. Never bypass
+with `--no-verify`. Then:
+
+```bash
 git commit -m "build: pin the AWS RDS trust root"
 ```
 
@@ -390,12 +469,24 @@ Add separate assertions for:
 
 ```python
 assert error.code == "missing"
+assert error.code == "unreadable"
 assert error.code == "non_regular"
 assert error.code == "owner_mismatch"
 assert error.code == "mode_mismatch"
 assert error.code == "digest_mismatch"
 assert error.code == "certificate_count_mismatch"
 ```
+
+Two of these need specific fixtures:
+
+- `unreadable`: write a valid bundle, `path.chmod(0o000)`, and mark the test
+  `@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")`
+  — a root-owned test process opens 0o000 files successfully.
+- `non_regular`: pass a **directory** (`tmp_path / "bundle.pem"` created with
+  `mkdir()`). Do not use a FIFO: opening a FIFO `O_RDONLY` without
+  `O_NONBLOCK` blocks forever when no writer exists, which would hang the
+  suite. A directory opens cleanly and `fstat` reports non-regular before any
+  read.
 
 - [ ] **Step 2: Run the verifier tests and verify they fail**
 
@@ -426,9 +517,10 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from cryptography import x509
+if TYPE_CHECKING:
+    from cryptography import x509
 
 AWS_RDS_GLOBAL_BUNDLE_PATH = Path("/etc/elspeth/rds/global-bundle.pem")
 AWS_RDS_GLOBAL_BUNDLE_SHA256 = (
@@ -482,6 +574,11 @@ class AwsRdsTrustBundleReport:
 
 
 def _parse_ca_certificates(data: bytes) -> tuple[x509.Certificate, ...]:
+    # Lazy import: deployment_contract imports this module for its constants
+    # on every deployment target, and cryptography ships only with the aws
+    # extra. Constants must stay importable without cryptography installed.
+    from cryptography import x509
+
     if not data.strip():
         raise AwsRdsTrustBundleError("empty")
 
@@ -626,8 +723,8 @@ def test_release_image_bakes_the_reviewed_rds_trust_root() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     dockerignore = DOCKERIGNORE.read_text(encoding="utf-8")
 
-    assert "!deploy/aws-ecs/trust/rds-global-bundle.pem" in dockerignore
-    assert "COPY deploy/aws-ecs/trust/rds-global-bundle.pem " in dockerfile
+    assert "!deploy/aws-ecs/trust/global-bundle.pem" in dockerignore
+    assert "COPY deploy/aws-ecs/trust/global-bundle.pem " in dockerfile
     assert "/runtime-root/etc/elspeth/rds/global-bundle.pem" in dockerfile
     assert "chmod 0444" in dockerfile
     assert RDS_BUNDLE_SHA256 in dockerfile
@@ -642,7 +739,7 @@ def test_release_workflow_verifies_trust_root_under_read_only_rootfs() -> None:
 
     for script in (lean, generic):
         assert "io.elspeth.rds-ca-bundle-sha256" in script
-        assert RDS_BUNDLE_SHA256 in script
+        assert "deploy/aws-ecs/trust/global-bundle.pem.sha256" in script
         assert "verify_aws_rds_trust_bundle" in script
         assert "docker run --rm --read-only" in script
 ```
@@ -669,8 +766,8 @@ Redeclare it in the builder stage. Before the existing runtime-root preparation
 
 ```dockerfile
 ARG RDS_CA_BUNDLE_SHA256
-COPY deploy/aws-ecs/trust/rds-global-bundle.pem /runtime-root/etc/elspeth/rds/global-bundle.pem
-COPY deploy/aws-ecs/trust/rds-global-bundle.pem.sha256 /runtime-root/etc/elspeth/rds/global-bundle.pem.sha256
+COPY deploy/aws-ecs/trust/global-bundle.pem /runtime-root/etc/elspeth/rds/global-bundle.pem
+COPY deploy/aws-ecs/trust/global-bundle.pem.sha256 /runtime-root/etc/elspeth/rds/global-bundle.pem.sha256
 RUN test "$(sha256sum /runtime-root/etc/elspeth/rds/global-bundle.pem | cut -d' ' -f1)" = "$RDS_CA_BUNDLE_SHA256" && \
     chown -R 0:0 /runtime-root/etc/elspeth && \
     find /runtime-root/etc/elspeth -type d -exec chmod 0755 {} + && \
@@ -688,14 +785,18 @@ LABEL io.elspeth.rds-ca-certificate-identifier="rds-ca-rsa2048-g1"
 - [ ] **Step 4: Extend both workflow image proofs**
 
 In the lean pre-publication step and the pulled-digest smoke step, assert the
-two OCI labels and run:
+two OCI labels and run the checks below. Both jobs check out the repository,
+so each step reads the expected digest from the committed sidecar instead of
+hardcoding it a second time — rotation then touches the sidecar, not the
+workflow:
 
 ```bash
+expected_rds_sha=$(cut -d' ' -f1 deploy/aws-ecs/trust/global-bundle.pem.sha256)
 test "$(
   docker inspect --format \
     '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
     "$image"
-)" = e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3
+)" = "$expected_rds_sha"
 test "$(
   docker inspect --format \
     '{{ index .Config.Labels "io.elspeth.rds-ca-certificate-identifier" }}' \
@@ -754,13 +855,34 @@ git commit -m "build: bake and verify the RDS trust root"
 
 - [ ] **Step 1: Change AWS test URLs to the canonical path and add negatives**
 
-Import `AWS_RDS_GLOBAL_BUNDLE_PATH` in the three test modules and set:
+The three test modules encode the TLS query differently; update each in its
+own shape:
 
-```python
-_AWS_TLS_QUERY = (
-    f"sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"
-)
-```
+- `tests/unit/web/test_deployment_contract.py:19` defines `_AWS_TLS_QUERY`
+  **with** a leading `?` that `_external_settings` concatenation consumes.
+  Keep the leading `?`:
+
+  ```python
+  _AWS_TLS_QUERY = (
+      f"?sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"
+  )
+  ```
+
+- `tests/unit/web/test_aws_ecs_startup.py:24` defines `_AWS_TLS_QUERY`
+  **without** a leading `?` (call sites append it after `?` or `&`):
+
+  ```python
+  _AWS_TLS_QUERY = (
+      f"sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"
+  )
+  ```
+
+- `tests/unit/web/test_doctor.py` has no shared constant; edit the two
+  hardcoded `sslrootcert=system` URLs in `_settings` (around
+  `test_doctor.py:61-62`) directly to the canonical query.
+
+Import `AWS_RDS_GLOBAL_BUNDLE_PATH` in the first two modules (and in
+`test_doctor.py` if the direct edit uses the constant in an f-string).
 
 Add this regression to `tests/unit/web/test_deployment_contract.py`:
 
@@ -850,6 +972,12 @@ git add src/elspeth/web/deployment_contract.py \
 git commit -m "fix(web): require the immutable RDS trust path"
 ```
 
+Red-window note: from this commit until Task 7 lands, the application rejects
+the Terraform module's current generated URLs (they still reference the old
+downloaded-bundle path). This is intentional on this branch — do not add
+compatibility shims; Task 7 reconciles Terraform and Task 10 proves the whole
+tree together.
+
 ## Task 5: Gate Doctor and Web Startup on Trust Verification
 
 **Files:**
@@ -911,14 +1039,39 @@ def test_trust_root_failure_precedes_settings_validation_and_database_work(
 
 - [ ] **Step 2: Add failing doctor trust-root tests**
 
-Patch a green trust check in the existing doctor auxiliary helper:
+Once `rds_trust_root` becomes a database prerequisite, every existing
+`test_doctor.py` test that reaches `collect_checks` /
+`collect_deployment_checks` on the AWS path without stubbing the trust check
+would fail on dev/CI hosts (no root-owned `/etc/elspeth/rds` bundle exists
+there). Verified affected examples: the TLS-downgrade test
+(`test_collection_blocks_postgresql_tls_downgrade_before_database_probe`,
+`test_doctor.py:512-529`, `collect_checks` at `:523`) and the
+every-external-target contract test (`collect_deployment_checks` at `:544`),
+plus the ordered-check-name and init-schema tests later in the module.
+Instead of patching each test, add one **module-level autouse fixture** to
+`test_doctor.py`:
 
 ```python
-monkeypatch.setattr(
-    doctor,
-    "_aws_rds_trust_root_check",
-    lambda: ContractCheck("rds_trust_root", True, "immutable RDS trust root verified"),
-)
+import elspeth.web.doctor as doctor
+
+
+@pytest.fixture(autouse=True)
+def _verified_rds_trust_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "_aws_rds_trust_root_check",
+        lambda: ContractCheck("rds_trust_root", True, "immutable RDS trust root verified"),
+    )
+```
+
+Tests that assert trust-root **failure** simply re-patch
+`doctor._aws_rds_trust_root_check` in their own body — a later
+`monkeypatch.setattr` overrides the autouse patch for that test only. The
+real-formatting test below bypasses the patch by capturing the genuine
+function at module import time:
+
+```python
+_REAL_TRUST_ROOT_CHECK = doctor._aws_rds_trust_root_check
 ```
 
 Add:
@@ -955,6 +1108,35 @@ def test_failed_trust_root_blocks_every_database_operation(
     assert events == []
 ```
 
+Also add one test that exercises the **real** `_aws_rds_trust_root_check`
+failure formatting (every other test stubs it with lambdas, so nothing else
+guards the detail string):
+
+```python
+def test_trust_root_check_formats_real_digest_mismatch_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        doctor.aws_rds_trust,
+        "verify_aws_rds_trust_bundle",
+        lambda: (_ for _ in ()).throw(
+            doctor.aws_rds_trust.AwsRdsTrustBundleError(
+                "digest_mismatch",
+                actual_sha256="f" * 64,
+            )
+        ),
+    )
+
+    check = _REAL_TRUST_ROOT_CHECK()
+
+    assert check.name == "rds_trust_root"
+    assert check.ok is False
+    assert "digest_mismatch" in check.detail
+    assert str(doctor.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH) in check.detail
+    assert doctor.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256 in check.detail
+    assert "f" * 64 in check.detail
+```
+
 - [ ] **Step 3: Run the two unit modules and verify failures**
 
 ```bash
@@ -963,8 +1145,18 @@ env -u VIRTUAL_ENV uv run --frozen pytest -n0 -q \
   tests/unit/web/test_doctor.py
 ```
 
-Expected: the new trust-root tests fail because neither admission path calls
-the verifier.
+Expected: both modules fail **wholesale**, not test-by-test —
+
+- `test_aws_ecs_startup.py`: every test errors at fixture setup with
+  `AttributeError`, because the autouse `_verified_trust_root` fixture
+  references `startup.aws_rds_trust` before Step 4 adds that import to
+  `aws_ecs_startup.py`.
+- `test_doctor.py`: collection of the module errors with `AttributeError`,
+  because the module-level `_REAL_TRUST_ROOT_CHECK = doctor._aws_rds_trust_root_check`
+  capture (and, at each test's setup, the autouse fixture) references a
+  function Step 5 has not yet defined.
+
+This is the expected red for this step; Steps 4-5 turn it green.
 
 - [ ] **Step 4: Verify at web startup before static validation**
 
@@ -1041,6 +1233,12 @@ git add src/elspeth/web/aws_ecs_startup.py src/elspeth/web/doctor.py \
 git commit -m "fix(web): verify RDS trust before database admission"
 ```
 
+Red-window note: from this commit until Task 8 lands, the AWS testcontainer
+lane is red — the real-PostgreSQL tests cannot satisfy the new
+`rds_trust_root` prerequisite against a host-local test CA. Intentional; do
+not weaken the verifier or skip the lane. Task 8 adds the test-only override
+and Task 10 reruns the lane green.
+
 ## Task 6: Record PostgreSQL TLS Evidence for Both Databases
 
 **Files:**
@@ -1060,6 +1258,8 @@ Add:
         ("landscape_schema", (True, "TLSv1.2", 256), True),
         ("session_schema", (False, None, None), False),
         ("landscape_schema", None, False),
+        ("session_schema", (True, "TLSv1.3", 64), False),
+        ("landscape_schema", (True, "SSLv3", 256), False),
     ],
 )
 def test_postgres_tls_check_is_named_redacted_and_fail_closed(
@@ -1159,10 +1359,18 @@ with engine.connect() as connection:
         result = (state, schema_check(label, state), None)
 ```
 
-The existing exception branches return the same static schema failure plus a
-static failed TLS check when `require_authenticated_tls` is true. Preserve the
-existing one-shot engine disposal in `finally`; a disposal failure replaces
-the schema result while retaining the already collected TLS result.
+Exception handling must not corrupt TLS evidence. An exception raised
+**after** `postgres_tls_check` succeeded (for example `SessionSchemaError`
+from `probe_fn` — see the `except (SessionSchemaError, SchemaCompatibilityError)`
+branch at `doctor.py:325`) occurred on a connection whose TLS was already
+proven: those branches retain the already-collected `tls_result` alongside
+their schema failure, mirroring the disposal-branch rule below. A **static
+failed TLS check** is emitted only when the exception precedes TLS capture
+(connection-establishment failures, where no TLS evidence exists). Doctor
+JSON is Task 11 admission evidence — a stale-schema failure must never read
+as a transport failure. Preserve the existing one-shot engine disposal in
+`finally`; a disposal failure replaces the schema result while retaining the
+already collected TLS result.
 
 Update `_collect_deployment_checks` to:
 
@@ -1196,6 +1404,23 @@ Update ordered check-name assertions to include:
 "session_tls",
 "landscape_tls",
 ```
+
+Also update the tests that call `_inspect_database` **directly** (verified
+locations in `tests/unit/web/test_doctor.py`):
+
+- `:854` — `state, check = _inspect_database(label, raw_url, probe)`: pass
+  the new `require_authenticated_tls` keyword and unpack the three-value
+  result (`state, check, tls_check = ...`).
+- `:896` — the second direct 2-tuple unpack in
+  `test_inspect_database_disposes_after_connection_and_probe_failures`: same
+  keyword and three-value unpack.
+- `:868` — `assert str(connection.execute.call_args.args[0]) == "SELECT 1"`:
+  this last-execute assertion holds only on the
+  `require_authenticated_tls=False` path (the TLS path's last execute is the
+  `pg_stat_ssl` query). Keep it for the non-AWS parametrization and assert
+  the `pg_stat_ssl` statement for the AWS one.
+- `:934` — the companion `SELECT 1` last-execute assertion in the disposal
+  test needs the same treatment.
 
 - [ ] **Step 5: Run the doctor and CLI unit tests**
 
@@ -1241,22 +1466,34 @@ assert re.search(
     storage,
 )
 assert "truststore.pki.rds.amazonaws.com" not in _all_text()
-assert "urllib.request" not in _all_text()
+assert "urllib.request" not in _text("modules/scenario/database_bootstrap.tf")
 assert "/tmp/rds-global-bundle.pem" not in _all_text()
 assert "${local.data_dir}/rds-global-bundle.pem" not in _all_text()
 ```
 
+Do **not** assert `"urllib.request" not in _all_text()`: the
+`ecs_identity_wrapper` legitimately uses `urllib.request` for the ECS
+task-metadata endpoint lookup (`ecs.tf:19-20`), which is not a trust download
+and stays. The forbidden-domain and forbidden-path assertions above, plus the
+bootstrap-scoped assertion (which complements
+`test_database_bootstrap_uses_the_image_trust_verifier` below), close the
+download hole without banning the metadata lookup.
+
 Add:
 
 ```python
-def test_every_elspeth_container_has_read_only_root_filesystem() -> None:
+def test_read_only_root_filesystem_matches_the_container_contract() -> None:
     ecs = _text("modules/scenario/ecs.tf")
     bootstrap = _text("modules/scenario/database_bootstrap.tf")
-    assert ecs.count("readonlyRootFilesystem = true") == 5
+    assert ecs.count("readonlyRootFilesystem = true") == 4
     assert "readonlyRootFilesystem = true" in bootstrap
     assert "readonlyRootFilesystem" not in ecs[
         ecs.index("cloudwatch_agent_container = {"):
         ecs.index("candidate_web_container = {")
+    ]
+    assert "readonlyRootFilesystem" not in ecs[
+        ecs.index("candidate_web_container = {"):
+        ecs.index("schema_init_doctor_container = {")
     ]
 
 
@@ -1297,14 +1534,14 @@ Change all five Secrets Manager URL queries to:
 ?sslmode=verify-full&sslrootcert=${local.rds_ca_bundle_path}
 ```
 
-- [ ] **Step 4: Remove downloads and make application containers read-only**
+- [ ] **Step 4: Remove downloads and make non-web containers read-only**
 
-Delete the `rds_ca=...` block from `local.ecs_identity_wrapper`. Keep metadata
-lookup, telemetry export, CLI normalization, and `exec`.
+Delete the `rds_ca=...` block from `local.ecs_identity_wrapper`. Keep the
+metadata lookup (the remaining `urllib.request` usage — the ECS task-metadata
+endpoint, not a download), telemetry export, CLI normalization, and `exec`.
 
 Add this exact property to:
 
-- `candidate_web_container`;
 - `schema_init_doctor_container`;
 - `runtime_doctor_container`;
 - `payload_container`; and
@@ -1314,8 +1551,24 @@ Add this exact property to:
 readonlyRootFilesystem = true
 ```
 
-Rollback web and doctor containers inherit the property through their existing
-`merge(...)` calls. Do not add it to `cloudwatch_agent_container`.
+Do **not** add it to `candidate_web_container` (and therefore not to
+`rollback_web_container`, which merges from it). Rationale, verified against
+AWS documentation on 2026-07-28: ECS Exec is unsupported when
+`readonlyRootFilesystem` is `true` — the SSM agent must write into the
+container filesystem — and the runbook's acceptance checks (`verify-s3`,
+`verify-bedrock`, `verify-bedrock-guardrails`, `verify-operator-telemetry`)
+run via `aws ecs execute-command` inside the candidate web container
+(`docs/runbooks/aws-ecs-deployment.md`, exec block near line 2711). The web
+container also has traced `/tmp` writers (Starlette multipart spooling for
+uploads over 1 MB; `tempfile.TemporaryDirectory()` at
+`operator_telemetry.py:382`), Fargate does not support
+`linuxParameters.tmpfs`, and EFS mounts only `/var/lib/elspeth`. Trust-root
+immutability on the web container is enforced by startup digest verification
+plus the 0444 root-owned baked file, not by the rootfs flag.
+
+`rollback_doctor_container` inherits the read-only property through its
+existing `merge(...)` call. Do not add the property to
+`cloudwatch_agent_container`.
 
 In `database_bootstrap_container`, add the same property. Replace the bootstrap
 imports and first operation with:
@@ -1343,9 +1596,9 @@ env -u VIRTUAL_ENV uv run --frozen pytest -n0 -q \
 Expected: formatting is clean, the native mocked plan passes, and the Python
 package contract passes.
 
-- [ ] **Step 6: Prove candidate and rollback inheritance in source**
+- [ ] **Step 6: Prove rollback inheritance in source**
 
-Extend `test_every_elspeth_container_has_read_only_root_filesystem` with:
+Extend `test_read_only_root_filesystem_matches_the_container_contract` with:
 
 ```python
 assert "rollback_web_container = merge(local.candidate_web_container" in ecs
@@ -1356,11 +1609,13 @@ Run:
 
 ```bash
 env -u VIRTUAL_ENV uv run --frozen pytest -n0 -q \
-  tests/unit/deployment/test_aws_ecs_terraform_package.py::test_every_elspeth_container_has_read_only_root_filesystem
+  tests/unit/deployment/test_aws_ecs_terraform_package.py::test_read_only_root_filesystem_matches_the_container_contract
 ```
 
-Expected: the five base ELSPETH definitions and database bootstrap are
-read-only, rollback web/doctor inherit from the read-only bases, and the
+Expected: the four non-web ELSPETH base definitions and database bootstrap
+are read-only; rollback doctor inherits read-only from its base; candidate
+and rollback web share the documented exemption (rollback web merges from the
+candidate definition, so the exemption is inherited, not divergent); the
 CloudWatch Agent remains outside the assertion. Task 11 verifies the rendered
 live definitions.
 
@@ -1451,9 +1706,101 @@ pytestmark = [
 ]
 ```
 
-in the three AWS testcontainer modules.
+in the three AWS testcontainer modules. The monkeypatch fixture covers every
+in-process test (the other two AWS modules and the `CliRunner` doctor tests
+run in-process); only the subprocess-spawning concurrency test needs Step 4.
 
-- [ ] **Step 4: Assert doctor reports both trust and transport**
+- [ ] **Step 4: Add a subprocess trust override via a sitecustomize shim**
+
+The concurrency test
+(`test_concurrent_doctor_init_schema_cli_runs_are_safe`,
+`test_doctor_aws_ecs_postgres.py:193-230`) spawns two
+`python -m elspeth.cli --no-dotenv doctor aws-ecs --init-schema --json`
+subprocesses via `subprocess.Popen(command, env=environment, ...)` and
+asserts an all-green report; an in-process monkeypatch cannot reach those
+interpreters. Give the subprocesses the same five-constant override through a
+test-only `sitecustomize.py` on `PYTHONPATH`. Add to
+`tests/testcontainer/web/conftest.py`:
+
+```python
+_SITECUSTOMIZE = '''\
+"""Test-only RDS trust override injected via PYTHONPATH by the test suite."""
+import os
+
+if os.environ.get("ELSPETH_TEST_RDS_TRUST_PATH"):
+    from pathlib import Path
+
+    from elspeth.web import aws_rds_trust
+
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH = Path(
+        os.environ["ELSPETH_TEST_RDS_TRUST_PATH"]
+    )
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256 = os.environ[
+        "ELSPETH_TEST_RDS_TRUST_SHA256"
+    ]
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_CERTIFICATE_COUNT = int(
+        os.environ["ELSPETH_TEST_RDS_TRUST_COUNT"]
+    )
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_OWNER_UID = int(
+        os.environ["ELSPETH_TEST_RDS_TRUST_UID"]
+    )
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_MODE = int(
+        os.environ["ELSPETH_TEST_RDS_TRUST_MODE"]
+    )
+'''
+
+
+@pytest.fixture
+def aws_rds_trust_subprocess_env(
+    external_deployment_postgres_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, str]:
+    parsed = make_url(external_deployment_postgres_url)
+    root = parsed.query["sslrootcert"]
+    assert isinstance(root, str)
+    path = Path(root)
+    file_stat = path.stat()
+    shim_dir = tmp_path_factory.mktemp("rds-trust-shim")
+    (shim_dir / "sitecustomize.py").write_text(_SITECUSTOMIZE, encoding="utf-8")
+    return {
+        "PYTHONPATH": str(shim_dir),
+        "ELSPETH_TEST_RDS_TRUST_PATH": str(path),
+        "ELSPETH_TEST_RDS_TRUST_SHA256": hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest(),
+        "ELSPETH_TEST_RDS_TRUST_COUNT": "1",
+        "ELSPETH_TEST_RDS_TRUST_UID": str(file_stat.st_uid),
+        "ELSPETH_TEST_RDS_TRUST_MODE": str(stat.S_IMODE(file_stat.st_mode)),
+    }
+```
+
+In the concurrency test, take the fixture and merge it into the Popen
+environment. `_doctor_environment` copies `os.environ` (minus
+`ELSPETH_WEB__*`), so prepend to any existing `PYTHONPATH` rather than
+overwrite it:
+
+```python
+environment = _doctor_environment(tmp_path, database_pair)
+overrides = dict(aws_rds_trust_subprocess_env)
+existing_pythonpath = environment.get("PYTHONPATH")
+if existing_pythonpath:
+    overrides["PYTHONPATH"] = (
+        overrides["PYTHONPATH"] + os.pathsep + existing_pythonpath
+    )
+environment.update(overrides)
+```
+
+The interpreter's automatic `sitecustomize` import — a standard Python
+startup hook — rewrites the five module constants on
+`elspeth.web.aws_rds_trust` before `elspeth.cli` imports anything.
+
+This adds **zero production code paths**: `elspeth.web.aws_rds_trust` itself
+reads no environment variable and exposes no override hook; the rewrite
+exists only in a test-authored `sitecustomize.py` placed on the `PYTHONPATH`
+of a test-spawned interpreter. Production callers still cannot supply a path
+or digest.
+
+- [ ] **Step 5: Assert doctor reports both trust and transport**
 
 After parsing doctor JSON, assert:
 
@@ -1468,7 +1815,7 @@ assert "TLSv" in checks["landscape_tls"]["detail"]
 
 Keep all existing redaction and concurrent-initialization assertions.
 
-- [ ] **Step 5: Run the sequential real-PostgreSQL suite**
+- [ ] **Step 6: Run the sequential real-PostgreSQL suite**
 
 ```bash
 CI=1 env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
@@ -1484,7 +1831,7 @@ CI=1 env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
 Expected: the complete sequential web PostgreSQL suite passes. Doctor evidence
 contains trust, session TLS, and Landscape TLS without URLs or credentials.
 
-- [ ] **Step 6: Commit real PostgreSQL proof**
+- [ ] **Step 7: Commit real PostgreSQL proof**
 
 ```bash
 git add tests/testcontainer/web
@@ -1498,6 +1845,13 @@ git commit -m "test(web): prove immutable trust over PostgreSQL TLS"
 - Modify: `deploy/aws-ecs/terraform/README.md`
 - Modify: `docs/runbooks/aws-ecs-deployment.md`
 - Modify: `tests/unit/web/test_aws_ecs_runbook_contract.py`
+
+**OPERATOR DECISION checkpoint (blocking):** the dirty cold-install worktree
+(`/home/john/elspeth/.worktrees/aws-cold-install-rc-280726`) holds
+uncommitted edits to exactly these three files. Before starting this task,
+confirm with the operator which set of runbook/README/contract-test edits
+lands first and how the loser rebases. Do not read from or copy from that
+worktree.
 
 - [ ] **Step 1: Add failing documentation contract tests**
 
@@ -1539,7 +1893,12 @@ Add this operational contract to both deployment documents:
 The image must contain `/etc/elspeth/rds/global-bundle.pem` with SHA-256
 `e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3`.
 Its OCI CA label must be `rds-ca-rsa2048-g1`. Every ELSPETH container in the
-task definitions must set `readonlyRootFilesystem` to `true`.
+task definitions except the web container (`elspeth-web`, candidate and
+rollback) must set `readonlyRootFilesystem` to `true`. The web container is
+exempt because ECS Exec — which runs the acceptance checks inside it — is
+unsupported by AWS with a read-only root filesystem, and its multipart and
+telemetry paths write to `/tmp`; its trust root remains immutable through
+startup digest verification of the 0444 root-owned baked file.
 
 The schema and runtime doctor JSON must report all of these checks as green
 before the web service is enabled:
@@ -1581,8 +1940,48 @@ aws --profile "$AWS_PROFILE" --region "$AWS_REGION" rds \
 aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs \
   describe-task-definition \
   --task-definition "$TASK_DEFINITION" \
-  --query 'taskDefinition.containerDefinitions[?name!=`cloudwatch-agent`].readonlyRootFilesystem' \
+  --query 'taskDefinition.containerDefinitions[?name!=`cloudwatch-agent` && name!=`elspeth-web`].readonlyRootFilesystem' \
   --output json | jq -e 'length > 0 and all(.[]; . == true)'
+
+aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs \
+  describe-task-definition \
+  --task-definition "$TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].readonlyRootFilesystem' \
+  --output json | jq -e 'all(.[]; . != true)'
+```
+
+For web task definitions the first check matches zero containers other than
+the CloudWatch sidecar's peers and is skipped; the second check proves the
+web container carries the documented exemption rather than a silent `true`
+that would break ECS Exec.
+
+Add a required **Upgrading an existing install** note to both documents:
+
+```markdown
+### Upgrading an existing install
+
+Applying this module version to an existing install rotates all five Secrets
+Manager database URLs to the canonical immutable-trust query immediately,
+while `aws_ecs_service.web` ignores task-definition changes
+(`lifecycle.ignore_changes`). An old-image task that restarts inside that
+window injects the new canonical URL, lacks the baked bundle, and
+crash-loops. Apply and roll the service in one operation: run
+`terraform apply`, then immediately
+`aws ecs update-service --force-new-deployment` with the new qualified image
+digest. Pinning `ca_cert_identifier` on an existing Aurora instance triggers
+a database modification with engine-dependent restart semantics — expect and
+schedule it. No pre-trust-root image digest is rollback-eligible after the
+upgrade (see the rollback section).
+```
+
+Add to the runbook's rollback section:
+
+```markdown
+No image digest that predates the immutable trust-root contract is
+rollback-eligible: such images lack the baked bundle and are rejected by the
+canonical URL contract at startup. Scenario B rollback evidence is therefore
+structurally impossible until a second, independently qualified trust-root
+digest exists; until then, record live rollback as unavailable.
 ```
 
 The existing schema/runtime task execution remains authoritative for obtaining
@@ -1615,6 +2014,24 @@ git commit -m "docs: require immutable RDS trust for AWS release"
 - No new files.
 - Fix any failure in its owning source or test file, rerun the narrow
   regression, commit the fix, then restart this task from Step 1.
+
+- [ ] **Step 0: Merge `release/0.7.2` into this branch (once)**
+
+This branch forked from `069ee12bc` and is behind `release/0.7.2`. The tree
+that Task 11 freezes and qualifies must contain the release tip, and a tree
+change after qualification invalidates the digest under this plan's evidence
+doctrine — so the merge happens here, before the gate, never after Task 11.
+
+```bash
+git fetch origin release/0.7.2
+git merge --no-ff release/0.7.2
+```
+
+Resolve any conflicts (the release tip touches runbook/README/test files this
+branch also edits), commit the merge, and then run Steps 1-8 on the merged
+tree. If the merge lands mid-gate for any reason, restart from Step 1. Gate
+restarts after ordinary fix commits resume from Step 1 without repeating this
+step.
 
 - [ ] **Step 1: Prove a clean, fully pinned tree**
 
@@ -1696,7 +2113,45 @@ docker run --rm --read-only "$release_image" --help
 
 Expected: build and every read-only smoke pass.
 
-- [ ] **Step 7: Run all pre-commit checks**
+- [ ] **Step 7: Rehearse read-only filesystems against real workloads**
+
+The live gate must never be the first read-only boot of real workloads.
+Rehearse both container postures locally with the built image:
+
+1. **Doctor under production posture** (doctor containers run read-only in
+   ECS). Start the TLS PostgreSQL testcontainer used by the Task 8 suite,
+   then run the image's doctor under a plain read-only root against it, with
+   the canonical AWS URLs:
+
+   ```bash
+   docker run --rm --read-only --network host \
+     -e ELSPETH_WEB__DEPLOYMENT_TARGET=aws-ecs \
+     ... \
+     "$release_image" doctor aws-ecs --json || true
+   ```
+
+   Expected: `rds_trust_root` is green (the baked AWS bundle verifies); the
+   TLS/schema checks fail — the local test CA is deliberately not the AWS
+   bundle, and no override exists outside the test suite — with
+   contract-shaped details. Assert the JSON and stderr contain **no**
+   `EROFS` and no `Read-only file system`: every red must be the trust
+   contract, never a filesystem write failure.
+
+2. **Web under the exemption's minimal surface.** The production web
+   container is exempt from `readonlyRootFilesystem` (ECS Exec plus `/tmp`
+   writers), but rehearse it read-only with only `/tmp` writable to prove
+   `/tmp` really is its sole rootfs write surface: run the web server in a
+   local configuration under
+   `docker run --read-only --tmpfs /tmp` with writable volumes for the data
+   and payload directories, then exercise a multipart blob upload **larger
+   than 1 MB** (Starlette spools multipart bodies over 1 MB to `/tmp`).
+
+   Expected: the upload succeeds (2xx) and no `EROFS` /
+   `Read-only file system` error appears in server logs. Any other write
+   path surfacing here means the exemption rationale is wrong — stop and
+   re-derive the design before Task 11.
+
+- [ ] **Step 8: Run all pre-commit checks**
 
 ```bash
 env -u VIRTUAL_ENV uv run --frozen pre-commit run --all-files
@@ -1775,7 +2230,9 @@ Doctor session_tls: true
 Doctor landscape_tls: true
 Doctor session_schema: true
 Doctor landscape_schema: true
-ELSPETH readonlyRootFilesystem: true
+ELSPETH non-web containers readonlyRootFilesystem: true
+elspeth-web containers (candidate and rollback): readonlyRootFilesystem
+  absent or false — the documented ECS Exec + /tmp exemption
 Task image: exact immutable candidate digest
 Session database: elspeth_session
 Landscape database: elspeth_landscape
@@ -1789,7 +2246,13 @@ candidate web. Confirm no definition or command contains:
 truststore.pki.rds.amazonaws.com
 /tmp/rds-global-bundle.pem
 /var/lib/elspeth/rds-global-bundle.pem
+PGSSLROOTCERT
+PGSSLMODE
 ```
+
+The two `PGSSL*` names close a bypass: libpq gives query parameters
+precedence, but an environment-injected root or mode must not exist for any
+container either.
 
 The Terraform source and native tests prove rollback web/doctor definitions
 inherit the same contract. Do not use the candidate digest as its own rollback
@@ -1810,8 +2273,28 @@ Require successful:
 - authenticated web use;
 - Composer-to-Bedrock invocation through the ECS task role;
 - CloudWatch/X-Ray operator telemetry expected by the existing runbook; and
-- no credential, URL, model-content, certificate-body, or private-path leakage
-  in retained evidence.
+- a clean leakage sweep over the retained evidence.
+
+The leakage sweep is a concrete, falsifiable grep over every retained
+evidence file, modeled on `_assert_private_database_values_absent`
+(`tests/testcontainer/web/test_doctor_aws_ecs_postgres.py:141`). Each of
+these patterns must produce **zero** matches:
+
+```bash
+grep -RniE 'postgresql\+psycopg' <evidence-dir>
+grep -RnF -e "$DB_RUNTIME_USER" -e "$DB_SCHEMA_USER" <evidence-dir>
+grep -RnF -e "$DB_RUNTIME_PASSWORD" -e "$DB_SCHEMA_PASSWORD" \
+  -e "$DB_ADMIN_PASSWORD" <evidence-dir>
+grep -RnF "$AURORA_ENDPOINT" <evidence-dir>
+grep -RnF 'BEGIN CERTIFICATE' <evidence-dir>
+grep -RnF "$AWS_ACCOUNT_ID" <evidence-dir>
+grep -RnF 'arn:aws:secretsmanager' <evidence-dir>
+grep -RnE '/tmp/[A-Za-z0-9._-]+' <evidence-dir>
+```
+
+Populate the variables from the run's actual generated values before
+sweeping. A single hit fails Step 5; sanitize the source that leaked, not the
+evidence file.
 
 - [ ] **Step 6: Destroy the complete run and prove zero leftovers**
 
