@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, create_autospec
 import pytest
 from sqlalchemy import Connection, Engine, create_engine
 
+import elspeth.web.doctor as doctor
 from elspeth.core.config import TelemetrySettings
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.web.aws_rds_trust import AWS_RDS_GLOBAL_BUNDLE_PATH
@@ -76,6 +77,18 @@ def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
 
 def _by_name(checks: list[ContractCheck]) -> dict[str, ContractCheck]:
     return {check.name: check for check in checks}
+
+
+@pytest.fixture(autouse=True)
+def _verified_rds_trust_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "_aws_rds_trust_root_check",
+        lambda: ContractCheck("rds_trust_root", True, "immutable RDS trust root verified"),
+    )
+
+
+_REAL_TRUST_ROOT_CHECK = doctor._aws_rds_trust_root_check
 
 
 def test_sanitize_error_exposes_only_context_and_exception_class() -> None:
@@ -530,6 +543,61 @@ def test_collection_blocks_postgresql_tls_downgrade_before_database_probe(
     assert "/private/ca.pem" not in repr(checks)
 
 
+def test_failed_trust_root_blocks_every_database_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.doctor as doctor
+
+    events: list[str] = []
+    _patch_database_states(
+        monkeypatch,
+        SchemaState.CURRENT,
+        SchemaState.CURRENT,
+        events,
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_aws_rds_trust_root_check",
+        lambda: ContractCheck(
+            "rds_trust_root",
+            False,
+            "immutable RDS trust root verification failed (digest_mismatch)",
+        ),
+    )
+
+    checks = _by_name(collect_checks(_settings(tmp_path)))
+
+    assert checks["rds_trust_root"].ok is False
+    assert checks["session_schema"].ok is False
+    assert checks["landscape_schema"].ok is False
+    assert events == []
+
+
+def test_trust_root_check_formats_real_digest_mismatch_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        doctor.aws_rds_trust,
+        "verify_aws_rds_trust_bundle",
+        lambda: (_ for _ in ()).throw(
+            doctor.aws_rds_trust.AwsRdsTrustBundleError(
+                "digest_mismatch",
+                actual_sha256="f" * 64,
+            )
+        ),
+    )
+
+    check = _REAL_TRUST_ROOT_CHECK()
+
+    assert check.name == "rds_trust_root"
+    assert check.ok is False
+    assert "digest_mismatch" in check.detail
+    assert str(doctor.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH) in check.detail
+    assert doctor.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256 in check.detail
+    assert "f" * 64 in check.detail
+
+
 @pytest.mark.parametrize(
     "target",
     ["docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
@@ -677,6 +745,7 @@ def test_task1_check_names_are_exact_ordered_and_unique(tmp_path: Path) -> None:
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",
+        "rds_trust_root",
         "session_schema",
         "landscape_schema",
     ]
@@ -1205,6 +1274,7 @@ def test_task2_order_remains_exact_and_unique_after_database_inspection(tmp_path
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",
+        "rds_trust_root",
         "session_schema",
         "landscape_schema",
     ]

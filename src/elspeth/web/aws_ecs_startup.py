@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 from sqlalchemy import Connection, Engine, create_engine
 
-from elspeth.web import external_state_startup
+from elspeth.web import aws_rds_trust, external_state_startup
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ResolvedDeploymentStateMode, validate_aws_ecs_settings
 from elspeth.web.schema_probe import SchemaState
@@ -43,6 +43,10 @@ def enforce_aws_ecs_contract(
     resolved_state_mode: ResolvedDeploymentStateMode | None = None,
 ) -> None:
     """Enforce the shared external-state contract plus AWS identity settings."""
+    try:
+        aws_rds_trust.verify_aws_rds_trust_bundle()
+    except aws_rds_trust.AwsRdsTrustBundleError as exc:
+        raise _contract_error(f"AWS ECS immutable RDS trust root failed verification ({exc.code}).") from None
     checks = (
         validate_aws_ecs_settings(settings)
         if resolved_state_mode is None

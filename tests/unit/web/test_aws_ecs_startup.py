@@ -125,6 +125,48 @@ def _operational_error() -> OperationalError:
     return OperationalError("SELECT raw_secret", {"credential": _SENTINEL}, RuntimeError(_SENTINEL))
 
 
+@pytest.fixture(autouse=True)
+def _verified_trust_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        startup.aws_rds_trust,
+        "verify_aws_rds_trust_bundle",
+        lambda: startup.aws_rds_trust.AwsRdsTrustBundleReport(
+            path=str(startup.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH),
+            expected_sha256=startup.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            actual_sha256=startup.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            certificate_count=108,
+        ),
+    )
+
+
+def test_trust_root_failure_precedes_settings_validation_and_database_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        startup.aws_rds_trust,
+        "verify_aws_rds_trust_bundle",
+        lambda: (_ for _ in ()).throw(
+            startup.aws_rds_trust.AwsRdsTrustBundleError(
+                "digest_mismatch",
+                actual_sha256="f" * 64,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        startup,
+        "validate_aws_ecs_settings",
+        lambda *_args, **_kwargs: pytest.fail("settings validation must not run"),
+    )
+
+    with pytest.raises(startup.AwsEcsStartupContractError) as caught:
+        startup.enforce_aws_ecs_contract(_settings(tmp_path))
+
+    assert "trust root" in str(caught.value)
+    assert "digest_mismatch" in str(caught.value)
+    _assert_redacted(caught.value)
+
+
 @pytest.mark.parametrize("failed_name", ["session_db_url", "landscape_url"])
 def test_contract_url_failure_reports_only_failed_check_name(
     tmp_path: Path,

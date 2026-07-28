@@ -20,6 +20,7 @@ from sqlalchemy import Connection, Engine, create_engine, text
 from sqlalchemy.engine import make_url
 
 from elspeth.core.landscape.database import SchemaCompatibilityError
+from elspeth.web import aws_rds_trust
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import (
     DEPLOYMENT_TARGET_AWS_ECS,
@@ -242,6 +243,26 @@ def _dependency_check(module_name: str, check_name: str) -> ContractCheck:
     return ContractCheck(check_name, True, f"{module_name} dependency is importable")
 
 
+def _aws_rds_trust_root_check() -> ContractCheck:
+    try:
+        report = aws_rds_trust.verify_aws_rds_trust_bundle()
+    except aws_rds_trust.AwsRdsTrustBundleError as exc:
+        actual = f", actual_sha256={exc.actual_sha256}" if exc.actual_sha256 is not None else ""
+        return ContractCheck(
+            "rds_trust_root",
+            False,
+            "immutable RDS trust root verification failed "
+            f"({exc.code}, path={aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH}, "
+            f"expected_sha256={aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256}"
+            f"{actual})",
+        )
+    return ContractCheck(
+        "rds_trust_root",
+        True,
+        f"immutable RDS trust root verified (path={report.path}, sha256={report.actual_sha256}, certificates={report.certificate_count})",
+    )
+
+
 def plugin_and_dependency_checks(
     *,
     settings: WebSettings | None = None,
@@ -428,11 +449,17 @@ def _collect_deployment_checks(
     )
     if include_aws_checks:
         checks.extend(plugin_and_dependency_checks(settings=settings))
+        checks.append(_aws_rds_trust_root_check())
+        by_name = {check.name: check for check in checks}
     else:
         checks.extend(plugin_and_dependency_checks(settings=settings, include_aws_checks=False))
 
     database_prerequisites_pass = (
-        url_eligible and by_name["deployment_target"].ok and by_name["deployment_state_mode"].ok and target_check.ok
+        url_eligible
+        and by_name["deployment_target"].ok
+        and by_name["deployment_state_mode"].ok
+        and target_check.ok
+        and (not include_aws_checks or by_name["rds_trust_root"].ok)
     )
     if not database_prerequisites_pass:
         blocked_detail = "schema inspection was not attempted because the deployment database prerequisites failed"
