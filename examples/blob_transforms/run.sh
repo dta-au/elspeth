@@ -11,6 +11,10 @@ ELSPETH_BIN="${ELSPETH_BLOB_TRANSFORMS_CLI_BIN:-$PROJECT_ROOT/.venv/bin/elspeth}
 cd "$PROJECT_ROOT"
 
 mkdir -p "$EXAMPLE_DIR/input" "$EXAMPLE_DIR/output" "$EXAMPLE_DIR/payloads/offline" "$EXAMPLE_DIR/runs"
+# The payload store refuses group/world-writable directories and only repairs
+# the mode on directories it creates itself; mkdir honours umask, so force a
+# private mode on the pre-created store directory.
+chmod 700 "$EXAMPLE_DIR/payloads/offline"
 rm -f \
   "$EXAMPLE_DIR/input/csv_blob_manifest.csv" \
   "$EXAMPLE_DIR/output/expanded_csv_rows.csv" \
