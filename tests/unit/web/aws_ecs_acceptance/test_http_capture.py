@@ -447,6 +447,100 @@ def test_capture_fails_closed_with_static_check_names(tmp_path: Path, failure: s
     assert not (tmp_path / "state.json").exists()
 
 
+def test_capture_accepts_generated_output_sink_node_id(tmp_path: Path) -> None:
+    """Reproduces elspeth-a811cba074: the live outputs manifest reports the
+    engine's deterministic generated node id (``sink_<yaml-key>_<12-hex>``,
+    e.g. ``sink_output_ca54c90e06a7``) for the fixed pipeline's one sink, not
+    the literal YAML key ``"output"``. ``capture()`` must accept this shape
+    since it is the schema-guaranteed identity of this pipeline's output
+    sink (see ``node_id()`` in ``elspeth.core.dag.builder``), not a defect.
+    """
+    api = _AcceptanceApi()
+    api.artifacts = [
+        {
+            "artifact_id": _ARTIFACT_ID,
+            "sink_node_id": "sink_output_ca54c90e06a7",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        }
+    ]
+
+    state = acceptance.capture(
+        _auth_env(),
+        state_file=tmp_path / "state.json",
+        transport=httpx.MockTransport(api),
+        now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+        sleep=lambda _seconds: None,
+    )
+
+    assert state.artifact_id == _ARTIFACT_ID
+    assert state.artifact_sha256 == api.artifact_sha256
+
+
+def test_capture_fails_closed_when_output_sink_id_is_ambiguous(tmp_path: Path) -> None:
+    api = _AcceptanceApi()
+    other_artifact_id = "9e15a237-4c5e-4b09-9d9d-3c9f8db6b6c1"
+    api.artifacts = [
+        {
+            "artifact_id": _ARTIFACT_ID,
+            "sink_node_id": "output",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        },
+        {
+            "artifact_id": other_artifact_id,
+            "sink_node_id": "sink_output_ca54c90e06a7",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        },
+    ]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="artifact_manifest"):
+        acceptance.capture(
+            _auth_env(),
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(api),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
+
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_capture_rejects_differently_named_sink_that_shares_the_output_prefix(tmp_path: Path) -> None:
+    """A sink named e.g. ``output_extra`` would generate
+    ``sink_output_extra_<12-hex>`` — a bare ``startswith("sink_output_")``
+    heuristic would wrongly accept it. The selector must require the exact
+    ``sink_output_<12-hex>`` shape and reject this near-miss (zero matches).
+    """
+    api = _AcceptanceApi()
+    api.artifacts = [
+        {
+            "artifact_id": _ARTIFACT_ID,
+            "sink_node_id": "sink_output_extra_ca54c90e06a7",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        }
+    ]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="artifact_manifest"):
+        acceptance.capture(
+            _auth_env(),
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(api),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
+
+
 def test_capture_times_out_on_nonterminal_run_without_persisting_state(tmp_path: Path) -> None:
     api = _AcceptanceApi()
     api.run_status = "running"
