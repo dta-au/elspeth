@@ -71,10 +71,23 @@ Schema, Prometheus/OpenTelemetry, and GitHub Actions.
   it for compatible telemetry labels/exporters or provider/docs-only changes.
   Any bump requires a hard cut and synchronized code, tests, envelopes,
   profiles, runbooks, and receipts.
-- Acquire authorities in this order:
-  `SessionOperationFence -> RunOwnershipFence -> Landscape CoordinationToken`.
+- Acquire authorities and database locks in this order:
+  `local compose/execution guard -> SessionOperationFence -> Sessions advisory
+  lock -> session-fence row -> guided/fork/derived rows -> RunOwnershipFence ->
+  Landscape CoordinationToken`. Local guards are optimizations only. Never
+  enter `SessionOperationAuthority.mutate()` on a second connection while an
+  advisory-locked Sessions transaction is open. Pair-session operations sort
+  session IDs before applying the same order. Release in reverse order.
   Cancellation request insertion is the only non-owner mutation, and only
   records a durable request.
+- One renewable `SessionOperationLease` owns each complete logical operation.
+  Request-complete composer/guided work may keep request scope, but deferred,
+  shielded, fork, and background execution work transfers lease ownership to
+  the operation coordinator before HTTP return and retains it through terminal
+  Sessions writes and blob compensation. Every child task is registered with
+  that lease; uncertain renewal stops new work and wins over ordinary
+  cancellation. Per-operation lease objects are the sole operation-lease
+  renewers; instance heartbeat renews membership only.
 - Task 12C exclusively registers the `multi_instance` and `kubernetes_kind`
   markers in `pyproject.toml` before either heavy suite is committed. Only Task
   20 may later edit `.github/workflows/ci.yaml`,
@@ -208,7 +221,7 @@ tests, and documentation:
 The exact container test command shape is:
 
 ```bash
-env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer <explicit-paths>
+env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer <explicit-paths>
 ```
 
 Dedicated lanes add their marker intersection, for example
@@ -232,7 +245,7 @@ selected container command; run the unit command separately.
 
    ```bash
    env -u VIRTUAL_ENV uv sync --frozen --all-extras
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      'tests/e2e/examples/test_shipped_examples.py::TestShippedExamples::test_shipped_journal_paths_resolve_next_to_audit_db_with_hostile_env[landscape-journal]'
    ```
 
@@ -245,10 +258,10 @@ selected container command; run the unit command separately.
    processes:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      'tests/e2e/examples/test_shipped_examples.py::TestShippedExamples::test_shipped_journal_paths_resolve_next_to_audit_db_with_hostile_env[landscape-journal]'
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 tests/e2e/examples/test_shipped_examples.py
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 tests/e2e/examples/test_shipped_examples.py
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 tests/e2e/examples/test_shipped_examples.py
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 tests/e2e/examples/test_shipped_examples.py
    ```
 
    Expected GREEN: all selected tests pass both times.
@@ -257,9 +270,9 @@ selected container command; run the unit command separately.
    receipt-aware work.
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 tests/unit tests/integration
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer tests/testcontainer/web
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 tests/unit tests/integration
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer tests/testcontainer/web
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0
    ```
 
    Record totals and any unrelated baseline failure before proceeding.
@@ -290,13 +303,13 @@ commit and exact test commands.
    editing its implementation:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/core/landscape/test_scheduler_fencing.py \
      tests/unit/core/landscape/test_scheduler_lease_recovery_races.py \
      tests/unit/core/landscape/test_leader_fence_stale_token.py \
      tests/unit/engine/test_lease_recovery_sweep.py \
      tests/unit/engine/test_scheduler_drain_characterization.py
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/e2e/recovery/test_concurrent_resume.py \
      tests/e2e/recovery/test_follower_coordination_chaos.py \
      tests/e2e/recovery/test_liveness_aware_reap.py \
@@ -444,7 +457,7 @@ No Git commit is expected.
 3. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/test_node_runtime_contract.py \
      tests/unit/test_build_push_release_checks.py
    ```
@@ -516,7 +529,7 @@ later README claim edits are cryptographically disjoint from image inputs.
    durable row identity plus version without preserving an obsolete value.
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/coordination/test_contracts.py \
      tests/unit/web/sessions/test_schema.py \
      tests/unit/web/sessions/test_blob_inline_resolutions_schema.py \
@@ -626,10 +639,10 @@ exposing raw database handles or a deleted-ID registry.
      either row.
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/coordination/test_session_operation_fence.py \
      tests/unit/web/coordination/test_sqlite_session_operation_authority.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_session_operation_fence_postgres.py
    ```
 
@@ -670,12 +683,22 @@ deleted state or take a fallback write path.
 
 **Files:**
 
+- Modify: `src/elspeth/web/app.py`
+- Modify: `src/elspeth/web/coordination/contracts.py`
+- Modify: `src/elspeth/web/coordination/lifecycle.py`
+- Modify: `src/elspeth/web/coordination/repository.py`
+- Modify: `src/elspeth/web/sessions/protocol.py`
 - Modify: `src/elspeth/web/sessions/service.py`
 - Modify: `src/elspeth/web/sessions/guided_operations.py`
+- Modify: `src/elspeth/web/sessions/routes/_helpers.py`
+- Modify: `src/elspeth/web/sessions/routes/guided_operations.py`
 - Modify: `src/elspeth/web/sessions/routes/messages.py`
 - Modify: `src/elspeth/web/sessions/routes/runs.py`
 - Modify: `src/elspeth/web/sessions/routes/sessions.py`
 - Modify: `src/elspeth/web/sessions/routes/composer/compose.py`
+- Modify: `src/elspeth/web/sessions/routes/composer/guided.py`
+- Modify: `src/elspeth/web/sessions/routes/composer/guided_chat_atomic.py`
+- Modify: `src/elspeth/web/sessions/routes/composer/guided_plan.py`
 - Modify: `src/elspeth/web/sessions/routes/composer/proposals.py`
 - Modify: `src/elspeth/web/sessions/routes/composer/pipeline_settlement.py`
 - Modify: `src/elspeth/web/sessions/routes/composer/state.py`
@@ -685,64 +708,129 @@ deleted state or take a fallback write path.
 - Modify: `src/elspeth/web/sessions/engine.py`
 - Modify: `src/elspeth/web/composer/service.py`
 - Modify: `src/elspeth/web/composer/progress.py`
+- Modify: `src/elspeth/web/composer/protocol.py`
+- Modify: `src/elspeth/web/composer/source_inspection.py`
 - Modify: `src/elspeth/web/composer/tutorial_service.py`
 - Modify: `src/elspeth/web/composer/reviewed_source_authority.py`
+- Modify: `src/elspeth/web/composer/tools/_common.py`
 - Modify: `src/elspeth/web/composer/tools/sources.py`
 - Modify: `src/elspeth/web/composer/tools/blobs.py`
+- Modify: `src/elspeth/web/blobs/protocol.py`
+- Modify: `src/elspeth/web/blobs/routes.py`
 - Modify: `src/elspeth/web/blobs/service.py`
 - Modify: `src/elspeth/contracts/blobs.py`
+- Modify: `src/elspeth/web/execution/routes.py`
 - Modify: `src/elspeth/web/execution/service.py`
 - Modify: `src/elspeth/web/execution/outputs.py`
 - Create: `tests/unit/architecture/test_session_db_mutation_authority.py`
 - Create: `tests/unit/web/sessions/test_operation_fence_wiring.py`
+- Modify: `tests/unit/web/sessions/test_static_direct_writers.py`
 - Test: `tests/unit/web/blobs/test_service.py`
 - Test: `tests/unit/web/composer/test_blob_inline_tools.py`
 - Create: `tests/unit/contracts/test_web_blob_fencing.py`
 - Create: `tests/testcontainer/web/test_session_mutation_fencing_postgres.py`
 
-1. Before wiring, build an AST/repository inventory of **every** Sessions-
-   database mutator and classify it as session-scoped or global. A session-
-   scoped writer must accept and exact-CAS `SessionOperationFence` in the same
-   transaction. A global writer must be explicitly listed with its separate
-   authority and cannot accept a session ID as an implicit bypass. Any new or
-   unclassified mutator fails
+1. Build a production-only, bidirectional AST/repository inventory of **every**
+   Sessions table and normalized `INSERT`/`UPDATE`/`DELETE`/upsert/raw-SQL
+   writer. Cover table methods, functional and dialect forms, aliases,
+   qualified imports, prebuilt statements, bulk/from-select, CTEs, wrappers,
+   engine paths, and direct write-connection acquisition. Fail closed on
+   parse/decode errors. Classify every table and writer as session-scoped or
+   global with a named typed authority, and compare the live inventory and
+   reviewed manifest in both directions using stable AST fingerprints,
+   occurrence ordinals, and exact `Counter` multiplicity. New sites, duplicate
+   identical sites, moved/replaced sites with the same count, stale manifest
+   rows, or direct write access outside a named authority all fail
    `tests/unit/architecture/test_session_db_mutation_authority.py`.
-2. Write RED tests for compose/recompose, message append, proposal creation and
-   settlement, guided seed/import/revert/settlement, blob finalization,
-   execution admission, progress update, archive, and delete. Include blob
-   creation/reattachment/finalization paths in `web/composer/tools/blobs.py`,
-   `web/blobs/service.py`, and `contracts/blobs.py`, not only route callers.
-   Guided writes
-   must carry both `GuidedOperationFence` and `SessionOperationFence`.
-   Include the current discovered owners: composer tutorial/state/reviewed-
-   source/source-tool writers; audit-story and proposal-reference writes;
-   interpretation events; execution admission/projection/output writers; and
-   the existing service/routes/guided/blob paths. Archive/delete must refuse an
-   active operation lease. Cross-replica reads must observe durable state rather
-   than local broadcaster state.
-3. Run:
+   The manifest includes all protected tables:
+   `audit_access_log`, `rate_limit_buckets`, `rate_limit_events`,
+   `run_start_permits`, `schema_identity`, `session_operation_fences`,
+   `sessions_cleanup_claims`, and `web_instances`. Startup/recovery code is not
+   an automatic exception; `cancel_orphaned_runs(session_id, ...)` is ordinary
+   session-scoped work, while any cross-session recovery writer needs its own
+   typed global authority.
+2. Keep the legacy test-fixture scanner separate. Replace its count-only,
+   set-keyed dynamic expansion with eight explicit Task-4 fixture/negative DML
+   identities and exact multiplicity. Add synthetic duplicate, aliased DML,
+   same-count replacement, and stale-entry cases. Do not broaden four generic
+   `(path, symbol, table, operation)` exceptions.
+3. Write RED matrix tests for every production writer cohort: compose/
+   recompose; chat; proposal create/settle; guided seed/import/revert/settle;
+   interpretation; tutorial/state/reviewed-source/source tools; audit-story/
+   proposal references; blob reserve/link/finalize/delete/read; run admission/
+   projection/output/event; progress; fork; archive/delete; and typed global
+   recovery. Acquire A, lose/release/expire it, take over with B, invoke A, and
+   compare every Sessions row plus observable external effects before/after.
+   Inject loss after async preparation but before DML. For every allocator,
+   prove a rejected write consumes no sequence and the next valid write gets
+   exactly N+1, including chat sequence, composition version, guided-event
+   sequence, and run-event sequence.
+4. Guided operations acquire `SessionOperationFence` before
+   `GuidedOperationFence`; every reserve, renew, bind, write, blob copy, replay,
+   settle, and fail checks both in the same transaction. Test current/current,
+   stale-session/current-guided, current-session/stale-guided, and mismatched
+   session pairs. Release guided authority before session authority. A live
+   guided token without the current session fence authorizes nothing.
+5. Add a typed, fenced Sessions unit of work. Expose narrow domain operations,
+   never a raw `Connection` or unrestricted `execute(object)`. Mandatory fence
+   or operation-context parameters replace optional compatibility bypasses.
+   One renewable lease owns the complete logical operation; the execute path
+   transfers it to the background coordinator before returning `202` and holds
+   it through progress/output/terminal writes and blob compensation.
+   Process-local locks and broadcasters remain UX/capacity optimizations only.
+6. Add explicit read authority for standalone blob download/preview so metadata
+   and bytes serialize with deletion. Use the existing durable composer
+   progress tables as correctness state: two independent services and
+   broadcasters over one database must replay/tail ordered progress without a
+   gap, deduplicate by sequence after reconnect, and emit no local-only event
+   when persistence fails.
+7. Add typed fork and archive lifecycles. Fork verifies the parent session and
+   guided fences, server-mints an inaccessible child, atomically creates the
+   child and closed epoch-1 fence, and uses canonical parent/hidden-child
+   ordering through copy and settlement. Physical archive acquires its own
+   conflicting archive lease and consumes it on confirmed cascade instead of
+   releasing a missing fence; soft retain releases normally. Cover cancellation
+   before/after commit, unknown outcome, stale retry, and pair deadlock
+   timeouts.
+8. Preserve staged filesystem safety. Use operation-epoch-qualified temp and
+   tombstone identities; recheck authority around temp creation, chunk writes,
+   fsync, rename, deletion staging, the short advisory-locked DB commit, and
+   publish/purge. Never hold a DB connection over long filesystem/network
+   work. Publish/restore/purge is idempotent, stale cleanup cannot remove
+   winner-owned state, and an unprovable post-commit cleanup records a durable
+   recovery obligation. Task 5 owns safe production and immediate
+   reconciliation; Task 12 adds distributed retention/claim processing.
+9. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/sessions/test_operation_fence_wiring.py \
      tests/unit/architecture/test_session_db_mutation_authority.py \
+     tests/unit/web/sessions/test_static_direct_writers.py \
      tests/unit/web/blobs/test_service.py \
      tests/unit/web/composer/test_blob_inline_tools.py \
      tests/unit/contracts/test_web_blob_fencing.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_session_mutation_fencing_postgres.py
    ```
 
    Expected RED: at least one mutation accepts no fence or writes after loss.
-4. Thread the typed fence through service boundaries; make every affected write
-   execute its CAS in the same transaction as the state change. Treat composer
-   inflight rows as capacity bookkeeping, never correctness authority.
-5. Rerun the commands plus `tests/unit/web/sessions`. Expected GREEN: stale
-   workers change neither row state nor event sequence.
-6. Commit:
+10. Implement through the listed production service/route/tool boundaries.
+    Every affected state change exact-CASes in its own short transaction under
+    the global order. Composer inflight rows remain capacity bookkeeping, never
+    correctness authority.
+11. Rerun the commands plus
+    `env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0
+    tests/unit/web/sessions`. The PostgreSQL gate uses separate production
+    services, repositories, engines/connections, and broadcasters with one
+    shared data directory; it proves DB-time expiry/blocked takeover ordering,
+    dual fencing, archive/delete refusal, contiguous sequences, durable tailing,
+    and blob rename/finalize compensation.
+12. Commit:
 
    ```bash
-   git add src/elspeth/web/sessions src/elspeth/web/composer \
+   git add src/elspeth/web/app.py src/elspeth/web/coordination \
+     src/elspeth/web/sessions src/elspeth/web/composer \
      src/elspeth/web/blobs src/elspeth/web/execution \
      src/elspeth/contracts/blobs.py tests/unit/web/sessions \
      tests/unit/architecture/test_session_db_mutation_authority.py \
@@ -755,7 +843,10 @@ deleted state or take a fallback write path.
 
 **Done when:** every Sessions mutator is exhaustively classified, every
 session-scoped write is fenced, every global write names its separate authority,
-and the existing issue's read/write/run-admission race reproducer is green.
+background work owns one renewable lease through its last durable/external
+effect, stale workers change neither state nor canonical bytes nor any sequence,
+cross-replica reads/progress are durable, and the existing issue's read/write/
+run-admission race reproducer is green.
 
 ## Task 6: Add Membership, Run Ownership, and Exhaustive Landscape Fencing
 
@@ -801,31 +892,39 @@ and the existing issue's read/write/run-admission race reproducer is green.
    batch/aggregation/coalesce; calls/operations; sink effects/reservations/
    finalization; checkpoint; artifact; source completion; export; terminal
    finalization. Every inventory entry must accept the current Landscape token
-   and open a transaction whose first statement verifies it. Predeclare the
-   sole exception implemented in Task 8B:
-   `begin_run_with_baseline` may create epoch 1 only from a supplied closed
-   `WebRunStartPermit` or `LocalRunStartPermit`; it validates/records the permit
-   subject inside Landscape and never reads or mutates Sessions. An
-   unclassified mutating method, another token creator, cross-database access,
-   or unfenced web caller fails the test.
+   and open a transaction whose first statement verifies it. Until Task 8B
+   only, permit exactly the legacy
+   `RunLifecycleRepository.begin_run ->
+   RunCoordinationRepository.register_run_leader_on` epoch-1 creation chain.
+   Freeze stable fingerprints, ordinals, write set, cardinality one, and the
+   exact production caller set; web callers must already hold matching
+   session/run ownership and run ID. The standalone `register_run_leader`
+   wrapper is test/fixture-only with no production caller: remove/privatize it
+   in Task 6 if practical, otherwise include it explicitly in the closed
+   temporary inventory. Reject another creator, another `leader_epoch=1`,
+   aliases/wrappers, changed writes, broad exception keys, cross-database
+   access, or new production callers. Mark this exception non-release and name
+   Task 8B as its mandatory sunset; it exempts no normal Landscape mutation
+   from first-statement full-token verification.
 3. Use sessions-database transaction time only for sessions instance/run/
    operation authority, and Landscape transaction time only for Landscape
    leadership, worker, scheduler/effect lease, checkpoint, and stale-owner
    decisions. A test with deliberately divergent database clocks must prove no
    timestamp crosses adapters or participates in a cross-database comparison.
-4. Write acquisition-failure tests for the required order. If run ownership is
-   obtained but Landscape leadership fails, or leadership is obtained and a
-   later validation fails, compensate/release every newly acquired authority
-   or durably mark recovery required. Partial acquisition cannot leak a usable
-   lease/token.
+4. Write acquisition-failure tests for the required order. Build the complete
+   authority bundle privately and publish no capability to a worker until all
+   components validate. If run ownership is obtained but Landscape leadership
+   fails, or leadership is obtained and a later validation fails, release in
+   reverse order or durably mark recovery required. An unpublished partial
+   token may expire but cannot leak usable authority.
 5. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/coordination/test_run_ownership.py \
      tests/unit/architecture/test_web_landscape_mutation_fencing.py \
      tests/unit/core/landscape/test_database_clock_authority.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_run_ownership_postgres.py
    ```
 
@@ -878,9 +977,9 @@ partial acquisition can leave usable authority behind.
 2. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/coordination/test_lifecycle.py tests/unit/web/test_readiness.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_compatibility_overlap_postgres.py
    ```
 
@@ -963,7 +1062,7 @@ recovery refusal).
 2. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/execution/test_execution_envelope.py \
      tests/unit/core/security/test_secret_loader.py \
      tests/unit/core/test_resolve_secret_refs.py \
@@ -1039,7 +1138,7 @@ OCI/generation fingerprint is durable.
 3. Run RED/GREEN:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/contracts/test_run_start_permits.py \
      tests/unit/web/execution/test_start_permit_issuance.py
    ```
@@ -1067,6 +1166,7 @@ is switched to the Landscape atomic-baseline API.
 **Files:**
 
 - Modify: `src/elspeth/contracts/run_start.py`
+- Modify: `src/elspeth/core/landscape/run_coordination_repository.py`
 - Modify: `src/elspeth/core/landscape/run_lifecycle_repository.py`
 - Modify: `src/elspeth/core/landscape/factory.py`
 - Modify: `src/elspeth/core/checkpoint/manager.py`
@@ -1077,6 +1177,7 @@ is switched to the Landscape atomic-baseline API.
   inventory before implementation
 - Create: `tests/unit/architecture/test_atomic_run_baseline_inventory.py`
 - Modify: `tests/unit/contracts/test_run_start_permits.py`
+- Modify: `tests/unit/core/landscape/test_run_coordination_repository.py`
 - Modify: `tests/unit/core/landscape/test_run_lifecycle_repository.py`
 - Modify: `tests/unit/core/landscape/test_factory.py`
 - Modify: `tests/unit/core/checkpoint/test_recovery.py`
@@ -1095,66 +1196,85 @@ is switched to the Landscape atomic-baseline API.
    canonical subject hash. Local permits explicitly name a single local owner
    and contain no Sessions authority. It is the sole Landscape first-statement
    token-creation exception and accepts only one of those serialized variants.
-   No other method may mint epoch 1. With periodic checkpoints disabled,
-   sequence 0 still records topology/envelope/source posture and
+   No other method may mint epoch 1. Reject permit subclasses/forged mappings,
+   a reused permit ID with another subject, and one run ID with another permit.
+   Exact retry returns the identical bundle without adding rows/events. Inject
+   failure after run insert, token mint, and baseline insert; every failure
+   rolls back all three. With periodic checkpoints disabled, sequence 0 still
+   records topology/envelope/source posture and
    `automatic_recovery_eligible: false`, plugin execution remains valid, and no
    later checkpoint is written.
 2. Write the architecture inventory before refactoring. It must fail while any
    fresh CLI, web, fixture, `RecorderFactory.run_lifecycle`, or direct
    repository path calls old `begin_run`, while
    `CheckpointCoordinator.checkpoint_run_start` exists, or while another path
-   can write sequence 0 after creation.
+   can write sequence 0 after creation. Import the Task-6 creator inventory:
+   RED requires its exact temporary exception and current caller set; GREEN
+   requires zero temporary entries. Inspect symbols, protocol/factory surfaces,
+   AST references, aliases, wrappers, and `getattr`, not only regex call text.
+   Prove Landscape imports no Sessions implementation.
 3. Run RED:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/architecture/test_atomic_run_baseline_inventory.py \
      tests/unit/contracts/test_run_start_permits.py \
+     tests/unit/core/landscape/test_run_coordination_repository.py \
      tests/unit/core/landscape/test_run_lifecycle_repository.py \
      tests/unit/core/landscape/test_factory.py \
      tests/unit/core/checkpoint/test_recovery.py \
      tests/integration/checkpoint/test_recovery.py \
      tests/integration/pipeline/orchestrator/test_graceful_shutdown.py \
      tests/integration/pipeline/test_resume_comprehensive.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_run_start_baseline_postgres.py
    ```
 
 4. Replace `begin_run` with one epoch-29 `begin_run_with_baseline`
-   transaction and remove the late sequence-0 seam. It validates and records
+   transaction and remove the Task-6 temporary exception and late sequence-0
+   seam. Remove or privatize the standalone `register_run_leader`; any
+   connection-level epoch-1 mint helper is an implementation detail callable
+   only inside `begin_run_with_baseline`. It validates and records
    the supplied permit variant/ID/run/canonical subject entirely inside its
    Landscape transaction; it never queries, locks, updates, or calls Sessions.
    The same exact permit and baseline inputs return the existing bundle;
    changed/reused permit subjects fail closed. All other Landscape mutations
    retain first-statement token verification. Update
    `RunLifecycleCoordinator`, checkpointing, leader drain, CLI, web, every
-   fixture, and every direct caller. A web start obtains or rehydrates only the
+   fixture, and every direct caller. The only structural creator of the run row,
+   epoch-1 coordination state, and sequence-0 baseline is this transaction.
+   A web start obtains or rehydrates only the
    Task 8A Sessions-issued `WebRunStartPermit`; it cannot construct one locally
    or substitute `LocalRunStartPermit`. CLI/direct callers use only the local
    variant. Do not add a Landscape schema bump.
-5. Prove absence and GREEN:
+5. Prove structural absence and GREEN:
 
    ```bash
    if rg -n '\.begin_run\(' src tests \
      --glob '!tests/unit/architecture/test_atomic_run_baseline_inventory.py'; then exit 1; fi
+   if rg -n 'register_run_leader|leader_epoch\s*=\s*1' src/elspeth \
+     --glob '!src/elspeth/core/landscape/run_coordination_repository.py' \
+     --glob '!src/elspeth/core/landscape/run_lifecycle_repository.py'; then exit 1; fi
    if rg -n 'checkpoint_run_start' src/elspeth; then exit 1; fi
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/architecture/test_atomic_run_baseline_inventory.py \
      tests/unit/contracts/test_run_start_permits.py \
+     tests/unit/core/landscape/test_run_coordination_repository.py \
      tests/unit/core/landscape/test_run_lifecycle_repository.py \
      tests/unit/core/landscape/test_factory.py \
      tests/unit/core/checkpoint/test_recovery.py \
      tests/integration/checkpoint/test_recovery.py \
      tests/integration/pipeline/orchestrator/test_graceful_shutdown.py \
      tests/integration/pipeline/test_resume_comprehensive.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_run_start_baseline_postgres.py
    ```
 
 6. Commit all mechanically updated direct callers in this one refactor commit:
 
    ```bash
-   git add src/elspeth/core/landscape/run_lifecycle_repository.py \
+   git add src/elspeth/core/landscape/run_coordination_repository.py \
+     src/elspeth/core/landscape/run_lifecycle_repository.py \
      src/elspeth/contracts/run_start.py \
      src/elspeth/core/landscape/factory.py src/elspeth/core/checkpoint/manager.py \
      src/elspeth/engine/orchestrator/run_lifecycle.py \
@@ -1213,8 +1333,8 @@ obey a typed permit baseline without any Landscape-to-Sessions access.
 3. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 tests/unit/web/execution/test_run_start_saga.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 tests/unit/web/execution/test_run_start_saga.py
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_run_start_saga_postgres.py
    ```
 
@@ -1297,7 +1417,7 @@ incomplete-source fresh execution remains valid but recovery-ineligible.
 5. Run RED/GREEN:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/architecture/test_execution_authority_inventory.py \
      tests/unit/engine/test_execution_authority_check.py \
      tests/integration/pipeline/orchestrator/test_execution_authority_loss.py
@@ -1378,7 +1498,7 @@ plus synchronous audit, and telemetry cannot precede authoritative state.
 4. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/execution/test_recovery_admission.py \
      tests/unit/web/execution/test_cancel_reconciliation.py \
      tests/unit/core/security/test_secret_loader.py \
@@ -1387,7 +1507,7 @@ plus synchronous audit, and telemetry cannot precede authoritative state.
      tests/unit/web/secrets/test_service.py \
      tests/unit/web/secrets/test_user_store.py \
      tests/integration/pipeline/orchestrator/test_resume_guardrails.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_recovery_reconciliation_postgres.py
    ```
 
@@ -1447,11 +1567,11 @@ and every ineligible/cancelled path performs zero plugin calls.
 2. Run unit tests separately from the explicit container command:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/execution/test_websocket_ticket.py \
      tests/unit/web/composer/test_progress.py \
      tests/unit/web/middleware/test_rate_limit.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_cross_replica_signals_postgres.py
    ```
 
@@ -1527,11 +1647,11 @@ memory and rate limiting is atomic across replicas.
 4. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/coordination/test_cleanup.py \
      tests/unit/web/coordination/test_audit_primacy.py \
      tests/unit/architecture/test_coordination_audit_ownership.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m testcontainer \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m testcontainer \
      tests/testcontainer/web/test_coordination_retention_postgres.py
    ```
 
@@ -1584,7 +1704,7 @@ schema/retention remains unchanged.
 3. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/coordination/test_telemetry.py \
      tests/unit/web/coordination/test_exporter_resilience.py \
      tests/unit/web/test_prometheus_extras.py
@@ -1623,10 +1743,10 @@ failure is bounded, and this commit supplies a real compatible N runtime delta.
 2. Register both markers before Task 13 or Task 15 creates a marked file. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 tests/unit/test_ci_workflow_xdist.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 tests/unit/test_ci_workflow_xdist.py
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 \
      -m "testcontainer and multi_instance" --collect-only tests/testcontainer; test "$?" -eq 5
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 \
      -m "testcontainer and kubernetes_kind" --collect-only tests/testcontainer; test "$?" -eq 5
    ```
 
@@ -1699,16 +1819,16 @@ suite enters history.
      tests/testcontainer/web/test_multi_instance_recovery.py \
      tests/testcontainer/web/test_multi_instance_cancellation.py \
      tests/testcontainer/web/test_multi_instance_retention.py; do
-     env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 \
+     env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 \
        -m "testcontainer and multi_instance" "$test_file"
    done
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m "testcontainer and multi_instance" \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m "testcontainer and multi_instance" \
      tests/testcontainer/web/test_multi_instance_overlap.py \
      tests/testcontainer/web/test_multi_instance_saga.py \
      tests/testcontainer/web/test_multi_instance_recovery.py \
      tests/testcontainer/web/test_multi_instance_cancellation.py \
      tests/testcontainer/web/test_multi_instance_retention.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m "testcontainer and multi_instance" \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m "testcontainer and multi_instance" \
      tests/testcontainer/web/test_multi_instance_overlap.py \
      tests/testcontainer/web/test_multi_instance_saga.py \
      tests/testcontainer/web/test_multi_instance_recovery.py \
@@ -1733,7 +1853,7 @@ suite enters history.
 5. Run neighboring AWS facade and PostgreSQL owner tests:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/architecture/test_aws_ecs_acceptance_dependencies.py \
      tests/unit/web/test_aws_ecs_acceptance.py \
      tests/unit/web/aws_ecs_acceptance \
@@ -1771,7 +1891,7 @@ issues have exact regression evidence ready for closure.
 2. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 tests/unit/deployment/test_kubernetes_bundle.py
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 tests/unit/deployment/test_kubernetes_bundle.py
    ```
 
    Expected RED: bundle is absent.
@@ -1784,7 +1904,7 @@ issues have exact regression evidence ready for closure.
    trap 'rm -rf -- "$render_dir"' EXIT
    "$DEPLOYMENT_TOOL_ROOT/bin/kubectl" kustomize deploy/kubernetes/base > "$render_dir/kubernetes.yaml"
    "$DEPLOYMENT_TOOL_ROOT/bin/kubectl" apply --dry-run=client --validate=false -f "$render_dir/kubernetes.yaml"
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 tests/unit/deployment/test_kubernetes_bundle.py
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 tests/unit/deployment/test_kubernetes_bundle.py
    ```
 
 4. Commit:
@@ -1822,7 +1942,7 @@ harness/provider infrastructure.
 
    ```bash
    DEPLOYMENT_TOOL_ROOT="$PWD/.cache/deployment-tools" \
-     env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m "testcontainer and kubernetes_kind" \
+     env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m "testcontainer and kubernetes_kind" \
      tests/testcontainer/deployment/test_kubernetes_kind.py
    ```
 
@@ -1888,7 +2008,7 @@ cluster and no provider assumptions in `deploy/kubernetes/base/`.
 3. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 tests/unit/deployment/test_azure_container_apps_bundle.py
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 tests/unit/deployment/test_azure_container_apps_bundle.py
    ```
 
    Expected RED: module is absent.
@@ -1904,7 +2024,7 @@ cluster and no provider assumptions in `deploy/kubernetes/base/`.
    trap 'rm -rf -- "$bicep_dir"' EXIT
    "$DEPLOYMENT_TOOL_ROOT/bin/bicep" build deploy/azure-container-apps/main.bicep --stdout > "$bicep_dir/template.json"
    "$DEPLOYMENT_TOOL_ROOT/bin/bicep" build-params deploy/azure-container-apps/main.example.bicepparam --stdout > "$bicep_dir/parameters.json"
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 tests/unit/deployment/test_azure_container_apps_bundle.py
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 tests/unit/deployment/test_azure_container_apps_bundle.py
    ```
 
 6. Commit:
@@ -2084,7 +2204,7 @@ overlap inputs, with no provider resources or secrets created by the module.
 7. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/deployment/test_azure_container_apps_acceptance.py \
      tests/unit/deployment/test_azure_container_apps_acceptance_contract.py \
      tests/unit/architecture/test_azure_container_apps_acceptance_dependencies.py \
@@ -2172,7 +2292,7 @@ provider success.
 3. Keep public ACA wording at release-candidate/unmaintained. Run:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/docs/test_deployment_platform_docs.py \
      tests/unit/docs/test_staging_session_recreation_policy.py
    ```
@@ -2232,7 +2352,7 @@ hard cuts without prematurely claiming ACA provider acceptance.
 4. Run RED/GREEN:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/deployment/test_platform_profiles.py \
      tests/unit/deployment/test_aca_support_state_contract.py \
      tests/unit/docs/test_public_release_docs.py \
@@ -2287,7 +2407,7 @@ validate, and both legal ACA support states are tested before live acceptance.
 
    ```bash
    wardline assure . --format json
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/architecture/test_wardline_trust_surface.py
    ```
 
@@ -2305,7 +2425,7 @@ validate, and both legal ACA support states are tested before live acceptance.
      --fail-on error --fail-on-unanalyzed --local-only
    wardline assure . --format json | \
      jq -e '(.boundaries_total | type == "number") and .boundaries_total > 0 and (.coverage_pct | type == "number") and .coverage_pct > 0'
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/architecture/test_wardline_trust_surface.py
    ```
 
@@ -2352,8 +2472,8 @@ crossing passes, and no suppression or runtime dependency fakes coverage.
    Require dedicated jobs to use explicit paths and:
 
    ```text
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m "testcontainer and multi_instance" ...
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 -m "testcontainer and kubernetes_kind" ...
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m "testcontainer and multi_instance" ...
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 -m "testcontainer and kubernetes_kind" ...
    ```
 
 2. Require exact tool/action pins from this plan. The Bicep job compiles both
@@ -2398,17 +2518,17 @@ crossing passes, and no suppression or runtime dependency fakes coverage.
    env -u VIRTUAL_ENV uv run --frozen python scripts/check_contracts.py
    env -u VIRTUAL_ENV uv run --frozen python scripts/cicd/check_slot_type_cross_language.py
    env -u VIRTUAL_ENV uv run --frozen python scripts/cicd/generate_skill_inventory.py --check
-   env -u VIRTUAL_ENV uv run --frozen pytest tests/ -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest tests/ -q -n 0 \
      --cov=src/elspeth --cov-report=term-missing --cov-fail-under=85 -m "not testcontainer"
    env -u VIRTUAL_ENV uv run --frozen coverage report --include="src/elspeth/core/landscape/*" --fail-under=92
    env -u VIRTUAL_ENV uv run --frozen coverage report --include="src/elspeth/core/canonical.py" --fail-under=99
    env -u VIRTUAL_ENV uv run --frozen coverage report --include="src/elspeth/engine/orchestrator/*" --fail-under=90
    env -u VIRTUAL_ENV uv run --frozen coverage report --include="src/elspeth/contracts/*" --fail-under=62
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 \
      -m "testcontainer and not multi_instance and not kubernetes_kind" tests/testcontainer
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 \
      -m "testcontainer and multi_instance" tests/testcontainer/web/test_multi_instance_*.py
-   env -u VIRTUAL_ENV CI=1 uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV CI=1 uv run --frozen python -m pytest -q -n 0 \
      -m "testcontainer and kubernetes_kind" tests/testcontainer/deployment/test_kubernetes_kind.py
    (cd src/elspeth/web/frontend && npm ci && npm run typecheck && \
      npm test -- --run && npx --no-install playwright install chromium && \
@@ -2464,7 +2584,7 @@ crossing passes, and no suppression or runtime dependency fakes coverage.
 5. Run RED tests:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/deployment/test_deployment_ci_gates.py \
      tests/unit/test_ci_workflow_xdist.py \
      tests/unit/test_build_push_release_checks.py \
@@ -2509,7 +2629,7 @@ and one focused regression commit each.
    ```bash
    rg -n 'SESSION_SCHEMA_EPOCH.{0,20}36|session epoch 36|expect 36' \
      src tests README.md CHANGELOG.md website docs
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/web/sessions/test_schema.py \
      tests/unit/web/sessions/test_blob_inline_resolutions_schema.py \
      tests/unit/web/sessions/test_interpretation_events_table.py \
@@ -2805,7 +2925,7 @@ No other file may change in this task.
 4. Run read-only binding checks without changing implementation:
 
    ```bash
-   env -u VIRTUAL_ENV uv run --frozen pytest -q -n 0 \
+   env -u VIRTUAL_ENV uv run --frozen python -m pytest -q -n 0 \
      tests/unit/deployment/test_azure_container_apps_acceptance.py \
      tests/unit/deployment/test_azure_container_apps_acceptance_contract.py \
      tests/unit/deployment/test_platform_profiles.py \

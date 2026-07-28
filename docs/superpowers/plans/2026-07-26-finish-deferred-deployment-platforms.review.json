@@ -1,0 +1,86 @@
+{
+  "plan": "docs/superpowers/plans/2026-07-26-finish-deferred-deployment-platforms.md",
+  "reviewed_head": "81af2005737115bfe37a8a3b55d067a93926a641",
+  "verdict": "CHANGES_REQUESTED",
+  "executable_after_amendments": true,
+  "resequencing_required": false,
+  "blockers": [
+    {
+      "area": "Task 5 scope and authority inventory",
+      "finding": "The manifest and gates do not cover all Sessions writers, read and admission boundaries, protected or global authorities, or durable progress paths.",
+      "required_paths": [
+        "src/elspeth/web/coordination/repository.py",
+        "src/elspeth/web/sessions/protocol.py",
+        "src/elspeth/web/app.py",
+        "src/elspeth/web/blobs/routes.py",
+        "src/elspeth/web/execution/routes.py",
+        "src/elspeth/web/composer/source_inspection.py",
+        "src/elspeth/web/sessions/routes/_helpers.py",
+        "src/elspeth/web/sessions/routes/guided_operations.py",
+        "src/elspeth/web/sessions/routes/composer/guided.py",
+        "src/elspeth/web/sessions/routes/composer/guided_chat_atomic.py",
+        "src/elspeth/web/sessions/routes/composer/guided_plan.py",
+        "tests/unit/web/sessions/test_static_direct_writers.py"
+      ]
+    },
+    {
+      "area": "Task 5 lease lifetime and lock order",
+      "finding": "One renewable SessionOperationLease must own the complete logical operation, including background work. The fixed order is local guard, SessionOperationFence, Sessions advisory lock, fence row, guided or fork or derived rows, RunOwnershipFence, then Landscape token."
+    },
+    {
+      "area": "Task 5 compound operations",
+      "finding": "Guided work must verify both fences in one transaction; fork needs typed parent and hidden-child authority with atomic child epoch-1 creation; physical archive needs a terminal-consume path."
+    },
+    {
+      "area": "Task 5 filesystem safety",
+      "finding": "Blob and archive effects need operation-qualified staging or tombstones, pre and post fence checks, idempotent publish or restore or purge, durable cleanup recovery, and crash and race tests."
+    },
+    {
+      "area": "Task 5 replica behavior",
+      "finding": "The four gates must prove production-service behavior across independent engines and connections, including no sequence consumption, durable gap-free progress tailing, PostgreSQL lock and expiry ordering, and blob compensation."
+    },
+    {
+      "area": "Task 6 legacy epoch-1 creator",
+      "finding": "Task 6 needs one exact, count-bounded, non-release exception for RunLifecycleRepository.begin_run through RunCoordinationRepository.register_run_leader_on, with frozen production callers and no wildcard exemption."
+    },
+    {
+      "area": "Task 8B removal gate",
+      "finding": "Task 8B must delete the temporary exception, begin_run, all callers, standalone register_run_leader exposure, and checkpoint_run_start, then prove structurally that only begin_run_with_baseline creates the run row, epoch-1 token, and sequence-0 baseline."
+    }
+  ],
+  "warnings": [
+    "Use typed fenced Sessions units of work; do not expose raw database connections or turn the coordination repository into a domain megarepository.",
+    "Use mandatory fence or context parameters or a shrinking exact call-site allowlist, never optional compatibility bypasses.",
+    "Use stable AST fingerprints plus ordinal and Counter equality; line numbers, set membership, and count-only allowlists are insufficient.",
+    "Choose one lease-renewal owner and preserve existing request-hash and proposal-CAS deduplication.",
+    "Local locks and broadcasters remain UX optimizations only; correctness state must be durable.",
+    "Warpline's stale snapshot and empty impact result do not narrow verification."
+  ],
+  "required_amendments": {
+    "task_5": [
+      "Make the architecture gate a production-only bidirectional inventory of every Sessions table and normalized writer, including named protected and global authorities and rejection of direct write-connection access.",
+      "Keep the legacy fixture scanner separate and repair its eight Task-4 identities with multiplicity-aware stable fingerprints.",
+      "Exercise every writer cohort, both guided-fence axes, authority loss, exact no-write snapshots, and N-plus-one sequence assertions.",
+      "Exercise staged filesystem compensation, stale-cleanup and winner races, and durable recovery obligations.",
+      "Use independent production services, repositories, engines, connections, broadcasters, and one shared data directory in PostgreSQL.",
+      "Define blob-read authority, background-operation lease ownership, terminal archive consumption, canonical pair-session locking, typed fork lifecycle, and durable cross-replica progress."
+    ],
+    "task_6": [
+      "Permit exactly the legacy begin_run to register_run_leader_on epoch-1 chain, with stable fingerprints, cardinality one, exact production callers, and a named Task 8B sunset.",
+      "Remove or privatize standalone register_run_leader, or include it explicitly in the closed temporary chain while proving it has no production caller.",
+      "Reject aliases, wrappers, additional epoch-1 creators, changed write sets, broad exception keys, and new production callers."
+    ],
+    "task_8b": [
+      "Add run_coordination_repository.py and its tests to the manifest.",
+      "Require zero temporary exceptions and no begin_run symbol, protocol or factory surface, AST reference, alias, wrapper, getattr access, or checkpoint_run_start seam.",
+      "Prove begin_run_with_baseline atomically creates exactly the run row, epoch-1 coordination state, and sequence-0 baseline; exact retries are idempotent and injected faults roll back all artifacts.",
+      "Keep WebRunStartPermit and LocalRunStartPermit exact and closed, forbid web construction of the local permit, and preserve the Landscape-to-Sessions dependency boundary."
+    ]
+  },
+  "reviewer_summaries": {
+    "reality": "CHANGES_REQUESTED: Task 5 omits concrete owners and the static-writer gate; Task 6 needs the exact temporary legacy chain; Task 8B must cover run_coordination_repository.py.",
+    "architecture": "CHANGES_REQUESTED: define background lease ownership, read and admission boundaries, guided dual fencing, typed fork creation, filesystem compensation, and the Task 6 to Task 8B sunset.",
+    "quality": "CHANGES_REQUESTED: strengthen all four Task 5 gates with exhaustive multiplicity-aware inventory, independent-replica durable behavior, crash compensation, and structural Task 8B absence tests.",
+    "systems": "CHANGES_REQUESTED: specify full operation lifetime, global lock order, terminal archive consumption, staged external effects, authority-loss propagation, and an exact non-release Task 6 exception."
+  }
+}
