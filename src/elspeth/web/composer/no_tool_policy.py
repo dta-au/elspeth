@@ -133,6 +133,10 @@ _DATA_SOURCE_REFERENCE_GRAMMAR: Final = (
     rf".*?\b{_DATA_SOURCE_FORMAT_GRAMMAR}\s+(?:inputs?|files?|rows?)\b"
     rf")(?=\s*(?:[,;:.]|\u2013|\u2014|\b(?:and|then)\b))"
 )
+_PIPELINE_OPERATION_GRAMMAR: Final = (
+    r"(?:aggregate|batch|coerce|collect|expand|fan(?:\s+out)?|hand(?:\s+off)?|"
+    r"interleave|merge|pass|process|route|send|transform|wait|write)"
+)
 _MULTI_CLAUSE_PIPELINE_BUILD_PATTERN: Final = re.compile(
     rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}"
     r"(?:build|create|make)\s+(?:a|an|the|this)\s+"
@@ -145,15 +149,26 @@ _MULTI_CLAUSE_PIPELINE_READ_PATTERN: Final = re.compile(
     re.IGNORECASE,
 )
 _MULTI_CLAUSE_PIPELINE_OPERATION_PATTERN: Final = re.compile(
-    r"\b(?:aggregat|batch|coerc|collect|expand|fan|hand|interleav|merg|pass|process|rout|send|transform|wait|writ)\w*\b",
+    rf"(?:[,;:.]|\u2013|\u2014|\b(?:and|then)\b)\s*"
+    rf"(?:(?:and|then)\s+)?{_PIPELINE_OPERATION_GRAMMAR}\b",
     re.IGNORECASE,
+)
+_NEGATED_DO_GRAMMAR: Final = r"(?:do\s+not|don(?:'|\u2019)t)"
+_WHOLE_REQUEST_ACTION_GRAMMAR: Final = r"(?:build|create|make|run|execute)"
+_WHOLE_REQUEST_TARGET_GRAMMAR: Final = r"(?:it|this|that|(?:(?:this|that|the|my)\s+)?(?:request|build|pipeline|workflow|automation))"
+_WHOLE_REQUEST_ACTION_CLAUSE_GRAMMAR: Final = (
+    rf"{_WHOLE_REQUEST_ACTION_GRAMMAR}"
+    rf"(?:\s+{_WHOLE_REQUEST_TARGET_GRAMMAR})?"
+    r"\s*(?:[.!;]|$)"
 )
 _REQUEST_REVOCATION_PATTERN: Final = re.compile(
     rf"(?:"
-    rf"\b(?:do\s+not|don't|never)\s+{_MUTATION_ACTION_PATTERN}\b|"
-    r"\b(?:do\s+not|don't|never)\s+do\s+(?:that|this|it|so)\s*(?:[.!;]|$)|"
-    rf"\b(?:do\s+not|don't)\s+want\s+(?:you\s+)?to\s+{_MUTATION_ACTION_PATTERN}\b|"
-    r"\b(?:actually,\s*)?(?:do\s+not|don't)\s*(?:[.!;]|$)|"
+    rf"\b(?:{_NEGATED_DO_GRAMMAR}|never)\s+{_WHOLE_REQUEST_ACTION_CLAUSE_GRAMMAR}|"
+    rf"\b(?:{_NEGATED_DO_GRAMMAR}|never)\s+do\s+(?:that|this|it|so)\s*(?:[.!;]|$)|"
+    rf"\b{_NEGATED_DO_GRAMMAR}\s+want\s+(?:you\s+)?to\s+{_WHOLE_REQUEST_ACTION_CLAUSE_GRAMMAR}|"
+    rf"\bi\s+{_NEGATED_DO_GRAMMAR}\s+want\s+(?:that|this|it)\s*(?:[.!;]|$)|"
+    rf"\b(?:actually,\s*)?{_NEGATED_DO_GRAMMAR}\s*(?:[.!;]|$)|"
+    rf"\b(?:please\s+)?{_NEGATED_DO_GRAMMAR}\s+(?:proceed|continue)\s*(?:[.!;]|$)|"
     r"\bshould\s+not\s+be\s+(?:built|created|made|run|executed)\b|"
     r"\bcancel\s+(?:(?:that|this|the|my)\s+)?(?:request|build|pipeline)\b|"
     r"\bforget\s+(?:(?:that|this|the|my)\s+)?(?:request|build|pipeline)\b|"
@@ -161,9 +176,10 @@ _REQUEST_REVOCATION_PATTERN: Final = re.compile(
     r"\bi\s+no\s+longer\s+(?:want|need)\b|"
     r"\bonly\s+an?\s+example\b|"
     r"\binstead,\s+(?:please\s+)?(?:describe|explain|show|tell)\b|"
-    r"\b(?:never\s+mind|cancel\s+that|scratch\s+that|forget\s+it|undo\s+that|revert\s+that|"
+    r"\b(?:never\s+mind|cancel\s+(?:that|this|it)|scratch\s+that|forget\s+it|undo\s+that|revert\s+that|"
     r"belay\s+that|hold\s+off|ignore\s+that|withdraw\s+that\s+request|i\s+take\s+that\s+back|"
     r"i\s+changed\s+my\s+mind|on\s+second\s+thought|skip\s+it|without\s+changing\s+anything)\b|"
+    r"\b(?:please\s+)?(?:stop|cancel)\s*(?:[.!;]|$)|"
     r"\babort\b"
     rf")",
     re.IGNORECASE,

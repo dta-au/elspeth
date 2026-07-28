@@ -33,6 +33,10 @@ _COMPLETE_MULTI_CLAUSE_REQUESTS = (
         "Build a pipeline that reads customers.csv and splits rows by country. Do not do that with a generic transform.",
         id="scoped-anaphoric-constraint",
     ),
+    pytest.param(
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not add a generic transform.",
+        id="scoped-negative-action-constraint",
+    ),
     *(
         pytest.param(json.loads(path.read_text(encoding="utf-8"))["intent"], id=f"parity-{path.stem}")
         for path in sorted(_PARITY_FIXTURE_DIR.glob("*.json"))
@@ -108,6 +112,16 @@ def _registered_recipe_request(*, envelope_insertion: str = "") -> str:
             "Read the CSV file documentation and explain its transform examples.",
             PipelineMutationIntentDecision.CONVERSATIONAL,
             id="informational-format-file-documentation",
+        ),
+        pytest.param(
+            "Read customers.csv and explain how transforms work.",
+            PipelineMutationIntentDecision.CONVERSATIONAL,
+            id="informational-source-with-transform-noun",
+        ),
+        pytest.param(
+            "Read customers.csv and explain the password policy.",
+            PipelineMutationIntentDecision.CONVERSATIONAL,
+            id="informational-source-with-operation-prefix-noun",
         ),
         pytest.param(
             "Make this explanation shorter.",
@@ -389,6 +403,11 @@ def test_complete_multi_clause_pipeline_request_is_explicit(message: str) -> Non
         "Build a pipeline that reads customers.csv and writes results.jsonl. Actually, do not.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. Please do not do that.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. Don't do it.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Please don\u2019t do that.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Please do not proceed.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. I do not want that.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Stop.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel it.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel that.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. I changed my mind.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. Do not build it.",
