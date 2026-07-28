@@ -329,26 +329,72 @@ def _build_engine(label: str, raw_url: str) -> Engine:
     raise ValueError("unknown doctor schema label")
 
 
+def postgres_tls_check(label: str, connection: Connection) -> ContractCheck:
+    """Prove the live PostgreSQL backend connection is authenticated over TLS."""
+    name = "session_tls" if label == "session_schema" else "landscape_tls"
+    row = connection.execute(text("SELECT ssl, version, bits FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()")).one_or_none()
+    if row is None:
+        return ContractCheck(name, False, "authenticated PostgreSQL TLS is not active")
+    version, bits = row[1], row[2]
+    ok = row[0] is True and isinstance(version, str) and version.startswith("TLSv") and isinstance(bits, int) and bits >= 128
+    if not ok:
+        return ContractCheck(name, False, "authenticated PostgreSQL TLS is not active")
+    return ContractCheck(
+        name,
+        True,
+        f"authenticated PostgreSQL TLS is active ({version}, {bits} bits)",
+    )
+
+
 def _inspect_database(
     label: str,
     raw_url: str,
     probe_fn: Callable[[Engine | Connection], SchemaState],
-) -> tuple[SchemaState | None, ContractCheck]:
-    """Inspect connectivity and schema state through one one-shot engine."""
+    *,
+    require_authenticated_tls: bool,
+) -> tuple[SchemaState | None, ContractCheck, ContractCheck | None]:
+    """Inspect connectivity, TLS transport, and schema state through one one-shot engine."""
     engine: Engine | None = None
-    result: tuple[SchemaState | None, ContractCheck]
+    tls_result: ContractCheck | None = None
+    result: tuple[SchemaState | None, ContractCheck, ContractCheck | None]
     try:
         engine = _build_engine(label, raw_url)
         with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
-            state = probe_fn(connection)
-        result = (state, schema_check(label, state))
+            if require_authenticated_tls:
+                tls_result = postgres_tls_check(label, connection)
+                if not tls_result.ok:
+                    result = (
+                        None,
+                        ContractCheck(
+                            label,
+                            False,
+                            f"{_human_schema_label(label)} inspection was blocked because authenticated PostgreSQL TLS was not active",
+                        ),
+                        tls_result,
+                    )
+                else:
+                    state = probe_fn(connection)
+                    result = (state, schema_check(label, state), tls_result)
+            else:
+                connection.execute(text("SELECT 1"))
+                state = probe_fn(connection)
+                result = (state, schema_check(label, state), None)
     except (SessionSchemaError, SchemaCompatibilityError):
-        result = (SchemaState.STALE, schema_check(label, SchemaState.STALE))
+        result = (SchemaState.STALE, schema_check(label, SchemaState.STALE), tls_result)
     except Exception as exc:
+        if require_authenticated_tls and tls_result is None:
+            # The exception precedes TLS capture (a connection-establishment
+            # failure); no TLS evidence was ever collected, so report a
+            # static failed check rather than silently omitting it.
+            tls_result = ContractCheck(
+                "session_tls" if label == "session_schema" else "landscape_tls",
+                False,
+                "authenticated PostgreSQL TLS is not active",
+            )
         result = (
             None,
             ContractCheck(label, False, sanitize_error(f"{_human_schema_label(label)} inspection failed", exc)),
+            tls_result,
         )
     finally:
         if engine is not None:
@@ -362,6 +408,7 @@ def _inspect_database(
                         False,
                         sanitize_error(f"{_human_schema_label(label)} engine disposal failed", exc),
                     ),
+                    tls_result,
                 )
     return result
 
@@ -463,6 +510,14 @@ def _collect_deployment_checks(
     )
     if not database_prerequisites_pass:
         blocked_detail = "schema inspection was not attempted because the deployment database prerequisites failed"
+        if include_aws_checks:
+            blocked_tls_detail = "TLS was not verified because the deployment database prerequisites failed"
+            checks.extend(
+                [
+                    ContractCheck("session_tls", False, blocked_tls_detail),
+                    ContractCheck("landscape_tls", False, blocked_tls_detail),
+                ]
+            )
         checks.extend(
             [
                 ContractCheck("session_schema", False, blocked_detail),
@@ -473,8 +528,20 @@ def _collect_deployment_checks(
 
     session_url = cast(str, settings.session_db_url)
     landscape_url = cast(str, settings.landscape_url)
-    session_state, session_result = _inspect_database("session_schema", session_url, probe_session_schema)
-    landscape_state, landscape_result = _inspect_database("landscape_schema", landscape_url, probe_landscape_schema)
+    session_state, session_result, session_tls_result = _inspect_database(
+        "session_schema",
+        session_url,
+        probe_session_schema,
+        require_authenticated_tls=include_aws_checks,
+    )
+    landscape_state, landscape_result, landscape_tls_result = _inspect_database(
+        "landscape_schema",
+        landscape_url,
+        probe_landscape_schema,
+        require_authenticated_tls=include_aws_checks,
+    )
+    if include_aws_checks:
+        checks.extend([cast(ContractCheck, session_tls_result), cast(ContractCheck, landscape_tls_result)])
 
     if not init_schema:
         checks.extend([session_result, landscape_result])
