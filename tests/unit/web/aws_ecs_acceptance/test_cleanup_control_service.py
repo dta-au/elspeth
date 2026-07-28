@@ -37,6 +37,30 @@ def test_facade_reexports_cleanup_and_control_service_owners_by_identity() -> No
         assert getattr(acceptance, name) is getattr(control_service, name)
 
 
+def test_control_manifest_validate_fails_loudly_for_corrupt_final_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest: dict[str, object] = {
+        "acceptance_run_id": "run-1",
+        "candidate_sha": "a" * 40,
+        "teardown_deadline_utc": "2026-07-14T01:00:00Z",
+        "cleanup_required": False,
+        "cleanup_states": {},
+        "deadline_failure_recorded": False,
+        "final_evidence": {},
+    }
+    monkeypatch.setattr(control_service, "_read_control_manifest", lambda _path: manifest)
+
+    with pytest.raises(KeyError, match="phase"):
+        control_service.control_manifest_validate(
+            tmp_path / "control.json",
+            cleanup_only=True,
+            require_cleanup_cleared=True,
+            now=lambda: datetime(2026, 7, 14, 1, 1, tzinfo=UTC),
+        )
+
+
 def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(tmp_path: Path) -> None:
     manifest_path = tmp_path / "control.json"
     _init_control_manifest(manifest_path)
