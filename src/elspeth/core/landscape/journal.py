@@ -187,9 +187,14 @@ class LandscapeJournal:
             try:
                 original_do_commit(dbapi_connection)
             except BaseException:
-                dbapi_connection.info.pop(_PENDING_BATCH_IDS_KEY, None)
+                if _PENDING_BATCH_IDS_KEY in dbapi_connection.info:
+                    dbapi_connection.info.pop(_PENDING_BATCH_IDS_KEY)
                 raise
-            pending_batch_ids = tuple(dbapi_connection.info.pop(_PENDING_BATCH_IDS_KEY, ()))
+            if _PENDING_BATCH_IDS_KEY in dbapi_connection.info:
+                raw_pending_batch_ids = dbapi_connection.info.pop(_PENDING_BATCH_IDS_KEY)
+            else:
+                raw_pending_batch_ids = ()
+            pending_batch_ids = tuple(raw_pending_batch_ids)
             if pending_batch_ids:
                 self._drain_committed_outbox(dbapi_connection, original_do_commit)
 
@@ -221,7 +226,7 @@ class LandscapeJournal:
         context: _JournalExecutionContext,
         executemany: bool,
     ) -> None:
-        if conn.info.get(_OUTBOX_WRITE_KEY, False):
+        if _OUTBOX_WRITE_KEY in conn.info and conn.info[_OUTBOX_WRITE_KEY] is True:
             return
         if not self._is_write_statement(statement):
             return
@@ -297,21 +302,26 @@ class LandscapeJournal:
                 )
             )
         finally:
-            conn.info.pop(_OUTBOX_WRITE_KEY, None)
-        pending: list[str] = conn.info.setdefault(_PENDING_BATCH_IDS_KEY, [])
+            if _OUTBOX_WRITE_KEY in conn.info:
+                conn.info.pop(_OUTBOX_WRITE_KEY)
+        if _PENDING_BATCH_IDS_KEY not in conn.info:
+            conn.info[_PENDING_BATCH_IDS_KEY] = []
+        pending: list[str] = conn.info[_PENDING_BATCH_IDS_KEY]
         pending.append(batch_id)
 
     def _enrich_committed_records(self, records: list[JournalRecord]) -> None:
         for record in records:
             self._enrich_with_payloads(record)
-            record.pop("_payload_ref_columns", None)
+            if "_payload_ref_columns" in record:
+                record.pop("_payload_ref_columns")
 
     def _after_rollback(self, conn: Connection) -> None:
         if _BUFFER_STACK_KEY in conn.info:
             stack: list[list[JournalRecord]] = conn.info[_BUFFER_STACK_KEY]
             stack.clear()
             stack.append([])  # Reset to single root buffer
-        conn.info.pop(_PENDING_BATCH_IDS_KEY, None)
+        if _PENDING_BATCH_IDS_KEY in conn.info:
+            conn.info.pop(_PENDING_BATCH_IDS_KEY)
 
     # After this many consecutive failures, disable until next success
     _MAX_CONSECUTIVE_FAILURES = 5
@@ -424,10 +434,13 @@ class LandscapeJournal:
         for ordinal, raw_record in enumerate(raw_records):
             if type(raw_record) is not dict:
                 raise AuditIntegrityError(f"sidecar journal outbox batch {batch_id!r} has an invalid record")
+            required_metadata = {"journal_batch_id", "journal_batch_ordinal", "journal_batch_size"}
+            if not required_metadata <= set(raw_record):
+                raise AuditIntegrityError(f"sidecar journal outbox batch {batch_id!r} metadata is inconsistent")
             if (
-                raw_record.get("journal_batch_id") != batch_id
-                or raw_record.get("journal_batch_ordinal") != ordinal
-                or raw_record.get("journal_batch_size") != expected_size
+                raw_record["journal_batch_id"] != batch_id
+                or raw_record["journal_batch_ordinal"] != ordinal
+                or raw_record["journal_batch_size"] != expected_size
             ):
                 raise AuditIntegrityError(f"sidecar journal outbox batch {batch_id!r} metadata is inconsistent")
             records.append(cast(JournalRecord, raw_record))
@@ -487,13 +500,15 @@ class LandscapeJournal:
                     record = json.loads(content)
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise AuditIntegrityError(f"Landscape journal contains corrupt JSON at line {line_number}") from exc
-                if type(record) is not dict or record.get("journal_batch_id") != batch_id:
+                if type(record) is not dict or "journal_batch_id" not in record or record["journal_batch_id"] != batch_id:
                     if batch_start is not None and not batch_complete:
                         raise AuditIntegrityError(f"Landscape journal batch {batch_id!r} is partial before end of file")
                     offset += len(line)
                     continue
-                ordinal = record.get("journal_batch_ordinal")
-                if record.get("journal_batch_size") != expected_size or type(ordinal) is not int:
+                if "journal_batch_ordinal" not in record or "journal_batch_size" not in record:
+                    raise AuditIntegrityError(f"Landscape journal batch {batch_id!r} has inconsistent metadata")
+                ordinal = record["journal_batch_ordinal"]
+                if record["journal_batch_size"] != expected_size or type(ordinal) is not int:
                     raise AuditIntegrityError(f"Landscape journal batch {batch_id!r} has inconsistent metadata")
                 if batch_complete or ordinal != next_ordinal or ordinal >= expected_size or line != expected_lines[ordinal]:
                     raise AuditIntegrityError(f"Landscape journal batch {batch_id!r} has inconsistent content")
