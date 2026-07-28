@@ -405,9 +405,16 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "entry lands in <query_key>_<suffix>. Downstream mappers and sinks "
     "reference those exact prefixed names.",
     # run-4 E1: the CLOSED per-query key set + namespace arbitration.
-    "The ONLY per-query keys you author are input_fields (REQUIRED), "
-    "template, and output_fields. The mapping key supplies the query name. "
-    "There is NO per-query response_field or schema — output naming comes "
+    # run-5 P2 correction: the run-4 set omitted response_format, max_tokens,
+    # and list-form name — all valid QueryDefinition keys — so the rule
+    # forbade supported configuration by omission and steered planners to
+    # drop it or produce a nameless list entry validation rejects.
+    "The per-query keys you author are input_fields (REQUIRED), template, "
+    "output_fields, response_format ('standard' or 'structured'; default "
+    "standard), and max_tokens (a per-query override of the node-level "
+    "max_tokens). In mapping form the mapping key supplies the query name; "
+    "in LIST form each entry additionally REQUIRES its own name key. There "
+    "is NO per-query response_field or schema — output naming comes "
     "exclusively from the query-key prefix, and the node-level schema block "
     "declares any guaranteed prefixed fields.",
     # run-4 P4: no interpretation delivery exists for per-query templates.
@@ -523,9 +530,22 @@ def discovery_digest(
         for alias in aliases
     )
     if llm_aliases:
+        # run-5 P2 correction: required_options above came from the RAW
+        # plugin schema (provider-form), never the operator profile's public
+        # schema. On a profile-bound deployment that advertised provider/
+        # model/credential fields as required even though
+        # ``_LLMProfileResolver`` rejects them outright on a profile-bound
+        # node (profiles.py's ``_LLM_PRIVATE_OPTIONS``/``lower_options``) —
+        # steering the planner into a guaranteed profile_unavailable /
+        # plugin_unavailable rejection. Project required_options through the
+        # live public schema so the digest teaches the form the planner is
+        # actually pushed toward.
+        public_schema = catalog.get_schema("transform", "llm")
+        public_required = [field["name"] for field in public_schema.knob_schema.get("fields", ()) if field.get("required")]
         for entry in digest["transforms"]:
             if entry["name"] == "llm":
                 entry["profile_aliases"] = llm_aliases
+                entry["required_options"] = public_required
     return digest
 
 

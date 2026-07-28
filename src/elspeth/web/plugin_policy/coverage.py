@@ -369,6 +369,32 @@ def _translate_protected_fields_through_mapper(
     return frozenset(translated)
 
 
+def _deterministic_written_fields(node: NodeSpec) -> frozenset[str] | None:
+    """Return the top-level row fields a deterministic transform writes.
+
+    ``None`` means the write set is unprovable, so required-control coverage
+    must fail closed on that path: an unproven transform may overwrite a
+    shielded field with unscanned content. ``field_mapper`` is excluded here
+    because ``_translate_protected_fields_through_mapper`` models its writes.
+    """
+    if node.plugin == "passthrough":
+        return frozenset()
+    if node.plugin != "value_transform":
+        return None
+    operations = node.options.get("operations")
+    if not isinstance(operations, Sequence) or isinstance(operations, (str, bytes)):
+        return None
+    targets: set[str] = set()
+    for operation in operations:
+        if not isinstance(operation, Mapping):
+            return None
+        target = operation.get("target")
+        if not isinstance(target, str) or not target.strip():
+            return None
+        targets.add(target)
+    return frozenset(targets)
+
+
 def _stream_proves_input_control(
     stream: str | None,
     graph: OutputStreamGraph,
@@ -433,6 +459,13 @@ def _producer_proves_input_control(
         return False
     if plugin_cls.determinism is Determinism.EXTERNAL_CALL:
         return False
+    if producer.plugin != "field_mapper":
+        written_fields = _deterministic_written_fields(producer)
+        if written_fields is None or written_fields & protected_fields:
+            # A write below the nearest shield replaces scanned content with
+            # unscanned data, so upstream shielding cannot cover it. Unknown
+            # write sets fail closed.
+            return False
     translated_fields = _translate_protected_fields_through_mapper(
         producer,
         protected_fields,

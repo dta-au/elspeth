@@ -343,6 +343,31 @@ def test_payload_unsafe_mode_is_rejected_by_startup_and_payload_store(tmp_path: 
         FilesystemPayloadStore(settings.payload_store_path)
 
 
+@pytest.mark.parametrize(
+    ("directory_of", "label"),
+    [
+        (lambda settings: settings.data_dir, "data_dir"),
+        (lambda settings: settings.data_dir / "blobs", "blob"),
+    ],
+)
+@pytest.mark.parametrize("mode", [0o770, 0o707])
+def test_group_or_world_writable_data_or_blob_directory_is_rejected(
+    tmp_path: Path,
+    directory_of: Callable[[WebSettings], Path],
+    label: str,
+    mode: int,
+) -> None:
+    settings = _settings(tmp_path)
+    target = directory_of(settings)
+    target.chmod(mode)
+
+    with pytest.raises(startup.AwsEcsStartupContractError, match=label) as exc_info:
+        startup.require_runtime_directories_mounted(settings)
+
+    assert "ELSPETH_WEB__DATA_DIR" in str(exc_info.value)
+    _assert_redacted(exc_info.value)
+
+
 @pytest.mark.parametrize("operation", ["lstat", "resolve"])
 def test_secret_bearing_path_failures_are_static(
     tmp_path: Path,

@@ -89,6 +89,7 @@ from elspeth.web.sessions.guided_payloads import verify_guided_json_payloads
 from elspeth.web.sessions.guided_replay import (
     guided_response_projection_hash,
     project_composition_proposal,
+    project_guided_full_decline,
     project_guided_response,
     response_json,
     validation_errors_for_composer_surface,
@@ -146,9 +147,12 @@ from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     GuidedAuditEvidence,
     GuidedCompositionStateResult,
+    GuidedDeclinedResult,
     GuidedFailureAuditCohort,
     GuidedFailureAuditLineage,
     GuidedForkSettlementCommand,
+    GuidedFullPipelineDeclineCommand,
+    GuidedFullPipelineDeclineSettlement,
     GuidedFullPipelineProposalStageCommand,
     GuidedFullPipelineProposalStageSettlement,
     GuidedOperationActive,
@@ -3846,6 +3850,15 @@ class SessionServiceImpl:
                 if row["kind"] != "session_fork" or row["result_state_id"] is not None or row["proposal_id"] is not None:
                     raise AuditIntegrityError("Tier 1: guided operation kind does not match its result locator")
                 UUID(row["result_session_id"])
+            elif result_kind == "declined":
+                if (
+                    row["kind"] != "guided_plan"
+                    or row["result_state_id"] is None
+                    or row["proposal_id"] is not None
+                    or row["result_session_id"] is not None
+                ):
+                    raise AuditIntegrityError("Tier 1: guided plan operation has a malformed decline locator")
+                UUID(row["result_state_id"])
             else:
                 raise AuditIntegrityError("Tier 1: completed guided operation has an invalid result kind")
         except (TypeError, ValueError) as exc:
@@ -3870,6 +3883,8 @@ class SessionServiceImpl:
             )
         elif result_kind == "session":
             result = GuidedSessionResult(session_id=UUID(row["result_session_id"]))
+        elif result_kind == "declined":
+            result = GuidedDeclinedResult(checkpoint_state_id=UUID(row["result_state_id"]))
         else:
             raise AuditIntegrityError("Tier 1: completed guided operation has an invalid result kind")
         return GuidedOperationCompleted(result=result, response_hash=response_hash)
@@ -4408,6 +4423,24 @@ class SessionServiceImpl:
                     "proposal_id": None,
                 },
                 GuidedSessionResult(session_id=UUID(session_id)),
+            )
+        if isinstance(result, GuidedDeclinedResult):
+            if kind != "guided_plan":
+                raise ValueError("only guided_plan may complete with a decline locator")
+            checkpoint_state_id = SessionServiceImpl._merge_guided_binding(
+                current=row["result_state_id"], requested=result.checkpoint_state_id, label="checkpoint state"
+            )
+            if row["result_session_id"] is not None or row["proposal_id"] is not None:
+                raise AuditIntegrityError("Guided plan decline has a conflicting session/proposal binding")
+            assert checkpoint_state_id is not None
+            return (
+                {
+                    "result_kind": "declined",
+                    "result_state_id": checkpoint_state_id,
+                    "result_session_id": None,
+                    "proposal_id": None,
+                },
+                GuidedDeclinedResult(checkpoint_state_id=UUID(checkpoint_state_id)),
             )
         raise TypeError("unsupported guided operation result locator")
 
@@ -9872,6 +9905,158 @@ class SessionServiceImpl:
         settlement = cast("GuidedFullPipelineProposalStageSettlement", await self._run_sync(_sync))
         _PIPELINE_PLANNER_COUNTER.add(1, {"surface": "guided_full", "result": "proposal_created"})
         _PIPELINE_CUSTODY_COUNTER.add(1, {"surface": "guided_full", "result": command.plan.custody_result})
+        return settlement
+
+    async def decline_guided_full_pipeline_proposal(
+        self,
+        command: GuidedFullPipelineDeclineCommand,
+    ) -> GuidedFullPipelineDeclineSettlement:
+        """Persist one guided-full escape-hatch decline as an ordinary chat turn.
+
+        Sibling of stage_guided_full_pipeline_proposal for the planner's
+        other outcome (PlannerDeclined, surfaced as GuidedPlannerDecline):
+        no proposal is created. The advisor's own words become an ordinary
+        assistant chat message and the operation completes with
+        GuidedDeclinedResult — never GuidedOperationFailureCode, per the
+        same "decline is a conversational outcome, not a failure" rule the
+        freeform surface already applies.
+        """
+
+        if type(command) is not GuidedFullPipelineDeclineCommand:
+            raise TypeError("command must be an exact GuidedFullPipelineDeclineCommand")
+        checkpoint_content_hash = _composition_state_data_content_hash(command.state)
+        if command.expected_current_content_hash is not None and command.expected_current_content_hash != checkpoint_content_hash:
+            raise AuditIntegrityError("guided-full decline checkpoint content differs from the observed composition head")
+
+        audit_rows = self._prepare_guided_audit_cohort(
+            audit_evidence=command.audit_evidence,
+            payloads=(),
+            payload_store=None,
+        )
+        sid = str(command.fence.session_id)
+        now = self._now()
+
+        def _sync() -> GuidedFullPipelineDeclineSettlement:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                operation_row, _database_now = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                if operation_row["kind"] != "guided_plan":
+                    raise AuditIntegrityError("guided-full decline requires a guided_plan operation")
+                current_row = conn.execute(
+                    select(composition_states_table)
+                    .where(composition_states_table.c.session_id == sid)
+                    .order_by(desc(composition_states_table.c.version))
+                    .limit(1)
+                ).one_or_none()
+                if command.expected_current_state_id is None:
+                    if current_row is not None:
+                        raise GuidedOperationSettlementConflictError()
+                else:
+                    if (
+                        current_row is None
+                        or current_row.id != str(command.expected_current_state_id)
+                        or current_row.version != command.expected_current_state_version
+                    ):
+                        raise GuidedOperationSettlementConflictError()
+                    current_record = self._row_to_state_record(current_row)
+                    if composition_content_hash(state_from_record(current_record)) != command.expected_current_content_hash:
+                        raise AuditIntegrityError("guided-full decline observed composition content changed before staging")
+
+                checkpoint_id = self._insert_composition_state(
+                    conn,
+                    session_id=sid,
+                    payload=StatePayload(
+                        data=command.state,
+                        derived_from_state_id=(
+                            str(command.expected_current_state_id) if command.expected_current_state_id is not None else None
+                        ),
+                    ),
+                    provenance="convergence_persist",
+                    created_at=now,
+                    state_id=str(command.checkpoint_state_id),
+                )
+                checkpoint_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == checkpoint_id)).one()
+                checkpoint = self._row_to_state_record(checkpoint_row)
+
+                sequence_no = self._reserve_sequence_range(conn, sid, count=2 + len(audit_rows))
+                self._insert_chat_message(
+                    conn,
+                    session_id=sid,
+                    role="user",
+                    content=command.originating_message.content,
+                    raw_content=None,
+                    tool_calls=None,
+                    sequence_no=sequence_no,
+                    writer_principal="route_user_message",
+                    composition_state_id=checkpoint_id,
+                    tool_call_id=None,
+                    parent_assistant_id=None,
+                    created_at=now,
+                    message_id=str(command.originating_message.message_id),
+                )
+                originating_message = ChatMessageRecord(
+                    id=command.originating_message.message_id,
+                    session_id=command.fence.session_id,
+                    role="user",
+                    content=command.originating_message.content,
+                    raw_content=None,
+                    tool_calls=None,
+                    created_at=now,
+                    sequence_no=sequence_no,
+                    composition_state_id=checkpoint.id,
+                    writer_principal="route_user_message",
+                )
+                decline_message_id = self._insert_chat_message(
+                    conn,
+                    session_id=sid,
+                    role="assistant",
+                    content=command.decline_text,
+                    raw_content=None,
+                    tool_calls=None,
+                    sequence_no=sequence_no + 1,
+                    writer_principal="compose_loop",
+                    composition_state_id=checkpoint_id,
+                    tool_call_id=None,
+                    parent_assistant_id=None,
+                    created_at=now,
+                )
+                decline_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.id == decline_message_id)).one()
+                decline_message = self._row_to_chat_message_record(decline_row)
+                audit_messages = self._insert_prepared_guided_audit_rows_on_connection(
+                    conn,
+                    session_id=sid,
+                    composition_state_id=checkpoint.id,
+                    audit_rows=audit_rows,
+                    sequence_no=sequence_no + 2,
+                    created_at=now,
+                )
+                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+
+                response = project_guided_full_decline(decline_message)
+                projected_json = response_json(response)
+                response_hash = guided_response_projection_hash(response)
+                self.bind_guided_operation_on_connection(
+                    conn,
+                    command.fence,
+                    originating_message_id=command.originating_message.message_id,
+                )
+                self.complete_guided_operation_on_connection(
+                    conn,
+                    command.fence,
+                    result=GuidedDeclinedResult(checkpoint_state_id=checkpoint.id),
+                    response_hash=response_hash,
+                    actor=command.actor,
+                )
+                return GuidedFullPipelineDeclineSettlement(
+                    checkpoint_state=checkpoint,
+                    decline_message=decline_message,
+                    originating_message=originating_message,
+                    audit_messages=audit_messages,
+                    response_json=projected_json,
+                    response_hash=response_hash,
+                )
+
+        settlement = cast("GuidedFullPipelineDeclineSettlement", await self._run_sync(_sync))
+        _PIPELINE_PLANNER_COUNTER.add(1, {"surface": "guided_full", "result": "declined"})
         return settlement
 
     async def stage_guided_pipeline_proposal(

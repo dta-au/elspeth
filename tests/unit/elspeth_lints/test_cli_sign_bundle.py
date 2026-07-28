@@ -1627,9 +1627,7 @@ def test_sign_bundle_resume_rejects_success_event_that_contradicts_signed_entry(
     event["model_verdict"] = "BLOCKED"
     event_path.write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
 
-    with _patch_judge(
-        lambda _file_path: (_ for _ in ()).throw(AssertionError("completed signed decision must not be re-judged"))
-    ):
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("completed signed decision must not be re-judged"))):
         rc = main(
             _argv(
                 bundle_path,
@@ -2398,9 +2396,7 @@ def test_sign_bundle_resume_tolerates_checkpoint_retired_after_journal(
     assert (transaction / "checkpoint").is_dir()
 
     monkeypatch.setattr(sign_bundle_transaction, "clear_action_checkpoint", real_clear)
-    with _patch_judge(
-        lambda _file_path: (_ for _ in ()).throw(AssertionError("journaled accepted action must not be re-judged"))
-    ):
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("journaled accepted action must not be re-judged"))):
         rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
 
     assert rc == 0

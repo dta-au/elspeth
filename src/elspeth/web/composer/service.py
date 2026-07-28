@@ -101,6 +101,7 @@ from elspeth.web.composer.llm_response_parsing import (
     token_usage_from_response,
 )
 from elspeth.web.composer.pipeline_planner import (
+    GuidedPlannerDecline,
     PipelinePlannerError,
     PipelinePlanResult,
     PlannerBudgetPolicy,
@@ -2360,7 +2361,7 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
         progress: ComposerProgressSink | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]]:
+    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Plan one ordinary guided-full proposal through the canonical core."""
 
         from elspeth.web.sessions.protocol import GuidedOperationFence
@@ -2437,6 +2438,16 @@ class ComposerServiceImpl:
         )
         try:
             plan = await guided_full_planner_call
+        except PlannerDeclined as declined:
+            # Honest decline from the escape-hatch advisor turn: a
+            # successful conversational outcome, not a planner failure.
+            # Return it (rather than letting it fall into the broad
+            # PipelinePlannerError handler below) so the caller can persist
+            # an ordinary assistant message and complete the guided
+            # operation instead of routing it into
+            # GuidedOperationFailureCode — mirrors the freeform surface's
+            # handling in ComposerServiceImpl.compose.
+            return GuidedPlannerDecline(decline_text=declined.decline_text)
         except PipelinePlannerError as exc:
             _log_guided_planner_failure(
                 exc,
@@ -2465,7 +2476,7 @@ class ComposerServiceImpl:
         operation_fence: GuidedOperationFence,
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]]:
+    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Run one shared planner call for the current guided checkpoint."""
 
         from elspeth.web.composer.guided.deferred_intents import evaluate_deferred_intent_coverage
@@ -2591,6 +2602,11 @@ class ComposerServiceImpl:
                     "surface": planner_surface.value,
                 }
             )
+            # prepare_pipeline_plan makes no provider call at all (server-
+            # synthesized pass-through), so it cannot raise PlannerDeclined —
+            # no escape-hatch decline handling is added here; only the two
+            # provider-calling plan_pipeline() sites (below, and in
+            # plan_guided_full_pipeline) need it.
             try:
                 plan = await prepare_pipeline_plan(
                     pipeline=sketch_pipeline,
@@ -2680,6 +2696,13 @@ class ComposerServiceImpl:
         )
         try:
             plan = await guided_planner_call
+        except PlannerDeclined as declined:
+            # Same escape-hatch decline handling as plan_guided_full_pipeline
+            # above: a decline is a conversational outcome, not a planner
+            # failure, so it must not fall into the broad
+            # PipelinePlannerError handler below and must never route
+            # through GuidedOperationFailureCode.
+            return GuidedPlannerDecline(decline_text=declined.decline_text)
         except PipelinePlannerError as exc:
             _log_guided_planner_failure(
                 exc,

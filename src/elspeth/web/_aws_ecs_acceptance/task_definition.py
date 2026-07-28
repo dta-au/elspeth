@@ -256,14 +256,14 @@ def validate_task_definition_policy_binding(
     container = matches[0]
     if container.get("essential") is not True:
         raise AcceptanceCheckError("task_definition_policy_binding")
-    if (
-        expected_user is None
-        and container_name == values["WEB_CONTAINER_NAME"]
-        and container.get("command") != list(_PUBLISHED_WEB_COMMAND)
-    ):
+    is_published_web_container = expected_user is None and container_name == values["WEB_CONTAINER_NAME"]
+    if is_published_web_container and container.get("command") != list(_PUBLISHED_WEB_COMMAND):
         raise AcceptanceCheckError("task_definition_policy_binding")
     sidecars = [candidate for candidate in containers if isinstance(candidate, Mapping) and candidate.get("name") == "cloudwatch-agent"]
-    if sidecars:
+    if not sidecars:
+        if is_published_web_container:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+    else:
         _validate_cloudwatch_agent_sidecar(sidecars[0], container, values)
     ecr = cast(Mapping[str, object], manifest["ecr"])
     registry = ecr["registry"]

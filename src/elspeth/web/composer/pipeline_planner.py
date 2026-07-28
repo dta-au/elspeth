@@ -20,7 +20,7 @@ from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, final
 from uuid import UUID
 
 import structlog
@@ -115,6 +115,29 @@ class PlannerDeclined(PipelinePlannerError):
     def __init__(self, message: str, *, decline_text: str) -> None:
         super().__init__(message, code="DECLINED")
         self.decline_text = decline_text
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GuidedPlannerDecline:
+    """A ``PlannerDeclined`` outcome carried as a return value, not raised.
+
+    Guided callers (``ComposerServiceImpl.plan_guided_full_pipeline`` and
+    ``.plan_guided_pipeline``) catch ``PlannerDeclined`` themselves and
+    return this instead of letting it propagate as a
+    ``PipelinePlannerError``: a decline is a conversational outcome, not a
+    planner failure, so it must never route through the guided operation's
+    ``GuidedOperationFailureCode`` mapping. Callers persist ``decline_text``
+    as an ordinary assistant chat message and complete the guided operation
+    normally (mirrors the freeform surface's handling in
+    ``ComposerServiceImpl.compose``).
+    """
+
+    decline_text: str
+
+    def __post_init__(self) -> None:
+        if type(self.decline_text) is not str:
+            raise TypeError("GuidedPlannerDecline.decline_text must be an exact str")
 
 
 class _PipelineCandidateRejected(RuntimeError):
@@ -2231,6 +2254,7 @@ async def _plan_pipeline_inner(
 
 __all__ = [
     "PLANNER_DISCOVERY_TOOL_NAMES",
+    "GuidedPlannerDecline",
     "PipelineCustodyResult",
     "PipelinePlanResult",
     "PipelinePlannerError",

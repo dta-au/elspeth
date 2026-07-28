@@ -201,6 +201,71 @@ def test_guided_full_provider_owned_cancelled_error_is_operation_failed(
     assert operation["failure_code"] == "operation_failed"
 
 
+def test_guided_full_escape_hatch_decline_is_an_ordinary_assistant_message_not_a_failure(
+    composer_test_client,
+) -> None:
+    """PlannerDeclined on the guided-full surface must not become operation_failed.
+
+    Mirrors the freeform surface's PlannerDeclined handling
+    (ComposerServiceImpl.compose): an honest decline from the escape-hatch
+    advisor is a conversational outcome, so the guided-full operation
+    completes with the advisor's own words persisted as an ordinary
+    assistant chat message — never routed through GuidedOperationFailureCode.
+    """
+    from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+    decline_text = "I could not find a source plugin that reads this format."
+
+    class _DecliningPlanner:
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+    composer_test_client.app.state.composer_service = _DecliningPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full decline"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000056"
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={"operation_id": operation_id, "intent": "Build a pipeline from an unsupported format."},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["outcome"] == "declined"
+    assert payload["message"]["role"] == "assistant"
+    assert payload["message"]["content"] == decline_text
+
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+        assistant_rows = conn.execute(
+            select(chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(chat_messages_table.c.role == "assistant")
+        ).all()
+        user_rows = conn.execute(
+            select(chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(chat_messages_table.c.role == "user")
+        ).all()
+        assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(proposal_events_table)) == 0
+
+    # Not a failure: completed, no failure_code, no proposal.
+    assert operation.status == "completed"
+    assert operation.failure_code is None
+    assert operation.result_kind == "declined"
+    assert operation.proposal_id is None
+    assert operation.result_state_id is not None
+    assert assistant_rows == [(decline_text, "compose_loop")]
+    assert user_rows == [("Build a pipeline from an unsupported format.", "route_user_message")]
+
+    # Replay is exact.
+    replay = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={"operation_id": operation_id, "intent": "Build a pipeline from an unsupported format."},
+    )
+    assert replay.status_code == 200
+    assert replay.json() == payload
+
+
 def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkpoint(
     composer_test_client,
 ) -> None:

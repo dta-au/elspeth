@@ -363,12 +363,17 @@ class LocalAuthProvider:
         *,
         record_token_issued: Callable[[str], None],
     ) -> str:
-        """Create, audit, and activate an open-registration user atomically.
+        """Create and durably commit an open-registration user, then audit it.
 
-        The Landscape callback runs while the new user remains uncommitted in
-        auth.db. A failed audit rolls the insertion back; a cancelled async
-        caller may abandon the worker future, but the synchronous critical
-        section itself continues through audit and commit or rollback.
+        The Landscape callback observes issuance only after auth.db commits,
+        so a failed commit can never leave a ``token_issued`` audit record
+        for a user that was never created. A failed audit remains fatal: the
+        just-committed user is compensatingly deleted so no durable account
+        outlives its missing audit record, and the audit error propagates. If
+        that cleanup itself fails, the durable-but-unaudited inconsistency is
+        surfaced as :class:`AuditIntegrityError`. A cancelled async caller may
+        abandon the worker future, but the synchronous critical section itself
+        continues through commit and audit or compensation.
         """
         if not display_name:
             raise ValueError("display_name must not be empty")
@@ -382,7 +387,17 @@ class LocalAuthProvider:
             except sqlite3.IntegrityError as exc:
                 raise LocalAuthRegistrationConflict(f"User already exists: {user_id}") from exc
             access_token = self._issue_token(user_id, user_id)
+        try:
             record_token_issued(access_token)
+        except BaseException as audit_error:
+            try:
+                self.delete_user(user_id)
+            except BaseException as cleanup_error:
+                raise AuditIntegrityError(
+                    f"Open registration for {user_id!r} committed, its required token_issued "
+                    "audit failed, and the compensating cleanup also failed"
+                ) from cleanup_error
+            raise audit_error
         return access_token
 
     def delete_user(self, user_id: str) -> bool:
@@ -601,17 +616,18 @@ class LocalAuthProvider:
         *,
         record_token_issued: Callable[[UserIdentity, str], None],
     ) -> str:
-        """Consume, activate, audit, and issue under one SQLite write fence.
+        """Consume, activate, and commit under one SQLite write fence, then audit.
 
         Exactly one caller can claim the one-use token. The required Landscape
-        write happens before auth.db commits. If that write fails, the same
+        write happens only after auth.db durably commits, so a failed commit
+        can never leave a ``token_issued`` audit record for a token that was
+        never consumed. If the Landscape write then fails, a compensating
         transaction restores the unverified state and grants a bounded retry
-        window before the original exception propagates.
+        window before the original exception propagates; if that restoration
+        fails, the inconsistency surfaces as :class:`AuditIntegrityError`.
         """
         token_hash = _verification_token_hash(token)
         now = int(time.time())
-        audit_error: BaseException | None = None
-        access_token: str | None = None
         with self._connect(immediate=True) as conn:
             row = conn.execute(
                 """
@@ -648,30 +664,32 @@ class LocalAuthProvider:
 
             identity = UserIdentity(user_id=user_id, username=user_id)
             access_token = self._issue_token(user_id, user_id)
-            try:
-                record_token_issued(identity, access_token)
-            except BaseException as exc:
-                audit_error = exc
-                retry_deadline = int(time.time()) + _EMAIL_VERIFICATION_AUDIT_RETRY_SECONDS
-                restored_user = conn.execute(
-                    "UPDATE users SET email_verified = 0 WHERE user_id = ? AND email_verified = 1",
-                    (user_id,),
-                )
-                restored_token = conn.execute(
-                    """
-                    UPDATE email_verification_tokens
-                    SET used_at = NULL, expires_at = MAX(expires_at, ?)
-                    WHERE token_hash = ? AND user_id = ? AND used_at = ?
-                    """,
-                    (retry_deadline, token_hash, user_id, now),
-                )
-                if restored_user.rowcount != 1 or restored_token.rowcount != 1:
-                    raise AuditIntegrityError("Email verification audit failure could not restore retryable state") from exc
 
-        if audit_error is not None:
+        try:
+            record_token_issued(identity, access_token)
+        except BaseException as audit_error:
+            retry_deadline = int(time.time()) + _EMAIL_VERIFICATION_AUDIT_RETRY_SECONDS
+            try:
+                with self._connect(immediate=True) as conn:
+                    restored_user = conn.execute(
+                        "UPDATE users SET email_verified = 0 WHERE user_id = ? AND email_verified = 1",
+                        (user_id,),
+                    )
+                    restored_token = conn.execute(
+                        """
+                        UPDATE email_verification_tokens
+                        SET used_at = NULL, expires_at = MAX(expires_at, ?)
+                        WHERE token_hash = ? AND user_id = ? AND used_at = ?
+                        """,
+                        (retry_deadline, token_hash, user_id, now),
+                    )
+                    if restored_user.rowcount != 1 or restored_token.rowcount != 1:
+                        raise AuditIntegrityError("Email verification audit failure could not restore retryable state")
+            except AuditIntegrityError:
+                raise
+            except BaseException as restore_error:
+                raise AuditIntegrityError("Email verification audit failure could not restore retryable state") from restore_error
             raise audit_error
-        if access_token is None:
-            raise AuditIntegrityError("Email verification committed without an access token")
         return access_token
 
     async def login(self, username: str, password: str) -> str:

@@ -253,6 +253,8 @@ def _validate_directory(name: str, candidate: Path) -> _ProbeResult:
             return (ReadinessCheck(name, False, f"{name} directory must not be a symlink"),)
         if not stat.S_ISDIR(candidate_stat.st_mode):
             return (ReadinessCheck(name, False, "directory is required and must already exist"),)
+        if candidate_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return (ReadinessCheck(name, False, f"{name} group/world-writable directory is not allowed"),)
         directory = candidate.resolve(strict=True)
     except BaseException as exc:
         return (ReadinessCheck(name, False, f"directory validation failed ({type(exc).__name__})"),)

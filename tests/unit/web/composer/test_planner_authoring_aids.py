@@ -978,3 +978,47 @@ class TestRun3PackEdits:
         assert set(rows[0]) == {"kind", "user_term", "draft"}
         parts = urgency["options"]["prompt_template_parts"]
         assert any(p.get("kind") == "interpretation_ref" and p.get("requirement_id") == "urgency:assess_urgency" for p in parts)
+
+
+class TestRun5PackEdits:
+    """Pack pressure-suite run-5 closures — planner-shielding review findings.
+
+    Finding A: the run-4 CLOSED per-query key set (E1) omitted
+    ``response_format``, ``max_tokens``, and list-form ``name`` — all valid
+    ``QueryDefinition`` keys (``src/elspeth/plugins/transforms/llm/
+    multi_query.py``) — so the rule steered planners to omit valid
+    configuration or author a list entry validation rejects for a missing
+    name.
+
+    Finding B: the digest advertised an active profile-bound llm node's
+    operator-private fields (``provider`` et al.) as *required* — the raw
+    catalog schema's required set, never projected through the operator
+    profile's public schema — steering profile-bound authors toward a
+    ``profile_unavailable``/``plugin_unavailable`` rejection guaranteed by
+    ``_LLMProfileResolver`` (``src/elspeth/web/plugin_policy/profiles.py``).
+    """
+
+    def test_query_definition_rule_permits_the_full_supported_key_set(self) -> None:
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        # response_format and max_tokens are real QueryDefinition fields the
+        # run-4 closed-set rule forbade by omission.
+        assert "response_format" in rendered
+        assert "max_tokens" in rendered
+
+    def test_llm_digest_required_options_are_profile_projected_under_an_active_profile(self, tmp_path: Path) -> None:
+        view, _snapshot = _profile_view(tmp_path)
+        aids = build_planner_authoring_aids(view)
+        llm_entry = next(e for e in aids["discovery_digest"]["plugins"]["transforms"] if e["name"] == "llm")
+        required = set(llm_entry["required_options"])
+        # Operator profile validation rejects these on a profile-bound node —
+        # the digest must never advertise them as required.
+        assert not required & {"provider", "model", "credential_ref", "api_key", "api_key_secret"}
+        assert "profile" in required
+
+    def test_trained_operator_llm_digest_required_options_are_unaffected(self) -> None:
+        """The trained-operator (profile-bypassed) view keeps the raw required set."""
+        view, _snapshot = _trained_view()
+        digest = discovery_digest(view)
+        llm_entry = next(e for e in digest["transforms"] if e["name"] == "llm")
+        assert set(llm_entry["required_options"]) == {"schema", "provider", "prompt_template"}

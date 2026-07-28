@@ -217,6 +217,62 @@ def test_payload_symlink_and_unsafe_mode_are_rejected(tmp_path: Path) -> None:
         startup.require_runtime_directories_mounted(settings)
 
 
+def test_correctly_private_runtime_directories_pass(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    startup.require_runtime_directories_mounted(settings)
+
+
+@pytest.mark.parametrize(
+    ("directory_of", "label"),
+    [
+        (lambda settings: settings.data_dir, "data_dir"),
+        (lambda settings: settings.data_dir / "blobs", "blob"),
+    ],
+)
+@pytest.mark.parametrize("mode", [0o770, 0o707, 0o777])
+def test_group_or_world_writable_data_or_blob_directory_is_rejected(
+    tmp_path: Path,
+    directory_of: Callable[[WebSettings], Path],
+    label: str,
+    mode: int,
+) -> None:
+    settings = _settings(tmp_path)
+    target = directory_of(settings)
+    target.chmod(mode)
+
+    with pytest.raises(startup.ExternalStateStartupContractError, match=label) as exc_info:
+        startup.require_runtime_directories_mounted(settings)
+
+    assert "ELSPETH_WEB__DATA_DIR" in str(exc_info.value)
+    _assert_redacted(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("directory_of", "label"),
+    [
+        (lambda settings: settings.data_dir, "data_dir"),
+        (lambda settings: settings.data_dir / "blobs", "blob"),
+    ],
+)
+def test_symlinked_data_or_blob_directory_is_rejected(
+    tmp_path: Path,
+    directory_of: Callable[[WebSettings], Path],
+    label: str,
+) -> None:
+    settings = _settings(tmp_path)
+    target = directory_of(settings)
+    replacement_target = tmp_path / f"{label}-replacement-target"
+    replacement_target.mkdir(mode=0o700)
+    if label == "data_dir":
+        (settings.data_dir / "blobs").rmdir()
+    target.rmdir()
+    target.symlink_to(replacement_target, target_is_directory=True)
+
+    with pytest.raises(startup.ExternalStateStartupContractError, match=label):
+        startup.require_runtime_directories_mounted(settings)
+
+
 @pytest.mark.parametrize("operation", ["lstat", "resolve"])
 def test_secret_bearing_path_failures_are_static(
     tmp_path: Path,

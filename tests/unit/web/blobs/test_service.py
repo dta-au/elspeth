@@ -4168,6 +4168,155 @@ class TestReadBlobContentLifecycleGuard:
 
 
 # ---------------------------------------------------------------------------
+# read_blob_content_prefix_verified — bounded-memory streamed read + verify
+# ---------------------------------------------------------------------------
+
+
+class _ReadSizeSpyFile:
+    """Wraps a real file handle, recording every ``read(size)`` argument.
+
+    Lets a test prove a read path is genuinely chunked — never one big
+    slurp — without needing a multi-hundred-MiB fixture to make the
+    difference observable.
+    """
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+        self.requested_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.requested_sizes.append(size)
+        return self._handle.read(size)
+
+    def __enter__(self) -> _ReadSizeSpyFile:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._handle.__exit__(exc_type, exc, tb)
+
+
+class TestReadBlobContentPrefixVerifiedStreaming:
+    """read_blob_content_prefix_verified must stream + verify without holding
+    the full blob in memory, mirroring read_blob_content's guards exactly.
+
+    Finding B (memory half): a 100 MiB blob was fully materialized in RAM
+    per guided selection just to serve an 8 KiB bounded preview, because the
+    only way to verify the full-content hash was `storage.read_bytes()`.
+    This method reads and hashes in bounded chunks instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reads_in_bounded_chunks_not_one_full_read(self, blob_service, session_id, monkeypatch) -> None:
+        # Shrink the chunk size so a modest fixture (20 KiB) still spans many
+        # chunks — proves chunking structurally without a huge fixture.
+        monkeypatch.setattr(blob_service_module, "_STREAM_CHUNK_BYTES", 4096)
+        content = bytes(range(256)) * 80  # 20480 bytes, > 4096 * 4
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="large.csv",
+            content=content,
+            mime_type="text/csv",
+            created_by="user",
+        )
+
+        spies: list[_ReadSizeSpyFile] = []
+        real_open = Path.open
+        target = str(Path(record.storage_path))
+
+        def spy_open(self: Path, *args: object, **kwargs: object) -> object:
+            handle = real_open(self, *args, **kwargs)
+            if str(self) == target:
+                spy = _ReadSizeSpyFile(handle)
+                spies.append(spy)
+                return spy
+            return handle
+
+        monkeypatch.setattr(Path, "open", spy_open)
+
+        prefix, verified_hash, total_size = await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=100)
+
+        assert prefix == content[:100]
+        assert verified_hash == hashlib.sha256(content).hexdigest()
+        assert verified_hash == record.content_hash
+        assert total_size == len(content)
+
+        assert len(spies) == 1
+        sizes = spies[0].requested_sizes
+        # More than one chunk read (proves streaming, not a single slurp),
+        # and no single read() call requested more than the chunk bound.
+        assert len(sizes) > 1
+        assert all(size <= 4096 for size in sizes)
+
+    @pytest.mark.asyncio
+    async def test_rejects_pending_blob(self, blob_service, session_id) -> None:
+        from elspeth.web.blobs.protocol import BlobStateError
+
+        pending = await blob_service.create_pending_blob(
+            session_id=session_id,
+            filename="output.csv",
+            mime_type="text/csv",
+            created_by="pipeline",
+        )
+        Path(pending.storage_path).write_bytes(b"partial-content")
+
+        with pytest.raises(BlobStateError):
+            await blob_service.read_blob_content_prefix_verified(pending.id, prefix_bytes=8)
+
+    @pytest.mark.asyncio
+    async def test_rejects_ready_blob_with_missing_backing_file(self, blob_service, session_id) -> None:
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="missing.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+        )
+        Path(record.storage_path).unlink()
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=8)
+
+    @pytest.mark.asyncio
+    async def test_detects_content_hash_mismatch_fail_closed(self, blob_service, session_id) -> None:
+        """Same Tier 1 fail-closed guarantee as read_blob_content: a tampered
+        file must never be served, even for a bounded preview."""
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="tampered.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+        )
+        Path(record.storage_path).write_bytes(b"tampered-content")
+
+        with pytest.raises(BlobIntegrityError):
+            await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=8)
+
+    @pytest.mark.asyncio
+    async def test_prefix_shorter_than_content_still_verifies_full_hash(self, blob_service, session_id) -> None:
+        """The verified hash covers the FULL blob even though only a short
+        prefix is retained — a partial digest could never validate the
+        stored full-content hash."""
+        content = b"0123456789" * 2000  # 20000 bytes
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="big.csv",
+            content=content,
+            mime_type="text/csv",
+            created_by="user",
+        )
+
+        prefix, verified_hash, total_size = await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=8 * 1024)
+
+        assert len(prefix) == 8 * 1024
+        assert prefix == content[: 8 * 1024]
+        assert total_size == len(content)
+        assert verified_hash == content_hash(content)
+
+
+# ---------------------------------------------------------------------------
 # finalize_run_output_blobs — error path file cleanup (elspeth-0a2644dcb9)
 # ---------------------------------------------------------------------------
 

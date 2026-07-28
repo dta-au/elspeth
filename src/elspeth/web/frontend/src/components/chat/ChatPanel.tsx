@@ -1085,9 +1085,32 @@ export function ChatPanel({
   // that were deleted or are no longer ready. The derived list repeats those
   // checks synchronously so a stale candidate cannot leak during the effect's
   // cleanup render.
+  //
+  // guidedSourceBlobCandidateSet is component-local state: a page reload or
+  // remount mid step_1_source loses it while the backend's ready blobs
+  // survive. When that happens with `current === null`, re-derive the set
+  // from the reloaded ready blobs — without this, the chooser silently
+  // disappears and the outgoing request omits source_blob_id even though
+  // multiple ready blobs exist.
   useEffect(() => {
     setGuidedSourceBlobCandidateSet((current) => {
-      if (current === null) return current;
+      if (current === null) {
+        if (
+          activeSessionId === null ||
+          guidedSession?.step !== "step_1_source" ||
+          guidedNextTurn?.type !== "single_select" ||
+          readyGuidedSourceBlobs.size === 0
+        ) {
+          return current;
+        }
+        const candidates = [...readyGuidedSourceBlobs.values()];
+        return {
+          sessionId: activeSessionId,
+          turnToken: guidedNextTurn.turn_token,
+          candidates,
+          requiresExplicitChoice: candidates.length > 1,
+        };
+      }
       if (
         activeSessionId === null ||
         guidedSession?.step !== "step_1_source" ||

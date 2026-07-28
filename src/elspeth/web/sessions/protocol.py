@@ -232,7 +232,22 @@ class GuidedPipelineProposalResult:
     checkpoint_state_id: UUID
 
 
-type GuidedOperationResult = GuidedCompositionStateResult | GuidedPipelineProposalResult | GuidedSessionResult
+@final
+@dataclass(frozen=True, slots=True)
+class GuidedDeclinedResult:
+    """Replay locator for a guided-full operation whose escape-hatch advisor
+    declined instead of proposing a pipeline.
+
+    No proposal is created. ``checkpoint_state_id`` names the (content-
+    unchanged) checkpoint composition_states row inserted alongside the
+    persisted decline message, mirroring GuidedPipelineProposalResult's
+    checkpoint semantics minus the proposal binding.
+    """
+
+    checkpoint_state_id: UUID
+
+
+type GuidedOperationResult = GuidedCompositionStateResult | GuidedPipelineProposalResult | GuidedSessionResult | GuidedDeclinedResult
 
 
 @final
@@ -1703,6 +1718,76 @@ class GuidedFullPipelineProposalStageSettlement:
 
 @final
 @dataclass(frozen=True, slots=True)
+class GuidedFullPipelineDeclineCommand:
+    """Complete input for one atomic guided-full escape-hatch decline.
+
+    Sibling of GuidedFullPipelineProposalStageCommand for the other
+    guided-full planner outcome: no pipeline/proposal fields, because a
+    decline creates no proposal — only a checkpoint and the advisor's own
+    words as an ordinary assistant chat message.
+    """
+
+    fence: GuidedOperationFence
+    expected_current_state_id: UUID | None
+    expected_current_state_version: int | None
+    expected_current_content_hash: str | None
+    checkpoint_state_id: UUID
+    state: CompositionStateData
+    decline_text: str
+    actor: str
+    originating_message: GuidedOriginatingUserMessageDraft
+    audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
+
+    def __post_init__(self) -> None:
+        if type(self.fence) is not GuidedOperationFence:
+            raise AuditIntegrityError("guided-full decline fence must be exact")
+        if (self.expected_current_state_id is None) != (self.expected_current_state_version is None):
+            raise AuditIntegrityError("guided-full decline expected state id/version must be paired")
+        if (self.expected_current_state_id is None) != (self.expected_current_content_hash is None):
+            raise AuditIntegrityError("guided-full decline expected state/hash must be paired")
+        if self.expected_current_state_id is not None and type(self.expected_current_state_id) is not UUID:
+            raise AuditIntegrityError("guided-full decline expected state id must be a UUID or None")
+        if self.expected_current_state_version is not None and (
+            type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1
+        ):
+            raise AuditIntegrityError("guided-full decline expected state version must be positive or None")
+        if self.expected_current_content_hash is not None:
+            _require_guided_sha256(self.expected_current_content_hash, "guided-full decline expected content hash")
+        if type(self.checkpoint_state_id) is not UUID:
+            raise AuditIntegrityError("guided-full decline checkpoint_state_id must be a UUID")
+        if type(self.state) is not CompositionStateData:
+            raise AuditIntegrityError("guided-full decline checkpoint state must be exact")
+        if type(self.decline_text) is not str:
+            raise AuditIntegrityError("guided-full decline text must be an exact str")
+        if type(self.actor) is not str or not self.actor:
+            raise AuditIntegrityError("guided-full decline actor must be non-empty")
+        if type(self.originating_message) is not GuidedOriginatingUserMessageDraft:
+            raise AuditIntegrityError("guided-full decline originating message must be exact")
+        if type(self.audit_evidence) is not GuidedAuditEvidence:
+            raise AuditIntegrityError("guided-full decline audit evidence must be exact")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GuidedFullPipelineDeclineSettlement:
+    """Durable guided-full checkpoint, decline message, origin, and replay bytes."""
+
+    checkpoint_state: CompositionStateRecord
+    decline_message: ChatMessageRecord
+    originating_message: ChatMessageRecord
+    audit_messages: tuple[ChatMessageRecord, ...]
+    response_json: Mapping[str, Any]
+    response_hash: str
+
+    def __post_init__(self) -> None:
+        _require_guided_sha256(self.response_hash, "GuidedFullPipelineDeclineSettlement.response_hash")
+        freeze_fields(self, "audit_messages", "response_json")
+        if stable_hash(self.response_json) != self.response_hash:
+            raise AuditIntegrityError("guided-full decline response hash mismatch")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class GuidedPipelineProposalAcceptCommand:
     """Complete atomic guided acceptance cohort."""
 
@@ -2255,6 +2340,11 @@ class SessionServiceProtocol(Protocol):
         self,
         command: GuidedFullPipelineProposalStageCommand,
     ) -> GuidedFullPipelineProposalStageSettlement: ...
+
+    async def decline_guided_full_pipeline_proposal(
+        self,
+        command: GuidedFullPipelineDeclineCommand,
+    ) -> GuidedFullPipelineDeclineSettlement: ...
 
     async def reconcile_rejected_guided_pipeline_proposal(
         self,

@@ -2246,6 +2246,8 @@ async def post_guided_respond(
         if str(parsed_target) != body.edit_target.stable_id:
             raise HTTPException(status_code=400, detail="edit_target.stable_id must be a canonical UUID")
 
+    from datetime import UTC, datetime
+
     from elspeth.core.canonical import stable_hash as _message_content_hash
     from elspeth.web.composer.guided.planning import (
         build_guided_proposal_projection,
@@ -2263,7 +2265,7 @@ async def post_guided_respond(
         RecoveredPipelineCommit,
         prepare_pipeline_proposal_commit,
     )
-    from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage
+    from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PlannerOriginatingMessage
     from elspeth.web.composer.pipeline_proposal import PresentBase
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
@@ -2272,6 +2274,7 @@ async def post_guided_respond(
         GuidedCompositionStateResult,
         GuidedOperationFailureCode,
         GuidedOperationFailureCommand,
+        GuidedOperationFence,
         GuidedOperationFenceLostError,
         GuidedOperationSettlementConflictError,
         GuidedPipelineConfirmationAdmissionCommand,
@@ -2282,6 +2285,7 @@ async def post_guided_respond(
         GuidedPipelineProposalStageCommand,
     )
 
+    from .._helpers import ChatRole, ChatTurn
     from ..guided_operations import (
         GuidedOperationExpired,
         GuidedOperationLease,
@@ -2289,6 +2293,12 @@ async def post_guided_respond(
         raise_guided_operation_failure,
         reserve_or_replay_guided_operation,
     )
+
+    # Escape-hatch decline text is the advisor's own free-text reply; an empty
+    # reply is theoretically possible (a hatch-turn response with no tool
+    # calls and blank content), but a ChatTurn requires non-empty content.
+    # Mirrors guided_plan.py's identical fallback for the guided-full surface.
+    _empty_decline_fallback = "I could not find a way to build this pipeline with the available components."
 
     service: SessionServiceProtocol = request.app.state.session_service
     composer = request.app.state.composer_service
@@ -2695,6 +2705,98 @@ async def post_guided_respond(
                     prepared_next: PreparedGuidedJsonPayload | None = None
                     existing_meta = dict(deep_thaw(state_record.composer_meta)) if state_record and state_record.composer_meta else {}
 
+                    async def _settle_guided_planner_decline(
+                        *,
+                        base_guided: GuidedSession,
+                        decline_text: str,
+                        current_state: CompositionState,
+                        current_state_record: CompositionStateRecord | None,
+                        current_meta: Mapping[str, Any],
+                        current_fence: GuidedOperationFence,
+                        tool_recorder: BufferingRecorder,
+                        llm_recorder: BufferingRecorder,
+                        pending_payloads: tuple[PreparedGuidedJsonPayload, ...],
+                    ) -> GuidedRespondResponse:
+                        """Persist an escape-hatch decline as an ordinary chat turn.
+
+                        Mirrors guided_plan.py's identical PlannerDeclined handling
+                        (a decline is a conversational outcome, never routed
+                        through GuidedOperationFailureCode): the advisor's own
+                        words are appended to ``base_guided.chat_history`` — the
+                        existing channel ``/guided/chat`` already uses for
+                        assistant text, rendered by the frontend's
+                        ``chatHistory={guidedSession.chat_history}`` regardless
+                        of endpoint — and the operation completes via the
+                        generic state settlement (legal for kind="guided_respond"
+                        per ``_guided_completion_values``) with no new turn. The
+                        step/proposal this attempt was trying to advance is left
+                        untouched (``base_guided`` is the caller's pre-attempt,
+                        unmutated GuidedSession), so the operator retries with a
+                        fresh operation_id and their pending turn intact.
+
+                        The per-attempt values that would otherwise be closed
+                        over from the enclosing retry loop (B023: a closure
+                        binds the loop variable, not its per-iteration value)
+                        are threaded through as explicit parameters instead.
+                        """
+
+                        declined_guided = _replace(
+                            base_guided,
+                            chat_history=(
+                                *base_guided.chat_history,
+                                ChatTurn(
+                                    role=ChatRole.ASSISTANT,
+                                    content=decline_text,
+                                    seq=base_guided.chat_turn_seq,
+                                    step=base_guided.step,
+                                    ts_iso=datetime.now(UTC).isoformat(),
+                                    assistant_message_kind="assistant",
+                                ),
+                            ),
+                            chat_turn_seq=base_guided.chat_turn_seq + 1,
+                        )
+                        declined_state = _replace(current_state, guided_session=declined_guided)
+                        declined_state_dict = declined_state.to_dict()
+                        decline_is_valid, decline_validation_errors = _guided_persisted_validity(declined_state, catalog=catalog)
+                        decline_meta = dict(current_meta)
+                        decline_meta["guided_session"] = declined_guided.to_dict()
+                        decline_settlement = await service.settle_guided_state_operation(
+                            GuidedStateOperationCommand(
+                                fence=current_fence,
+                                expected_current_state_id=(current_state_record.id if current_state_record is not None else None),
+                                expected_current_state_version=(current_state_record.version if current_state_record is not None else None),
+                                expected_current_content_hash=(
+                                    composition_content_hash(current_state) if current_state_record is not None else None
+                                ),
+                                state_id=uuid4(),
+                                state=CompositionStateData(
+                                    sources=declined_state_dict["sources"],
+                                    nodes=declined_state_dict["nodes"],
+                                    edges=declined_state_dict["edges"],
+                                    outputs=declined_state_dict["outputs"],
+                                    metadata_=declined_state_dict["metadata"],
+                                    is_valid=decline_is_valid,
+                                    validation_errors=decline_validation_errors,
+                                    composer_meta=decline_meta,
+                                ),
+                                provenance="convergence_persist",
+                                actor="composer_route",
+                                response=GuidedResponseDescriptor(
+                                    kind="guided_respond",
+                                    next_turn=None,
+                                    assistant_turn_seq=None,
+                                ),
+                                payloads=pending_payloads,
+                                audit_evidence=GuidedAuditEvidence(
+                                    invocations=(*llm_recorder.invocations, *tool_recorder.invocations),
+                                    llm_calls=llm_recorder.llm_calls,
+                                    chat_turns=llm_recorder.chat_turns,
+                                ),
+                            ),
+                            payload_store=payload_store,
+                        )
+                        return _response_from_record(decline_settlement.result_state)
+
                     if guided.terminal is not None:
                         if not (
                             guided.terminal.kind is TerminalKind.COMPLETED
@@ -2992,7 +3094,7 @@ async def post_guided_respond(
                             )
                             if not attempt_planner_admitted:
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
-                            plan, catalog_ids = await composer.plan_guided_pipeline(
+                            outcome = await composer.plan_guided_pipeline(
                                 intent=planner_intent,
                                 current_state=state,
                                 guided=planning_guided,
@@ -3007,6 +3109,19 @@ async def post_guided_respond(
                                 operation_fence=fence,
                                 progress=planner_progress,
                             )
+                            if isinstance(outcome, GuidedPlannerDecline):
+                                return await _settle_guided_planner_decline(
+                                    base_guided=guided,
+                                    decline_text=outcome.decline_text.strip() or _empty_decline_fallback,
+                                    current_state=state,
+                                    current_state_record=state_record,
+                                    current_meta=existing_meta,
+                                    current_fence=fence,
+                                    tool_recorder=recorder,
+                                    llm_recorder=planner_recorder,
+                                    pending_payloads=tuple(prepared_payloads),
+                                )
+                            plan, catalog_ids = outcome
                             projection = build_guided_proposal_projection(
                                 proposal_id=successor_proposal_id,
                                 proposal=plan.proposal,
@@ -3348,7 +3463,7 @@ async def post_guided_respond(
                             )
                             if not attempt_planner_admitted:
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
-                            plan, catalog_ids = await composer.plan_guided_pipeline(
+                            outcome = await composer.plan_guided_pipeline(
                                 intent=body.correction_feedback,
                                 current_state=predecessor_candidate,
                                 guided=planning_guided,
@@ -3369,6 +3484,19 @@ async def post_guided_respond(
                                 progress=planner_progress,
                                 correction_target=correction_target,
                             )
+                            if isinstance(outcome, GuidedPlannerDecline):
+                                return await _settle_guided_planner_decline(
+                                    base_guided=guided,
+                                    decline_text=outcome.decline_text.strip() or _empty_decline_fallback,
+                                    current_state=state,
+                                    current_state_record=state_record,
+                                    current_meta=existing_meta,
+                                    current_fence=fence,
+                                    tool_recorder=recorder,
+                                    llm_recorder=planner_recorder,
+                                    pending_payloads=tuple(prepared_payloads),
+                                )
+                            plan, catalog_ids = outcome
                             projection = build_guided_proposal_projection(
                                 proposal_id=successor_proposal_id,
                                 proposal=plan.proposal,
@@ -3884,7 +4012,7 @@ async def post_guided_respond(
                             )
                             if not attempt_planner_admitted:
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
-                            plan, catalog_ids = await composer.plan_guided_pipeline(
+                            outcome = await composer.plan_guided_pipeline(
                                 intent=planner_intent,
                                 current_state=state,
                                 guided=resulting_guided,
@@ -3899,6 +4027,30 @@ async def post_guided_respond(
                                 operation_fence=fence,
                                 progress=planner_progress,
                             )
+                            if isinstance(outcome, GuidedPlannerDecline):
+                                # Base off the ORIGINAL unmutated guided (still at
+                                # STEP_2_SINK), not resulting_guided (already
+                                # advanced to STEP_3_TRANSFORMS with no proposal):
+                                # persisting that half-advanced state would create
+                                # a step the machine has never legally reached
+                                # (STEP_3_TRANSFORMS requires active_proposal).
+                                # Today's failure path already persists nothing
+                                # and leaves the session at STEP_2_SINK; keeping
+                                # that means the decline is a completed operation
+                                # with the advisor's words visible, and nothing
+                                # else changes.
+                                return await _settle_guided_planner_decline(
+                                    base_guided=guided,
+                                    decline_text=outcome.decline_text.strip() or _empty_decline_fallback,
+                                    current_state=state,
+                                    current_state_record=state_record,
+                                    current_meta=existing_meta,
+                                    current_fence=fence,
+                                    tool_recorder=recorder,
+                                    llm_recorder=planner_recorder,
+                                    pending_payloads=tuple(prepared_payloads),
+                                )
+                            plan, catalog_ids = outcome
                             projection = build_guided_proposal_projection(
                                 proposal_id=proposal_id,
                                 proposal=plan.proposal,

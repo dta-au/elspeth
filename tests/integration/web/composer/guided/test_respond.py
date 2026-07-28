@@ -2329,6 +2329,85 @@ class TestStep2IntraStep:
         rendered = repr((failed.json(), restored, operation_rows, operation_events, audit_messages))
         assert all(canary not in rendered for canary in failure_canaries)
 
+    def test_escape_hatch_decline_is_an_ordinary_chat_turn_not_a_failure(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PlannerDeclined on the staged guided surface must not become operation_failed.
+
+        Mirrors test_failed_proposal_planning_retains_only_closed_failure_code's
+        drive-to-the-planner-call setup, but the escape-hatch advisor declines
+        instead of erroring. An honest decline is a conversational outcome
+        (mirrors the guided-full and freeform surfaces' identical
+        PlannerDeclined handling): the operation completes with the advisor's
+        own words appended to guided_session.chat_history — never routed
+        through GuidedOperationFailureCode — and the session stays at
+        STEP_2_SINK with the pending output review intact, so the operator
+        retries with a fresh operation_id.
+        """
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        decline_text = "I could not find a transform that fits this shape."
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "declined-plan.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+
+        async def decline_planner(**_kwargs):
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        _respond(
+            composer_test_client,
+            session_id,
+            chosen=["text"],
+            custom_inputs=[],
+        )
+        declined = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert declined.status_code == 200, declined.json()
+        body = declined.json()
+        assert body["next_turn"] is None
+        assert body["guided_session"]["step"] == "step_2_sink"
+        chat_history = _full_guided_session(body)["chat_history"]
+        assert [turn["content"] for turn in chat_history if turn["role"] == "assistant"] == [decline_text]
+
+        with composer_test_client.app.state.session_engine.connect() as conn:
+            operation_rows = (
+                conn.execute(
+                    select(guided_operations_table)
+                    .where(guided_operations_table.c.session_id == session_id)
+                    .order_by(guided_operations_table.c.created_at)
+                )
+                .mappings()
+                .all()
+            )
+        assert all(row["status"] == "completed" for row in operation_rows)
+        last_operation = operation_rows[-1]
+        assert last_operation["failure_code"] is None
+        assert last_operation["result_kind"] == "composition_state"
+
     @pytest.mark.parametrize(
         "composer_test_client",
         (

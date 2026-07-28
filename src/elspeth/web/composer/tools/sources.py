@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import csv
 import hashlib
 import io
@@ -73,7 +74,10 @@ from elspeth.web.composer.tools.declarations import (
     ToolKind,
 )
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY, SourceAuthoringMetadata, source_component_id
-from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+from elspeth.web.provider_config_policy import (
+    web_aws_s3_endpoint_url_policy_error,
+    web_aws_s3_source_policy_error,
+)
 from elspeth.web.sessions.models import blobs_table
 
 _INSPECT_SOURCE_MAX_BYTES = 8 * 1024
@@ -88,6 +92,17 @@ class _CsvContentBoundaryError(ValueError):
     """One redacted domain error for unsafe or malformed CSV content."""
 
 
+class _CsvParseIncompleteError(_CsvContentBoundaryError):
+    """The csv module could not complete a record from the supplied content
+    (e.g. an unterminated quoted field, or a field beyond its internal
+    field-size limit). Distinct from the structural limit checks (oversized
+    cell/row, NUL byte) in ``_bounded_csv_rows``, which are true regardless of
+    how much more content exists. A caller that knows its ``content`` is
+    itself a bounded prefix of a larger file may treat this specific error as
+    expected truncation rather than corruption.
+    """
+
+
 def _bounded_csv_rows(content: str) -> Iterator[list[str]]:
     """Yield CSV rows while containing parser and structural limit failures."""
 
@@ -97,7 +112,7 @@ def _bounded_csv_rows(content: str) -> Iterator[list[str]]:
                 raise _CsvContentBoundaryError("CSV content exceeds bounded inspection limits")
             yield row
     except csv.Error as exc:
-        raise _CsvContentBoundaryError("CSV content exceeds bounded inspection limits") from exc
+        raise _CsvParseIncompleteError("CSV content exceeds bounded inspection limits") from exc
 
 
 class InspectSourceArgumentsModel(BaseModel):
@@ -537,6 +552,20 @@ def _execute_set_source(
     if plugin_error is not None:
         return _plugin_policy_failure(state, plugin_error)
 
+    # Mirror execution/validation.py's unconditional aws_s3-source ban for
+    # non-trained-operator sessions (reusing the same predicate so the two
+    # paths cannot drift). Checked independently of endpoint_url above:
+    # authoritative validation rejects every web-authored aws_s3 source
+    # regardless of endpoint_url, because reads use the server AWS
+    # credential chain with author-chosen bucket/key. Without this check
+    # here, a non-trained session could persist an aws_s3 source with no
+    # endpoint_url override — a state that passes mutation but can never
+    # pass dry-run/proposal validation.
+    if not context.plugin_snapshot.is_trained_operator:
+        source_policy_error = web_aws_s3_source_policy_error(plugin)
+        if source_policy_error is not None:
+            return _failure_result(state, source_policy_error, error_code="aws_s3_source_not_allowed")
+
     # Reject manual blob_ref injection.  The canonical write path for a
     # blob-backed source is set_source_from_blob, which forces the path to
     # the blob's authoritative storage_path.  set_source with a hand-crafted
@@ -671,6 +700,17 @@ def _execute_set_source_from_blob(
     if endpoint_policy_error is not None:
         return _failure_result(state, endpoint_policy_error)
 
+    # Mirror execution/validation.py's unconditional aws_s3-source ban for
+    # non-trained-operator sessions (see _execute_set_source above for the
+    # full rationale). Checked against the resolved plugin — blob binding
+    # can infer aws_s3 from an explicit ``plugin`` override even when the
+    # blob's own MIME type would infer something else — so a non-trained
+    # session cannot reach the same never-valid state via blob binding.
+    if not context.plugin_snapshot.is_trained_operator:
+        source_policy_error = web_aws_s3_source_policy_error(resolved.plugin)
+        if source_policy_error is not None:
+            return _failure_result(state, source_policy_error, error_code="aws_s3_source_not_allowed")
+
     source = SourceSpec(
         plugin=resolved.plugin,
         on_success=validated.on_success,
@@ -743,10 +783,45 @@ def _first_nonempty_csv_row(content: str) -> tuple[str, ...] | None:
 
 
 def _first_nonempty_csv_row_from_path(path: Path) -> tuple[str, ...] | None:
-    """Return a candidate CSV header from a bounded file prefix."""
+    """Return a candidate CSV header from a bounded file prefix.
+
+    Reads one byte past ``_INLINE_CSV_HEADER_READ_BYTES`` solely to tell apart
+    two situations that both start out looking like a parse failure:
+
+    * The file genuinely ends within the window and the parser still can't
+      complete a record — real corruption, which the caller escalates.
+    * The file continues past the window and its first record (typically a
+      long quoted cell) simply straddles the boundary, so the truncated
+      prefix ends mid-record. This is expected truncation of an otherwise
+      well-formed CSV, not corruption, so the header is reported as
+      undeterminable (``None``) rather than as a parse failure.
+
+    Structural limit violations (oversized cell/row, embedded NUL) are never
+    swallowed here regardless of truncation: a cell that already exceeds the
+    limit within the visible prefix only gets longer with more data, so it is
+    a genuine finding either way.
+
+    The same window-edge-truncation reasoning applies to decoding: a
+    multi-byte UTF-8 character straddling the window boundary is not
+    corruption either, so the trailing partial sequence is decoded with
+    ``final=not truncated_by_window`` — an incremental decoder buffers (and
+    silently drops) a dangling partial sequence at the end of input rather
+    than raising, but still raises immediately on bytes that are invalid
+    UTF-8 regardless of what follows, and still raises on any incomplete
+    sequence when the file's real EOF was reached (``final=True``).
+    """
     with path.open("rb") as handle:
-        content = handle.read(_INLINE_CSV_HEADER_READ_BYTES)
-    return _first_nonempty_csv_row(content.decode("utf-8"))
+        raw = handle.read(_INLINE_CSV_HEADER_READ_BYTES + 1)
+    truncated_by_window = len(raw) > _INLINE_CSV_HEADER_READ_BYTES
+    content = raw[:_INLINE_CSV_HEADER_READ_BYTES]
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    text = decoder.decode(content, final=not truncated_by_window)
+    try:
+        return _first_nonempty_csv_row(text)
+    except _CsvParseIncompleteError:
+        if truncated_by_window:
+            return None
+        raise
 
 
 def _is_header_only_csv(content: str) -> tuple[str, ...] | None:
