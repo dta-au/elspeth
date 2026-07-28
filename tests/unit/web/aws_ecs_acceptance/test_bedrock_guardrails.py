@@ -480,7 +480,10 @@ def test_verify_bedrock_guardrails_rejects_version_drift_and_redacts_checker_fai
     assert "raw provider" not in str(raised.value)
 
 
-def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_safe_aliases(tmp_path: Path) -> None:
+def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_safe_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from elspeth.web.config import WebSettings
 
     settings = WebSettings(
@@ -558,6 +561,14 @@ def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_sa
     drifted["ELSPETH_WEB__PLUGIN_ALLOWLIST"] = "[]"
     with pytest.raises(acceptance.AcceptanceCheckError, match="plugin_policy_settings"):
         acceptance.build_plugin_policy_acceptance(settings, drifted)
+
+    monkeypatch.setattr(
+        bedrock,
+        "build_plugin_policy_readiness",
+        lambda **_kwargs: SimpleNamespace(rows=(), tutorial_ready=False),
+    )
+    with pytest.raises(KeyError, match="tutorial_profile"):
+        acceptance.build_plugin_policy_acceptance(settings, env)
 
 
 def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_and_closes_resources(tmp_path: Path) -> None:

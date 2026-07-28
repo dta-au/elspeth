@@ -176,9 +176,7 @@ def _bedrock_receipt_projection(
         "response_usage.cost": "provider_reported",
         "_hidden_params.response_cost": "litellm_calculated",
     }
-    cost_source = cost_sources.get(record.provider_cost_source)
-    if cost_source is None:
-        raise AcceptanceCheckError("bedrock_metadata")
+    cost_source = cost_sources[record.provider_cost_source]
     return {
         "returned_model_sha256": _sha256(record.model_returned.encode("utf-8")),
         "provider_request_id_sha256": _sha256(record.provider_request_id.encode("utf-8")),
@@ -333,11 +331,14 @@ def build_plugin_policy_acceptance(
             secret_inventory=_AcceptanceSecretInventory(),
             generation_key=secret_key.encode("utf-8"),
         )
+        tutorial_state_profile = runtime.tutorial_llm_profile
+        if tutorial_state_profile is None:
+            tutorial_state_profile = ""
         readiness = build_plugin_policy_readiness(
             policy=policy,
             snapshot=snapshot,
             tutorial_profile=runtime.tutorial_llm_profile,
-            tutorial_state=_canonical_tutorial_policy_state(profile_alias=runtime.tutorial_llm_profile or ""),
+            tutorial_state=_canonical_tutorial_policy_state(profile_alias=tutorial_state_profile),
             profile_registry=profiles,
             catalog=catalog,
         )
@@ -349,30 +350,59 @@ def build_plugin_policy_acceptance(
     modes = dict(snapshot.control_modes)
     tutorial_alias = runtime.tutorial_llm_profile
     llm_profiles = dict(runtime.llm_profiles)
-    tutorial_profile = llm_profiles.get(tutorial_alias) if tutorial_alias is not None else None
+    tutorial_profile = None
+    if tutorial_alias is not None:
+        tutorial_profile = llm_profiles[tutorial_alias]
     readiness_rows = {row.id: row for row in readiness.rows}
-    profile_row = readiness_rows.get("tutorial_profile")
-    coverage_row = readiness_rows.get("tutorial_required_control_coverage")
+    profile_row = readiness_rows["tutorial_profile"]
+    coverage_row = readiness_rows["tutorial_required_control_coverage"]
+    tutorial_profile_region: object = None
+    if tutorial_profile is not None:
+        tutorial_profile_options = dict(tutorial_profile.provider_options)
+        if "region_name" in tutorial_profile_options:
+            tutorial_profile_region = tutorial_profile_options["region_name"]
+    selected_llm = None
+    if PluginCapability.LLM in selected:
+        selected_llm = selected[PluginCapability.LLM]
+    selected_prompt_shield = None
+    if PluginCapability.PROMPT_SHIELD in selected:
+        selected_prompt_shield = selected[PluginCapability.PROMPT_SHIELD]
+    selected_content_safety = None
+    if PluginCapability.CONTENT_SAFETY in selected:
+        selected_content_safety = selected[PluginCapability.CONTENT_SAFETY]
+    prompt_shield_mode = None
+    if PluginCapability.PROMPT_SHIELD in modes:
+        prompt_shield_mode = modes[PluginCapability.PROMPT_SHIELD]
+    content_safety_mode = None
+    if PluginCapability.CONTENT_SAFETY in modes:
+        content_safety_mode = modes[PluginCapability.CONTENT_SAFETY]
+    llm_alias = None
+    if llm_id in aliases:
+        llm_alias = aliases[llm_id]
+    prompt_shield_alias = None
+    if prompt_id in aliases:
+        prompt_shield_alias = aliases[prompt_id]
+    content_safety_alias = None
+    if content_id in aliases:
+        content_safety_alias = aliases[content_id]
     if (
         tutorial_alias is None
         or tutorial_profile is None
         or tutorial_profile.provider != "bedrock"
         or tutorial_profile.model != live_model
-        or dict(tutorial_profile.provider_options).get("region_name") != live_region
+        or tutorial_profile_region != live_region
         or readiness.tutorial_ready is not False
-        or profile_row is None
         or profile_row.status == "error"
-        or coverage_row is None
         or coverage_row.status != "error"
         or not {llm_id, prompt_id, content_id} <= snapshot.available
-        or selected.get(PluginCapability.LLM) != llm_id
-        or selected.get(PluginCapability.PROMPT_SHIELD) != prompt_id
-        or selected.get(PluginCapability.CONTENT_SAFETY) != content_id
-        or modes.get(PluginCapability.PROMPT_SHIELD) is not ControlMode.REQUIRED
-        or modes.get(PluginCapability.CONTENT_SAFETY) is not ControlMode.REQUIRED
-        or aliases.get(llm_id) != tutorial_alias
-        or aliases.get(prompt_id) != expected_aliases["aws_bedrock_prompt_shield"]
-        or aliases.get(content_id) != expected_aliases["aws_bedrock_content_safety"]
+        or selected_llm != llm_id
+        or selected_prompt_shield != prompt_id
+        or selected_content_safety != content_id
+        or prompt_shield_mode is not ControlMode.REQUIRED
+        or content_safety_mode is not ControlMode.REQUIRED
+        or llm_alias != tutorial_alias
+        or prompt_shield_alias != expected_aliases["aws_bedrock_prompt_shield"]
+        or content_safety_alias != expected_aliases["aws_bedrock_content_safety"]
     ):
         raise AcceptanceCheckError("plugin_policy_selection")
 
