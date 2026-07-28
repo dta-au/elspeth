@@ -2019,11 +2019,13 @@ Verify the live Aurora CA identifier and the task definitions'
 defined in [Protected command capture](#protected-command-capture):
 
 ```bash
+DB_INSTANCE_IDENTIFIER=$(jq -er '.orphan_sweep.rds_db_instance_identifiers[0]' "$SCENARIO_A_INVENTORY")
 CA_IDENTIFIER=$(aws_capture aws rds describe-db-instances \
   --db-instance-identifier "$DB_INSTANCE_IDENTIFIER" \
   --query 'DBInstances[0].CACertificateIdentifier' --output text)
 test "$CA_IDENTIFIER" = rds-ca-rsa2048-g1
 
+TASK_DEFINITION="$DOCTOR_TASK_DEFINITION"
 NON_WEB_READONLY_JSON=$(aws_capture aws ecs describe-task-definition \
   --task-definition "$TASK_DEFINITION" \
   --query 'taskDefinition.containerDefinitions[?name!=`cloudwatch-agent` && name!=`elspeth-web`].readonlyRootFilesystem' \
@@ -2031,19 +2033,30 @@ NON_WEB_READONLY_JSON=$(aws_capture aws ecs describe-task-definition \
 jq -e 'length > 0 and all(.[]; . == true)' <<<"$NON_WEB_READONLY_JSON" >/dev/null
 
 WEB_READONLY_JSON=$(aws_capture aws ecs describe-task-definition \
-  --task-definition "$TASK_DEFINITION" \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
   --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].readonlyRootFilesystem' \
   --output json)
 jq -e 'all(.[]; . != true)' <<<"$WEB_READONLY_JSON" >/dev/null
 ```
 
-Run the first check against a task definition that carries non-web ELSPETH
-containers (doctor, schema-init, or verifier); a web-only task definition
-projects an empty array there, and `length > 0` fails closed rather than
-silently passing. Run the second check against the web task definition: its
-`readonlyRootFilesystem` field is absent, so the projection yields `[null]`,
-and `. != true` proves the documented exemption rather than a silent `true`
-that would break ECS Exec.
+Run the first check only against `$DOCTOR_TASK_DEFINITION` — the schema-init
+or runtime doctor definition, container name `doctor` — never against
+`$PAYLOAD_VERIFIER_TASK_DEFINITION` or `$LOCAL_AUTH_VERIFIER_TASK_DEFINITION`:
+`resolve_bound_task_definition` binds those two under the `elspeth-web`
+container name (see
+[Saved-plan apply and scenario binding](#saved-plan-apply-and-scenario-binding)),
+so against either of them the `name!='elspeth-web'` projection returns an
+empty array and `length > 0` fails closed rather than silently passing. Run
+the second check only against a candidate or rollback web task definition —
+`$CANDIDATE_TASK_DEFINITION`, or `$PREVIOUS_TASK_DEFINITION` on an upgrade:
+its `readonlyRootFilesystem` field is absent, so the projection yields
+`[null]`, and `. != true` proves the documented exemption rather than a
+silent `true` that would break ECS Exec. The payload and local-auth verifier
+task definitions run a read-only container (`readonlyRootFilesystem = true`)
+under the `elspeth-web` container name; neither jq command above exercises
+them — that source-level contract is asserted directly against
+`deploy/aws-ecs/terraform/modules/scenario/ecs.tf` by
+`tests/unit/deployment/test_aws_ecs_terraform_package.py`.
 
 ### Upgrading an existing install
 

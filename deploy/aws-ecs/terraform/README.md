@@ -331,34 +331,49 @@ test "$(docker inspect --format \
   '{{ index .Config.Labels "io.elspeth.rds-ca-certificate-identifier" }}' \
   "$CANDIDATE_IMAGE")" = rds-ca-rsa2048-g1
 
+DB_INSTANCE_IDENTIFIER=$(terraform -chdir=scenario-a output -json resolved_inventory \
+  | jq -r '.orphan_sweep.rds_db_instance_identifiers[0]')
 aws --profile "$AWS_PROFILE" --region "$AWS_REGION" rds \
   describe-db-instances \
   --db-instance-identifier "$DB_INSTANCE_IDENTIFIER" \
   --query 'DBInstances[0].CACertificateIdentifier' \
   --output text | grep -Fx rds-ca-rsa2048-g1
 
+TASK_DEFINITION=$(terraform -chdir=scenario-a output -raw runtime_doctor_task_definition_arn)
 aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs \
   describe-task-definition \
   --task-definition "$TASK_DEFINITION" \
   --query 'taskDefinition.containerDefinitions[?name!=`cloudwatch-agent` && name!=`elspeth-web`].readonlyRootFilesystem' \
   --output json | jq -e 'length > 0 and all(.[]; . == true)'
 
+CANDIDATE_TASK_DEFINITION=$(terraform -chdir=scenario-a output -json resolved_inventory \
+  | jq -r '.values.CANDIDATE_TASK_DEFINITION')
 aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs \
   describe-task-definition \
-  --task-definition "$TASK_DEFINITION" \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
   --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].readonlyRootFilesystem' \
   --output json | jq -e 'all(.[]; . != true)'
 ```
 
-Run the first check against a task definition that carries non-web ELSPETH
-containers — the doctor, schema-init, or verifier definitions. Run it against
-a web-only `$TASK_DEFINITION` and the query returns an empty array; the
-`length > 0` guard then fails closed rather than silently passing, so use the
-right definition rather than expecting a pass on the web family. Run the
-second check against the web task definition: its `readonlyRootFilesystem`
-field is absent (not a literal `false`), so the projection yields `[null]`,
-and `. != true` proves the documented exemption rather than a silent `true`
-that would break ECS Exec.
+Run the first check only against `$TASK_DEFINITION` above — the schema-init
+or runtime doctor definition, container name `doctor` — never against the
+payload or local-auth verifier task definitions
+(`resolved_inventory.values.PAYLOAD_VERIFIER_TASK_DEFINITION` /
+`LOCAL_AUTH_VERIFIER_TASK_DEFINITION`): those two bind their read-only
+container under the `elspeth-web` container name, so against either of them
+the `name!='elspeth-web'` projection returns an empty array and the
+`length > 0` guard fails closed rather than silently passing. Run the second
+check only against a candidate or rollback web task definition —
+`$CANDIDATE_TASK_DEFINITION` above, or
+`resolved_inventory.values.PREVIOUS_TASK_DEFINITION` on an upgrade: its
+`readonlyRootFilesystem` field is absent (not a literal `false`), so the
+projection yields `[null]`, and `. != true` proves the documented exemption
+rather than a silent `true` that would break ECS Exec. The payload and
+local-auth verifier task definitions run a read-only container
+(`readonlyRootFilesystem = true`) under the `elspeth-web` container name;
+neither jq command above exercises them — that source-level contract is
+asserted directly against `modules/scenario/ecs.tf` by
+`tests/unit/deployment/test_aws_ecs_terraform_package.py`.
 
 ### Upgrading an existing install
 
