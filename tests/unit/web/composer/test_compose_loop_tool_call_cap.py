@@ -13,6 +13,44 @@ from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 
 
+@pytest.mark.parametrize(
+    ("pretender", "expected_message"),
+    (
+        (
+            type(
+                "_DynamicToolCallPretender",
+                (),
+                {
+                    "__getattr__": lambda _self, name: (
+                        "call_dynamic" if name == "id" else SimpleNamespace(name="get_pipeline_state", arguments="{}")
+                    ),
+                },
+            )(),
+            "Composer tool batch is missing a provider tool-call ID",
+        ),
+        (
+            SimpleNamespace(
+                id="call_dynamic_function",
+                function=type(
+                    "_DynamicFunctionPretender",
+                    (),
+                    {
+                        "__getattr__": lambda _self, name: "get_pipeline_state" if name == "name" else "{}",
+                    },
+                )(),
+            ),
+            "Composer tool batch contains malformed provider function metadata",
+        ),
+    ),
+)
+def test_tool_batch_admission_rejects_dynamic_attribute_pretenders(
+    pretender: object,
+    expected_message: str,
+) -> None:
+    with pytest.raises(AuditIntegrityError, match=expected_message):
+        tool_batch_module._admit_tool_batch((pretender,))
+
+
 async def _run_one_turn(service: object, *, llm: object, session_id: str) -> Any:
     driver = cast(Any, service)
     return await driver._run_one_turn_for_test(llm=llm, session_id=session_id)

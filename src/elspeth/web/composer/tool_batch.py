@@ -18,7 +18,7 @@ import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast, runtime_checkable
 from uuid import UUID
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
@@ -158,7 +158,20 @@ class _AdmittedToolBatch:
     call_ids: frozenset[str]
 
 
-_MISSING_TOOL_CALL_FIELD = object()
+@runtime_checkable
+class _ProviderToolCallIdentity(Protocol):
+    id: object
+
+
+@runtime_checkable
+class _ProviderToolCallFunctionEnvelope(Protocol):
+    function: object
+
+
+@runtime_checkable
+class _ProviderToolFunctionMetadata(Protocol):
+    name: object
+    arguments: object
 
 
 def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
@@ -166,9 +179,9 @@ def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
     admitted_calls: list[_AdmittedToolCall] = []
     call_ids: set[str] = set()
     for tool_call in tool_calls:
-        call_id = getattr(tool_call, "id", _MISSING_TOOL_CALL_FIELD)
-        if call_id is _MISSING_TOOL_CALL_FIELD:
+        if not isinstance(tool_call, _ProviderToolCallIdentity):
             raise AuditIntegrityError("Composer tool batch is missing a provider tool-call ID")
+        call_id = tool_call.id
         if type(call_id) is not str:
             raise AuditIntegrityError("Composer tool batch contains a non-string provider tool-call ID")
         if not call_id.strip():
@@ -178,9 +191,13 @@ def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
         if call_id in call_ids:
             raise AuditIntegrityError("Composer tool batch contains duplicate provider tool-call IDs")
 
-        function = getattr(tool_call, "function", _MISSING_TOOL_CALL_FIELD)
-        function_name = getattr(function, "name", _MISSING_TOOL_CALL_FIELD)
-        function_arguments = getattr(function, "arguments", _MISSING_TOOL_CALL_FIELD)
+        if not isinstance(tool_call, _ProviderToolCallFunctionEnvelope):
+            raise AuditIntegrityError("Composer tool batch contains malformed provider function metadata")
+        function = tool_call.function
+        if not isinstance(function, _ProviderToolFunctionMetadata):
+            raise AuditIntegrityError("Composer tool batch contains malformed provider function metadata")
+        function_name = function.name
+        function_arguments = function.arguments
         if type(function_name) is not str or type(function_arguments) is not str:
             raise AuditIntegrityError("Composer tool batch contains malformed provider function metadata")
 

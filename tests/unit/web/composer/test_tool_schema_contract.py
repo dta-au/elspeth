@@ -159,6 +159,48 @@ def test_directional_guard_does_not_replace_an_explicit_empty_schema() -> None:
 
 
 @pytest.mark.parametrize(
+    ("path", "keyword"),
+    (
+        ((), "type"),
+        (("properties", "nodes"), "items"),
+        (("properties", "edges", "items", "properties", "edge_type"), "enum"),
+        ((), "additionalProperties"),
+    ),
+)
+def test_directional_guard_distinguishes_absent_optional_keyword_from_present_null(
+    path: tuple[str, ...],
+    keyword: str,
+) -> None:
+    module = _schema_contract_module()
+    advertised = deepcopy(_registered_set_pipeline_schema())
+    node = _node_at(advertised, path)
+    del node[keyword]
+    module.assert_set_pipeline_schema_compatible(advertised_schema=advertised)
+
+    node[keyword] = None
+    with pytest.raises(RuntimeError):
+        module.assert_set_pipeline_schema_compatible(advertised_schema=advertised)
+
+
+def test_directional_guard_does_not_skip_a_malformed_advertised_union_branch() -> None:
+    module = _schema_contract_module()
+    valid = deepcopy(_registered_set_pipeline_schema())
+    malformed = deepcopy(valid)
+    malformed["properties"] = None
+
+    with pytest.raises(RuntimeError, match="properties"):
+        module.assert_set_pipeline_schema_compatible(advertised_schema={"anyOf": [malformed, valid]})
+
+
+def test_registered_schema_lookup_rejects_missing_internal_definition_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _schema_contract_module()
+    monkeypatch.setattr(module, "get_tool_definitions", lambda: ({},))
+
+    with pytest.raises(KeyError, match="name"):
+        module.canonical_set_pipeline_schema()
+
+
+@pytest.mark.parametrize(
     ("path", "non_null_type"),
     [
         (("properties", "source", "properties", "inline_blob", "properties", "description"), "string"),

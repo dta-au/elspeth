@@ -199,6 +199,14 @@ def test_capability_field_extraction_detects_new_structural_field() -> None:
     assert canonical_capability_fields(schema) != CANONICAL_CAPABILITY_FIELDS
 
 
+def test_capability_field_extraction_rejects_missing_required_schema_node() -> None:
+    schema = canonical_set_pipeline_schema()
+    del schema["properties"]
+
+    with pytest.raises(KeyError, match="properties"):
+        canonical_capability_fields(schema)
+
+
 def test_manifest_rejects_schema_and_terminal_updated_without_documented_field() -> None:
     schema = canonical_set_pipeline_schema()
     schema["properties"]["future_topology"] = {"type": "object"}
@@ -291,6 +299,34 @@ def test_manifest_fails_closed_on_capability_identity_drift(mutation: str) -> No
             surface=PlannerSurface.FREEFORM,
             profile="ordinary",
             messages=messages,
+            tools=tools,
+            canonical_schema=canonical_set_pipeline_schema(),
+        )
+
+
+def test_manifest_rejects_message_missing_required_role() -> None:
+    messages = _messages(build_system_prompt(None))
+    del messages[0]["role"]
+
+    with pytest.raises(KeyError, match="role"):
+        build_planner_capability_manifest(
+            surface=PlannerSurface.FREEFORM,
+            profile="ordinary",
+            messages=messages,
+            tools=planner_tool_definitions(),
+            canonical_schema=canonical_set_pipeline_schema(),
+        )
+
+
+def test_manifest_rejects_terminal_missing_required_parameters() -> None:
+    tools = planner_tool_definitions()
+    del tools[-1]["function"]["parameters"]
+
+    with pytest.raises(KeyError, match="parameters"):
+        build_planner_capability_manifest(
+            surface=PlannerSurface.FREEFORM,
+            profile="ordinary",
+            messages=_messages(build_system_prompt(None)),
             tools=tools,
             canonical_schema=canonical_set_pipeline_schema(),
         )
