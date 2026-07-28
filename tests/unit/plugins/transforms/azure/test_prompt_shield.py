@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Generator
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
@@ -1399,8 +1400,28 @@ class TestPromptShieldInternalProcessing:
                 raise CapacityError(429, "capacity on second")
             return None
 
-        monkeypatch.setattr("elspeth.plugins.transforms.azure.base.time.monotonic", fake_monotonic)
-        monkeypatch.setattr("elspeth.plugins.transforms.azure.base.time.sleep", fake_sleep)
+        class _FakeClockTime:
+            """Stand-in for the ``time`` name as seen from inside
+            ``elspeth.plugins.transforms.azure.base``, scoped to that module only.
+
+            ``monkeypatch.setattr("...base.time.monotonic", ...)`` would resolve
+            ``...base.time`` to the *real* ``time`` module (Python modules are
+            process-wide singletons; the base module merely imports the same
+            object everyone else does) and replace ``time.monotonic``/``time.sleep``
+            for the whole process during the test -- especially hazardous since
+            threading internals also rely on those two. Rebinding the ``time``
+            *name inside the base module's own namespace* keeps the fake clock
+            local to the code path under test; everything else delegates to the
+            real module.
+            """
+
+            monotonic = staticmethod(fake_monotonic)
+            sleep = staticmethod(fake_sleep)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(time, name)
+
+        monkeypatch.setattr("elspeth.plugins.transforms.azure.base.time", _FakeClockTime())
         monkeypatch.setattr(transform._capacity_retry_shutdown, "wait", fake_wait)
         monkeypatch.setattr(transform, "_analyze_field_once", fake_analyze_once)
 
@@ -1446,7 +1467,27 @@ class TestPromptShieldInternalProcessing:
             del value, field_name, state_id, token_id
             raise CapacityError(429, "capacity")
 
-        monkeypatch.setattr("elspeth.plugins.transforms.azure.base.time.sleep", fail_sleep)
+        class _NoSleepAllowedTime:
+            """Stand-in for the ``time`` name as seen from inside
+            ``elspeth.plugins.transforms.azure.base``, scoped to that module only.
+
+            ``monkeypatch.setattr("...base.time.sleep", ...)`` would resolve
+            ``...base.time`` to the *real* ``time`` module (Python modules are
+            process-wide singletons; the base module merely imports the same
+            object everyone else does) and replace ``time.sleep`` for the whole
+            process during the test -- especially hazardous since threading
+            internals also rely on it. Rebinding the ``time`` *name inside the
+            base module's own namespace* keeps the assertion-raising sleep local
+            to the code path under test; everything else delegates to the real
+            module.
+            """
+
+            sleep = staticmethod(fail_sleep)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(time, name)
+
+        monkeypatch.setattr("elspeth.plugins.transforms.azure.base.time", _NoSleepAllowedTime())
         monkeypatch.setattr(transform, "_analyze_field_once", fake_analyze_once)
 
         result = transform._analyze_field_with_capacity_retry("text", "prompt", "state-id")
