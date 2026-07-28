@@ -1384,6 +1384,56 @@ def test_sign_bundle_rejects_judge_decision_event_rewrite(
     assert _tree_bytes(allowlist_dir) == before
 
 
+def test_sign_bundle_resume_rejects_written_event_for_incomplete_action(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _execute_then_remove_written_entry(action: Any, *, args: Any) -> int:
+        assert real_execute(action, args=args) == 0
+        cli_module._pop_allow_hits_entry(
+            args.allowlist_dir / "plugins.yaml",
+            action.key,
+        )
+        raise KeyboardInterrupt
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(
+            cli_module,
+            "_execute_new_judgment_action",
+            side_effect=_execute_then_remove_written_entry,
+        ),
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(_accept_all):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
 @pytest.mark.parametrize("tamper", ("unrelated_record", "naive_timestamp"))
 def test_sign_bundle_rejects_unrelated_staged_rotation_record(
     tmp_path: Path,

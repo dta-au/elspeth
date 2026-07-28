@@ -441,6 +441,25 @@ def run_sign_bundle_transaction(
             )
             completed.add(running_index)
         else:
+            expected_key = _expected_action_key(
+                running_action,
+                verification=verification,
+                repair_keys_by_stale_key=repair_keys_by_stale_key,
+            )
+            _assert_judge_event_transition(
+                running_action,
+                tx_path=tx_path,
+                candidate_dir=Path(manifest["candidate_dir"]),
+                expected_key=expected_key,
+                success=False,
+            )
+            _assert_rotation_staged_transition(
+                running_action,
+                tx_path=tx_path,
+                source_file=running_source_file,
+                expected_key=expected_key,
+                success=False,
+            )
             restore_action_checkpoint(tx_path, manifest)
         manifest["running_action"] = None
         manifest["completed_actions"] = sorted(completed)
