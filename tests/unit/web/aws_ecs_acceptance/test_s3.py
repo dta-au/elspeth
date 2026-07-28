@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import ClassVar
 
 import pytest
+from botocore.exceptions import ClientError
 
 from elspeth.contracts import ArtifactDescriptor, CallType
 from elspeth.contracts.sink_effects import (
@@ -27,6 +27,14 @@ def test_facade_reexports_s3_owner_by_identity() -> None:
     assert acceptance.verify_s3 is s3.verify_s3
 
 
+def test_s3_not_found_rejects_exception_objects_that_only_pretend_to_be_client_errors() -> None:
+    class Pretender(RuntimeError):
+        def __init__(self) -> None:
+            self.response = {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}}
+
+    assert s3._s3_not_found(Pretender()) is False
+
+
 _S3_PREFIX = "plan10/764dd764-c265-40d7-a907-390255dccb64"
 _S3_HASH = "1ee9a4c7f487fc1b2413aea5272537ff1e5985dd14344eb268b69e83da7245a7"
 
@@ -41,8 +49,12 @@ def _s3_env(**updates: str) -> dict[str, str]:
     return values
 
 
-class _S3NotFound(RuntimeError):
-    response: ClassVar[dict[str, object]] = {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}}
+class _S3NotFound(ClientError):
+    def __init__(self) -> None:
+        super().__init__(
+            {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+            "HeadObject",
+        )
 
 
 class _S3CleanupClient:

@@ -7,6 +7,8 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from botocore.exceptions import ClientError
+
 from elspeth.contracts import ArtifactDescriptor
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.sink_effects import (
@@ -94,9 +96,9 @@ def _resolve_s3_acceptance_inputs(env: Mapping[str, str]) -> tuple[str, str, str
 
 
 def _s3_not_found(error: BaseException) -> bool:
-    response = getattr(error, "response", None)
-    if not isinstance(response, Mapping):
+    if not isinstance(error, ClientError):
         return False
+    response = error.response
     error_payload = response.get("Error")
     code = error_payload.get("Code") if isinstance(error_payload, Mapping) else None
     metadata = response.get("ResponseMetadata")
@@ -266,7 +268,7 @@ def verify_s3(
                 failure_check = "s3_source_read"
             else:
                 source_hash = _s3_source_hash(source_context)
-                materialized = [getattr(row, "row", None) for row in rows]
+                materialized = [row.row for row in rows]
                 if materialized != [_S3_ACCEPTANCE_ROW]:
                     failure_check = "s3_source_rows"
                 elif source_hash != expected_hash or source_hash != sink_hash:
@@ -292,12 +294,8 @@ def verify_s3(
         for resource in (source, collision_sink, primary_sink):
             if resource is None:
                 continue
-            close = getattr(resource, "close", None)
-            if not callable(close):
-                resource_close_failed = True
-                continue
             try:
-                close()
+                resource.close()
             except Exception:
                 resource_close_failed = True
 
@@ -319,14 +317,10 @@ def verify_s3(
                     cleanup_failed = True
             else:
                 cleanup_failed = True
-            close = getattr(cleanup_client, "close", None)
-            if not callable(close):
+            try:
+                cleanup_client.close()
+            except Exception:
                 cleanup_failed = True
-            else:
-                try:
-                    close()
-                except Exception:
-                    cleanup_failed = True
 
     if cleanup_failed:
         raise AcceptanceCheckError("s3_cleanup")
