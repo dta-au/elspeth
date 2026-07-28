@@ -34,7 +34,7 @@ Lifecycle Contract (all hooks called on main thread by orchestrator):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from elspeth.contracts import (
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.plugins.infrastructure.config_base import PluginConfig, TransformDataConfig
 
-from elspeth.contracts.sink_effects import ResolvedSinkEffectMode, SinkEffectExecutionPurpose, SinkEffectInputKind
+from elspeth.contracts.sink_effects import AuditExportFormat, ResolvedSinkEffectMode, SinkEffectExecutionPurpose, SinkEffectInputKind
 from elspeth.plugins.infrastructure.results import (
     TransformResult,
 )
@@ -969,6 +969,15 @@ class BaseSink(ABC):
     ) -> ResolvedSinkEffectMode | None:
         """Adapter-owned, local mode resolution seam for runtime construction."""
         del cls, config, purpose
+        return None
+
+    def _resolve_audit_export_publication_preflight(
+        self,
+        export_format: AuditExportFormat,
+    ) -> Callable[[], None] | None:
+        """Bind any plugin-owned publication probe from validated instance state."""
+        if type(export_format) is not AuditExportFormat:
+            raise TypeError("audit export format must be an exact AuditExportFormat")
         return None
 
     # ── Reference content (Phase 7A) ────────────────────────────────────

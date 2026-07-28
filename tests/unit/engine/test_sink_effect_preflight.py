@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -792,7 +792,7 @@ def test_runtime_factory_does_not_construct_delayed_export_sink(
         transforms=(),
         aggregations=(),
         sinks={"pipeline": sink("pipeline"), "audit-export": sink("audit-export")},
-        landscape=SimpleNamespace(export=SimpleNamespace(enabled=True, sink="audit-export")),
+        landscape=SimpleNamespace(export=SimpleNamespace(enabled=True, sink="audit-export", format="json")),
     )
 
     bundle = instantiate_plugins_from_config(settings, preflight_mode=True)  # type: ignore[arg-type]
@@ -821,7 +821,7 @@ def test_real_runtime_factory_validates_delayed_export_options_without_construct
                 on_write_failure="discard",
             )
         },
-        landscape=SimpleNamespace(export=SimpleNamespace(enabled=True, sink="audit-export")),
+        landscape=SimpleNamespace(export=SimpleNamespace(enabled=True, sink="audit-export", format="json")),
     )
 
     with pytest.raises(PluginConfigError, match="append"):
@@ -848,7 +848,7 @@ def test_valid_delayed_export_is_excluded_then_constructed_by_fresh_export_facto
                 on_write_failure="discard",
             )
         },
-        landscape=SimpleNamespace(export=SimpleNamespace(enabled=True, sink="audit-export")),
+        landscape=SimpleNamespace(export=SimpleNamespace(enabled=True, sink="audit-export", format="json")),
     )
 
     bundle = instantiate_plugins_from_config(settings, preflight_mode=True)  # type: ignore[arg-type]
@@ -856,6 +856,37 @@ def test_valid_delayed_export_is_excluded_then_constructed_by_fresh_export_facto
 
     assert bundle.sinks == {}
     assert type(binding.sink) is JSONSink
+    assert binding.audit_export_publication_preflight is None
+
+
+def test_csv_audit_export_factory_binds_preflight_to_validated_target(
+    tmp_path: Path,
+) -> None:
+    from elspeth.plugins.infrastructure.runtime_factory import make_sink_factory
+
+    target = tmp_path / "audit-bundle"
+    settings = SimpleNamespace(
+        sinks={
+            "audit-export": SimpleNamespace(
+                plugin="csv",
+                options={
+                    "path": str(target),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                },
+                on_write_failure="discard",
+            )
+        },
+        landscape=SimpleNamespace(export=SimpleNamespace(enabled=True, sink="audit-export", format="csv")),
+    )
+
+    with patch("elspeth.plugins.sinks.csv_sink.preflight_audit_export_bundle") as preflight:
+        binding = make_sink_factory(settings)("audit-export")  # type: ignore[arg-type]
+        publication_preflight = binding.audit_export_publication_preflight
+        assert publication_preflight is not None
+        publication_preflight()
+
+    preflight.assert_called_once_with(target)
 
 
 def test_real_runtime_factory_carries_adapter_resolved_mode_with_exact_sink(

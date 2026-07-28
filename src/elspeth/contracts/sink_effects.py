@@ -127,6 +127,7 @@ class SinkEffectRuntimeBinding:
     config_fingerprint: str
     purpose: SinkEffectExecutionPurpose
     effect_mode: ResolvedSinkEffectMode | None
+    audit_export_publication_preflight: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.sink_name, str) or not self.sink_name.strip():

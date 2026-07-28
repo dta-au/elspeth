@@ -254,6 +254,11 @@ def test_csv_export_runs_bundle_capability_probe_before_snapshot_reservation(tmp
     settings = _make_settings(fmt="csv")
     settings.sinks["output"].options = options
     sink = CSVSink(options)
+    observed: list[str] = []
+
+    def publication_preflight() -> None:
+        observed.append(f"probe:{target}")
+
     binding = SinkEffectRuntimeBinding(
         sink_name="output",
         sink=sink,
@@ -261,17 +266,13 @@ def test_csv_export_runs_bundle_capability_probe_before_snapshot_reservation(tmp
         config_fingerprint=stable_hash(options),
         purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
         effect_mode=ResolvedSinkEffectMode("write"),
+        audit_export_publication_preflight=publication_preflight,
     )
     binding, admission = prepare_audit_export_binding(settings, lambda _name: binding)
-    observed: list[str] = []
     factory = SimpleNamespace(data_flow=SimpleNamespace(register_node=_CallRecorder(), get_node=lambda *_a, **_k: None))
 
     with (
         patch("elspeth.core.landscape.factory.RecorderFactory", return_value=factory),
-        patch(
-            "elspeth.plugins.sinks._audit_export_bundle_effects.preflight_audit_export_bundle",
-            side_effect=lambda path: observed.append(f"probe:{path}"),
-        ),
         patch(
             "elspeth.engine.orchestrator.audit_export_effects.prepare_audit_export_snapshot",
             side_effect=lambda *_args, **_kwargs: observed.append("snapshot") or object(),
@@ -288,6 +289,39 @@ def test_csv_export_runs_bundle_capability_probe_before_snapshot_reservation(tmp
         )
 
     assert observed == [f"probe:{target}", "snapshot"]
+
+
+def test_csv_export_requires_runtime_bound_publication_preflight(tmp_path: Path) -> None:
+    from elspeth.plugins.sinks.csv_sink import CSVSink
+
+    options = {"path": str(tmp_path / "audit-bundle"), "schema": {"mode": "observed"}}
+    settings = _make_settings(fmt="csv")
+    settings.sinks["output"].options = options
+    sink = CSVSink(options)
+    binding = SinkEffectRuntimeBinding(
+        sink_name="output",
+        sink=sink,
+        sink_type=type(sink),
+        config_fingerprint=stable_hash(options),
+        purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
+        effect_mode=ResolvedSinkEffectMode("write"),
+    )
+    binding, admission = prepare_audit_export_binding(settings, lambda _name: binding)
+
+    with (
+        patch("elspeth.engine.orchestrator.audit_export_effects.prepare_audit_export_snapshot") as prepare_snapshot,
+        pytest.raises(SinkEffectCapabilityError, match="publication preflight"),
+    ):
+        export_landscape(
+            object(),
+            "run-1",
+            settings,
+            lambda _name: binding,
+            prepared_binding=binding,
+            sink_effect_admission=admission,
+        )
+
+    prepare_snapshot.assert_not_called()
 
 
 # =============================================================================

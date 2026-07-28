@@ -405,14 +405,17 @@ def make_sink_factory(config: ElspethSettings) -> Callable[[str], SinkEffectRunt
         sink._on_write_failure = sink_config.on_write_failure
         from elspeth.plugins.infrastructure.base import BaseSink
 
-        resolved_mode = (
-            sink_cls._resolve_sink_effect_mode(
+        is_base_sink = isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink)
+        resolved_mode = None
+        publication_preflight = None
+        if is_base_sink:
+            base_sink_type = cast(type[BaseSink], sink_cls)
+            resolved_mode = base_sink_type._resolve_sink_effect_mode(
                 dict(sink_config.options),
                 purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
             )
-            if isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink)
-            else None
-        )
+            export_format = AuditExportFormat(config.landscape.export.format)
+            publication_preflight = cast(BaseSink, sink)._resolve_audit_export_publication_preflight(export_format)
         if resolved_mode is not None and type(resolved_mode) is not ResolvedSinkEffectMode:
             raise TypeError("Sink _resolve_sink_effect_mode must return ResolvedSinkEffectMode or None")
         return SinkEffectRuntimeBinding(
@@ -422,6 +425,7 @@ def make_sink_factory(config: ElspethSettings) -> Callable[[str], SinkEffectRunt
             config_fingerprint=stable_hash(dict(sink_config.options)),
             purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
             effect_mode=resolved_mode,
+            audit_export_publication_preflight=publication_preflight,
         )
 
     return factory

@@ -11,7 +11,7 @@ from __future__ import annotations
 import codecs
 import csv
 import io
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -59,6 +59,7 @@ from elspeth.plugins.infrastructure.schema_factory import create_schema_from_con
 from elspeth.plugins.sinks._audit_export_bundle_effects import (
     commit_audit_export_bundle,
     inspect_audit_export_bundle,
+    preflight_audit_export_bundle,
     prepare_audit_export_bundle,
     reconcile_audit_export_bundle,
 )
@@ -175,6 +176,21 @@ class CSVSink(BaseSink):
             raise SinkEffectCapabilityError(
                 "CSV audit export requires mode='write' and create-only collision policy 'fail_if_exists' or null"
             )
+
+    def _resolve_audit_export_publication_preflight(
+        self,
+        export_format: AuditExportFormat,
+    ) -> Callable[[], None] | None:
+        if type(export_format) is not AuditExportFormat:
+            raise TypeError("audit export format must be an exact AuditExportFormat")
+        if export_format is not AuditExportFormat.CSV:
+            return None
+        target_path = self._requested_path
+
+        def run_preflight() -> None:
+            preflight_audit_export_bundle(target_path)
+
+        return run_preflight
 
     def _validate_sink_effect_capability_configuration(
         self,
