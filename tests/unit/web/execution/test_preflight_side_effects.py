@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_yaml_string
+from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, load_settings_from_yaml_string, resolve_config
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode, plugin_preflight_mode_enabled
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
 from elspeth.plugins.sinks.csv_sink import CSVSink
@@ -20,6 +20,7 @@ from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.execution import preflight as execution_preflight
 from elspeth.web.execution.preflight import (
     audit_safe_resolved_config,
     build_validated_runtime_graph,
@@ -160,6 +161,78 @@ def _snapshot_without(plugin_id: PluginId) -> PluginAvailabilitySnapshot:
         selected_profile_aliases=(),
         binding_generation_fingerprint="runtime-policy-generation",
     )
+
+
+def _snapshot_with_profiles(*profiles: tuple[PluginId, str]) -> PluginAvailabilitySnapshot:
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+    return PluginAvailabilitySnapshot.create(
+        policy_hash="runtime-policy",
+        principal_scope="test:alice",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=tuple((plugin_id, (alias,)) for plugin_id, alias in profiles),
+        selected_profile_aliases=tuple(profiles),
+        binding_generation_fingerprint="runtime-policy-generation",
+    )
+
+
+def _profiled_llm_audit_inputs(
+    tmp_path: Path,
+    *,
+    source_name: str = "primary",
+) -> tuple[ElspethSettings, dict[str, Any], PluginAvailabilitySnapshot]:
+    (tmp_path / "blobs").mkdir(exist_ok=True)
+    (tmp_path / "outputs").mkdir(exist_ok=True)
+    input_path = tmp_path / "blobs" / "profile_input.csv"
+    input_path.write_text("text\nAda\n", encoding="utf-8")
+    executable_yaml = f"""\
+sources:
+  {source_name}:
+    plugin: csv
+    on_success: llm_step
+    options:
+      path: {input_path}
+      on_validation_failure: discard
+      schema:
+        mode: observed
+transforms:
+  - name: llm_step
+    plugin: llm
+    input: llm_step
+    on_success: output
+    on_error: discard
+    options:
+      provider: openrouter
+      api_key: probe-key
+      model: openai/gpt-4o
+      prompt_template: "Summarise {{{{ row.text }}}}"
+      schema:
+        mode: observed
+      required_input_fields: []
+sinks:
+  output:
+    plugin: csv
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "outputs" / "profile_output.csv"}
+      schema:
+        mode: observed
+"""
+    settings = load_settings_from_yaml_string(executable_yaml)
+    audit_safe = load_bounded_pipeline_yaml(executable_yaml)
+    assert type(audit_safe) is dict
+    transforms = audit_safe["transforms"]
+    assert type(transforms) is list
+    llm_options = transforms[0]["options"]
+    transforms[0]["options"] = {
+        "profile": "tutorial",
+        "prompt_template": llm_options["prompt_template"],
+        "schema": llm_options["schema"],
+        "required_input_fields": llm_options["required_input_fields"],
+    }
+    snapshot = _snapshot_with_profiles((PluginId("transform", "llm"), "tutorial"))
+    return settings, audit_safe, snapshot
 
 
 def _external_plugin_probe_pipeline_yaml(tmp_path: Path) -> str:
@@ -425,66 +498,7 @@ def test_delayed_sink_factory_uses_frozen_snapshot_before_construction(
 
 
 def test_profile_private_bindings_never_enter_run_or_node_audit_config(tmp_path: Path) -> None:
-    (tmp_path / "blobs").mkdir(exist_ok=True)
-    (tmp_path / "outputs").mkdir(exist_ok=True)
-    input_path = tmp_path / "blobs" / "profile_input.csv"
-    input_path.write_text("text\nAda\n", encoding="utf-8")
-    executable_yaml = f"""\
-sources:
-  primary:
-    plugin: csv
-    on_success: llm_step
-    options:
-      path: {input_path}
-      on_validation_failure: discard
-      schema:
-        mode: observed
-transforms:
-  - name: llm_step
-    plugin: llm
-    input: llm_step
-    on_success: output
-    on_error: discard
-    options:
-      provider: openrouter
-      api_key: probe-key
-      model: openai/gpt-4o
-      prompt_template: "Summarise {{{{ row.text }}}}"
-      schema:
-        mode: observed
-      required_input_fields: []
-sinks:
-  output:
-    plugin: csv
-    on_write_failure: discard
-    options:
-      path: {tmp_path / "outputs" / "profile_output.csv"}
-      schema:
-        mode: observed
-"""
-    settings = load_settings_from_yaml_string(executable_yaml)
-    audit_safe = load_bounded_pipeline_yaml(executable_yaml)
-    assert isinstance(audit_safe, dict)
-    transforms = audit_safe["transforms"]
-    assert isinstance(transforms, list)
-    llm_options = transforms[0]["options"]
-    transforms[0]["options"] = {
-        "profile": "tutorial",
-        "prompt_template": llm_options["prompt_template"],
-        "schema": llm_options["schema"],
-        "required_input_fields": llm_options["required_input_fields"],
-    }
-    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
-    snapshot = PluginAvailabilitySnapshot.create(
-        policy_hash="runtime-policy",
-        principal_scope="test:alice",
-        available=unrestricted.available,
-        unavailable=(),
-        selected=unrestricted.selected,
-        usable_profile_aliases=((PluginId("transform", "llm"), ("tutorial",)),),
-        selected_profile_aliases=((PluginId("transform", "llm"), "tutorial"),),
-        binding_generation_fingerprint="runtime-policy-generation",
-    )
+    settings, audit_safe, snapshot = _profiled_llm_audit_inputs(tmp_path)
 
     runtime = build_validated_runtime_graph(
         settings,
@@ -502,6 +516,214 @@ sinks:
     assert "tutorial" in rendered
     assert "openai/gpt-4o" not in rendered
     assert "probe-key" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("section", "corrupt_value"),
+    [
+        ("sources", None),
+        ("transforms", {}),
+        ("aggregations", {}),
+        ("sinks", []),
+    ],
+)
+def test_audit_safe_resolved_config_rejects_corrupt_resolved_section(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    section: str,
+    corrupt_value: object,
+) -> None:
+    settings, audit_safe, snapshot = _profiled_llm_audit_inputs(tmp_path)
+    resolved = resolve_config(settings)
+    resolved[section] = corrupt_value
+    monkeypatch.setattr(execution_preflight, "resolve_config", lambda _settings: resolved)
+
+    with pytest.raises(TypeError, match=section):
+        audit_safe_resolved_config(
+            settings,
+            audit_safe_settings=audit_safe,
+            plugin_snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize(
+    ("section", "component_name"),
+    [
+        ("sources", "primary"),
+        ("transforms", None),
+        ("aggregations", None),
+        ("sinks", "output"),
+    ],
+)
+def test_audit_safe_resolved_config_rejects_corrupt_resolved_component(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    section: str,
+    component_name: str | None,
+) -> None:
+    settings, audit_safe, snapshot = _profiled_llm_audit_inputs(tmp_path)
+    resolved = resolve_config(settings)
+    components = resolved[section]
+    if component_name is None:
+        assert type(components) is list
+        if components:
+            components[0] = None
+        else:
+            components.append(None)
+    else:
+        assert type(components) is dict
+        components[component_name] = None
+    monkeypatch.setattr(execution_preflight, "resolve_config", lambda _settings: resolved)
+
+    with pytest.raises(TypeError, match=section):
+        audit_safe_resolved_config(
+            settings,
+            audit_safe_settings=audit_safe,
+            plugin_snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("missing_field", ["plugin", "name"])
+def test_audit_safe_resolved_config_requires_resolved_transform_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    settings, audit_safe, snapshot = _profiled_llm_audit_inputs(tmp_path)
+    resolved = resolve_config(settings)
+    del resolved["transforms"][0][missing_field]
+    monkeypatch.setattr(execution_preflight, "resolve_config", lambda _settings: resolved)
+
+    with pytest.raises(KeyError, match=missing_field):
+        audit_safe_resolved_config(
+            settings,
+            audit_safe_settings=audit_safe,
+            plugin_snapshot=snapshot,
+        )
+
+
+def test_audit_safe_resolved_config_requires_authored_profile_options(tmp_path: Path) -> None:
+    settings, audit_safe, snapshot = _profiled_llm_audit_inputs(tmp_path)
+    del audit_safe["transforms"][0]["options"]
+
+    with pytest.raises(KeyError, match="options"):
+        audit_safe_resolved_config(
+            settings,
+            audit_safe_settings=audit_safe,
+            plugin_snapshot=snapshot,
+        )
+
+
+def test_audit_safe_projections_preserve_historical_singular_source_contract(tmp_path: Path) -> None:
+    settings, audit_safe, _snapshot = _profiled_llm_audit_inputs(tmp_path, source_name="source")
+    authored_sources = audit_safe["sources"]
+    assert type(authored_sources) is dict
+    audit_safe["source"] = authored_sources["source"]
+    del audit_safe["sources"]
+    snapshot = _snapshot_with_profiles(
+        (PluginId("source", "csv"), "source-profile"),
+        (PluginId("transform", "llm"), "tutorial"),
+    )
+
+    runtime = build_validated_runtime_graph(
+        settings,
+        plugin_snapshot=snapshot,
+        audit_safe_settings=audit_safe,
+    )
+    run_config = audit_safe_resolved_config(
+        settings,
+        audit_safe_settings=audit_safe,
+        plugin_snapshot=snapshot,
+    )
+
+    rendered = json.dumps(
+        {
+            "run": run_config,
+            "nodes": [runtime.graph.get_node_info(node_id).config for node_id in runtime.graph.topological_order()],
+        },
+        default=dict,
+    )
+    assert "tutorial" in rendered
+    assert "openai/gpt-4o" not in rendered
+    assert "probe-key" not in rendered
+
+
+def test_audit_safe_projections_do_not_require_authored_matches_for_unprofiled_components(
+    tmp_path: Path,
+) -> None:
+    settings, audit_safe, snapshot = _profiled_llm_audit_inputs(tmp_path)
+    audit_safe["sources"] = {}
+    audit_safe["sinks"] = {}
+
+    runtime = build_validated_runtime_graph(
+        settings,
+        plugin_snapshot=snapshot,
+        audit_safe_settings=audit_safe,
+    )
+    run_config = audit_safe_resolved_config(
+        settings,
+        audit_safe_settings=audit_safe,
+        plugin_snapshot=snapshot,
+    )
+
+    rendered = json.dumps(
+        {
+            "run": run_config,
+            "nodes": [runtime.graph.get_node_info(node_id).config for node_id in runtime.graph.topological_order()],
+        },
+        default=dict,
+    )
+    assert "tutorial" in rendered
+    assert "openai/gpt-4o" not in rendered
+    assert "probe-key" not in rendered
+
+
+def test_audit_safe_projections_explicitly_synthesise_absent_optional_component_lists(
+    tmp_path: Path,
+) -> None:
+    pipeline_yaml = _minimal_csv_pipeline_yaml(tmp_path)
+    settings = load_settings_from_yaml_string(pipeline_yaml)
+    audit_safe = load_bounded_pipeline_yaml(pipeline_yaml)
+    assert type(audit_safe) is dict
+    audit_safe["transforms"] = None
+    audit_safe["aggregations"] = None
+    snapshot = _snapshot_with_profiles((PluginId("source", "csv"), "source-profile"))
+
+    build_validated_runtime_graph(
+        settings,
+        plugin_snapshot=snapshot,
+        audit_safe_settings=audit_safe,
+    )
+    audit_safe_resolved_config(
+        settings,
+        audit_safe_settings=audit_safe,
+        plugin_snapshot=snapshot,
+    )
+
+
+def test_audit_safe_plugin_configs_restores_earlier_substitutions_when_later_authored_config_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    settings, audit_safe, _snapshot = _profiled_llm_audit_inputs(tmp_path)
+    snapshot = _snapshot_with_profiles(
+        (PluginId("source", "csv"), "source-profile"),
+        (PluginId("transform", "llm"), "tutorial"),
+    )
+    bundle = instantiate_runtime_plugins(settings, plugin_snapshot=snapshot)
+    executable_source_config = bundle.sources["primary"].config
+    del audit_safe["transforms"][0]["options"]
+
+    with (
+        pytest.raises(KeyError),
+        execution_preflight._audit_safe_plugin_configs(
+            bundle,
+            audit_safe_settings=audit_safe,
+            plugin_snapshot=snapshot,
+        ),
+    ):
+        pass
+
+    assert bundle.sources["primary"].config is executable_source_config
 
 
 @pytest.mark.asyncio
