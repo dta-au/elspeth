@@ -5,8 +5,8 @@
 //      (otherwise the app redirects to /login and these tests fail).
 //   2. Both webServer instances came up healthy on the Playwright-assigned
 //      backend and frontend ports.
-//   3. The frontend SPA loads, restores auth from localStorage, and renders
-//      the composer empty state.
+//   3. The frontend SPA loads, restores auth from localStorage, completes
+//      session bootstrap, and renders the stable application shell.
 //   4. The backend's /api/sessions endpoint accepts the bearer token and
 //      can create + delete a session.
 //
@@ -30,16 +30,31 @@ import {
 } from "./helpers/api";
 import { ComposerPage } from "./page-objects/composer-page";
 
-test.describe("smoke — boot + auth + empty composer", () => {
-  test("frontend boots and chat panel renders", async ({ page }) => {
+test.describe("smoke — boot + auth + session shell", () => {
+  test("frontend completes bootstrap and renders the session shell", async ({
+    page,
+  }) => {
     const composer = new ComposerPage(page);
-    await composer.goto();
+    const sessionsLoaded = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        url.pathname === "/api/sessions" &&
+        url.searchParams.get("include_archived") === "true" &&
+        response.request().method() === "GET" &&
+        response.status() === 200
+      );
+    });
 
-    // Empty-state copy from ChatPanel.tsx when there is no active session.
+    await composer.goto();
+    await sessionsLoaded;
+
+    // These shell elements are stable whether bootstrap finds no sessions or
+    // automatically resumes an existing session.
     await expect(
-      page.getByText(
-        /Use the session switcher to select a session or create a new one\./i,
-      ),
+      page.getByRole("heading", { name: "ELSPETH Pipeline Composer" }),
+    ).toBeAttached();
+    await expect(
+      page.getByRole("button", { name: /session switcher:/i }),
     ).toBeVisible();
   });
 
