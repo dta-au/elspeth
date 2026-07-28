@@ -78,8 +78,8 @@ historical behavior; entries signed before 2026-07-09 were produced under it.
     stage_scan   -> worklist bundle  -->  sign-bundle <bundle.json>
     stage_preview (advisory verdict)        (re-verifies the bundle against the
     stage_status (paste-ready cmd)           tree, THEN fires the real judge /
-    stage_rekey  -> rekey bundle     -->     re-keys; aborts on any staleness
-    verify_signatures (shape-only)           BEFORE a single write)
+    stage_rekey  -> rekey bundle     -->     re-keys in a private transaction;
+    verify_signatures (shape-only)           active bytes publish coherently)
                                           rekey --in <bundle.json>
 ```
 
@@ -117,7 +117,7 @@ Run these only in an operator-controlled shell that holds
 `ELSPETH_JUDGE_METADATA_HMAC_KEY`. The Codex transport authenticates from the
 installed CLI account and does not need a provider API key in that shell. Both
 commands re-derive every binding from the live tree and abort on any staleness
-*before* the first write.
+before touching the configured active allowlist.
 
 ### `sign-bundle` — fire a staged review bundle
 
@@ -128,12 +128,47 @@ elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
 
 This is the **only** place a judge signature is minted from a bundle. The verify
 phase (re-check the whole bundle against the tree) is the all-or-nothing gate; on
-any mismatch it aborts before writing anything. The execute phase is per-action,
-non-transactional (a mid-bundle real-judge BLOCK after confirmation leaves
-earlier-accepted actions written and restores/skips the blocked one), and exits
-non-zero with a per-action report.
+any mismatch it aborts before creating a transaction. Execution happens in a
+private same-filesystem copy under a sibling `.sign-bundle-transactions/`
+directory. `stale_delete` and safe `rotation` actions run before paid judge
+calls. Each accepted authoritative decision is journalled, but the configured
+active allowlist remains byte-identical until every action succeeds, the bundle
+and live tree are re-verified, and every recovered signature verifies
+authoritatively. The transaction manifest is HMAC-authenticated with a
+purpose-separated key derived from the operator signing key; candidate,
+checkpoint, and staged-audit bytes are fsynced before their hashes are recorded,
+so scratch bytes and journal claims cannot be changed together by a keyless
+process. Publication shares a stable sibling mutation lock with the ordinary
+allowlist writers and rechecks both trees while holding it. Any staged rotation
+audit records are conflict-checked before the coherent candidate publishes with
+one Linux `renameat2(RENAME_EXCHANGE)` directory swap, then the exact staged
+audit delta is appended idempotently with the durable publish-start timestamp.
+The private transaction is the pending record for the narrow cross-resource
+window: if publication commits before the audit append, resume detects the
+published bytes and finishes that append without repeating judge work.
+
+A real-judge BLOCK, ordinary action failure, unexpected exception, or
+interruption exits non-zero (interrupts return 130), preserves the private
+transaction, and prints a paste-ready command containing
+`--resume <transaction-dir>`. Resume does not trust the scratch copy: it
+authenticates the journal, then re-checks the exact bundle bytes,
+source/bindings, active/candidate state, action evidence, and previously
+produced HMAC signatures before skipping completed judge work. The manifest
+authenticates the original active and candidate directory identities
+(`st_dev`/`st_ino`). Recovery accepts their original orientation before
+publication, or their exact swapped orientation as causal proof that
+`RENAME_EXCHANGE` committed. In the swapped orientation, the active contents may
+equal the authenticated candidate or may have advanced under a later coordinated
+writer while the private candidate still contains the exact base. Any other
+identity or content state refuses recovery. On
+successful completion the
+coherent active tree is diagnosed and the canonical override-rate counter
+snapshot is refreshed. Resume also binds the original non-secret signing policy
+(owner, override mode, judge transport/tools, token setting, roots, environment
+file, and output format); changing any of it requires a new transaction.
 
 Per lane:
+
 - `drift_repair` and `new_judgment` run the **real judge** — re-judging, never
   carrying a stale verdict forward over changed content (that would be the [O1]
   forgery). A contradicting BLOCK is surfaced and **not** signed; on BLOCK the
@@ -152,8 +187,10 @@ Flags:
 | `--allowlist-dir` | `config/cicd/enforce_tier_model` | Per-module allowlist YAML to repair in place. |
 | `--operator-override` | off | Forward `--operator-override` to each justify call (requires the override-token env, exactly like `justify`). |
 | `--max-tokens` | none | Override judge response `max_tokens` per call. |
-| `--dry-run` | off | Print verify + per-lane plan; no judge call, no writes. |
-| `--yes` | off | Skip the interactive confirm before the destructive write phase. |
+| `--dry-run` | off | Print verify + per-lane plan; no judge call and no transaction or other writes. |
+| `--yes` | off | Skip the interactive confirm before creating/resuming the private transaction. |
+| `--resume` | none | Resume the printed transaction directory after re-verifying bundle bytes, source/bindings, active bytes, journaled effects, and prior signatures. |
+| `--rotation-log` | `.elspeth/rotations.log` | Rotation audit JSONL finalized only with coherent publish. |
 | `--format` | `text` | Per-entry justify output (`text`/`json`). |
 | `--judge-transport` | `openrouter` | Provider that produces the verdict (`codex-cli` is the required normal signing choice; `agent` is the legacy Claude SDK path). |
 | `--judge-tools` | `none` | Judge tool configuration; use `readonly` with `codex-cli` for signing. |
@@ -211,10 +248,30 @@ provenance only**, not a contract:
 Read the lists as a preview of scope, never as the set that will actually be
 acted on.
 
-## Staleness: when the operator must re-run `stage_scan`
+## Recovery versus re-staging
 
-A bundle is a point-in-time assertion about the tree. The verify gate aborts
-(and the operator simply re-stages) in two expected situations:
+Use the printed `--resume` command when the bundle and live source/bindings are
+still current and the authenticated directory identities have either their
+original orientation (publication has not happened) or their exact swapped
+orientation (publication committed). In the swapped orientation, resume also
+supports a later coordinated writer having advanced the active contents while
+the private candidate retains the exact base; it finalizes the pending audit
+without repeating judge work. This reuses accepted authoritative decisions and
+retries only unfinished work. Do not re-run the judge merely because a later
+action BLOCKed or the process was interrupted.
+
+A BLOCK decision event is retained in the private transaction even though the
+active allowlist is unchanged. A later successful resume publishes the
+accumulated event history with the coherent candidate. If the transaction is
+abandoned, its BLOCK evidence remains visible only in that printed transaction
+directory; retain or remove that directory deliberately according to the
+operator's audit policy. `sign-bundle` does not silently prune it.
+
+Re-run `stage_scan` when live source/bindings changed, when pre-publication
+active contents drifted, when directory identities or contents cannot be
+reconciled to one of those two authenticated orientations, or when the original
+preflight itself rejected the bundle. A bundle is a point-in-time assertion
+about the tree. The verify gate aborts in two expected situations:
 
 - **AST-position cascade staleness (by design).** A bundle staged *before* an
   edit that shifts AST positions in a covered `src/elspeth` source — for example
@@ -224,7 +281,7 @@ A bundle is a point-in-time assertion about the tree. The verify gate aborts
   once in a file, `sign-bundle` refuses (`return 2`, both copies preserved).
   Resolve the duplicate in the YAML, re-run `stage_scan`, and fire again.
 
-In both cases the safe action is the same: re-stage, do not force.
+In those cases re-stage; never force or edit the transaction journal.
 
 ## What replaced the one-off signing scripts
 

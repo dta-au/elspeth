@@ -2501,7 +2501,12 @@ def _match_per_file_rule(rules: list[PerFileRule], finding_key: FindingKey) -> P
     return None
 
 
-def _match_finding(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | PerFileRule | None:
+def _match_finding(
+    allowlist: Allowlist,
+    finding: Finding,
+    *,
+    binding_failure_is_no_match: bool = False,
+) -> AllowlistEntry | PerFileRule | None:
     """Match a tier_model ``Finding`` against ``allowlist``.
 
     Preserves tier_model's historical match order: per-file rules are checked
@@ -2511,6 +2516,10 @@ def _match_finding(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | P
     diagnostics) for findings covered by both an exact entry and a per-file
     rule. We keep the historical order to preserve the production
     ``contracts.yaml`` semantics across this consolidation.
+
+    Direct callers retain binding-verifier ``ValueError`` diagnostics. Collection
+    passes ``binding_failure_is_no_match=True`` so a stale signed binding remains
+    an ordinary unsuppressed finding while unrelated matcher errors still escape.
     """
     finding_key = _finding_key_for(finding)
     matched_rule = _match_per_file_rule(allowlist.per_file_rules, finding_key)
@@ -2527,12 +2536,17 @@ def _match_finding(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | P
             # persisted ast_path is the AST-level address the judge
             # actually inspected; it must equal the live finding's
             # ast_path. Mismatch ⇒ tampering or unannounced refactor.
-            verify_entry_binding_against_finding(
-                entry,
-                file_path=finding.file_path,
-                ast_path=finding.ast_path,
-                scope_fingerprint=finding.scope_fingerprint,
-            )
+            try:
+                verify_entry_binding_against_finding(
+                    entry,
+                    file_path=finding.file_path,
+                    ast_path=finding.ast_path,
+                    scope_fingerprint=finding.scope_fingerprint,
+                )
+            except ValueError:
+                if binding_failure_is_no_match:
+                    return None
+                raise
             entry.matched = True
             return entry
     # Exact key missed. A judge-gated v2 entry whose module-rooted ast_path
@@ -2554,6 +2568,11 @@ def _match_finding(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | P
         fallback.matched = True
         return fallback
     return None
+
+
+def _match_finding_for_collection(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | PerFileRule | None:
+    """Fail closed on stale judge bindings while preserving direct diagnostics."""
+    return _match_finding(allowlist, finding, binding_failure_is_no_match=True)
 
 
 def _load_tier_model_allowlist(path: Path, *, source_root: Path | None = None) -> Allowlist:
@@ -2745,12 +2764,12 @@ def collect_check_result(
 
     violations: list[Finding] = []
     for finding in all_findings:
-        if finding.rule_id in _BANNED_RULES or _match_finding(allowlist, finding) is None:
+        if finding.rule_id in _BANNED_RULES or _match_finding_for_collection(allowlist, finding) is None:
             violations.append(finding)
 
     layer_warnings: list[Finding] = []
     for tc_finding in all_tc_findings:
-        if _match_finding(allowlist, tc_finding) is None:
+        if _match_finding_for_collection(allowlist, tc_finding) is None:
             layer_warnings.append(tc_finding)
 
     if files:

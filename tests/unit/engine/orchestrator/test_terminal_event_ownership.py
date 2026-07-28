@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import time
 from pathlib import Path
 from typing import Any
 
@@ -96,7 +97,27 @@ def test_run_ceremony_emits_partial_summary_from_run_result(monkeypatch: pytest.
         routed_destinations={"default": 2, "quarantine": 1},
     )
 
-    monkeypatch.setattr("elspeth.engine.orchestrator.ceremony.time.perf_counter", lambda: 42.5)
+    class _FrozenClockTime:
+        """Stand-in for the ``time`` name as seen from inside
+        ``elspeth.engine.orchestrator.ceremony``, scoped to that module only.
+
+        ``monkeypatch.setattr("...ceremony.time.perf_counter", ...)`` would
+        resolve ``...ceremony.time`` to the *real* ``time`` module (Python
+        modules are process-wide singletons; the ceremony module merely
+        imports the same object everyone else does) and replace
+        ``time.perf_counter`` for the whole process during the test.
+        Rebinding the ``time`` *name inside the ceremony module's own
+        namespace* keeps the freeze local to the code path under test;
+        everything else (the ceremony module only calls ``time.perf_counter``)
+        delegates to the real module.
+        """
+
+        perf_counter = staticmethod(lambda: 42.5)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(time, name)
+
+    monkeypatch.setattr("elspeth.engine.orchestrator.ceremony.time", _FrozenClockTime())
 
     ceremony.emit_partial_summary(
         run_id=result.run_id,

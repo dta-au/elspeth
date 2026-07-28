@@ -140,6 +140,7 @@ from types import TracebackType
 from typing import Any, Self, cast
 
 from elspeth_lints.core.allowlist import AllowlistEntry, JudgeVerdict
+from elspeth_lints.core.atomic_io import allowlist_mutation_lock
 from elspeth_lints.core.reaudit import (
     ReauditCause,
     ReauditDivergence,
@@ -336,9 +337,21 @@ class SidecarWriter:
         self._append = append
         self._on_resume_locked = on_resume_locked
         self._file: Any = None  # set in __enter__
+        self._mutation_lock: Any = None
         self._outcomes_written = 0
 
     def __enter__(self) -> Self:
+        allowlist_dir = self._sidecar_path.parent.parent
+        self._mutation_lock = allowlist_mutation_lock(allowlist_dir)
+        self._mutation_lock.__enter__()
+        try:
+            return self._enter_with_mutation_lock()
+        except BaseException:
+            self._mutation_lock.__exit__(*sys.exc_info())
+            self._mutation_lock = None
+            raise
+
+    def _enter_with_mutation_lock(self) -> Self:
         self._sidecar_path.parent.mkdir(parents=True, exist_ok=True)
         # Retention runs OUTSIDE the per-run flock — it acquires its own
         # LOCK_NB on each candidate so an in-progress resume on a stale-
@@ -467,12 +480,17 @@ class SidecarWriter:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        if self._file is not None:
-            try:
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-            finally:
-                self._file.close()
-                self._file = None
+        try:
+            if self._file is not None:
+                try:
+                    fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+                finally:
+                    self._file.close()
+                    self._file = None
+        finally:
+            if self._mutation_lock is not None:
+                self._mutation_lock.__exit__(exc_type, exc_val, exc_tb)
+                self._mutation_lock = None
 
     def write_outcome(self, outcome: ReauditOutcome) -> None:
         """Append one outcome line, flushing and fsyncing immediately.

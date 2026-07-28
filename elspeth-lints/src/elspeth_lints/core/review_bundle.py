@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from elspeth_lints.core.atomic_io import atomic_update_text
+from elspeth_lints.core.strict_json import strict_json_loads
 
 SCHEMA_VERSION = 1
 
@@ -95,6 +96,14 @@ class ActionPreview:
     authoritative: bool = False
 
     def __post_init__(self) -> None:
+        for name in ("verdict", "rationale", "model", "transport"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise ValueError(f"ActionPreview.{name} must be a string; got {type(value).__name__}")
+        if not isinstance(self.authoritative, bool):
+            raise ValueError(
+                f"ActionPreview.authoritative must be a boolean; got {type(self.authoritative).__name__}"
+            )
         if self.authoritative:
             raise ValueError("ActionPreview.authoritative must be False; a bundle preview is never authoritative")
 
@@ -122,7 +131,27 @@ class BundleAction:
     preview: ActionPreview | None = None
 
     def __post_init__(self) -> None:
-        if not self.key:
+        for name in ("lane", "kind", "key"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise ValueError(f"BundleAction.{name} must be a string; got {type(value).__name__}")
+        for name in (
+            "file_path",
+            "symbol",
+            "rule",
+            "fingerprint",
+            "scope_fingerprint",
+            "ast_path",
+            "draft_rationale",
+            "diagnosis_status",
+            "source_file",
+        ):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"BundleAction.{name} must be a string or null; got {type(value).__name__}")
+        if self.preview is not None and not isinstance(self.preview, ActionPreview):
+            raise ValueError(f"BundleAction.preview must be an ActionPreview or null; got {type(self.preview).__name__}")
+        if self.key == "":
             raise ValueError("BundleAction.key must be a non-empty canonical allowlist key")
         expected_lane = _KIND_TO_LANE.get(self.kind)
         if expected_lane is None:
@@ -132,9 +161,16 @@ class BundleAction:
                 f"BundleAction.lane={self.lane!r} is incoherent with kind={self.kind!r} "
                 f"(kind {self.kind!r} requires lane {expected_lane!r})"
             )
-        missing = [name for name in _REQUIRED_FIELDS_BY_KIND[self.kind] if not getattr(self, name)]
+        missing = [name for name in _REQUIRED_FIELDS_BY_KIND[self.kind] if getattr(self, name) in {None, ""}]
         if missing:
             raise ValueError(f"BundleAction kind={self.kind!r} is missing required field(s): {missing}")
+        if self.kind in {"rotation", "stale_delete"}:
+            assert self.source_file is not None
+            source_path = Path(self.source_file)
+            if source_path.is_absolute() or len(source_path.parts) != 1 or source_path.name != self.source_file:
+                raise ValueError(
+                    f"BundleAction kind={self.kind!r} source_file must be one local allowlist filename; got {self.source_file!r}"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,7 +219,7 @@ def load_bundle(text: str) -> ReviewBundle:
     Unknown keys raise, ``schema_version`` is checked, and each action is
     validated per-kind via ``BundleAction.__post_init__``.
     """
-    data = json.loads(text)
+    data = strict_json_loads(text)
     if not isinstance(data, dict):
         raise ValueError(f"review bundle must be a JSON object; got {type(data).__name__}")
     _reject_unknown_keys(data, _BUNDLE_FIELDS, "bundle")
@@ -191,13 +227,19 @@ def load_bundle(text: str) -> ReviewBundle:
     schema_version = data.get("schema_version")
     if schema_version is None:
         raise ValueError("review bundle is missing required field 'schema_version'")
-    if schema_version != SCHEMA_VERSION:
+    if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
         raise ValueError(f"review bundle schema_version={schema_version!r}; this build understands {SCHEMA_VERSION}")
 
     raw_actions = _require(data, "actions", "bundle")
     if not isinstance(raw_actions, list):
         raise ValueError(f"review bundle 'actions' must be a list; got {type(raw_actions).__name__}")
     actions = tuple(_action_from_dict(item) for item in raw_actions)
+    identities: set[str] = set()
+    for action in actions:
+        identity = _action_identity(action)
+        if identity in identities:
+            raise ValueError(f"review bundle contains duplicate semantic action identity for key {action.key!r}")
+        identities.add(identity)
 
     raw_rekey = data.get("rekey")
     rekey = _rekey_from_dict(raw_rekey) if raw_rekey is not None else None
@@ -209,8 +251,8 @@ def load_bundle(text: str) -> ReviewBundle:
         staged_by=_require_str(data, "staged_by", "bundle"),
         root=_require_str(data, "root", "bundle"),
         allowlist_dir=_require_str(data, "allowlist_dir", "bundle"),
-        source_rev=data.get("source_rev"),
-        source_dirty=bool(_require(data, "source_dirty", "bundle")),
+        source_rev=_optional_str(data, "source_rev", "bundle"),
+        source_dirty=_require_bool(data, "source_dirty", "bundle"),
         actions=actions,
         rekey=rekey,
     )
@@ -295,15 +337,15 @@ def _action_from_dict(data: Any) -> BundleAction:
         lane=_require_str(data, "lane", "action"),
         kind=_require_str(data, "kind", "action"),
         key=_require_str(data, "key", "action"),
-        file_path=data.get("file_path"),
-        symbol=data.get("symbol"),
-        rule=data.get("rule"),
-        fingerprint=data.get("fingerprint"),
-        scope_fingerprint=data.get("scope_fingerprint"),
-        ast_path=data.get("ast_path"),
-        draft_rationale=data.get("draft_rationale"),
-        diagnosis_status=data.get("diagnosis_status"),
-        source_file=data.get("source_file"),
+        file_path=_optional_str(data, "file_path", "action"),
+        symbol=_optional_str(data, "symbol", "action"),
+        rule=_optional_str(data, "rule", "action"),
+        fingerprint=_optional_str(data, "fingerprint", "action"),
+        scope_fingerprint=_optional_str(data, "scope_fingerprint", "action"),
+        ast_path=_optional_str(data, "ast_path", "action"),
+        draft_rationale=_optional_str(data, "draft_rationale", "action"),
+        diagnosis_status=_optional_str(data, "diagnosis_status", "action"),
+        source_file=_optional_str(data, "source_file", "action"),
         preview=preview,
     )
 
@@ -317,7 +359,7 @@ def _preview_from_dict(data: Any) -> ActionPreview:
         rationale=_require_str(data, "rationale", "preview"),
         model=_require_str(data, "model", "preview"),
         transport=_require_str(data, "transport", "preview"),
-        authoritative=bool(data.get("authoritative", False)),
+        authoritative=_optional_bool(data, "authoritative", "preview", default=False),
     )
 
 
@@ -350,6 +392,42 @@ def _require_str(data: dict[str, Any], key: str, context: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"review {context} field {key!r} must be a string; got {type(value).__name__}")
     return value
+
+
+def _optional_str(data: dict[str, Any], key: str, context: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"review {context} field {key!r} must be a string or null; got {type(value).__name__}")
+    return value
+
+
+def _require_bool(data: dict[str, Any], key: str, context: str) -> bool:
+    value = _require(data, key, context)
+    if not isinstance(value, bool):
+        raise ValueError(f"review {context} field {key!r} must be a boolean; got {type(value).__name__}")
+    return value
+
+
+def _optional_bool(
+    data: dict[str, Any],
+    key: str,
+    context: str,
+    *,
+    default: bool,
+) -> bool:
+    if key not in data:
+        return default
+    value = data[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"review {context} field {key!r} must be a boolean; got {type(value).__name__}")
+    return value
+
+
+def _action_identity(action: BundleAction) -> str:
+    """Return the canonical mutation identity shared by every action kind."""
+    return action.key
 
 
 def _require_str_list(data: dict[str, Any], key: str, context: str) -> list[str]:

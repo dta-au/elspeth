@@ -2629,7 +2629,29 @@ def test_t6b_fsync_called_per_outcome(tmp_path: Path, monkeypatch: pytest.Monkey
         fsync_calls.append(fd)
         real_fsync(fd)
 
-    monkeypatch.setattr("elspeth_lints.core.reaudit_sidecar.os.fsync", spy_fsync)
+    class _FsyncSpyOs:
+        """Stand-in for the ``os`` name as seen from inside
+        ``elspeth_lints.core.reaudit_sidecar``, scoped to that module only.
+
+        ``monkeypatch.setattr("...reaudit_sidecar.os.fsync", spy_fsync)``
+        resolves ``...reaudit_sidecar.os`` to the *real* ``os`` module
+        (Python modules are process-wide singletons; the sidecar merely
+        imports the same object everyone else does) and replaces
+        ``os.fsync`` for the whole process during the test — the same
+        dotted-path pattern that crashed a full-suite run when a sibling
+        test globally replaced ``os.environ``. Rebinding the ``os`` *name
+        inside the sidecar's own namespace* keeps the spy local to the
+        code path under test; everything except ``fsync`` delegates to
+        the real module (the sidecar also uses ``os.ftruncate``,
+        ``os.open``, ``os.close``, and the ``O_*`` flag constants).
+        """
+
+        fsync = staticmethod(spy_fsync)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(_os, name)
+
+    monkeypatch.setattr("elspeth_lints.core.reaudit_sidecar.os", _FsyncSpyOs())
 
     root, _target = _build_source_tree(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
