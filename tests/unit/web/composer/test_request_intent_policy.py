@@ -124,6 +124,16 @@ def _registered_recipe_request(*, envelope_insertion: str = "") -> str:
             id="informational-source-with-operation-prefix-noun",
         ),
         pytest.param(
+            "Read customers.csv and explain: write is a pipeline operation.",
+            PipelineMutationIntentDecision.CONVERSATIONAL,
+            id="informational-source-with-objectless-operation-definition",
+        ),
+        pytest.param(
+            "Read customers.csv and summarize the data, then write a summary in this chat.",
+            PipelineMutationIntentDecision.CONVERSATIONAL,
+            id="informational-source-with-chat-writing-request",
+        ),
+        pytest.param(
             "Make this explanation shorter.",
             PipelineMutationIntentDecision.AMBIGUOUS,
             id="non-pipeline-make-command",
@@ -420,6 +430,11 @@ def test_complete_multi_clause_pipeline_request_is_explicit(message: str) -> Non
         "Build a pipeline that reads customers.csv and writes results.jsonl. I no longer want it.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. This is only an example, not a request.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. Instead, explain what it would do.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not make any changes.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Don't change anything.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not process that request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not save anything.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not update it.",
         "Build a pipeline that reads customers.csv and writes results.jsonl?",
         "If needed, build a pipeline that reads customers.csv and writes results.jsonl.",
         "The operator said: build a pipeline that reads customers.csv and writes results.jsonl.",

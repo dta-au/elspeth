@@ -307,15 +307,8 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
     assert invalid_payload["data"]["applied"] is False
     assert invalid_payload["validation"]["errors"][0]["component"] == "rejected_mutation"
     assert "not_installed" in invalid_feedback["content"]
-    with harness.engine.connect() as conn:
-        persisted_tool_content = tuple(
-            conn.execute(
-                select(chat_messages_table.c.content)
-                .where(chat_messages_table.c.session_id == harness.session_id)
-                .where(chat_messages_table.c.role == "tool")
-            ).scalars()
-        )
-    assert all("not_installed" not in content for content in persisted_tool_content)
+    persisted_invalid_feedback = _persisted_tool_content(harness, "call_invalid")
+    assert "not_installed" not in persisted_invalid_feedback
 
     assert len(result.tool_invocations) == 2
     assert result.tool_invocations[0].version_after == state.version

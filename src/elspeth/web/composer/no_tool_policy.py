@@ -137,6 +137,17 @@ _PIPELINE_OPERATION_GRAMMAR: Final = (
     r"(?:aggregate|batch|coerce|collect|expand|fan(?:\s+out)?|hand(?:\s+off)?|"
     r"interleave|merge|pass|process|route|send|transform|wait|write)"
 )
+_PIPELINE_OPERATION_OBJECT_GRAMMAR: Final = (
+    r"(?:"
+    r"(?:(?:a|an|the|this|these|those|each|every|both|all|one|two)\s+)?"
+    r"(?:(?:combined|aggregated|transformed|expanded|input|output|source|typed|numeric)\s+)*"
+    r"(?:rows?|records?|data|streams?|results?|outputs?|sinks?|sources?|inputs?|nodes?|edges?|batches?|fields?|values?|price)|"
+    r"each(?=\s+through\b)|"
+    r"[a-z0-9_./-]+\.(?:csv|jsonl?|parquet)\b|"
+    r"(?:it|them)\s+(?:to|into|through)\s+"
+    r"(?:(?:a|an|the|one)\s+)?(?:(?:csv|jsonl?|parquet)\s+)?(?:output|sink|file|path)"
+    r")"
+)
 _MULTI_CLAUSE_PIPELINE_BUILD_PATTERN: Final = re.compile(
     rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}"
     r"(?:build|create|make)\s+(?:a|an|the|this)\s+"
@@ -150,12 +161,15 @@ _MULTI_CLAUSE_PIPELINE_READ_PATTERN: Final = re.compile(
 )
 _MULTI_CLAUSE_PIPELINE_OPERATION_PATTERN: Final = re.compile(
     rf"(?:[,;:.]|\u2013|\u2014|\b(?:and|then)\b)\s*"
-    rf"(?:(?:and|then)\s+)?{_PIPELINE_OPERATION_GRAMMAR}\b",
+    rf"(?:(?:and|then)\s+)?{_PIPELINE_OPERATION_GRAMMAR}\b\s+"
+    rf"{_PIPELINE_OPERATION_OBJECT_GRAMMAR}",
     re.IGNORECASE,
 )
 _NEGATED_DO_GRAMMAR: Final = r"(?:do\s+not|don(?:'|\u2019)t)"
-_WHOLE_REQUEST_ACTION_GRAMMAR: Final = r"(?:build|create|make|run|execute)"
-_WHOLE_REQUEST_TARGET_GRAMMAR: Final = r"(?:it|this|that|(?:(?:this|that|the|my)\s+)?(?:request|build|pipeline|workflow|automation))"
+_WHOLE_REQUEST_ACTION_GRAMMAR: Final = r"(?:build|change|create|execute|make|process|run|save|update)"
+_WHOLE_REQUEST_TARGET_GRAMMAR: Final = (
+    r"(?:anything|any\s+changes?|it|this|that|(?:(?:this|that|the|my)\s+)?(?:request|build|pipeline|workflow|automation))"
+)
 _WHOLE_REQUEST_ACTION_CLAUSE_GRAMMAR: Final = (
     rf"{_WHOLE_REQUEST_ACTION_GRAMMAR}"
     rf"(?:\s+{_WHOLE_REQUEST_TARGET_GRAMMAR})?"
