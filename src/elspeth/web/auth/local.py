@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 
 import bcrypt
 import jwt
+import structlog
 from jwt.exceptions import PyJWTError
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -30,9 +31,12 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
 from elspeth.web.validation import has_visible_content
 
+_slog = structlog.get_logger(__name__)
+
 _EMAIL_VERIFICATION_TOKEN_BYTES = 32
 _EMAIL_VERIFICATION_TOKEN_TTL_SECONDS = 24 * 60 * 60
 _EMAIL_VERIFICATION_AUDIT_RETRY_SECONDS = 5 * 60
+_TOKEN_AUDIT_INTENT_GRACE_SECONDS = 5 * 60
 _PENDING_REGISTRATION_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _EMAIL_VERIFICATION_DELIVERY_FIELDS = frozenset(
     {
@@ -228,7 +232,9 @@ class LocalAuthProvider:
         self._max_refresh_chain_hours = max_refresh_chain_hours
         self._ensure_schema()
         with self._connect(immediate=True) as conn:
-            self._reap_stale_pending_registrations(conn, now=int(time.time()))
+            now = int(time.time())
+            self._reap_stale_pending_registrations(conn, now=now)
+            self._reclaim_stale_token_audit_intents(conn, now=now)
 
     def _get_conn(self) -> sqlite3.Connection:
         """Open SQLite through a validated, no-follow database descriptor."""
@@ -321,6 +327,20 @@ class LocalAuthProvider:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_email_verification_outbox_pending ON email_verification_outbox (published_at, created_at)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS token_audit_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    issuance_path TEXT NOT NULL,
+                    token_hash TEXT,
+                    claimed_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_token_audit_intents_created_at ON token_audit_intents (created_at)")
 
     def create_user(
         self,
@@ -365,20 +385,27 @@ class LocalAuthProvider:
     ) -> str:
         """Create and durably commit an open-registration user, then audit it.
 
-        The Landscape callback observes issuance only after auth.db commits,
-        so a failed commit can never leave a ``token_issued`` audit record
-        for a user that was never created. A failed audit remains fatal: the
-        just-committed user is compensatingly deleted so no durable account
-        outlives its missing audit record, and the audit error propagates. If
-        that cleanup itself fails, the durable-but-unaudited inconsistency is
-        surfaced as :class:`AuditIntegrityError`. A cancelled async caller may
-        abandon the worker future, but the synchronous critical section itself
-        continues through commit and audit or compensation.
+        The auth.db transaction commits the user together with a durable
+        ``token_issued`` audit intent, then the Landscape callback delivers
+        the record and the intent is cleared. A failed commit therefore
+        cannot leave a ``token_issued`` record for a user that was never
+        created, and a crash between commit and delivery leaves an intent
+        that the reclaim sweep resolves by quarantining the unaudited
+        account. A failed audit remains fatal: the just-committed user is
+        compensatingly deleted and the audit error propagates; if cleanup
+        itself fails, the inconsistency surfaces as
+        :class:`AuditIntegrityError` and the surviving intent keeps the
+        account reclaimable. A cancelled async caller may abandon the worker
+        future, but the synchronous critical section itself continues
+        through commit and audit or compensation.
         """
         if not display_name:
             raise ValueError("display_name must not be empty")
         password_hash = bcrypt.hashpw(bcrypt_password_bytes(password), bcrypt.gensalt()).decode()
+        now = int(time.time())
+        intent_id = secrets.token_urlsafe(18)
         with self._connect(immediate=True) as conn:
+            self._reclaim_stale_token_audit_intents(conn, now=now)
             try:
                 conn.execute(
                     "INSERT INTO users (user_id, password_hash, display_name, email, email_verified) VALUES (?, ?, ?, ?, 1)",
@@ -386,36 +413,62 @@ class LocalAuthProvider:
                 )
             except sqlite3.IntegrityError as exc:
                 raise LocalAuthRegistrationConflict(f"User already exists: {user_id}") from exc
+            conn.execute(
+                """
+                INSERT INTO token_audit_intents
+                    (intent_id, user_id, issuance_path, token_hash, claimed_at, created_at)
+                VALUES (?, ?, 'register', NULL, NULL, ?)
+                """,
+                (intent_id, user_id, now),
+            )
             access_token = self._issue_token(user_id, user_id)
         try:
             record_token_issued(access_token)
         except BaseException as audit_error:
             try:
-                self.delete_user(user_id)
+                self._compensate_open_registration(user_id)
             except BaseException as cleanup_error:
                 raise AuditIntegrityError(
                     f"Open registration for {user_id!r} committed, its required token_issued "
-                    "audit failed, and the compensating cleanup also failed"
+                    f"audit failed ({audit_error!r}), and the compensating cleanup also failed"
                 ) from cleanup_error
             raise audit_error
+        try:
+            with self._connect(immediate=True) as conn:
+                conn.execute("DELETE FROM token_audit_intents WHERE intent_id = ?", (intent_id,))
+        except BaseException as mark_error:
+            try:
+                self._compensate_open_registration(user_id)
+            except BaseException as cleanup_error:
+                raise AuditIntegrityError(
+                    f"Open registration for {user_id!r} was audited but its audit intent could not "
+                    f"be cleared ({mark_error!r}) and the compensating cleanup also failed"
+                ) from cleanup_error
+            raise AuditIntegrityError(
+                f"Open registration for {user_id!r} was audited but its audit intent could not be "
+                "cleared; the account was removed so the reclaim sweep cannot later quarantine an "
+                "audited account"
+            ) from mark_error
         return access_token
+
+    def _compensate_open_registration(self, user_id: str) -> None:
+        """Remove a committed open registration together with its audit intent."""
+        with self._connect(immediate=True) as conn:
+            self._delete_user_rows(conn, user_id)
+
+    @staticmethod
+    def _delete_user_rows(conn: sqlite3.Connection, user_id: str) -> bool:
+        """Delete a user and every dependent row, including audit intents."""
+        conn.execute("DELETE FROM token_audit_intents WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM email_verification_outbox WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM email_verification_tokens WHERE user_id = ?", (user_id,))
+        cursor = conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        return cursor.rowcount > 0
 
     def delete_user(self, user_id: str) -> bool:
         """Delete a local auth user and any pending verification tokens."""
         with self._connect() as conn:
-            conn.execute(
-                "DELETE FROM email_verification_outbox WHERE user_id = ?",
-                (user_id,),
-            )
-            conn.execute(
-                "DELETE FROM email_verification_tokens WHERE user_id = ?",
-                (user_id,),
-            )
-            cursor = conn.execute(
-                "DELETE FROM users WHERE user_id = ?",
-                (user_id,),
-            )
-            return cursor.rowcount > 0
+            return self._delete_user_rows(conn, user_id)
 
     def create_email_verification_token(
         self,
@@ -513,6 +566,101 @@ class LocalAuthProvider:
             conn.execute("DELETE FROM email_verification_tokens WHERE user_id = ?", (stale_user_id,))
             conn.execute("DELETE FROM users WHERE user_id = ? AND email_verified = 0", (stale_user_id,))
 
+    def _reclaim_stale_token_audit_intents(self, conn: sqlite3.Connection, *, now: int) -> None:
+        """Resolve ``token_issued`` audit intents that survived a crash.
+
+        An intent that outlives the delivery grace window means the process
+        died between the durable auth.db commit and the Landscape delivery
+        (or between delivery and the intent clear). The Landscape callback is
+        request-bound and cannot be replayed here, so reconciliation restores
+        the pre-issuance auth state instead: an open registration is
+        quarantined by deleting the never-audited account, and an email
+        verification is returned to its retryable unverified state. Either
+        way, no unaudited auth state survives silently.
+        """
+        cutoff = now - _TOKEN_AUDIT_INTENT_GRACE_SECONDS
+        stale = conn.execute(
+            """
+            SELECT intent_id, user_id, issuance_path, token_hash, claimed_at
+            FROM token_audit_intents
+            WHERE created_at <= ?
+            ORDER BY created_at, intent_id
+            """,
+            (cutoff,),
+        ).fetchall()
+        for intent_id, user_id, issuance_path, token_hash, claimed_at in stale:
+            if issuance_path == "register":
+                self._delete_user_rows(conn, user_id)
+                fully_restored = True
+            else:
+                fully_restored = self._restore_retryable_verification(
+                    conn,
+                    user_id=user_id,
+                    token_hash=token_hash,
+                    claimed_at=claimed_at,
+                    now=now,
+                    intent_id=intent_id,
+                )
+            _slog.warning(
+                "token_issued_audit_intent_reclaimed",
+                user_id=user_id,
+                issuance_path=issuance_path,
+                fully_restored=fully_restored,
+            )
+
+    def _restore_retryable_verification(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+        token_hash: str | None,
+        claimed_at: int | None,
+        now: int,
+        intent_id: str,
+    ) -> bool:
+        """Return a claimed email verification to unverified, retryable state."""
+        retry_deadline = now + _EMAIL_VERIFICATION_AUDIT_RETRY_SECONDS
+        restored_user = conn.execute(
+            "UPDATE users SET email_verified = 0 WHERE user_id = ? AND email_verified = 1",
+            (user_id,),
+        )
+        restored_token = conn.execute(
+            """
+            UPDATE email_verification_tokens
+            SET used_at = NULL, expires_at = MAX(expires_at, ?)
+            WHERE token_hash = ? AND user_id = ? AND used_at = ?
+            """,
+            (retry_deadline, token_hash, user_id, claimed_at),
+        )
+        conn.execute("DELETE FROM token_audit_intents WHERE intent_id = ?", (intent_id,))
+        return restored_user.rowcount == 1 and restored_token.rowcount == 1
+
+    def _restore_retryable_verification_or_raise(
+        self,
+        user_id: str,
+        *,
+        token_hash: str,
+        claimed_at: int,
+        intent_id: str,
+    ) -> None:
+        """Compensate a delivered-or-failed verification audit, loudly on failure."""
+        try:
+            with self._connect(immediate=True) as conn:
+                restored = self._restore_retryable_verification(
+                    conn,
+                    user_id=user_id,
+                    token_hash=token_hash,
+                    claimed_at=claimed_at,
+                    now=int(time.time()),
+                    intent_id=intent_id,
+                )
+                if not restored:
+                    raise AuditIntegrityError("Email verification audit failure could not restore retryable state")
+        except AuditIntegrityError:
+            raise
+        except BaseException as restore_error:
+            raise AuditIntegrityError("Email verification audit failure could not restore retryable state") from restore_error
+
     def register_email_verified_user(
         self,
         user_id: str,
@@ -537,6 +685,7 @@ class LocalAuthProvider:
         now = int(time.time())
         with self._connect(immediate=True) as conn:
             self._reap_stale_pending_registrations(conn, now=now)
+            self._reclaim_stale_token_audit_intents(conn, now=now)
             existing = conn.execute(
                 "SELECT password_hash, display_name, email, email_verified FROM users WHERE user_id = ?",
                 (user_id,),
@@ -618,17 +767,23 @@ class LocalAuthProvider:
     ) -> str:
         """Consume, activate, and commit under one SQLite write fence, then audit.
 
-        Exactly one caller can claim the one-use token. The required Landscape
-        write happens only after auth.db durably commits, so a failed commit
-        can never leave a ``token_issued`` audit record for a token that was
-        never consumed. If the Landscape write then fails, a compensating
-        transaction restores the unverified state and grants a bounded retry
-        window before the original exception propagates; if that restoration
-        fails, the inconsistency surfaces as :class:`AuditIntegrityError`.
+        Exactly one caller can claim the one-use token. The claim commits
+        together with a durable ``token_issued`` audit intent, then the
+        required Landscape write happens and the intent is cleared. A failed
+        commit therefore cannot leave a ``token_issued`` record for a token
+        that was never consumed, and a crash between commit and delivery
+        leaves an intent that the reclaim sweep resolves by restoring the
+        retryable unverified state. If the Landscape write fails in-process,
+        a compensating transaction performs the same restoration and grants a
+        bounded retry window before the original exception propagates; if
+        that restoration fails, the inconsistency surfaces as
+        :class:`AuditIntegrityError`.
         """
         token_hash = _verification_token_hash(token)
         now = int(time.time())
+        intent_id = secrets.token_urlsafe(18)
         with self._connect(immediate=True) as conn:
+            self._reclaim_stale_token_audit_intents(conn, now=now)
             row = conn.execute(
                 """
                 SELECT tokens.user_id, tokens.expires_at, tokens.used_at, users.email_verified
@@ -662,34 +817,41 @@ class LocalAuthProvider:
             if token_result.rowcount != 1 or user_result.rowcount != 1:
                 raise AuditIntegrityError("Email verification claim lost its transaction precondition")
 
+            conn.execute(
+                """
+                INSERT INTO token_audit_intents
+                    (intent_id, user_id, issuance_path, token_hash, claimed_at, created_at)
+                VALUES (?, ?, 'email_verification', ?, ?, ?)
+                """,
+                (intent_id, user_id, token_hash, now, now),
+            )
             identity = UserIdentity(user_id=user_id, username=user_id)
             access_token = self._issue_token(user_id, user_id)
 
         try:
             record_token_issued(identity, access_token)
         except BaseException as audit_error:
-            retry_deadline = int(time.time()) + _EMAIL_VERIFICATION_AUDIT_RETRY_SECONDS
-            try:
-                with self._connect(immediate=True) as conn:
-                    restored_user = conn.execute(
-                        "UPDATE users SET email_verified = 0 WHERE user_id = ? AND email_verified = 1",
-                        (user_id,),
-                    )
-                    restored_token = conn.execute(
-                        """
-                        UPDATE email_verification_tokens
-                        SET used_at = NULL, expires_at = MAX(expires_at, ?)
-                        WHERE token_hash = ? AND user_id = ? AND used_at = ?
-                        """,
-                        (retry_deadline, token_hash, user_id, now),
-                    )
-                    if restored_user.rowcount != 1 or restored_token.rowcount != 1:
-                        raise AuditIntegrityError("Email verification audit failure could not restore retryable state")
-            except AuditIntegrityError:
-                raise
-            except BaseException as restore_error:
-                raise AuditIntegrityError("Email verification audit failure could not restore retryable state") from restore_error
+            self._restore_retryable_verification_or_raise(
+                user_id,
+                token_hash=token_hash,
+                claimed_at=now,
+                intent_id=intent_id,
+            )
             raise audit_error
+        try:
+            with self._connect(immediate=True) as conn:
+                conn.execute("DELETE FROM token_audit_intents WHERE intent_id = ?", (intent_id,))
+        except BaseException as mark_error:
+            self._restore_retryable_verification_or_raise(
+                user_id,
+                token_hash=token_hash,
+                claimed_at=now,
+                intent_id=intent_id,
+            )
+            raise AuditIntegrityError(
+                "Email verification was audited but its audit intent could not be cleared; "
+                "the verification was restored for an audited retry"
+            ) from mark_error
         return access_token
 
     async def login(self, username: str, password: str) -> str:
