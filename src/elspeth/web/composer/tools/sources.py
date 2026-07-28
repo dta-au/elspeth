@@ -94,25 +94,32 @@ class _CsvContentBoundaryError(ValueError):
 
 class _CsvParseIncompleteError(_CsvContentBoundaryError):
     """The csv module could not complete a record from the supplied content
-    (e.g. an unterminated quoted field, or a field beyond its internal
-    field-size limit). Distinct from the structural limit checks (oversized
-    cell/row, NUL byte) in ``_bounded_csv_rows``, which are true regardless of
-    how much more content exists. A caller that knows its ``content`` is
-    itself a bounded prefix of a larger file may treat this specific error as
-    expected truncation rather than corruption.
+    because its input ended (e.g. an unterminated quoted field). Distinct from
+    syntax and structural limit failures in ``_bounded_csv_rows``, which are
+    true regardless of how much more content exists. A caller that knows its
+    ``content`` is itself a bounded prefix of a larger file may treat this
+    specific error as expected truncation rather than corruption.
     """
 
 
 def _bounded_csv_rows(content: str) -> Iterator[list[str]]:
     """Yield CSV rows while containing parser and structural limit failures."""
 
+    input_exhausted = False
+
+    def _content_lines() -> Iterator[str]:
+        nonlocal input_exhausted
+        yield from io.StringIO(content)
+        input_exhausted = True
+
     try:
-        for row in csv.reader(io.StringIO(content), strict=True):
+        for row in csv.reader(_content_lines(), strict=True):
             if len(row) > _CSV_MAX_COLUMNS or any(len(cell) > _CSV_FIELD_MAX_CHARS or "\x00" in cell for cell in row):
                 raise _CsvContentBoundaryError("CSV content exceeds bounded inspection limits")
             yield row
     except csv.Error as exc:
-        raise _CsvParseIncompleteError("CSV content exceeds bounded inspection limits") from exc
+        error_type = _CsvParseIncompleteError if input_exhausted else _CsvContentBoundaryError
+        raise error_type("CSV content exceeds bounded inspection limits") from exc
 
 
 class InspectSourceArgumentsModel(BaseModel):

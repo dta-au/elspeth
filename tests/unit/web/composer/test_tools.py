@@ -9631,6 +9631,69 @@ class TestSetPipeline:
         assert result.success is True, result.data
         assert _default_source(result.updated_state) is not None
 
+    def test_set_pipeline_header_only_inline_csv_escalates_definitive_parse_error_before_window_end(self, tmp_path: Path) -> None:
+        """A larger backing file must not hide syntax errors raised before the
+        bounded reader reaches its prefix boundary.
+        """
+        from datetime import UTC, datetime
+
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        state = _empty_state()
+        catalog = _mock_catalog()
+        engine, session_id = _session_engine_with_session()
+        uploaded_id = str(uuid4())
+        uploaded_content = '"a"x,b\n' + ("z" * (64 * 1024))
+        uploaded_path = tmp_path / "blobs" / session_id / f"{uploaded_id}_malformed.csv"
+        uploaded_path.parent.mkdir(parents=True)
+        uploaded_path.write_text(uploaded_content, encoding="utf-8")
+        now = datetime.now(UTC)
+        with engine.begin() as conn:
+            conn.execute(
+                blobs_table.insert().values(
+                    id=uploaded_id,
+                    session_id=session_id,
+                    filename="malformed.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(uploaded_content.encode("utf-8")),
+                    content_hash=_STUB_SHA256,
+                    storage_path=str(uploaded_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description="uploaded rows with malformed CSV syntax",
+                    status="ready",
+                )
+            )
+
+        inline_content = "name,email\n"
+        args = _valid_pipeline_args()
+        args["source"] = {
+            "plugin": "csv",
+            "on_success": "source_out",
+            "options": {"schema": {"mode": "observed"}},
+            "inline_blob": {
+                "filename": "contacts.csv",
+                "mime_type": "text/csv",
+                "content": inline_content,
+            },
+            "on_validation_failure": "quarantine",
+        }
+        args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "out.csv")
+        args["outputs"][0]["options"]["mode"] = "write"
+        args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
+
+        with pytest.raises(AuditIntegrityError, match="bounded CSV inspection"):
+            execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                **_verbatim_blob_context(engine, session_id, inline_content),
+            )
+
     @pytest.mark.parametrize(
         ("candidate_count", "match_on_read", "expected_reads", "expected_error"),
         [
