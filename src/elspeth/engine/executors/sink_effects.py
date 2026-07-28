@@ -858,10 +858,10 @@ class SinkEffectCoordinator:
         current_members: list[SinkEffectMember] = []
         current_finalization: list[SinkEffectFinalizationMember] = []
         for durable in durable_members:
-            caller = caller_by_token.get(durable.token_id)
-            finalization = finalization_by_token.get(durable.token_id)
-            if caller is None or finalization is None:
+            if durable.token_id not in caller_by_token or durable.token_id not in finalization_by_token:
                 raise LandscapeRecordError(f"open sink effect {effect.effect_id} cannot be recovered from a partial caller partition")
+            caller = caller_by_token[durable.token_id]
+            finalization = finalization_by_token[durable.token_id]
             current_members.append(
                 replace(
                     caller,
@@ -918,8 +918,11 @@ class SinkEffectCoordinator:
                         f"finalized sink effect predecessor {predecessor.effect_id} member ordinal "
                         f"{durable.ordinal} is missing its accepted/diverted disposition"
                     )
-                known = known_members.get(durable.token_id)
-                member = replace(known, member_effect_id=durable.member_effect_id) if known is not None else self._hydrate_member(durable)
+                if durable.token_id in known_members:
+                    known = known_members[durable.token_id]
+                    member = replace(known, member_effect_id=durable.member_effect_id)
+                else:
+                    member = self._hydrate_member(durable)
                 snapshot.append(replace(member, ordinal=len(snapshot)))
         current_start = len(snapshot)
         snapshot.extend(replace(member, ordinal=current_start + ordinal) for ordinal, member in enumerate(current_members))
@@ -1075,21 +1078,21 @@ class SinkEffectCoordinator:
             raise LandscapeRecordError("prepared sink effect has invalid durable plan JSON") from exc
         if type(payload) is not dict:
             raise LandscapeRecordError("prepared sink effect durable plan must be an object")
-        descriptor_payload = payload.get("expected_descriptor")
-        descriptor: ArtifactDescriptor | None
-        if descriptor_payload is None:
-            descriptor = None
-        elif type(descriptor_payload) is dict:
-            descriptor = ArtifactDescriptor(
-                artifact_type=descriptor_payload["artifact_type"],
-                path_or_uri=descriptor_payload["path_or_uri"],
-                content_hash=descriptor_payload["content_hash"],
-                size_bytes=descriptor_payload["size_bytes"],
-                metadata=descriptor_payload.get("metadata"),
-            )
-        else:
-            raise LandscapeRecordError("prepared sink effect durable descriptor is invalid")
         try:
+            descriptor_payload = payload["expected_descriptor"]
+            descriptor: ArtifactDescriptor | None
+            if descriptor_payload is None:
+                descriptor = None
+            elif type(descriptor_payload) is dict:
+                descriptor = ArtifactDescriptor(
+                    artifact_type=descriptor_payload["artifact_type"],
+                    path_or_uri=descriptor_payload["path_or_uri"],
+                    content_hash=descriptor_payload["content_hash"],
+                    size_bytes=descriptor_payload["size_bytes"],
+                    metadata=descriptor_payload["metadata"],
+                )
+            else:
+                raise LandscapeRecordError("prepared sink effect durable descriptor is invalid")
             return SinkEffectPlan(
                 effect_id=payload["effect_id"],
                 protocol_version=payload["protocol_version"],
@@ -1102,6 +1105,8 @@ class SinkEffectCoordinator:
                 expected_descriptor=descriptor,
                 safe_evidence=payload["safe_evidence"],
             )
+        except LandscapeRecordError:
+            raise
         except (KeyError, TypeError, ValueError) as exc:
             raise LandscapeRecordError("prepared sink effect durable plan is incomplete or divergent") from exc
 
@@ -1326,7 +1331,10 @@ class SinkEffectCoordinator:
     ) -> SinkEffectFinalizationResult:
         if plan.expected_descriptor is None:
             raise LandscapeRecordError("no-publication effect requires its precomputed descriptor")
-        publication_kind = plan.safe_evidence.get("publication_kind")
+        try:
+            publication_kind = plan.safe_evidence["publication_kind"]
+        except KeyError as exc:
+            raise LandscapeRecordError("no-publication effect is missing publication evidence") from exc
         if publication_kind == "inherited":
             evidence_kind: Literal["inherited", "virtual"] = "inherited"
         elif publication_kind == "virtual":
@@ -1408,9 +1416,9 @@ class SinkEffectCoordinator:
                 raise LandscapeRecordError("sink effect predecessor disappeared")
             if predecessor.state is not SinkEffectState.FINALIZED:
                 raise SinkEffectPredecessorPending(f"sink effect {effect.effect_id} is waiting for predecessor {predecessor.effect_id}")
-            artifact = artifacts_by_effect.get(predecessor.effect_id)
-            if artifact is None:
+            if predecessor.effect_id not in artifacts_by_effect:
                 raise LandscapeRecordError("finalized sink effect predecessor is missing its artifact")
+            artifact = artifacts_by_effect[predecessor.effect_id]
             if not artifact.publication_performed:
                 # A no-publication (virtual or inherited) predecessor never
                 # touched the remote target, so its artifact is not remote

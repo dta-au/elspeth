@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import ast
+import json
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
 )
+from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution import sink_effect_lifecycle
 from elspeth.core.landscape.execution.sink_effect_attempt_results import encode_sink_effect_returned_result
 from elspeth.core.landscape.execution.sink_effect_finalization import SinkEffectFinalizationMember
@@ -469,6 +471,58 @@ def test_second_preparer_refuses_while_preparation_claim_is_live() -> None:
         # The rival never mutated staging: no inspect, prepare, or commit calls.
         assert (rival_sink.inspect_calls, rival_sink.prepare_calls, rival_sink.commit_calls) == (0, 0, 0)
         assert target.published_rows == [[{"ordinal": 0}]]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("missing_container", "missing_key"),
+    [
+        ("plan", "expected_descriptor"),
+        ("descriptor", "metadata"),
+    ],
+)
+def test_load_plan_rejects_missing_required_durable_fields(
+    missing_container: str,
+    missing_key: str,
+) -> None:
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+
+        def fail_before_effect(seam: SinkEffectExecutionSeam) -> None:
+            if seam is SinkEffectExecutionSeam.BEFORE_EFFECT:
+                raise SinkEffectInjectedFault(seam)
+
+        with pytest.raises(SinkEffectInjectedFault):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="worker-a",
+                fault_hook=fail_before_effect,
+            ).execute(
+                _execution_request(run_id, sink_id, members),
+                _CumulativeObservableSink(_CumulativeTarget()),
+            )
+
+        effects = factory.execution.sink_effects.get_effects_for_run(run_id)
+        assert len(effects) == 1
+        assert effects[0].plan_json is not None
+        payload = json.loads(effects[0].plan_json)
+        assert type(payload) is dict
+        if missing_container == "plan":
+            del payload[missing_key]
+        else:
+            descriptor = payload["expected_descriptor"]
+            assert type(descriptor) is dict
+            del descriptor[missing_key]
+
+        malformed = replace(effects[0], plan_json=json.dumps(payload))
+        with pytest.raises(LandscapeRecordError, match="durable plan is incomplete or divergent") as exc_info:
+            SinkEffectCoordinator._load_plan(malformed)
+
+        assert isinstance(exc_info.value.__cause__, KeyError)
+        assert exc_info.value.__cause__.args == (missing_key,)
     finally:
         db.close()
 
