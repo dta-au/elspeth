@@ -913,6 +913,73 @@ def test_sign_bundle_resume_rejects_unrelated_same_yaml_stale_delete(
     assert _tree_bytes(allowlist_dir) == before
 
 
+def test_sign_bundle_resume_rejects_duplicate_allow_hits_block(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_entry_with_spare(
+        allowlist_dir,
+        "widget.yaml",
+        finding=finding,
+    )
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                BundleAction(
+                    lane="resign",
+                    kind="stale_delete",
+                    key=orphan_key,
+                    source_file="widget.yaml",
+                ),
+            ),
+        ),
+    )
+    real_delete = cli_module._execute_stale_delete_action
+
+    def _delete_then_duplicate_block(
+        action: Any,
+        *,
+        source_file: str,
+        args: Any,
+    ) -> int:
+        assert real_delete(action, source_file=source_file, args=args) == 0
+        target = args.allowlist_dir / source_file
+        current = target.read_text(encoding="utf-8")
+        target.write_text(current + "\n" + current, encoding="utf-8")
+        raise KeyboardInterrupt
+
+    with patch.object(
+        cli_module,
+        "_execute_stale_delete_action",
+        side_effect=_delete_then_duplicate_block,
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
 # =========================================================================== #
 # Task 2.4 -- new-judgment lane (real judge + sign) + BLOCK + override
 # =========================================================================== #
@@ -1244,6 +1311,137 @@ def test_sign_bundle_rejects_unrelated_candidate_mutation(tmp_path: Path) -> Non
 
     assert rc == 2
     assert _tree_bytes(allowlist_dir) == before
+
+
+def test_sign_bundle_rejects_judge_decision_event_rewrite(tmp_path: Path) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _execute_then_rewrite_events(action: Any, *, args: Any) -> int:
+        code = real_execute(action, args=args)
+        event_path = args.allowlist_dir / ".judge-metrics" / "judge-decision-events.jsonl"
+        event_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source_file": "unrelated.py",
+                    "entry_key": "unrelated.py:R1:X:y:fp=deadbeefdeadbeef",
+                    "rule_id": "R1",
+                    "effective_verdict": "ACCEPTED",
+                    "model_verdict": "ACCEPTED",
+                    "judge_recorded_at": "2026-01-01T00:00:00+00:00",
+                    "write_disposition": "written",
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return code
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(
+            cli_module,
+            "_execute_new_judgment_action",
+            side_effect=_execute_then_rewrite_events,
+        ),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
+def test_sign_bundle_rejects_unrelated_staged_rotation_record(tmp_path: Path) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    before = _tree_bytes(allowlist_dir)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                BundleAction(
+                    lane="resign",
+                    kind="rotation",
+                    key=stale_key,
+                    source_file="gadget.yaml",
+                ),
+            ),
+        ),
+    )
+    real_rotation = cli_module._execute_rotation_action
+
+    def _rotate_then_append_unrelated(
+        action: Any,
+        *,
+        rotation_plan: Any,
+        args: Any,
+    ) -> int:
+        code = real_rotation(action, rotation_plan=rotation_plan, args=args)
+        unrelated = {
+            "schema_version": 1,
+            "kind": "tier_model_rotation",
+            "recorded_at": "2026-01-01T00:00:00+00:00",
+            "allowlist_dir": str(args.allowlist_dir),
+            "rotations": [
+                {
+                    "source_file": "other.yaml",
+                    "old_key": "other.py:R1:X:y:fp=deadbeefdeadbeef",
+                    "new_key": "other.py:R1:X:y:fp=feedfacefeedface",
+                }
+            ],
+            "stale_entries_removed": [],
+            "applied": {
+                "other.yaml": {
+                    "rotations_applied": 1,
+                    "stale_entries_removed": 0,
+                }
+            },
+        }
+        args.rotation_log.write_text(
+            args.rotation_log.read_text(encoding="utf-8") + json.dumps(unrelated, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return code
+
+    with patch.object(
+        cli_module,
+        "_execute_rotation_action",
+        side_effect=_rotate_then_append_unrelated,
+    ):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--rotation-log", str(rotation_log)),
+            )
+        )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert not rotation_log.exists()
 
 
 @pytest.mark.parametrize(

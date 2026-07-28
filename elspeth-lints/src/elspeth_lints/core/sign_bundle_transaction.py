@@ -242,6 +242,10 @@ def checkpoint_action_file(tx_path: Path, manifest: dict[str, Any], relative_pat
     rotation_staged = tx_path / "rotation-staged.log"
     if rotation_staged.is_file():
         shutil.copy2(rotation_staged, checkpoint / "rotation-staged.log")
+    judge_events = Path(manifest["candidate_dir"]) / ".judge-metrics" / "judge-decision-events.jsonl"
+    metadata["judge_events_existed"] = judge_events.is_file()
+    if judge_events.is_file():
+        shutil.copy2(judge_events, checkpoint / "judge-decision-events.jsonl")
     (checkpoint / "metadata.json").write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -624,6 +628,20 @@ def _assert_action_scoped_candidate_changes(
     unexpected = sorted(changed - allowed)
     if unexpected:
         raise SignBundleTransactionError(f"{action.kind} {action.key!r} changed unrelated candidate path(s): {', '.join(unexpected)}")
+    _assert_judge_event_transition(
+        action,
+        tx_path=tx_path,
+        candidate_dir=Path(manifest["candidate_dir"]),
+        expected_key=expected_key,
+        success=verify_semantics,
+    )
+    _assert_rotation_staged_transition(
+        action,
+        tx_path=tx_path,
+        source_file=source_file,
+        expected_key=expected_key,
+        success=verify_semantics,
+    )
     if target is not None and verify_semantics is not None:
         _assert_target_yaml_transition(
             action,
@@ -633,6 +651,154 @@ def _assert_action_scoped_candidate_changes(
             expected_key=expected_key,
             success=verify_semantics,
         )
+
+
+def _assert_judge_event_transition(
+    action: Any,
+    *,
+    tx_path: Path,
+    candidate_dir: Path,
+    expected_key: str,
+    success: bool | None,
+) -> None:
+    checkpoint = tx_path / "checkpoint"
+    metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    saved = checkpoint / "judge-decision-events.jsonl"
+    if metadata.get("judge_events_existed") is True and not saved.is_file():
+        raise SignBundleTransactionError("judge-event checkpoint is missing its before-image")
+    before = saved.read_bytes() if metadata.get("judge_events_existed") is True else b""
+    event_path = candidate_dir / ".judge-metrics" / "judge-decision-events.jsonl"
+    after = event_path.read_bytes() if event_path.is_file() else b""
+    if action.kind not in {"justify", "drift_repair"}:
+        if after != before:
+            raise SignBundleTransactionError(f"{action.kind} {action.key!r} changed the judge decision-event log")
+        return
+    if not after.startswith(before):
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} rewrote prior judge decision events")
+    delta = after[len(before) :]
+    if not delta:
+        return
+    if before and not before.endswith(b"\n"):
+        raise SignBundleTransactionError("judge decision-event before-image lacks a JSONL boundary")
+    if not delta.endswith(b"\n"):
+        raise SignBundleTransactionError("judge decision-event delta lacks a JSONL boundary")
+    try:
+        lines = delta.decode("utf-8").splitlines()
+        records = [json.loads(line) for line in lines]
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SignBundleTransactionError("judge decision-event delta is not valid JSONL") from exc
+    if len(records) != 1 or not isinstance(records[0], dict):
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} must append at most one decision event")
+    record = cast("dict[str, Any]", records[0])
+    required_fields = {
+        "schema_version",
+        "source_file",
+        "entry_key",
+        "rule_id",
+        "effective_verdict",
+        "model_verdict",
+        "recorded_at",
+        "write_disposition",
+    }
+    key_parts = expected_key.split(":")
+    expected_dispositions = (
+        {"written"} if success is True else {"blocked_without_override"} if success is False else {"written", "blocked_without_override"}
+    )
+    expected_effective_verdicts = (
+        {"ACCEPTED", "OVERRIDDEN_BY_OPERATOR"}
+        if success is True
+        else {"BLOCKED"}
+        if success is False
+        else {"ACCEPTED", "BLOCKED", "OVERRIDDEN_BY_OPERATOR"}
+    )
+    if (
+        set(record) != required_fields
+        or record.get("schema_version") != 1
+        or record.get("entry_key") != expected_key
+        or len(key_parts) < 2
+        or record.get("source_file") != key_parts[0]
+        or record.get("rule_id") != key_parts[1]
+        or record.get("write_disposition") not in expected_dispositions
+        or record.get("effective_verdict") not in expected_effective_verdicts
+        or record.get("model_verdict") not in {"ACCEPTED", "BLOCKED"}
+        or not isinstance(record.get("recorded_at"), str)
+    ):
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} appended an unrelated decision event")
+
+
+def _assert_rotation_staged_transition(
+    action: Any,
+    *,
+    tx_path: Path,
+    source_file: str | None,
+    expected_key: str,
+    success: bool | None,
+) -> None:
+    checkpoint = tx_path / "checkpoint" / "rotation-staged.log"
+    if not checkpoint.is_file():
+        raise SignBundleTransactionError("rotation-staged checkpoint is missing")
+    before = checkpoint.read_bytes()
+    after = (tx_path / "rotation-staged.log").read_bytes()
+    if action.kind != "rotation":
+        if after != before:
+            raise SignBundleTransactionError(f"{action.kind} {action.key!r} changed the staged rotation audit")
+        return
+    if success is False:
+        if after != before:
+            raise SignBundleTransactionError(f"failed rotation {action.key!r} changed the staged rotation audit")
+        return
+    if not after.startswith(before):
+        raise SignBundleTransactionError(f"rotation {action.key!r} rewrote prior staged rotation audit records")
+    if success is None:
+        return
+    delta = after[len(before) :]
+    if before and not before.endswith(b"\n"):
+        raise SignBundleTransactionError("rotation audit before-image lacks a JSONL boundary")
+    if not delta.endswith(b"\n"):
+        raise SignBundleTransactionError("staged rotation audit delta lacks a JSONL boundary")
+    try:
+        lines = delta.decode("utf-8").splitlines()
+        records = [json.loads(line) for line in lines]
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SignBundleTransactionError("staged rotation audit delta is not valid JSONL") from exc
+    if len(records) != 1 or not isinstance(records[0], dict) or source_file is None:
+        raise SignBundleTransactionError(f"rotation {action.key!r} must append exactly one staged audit record")
+    record = cast("dict[str, Any]", records[0])
+    expected_rotation = {
+        "source_file": source_file,
+        "old_key": action.key,
+        "new_key": expected_key,
+    }
+    expected_applied = {
+        source_file: {
+            "rotations_applied": 1,
+            "stale_entries_removed": 0,
+        }
+    }
+    required_fields = {
+        "schema_version",
+        "kind",
+        "recorded_at",
+        "allowlist_dir",
+        "rotations",
+        "stale_entries_removed",
+        "applied",
+    }
+    recorded_allowlist = record.get("allowlist_dir")
+    recorded_allowlist_is_candidate = (
+        isinstance(recorded_allowlist, str) and Path(recorded_allowlist).resolve().parent.parent == tx_path.resolve()
+    )
+    if (
+        set(record) != required_fields
+        or record.get("schema_version") != 1
+        or record.get("kind") != "tier_model_rotation"
+        or not isinstance(record.get("recorded_at"), str)
+        or not recorded_allowlist_is_candidate
+        or record.get("rotations") != [expected_rotation]
+        or record.get("stale_entries_removed") != []
+        or record.get("applied") != expected_applied
+    ):
+        raise SignBundleTransactionError(f"rotation {action.key!r} appended an unrelated staged audit record")
 
 
 def _assert_target_yaml_transition(
@@ -659,8 +825,17 @@ def _assert_target_yaml_transition(
 
     def load_mapping(payload: bytes, *, label: str) -> dict[str, Any]:
         try:
-            raw = yaml.safe_load(payload.decode("utf-8")) if payload else {}
-        except (UnicodeDecodeError, yaml.YAMLError) as exc:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SignBundleTransactionError(f"{action.kind} {action.key!r} left invalid {label} YAML") from exc
+        headers = [line_number for line_number, line in enumerate(text.splitlines(), start=1) if line in {"allow_hits:", "allow_hits: []"}]
+        if len(headers) > 1:
+            raise SignBundleTransactionError(
+                f"{action.kind} {action.key!r} {label} YAML has duplicate allow_hits blocks at lines {headers}"
+            )
+        try:
+            raw = yaml.safe_load(text) if text else {}
+        except yaml.YAMLError as exc:
             raise SignBundleTransactionError(f"{action.kind} {action.key!r} left invalid {label} YAML") from exc
         if raw is None:
             return {}
