@@ -326,11 +326,11 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
       ONLY (the filtered scan cannot raise on the mostly-judge-gated corpus;
       ``.new_findings``/``.ambiguous`` on a *filtered* plan are pollution and are
       never read);
-    * ``new_judgment`` -- live findings whose identity-prefix is owned by NO
-      entry in the **full, unfiltered** allowlist (the double-route guard: an
-      fp-shifted judge-gated entry's live finding shares its prefix with the
-      drifted entry, so it routes to ``drift_repair`` alone, never also to a
-      spurious ``new_judgment``).
+    * ``new_judgment`` -- live findings covered by neither a per-file rule nor
+      an identity-prefix in the **full, unfiltered** allowlist (the double-route
+      guard: an fp-shifted judge-gated entry's live finding shares its prefix
+      with the drifted entry, so it routes to ``drift_repair`` alone, never also
+      to a spurious ``new_judgment``).
     """
     from elspeth_lints.core.bundle_verify import _STALE_DELETE_ORPHAN_STATUSES
     from elspeth_lints.core.judge_signature_diagnosis import (
@@ -338,7 +338,11 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
         diagnose_judge_signatures,
     )
     from elspeth_lints.core.review_bundle import BundleAction
-    from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix, scan_for_rotations
+    from elspeth_lints.rules.trust_tier.tier_model.rotate import (
+        _finding_covered_by_per_file_rule,
+        identity_prefix,
+        scan_for_rotations,
+    )
     from elspeth_lints.rules.trust_tier.tier_model.rule import _ALWAYS_EXCLUDED_DIRS, _load_tier_model_allowlist
 
     actions: list[Any] = []
@@ -379,6 +383,8 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
             continue  # a malformed (non-canonical) key cannot own a prefix
     seen_new: set[str] = set()
     for finding in _live_findings_for_tree(ctx.root, _ALWAYS_EXCLUDED_DIRS):
+        if _finding_covered_by_per_file_rule(finding, allowlist.per_file_rules):
+            continue
         canonical_key = _finding_canonical_key(finding)
         try:
             prefix = identity_prefix(canonical_key)

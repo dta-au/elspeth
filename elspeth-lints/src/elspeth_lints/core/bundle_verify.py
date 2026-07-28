@@ -14,8 +14,8 @@ entries:
   diagnosis row (must be present and in ``_SIGNABLE_DIAGNOSIS_STATUSES``);
 * ``justify`` (new_judgment) -- the key has no entry yet, so scan the action's
   file via the shared single-file scan helper and confirm the live finding
-  still exists at the staged fingerprint (coverage delta is ignored -- a
-  now-covered finding is a benign redundant re-judge, not a failure);
+  still exists at the staged fingerprint and remains uncovered by both exact
+  allow-hit prefixes and production ``per_file_rules``;
 * ``stale_delete`` -- confirm the tree still reports the key as a non-signable
   orphan; a reappeared live finding is a mismatch (never delete a live entry);
 * ``rotation`` -- re-derive via ``scan_for_rotations(exclude_judge_gated=True)``
@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from elspeth_lints.core.allowlist import PerFileRule
 from elspeth_lints.core.judge_signature_diagnosis import (
     _SIGNABLE_DIAGNOSIS_STATUSES,
     JudgeSignatureDiagnosisReport,
@@ -45,7 +46,13 @@ from elspeth_lints.core.judge_signature_diagnosis import (
 )
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle
 from elspeth_lints.core.tier_model_scan import scan_single_file_findings
-from elspeth_lints.rules.trust_tier.tier_model.rotate import RotationPlan, scan_for_rotations
+from elspeth_lints.rules.trust_tier.tier_model.rotate import (
+    RotationPlan,
+    _finding_covered_by_per_file_rule,
+    identity_prefix,
+    scan_for_rotations,
+)
+from elspeth_lints.rules.trust_tier.tier_model.rule import _load_tier_model_allowlist
 
 # A ``stale_delete`` target is safe to remove only while the tree still reports
 # it as one of these non-signable orphan statuses (neither is in
@@ -84,6 +91,8 @@ def verify_bundle_against_tree(
 
     diagnosis = diagnose_judge_signatures(root=root, allowlist_dir=allowlist_dir)
     index: dict[str, Any] = {item.key: item for item in diagnosis.items}
+    allowlist = _load_tier_model_allowlist(allowlist_dir)
+    covered_prefixes = frozenset(identity_prefix(entry.key) for entry in allowlist.entries)
 
     # Compute the filtered rotation plan exactly once, iff there is a rotation
     # action. Pass the directory as ``allowlist_path`` (load_allowlist accepts a
@@ -99,9 +108,9 @@ def verify_bundle_against_tree(
 
     mismatches: list[str] = []
     # One source file can account for hundreds of new judgments.  Re-scan it
-    # once and share the immutable key set across those actions; otherwise
+    # once and share the key-to-finding map across those actions; otherwise
     # verification cost grows with findings-per-file rather than files.
-    new_judgment_keys_by_file: dict[str, frozenset[str] | None] = {}
+    new_judgment_findings_by_file: dict[str, dict[str, Any] | None] = {}
     for action in bundle.actions:
         if action.kind == "drift_repair":
             mismatches.extend(_verify_drift_repair(action, index))
@@ -110,7 +119,9 @@ def verify_bundle_against_tree(
                 _verify_new_judgment(
                     action,
                     root=root,
-                    live_keys_by_file=new_judgment_keys_by_file,
+                    live_findings_by_file=new_judgment_findings_by_file,
+                    covered_prefixes=covered_prefixes,
+                    per_file_rules=allowlist.per_file_rules,
                 )
             )
         elif action.kind == "stale_delete":
@@ -142,26 +153,31 @@ def _verify_new_judgment(
     action: BundleAction,
     *,
     root: Path,
-    live_keys_by_file: dict[str, frozenset[str] | None],
+    live_findings_by_file: dict[str, dict[str, Any] | None],
+    covered_prefixes: frozenset[str],
+    per_file_rules: list[PerFileRule],
 ) -> list[str]:
     if not action.file_path:  # pragma: no cover - enforced by BundleAction.__post_init__
         return [f"new_judgment {action.key!r}: missing file_path"]
-    if action.file_path not in live_keys_by_file:
+    if action.file_path not in live_findings_by_file:
         target_file = (root / action.file_path).resolve()
         try:
             findings = scan_single_file_findings(target_file=target_file, root=root)
         except (OSError, ValueError):
-            live_keys_by_file[action.file_path] = None
+            live_findings_by_file[action.file_path] = None
         else:
-            live_keys_by_file[action.file_path] = frozenset(_finding_canonical_key(finding) for finding in findings)
-    live_keys = live_keys_by_file[action.file_path]
-    if live_keys is None:
+            live_findings_by_file[action.file_path] = {_finding_canonical_key(finding): finding for finding in findings}
+    live_findings = live_findings_by_file[action.file_path]
+    if live_findings is None:
         return [f"new_judgment {action.key!r}: source {action.file_path} could not be scanned"]
-    if action.key not in live_keys:
+    finding = live_findings.get(action.key)
+    if finding is None:
         return [
             f"new_judgment {action.key!r}: no live finding at the staged fingerprint in "
             f"{action.file_path} (vanished or fingerprint-shifted)"
         ]
+    if identity_prefix(action.key) in covered_prefixes or _finding_covered_by_per_file_rule(finding, per_file_rules):
+        return [f"new_judgment {action.key!r}: finding is already covered by the current allowlist; re-run stage_scan"]
     return []
 
 
