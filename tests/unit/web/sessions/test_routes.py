@@ -6096,10 +6096,14 @@ class TestRevertEndpoint:
         # Create session and two state versions via the service
         session = await service.create_session("alice", "Pipeline", "local")
         v1 = await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "csv"}, is_valid=True), provenance="session_seed"
+            session.id,
+            CompositionStateData(source={"plugin": "csv"}, is_valid=True),
+            provenance="session_seed",
         )
         await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "api"}, is_valid=True), provenance="session_seed"
+            session.id,
+            CompositionStateData(source={"plugin": "json"}, is_valid=True),
+            provenance="session_seed",
         )
 
         # Revert to v1
@@ -6112,7 +6116,7 @@ class TestRevertEndpoint:
         body = resp.json()
         assert body["version"] == 3
         # Should match v1's source, not v2's
-        assert body["sources"] == {"source": {"type": "csv"}}
+        assert body["sources"] == {"source": {"plugin": "csv"}}
         # Lineage: new version derives from v1
         assert body["derived_from_state_id"] == str(v1.id)
 
@@ -8515,7 +8519,9 @@ class TestNewStateHasNoLineage:
 
         session = await service.create_session("alice", "Pipeline", "local")
         await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "csv"}, is_valid=True), provenance="session_seed"
+            session.id,
+            CompositionStateData(source={"plugin": "csv"}, is_valid=True),
+            provenance="session_seed",
         )
 
         resp = client.get(f"/api/sessions/{session.id}/state")
