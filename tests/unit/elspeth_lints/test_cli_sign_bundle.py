@@ -845,6 +845,74 @@ def test_sign_bundle_stale_delete_removes_entry(tmp_path: Path) -> None:
     assert sibling_before in gadget_before
 
 
+def test_sign_bundle_resume_rejects_unrelated_same_yaml_stale_delete(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_entry_with_spare(
+        allowlist_dir,
+        "widget.yaml",
+        finding=finding,
+    )
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                BundleAction(
+                    lane="resign",
+                    kind="stale_delete",
+                    key=orphan_key,
+                    source_file="widget.yaml",
+                ),
+            ),
+        ),
+    )
+    real_delete = cli_module._execute_stale_delete_action
+
+    def _delete_target_and_sibling(
+        action: Any,
+        *,
+        source_file: str,
+        args: Any,
+    ) -> int:
+        assert real_delete(action, source_file=source_file, args=args) == 0
+        cli_module._pop_allow_hits_entry(
+            args.allowlist_dir / source_file,
+            _SPARE_PRE_JUDGE_KEY,
+        )
+        raise KeyboardInterrupt
+
+    with patch.object(
+        cli_module,
+        "_execute_stale_delete_action",
+        side_effect=_delete_target_and_sibling,
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
 # =========================================================================== #
 # Task 2.4 -- new-judgment lane (real judge + sign) + BLOCK + override
 # =========================================================================== #

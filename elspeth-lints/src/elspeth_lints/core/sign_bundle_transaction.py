@@ -404,17 +404,37 @@ def run_sign_bundle_transaction(
         )
         _assert_action_scoped_candidate_changes(
             running_action,
+            tx_path=tx_path,
             manifest=manifest,
             source_file=running_source_file,
+            expected_key=_expected_action_key(
+                running_action,
+                verification=verification,
+                repair_keys_by_stale_key=repair_keys_by_stale_key,
+            ),
+            verify_semantics=None,
         )
-        if _action_is_complete(
+        running_complete = _action_is_complete(
             running_action,
             verification=verification,
             repair_keys_by_stale_key=repair_keys_by_stale_key,
             args=candidate_args,
             tx_path=tx_path,
             authoritative=True,
-        ):
+        )
+        if running_complete:
+            _assert_action_scoped_candidate_changes(
+                running_action,
+                tx_path=tx_path,
+                manifest=manifest,
+                source_file=running_source_file,
+                expected_key=_expected_action_key(
+                    running_action,
+                    verification=verification,
+                    repair_keys_by_stale_key=repair_keys_by_stale_key,
+                ),
+                verify_semantics=True,
+            )
             completed.add(running_index)
         else:
             restore_action_checkpoint(tx_path, manifest)
@@ -459,8 +479,15 @@ def run_sign_bundle_transaction(
             raise
         _assert_action_scoped_candidate_changes(
             action,
+            tx_path=tx_path,
             manifest=manifest,
             source_file=source_file,
+            expected_key=_expected_action_key(
+                action,
+                verification=verification,
+                repair_keys_by_stale_key=repair_keys_by_stale_key,
+            ),
+            verify_semantics=code == 0,
         )
         if code != 0:
             manifest["running_action"] = None
@@ -542,27 +569,47 @@ def _action_source_file(
         if len(matching) != 1:
             raise SignBundleTransactionError(f"rotation {action.key!r} has {len(matching)} verified owning files")
         return _local_allowlist_filename(cast("str", matching[0].entry_source_file))
+    if action.kind == "justify":
+        file_path = cast("str", action.file_path)
+        if "/" in file_path:
+            return _local_allowlist_filename(f"{file_path.split('/', 1)[0]}.yaml")
+        stem = file_path.removesuffix(".py")
+        return _local_allowlist_filename("cli.yaml" if stem.startswith("cli") else f"{stem}.yaml")
     return None
+
+
+def _expected_action_key(
+    action: Any,
+    *,
+    verification: Any,
+    repair_keys_by_stale_key: dict[str, str],
+) -> str:
+    if action.kind == "drift_repair":
+        return repair_keys_by_stale_key.get(cast("str", action.key), cast("str", action.key))
+    if action.kind == "rotation":
+        if verification.rotation_plan is None:
+            raise SignBundleTransactionError("rotation action has no verified rotation plan")
+        matching = [rotation for rotation in verification.rotation_plan.rotations if rotation.old_key == action.key]
+        if len(matching) != 1:
+            raise SignBundleTransactionError(f"rotation {action.key!r} has {len(matching)} verified target keys")
+        return cast("str", matching[0].new_key)
+    return cast("str", action.key)
 
 
 def _assert_action_scoped_candidate_changes(
     action: Any,
     *,
+    tx_path: Path,
     manifest: dict[str, Any],
     source_file: str | None,
+    expected_key: str,
+    verify_semantics: bool | None,
 ) -> None:
-    """Reject candidate mutations outside the one verified action surface."""
+    """Reject mutations outside the exact verified action transition."""
     before = cast("dict[str, str]", manifest["candidate_snapshot"])
     after = tree_snapshot(Path(manifest["candidate_dir"]))
     changed = {path for path in before.keys() | after.keys() if before.get(path) != after.get(path)}
     target = source_file
-    if action.kind == "justify":
-        file_path = cast("str", action.file_path)
-        if "/" in file_path:
-            target = f"{file_path.split('/', 1)[0]}.yaml"
-        else:
-            stem = file_path.removesuffix(".py")
-            target = "cli.yaml" if stem.startswith("cli") else f"{stem}.yaml"
     allowed: set[str] = set()
     if target is not None:
         target = _local_allowlist_filename(target)
@@ -577,6 +624,106 @@ def _assert_action_scoped_candidate_changes(
     unexpected = sorted(changed - allowed)
     if unexpected:
         raise SignBundleTransactionError(f"{action.kind} {action.key!r} changed unrelated candidate path(s): {', '.join(unexpected)}")
+    if target is not None and verify_semantics is not None:
+        _assert_target_yaml_transition(
+            action,
+            tx_path=tx_path,
+            candidate_dir=Path(manifest["candidate_dir"]),
+            source_file=target,
+            expected_key=expected_key,
+            success=verify_semantics,
+        )
+
+
+def _assert_target_yaml_transition(
+    action: Any,
+    *,
+    tx_path: Path,
+    candidate_dir: Path,
+    source_file: str,
+    expected_key: str,
+    success: bool,
+) -> None:
+    """Compare action-owned YAML semantically while preserving every sibling."""
+    import yaml
+
+    checkpoint = tx_path / "checkpoint"
+    metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    if metadata.get("relative_path") != source_file:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} checkpoint target does not match verified owner {source_file!r}")
+    if metadata.get("existed") is True and not (checkpoint / "allowlist-file").is_file():
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} checkpoint is missing its owning YAML before-image")
+    before_bytes = (checkpoint / "allowlist-file").read_bytes() if metadata.get("existed") is True else b""
+    target = candidate_dir / _local_allowlist_filename(source_file)
+    after_bytes = target.read_bytes() if target.is_file() else b""
+
+    def load_mapping(payload: bytes, *, label: str) -> dict[str, Any]:
+        try:
+            raw = yaml.safe_load(payload.decode("utf-8")) if payload else {}
+        except (UnicodeDecodeError, yaml.YAMLError) as exc:
+            raise SignBundleTransactionError(f"{action.kind} {action.key!r} left invalid {label} YAML") from exc
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise SignBundleTransactionError(f"{action.kind} {action.key!r} {label} YAML must be a mapping")
+        return cast("dict[str, Any]", raw)
+
+    before_mapping = load_mapping(before_bytes, label="checkpoint")
+    after_mapping = load_mapping(after_bytes, label="candidate")
+    before_other = {key: value for key, value in before_mapping.items() if key != "allow_hits"}
+    after_other = {key: value for key, value in after_mapping.items() if key != "allow_hits"}
+    if before_other != after_other:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} changed unrelated YAML sections in {source_file}")
+    before_entries = before_mapping.get("allow_hits", [])
+    after_entries = after_mapping.get("allow_hits", [])
+    if before_entries is None:
+        before_entries = []
+    if after_entries is None:
+        after_entries = []
+    if not isinstance(before_entries, list) or not isinstance(after_entries, list):
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} requires list-valued allow_hits in {source_file}")
+    if not success:
+        if before_entries != after_entries:
+            raise SignBundleTransactionError(f"{action.kind} {action.key!r} failed after changing allow_hits in {source_file}")
+        return
+
+    if action.kind == "justify":
+        matches = [index for index, entry in enumerate(after_entries) if isinstance(entry, dict) and entry.get("key") == expected_key]
+        if len(matches) != 1:
+            raise SignBundleTransactionError(f"justify {action.key!r} did not add exactly one expected entry")
+        index = matches[0]
+        if after_entries[:index] + after_entries[index + 1 :] != before_entries:
+            raise SignBundleTransactionError(f"justify {action.key!r} changed unrelated allow_hits entries")
+        return
+
+    before_matches = [index for index, entry in enumerate(before_entries) if isinstance(entry, dict) and entry.get("key") == action.key]
+    if len(before_matches) != 1:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} checkpoint lacks one unique source entry")
+    index = before_matches[0]
+    if action.kind == "stale_delete":
+        if after_entries != before_entries[:index] + before_entries[index + 1 :]:
+            raise SignBundleTransactionError(f"stale_delete {action.key!r} changed unrelated allow_hits entries")
+        return
+
+    after_matches = [
+        candidate_index
+        for candidate_index, entry in enumerate(after_entries)
+        if isinstance(entry, dict) and entry.get("key") == expected_key
+    ]
+    if len(after_matches) != 1:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} did not produce one expected replacement entry")
+    after_index = after_matches[0]
+    if index != after_index:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} moved its replacement entry")
+    if before_entries[:index] != after_entries[:index] or before_entries[index + 1 :] != after_entries[index + 1 :]:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} changed unrelated allow_hits entries")
+    if action.kind == "rotation":
+        before_entry = cast("dict[str, Any]", before_entries[index])
+        after_entry = cast("dict[str, Any]", after_entries[index])
+        expected_entry = dict(before_entry)
+        expected_entry["key"] = expected_key
+        if after_entry != expected_entry:
+            raise SignBundleTransactionError(f"rotation {action.key!r} changed fields beyond the verified key transition")
 
 
 def _allow_hits_keys(allowlist_dir: Path, source_file: str | None = None) -> list[str]:
