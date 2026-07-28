@@ -145,7 +145,7 @@ class CSVSink(BaseSink):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:146615184e08fe4e"
+    source_file_hash: str | None = "sha256:22018817f8d787f2"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -419,7 +419,10 @@ class CSVSink(BaseSink):
                 yield encoder.encode(header_text())
             locked_fields = set(data_fields)
             for snapshot_member, row in zip(emitted_members, rows, strict=True):
-                current_member = current_by_effect_id.get(snapshot_member.member_effect_id)
+                if snapshot_member.member_effect_id in current_by_effect_id:
+                    current_member = current_by_effect_id[snapshot_member.member_effect_id]
+                else:
+                    current_member = None
                 extra_fields = set(row) - locked_fields
                 if extra_fields:
                     reason = "CSV row contains fields outside the established columns: " + ", ".join(

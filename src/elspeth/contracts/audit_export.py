@@ -430,7 +430,7 @@ def _validate_chunk_seal(payload: object) -> None:
     if type(predecessor) is not dict:
         raise TypeError("predecessor must be an exact object")
     assert isinstance(predecessor, dict)
-    if predecessor.get("kind") == "genesis":
+    if "kind" in predecessor and predecessor["kind"] == "genesis":
         _object(predecessor, fields=frozenset({"kind"}), path="predecessor")
     else:
         pred = _object(predecessor, fields=frozenset({"hash", "kind"}), path="predecessor")
@@ -813,8 +813,7 @@ class AuditExportContentStoreResolver:
         validate_content_namespace(store.namespace)
         if not store.is_durable():
             raise ValueError("audit-export content store must prove durability")
-        current = self._stores.get(store_id)
-        if current is not None and current is not store:
+        if store_id in self._stores and self._stores[store_id] is not store:
             raise ValueError(f"content_store_id {store_id!r} is already registered to a different store")
         self._stores[store_id] = store
 
@@ -1010,7 +1009,7 @@ def _detached_record(record: Mapping[str, object]) -> dict[str, ClosedAuditExpor
         raise TypeError("audit export records must be exact string-keyed dictionaries")
     if "signature" in record:
         raise ValueError("audit export input records must not predeclare the reserved signature field")
-    if record.get("record_type") == "manifest":
+    if "record_type" in record and record["record_type"] == "manifest":
         raise ValueError("audit export input records must not contain a manifest")
     # Round-tripping through the committed canonical encoder proves the value
     # tree is detached JSON data and rejects datetimes/bytes/custom authority.

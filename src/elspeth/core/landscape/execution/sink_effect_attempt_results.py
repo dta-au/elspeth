@@ -94,7 +94,7 @@ def decode_sink_effect_returned_result(
         payload = json.loads(evidence_json)
     except (TypeError, json.JSONDecodeError) as exc:
         raise LandscapeRecordError("sink effect returned attempt has invalid result JSON") from exc
-    if type(payload) is not dict or type(payload.get("evidence")) is not dict:
+    if type(payload) is not dict or "evidence" not in payload or type(payload["evidence"]) is not dict:
         raise LandscapeRecordError("sink effect returned attempt must contain exact evidence")
     evidence = payload["evidence"]
     try:
@@ -128,12 +128,18 @@ def decode_sink_effect_returned_result(
             or (set(payload) == v2_fields and payload["schema"] == "sink-effect-reconcile-result-v2")
         ):
             raise LandscapeRecordError("sink effect reconcile result envelope is divergent")
+        if set(payload) == v2_fields:
+            accepted_ordinals = payload["accepted_ordinals"]
+            diverted_ordinals = payload["diverted_ordinals"]
+        else:
+            accepted_ordinals = None
+            diverted_ordinals = None
         return SinkEffectReconcileResult(
             kind=SinkEffectReconcileKind(payload["kind"]),
             descriptor=_load_descriptor(payload["descriptor"]),
             evidence=evidence,
-            accepted_ordinals=payload.get("accepted_ordinals"),
-            diverted_ordinals=payload.get("diverted_ordinals"),
+            accepted_ordinals=accepted_ordinals,
+            diverted_ordinals=diverted_ordinals,
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, LandscapeRecordError):

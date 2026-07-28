@@ -289,13 +289,10 @@ class SinkEffectReservation:
             raise ValueError("sink effect current-state witness changed during reservation")
         member_by_token = {member.token_id: member for member in request.members}
         for row in locked_states:
-            member = member_by_token.get(row.token_id)
-            if (
-                member is None
-                or row.run_id != request.run_id
-                or row.node_id != request.sink_node_id
-                or row.input_hash != member.payload_hash
-            ):
+            if row.token_id not in member_by_token:
+                raise ValueError("sink effect current-state witness is divergent")
+            member = member_by_token[row.token_id]
+            if row.run_id != request.run_id or row.node_id != request.sink_node_id or row.input_hash != member.payload_hash:
                 raise ValueError("sink effect current-state witness is divergent")
         self._after_witness_locks(self._backend_pid(conn), token_ids, state_ids)
 
@@ -617,9 +614,9 @@ class SinkEffectReservation:
     @staticmethod
     def _validate_existing_members(request: SinkEffectReservationRequest, bindings: Mapping[str, Row[Any]]) -> None:
         for member in request.members:
-            row = bindings.get(member.token_id)
-            if row is None:
+            if member.token_id not in bindings:
                 continue
+            row = bindings[member.token_id]
             expected = {
                 "run_id": request.run_id,
                 "sink_node_id": request.sink_node_id,

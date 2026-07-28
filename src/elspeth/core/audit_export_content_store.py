@@ -27,9 +27,9 @@ from elspeth.contracts.audit_export import (
 from elspeth.contracts.hashing import canonical_json
 from elspeth.core.config import AuditExportContentStoreSettings, LandscapeExportSettings
 
-_DIRECTORY_FLAGS: Final = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-_FILE_READ_FLAGS: Final = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-_FILE_CREATE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_FILE_READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW
+_FILE_CREATE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 _COPY_BYTES: Final = 64 * 1024
 # Explicit safe bound on orphan-marker size. A marker lists one canonical
 # "sha256:<64 hex>" reference per content object — at most

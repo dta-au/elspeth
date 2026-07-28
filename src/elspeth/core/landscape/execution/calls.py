@@ -275,7 +275,14 @@ class CallAuditRepository:
             if recorded_index is None:
                 return
             counters = self._operation_call_indices if operation else self._call_indices
-            counters[parent_id] = max(counters.get(parent_id, 0), recorded_index + 1)
+            if parent_id in counters:
+                current_index = counters[parent_id]
+            else:
+                current_index = 0
+            next_recorded_index = recorded_index + 1
+            if current_index < next_recorded_index:
+                current_index = next_recorded_index
+            counters[parent_id] = current_index
 
     def _prepare_call_payloads(
         self,

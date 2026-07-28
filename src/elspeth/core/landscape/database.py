@@ -762,7 +762,7 @@ def _missing_additive_indexes(inspector: Inspector, present_tables: set[str]) ->
         if table_name not in present_tables:
             missing.add(index_name)
             continue
-        found = {str(index["name"]) for index in inspector.get_indexes(table_name) if index.get("name") is not None}
+        found = {str(index["name"]) for index in inspector.get_indexes(table_name) if "name" in index and index["name"] is not None}
         if index_name not in found:
             missing.add(index_name)
     return frozenset(missing)

@@ -798,9 +798,9 @@ class SinkEffectLifecycle:
             .with_for_update()
         ).fetchall()
         by_id = {row.effect_id: row for row in rows}
-        row = by_id.get(effect_id)
-        if row is None:
+        if effect_id not in by_id:
             raise LandscapeRecordError("sink effect disappeared while locking")
+        row = by_id[effect_id]
         self._after_effect_lock(self._backend_pid(conn), effect_id)
         return row
 

@@ -270,7 +270,7 @@ class BaseTransform(ABC):
         options: Mapping[str, object],
     ) -> bool:
         """Evaluate whether this concrete config can enforce a declared control."""
-        if options.get("detect_only") is True:
+        if "detect_only" in options and options["detect_only"] is True:
             return False
         return any(
             declaration.capability is capability and declaration.control_role is role and declaration.blocks_positive_detection

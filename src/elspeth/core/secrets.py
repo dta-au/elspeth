@@ -116,7 +116,10 @@ def parse_secret_ref_marker(value: Any) -> tuple[str, SecretScope | None] | None
     """Return the typed deferred-secret marker, if *value* is exactly one."""
     if isinstance(value, Mapping) and set(value) in ({"secret_ref"}, {"secret_ref", "secret_scope"}):
         ref = value["secret_ref"]
-        scope = value.get("secret_scope")
+        if "secret_scope" in value:
+            scope = value["secret_scope"]
+        else:
+            scope = None
         if isinstance(ref, str) and (scope is None or scope in ("user", "server", "org")):
             return ref, scope
     return None

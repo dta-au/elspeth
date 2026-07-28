@@ -1045,8 +1045,10 @@ class Artifact:
             "inherited": False,
             "virtual": False,
         }
-        expected = evidence_performed.get(self.publication_evidence_kind)
-        if expected is None or self.publication_performed is not expected:
+        if self.publication_evidence_kind not in evidence_performed:
+            raise ValueError("effect artifact publication evidence is invalid or contradicts publication_performed")
+        expected = evidence_performed[self.publication_evidence_kind]
+        if self.publication_performed is not expected:
             raise ValueError("effect artifact publication evidence is invalid or contradicts publication_performed")
 
     @property

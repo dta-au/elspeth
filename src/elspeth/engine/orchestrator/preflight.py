@@ -417,7 +417,10 @@ def _build_sink_effect_admission_authority() -> tuple[
             raise SinkEffectCapabilityError(f"Sink effect configured modes contain non-runtime sink names: {sorted(extra_modes)!r}")
         bindings: list[_AdmissionBinding] = []
         for sink_name, sink in sinks.items():
-            mode = configured_modes.get(sink_name, "")
+            if sink_name in configured_modes:
+                mode = configured_modes[sink_name]
+            else:
+                mode = ""
             validate_sink_effect_capability(
                 sink,
                 mode=mode,
@@ -449,18 +452,26 @@ def _build_sink_effect_admission_authority() -> tuple[
         if type(receipt) is not _SinkEffectCapabilityAdmission:
             return False
         with lock:
-            record = registry.get(receipt)
-        if record is None or record.required_input_kind is not required_input_kind:
+            if receipt not in registry:
+                return False
+            record = registry[receipt]
+        if record.required_input_kind is not required_input_kind:
             return False
         if set(configured_modes) != set(sinks) or len(record.bindings) != len(sinks):
             return False
-        return all(
-            binding.name == sink_name
-            and binding.sink is sink
-            and binding.mode == configured_modes.get(sink_name, "")
-            and binding.capability_fingerprint == _capability_fingerprint(sink)
-            for binding, (sink_name, sink) in zip(record.bindings, sinks.items(), strict=True)
-        )
+        for binding, (sink_name, sink) in zip(record.bindings, sinks.items(), strict=True):
+            if sink_name in configured_modes:
+                mode = configured_modes[sink_name]
+            else:
+                mode = ""
+            if (
+                binding.name != sink_name
+                or binding.sink is not sink
+                or binding.mode != mode
+                or binding.capability_fingerprint != _capability_fingerprint(sink)
+            ):
+                return False
+        return True
 
     return issue, lookup
 

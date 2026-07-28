@@ -241,10 +241,9 @@ class SinkEffectFinalization:
         self._after_state_locks(self._backend_pid(conn), tuple(sorted(state_id for _ordinal, state_id in current_state_ids)))
 
         locked = self._lock_stream_and_effects(conn, optimistic_effect, optimistic.linked_effect_ids)
-        locked_effect = locked.get(request.effect_id)
-        if locked_effect is None:
+        if request.effect_id not in locked:
             raise LandscapeRecordError("sink effect disappeared while acquiring finalization locks")
-        effect = locked_effect
+        effect = locked[request.effect_id]
         if effect.state == SinkEffectState.FINALIZED.value:
             raise _WitnessChanged
         self._validate_effect_authority(conn, request, effect, locked, members)
@@ -494,10 +493,11 @@ class SinkEffectFinalization:
                 raise LandscapeRecordError("failsink effect requires exact per-member primary linkage")
             for member in members:
                 primary_effect_id = str(member.primary_effect_id)
-                primary = linked.get(primary_effect_id)
+                if primary_effect_id not in linked:
+                    raise LandscapeRecordError("failsink effect requires every same-run primary effect to be finalized")
+                primary = linked[primary_effect_id]
                 if (
-                    primary is None
-                    or primary.run_id != effect.run_id
+                    primary.run_id != effect.run_id
                     or primary.role != SinkEffectRole.PRIMARY.value
                     or primary.state != SinkEffectState.FINALIZED.value
                 ):
@@ -517,8 +517,11 @@ class SinkEffectFinalization:
         elif primary_effect_ids:
             raise LandscapeRecordError("primary effect members cannot refer to another primary effect")
         if effect.predecessor_effect_id is not None:
-            predecessor = linked.get(str(effect.predecessor_effect_id))
-            if predecessor is None or predecessor.state != SinkEffectState.FINALIZED.value:
+            predecessor_effect_id = str(effect.predecessor_effect_id)
+            if predecessor_effect_id not in linked:
+                raise LandscapeRecordError("stream predecessor must be finalized before successor finalization")
+            predecessor = linked[predecessor_effect_id]
+            if predecessor.state != SinkEffectState.FINALIZED.value:
                 raise LandscapeRecordError("stream predecessor must be finalized before successor finalization")
         current = conn.execute(select(sink_effects_table.c.effect_id).where(sink_effects_table.c.effect_id == request.effect_id)).fetchone()
         if current is None:  # pragma: no cover - protected by row lock

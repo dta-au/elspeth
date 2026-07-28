@@ -1004,9 +1004,9 @@ class NodeStateRepository:
         )
         found = {str(row.edge_id): row for row in rows}
         for edge_id in unique_edge_ids:
-            row = found.get(edge_id)
-            if row is None:
+            if edge_id not in found:
                 raise LandscapeRecordError(f"{owner} requires existing state_id={state_id!r} and edge_id={edge_id!r} in the same run")
+            row = found[edge_id]
             if row.state_run_id != row.edge_run_id:
                 raise LandscapeRecordError(f"{owner} requires state_id={state_id!r} and edge_id={edge_id!r} to belong to the same run")
 

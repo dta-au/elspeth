@@ -62,7 +62,9 @@ def load_sink_effect_recovery_history(db: LandscapeDB, effect_id: str) -> SinkEf
     member_progress: dict[str, int] = {}
     for member in members:
         state = "unprepared" if member.member_state is None else member.member_state.value
-        member_progress[state] = member_progress.get(state, 0) + 1
+        if state not in member_progress:
+            member_progress[state] = 0
+        member_progress[state] += 1
     response_lost_attempts = sum(attempt.state.value == "response_lost" for attempt in attempts)
 
     if effect.reconcile_kind is not None and effect.reconcile_kind.value == "unknown":

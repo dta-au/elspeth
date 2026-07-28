@@ -539,12 +539,11 @@ class SinkExecutor:
                 fresh_state_by_token[token.token_id] = opened
         states: list[tuple[TokenInfo, NodeState]] = []
         for token in tokens:
-            fresh_state = fresh_state_by_token.get(token.token_id)
-            if fresh_state is not None:
-                states.append((token, fresh_state))
+            if token.token_id in fresh_state_by_token:
+                states.append((token, fresh_state_by_token[token.token_id]))
                 continue
-            open_state_id = open_ids.get(token.token_id)
-            if open_state_id is not None:
+            if token.token_id in open_ids:
+                open_state_id = open_ids[token.token_id]
                 state = self._execution.get_node_state(open_state_id)
             else:
                 candidates = [

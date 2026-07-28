@@ -79,11 +79,14 @@ def _verify_snapshot_graph(
                 emitted = json.loads(frame[:-1])
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains invalid JSON") from exc
-            if type(emitted) is not dict or emitted.get("record_type") == "manifest":
+            if type(emitted) is not dict or ("record_type" in emitted and emitted["record_type"] == "manifest"):
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains an invalid data record")
             if canonical_json(emitted).encode("utf-8") + b"\n" != frame:
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains non-canonical record bytes")
-            signature = emitted.pop("signature", None)
+            if "signature" in emitted:
+                signature = emitted.pop("signature")
+            else:
+                signature = None
             unsigned_bytes = canonical_json(emitted).encode("utf-8")
             if snapshot.signing_mode is AuditExportSigningMode.UNSIGNED:
                 if signature is not None:

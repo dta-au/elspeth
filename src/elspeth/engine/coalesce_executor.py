@@ -1161,9 +1161,9 @@ class CoalesceExecutor:
             entries_by_token_id = {entry.token.token_id: entry for entry in pending.branches.values()}
             parent_completions: list[CoalesceParentCompletion] = []
             for token in consumed_tokens:
-                parent_entry = entries_by_token_id.get(token.token_id)
-                if parent_entry is None:
+                if token.token_id not in entries_by_token_id:
                     raise OrchestrationInvariantError(f"coalesce consumed token {token.token_id!r} has no pending node-state witness")
+                parent_entry = entries_by_token_id[token.token_id]
                 parent_completions.append(
                     CoalesceParentCompletion(
                         parent_ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
