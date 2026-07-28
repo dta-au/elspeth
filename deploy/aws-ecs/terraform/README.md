@@ -362,21 +362,26 @@ TASK_DEFINITION=$(terraform -chdir=scenario-a output -raw runtime_doctor_task_de
 aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs \
   describe-task-definition \
   --task-definition "$TASK_DEFINITION" \
-  --query 'taskDefinition.containerDefinitions[?name!=`cloudwatch-agent` && name!=`elspeth-web`].readonlyRootFilesystem' \
-  --output json | jq -e 'length > 0 and all(.[]; . == true)'
+  --query 'taskDefinition.containerDefinitions[?name!=`cloudwatch-agent` && name!=`elspeth-web`].{name: name, readonlyRootFilesystem: readonlyRootFilesystem}' \
+  --output json | jq -e 'length > 0 and all(.[]; .readonlyRootFilesystem == true)'
 
 CANDIDATE_TASK_DEFINITION=$(terraform -chdir=scenario-a output -json resolved_inventory \
   | jq -r '.values.CANDIDATE_TASK_DEFINITION')
 aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs \
   describe-task-definition \
   --task-definition "$CANDIDATE_TASK_DEFINITION" \
-  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].readonlyRootFilesystem' \
-  --output json | jq -e 'all(.[]; . != true)'
+  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].{name: name, readonlyRootFilesystem: readonlyRootFilesystem}' \
+  --output json | jq -e 'length == 1 and all(.[]; .readonlyRootFilesystem != true)'
 ```
 
-Run the first check only against `$TASK_DEFINITION` above — the schema-init
-or runtime doctor definition, container name `doctor` — never against the
-payload or local-auth verifier task definitions
+Both checks project `{name, readonlyRootFilesystem}` objects rather than the
+bare field because a JMESPath filter-then-field projection drops null
+results: against a container whose field is absent, the bare-field form
+yields the same empty array as a query that matched nothing at all, and any
+`all(...)` over an empty array is vacuously true. Run the first check only
+against `$TASK_DEFINITION` above — the schema-init or runtime doctor
+definition, container name `doctor` — never against the payload or
+local-auth verifier task definitions
 (`resolved_inventory.values.PAYLOAD_VERIFIER_TASK_DEFINITION` /
 `LOCAL_AUTH_VERIFIER_TASK_DEFINITION`): those two bind their read-only
 container under the `elspeth-web` container name, so against either of them
@@ -386,8 +391,13 @@ check only against a candidate or rollback web task definition —
 `$CANDIDATE_TASK_DEFINITION` above, or
 `resolved_inventory.values.PREVIOUS_TASK_DEFINITION` on an upgrade: its
 `readonlyRootFilesystem` field is absent (not a literal `false`), so the
-projection yields `[null]`, and `. != true` proves the documented exemption
-rather than a silent `true` that would break ECS Exec. The payload and
+projection yields `[{"name": "elspeth-web", "readonlyRootFilesystem":
+null}]`; `length == 1` proves the query found exactly the intended container
+(a bare-field projection would drop the null and yield `[]`, which an
+unguarded `all()` would pass with zero evidentiary value — including against
+a wrong task-definition ARN or a typo'd container name), and
+`.readonlyRootFilesystem != true` proves the documented exemption rather
+than a silent `true` that would break ECS Exec. The payload and
 local-auth verifier task definitions run a read-only container
 (`readonlyRootFilesystem = true`) under the `elspeth-web` container name;
 neither jq command above exercises them — that source-level contract is
