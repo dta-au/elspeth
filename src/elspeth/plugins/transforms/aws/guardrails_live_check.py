@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 
 from elspeth.contracts.audit_protocols import CallRecorder
@@ -107,4 +108,5 @@ def run_guardrail_live_check(
         raise GuardrailLiveCheckError("Bedrock Guardrail live check failed") from None
     finally:
         if owns_sdk_client and client is not None:
-            client.sdk_client.close()
+            with suppress(Exception):
+                client.sdk_client.close()

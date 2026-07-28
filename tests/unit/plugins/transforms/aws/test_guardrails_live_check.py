@@ -21,8 +21,9 @@ from elspeth.plugins.transforms.aws.guardrails_live_check import (
 
 
 class _SequencedSDK:
-    def __init__(self, *responses: object) -> None:
+    def __init__(self, *responses: object, close_error: Exception | None = None) -> None:
         self._responses = iter(responses)
+        self._close_error = close_error
         self.calls: list[dict[str, object]] = []
         self.close_count = 0
 
@@ -35,6 +36,8 @@ class _SequencedSDK:
 
     def close(self) -> None:
         self.close_count += 1
+        if self._close_error is not None:
+            raise self._close_error
 
 
 def _profile(plugin: str = "aws_bedrock_prompt_shield") -> BedrockGuardrailProfileSettings:
@@ -208,3 +211,63 @@ def test_live_check_does_not_close_borrowed_sdk_client() -> None:
     _run(sdk)
 
     assert sdk.close_count == 0
+
+
+def test_owned_sdk_close_failure_does_not_replace_success_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk = _SequencedSDK(
+        response(),
+        response(detected="PROMPT_ATTACK"),
+        close_error=RuntimeError("PRIVATE_CLOSE_ERROR_MARKER"),
+    )
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.guardrails_client.build_bedrock_runtime_client",
+        lambda _region: sdk,
+    )
+
+    receipt = run_guardrail_live_check(
+        profile=_profile(),
+        safe_text="safe",
+        blocked_text="blocked",
+        execution=FakeExecution(),
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+    )
+
+    assert receipt.safe_case_passed is True
+    assert receipt.attack_case_blocked is True
+    assert sdk.close_count == 1
+
+
+def test_owned_sdk_close_failure_does_not_replace_sanitized_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider_marker = "PRIVATE_PROVIDER_ERROR_MARKER"
+    close_marker = "PRIVATE_CLOSE_ERROR_MARKER"
+    failure = ClientError(
+        {
+            "Error": {"Code": "AccessDeniedException", "Message": provider_marker},
+            "ResponseMetadata": {"RetryAttempts": 0},
+        },
+        "ApplyGuardrail",
+    )
+    sdk = _SequencedSDK(failure, close_error=RuntimeError(close_marker))
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.guardrails_client.build_bedrock_runtime_client",
+        lambda _region: sdk,
+    )
+
+    with pytest.raises(GuardrailLiveCheckError) as exc_info:
+        run_guardrail_live_check(
+            profile=_profile(),
+            safe_text="safe",
+            blocked_text="blocked",
+            execution=FakeExecution(),
+            state_id="state-1",
+            run_id="run-1",
+            telemetry_emit=lambda _event: None,
+        )
+
+    assert str(exc_info.value) == "Bedrock Guardrail live check failed"
+    assert exc_info.value.__cause__ is None
+    assert provider_marker not in str(exc_info.value)
+    assert close_marker not in str(exc_info.value)
+    assert sdk.close_count == 1
