@@ -532,7 +532,7 @@ class SinkEffectFinalization:
             plan = json.loads(effect.plan_json)
         except (TypeError, json.JSONDecodeError) as exc:
             raise LandscapeRecordError("sink effect durable plan is not valid JSON") from exc
-        if not isinstance(plan, dict):
+        if type(plan) is not dict:
             raise LandscapeRecordError("sink effect durable plan must be an object")
         exact_plan_fields = {
             "effect_id": effect.effect_id,
@@ -540,23 +540,27 @@ class SinkEffectFinalization:
             "plan_hash": effect.plan_hash,
             "descriptor_mode": effect.descriptor_mode,
         }
-        mismatches = [field for field, expected in exact_plan_fields.items() if plan.get(field) != expected]
+        mismatches = [field for field, expected in exact_plan_fields.items() if plan[field] != expected]
         if mismatches:
             raise LandscapeRecordError("sink effect durable plan disagrees with ledger fields: " + ", ".join(mismatches))
         descriptor_payload = _descriptor_payload(request.descriptor)
         descriptor_hash = stable_hash(descriptor_payload)
         mode = SinkEffectDescriptorMode(effect.descriptor_mode)
         if mode in {SinkEffectDescriptorMode.PRECOMPUTED, SinkEffectDescriptorMode.NO_PUBLICATION}:
-            if effect.expected_descriptor_hash != descriptor_hash or plan.get("expected_descriptor") != descriptor_payload:
+            if effect.expected_descriptor_hash != descriptor_hash or plan["expected_descriptor"] != descriptor_payload:
                 raise LandscapeRecordError("sink effect finalization descriptor differs from immutable plan")
         elif mode is SinkEffectDescriptorMode.RESULT_DERIVED:
             evidence = deep_thaw(request.evidence)
+            if type(evidence) is not dict:
+                raise LandscapeRecordError("result-derived evidence must be an object")
             expected_evidence = {
                 "accepted_ordinals": list(request.accepted_ordinals),
                 "descriptor": descriptor_payload,
                 "diverted_ordinals": list(request.diverted_ordinals),
             }
-            if isinstance(evidence, dict) and "diversion_attribution" in evidence:
+            if request.diverted_ordinals and "diversion_attribution" not in evidence:
+                raise LandscapeRecordError("result-derived diversion requires diversion attribution")
+            if "diversion_attribution" in evidence:
                 # Commit-time diverters (e.g. database constraints) bind their
                 # durable per-member attribution into the result evidence. When
                 # present it must exactly cover the diverted partition in order.

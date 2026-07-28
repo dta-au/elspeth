@@ -39,7 +39,7 @@ from elspeth.contracts.errors import (
     SinkDiversionReason,
     SinkTransactionalInvariantError,
 )
-from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import SchemaContract
@@ -691,8 +691,7 @@ class SinkExecutor:
         diverted_keys = {(member.effect_id, member.ordinal) for member in durable_members if member.prepared_disposition == "diverted"}
         effect_ids = tuple(dict.fromkeys(member.effect_id for member in durable_members))
         single_effect = len(effect_ids) == 1
-        get_diversions = getattr(sink, "_get_diversions", None)
-        returned_diversions = tuple(get_diversions()) if callable(get_diversions) else ()
+        returned_diversions = sink._get_diversions()
         # The in-memory diversion log indexes rows within one effect's member
         # list; across several effects those indexes are ambiguous, so a
         # spanning batch recovers from each effect's durable attribution only.
@@ -700,27 +699,47 @@ class SinkExecutor:
         attribution_by_key: dict[tuple[str, int], tuple[str, str]] = {}
 
         def merge_attribution(effect_id: str, raw_attribution: object) -> None:
-            if not isinstance(raw_attribution, Sequence) or isinstance(raw_attribution, (str, bytes, bytearray)):
-                return
+            if type(raw_attribution) is not list:
+                raise AuditIntegrityError("effect diversion attribution must be a list")
             for item in raw_attribution:
-                if not isinstance(item, Mapping):
+                if type(item) is not dict:
                     raise AuditIntegrityError("effect diversion attribution is not a mapping")
-                ordinal = item.get("ordinal")
-                reason_hash = item.get("reason_hash")
-                error_hash = item.get("error_hash")
-                if type(ordinal) is not int or not isinstance(reason_hash, str) or not isinstance(error_hash, str):
-                    raise AuditIntegrityError("effect diversion attribution is incomplete")
+                if set(item) != {"error_hash", "ordinal", "reason_hash"}:
+                    raise AuditIntegrityError("effect diversion attribution has a divergent field set")
+                ordinal = item["ordinal"]
+                reason_hash = item["reason_hash"]
+                error_hash = item["error_hash"]
+                if (
+                    type(ordinal) is not int
+                    or type(reason_hash) is not str
+                    or len(reason_hash) != 64
+                    or any(character not in "0123456789abcdef" for character in reason_hash)
+                    or type(error_hash) is not str
+                    or len(error_hash) != 16
+                    or any(character not in "0123456789abcdef" for character in error_hash)
+                ):
+                    raise AuditIntegrityError("effect diversion attribution is incomplete or invalid")
                 key = (effect_id, ordinal)
                 value = (reason_hash, error_hash)
-                if attribution_by_key.setdefault(key, value) != value:
+                if key in attribution_by_key:
+                    if attribution_by_key[key] == value:
+                        continue
                     raise AuditIntegrityError("effect diversion attribution sources diverge for one durable member")
+                attribution_by_key[key] = value
 
         for effect_id in effect_ids:
             effect = self._execution.sink_effects.get_effect(effect_id)
             if effect is None:
                 raise AuditIntegrityError("durable effect partition references a missing effect")
             plan = SinkEffectCoordinator._load_plan(effect)
-            merge_attribution(effect_id, plan.safe_evidence.get("diversion_attribution", ()))
+            plan_evidence = deep_thaw(plan.safe_evidence)
+            if type(plan_evidence) is not dict:
+                raise AuditIntegrityError("durable effect plan evidence must be an object")
+            if "diversion_attribution" in plan_evidence:
+                plan_attribution = plan_evidence["diversion_attribution"]
+            else:
+                plan_attribution = []
+            merge_attribution(effect_id, plan_attribution)
             if not diverted_keys:
                 continue
             # Commit-time diversions (e.g. database constraints) cannot exist in
@@ -735,11 +754,18 @@ class SinkExecutor:
                 ):
                     continue
                 decoded = decode_sink_effect_returned_result(attempt.action, attempt.evidence_json)
-                merge_attribution(effect_id, decoded.evidence.get("diversion_attribution", ()))
+                attempt_evidence = deep_thaw(decoded.evidence)
+                if type(attempt_evidence) is not dict:
+                    raise AuditIntegrityError("durable effect attempt evidence must be an object")
+                if "diversion_attribution" in attempt_evidence:
+                    attempt_attribution = attempt_evidence["diversion_attribution"]
+                else:
+                    attempt_attribution = []
+                merge_attribution(effect_id, attempt_attribution)
         if returned_by_ordinal and set(returned_by_ordinal) != {ordinal for _effect_id, ordinal in diverted_keys}:
             raise AuditIntegrityError("effect result diversion evidence does not match the durable member partition")
-        if not returned_by_ordinal and set(attribution_by_key) != diverted_keys:
-            raise AuditIntegrityError("recovered effect is missing durable diversion attribution")
+        if set(attribution_by_key) != diverted_keys:
+            raise AuditIntegrityError("effect is missing durable diversion attribution")
         diversions: list[RowDiversion] = []
         diversion_error_hashes: dict[int, str] = {}
         diversion_reason_hashes: dict[int, str] = {}
@@ -748,11 +774,16 @@ class SinkExecutor:
             _diverted_effect_id, durable_ordinal = diverted_key
             durable = durable_by_key[diverted_key]
             caller_index = caller_index_by_token[durable.token_id]
-            returned = returned_by_ordinal.get(durable_ordinal)
-            attribution = attribution_by_key.get(diverted_key)
-            reason = returned.reason if returned is not None else f"effect-diversion:{attribution[0]}"  # type: ignore[index]
-            error_hash = attribution[1] if attribution is not None else compute_error_hash(reason)
-            reason_hash = attribution[0] if attribution is not None else stable_hash({"diversion_reason": reason})
+            returned = None
+            if durable_ordinal in returned_by_ordinal:
+                returned = returned_by_ordinal[durable_ordinal]
+            reason_hash, error_hash = attribution_by_key[diverted_key]
+            if returned is None:
+                reason = f"effect-diversion:{reason_hash}"
+            else:
+                reason = returned.reason
+                if stable_hash({"diversion_reason": reason}) != reason_hash or compute_error_hash(reason) != error_hash:
+                    raise AuditIntegrityError("live reason disagrees with durable attribution")
             diversions.append(
                 RowDiversion(
                     row_index=caller_index,

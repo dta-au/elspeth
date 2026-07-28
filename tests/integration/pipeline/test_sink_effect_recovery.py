@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select, update
 
 from elspeth.contracts import NodeStateStatus, NodeType, PendingOutcome, RoutingMode, TerminalOutcome, TerminalPath, TokenInfo
 from elspeth.contracts.audit import SinkEffect, SinkEffectMemberRecord, TokenRef
@@ -30,9 +32,10 @@ from elspeth.contracts.sink_effects import (
     SinkEffectRole,
 )
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_reservation import SinkEffectReservation
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import node_states_table, routing_events_table, sink_effect_members_table
+from elspeth.core.landscape.schema import node_states_table, routing_events_table, sink_effect_members_table, sink_effects_table
 from elspeth.engine.executors.sink import SinkExecutor
 from elspeth.engine.executors.sink_effects import SinkEffectExecutionSeam, SinkEffectInjectedFault
 from elspeth.engine.spans import SpanFactory
@@ -1234,6 +1237,55 @@ class _UnattributedDivertingSink(PartitioningObservableSink):
         return replace(plan, safe_evidence=evidence)
 
 
+def test_live_diversion_without_durable_attribution_fails_closed(tmp_path: Path) -> None:
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'live-unattributed.db'}")
+    try:
+        factory, run_id, sink_id, tokens, ctx = _primary_setup(db, [{"value": 1}, {"value": 2, "divert": True}])
+        sink = _UnattributedDivertingSink(DuplicateObservableTarget(), name="primary")
+        sink.node_id = sink_id
+
+        with pytest.raises(LandscapeRecordError, match="attribution must cover every diverted member"):
+            _executor_for(factory, run_id).write(
+                sink,  # type: ignore[arg-type]
+                tokens,
+                ctx,
+                1,
+                sink_name="output",
+                pending_outcome=_PENDING_SUCCESS,
+                effect_mode="write",
+            )
+    finally:
+        db.close()
+
+
+class _DivergentLiveReasonSink(PartitioningObservableSink):
+    def prepare_effect(self, request: SinkEffectPrepareRequest, ctx: RestrictedSinkEffectContext) -> SinkEffectPlan:
+        plan = super().prepare_effect(request, ctx)
+        self._diversions = (RowDiversion(row_index=1, reason="tampered live reason", row_data={"value": 2, "divert": True}),)
+        return plan
+
+
+def test_live_diversion_reason_must_match_durable_attribution(tmp_path: Path) -> None:
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'live-reason-divergence.db'}")
+    try:
+        factory, run_id, sink_id, tokens, ctx = _primary_setup(db, [{"value": 1}, {"value": 2, "divert": True}])
+        sink = _DivergentLiveReasonSink(DuplicateObservableTarget(), name="primary")
+        sink.node_id = sink_id
+
+        with pytest.raises(AuditIntegrityError, match="live reason disagrees with durable attribution"):
+            _executor_for(factory, run_id).write(
+                sink,  # type: ignore[arg-type]
+                tokens,
+                ctx,
+                1,
+                sink_name="output",
+                pending_outcome=_PENDING_SUCCESS,
+                effect_mode="write",
+            )
+    finally:
+        db.close()
+
+
 def test_recovered_diversion_without_durable_attribution_fails_closed(tmp_path: Path) -> None:
     """A recovered effect (no in-memory diversion log — its plan was durably
     bound before the crash, so ``prepare_effect`` never re-runs) must find its
@@ -1244,7 +1296,7 @@ def test_recovered_diversion_without_durable_attribution_fails_closed(tmp_path: 
     try:
         factory, run_id, sink_id, tokens, ctx = _primary_setup(db, [{"value": 1}, {"value": 2, "divert": True}])
         target = DuplicateObservableTarget()
-        first_sink = _UnattributedDivertingSink(target, name="primary")
+        first_sink = PartitioningObservableSink(target, name="primary")
         first_sink.node_id = sink_id
         with pytest.raises(SinkEffectInjectedFault):
             _executor_for(factory, run_id, fault_hook=_fail_once(SinkEffectExecutionSeam.BEFORE_EFFECT)).write(
@@ -1257,10 +1309,28 @@ def test_recovered_diversion_without_durable_attribution_fails_closed(tmp_path: 
                 effect_mode="write",
             )
 
+        with db.write_connection() as conn:
+            effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.sink_node_id == sink_id)).one()
+            plan_json = effect_row.plan_json
+            if type(plan_json) is not str:
+                raise AssertionError("prepared test effect must carry a durable plan")
+            plan_payload = json.loads(plan_json)
+            if type(plan_payload) is not dict:
+                raise AssertionError("prepared test effect plan must be an object")
+            plan_evidence = plan_payload["safe_evidence"]
+            if type(plan_evidence) is not dict:
+                raise AssertionError("prepared test effect evidence must be an object")
+            del plan_evidence["diversion_attribution"]
+            conn.execute(
+                update(sink_effects_table)
+                .where(sink_effects_table.c.effect_id == effect_row.effect_id)
+                .values(plan_json=json.dumps(plan_payload, sort_keys=True, separators=(",", ":")))
+            )
+
         recovered_factory = make_factory(db)
-        recovered_sink = _UnattributedDivertingSink(target, name="primary")
+        recovered_sink = PartitioningObservableSink(target, name="primary")
         recovered_sink.node_id = sink_id
-        with pytest.raises(AuditIntegrityError, match="recovered effect is missing durable diversion attribution"):
+        with pytest.raises(AuditIntegrityError, match="missing durable diversion attribution"):
             _executor_for(recovered_factory, run_id).write(
                 recovered_sink,  # type: ignore[arg-type]
                 tokens,

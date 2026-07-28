@@ -27,7 +27,7 @@ from elspeth.contracts.schema import SchemaConfig
 if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext, SourceContext, TransformContext
     from elspeth.contracts.data import PluginSchema
-    from elspeth.contracts.diversion import SinkWriteResult
+    from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
     from elspeth.contracts.plugin_assistance import PluginAssistance
     from elspeth.contracts.results import SourceRow, TransformResult
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -744,6 +744,10 @@ class SinkProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
 
     def _reset_diversion_log(self) -> None:
         """Clear diversion log before each write() call."""
+        ...
+
+    def _get_diversions(self) -> tuple["RowDiversion", ...]:
+        """Return the exact in-memory diversion log after a write."""
         ...
 
     def __init__(self, config: dict[str, Any]) -> None:

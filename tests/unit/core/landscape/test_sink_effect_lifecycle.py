@@ -156,6 +156,27 @@ def test_concurrent_plan_cas_accepts_equal_and_rejects_divergent(db_factory: tup
         repo.complete_plan(effect.effect_id, _plan(effect.effect_id, plan_hash="c" * 64), claim=claim)
 
 
+def test_plan_diversion_requires_exact_durable_attribution(
+    db_factory: tuple[LandscapeDB, RecorderFactory],
+) -> None:
+    _db, factory = db_factory
+    effect = _reserved(factory)
+    plan = replace(
+        _plan(effect.effect_id),
+        safe_evidence={
+            "accepted_ordinals": [],
+            "diverted_ordinals": [0],
+        },
+    )
+
+    with pytest.raises(LandscapeRecordError, match="attribution must cover every diverted member"):
+        factory.execution.sink_effects.complete_plan(
+            effect.effect_id,
+            plan,
+            claim=_claim(factory, effect.effect_id),
+        )
+
+
 def test_inspected_plan_requires_returned_inspection_attempt(db_factory: tuple[LandscapeDB, RecorderFactory]) -> None:
     _db, factory = db_factory
     effect = _reserved(factory)
