@@ -29,7 +29,11 @@ def _valid_state() -> state_module.AcceptanceState:
             "blob_id": "cc742c5f-ae01-49f3-988b-7ecddf0445ef",
             "run_id": "401b6510-a37f-4375-acb8-695fe0098265",
             "landscape_run_id": "a31de342-a9f2-4b31-bb02-9043a047db72",
-            "artifact_id": "8e82b504-5dcc-4dc9-9fe4-a1c62be47153",
+            # NOT a UUID: real artifact_id values are landscape
+            # `artifacts.artifact_id` hex identities (32 or 64 lowercase hex
+            # chars), never canonical dashed UUIDs -- see
+            # `_ARTIFACT_ID_PATTERN` in contracts.py.
+            "artifact_id": "6d9653ae9f51e25579b040ab9ffb7d75e42b731666bbf7500a5c0e3546195d96",
             "uploaded_sha256": "a" * 64,
             "blob_sha256": "a" * 64,
             "artifact_sha256": "b" * 64,

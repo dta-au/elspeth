@@ -31,6 +31,7 @@ from .contracts import (
     RUN_POLL_INTERVAL_SECONDS,
     AcceptanceCheckError,
     AcceptanceInputError,
+    _artifact_id_field,
     _canonical_uuid,
     _mapping,
     _sha256,
@@ -180,7 +181,7 @@ def _select_output_artifact(payload: object, *, check: str) -> tuple[str, str]:
         raise AcceptanceCheckError(check)
     if artifact.get("exists_now") is not True or artifact.get("downloadable") is not True:
         raise AcceptanceCheckError(check)
-    return _uuid_field(artifact, "artifact_id", check=check), _sha256_field(artifact, "content_hash", check=check)
+    return _artifact_id_field(artifact, "artifact_id", check=check), _sha256_field(artifact, "content_hash", check=check)
 
 
 def capture(

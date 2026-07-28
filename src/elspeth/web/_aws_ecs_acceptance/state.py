@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 from .contracts import (
+    _ARTIFACT_ID_PATTERN,
     _SHA256_PATTERN,
     MAX_STATE_FILE_BYTES,
     AcceptanceInputError,
@@ -93,9 +94,14 @@ class AcceptanceState:
         if data["schema_version"] != 1 or type(data["schema_version"]) is not int:
             raise AcceptanceStateError("acceptance state schema is invalid")
 
+        # session_id/tutorial_session_id/blob_id/run_id/landscape_run_id are
+        # all genuine canonical dashed UUIDs (str(uuid.uuid4()) at their web
+        # ID-generation sites). artifact_id is NOT: it is a landscape
+        # `artifacts.artifact_id` value (`String(64)` column), generated as
+        # a labeled SHA-256 hex digest by the sink-effect producer path
+        # (see `_ARTIFACT_ID_PATTERN` in contracts.py), never a UUID.
         identities = {
-            field: _state_string(data, field)
-            for field in ("session_id", "tutorial_session_id", "blob_id", "run_id", "landscape_run_id", "artifact_id")
+            field: _state_string(data, field) for field in ("session_id", "tutorial_session_id", "blob_id", "run_id", "landscape_run_id")
         }
         for value in identities.values():
             try:
@@ -104,6 +110,11 @@ class AcceptanceState:
                 raise AcceptanceStateError("acceptance state schema is invalid") from None
             if str(parsed) != value:
                 raise AcceptanceStateError("acceptance state schema is invalid")
+
+        artifact_id = _state_string(data, "artifact_id")
+        if _ARTIFACT_ID_PATTERN.fullmatch(artifact_id) is None:
+            raise AcceptanceStateError("acceptance state schema is invalid")
+        identities["artifact_id"] = artifact_id
 
         hashes = {field: _state_string(data, field) for field in ("uploaded_sha256", "blob_sha256", "artifact_sha256")}
         if any(_SHA256_PATTERN.fullmatch(value) is None for value in hashes.values()):
