@@ -2730,6 +2730,16 @@ or sanitized doctor failure blocks service mutation. Diagnose only through
 bounded `aws logs filter-log-events` calls captured by `aws_capture` and sent
 directly to `sanitize-evidence`; raw logs are never printed or persisted.
 
+If the sanitized failure names `payload_store_writable` or `blob_writable`
+with a `FileNotFoundError` on an otherwise fresh stack, `provision_scenario_storage`
+(see [Fresh Scenario A database baseline](#fresh-scenario-a-database-baseline))
+has not yet run against this stack. Doctor deliberately never creates
+directories, including under `--init-schema` (see
+[Storage provisioning and cold start](#storage-provisioning-and-cold-start)),
+so a missing mount surfaces as this same sanitized failure. Run
+`provision_scenario_storage`, confirm the non-root probe booleans, then rerun
+this doctor step.
+
 ### 3. Apply the schema compatibility gate
 
 `--init-schema` may initialize a session or Landscape schema only when it is
