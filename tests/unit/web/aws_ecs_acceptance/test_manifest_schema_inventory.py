@@ -1026,3 +1026,8 @@ def test_complete_retained_evidence_requires_paired_metric_and_trace_counts(tmp_
             require_complete=True,
             now=lambda: datetime(2026, 7, 14, 1, 2, tzinfo=UTC),
         )
+
+
+def test_mutable_manifest_check_fails_loudly_for_corrupt_final_evidence() -> None:
+    with pytest.raises(KeyError, match="phase"):
+        acceptance._require_mutable_control_manifest({"final_evidence": {}})
