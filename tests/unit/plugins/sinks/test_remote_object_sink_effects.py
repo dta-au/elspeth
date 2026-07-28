@@ -12,9 +12,12 @@ from datetime import UTC, datetime
 from hashlib import md5, sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any
 
 import pytest
+from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
+from azure.storage.blob import BlobProperties
+from botocore.exceptions import ClientError, ConnectionClosedError
 
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.sink_effects import (
@@ -88,18 +91,24 @@ def _prepare(
     )
 
 
-class _S3Missing(Exception):
-    response: ClassVar[dict[str, object]] = {
-        "Error": {"Code": "NoSuchKey"},
-        "ResponseMetadata": {"HTTPStatusCode": 404},
-    }
+def _s3_missing_error() -> ClientError:
+    return ClientError(
+        {
+            "Error": {"Code": "NoSuchKey"},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        },
+        "HeadObject",
+    )
 
 
-class _S3PreconditionFailed(Exception):
-    response: ClassVar[dict[str, object]] = {
-        "Error": {"Code": "PreconditionFailed"},
-        "ResponseMetadata": {"HTTPStatusCode": 412},
-    }
+def _s3_precondition_failed_error() -> ClientError:
+    return ClientError(
+        {
+            "Error": {"Code": "PreconditionFailed"},
+            "ResponseMetadata": {"HTTPStatusCode": 412},
+        },
+        "PutObject",
+    )
 
 
 @dataclass
@@ -119,7 +128,7 @@ class _S3Store:
     def head_object(self, **request: object) -> dict[str, object]:
         self.requests.append({"operation": "head", **request})
         if self.value is None:
-            raise _S3Missing()
+            raise _s3_missing_error()
         return {
             "ContentLength": len(self.value.body),
             "ETag": self.value.etag,
@@ -132,9 +141,9 @@ class _S3Store:
         if self.control is not None:
             raise self.control
         if request.get("IfNoneMatch") == "*" and self.value is not None:
-            raise _S3PreconditionFailed()
+            raise _s3_precondition_failed_error()
         if "IfMatch" in request and (self.value is None or request["IfMatch"] != self.value.etag):
-            raise _S3PreconditionFailed()
+            raise _s3_precondition_failed_error()
         body = request["Body"]
         assert isinstance(body, io.BufferedIOBase)
         payload = body.read()
@@ -145,40 +154,38 @@ class _S3Store:
         self.value = _Object(payload, etag, dict(metadata))
         if self.response_loss:
             self.response_loss = False
-            raise ConnectionError("response lost after accepted write")
+            raise ConnectionClosedError(endpoint_url="https://bucket.s3.test")
         return {"ETag": etag}
-
-
-class ResourceNotFoundError(Exception):
-    pass
-
-
-class _AzurePreconditionFailed(Exception):
-    status_code = 412
 
 
 class _AzureBlob:
     def __init__(self, store: _AzureStore) -> None:
         self._store = store
 
-    def get_blob_properties(self) -> SimpleNamespace:
+    def get_blob_properties(self) -> BlobProperties:
         self._store.requests.append({"operation": "properties"})
+        if self._store.control is not None:
+            raise self._store.control
         value = self._store.value
         if value is None:
-            raise ResourceNotFoundError()
-        return SimpleNamespace(
-            size=len(value.body),
-            etag=value.etag,
-            metadata=value.metadata,
-            content_settings=SimpleNamespace(content_md5=md5(value.body, usedforsecurity=False).digest()),
+            raise ResourceNotFoundError("missing")
+        return BlobProperties(
+            **{
+                "Content-Length": len(value.body),
+                "ETag": value.etag,
+                "metadata": value.metadata,
+                "Content-MD5": md5(value.body, usedforsecurity=False).digest(),
+            }
         )
 
     def upload_blob(self, data: object, **request: object) -> dict[str, object]:
         self._store.requests.append({"operation": "upload", **request})
+        if self._store.control is not None:
+            raise self._store.control
         if request.get("if_none_match") == "*" and self._store.value is not None:
-            raise _AzurePreconditionFailed()
+            raise ResourceModifiedError("precondition")
         if "etag" in request and (self._store.value is None or request["etag"] != self._store.value.etag):
-            raise _AzurePreconditionFailed()
+            raise ResourceModifiedError("precondition")
         if isinstance(data, bytes):
             payload = data
         else:
@@ -200,6 +207,7 @@ class _AzureStore:
         self.value: _Object | None = None
         self.requests: list[dict[str, object]] = []
         self.response_loss = False
+        self.control: BaseException | None = None
         self.blob = _AzureBlob(self)
 
     def get_blob_client(self, *_args: object, **_kwargs: object) -> _AzureBlob:
@@ -495,6 +503,81 @@ def test_azure_fresh_process_successor_and_response_loss_reconcile() -> None:
     reconciled = _azure(store).reconcile_effect(second_plan, _CTX)
     assert reconciled.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR
     assert reconciled.descriptor == second_plan.expected_descriptor
+
+
+def test_non_azure_exception_named_resource_not_found_is_not_absence() -> None:
+    pretender_type = type("ResourceNotFoundError", (Exception,), {})
+    pretender = pretender_type("not an Azure SDK error")
+
+    assert AzureBlobSink._is_missing(pretender) is False
+
+
+def test_azure_properties_require_the_declared_sdk_contract() -> None:
+    with pytest.raises(TypeError):
+        AzureBlobSink._observation_from_properties(object())
+
+
+def test_azure_prepare_missing_owned_inspection_evidence_raises() -> None:
+    store = _AzureStore()
+    sink = _azure(store)
+    member = _member(0, {"id": 1})
+    inspection = sink.inspect_effect(
+        SinkEffectInspectionRequest(effect_id="d1" * 32, target="{}", predecessor_descriptor=None),
+        _CTX,
+    )
+    evidence = dict(inspection.evidence)
+    evidence.pop("predecessor_declared")
+    corrupt_inspection = replace(inspection, evidence=evidence)
+
+    with pytest.raises(KeyError, match="predecessor_declared"):
+        sink.prepare_effect(
+            SinkEffectPrepareRequest(
+                effect_id="d1" * 32,
+                effect_input=SinkEffectPipelineMembersInput(members=(member,), target_snapshot_members=(member,)),
+                inspection=corrupt_inspection,
+            ),
+            _CTX,
+        )
+
+
+@pytest.mark.parametrize("control", [GeneratorExit(), AssertionError("our bug"), NotImplementedError("our bug")])
+def test_azure_external_call_programmer_failures_escape(control: BaseException) -> None:
+    store = _AzureStore()
+    sink = _azure(store)
+    store.control = control
+
+    with pytest.raises(type(control)):
+        sink.inspect_effect(
+            SinkEffectInspectionRequest(effect_id="d2" * 32, target="{}", predecessor_descriptor=None),
+            _CTX,
+        )
+
+
+def test_azure_local_stage_open_failure_is_not_an_unknown_remote_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _AzureStore()
+    sink = _azure(store)
+    member = _member(0, {"id": 1})
+    plan = _prepare(sink, effect_id="d3" * 32, current=(member,), target_snapshot=(member,))
+    stage = Path(str(plan.safe_evidence["staging_path"]))
+    original_open = Path.open
+    failure = OSError("local stage race")
+    stage_open_count = 0
+
+    def fail_stage_open(path: Path, *args: object, **kwargs: object) -> Any:
+        nonlocal stage_open_count
+        if path == stage:
+            stage_open_count += 1
+            if stage_open_count == 2:
+                raise failure
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_stage_open)
+    with pytest.raises(OSError) as exc_info:
+        sink.commit_effect(plan, _CTX)
+    assert exc_info.value is failure
+    assert all(request["operation"] != "upload" for request in store.requests)
 
 
 def test_azure_effect_diverts_fixed_schema_extra_and_publishes_good_rows() -> None:

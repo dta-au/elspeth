@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from azure.core.exceptions import ResourceNotFoundError
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -36,13 +37,9 @@ _CTX = RestrictedSinkEffectContext(
 )
 
 
-class ResourceNotFoundError(Exception):
-    pass
-
-
 class _Blob:
     def get_blob_properties(self) -> None:
-        raise ResourceNotFoundError
+        raise ResourceNotFoundError("missing")
 
 
 class _Container:

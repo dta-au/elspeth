@@ -73,6 +73,13 @@ if TYPE_CHECKING:
     from azure.storage.blob import ContainerClient
 
 
+def _azure_provider_exception_types() -> tuple[type[Exception], ...]:
+    """Declared Azure SDK and transport failures at the external seam."""
+    from azure.core.exceptions import AzureError
+
+    return (AzureError, ConnectionError, TimeoutError)
+
+
 class CSVWriteOptions(BaseModel):
     """CSV writing options."""
 
@@ -340,7 +347,7 @@ class AzureBlobSink(BaseSink):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b548036e53250b4a"
+    source_file_hash: str | None = "sha256:6aa3a0159afda371"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -468,29 +475,70 @@ class AzureBlobSink(BaseSink):
 
     @staticmethod
     def _is_missing(error: BaseException) -> bool:
-        return type(error).__name__ == "ResourceNotFoundError" or getattr(error, "status_code", None) == 404
+        from azure.core.exceptions import ResourceNotFoundError
+
+        return isinstance(error, ResourceNotFoundError)
 
     @staticmethod
     def _observation_from_properties(properties: object) -> RemoteObjectObservation:
-        size = getattr(properties, "size", None)
-        etag = getattr(properties, "etag", None)
-        metadata_value = getattr(properties, "metadata", None)
-        metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
-        content_hash = metadata.get("elspeth_content_sha256")
-        effect_id = metadata.get("elspeth_effect_id")
-        plan_hash = metadata.get("elspeth_plan_hash")
-        protocol_version = metadata.get("elspeth_protocol_version")
-        content_settings = getattr(properties, "content_settings", None)
-        content_md5 = getattr(content_settings, "content_md5", None)
-        checksum_b64 = base64.b64encode(content_md5).decode("ascii") if isinstance(content_md5, (bytes, bytearray)) else None
+        from azure.storage.blob import BlobProperties, ContentSettings
+
+        if not isinstance(properties, BlobProperties):
+            raise TypeError("Azure get_blob_properties violated its BlobProperties contract")
+        size = properties.size
+        if type(size) is not int or size < 0:
+            raise RemoteObjectPreconditionError("Azure blob properties contain an invalid size")
+        etag = properties.etag
+        if type(etag) is not str or not etag:
+            raise RemoteObjectPreconditionError("Azure blob properties contain an invalid etag")
+
+        metadata_value: object = properties.metadata
+        if metadata_value is None:
+            metadata: Mapping[str, str] = {}
+        elif isinstance(metadata_value, Mapping) and all(type(key) is str and type(value) is str for key, value in metadata_value.items()):
+            metadata = metadata_value
+        else:
+            raise RemoteObjectPreconditionError("Azure blob properties contain invalid metadata")
+
+        def optional_metadata(key: str) -> str | None:
+            if key not in metadata:
+                return None
+            value = metadata[key]
+            if not value:
+                raise RemoteObjectPreconditionError(f"Azure blob metadata {key!r} is empty")
+            return value
+
+        content_hash = optional_metadata("elspeth_content_sha256")
+        effect_id = optional_metadata("elspeth_effect_id")
+        plan_hash = optional_metadata("elspeth_plan_hash")
+        protocol_version = optional_metadata("elspeth_protocol_version")
+
+        content_settings = properties.content_settings
+        if not isinstance(content_settings, ContentSettings):
+            raise RemoteObjectPreconditionError("Azure blob properties contain invalid content settings")
+        raw_content_md5: object = content_settings.content_md5
+        content_md5: bytes | None
+        if raw_content_md5 is None:
+            content_md5 = None
+        elif type(raw_content_md5) is bytes:
+            content_md5 = raw_content_md5
+        elif type(raw_content_md5) is bytearray:
+            content_md5 = bytes(raw_content_md5)
+        else:
+            raise RemoteObjectPreconditionError("Azure blob properties contain an invalid content MD5")
+        if content_md5 is not None and len(content_md5) != 16:
+            raise RemoteObjectPreconditionError("Azure blob properties contain an invalid content MD5")
+        checksum_b64 = None
+        if content_md5 is not None:
+            checksum_b64 = base64.b64encode(content_md5).decode("ascii")
         return RemoteObjectObservation(
             exists=True,
-            etag=etag if isinstance(etag, str) and etag else None,
-            content_hash=content_hash if isinstance(content_hash, str) else None,
-            size_bytes=size if type(size) is int and size >= 0 else None,
-            effect_id=effect_id if isinstance(effect_id, str) else None,
-            plan_hash=plan_hash if isinstance(plan_hash, str) else None,
-            protocol_version=protocol_version if isinstance(protocol_version, str) else None,
+            etag=etag,
+            content_hash=content_hash,
+            size_bytes=size,
+            effect_id=effect_id,
+            plan_hash=plan_hash,
+            protocol_version=protocol_version,
             checksum_algorithm="md5" if checksum_b64 is not None else None,
             checksum_b64=checksum_b64,
         )
@@ -498,9 +546,7 @@ class AzureBlobSink(BaseSink):
     def _observe_effect_target(self, blob_path: str) -> RemoteObjectObservation:
         try:
             properties = self._get_container_client().get_blob_client(blob_path).get_blob_properties()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as error:
+        except _azure_provider_exception_types() as error:
             if self._is_missing(error):
                 return RemoteObjectObservation(False, None, None, None)
             raise RemoteObjectPreconditionError("Azure blob inspection failed before effect dispatch") from None
@@ -569,17 +615,18 @@ class AzureBlobSink(BaseSink):
         content = self._serialize_rows(rows)
         evidence = request.inspection.evidence
         predecessor: ArtifactDescriptor | None = None
-        if evidence.get("predecessor_declared") is True:
-            observed_hash = evidence.get("observed_content_hash")
-            observed_size = evidence.get("observed_size")
-            if not isinstance(observed_hash, str) or type(observed_size) is not int:
-                raise RemoteObjectPreconditionError("Azure predecessor inspection lacks exact content identity")
+        predecessor_declared = evidence["predecessor_declared"]
+        if predecessor_declared is True:
+            observed_hash = cast("str", evidence["observed_content_hash"])
+            observed_size = cast("int", evidence["observed_size"])
             predecessor = ArtifactDescriptor(
                 artifact_type="file",
                 path_or_uri=request.inspection.reference,
                 content_hash=observed_hash,
                 size_bytes=observed_size,
             )
+        elif predecessor_declared is not False:
+            raise RemoteObjectPreconditionError("Azure predecessor inspection declaration is invalid")
         return prepare_remote_object(
             effect_id=request.effect_id,
             provider="azure_blob",
@@ -603,7 +650,9 @@ class AzureBlobSink(BaseSink):
 
     @staticmethod
     def _is_conditional_failure(error: BaseException) -> bool:
-        return type(error).__name__ in {"ResourceExistsError", "ResourceModifiedError"} or getattr(error, "status_code", None) in {409, 412}
+        from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
+
+        return isinstance(error, (ResourceExistsError, ResourceModifiedError))
 
     def restage_effect(
         self,
@@ -651,8 +700,8 @@ class AzureBlobSink(BaseSink):
         from azure.storage.blob import ContentSettings
 
         content_settings = ContentSettings(content_md5=bytearray(base64.b64decode(evidence.checksum_b64, validate=True)))
-        try:
-            with stage.open("rb") as body:
+        with stage.open("rb") as body:
+            try:
                 if evidence.precondition == "if_none_match":
                     blob_client.upload_blob(
                         body,
@@ -674,12 +723,10 @@ class AzureBlobSink(BaseSink):
                         content_settings=content_settings,
                         validate_content=True,
                     )
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as error:
-            if self._is_conditional_failure(error):
-                raise RemoteObjectPreconditionError("Azure conditional blob upload was rejected") from None
-            raise RemoteObjectEffectError("Azure blob upload outcome is unknown; reconciliation is required") from None
+            except _azure_provider_exception_types() as error:
+                if self._is_conditional_failure(error):
+                    raise RemoteObjectPreconditionError("Azure conditional blob upload was rejected") from None
+                raise RemoteObjectEffectError("Azure blob upload outcome is unknown; reconciliation is required") from None
         return remote_commit_result(plan, evidence)
 
     def reconcile_effect(
