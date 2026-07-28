@@ -182,6 +182,13 @@ class _PrecomputedDivertingSink(_CumulativeObservableSink):
             safe_evidence={
                 **dict(plan.safe_evidence),
                 "accepted_ordinals": [0],
+                "diversion_attribution": [
+                    {
+                        "error_hash": "b" * 16,
+                        "ordinal": 1,
+                        "reason_hash": "a" * 64,
+                    }
+                ],
                 "diverted_ordinals": [1],
             },
         )
@@ -249,6 +256,13 @@ class _ResultDerivedReconciledSink(_CumulativeObservableSink):
                     "path_or_uri": descriptor.path_or_uri,
                     "size_bytes": descriptor.size_bytes,
                 },
+                "diversion_attribution": [
+                    {
+                        "error_hash": "b" * 16,
+                        "ordinal": 1,
+                        "reason_hash": "a" * 64,
+                    }
+                ],
                 "diverted_ordinals": [1],
             },
             accepted_ordinals=(0,),
