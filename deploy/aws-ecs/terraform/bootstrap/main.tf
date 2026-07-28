@@ -152,6 +152,14 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
   }
 
   statement {
+    # Bucket-level (not object-level) resource: s3:ListBucket targets the bucket, and the
+    # runtime task policy needs it so a missing acceptance object reports 404, not 403.
+    sid       = "ListElspethBuckets"
+    actions   = ["s3:ListBucket"]
+    resources = ["arn:aws:s3:::elspeth-*"]
+  }
+
+  statement {
     sid     = "InvokeBedrockModels"
     actions = ["bedrock:InvokeModel"]
     resources = [

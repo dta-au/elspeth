@@ -62,9 +62,24 @@ data "aws_iam_policy_document" "task" {
   }
 
   statement {
-    sid       = "InvokeConfiguredBedrockModels"
-    actions   = ["bedrock:InvokeModel"]
-    resources = concat(tolist(var.bedrock_inference_profile_arns), tolist(var.bedrock_foundation_model_arns))
+    # Unconditioned on purpose: S3 decides HeadObject/GetObject's missing-vs-forbidden response
+    # (404 vs 403) with an implicit ListBucket check that runs outside the triggering request's
+    # own context, so an s3:prefix condition here never matches and the object 403 persists. The
+    # statement stays narrowly scoped because it names only this run's own disposable bucket, not
+    # a wildcard bucket pattern.
+    sid       = "ListAcceptanceBucket"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.acceptance.arn]
+  }
+
+  statement {
+    sid     = "InvokeConfiguredBedrockModels"
+    actions = ["bedrock:InvokeModel"]
+    resources = concat(
+      tolist(var.bedrock_inference_profile_arns),
+      tolist(var.bedrock_foundation_model_arns),
+      local.bedrock_cross_region_foundation_model_arns,
+    )
   }
 
   statement {

@@ -102,6 +102,15 @@ def _hcl_variable_names(text: str) -> frozenset[str]:
     return frozenset(re.findall(r'^variable "([^"]+)"', text, re.MULTILINE))
 
 
+def _statement_body(text: str, sid: str) -> str:
+    """Slice one `statement { ... }` block by its `sid`, tolerant of fmt's column alignment."""
+
+    match = re.search(rf'sid\s*=\s*"{re.escape(sid)}"', text)
+    assert match is not None, f"statement not found: {sid}"
+    end = text.index("statement {", match.start())
+    return text[match.start() : end]
+
+
 def test_package_contains_only_the_supported_source_and_operator_inputs() -> None:
     actual = {path.relative_to(PACKAGE).as_posix() for path in _source_files()}
     assert actual == EXPECTED_FILES
@@ -296,6 +305,59 @@ def test_bedrock_composer_uses_the_task_role_without_static_credentials() -> Non
     assert "var.bedrock_inference_profile_arns" in iam
     assert "var.bedrock_foundation_model_arns" in iam
     assert '"Resource" = ["*"]' not in iam
+
+
+def test_cross_region_bedrock_profile_gets_wildcard_region_foundation_model_grant() -> None:
+    module_locals = _text("modules/scenario/locals.tf")
+    iam = _text("modules/scenario/iam_observability.tf")
+
+    # A cross-region ("global."/"us."/"eu."/"apac.") composer_model or composer_advisor_model
+    # profile is authorized by Bedrock against the underlying foundation model in whichever
+    # region it routes to, and that authorization check reports a region-less resource ARN. A
+    # single region-pinned foundation-model grant can never match that check, so the module must
+    # derive a wildcard-region grant for every configured model that carries one of these
+    # prefixes.
+    assert re.search(r'bedrock_cross_region_prefixes\s*=\s*\["global\.", "us\.", "eu\.", "apac\."\]', module_locals)
+    assert re.search(r'trimprefix\(var\.composer_model, "bedrock/"\)', module_locals)
+    assert re.search(r'trimprefix\(var\.composer_advisor_model, "bedrock/"\)', module_locals)
+    assert "bedrock_cross_region_foundation_model_arns" in module_locals
+    assert '"arn:aws:bedrock:*::foundation-model/${trimprefix(model_id, prefix)}"' in module_locals
+
+    bedrock_statement = _statement_body(iam, "InvokeConfiguredBedrockModels")
+    # Retention: the region-pinned inference-profile and foundation-model grants must stay —
+    # the wildcard grant is additive, not a replacement.
+    assert "var.bedrock_inference_profile_arns" in bedrock_statement
+    assert "var.bedrock_foundation_model_arns" in bedrock_statement
+    assert "local.bedrock_cross_region_foundation_model_arns" in bedrock_statement
+
+    # The runtime task-role grant alone is not enough: it is intersected with the run-scoped
+    # permissions boundary bootstrap creates, so the boundary must independently allow the same
+    # wildcard-region foundation-model resource or the effective permission is still denied.
+    bootstrap = _text("bootstrap/main.tf")
+    assert '"arn:aws:bedrock:*::foundation-model/*"' in bootstrap
+
+
+def test_task_role_can_list_the_acceptance_bucket_so_head_object_can_report_missing() -> None:
+    iam = _text("modules/scenario/iam_observability.tf")
+    bootstrap = _text("bootstrap/main.tf")
+
+    # Without bucket-scoped s3:ListBucket, S3 cannot distinguish "object does not exist" from
+    # "caller lacks permission" and returns 403 uniformly, which the acceptance harness's missing
+    # -object check does not recognize as "not created yet." Grant ListBucket scoped to this
+    # run's own acceptance bucket.
+    assert '"s3:ListBucket"' in iam
+    list_bucket_statement = _statement_body(iam, "ListAcceptanceBucket")
+    assert '"s3:ListBucket"' in list_bucket_statement
+    assert "aws_s3_bucket.acceptance.arn" in list_bucket_statement
+    # No s3:prefix (or any other) condition: S3 evaluates the missing-vs-forbidden outcome for
+    # HeadObject/GetObject with an implicit ListBucket check that runs outside the triggering
+    # request's own context, so a condition here would never match and 403 would persist.
+    assert "condition" not in list_bucket_statement
+
+    # Same boundary-intersection requirement as the Bedrock grant: bucket-level (not
+    # object-level) ListBucket must also be allowed by the permissions boundary.
+    assert '"arn:aws:s3:::elspeth-*"' in bootstrap
+    assert re.search(r'actions\s*=\s*\["s3:ListBucket"\]', bootstrap)
 
 
 def test_composer_boot_probe_exercises_primary_and_advisor_models() -> None:

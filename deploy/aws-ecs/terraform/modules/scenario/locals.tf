@@ -102,6 +102,35 @@ locals {
     prompt_shield  = "required"
     content_safety = "required"
   })
+  # A cross-region ("global."/"us."/"eu."/"apac.") inference profile is authorized by Bedrock
+  # against the underlying foundation model in whichever region it actually routes to, and that
+  # authorization check reports a region-less resource ARN. A single region-pinned
+  # foundation-model grant never matches that check, so derive an additional wildcard-region
+  # grant for every configured Composer model (primary and advisor) that carries one of these
+  # prefixes; a non-cross-region model keeps relying solely on the region-pinned ARNs supplied
+  # in var.bedrock_foundation_model_arns.
+  bedrock_cross_region_prefixes = ["global.", "us.", "eu.", "apac."]
+
+  bedrock_configured_model_ids = distinct([
+    trimprefix(var.composer_model, "bedrock/"),
+    trimprefix(var.composer_advisor_model, "bedrock/"),
+  ])
+
+  # Map each configured model id to the cross-region prefix it starts with, or null if it is
+  # region-pinned. try() turns the index-out-of-bounds error from an empty match list into null.
+  bedrock_configured_model_cross_region_prefixes = {
+    for model_id in local.bedrock_configured_model_ids : model_id => try(
+      [for prefix in local.bedrock_cross_region_prefixes : prefix if startswith(model_id, prefix)][0],
+      null,
+    )
+  }
+
+  bedrock_cross_region_foundation_model_arns = distinct([
+    for model_id, prefix in local.bedrock_configured_model_cross_region_prefixes :
+    "arn:aws:bedrock:*::foundation-model/${trimprefix(model_id, prefix)}"
+    if prefix != null
+  ])
+
   bedrock_litellm_model = var.composer_model
   llm_profiles = jsonencode({
     tutorial = {

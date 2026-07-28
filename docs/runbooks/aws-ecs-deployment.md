@@ -2095,9 +2095,19 @@ the exact filesystem/access point; `ClientRootAccess` needs separate approval.
 
 ## Bedrock, Guardrails, and S3 task-role shape
 
-Grant the runtime task role resource-scoped `bedrock:InvokeModel`. Configure
-the ordinary `region_name` and a `bedrock/anthropic...` model identifier; do
-not embed AWS keys. For the two run-scoped Guardrails, grant resource-scoped
+Grant the runtime task role resource-scoped `bedrock:InvokeModel`. Whichever
+of Composer primary/advisor is a cross-region (`global.`/`us.`/`eu.`/`apac.`)
+inference-profile model also needs a wildcard-region foundation-model grant
+(`arn:aws:bedrock:*::foundation-model/<base-model-id>`) alongside the
+region-pinned inference-profile ARN, because Bedrock authorizes the
+underlying foundation-model call in whichever region the profile actually
+routes to and reports that check against a region-less resource ARN; a
+single region-pinned foundation-model grant does not match it. The
+run-scoped permissions boundary must independently allow the same
+wildcard-region resource — a task-role grant the boundary does not also
+allow is intersected away to nothing. Configure the ordinary `region_name`
+and a `bedrock/anthropic...` model identifier; do not embed AWS keys. For
+the two run-scoped Guardrails, grant resource-scoped
 `bedrock:ApplyGuardrail` and grant `bedrock:GetGuardrail` only if the approved
 preflight uses it. Terraform creates two acceptance-run-tagged Guardrails,
 publishes immutable numeric versions, injects private identifier/version/
@@ -2129,6 +2139,14 @@ disposable acceptance role additionally gets `s3:DeleteObject` only for
 `ELSPETH_ACCEPTANCE_S3_BUCKET` plus its UUID-scoped
 `ELSPETH_ACCEPTANCE_S3_PREFIX`; the Plan 12 operator receives the same narrow
 cleanup backstop. Steady-state production does not inherit test-only delete.
+Also grant bucket-scoped `s3:ListBucket` on the acceptance bucket, and grant
+it unconditioned: without it S3 cannot distinguish a missing object from a
+forbidden one and `HeadObject` on a not-yet-existing key returns `403`
+instead of `404`, and a prefix condition on this statement never matches
+because S3 evaluates that missing-vs-forbidden check outside the triggering
+request's own context. The statement stays narrow because it names only
+this run's own disposable bucket, and the permissions boundary must grant
+the same bucket-level (not object-level) `s3:ListBucket` resource.
 
 For ECS Exec, grant exactly `ssmmessages:CreateControlChannel`,
 `ssmmessages:CreateDataChannel`, `ssmmessages:OpenControlChannel`, and

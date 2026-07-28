@@ -274,6 +274,18 @@ The ECS task role is the only Bedrock credential source. The package does not
 accept static AWS keys, a profile, a custom endpoint, a model gateway, or an
 AgentCore setting. Composer model names are ordinary non-secret environment
 values. `bedrock:InvokeModel` is limited to the ARNs supplied in tfvars.
+Whichever of `composer_model`/`composer_advisor_model` is a cross-region
+(`global.`/`us.`/`eu.`/`apac.`) profile also needs a wildcard-region
+foundation-model grant (`arn:aws:bedrock:*::foundation-model/<base-model-id>`)
+alongside the region-pinned inference-profile ARN, because Bedrock authorizes
+that call against the underlying foundation model in whichever region the
+profile actually routes to; the module derives this grant automatically, and
+the run-scoped permissions boundary already allows the matching wildcard
+resource so the grant is not intersected away. The task role also needs
+bucket-scoped, unconditioned `s3:ListBucket` on the acceptance bucket,
+because without it S3 cannot distinguish a missing object from a forbidden
+one and returns `403` instead of `404`; the boundary grants the matching
+bucket-level resource.
 
 Aurora creates one administrative database first, then the database bootstrap
 task creates independent `elspeth_session` and `elspeth_landscape` databases.
