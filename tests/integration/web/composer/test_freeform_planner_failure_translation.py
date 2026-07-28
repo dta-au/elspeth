@@ -64,6 +64,10 @@ _COMPLETE_MULTI_CLAUSE_REQUESTS = (
         "Build a pipeline that reads customers.csv and writes results.jsonl.",
         id="ordinary-source-and-sink-clauses",
     ),
+    pytest.param(
+        "Build a pipeline that reads customers.csv and splits rows by country. Do not do that with a generic transform.",
+        id="scoped-anaphoric-constraint",
+    ),
     *(
         pytest.param(json.loads(path.read_text(encoding="utf-8"))["intent"], id=f"parity-{path.stem}")
         for path in sorted(_PARITY_FIXTURE_DIR.glob("*.json"))
@@ -356,6 +360,8 @@ def _registered_recipe_request(*, envelope_insertion: str) -> str:
         "Build the pipeline. I changed my mind.",
         "Build the pipeline. On second thought, leave it.",
         "Build the pipeline. Actually, skip it.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Please do not do that.",
+        "Read the CSV documentation and explain how transforms work.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. It should not be built.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. I do not want you to build it.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel the request.",

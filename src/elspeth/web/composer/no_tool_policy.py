@@ -125,6 +125,14 @@ _MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR: Final = (
     rf"(?:(?:{_FIRST_PERSON_REQUEST_GRAMMAR})|(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?))?"
     rf"{_POSITIVE_LEAD_GRAMMAR}"
 )
+_DATA_SOURCE_FORMAT_GRAMMAR: Final = r"(?:csv|jsonl?|parquet)"
+_DATA_SOURCE_REFERENCE_GRAMMAR: Final = (
+    rf"(?:"
+    rf"[a-z0-9_./-]+\.{_DATA_SOURCE_FORMAT_GRAMMAR}\b|"
+    rf".+?\s+from\s+(?:(?:an?|the|named)\s+)*{_DATA_SOURCE_FORMAT_GRAMMAR}\b|"
+    rf".*?\b{_DATA_SOURCE_FORMAT_GRAMMAR}\s+(?:inputs?|files?|rows?)\b"
+    rf")(?=\s*(?:[,;:.]|\u2013|\u2014|\b(?:and|then)\b))"
+)
 _MULTI_CLAUSE_PIPELINE_BUILD_PATTERN: Final = re.compile(
     rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}"
     r"(?:build|create|make)\s+(?:a|an|the|this)\s+"
@@ -133,7 +141,7 @@ _MULTI_CLAUSE_PIPELINE_BUILD_PATTERN: Final = re.compile(
     re.IGNORECASE,
 )
 _MULTI_CLAUSE_PIPELINE_READ_PATTERN: Final = re.compile(
-    rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}read\s+.+?\b(?:csv|jsonl?|parquet)\b.+",
+    rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}read\s+{_DATA_SOURCE_REFERENCE_GRAMMAR}.+",
     re.IGNORECASE,
 )
 _MULTI_CLAUSE_PIPELINE_OPERATION_PATTERN: Final = re.compile(
@@ -143,6 +151,7 @@ _MULTI_CLAUSE_PIPELINE_OPERATION_PATTERN: Final = re.compile(
 _REQUEST_REVOCATION_PATTERN: Final = re.compile(
     rf"(?:"
     rf"\b(?:do\s+not|don't|never)\s+{_MUTATION_ACTION_PATTERN}\b|"
+    r"\b(?:do\s+not|don't|never)\s+do\s+(?:that|this|it|so)\s*(?:[.!;]|$)|"
     rf"\b(?:do\s+not|don't)\s+want\s+(?:you\s+)?to\s+{_MUTATION_ACTION_PATTERN}\b|"
     r"\b(?:actually,\s*)?(?:do\s+not|don't)\s*(?:[.!;]|$)|"
     r"\bshould\s+not\s+be\s+(?:built|created|made|run|executed)\b|"
