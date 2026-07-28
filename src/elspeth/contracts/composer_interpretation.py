@@ -260,33 +260,46 @@ class InterpretationEventRecord:
     def _validate_source_shape(self) -> None:
         missing_required_fields: list[str] = []
         non_null_fields: list[str] = []
+        surface_fields = (
+            ("composition_state_id", self.composition_state_id),
+            ("affected_node_id", self.affected_node_id),
+            ("tool_call_id", self.tool_call_id),
+            ("user_term", self.user_term),
+            ("llm_draft", self.llm_draft),
+        )
+        kind_field = (("kind", self.kind),)
+        llm_provenance_fields = (
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+            ("composer_skill_hash", self.composer_skill_hash),
+        )
+        shape_fields = (*surface_fields, *kind_field, *llm_provenance_fields)
 
         if self.interpretation_source is InterpretationSource.USER_APPROVED:
-            missing_required_fields = [name for name in _INTERPRETATION_SHAPE_FIELDS if getattr(self, name) is None]
+            missing_required_fields = [name for name, value in shape_fields if value is None]
         elif self.interpretation_source is InterpretationSource.AUTO_INTERPRETED_OPT_OUT:
             if self.kind is None:
                 marker_null_fields = (
-                    *_INTERPRETATION_SURFACE_FIELDS,
-                    *_INTERPRETATION_LLM_PROVENANCE_FIELDS,
-                    "accepted_value",
-                    "arguments_hash",
-                    "hash_domain_version",
+                    *surface_fields,
+                    *llm_provenance_fields,
+                    ("accepted_value", self.accepted_value),
+                    ("arguments_hash", self.arguments_hash),
+                    ("hash_domain_version", self.hash_domain_version),
                 )
-                non_null_fields = [name for name in marker_null_fields if getattr(self, name) is not None]
+                non_null_fields = [name for name, value in marker_null_fields if value is not None]
             else:
                 surface_opt_out_required_fields = (
-                    *_INTERPRETATION_SURFACE_FIELDS,
-                    *_INTERPRETATION_LLM_PROVENANCE_FIELDS,
-                    "accepted_value",
-                    "arguments_hash",
-                    "hash_domain_version",
+                    *surface_fields,
+                    *llm_provenance_fields,
+                    ("accepted_value", self.accepted_value),
+                    ("arguments_hash", self.arguments_hash),
+                    ("hash_domain_version", self.hash_domain_version),
                 )
-                missing_required_fields = [name for name in surface_opt_out_required_fields if getattr(self, name) is None]
+                missing_required_fields = [name for name, value in surface_opt_out_required_fields if value is None]
         elif self.interpretation_source is InterpretationSource.AUTO_INTERPRETED_NO_SURFACES:
-            non_null_fields = [name for name in _INTERPRETATION_SURFACE_FIELDS if getattr(self, name) is not None]
-            missing_required_fields = [
-                name for name in (*_INTERPRETATION_KIND_FIELD, *_INTERPRETATION_LLM_PROVENANCE_FIELDS) if getattr(self, name) is None
-            ]
+            non_null_fields = [name for name, value in surface_fields if value is not None]
+            missing_required_fields = [name for name, value in (*kind_field, *llm_provenance_fields) if value is None]
 
         if missing_required_fields or non_null_fields:
             raise ValueError(

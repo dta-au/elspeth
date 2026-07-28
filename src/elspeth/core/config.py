@@ -1314,19 +1314,19 @@ class LandscapeExportSettings(BaseModel):
                 raise ValueError("hmac_sha256 signing requires a signing secret reference")
 
         required = (
-            "total_record_limit",
-            "total_byte_limit",
-            "chunk_limit",
-            "per_chunk_record_limit",
-            "per_chunk_byte_limit",
-            "spool_root",
-            "content_store",
+            ("total_record_limit", self.total_record_limit),
+            ("total_byte_limit", self.total_byte_limit),
+            ("chunk_limit", self.chunk_limit),
+            ("per_chunk_record_limit", self.per_chunk_record_limit),
+            ("per_chunk_byte_limit", self.per_chunk_byte_limit),
+            ("spool_root", self.spool_root),
+            ("content_store", self.content_store),
         )
         if self.enabled:
-            missing = [name for name in required if getattr(self, name) is None]
+            missing = [name for name, value in required if value is None]
             if missing:
                 raise ValueError(f"enabled audit export requires explicit fields: {', '.join(missing)}")
-        if all(getattr(self, name) is not None for name in required):
+        if all(value is not None for _name, value in required):
             assert self.total_record_limit is not None
             assert self.total_byte_limit is not None
             assert self.chunk_limit is not None

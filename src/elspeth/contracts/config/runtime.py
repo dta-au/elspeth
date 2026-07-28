@@ -204,8 +204,12 @@ class RuntimeRetryConfig:
         from what the user configured, violating auditability.
         """
         require_int(self.max_attempts, "max_attempts", min_value=1)
-        for field_name in ("base_delay", "max_delay", "jitter", "exponential_base"):
-            value = getattr(self, field_name)
+        for field_name, value in (
+            ("base_delay", self.base_delay),
+            ("max_delay", self.max_delay),
+            ("jitter", self.jitter),
+            ("exponential_base", self.exponential_base),
+        ):
             if not math.isfinite(value):
                 raise ValueError(f"{field_name} must be finite, got {value!r}")
         if self.base_delay < 0.01:

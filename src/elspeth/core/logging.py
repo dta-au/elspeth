@@ -108,7 +108,17 @@ def configure_logging(
         color_output: If True, force ANSI colors in console output. If False,
             disable them. If None, auto-detect from stdout interactivity.
     """
-    log_level = getattr(logging, level.upper())
+    normalized_level = level.upper()
+    if normalized_level == "DEBUG":
+        log_level = logging.DEBUG
+    elif normalized_level == "INFO":
+        log_level = logging.INFO
+    elif normalized_level == "WARNING":
+        log_level = logging.WARNING
+    elif normalized_level == "ERROR":
+        log_level = logging.ERROR
+    else:
+        raise ValueError(f"Unsupported log level {level!r}; expected DEBUG, INFO, WARNING, or ERROR")
     use_colors = sys.stdout.isatty() if color_output is None else color_output
 
     # Shared processors applied to ALL log records (structlog and stdlib)

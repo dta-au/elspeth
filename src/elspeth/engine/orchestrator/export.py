@@ -247,20 +247,20 @@ def export_landscape(
             )
         else:
             audit_safe_config = sanitize_node_config_for_audit(dict(sink.config), plugin_name=sink.name)
-            expected_provenance = {
-                "plugin_name": sink.name,
-                "node_type": NodeType.SINK,
-                "plugin_version": sink.plugin_version,
-                "determinism": Determinism.IO_WRITE,
-                "config_hash": stable_hash(audit_safe_config),
-                "config_json": canonical_json(audit_safe_config),
-                "source_file_hash": sink.source_file_hash,
-                "schema_hash": None,
-                "sequence_in_pipeline": None,
-                "schema_mode": "observed",
-                "schema_fields": None,
-            }
-            divergent_fields = [field for field, expected in expected_provenance.items() if getattr(existing_node, field) != expected]
+            provenance_fields = (
+                ("plugin_name", existing_node.plugin_name, sink.name),
+                ("node_type", existing_node.node_type, NodeType.SINK),
+                ("plugin_version", existing_node.plugin_version, sink.plugin_version),
+                ("determinism", existing_node.determinism, Determinism.IO_WRITE),
+                ("config_hash", existing_node.config_hash, stable_hash(audit_safe_config)),
+                ("config_json", existing_node.config_json, canonical_json(audit_safe_config)),
+                ("source_file_hash", existing_node.source_file_hash, sink.source_file_hash),
+                ("schema_hash", existing_node.schema_hash, None),
+                ("sequence_in_pipeline", existing_node.sequence_in_pipeline, None),
+                ("schema_mode", existing_node.schema_mode, "observed"),
+                ("schema_fields", existing_node.schema_fields, None),
+            )
+            divergent_fields = [field_name for field_name, observed, expected in provenance_fields if observed != expected]
             if divergent_fields:
                 raise AuditIntegrityError(
                     f"audit export node {sink.node_id!r} for run {run_id!r} is already registered "

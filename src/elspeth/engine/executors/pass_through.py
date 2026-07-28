@@ -143,7 +143,11 @@ class PassThroughDeclarationContract(DeclarationContract):
         # Direct attribute access, NOT getattr with default (CLAUDE.md
         # §Offensive Programming). A plugin missing passes_through_input
         # is a framework bug — let it crash.
-        return _require_bool_flag(plugin, attr_name="passes_through_input")
+        return _require_bool_flag(
+            plugin,
+            attr_name="passes_through_input",
+            value=plugin.passes_through_input,
+        )
 
     @implements_dispatch_site("post_emission_check")
     def post_emission_check(
@@ -163,7 +167,11 @@ class PassThroughDeclarationContract(DeclarationContract):
         verify_pass_through(
             input_fields=inputs.effective_input_fields,
             emitted_rows=outputs.emitted_rows,
-            can_drop_rows=_require_bool_flag(inputs.plugin, attr_name="can_drop_rows"),
+            can_drop_rows=_require_bool_flag(
+                inputs.plugin,
+                attr_name="can_drop_rows",
+                value=inputs.plugin.can_drop_rows,
+            ),
             static_contract=inputs.static_contract,
             transform_name=inputs.plugin.name,
             transform_node_id=transform_node_id,
@@ -190,7 +198,11 @@ class PassThroughDeclarationContract(DeclarationContract):
         verify_pass_through(
             input_fields=inputs.effective_input_fields,
             emitted_rows=outputs.emitted_rows,
-            can_drop_rows=_require_bool_flag(inputs.plugin, attr_name="can_drop_rows"),
+            can_drop_rows=_require_bool_flag(
+                inputs.plugin,
+                attr_name="can_drop_rows",
+                value=inputs.plugin.can_drop_rows,
+            ),
             static_contract=inputs.static_contract,
             transform_name=inputs.plugin.name,
             transform_node_id=transform_node_id,

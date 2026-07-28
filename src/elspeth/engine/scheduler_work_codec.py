@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from dataclasses import fields as dataclass_fields
 from typing import Protocol
 
 from elspeth.contracts import TokenInfo
@@ -115,7 +114,23 @@ class SchedulerWorkCodec:
     def ready_emission(self, item: WorkItem) -> BarrierEmission:
         """Build the READY continuation emission for an atomic barrier completion."""
         fields = self.ready_fields(item)
-        return BarrierEmission(**{field.name: getattr(fields, field.name) for field in dataclass_fields(ScheduledWorkFields)})
+        return BarrierEmission(
+            token_id=fields.token_id,
+            row_id=fields.row_id,
+            node_id=fields.node_id,
+            step_index=fields.step_index,
+            ingest_sequence=fields.ingest_sequence,
+            row_payload_json=fields.row_payload_json,
+            queue_key=fields.queue_key,
+            barrier_key=fields.barrier_key,
+            on_success_sink=fields.on_success_sink,
+            branch_name=fields.branch_name,
+            fork_group_id=fields.fork_group_id,
+            join_group_id=fields.join_group_id,
+            expand_group_id=fields.expand_group_id,
+            coalesce_node_id=fields.coalesce_node_id,
+            coalesce_name=fields.coalesce_name,
+        )
 
     def work_item_from_scheduler(self, scheduled: TokenWorkItem) -> WorkItem:
         """Rehydrate a scheduler work item from its durable payload snapshot."""
