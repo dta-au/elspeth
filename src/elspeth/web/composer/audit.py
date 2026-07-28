@@ -1119,7 +1119,7 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
 
     canonicalized: list[dict[str, Any]] = []
     for err in raw_errors[:_MAX_PYDANTIC_CAUSE_ERRORS]:
-        code = error_code(err.get("type"))
+        code = error_code(err["type"])
         loc = [
             (
                 "index"
@@ -1130,7 +1130,7 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
                 if position == 0
                 else "item"
             )
-            for position, piece in enumerate(err.get("loc", ())[:_MAX_PYDANTIC_CAUSE_LOC_DEPTH])
+            for position, piece in enumerate(err["loc"][:_MAX_PYDANTIC_CAUSE_LOC_DEPTH])
         ]
         canonicalized.append(
             {

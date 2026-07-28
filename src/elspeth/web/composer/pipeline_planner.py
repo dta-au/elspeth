@@ -24,6 +24,9 @@ from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast
 from uuid import UUID
 
 import structlog
+from litellm.exceptions import APIError as LiteLLMAPIError
+from litellm.exceptions import AuthenticationError as LiteLLMAuthError
+from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
@@ -138,8 +141,11 @@ class PlannerBudgetPolicy:
     max_cumulative_provider_cost: Decimal
 
     def __post_init__(self) -> None:
-        for name in ("max_total_provider_calls", "max_request_bytes", "max_completion_tokens"):
-            value = getattr(self, name)
+        for name, value in (
+            ("max_total_provider_calls", self.max_total_provider_calls),
+            ("max_request_bytes", self.max_request_bytes),
+            ("max_completion_tokens", self.max_completion_tokens),
+        ):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive exact integer")
         if type(self.max_cumulative_provider_cost) is not Decimal:
@@ -179,10 +185,12 @@ class PlannerModelConfig:
     escape_hatch_provider: str | None = None
 
     def __post_init__(self) -> None:
-        for name in ("model_identifier", "provider"):
-            value = getattr(self, name)
-            if type(value) is not str or not value.strip():
-                raise ValueError(f"{name} must be a non-empty exact string")
+        for string_field_name, string_value in (
+            ("model_identifier", self.model_identifier),
+            ("provider", self.provider),
+        ):
+            if type(string_value) is not str or not string_value.strip():
+                raise ValueError(f"{string_field_name} must be a non-empty exact string")
         if self.escape_hatch_model is not None and (type(self.escape_hatch_model) is not str or not self.escape_hatch_model.strip()):
             raise ValueError("escape_hatch_model must be a non-empty exact string or None")
         if self.escape_hatch_provider is not None and (
@@ -191,10 +199,14 @@ class PlannerModelConfig:
             raise ValueError("escape_hatch_provider must be a non-empty exact string or None")
         if (self.escape_hatch_model is None) != (self.escape_hatch_provider is None):
             raise ValueError("escape_hatch_model and escape_hatch_provider must be configured together")
-        for name in ("max_composition_turns", "max_discovery_turns", "max_tool_calls_per_turn", "max_api_attempts"):
-            value = getattr(self, name)
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"{name} must be a positive exact integer")
+        for integer_field_name, integer_value in (
+            ("max_composition_turns", self.max_composition_turns),
+            ("max_discovery_turns", self.max_discovery_turns),
+            ("max_tool_calls_per_turn", self.max_tool_calls_per_turn),
+            ("max_api_attempts", self.max_api_attempts),
+        ):
+            if type(integer_value) is not int or integer_value <= 0:
+                raise ValueError(f"{integer_field_name} must be a positive exact integer")
         if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, int | float):
             raise TypeError("timeout_seconds must be a finite positive number")
         if not math.isfinite(float(self.timeout_seconds)) or self.timeout_seconds <= 0:
@@ -213,14 +225,12 @@ class PlannerOriginatingMessage:
     user_id: str | None
 
     def __post_init__(self) -> None:
-        for name in ("session_id",):
-            value = getattr(self, name)
-            try:
-                parsed = UUID(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{name} must be a canonical UUID string") from exc
-            if str(parsed) != value:
-                raise ValueError(f"{name} must be a canonical UUID string")
+        try:
+            parsed = UUID(self.session_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session_id must be a canonical UUID string") from exc
+        if str(parsed) != self.session_id:
+            raise ValueError("session_id must be a canonical UUID string")
         if self.message_id is not None:
             try:
                 parsed_message_id = UUID(self.message_id)
@@ -309,7 +319,9 @@ class _PlannerAttemptTrail:
         planner_code: str | None = None,
         tool_calls: int = 0,
     ) -> None:
-        self.phase_counts[phase] = self.phase_counts.get(phase, 0) + 1
+        if phase not in self.phase_counts:
+            self.phase_counts[phase] = 0
+        self.phase_counts[phase] += 1
         rejection_codes = sorted(set(codes))
         if rejection_codes:
             self.rejection_history.append({"attempt": self.attempts, "outcome": outcome, "codes": rejection_codes})
@@ -360,8 +372,11 @@ class PipelinePlanResult:
         custody_result = cast(Any, self.custody_result)
         if type(custody_result) is not str or custody_result not in {"not_required", "ready"}:
             raise ValueError("custody_result must be 'not_required' or 'ready'")
-        for name in ("model_identifier", "model_version", "provider"):
-            value = getattr(self, name)
+        for name, value in (
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+        ):
             if type(value) is not str or not value.strip():
                 raise ValueError(f"{name} must be a non-empty exact string")
 
@@ -643,21 +658,15 @@ def _assistant_tool_calls_message(message: Any, calls: tuple[_ParsedToolCall, ..
 
 def _feedback_error_codes(feedback: Mapping[str, Any]) -> tuple[str, ...]:
     """Extract the closed error codes from a structural feedback envelope."""
-    validation = feedback.get("validation")
-    if not isinstance(validation, Mapping):
-        return ()
-    errors = validation.get("errors")
-    if not isinstance(errors, list | tuple):
-        return ()
-    return tuple(entry["error_code"] for entry in errors if isinstance(entry, Mapping) and isinstance(entry.get("error_code"), str))
+    validation = cast(Mapping[str, Any], feedback["validation"])
+    errors = cast(list[Mapping[str, Any]], validation["errors"])
+    return tuple(cast(str, entry["error_code"]) for entry in errors)
 
 
 def _transform_node_count(pipeline: Mapping[str, Any]) -> int:
     """Count transform/aggregation nodes in a planner-authored pipeline dict."""
-    nodes = pipeline.get("nodes")
-    if not isinstance(nodes, list):
-        return 0
-    return sum(1 for node in nodes if isinstance(node, dict) and node.get("node_type") in ("transform", "aggregation"))
+    nodes = cast(list[Mapping[str, Any]], pipeline["nodes"])
+    return sum(1 for node in nodes if node["node_type"] in ("transform", "aggregation"))
 
 
 def _nodeless_revision_rejection(state: CompositionState) -> ToolResult:
@@ -754,9 +763,7 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
             # exist.
             if reachability_facts is None:
                 reachability_facts = coalesce_reachability_facts(result.updated_state)
-            connectivity = reachability_facts.get(entry.component.removeprefix("node:"))
-            if connectivity is not None:
-                projected["connectivity"] = connectivity
+            projected["connectivity"] = reachability_facts[entry.component.removeprefix("node:")]
         if entry.contract is not None:
             # Structured contract facts: producer/consumer component ids and
             # schema FIELD NAMES from validated contract config — pipeline
@@ -1537,6 +1544,32 @@ async def _plan_pipeline_inner(
             raise PipelinePlannerError("planner request byte budget exhausted", code="REQUEST_BYTES_EXHAUSTED")
         await emit_progress(lifecycle.progress, model_call_progress_event(intent))
 
+        def record_provider_failure(
+            exc: BaseException,
+            status: ComposerLLMCallStatus,
+            *,
+            started_at: datetime,
+            started_ns: int,
+            ordinal: int,
+        ) -> None:
+            failed_call = build_llm_call_record(
+                model_requested=effective_model,
+                messages=marked_messages,
+                tools=marked_tools,
+                status=status,
+                started_at=started_at,
+                started_ns=started_ns,
+                temperature=model_config.temperature,
+                seed=model_config.seed,
+                error_class=type(exc).__name__,
+                error_message=type(exc).__name__,
+                max_completion_tokens_requested=budget_policy.max_completion_tokens,
+                planner_policy_hash=budget_policy.audit_hash,
+                planner_call_ordinal=ordinal,
+            )
+            _assert_planner_call_matches_manifest(failed_call, manifest, recorder)
+            recorder.record_llm_call(failed_call)
+
         for attempt in range(1, model_config.max_api_attempts + 1):
             if total_calls >= budget_policy.max_total_provider_calls:
                 raise PipelinePlannerError("planner provider call budget exhausted", code="PROVIDER_CALLS_EXHAUSTED")
@@ -1564,6 +1597,7 @@ async def _plan_pipeline_inner(
                 kwargs["temperature"] = model_config.temperature
             if model_config.seed is not None:
                 kwargs["seed"] = model_config.seed
+
             try:
                 response = await asyncio.wait_for(model_config.completion(**kwargs), timeout=remaining)
             except asyncio.CancelledError as exc:
@@ -1604,38 +1638,39 @@ async def _plan_pipeline_inner(
                 _assert_planner_call_matches_manifest(timed_out_call, manifest, recorder)
                 recorder.record_llm_call(timed_out_call)
                 raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT") from exc
-            except Exception as exc:
-                from litellm.exceptions import APIError as LiteLLMAPIError
-                from litellm.exceptions import AuthenticationError as LiteLLMAuthError
-                from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
-
-                status = ComposerLLMCallStatus.API_ERROR
-                if isinstance(exc, LiteLLMAuthError):
-                    status = ComposerLLMCallStatus.AUTH_ERROR
-                elif isinstance(exc, LiteLLMBadRequestError):
-                    status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
-                failed_call = build_llm_call_record(
-                    model_requested=effective_model,
-                    messages=marked_messages,
-                    tools=marked_tools,
-                    status=status,
+            except LiteLLMAuthError as exc:
+                record_provider_failure(
+                    exc,
+                    ComposerLLMCallStatus.AUTH_ERROR,
                     started_at=started_at,
                     started_ns=started_ns,
-                    temperature=model_config.temperature,
-                    seed=model_config.seed,
-                    error_class=type(exc).__name__,
-                    error_message=type(exc).__name__,
-                    max_completion_tokens_requested=budget_policy.max_completion_tokens,
-                    planner_policy_hash=budget_policy.audit_hash,
-                    planner_call_ordinal=ordinal,
+                    ordinal=ordinal,
                 )
-                _assert_planner_call_matches_manifest(failed_call, manifest, recorder)
-                recorder.record_llm_call(failed_call)
-                if (
-                    isinstance(exc, LiteLLMAPIError)
-                    and status is ComposerLLMCallStatus.API_ERROR
-                    and attempt < model_config.max_api_attempts
-                ):
+                raise PipelinePlannerError(
+                    f"planner provider call failed ({type(exc).__name__})",
+                    code="PROVIDER_ERROR",
+                ) from None
+            except LiteLLMBadRequestError as exc:
+                record_provider_failure(
+                    exc,
+                    ComposerLLMCallStatus.BAD_REQUEST_ERROR,
+                    started_at=started_at,
+                    started_ns=started_ns,
+                    ordinal=ordinal,
+                )
+                raise PipelinePlannerError(
+                    f"planner provider call failed ({type(exc).__name__})",
+                    code="PROVIDER_ERROR",
+                ) from None
+            except LiteLLMAPIError as exc:
+                record_provider_failure(
+                    exc,
+                    ComposerLLMCallStatus.API_ERROR,
+                    started_at=started_at,
+                    started_ns=started_ns,
+                    ordinal=ordinal,
+                )
+                if attempt < model_config.max_api_attempts:
                     retry_delay = model_config.api_retry_base_seconds * (2 ** (attempt - 1))
                     if retry_delay > 0:
                         await asyncio.sleep(min(retry_delay, max(0.0, deadline - asyncio.get_running_loop().time())))

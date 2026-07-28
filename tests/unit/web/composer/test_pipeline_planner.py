@@ -47,9 +47,11 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerOriginatingMessage,
     PlannerRequestLifecycle,
     _allowlisted_candidate_feedback,
+    _feedback_error_codes,
     _parse_response_tool_calls,
     _ParsedToolCall,
     _serialize_provider_discovery_result,
+    _transform_node_count,
     plan_pipeline,
     planner_tool_definitions,
 )
@@ -1238,7 +1240,15 @@ async def test_provider_side_call_input_mutation_is_detected_as_audit_integrity_
     ("provider_outcome", "expected_status"),
     (
         (_response(("emit_pipeline_proposal", {"pipeline": {}})), ComposerLLMCallStatus.SUCCESS),
-        (RuntimeError("provider unavailable"), ComposerLLMCallStatus.API_ERROR),
+        (
+            LiteLLMAPIError(
+                status_code=503,
+                message="provider unavailable",
+                llm_provider="test-provider",
+                model="anthropic/claude-planner",
+            ),
+            ComposerLLMCallStatus.API_ERROR,
+        ),
         (asyncio.CancelledError(), ComposerLLMCallStatus.CANCELLED),
     ),
 )
@@ -1291,6 +1301,26 @@ async def test_provider_input_mutation_is_audited_once_before_integrity_failure(
     assert audit_call.status is expected_status
     assert audit_call.messages_hash != manifest.rendered_prompt_hash
     assert audit_call.tools_spec_hash == manifest.effective_tool_hash
+
+
+@pytest.mark.asyncio
+async def test_unexpected_completion_exception_propagates_without_provider_audit(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    failure = RuntimeError("local completion adapter defect")
+    recorder = BufferingRecorder()
+
+    with pytest.raises(RuntimeError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=_ScriptedCompletion(failure),
+            recorder=recorder,
+        )
+
+    assert caught.value is failure
+    assert recorder.llm_calls == ()
 
 
 @pytest.mark.asyncio
@@ -2541,6 +2571,59 @@ def test_allowlisted_candidate_feedback_enriches_node_shape_codes() -> None:
     # because nothing told them the exact code string is the key. One static
     # line, no topology hints (mid-repair suggestions have derailed runs).
     assert feedback["guidance"] == ("To expand any code, call explain_validation_error with the exact code string.")
+
+
+@pytest.mark.parametrize(
+    "feedback",
+    (
+        {},
+        {"validation": {}},
+        {"validation": {"errors": [{}]}},
+    ),
+)
+def test_feedback_error_codes_rejects_malformed_internal_envelopes(feedback: dict[str, Any]) -> None:
+    with pytest.raises((KeyError, TypeError)):
+        _feedback_error_codes(feedback)
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    (
+        {},
+        {"nodes": [{}]},
+    ),
+)
+def test_transform_node_count_rejects_malformed_validated_pipeline(pipeline: dict[str, Any]) -> None:
+    with pytest.raises((KeyError, TypeError)):
+        _transform_node_count(pipeline)
+
+
+def test_coalesce_feedback_rejects_missing_internal_reachability_fact(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="node:coalesce_missing",
+                message="closed diagnostic",
+                severity="error",
+                error_code="coalesce_branch_unreachable",
+            ),
+        ),
+    )
+    monkeypatch.setattr(planner_module, "coalesce_reachability_facts", lambda _state: {})
+
+    with pytest.raises(KeyError, match="coalesce_missing"):
+        _allowlisted_candidate_feedback(
+            cast(
+                Any,
+                SimpleNamespace(
+                    validation=summary,
+                    updated_state=object(),
+                ),
+            )
+        )
 
 
 @pytest.mark.asyncio

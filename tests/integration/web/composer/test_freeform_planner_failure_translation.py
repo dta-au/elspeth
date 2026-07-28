@@ -29,6 +29,7 @@ from uuid import UUID
 
 import pytest
 import structlog
+from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import func, select
 
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -132,10 +133,15 @@ def _timeout_completion() -> Any:
 
 
 def _provider_error_completion() -> Any:
-    """An opaque provider crash — trips the PROVIDER_ERROR code."""
+    """A declared LiteLLM provider failure — trips the PROVIDER_ERROR code."""
 
     async def completion(**_kwargs: Any) -> _Response:
-        raise RuntimeError(f"provider unavailable {_PROVIDER_LEAK_SENTINEL}")
+        raise LiteLLMAPIError(
+            status_code=503,
+            message=f"provider unavailable {_PROVIDER_LEAK_SENTINEL}",
+            llm_provider="test-provider",
+            model="test/planner",
+        )
 
     return completion
 
@@ -468,7 +474,9 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
         # attempt lands as durable audit evidence alongside the terminal one.
         (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 1),
         (_timeout_completion, 504, "provider_timeout", "TIMEOUT", 1),
-        (_provider_error_completion, 503, "provider_unavailable", "PROVIDER_ERROR", 1),
+        # LiteLLM API errors are the declared retryable provider failure, so
+        # every configured physical attempt must be present in the audit.
+        (_provider_error_completion, 503, "provider_unavailable", "PROVIDER_ERROR", 3),
     ],
     ids=["malformed", "timeout", "provider_error"],
 )
