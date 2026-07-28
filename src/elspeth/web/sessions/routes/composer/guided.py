@@ -517,26 +517,42 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
     if inspection_facts is None:
         return None
     prefilled = build_step_1_source_prefill(plugin_hint, inspection_facts=inspection_facts)
-    path = prefilled.get("path")
-    if not isinstance(path, str):
+    if "path" not in prefilled:
         # A ready upload with incompatible inspected content is not the same
         # thing as no upload. Preserve the facts so the chat boundary can
         # acknowledge the file and report the type mismatch without asking a
         # provider to infer whether bytes arrived.
         return None, inspection_facts
-    schema = prefilled.get("schema")
-    options: dict[str, Any] = {"path": path}
-    if isinstance(schema, Mapping):
-        options["schema"] = dict(deep_thaw(schema))
-    on_validation_failure = prefilled.get("on_validation_failure")
-    if not isinstance(on_validation_failure, str) or not on_validation_failure:
-        on_validation_failure = "discard"
+    path = prefilled["path"]
+    if type(path) is not str or path == "":
+        raise InvariantError("source prefill path must be a non-empty exact str")
+    try:
+        schema = prefilled["schema"]
+    except KeyError as exc:
+        raise InvariantError("source prefill is missing required schema") from exc
+    if type(schema) is not dict:
+        raise InvariantError("source prefill schema must be an exact dict")
+    options: dict[str, Any] = {
+        "path": path,
+        "schema": dict(deep_thaw(schema)),
+    }
+    try:
+        on_validation_failure = prefilled["on_validation_failure"]
+    except KeyError as exc:
+        raise InvariantError("source prefill is missing required on_validation_failure") from exc
+    if type(on_validation_failure) is not str or on_validation_failure == "":
+        raise InvariantError("source prefill on_validation_failure must be a non-empty exact str")
+    observed_headers = inspection_facts.observed_headers
+    if observed_headers is None:
+        observed_columns: tuple[str, ...] = ()
+    else:
+        observed_columns = tuple(observed_headers)
     return (
         SourceResolved(
             name="source",
             plugin=plugin_hint,
             options=options,
-            observed_columns=tuple(inspection_facts.observed_headers or ()),
+            observed_columns=observed_columns,
             sample_rows=(),
             on_validation_failure=on_validation_failure,
         ),

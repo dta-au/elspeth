@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import shutil
 import uuid
 from datetime import UTC, datetime
-from typing import Any
 
 import pytest
 import structlog
@@ -258,14 +256,10 @@ class TestSessionCRUD:
             ``shutil.rmtree`` for the whole process during the test.
             Rebinding the ``shutil`` *name inside the service module's own
             namespace* keeps the failure local to the code path under test;
-            everything else delegates to the real module (the service module
-            only calls ``shutil.rmtree``).
+            the service path under test only requires ``shutil.rmtree``.
             """
 
             rmtree = staticmethod(fail_rmtree)
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(shutil, name)
 
         monkeypatch.setattr("elspeth.web.sessions.service.shutil", _FailingRmtreeShutil())
 

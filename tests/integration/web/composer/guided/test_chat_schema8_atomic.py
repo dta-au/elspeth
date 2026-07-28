@@ -22,6 +22,7 @@ from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, Compose
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.guided.chat_solver import Step1SourceChatResolution
+from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
@@ -533,6 +534,157 @@ def test_schema_form_uploaded_source_type_mismatch_is_acknowledged_without_provi
     assert replay.status_code == 200, replay.json()
     assert replay.json() == body
     assert _chat_operation_count(composer_test_client, session_id) == 1
+
+
+def test_matching_uploaded_source_missing_required_failure_policy_raises(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    uploaded = asyncio.run(
+        composer_test_client.app.state.blob_service.create_blob(
+            UUID(session_id),
+            "orders.csv",
+            b"order_id,total\n1,10\n",
+            "text/csv",
+            created_by="user",
+        )
+    )
+
+    def missing_policy_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
+        assert inspection_facts is not None
+        return {
+            "path": f"blob:{uploaded.id}",
+            "schema": {"mode": "observed"},
+        }
+
+    monkeypatch.setattr(guided_route, "build_step_1_source_prefill", missing_policy_prefill)
+
+    with pytest.raises(InvariantError, match="source prefill is missing required on_validation_failure"):
+        asyncio.run(
+            guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
+                message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
+                plugin_hint="csv",
+                blob_service=composer_test_client.app.state.blob_service,
+                session_id=UUID(session_id),
+            )
+        )
+
+
+@pytest.mark.parametrize("malformed_policy", [None, 0, ""])
+def test_matching_uploaded_source_malformed_failure_policy_raises(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_policy: object,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    uploaded = asyncio.run(
+        composer_test_client.app.state.blob_service.create_blob(
+            UUID(session_id),
+            "orders.csv",
+            b"order_id,total\n1,10\n",
+            "text/csv",
+            created_by="user",
+        )
+    )
+
+    def malformed_policy_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
+        assert inspection_facts is not None
+        return {
+            "path": f"blob:{uploaded.id}",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": malformed_policy,
+        }
+
+    monkeypatch.setattr(guided_route, "build_step_1_source_prefill", malformed_policy_prefill)
+
+    with pytest.raises(InvariantError, match="source prefill on_validation_failure must be a non-empty exact str"):
+        asyncio.run(
+            guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
+                message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
+                plugin_hint="csv",
+                blob_service=composer_test_client.app.state.blob_service,
+                session_id=UUID(session_id),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("prefill", "expected_field"),
+    [
+        (
+            {
+                "path": None,
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+            "path",
+        ),
+        (
+            {
+                "path": 0,
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+            "path",
+        ),
+        (
+            {
+                "path": "",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+            "path",
+        ),
+        (
+            {
+                "path": "blob:authoritative",
+                "on_validation_failure": "discard",
+            },
+            "schema",
+        ),
+        (
+            {
+                "path": "blob:authoritative",
+                "schema": None,
+                "on_validation_failure": "discard",
+            },
+            "schema",
+        ),
+    ],
+)
+def test_matching_uploaded_source_malformed_prefill_contract_raises(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    prefill: dict[str, object],
+    expected_field: str,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    asyncio.run(
+        composer_test_client.app.state.blob_service.create_blob(
+            UUID(session_id),
+            "orders.csv",
+            b"order_id,total\n1,10\n",
+            "text/csv",
+            created_by="user",
+        )
+    )
+
+    def malformed_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
+        assert inspection_facts is not None
+        return dict(prefill)
+
+    monkeypatch.setattr(guided_route, "build_step_1_source_prefill", malformed_prefill)
+
+    with pytest.raises(InvariantError, match=expected_field):
+        asyncio.run(
+            guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
+                message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
+                plugin_hint="csv",
+                blob_service=composer_test_client.app.state.blob_service,
+                session_id=UUID(session_id),
+            )
+        )
 
 
 def test_schema_form_source_plugin_reselection_rebuilds_form_and_preserves_ready_upload(
