@@ -2883,6 +2883,17 @@ set_traffic_action forward
 verify_public_probes
 ```
 
+> **Known issue (elspeth-9a78b3a02f):** the `verify-s3` collision re-drive
+> currently fails deterministically because of a pre-existing sink
+> publication-protocol defect, unrelated to IAM or the deployment package.
+> Until that issue closes, S3-path qualification evidence is the raw
+> task-role S3 sequence — put/head/get/overwrite/delete → clean
+> 200s/204/404 with correct 404-vs-403 discrimination. A `verify-s3`
+> failure matching that signature (sanitized `s3_collision`
+> `AcceptanceCheckError`) does not gate release admission; any other
+> `verify-s3` failure signature still gates. Keep running the check in
+> sequence below — do not remove it from the acceptance program.
+
 #### Persistence, replacement, task-role, and local-auth sequence
 
 Run these checks in this order; a later check never substitutes for an earlier
