@@ -68,6 +68,14 @@ def test_manifest_schema_and_scenario_inventory_modules_exist() -> None:
     assert importlib.util.find_spec("elspeth.web._aws_ecs_acceptance.scenario_inventory") is not None
 
 
+def test_bound_scenario_loader_fails_loudly_for_invalid_manifest_contract() -> None:
+    with pytest.raises(TypeError, match="not subscriptable"):
+        scenario_inventory._load_bound_scenario_inventory(
+            {"scenarios": None, "aws": {}},
+            "A",
+        )
+
+
 def test_manifest_and_inventory_owners_are_facade_reexports_by_identity() -> None:
     for name in (
         "_load_retained_evidence",
