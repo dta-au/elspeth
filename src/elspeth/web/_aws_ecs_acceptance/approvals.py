@@ -32,23 +32,22 @@ def _require_current_approval(
     approval_sha256: str,
     current: datetime,
 ) -> Mapping[str, object]:
+    approval_records = cast(list[Mapping[str, object]], approvals)
     matches = [
         approval
-        for approval in approvals
-        if isinstance(approval, Mapping)
-        and approval.get("scenario_id") == scenario_id
-        and approval.get("kind") == kind
-        and approval.get("plan_receipt_sha256") == plan_receipt_sha256
-        and approval.get("approval_sha256") == approval_sha256
+        for approval in approval_records
+        if approval["scenario_id"] == scenario_id
+        and approval["kind"] == kind
+        and approval["plan_receipt_sha256"] == plan_receipt_sha256
+        and approval["approval_sha256"] == approval_sha256
     ]
     if len(matches) != 1:
         raise AcceptanceCheckError("control_manifest_update")
     approval = matches[0]
     if current >= _control_timestamp(approval["expires_at"]):
         raise AcceptanceCheckError("approval_expired")
-    approval_path = approval["approval_path"]
-    expected_sha256 = approval["approval_sha256"]
-    assert isinstance(approval_path, str) and isinstance(expected_sha256, str)
+    approval_path = cast(str, approval["approval_path"])
+    expected_sha256 = cast(str, approval["approval_sha256"])
     document = _read_protected_document(Path(approval_path), check="approval_file")
     observed_sha256 = _sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     if observed_sha256 != expected_sha256:
@@ -124,15 +123,10 @@ def approval_verify(
         raise AcceptanceCheckError("approval_binding")
     manifest = _read_control_manifest(manifest_path)
     _require_mutable_control_manifest(manifest)
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, dict)
-    receipts = evidence["receipts"]
-    assert isinstance(receipts, list)
+    evidence = cast(dict[str, object], manifest["evidence"])
+    receipts = cast(list[dict[str, object]], evidence["receipts"])
     if not any(
-        isinstance(receipt, dict)
-        and receipt.get("scenario_id") == scenario_id
-        and receipt.get("kind") == kind
-        and receipt.get("receipt_sha256") == plan_receipt_hash
+        receipt["scenario_id"] == scenario_id and receipt["kind"] == kind and receipt["receipt_sha256"] == plan_receipt_hash
         for receipt in receipts
     ):
         raise AcceptanceCheckError("approval_binding")
@@ -181,9 +175,8 @@ def approval_verify(
         raise AcceptanceCheckError("approval_expired")
     signed = {key: value for key, value in approval.items() if key != "signature"}
     canonical = json.dumps(signed, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    signature = approval["signature"]
-    key_id = approval["key_id"]
-    assert isinstance(signature, str) and isinstance(key_id, str)
+    signature = cast(str, approval["signature"])
+    key_id = cast(str, approval["key_id"])
     try:
         verified = signature_verifier(canonical, signature, key_id)
     except Exception:
@@ -191,9 +184,8 @@ def approval_verify(
     if verified is not True:
         raise AcceptanceCheckError("approval_signature")
     approval_sha256 = _sha256(json.dumps(approval, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-    approvals = evidence["approvals"]
-    assert isinstance(approvals, list)
-    record = {
+    approvals = cast(list[dict[str, object]], evidence["approvals"])
+    record: dict[str, object] = {
         "scenario_id": scenario_id,
         "kind": kind,
         "plan_receipt_sha256": plan_receipt_hash,
@@ -205,13 +197,10 @@ def approval_verify(
     matches = [
         item
         for item in approvals
-        if isinstance(item, dict)
-        and item.get("scenario_id") == scenario_id
-        and item.get("kind") == kind
-        and item.get("plan_receipt_sha256") == plan_receipt_hash
+        if item["scenario_id"] == scenario_id and item["kind"] == kind and item["plan_receipt_sha256"] == plan_receipt_hash
     ]
     if matches:
-        comparable = {**record, "verified_at": matches[0].get("verified_at")}
+        comparable = {**record, "verified_at": matches[0]["verified_at"]}
         if matches != [comparable]:
             raise AcceptanceCheckError("approval_conflict")
         return approval_sha256
@@ -247,12 +236,10 @@ def approval_require_current(
     ):
         raise AcceptanceCheckError("approval_binding")
     manifest = _read_control_manifest(manifest_path)
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, Mapping)
-    approvals = evidence["approvals"]
-    assert isinstance(approvals, list)
+    evidence = cast(Mapping[str, object], manifest["evidence"])
+    approvals = cast(list[object], evidence["approvals"])
     _require_current_approval(
-        cast(list[object], approvals),
+        approvals,
         scenario_id=scenario_id,
         kind=kind,
         plan_receipt_sha256=plan_receipt_hash,

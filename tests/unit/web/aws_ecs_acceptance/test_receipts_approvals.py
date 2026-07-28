@@ -904,3 +904,15 @@ def test_approval_verify_uses_protected_ed25519_keyring_when_no_verifier_is_inje
     )
 
     assert len(approval_hash) == 64
+
+
+def test_current_approval_fails_loudly_for_corrupt_manifest_record() -> None:
+    with pytest.raises(KeyError, match="scenario_id"):
+        approvals_owner._require_current_approval(
+            [{}],
+            scenario_id="A",
+            kind="terraform-plan",
+            plan_receipt_sha256="a" * 64,
+            approval_sha256="b" * 64,
+            current=datetime(2026, 7, 14, 1, 7, tzinfo=UTC),
+        )

@@ -6,7 +6,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -90,33 +90,26 @@ def _receipt_store_locked(
     subject_sha256 = _sha256(subject_id.encode("utf-8"))
     manifest = _read_control_manifest(manifest_path)
     _require_mutable_control_manifest(manifest)
-    candidate_sha = manifest["candidate_sha"]
-    assert isinstance(candidate_sha, str)
+    candidate_sha = cast(str, manifest["candidate_sha"])
     expected_plugin_policy_binding_sha256: str | None = None
     expected_acceptance_run_id_sha256: str | None = None
     expected_cluster_id_sha256: str | None = None
     if kind == "connection-budget":
         inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-        values = inventory["values"]
-        acceptance_run_id = manifest["acceptance_run_id"]
-        assert isinstance(values, dict) and isinstance(acceptance_run_id, str)
-        cluster_id = values["DB_CLUSTER_IDENTIFIER"]
-        assert isinstance(cluster_id, str)
+        values = cast(dict[str, object], inventory["values"])
+        acceptance_run_id = cast(str, manifest["acceptance_run_id"])
+        cluster_id = cast(str, values["DB_CLUSTER_IDENTIFIER"])
         expected_acceptance_run_id_sha256 = _sha256(acceptance_run_id.encode("utf-8"))
         expected_cluster_id_sha256 = _sha256(cluster_id.encode("utf-8"))
     if kind == "verify-bedrock-guardrails":
         inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-        values = inventory["values"]
-        assert isinstance(values, dict)
-        binding = values["ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256"]
-        assert isinstance(binding, str)
+        values = cast(dict[str, object], inventory["values"])
+        binding = cast(str, values["ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256"])
         expected_plugin_policy_binding_sha256 = binding
     if kind == "compatibility-record":
         inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-        values = inventory["values"]
-        ecr = manifest["ecr"]
-        if not isinstance(values, dict) or not isinstance(ecr, dict) or not isinstance(document, Mapping):
-            raise AcceptanceCheckError("receipt_store_binding")
+        values = cast(dict[str, object], inventory["values"])
+        ecr = cast(dict[str, object], manifest["ecr"])
         previous = values["PREVIOUS_TASK_DEFINITION"] if scenario_id == "B" else ""
         rollback_doctor = values["ROLLBACK_DOCTOR_TASK_DEFINITION"] if scenario_id == "B" else ""
         baseline_tag = ecr["baseline_tag"] if scenario_id == "B" else ""
@@ -180,11 +173,9 @@ def _receipt_store_locked(
             write_check="receipt_store_write",
             parent_check="receipt_store_write",
         )
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, dict)
-    receipts = evidence["receipts"]
-    assert isinstance(receipts, list)
-    record = {
+    evidence = cast(dict[str, object], manifest["evidence"])
+    receipts = cast(list[dict[str, object]], evidence["receipts"])
+    record: dict[str, object] = {
         "scenario_id": scenario_id,
         "kind": kind,
         "subject_sha256": subject_sha256,
@@ -194,13 +185,10 @@ def _receipt_store_locked(
     matches = [
         item
         for item in receipts
-        if isinstance(item, dict)
-        and item.get("scenario_id") == scenario_id
-        and item.get("kind") == kind
-        and item.get("subject_sha256") == subject_sha256
+        if item["scenario_id"] == scenario_id and item["kind"] == kind and item["subject_sha256"] == subject_sha256
     ]
     if matches:
-        comparable = {**record, "stored_at": matches[0].get("stored_at")}
+        comparable = {**record, "stored_at": matches[0]["stored_at"]}
         if matches != [comparable]:
             raise AcceptanceCheckError("receipt_store_conflict")
         return receipt_sha256

@@ -9,6 +9,7 @@ import math
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta
+from typing import cast
 from urllib.parse import urlsplit
 
 import httpx
@@ -541,10 +542,9 @@ def extract_exec_receipt(
     if expected_plugin_policy_binding_sha256 is not None:
         if expected_check != "verify-bedrock-guardrails" or _SHA256_PATTERN.fullmatch(expected_plugin_policy_binding_sha256) is None:
             raise AcceptanceCheckError("plugin_policy_binding")
-        details = payload["details"]
-        assert isinstance(details, dict)
-        plugin_policy = details.get("plugin_policy")
-        if not isinstance(plugin_policy, Mapping) or plugin_policy.get("binding_sha256") != expected_plugin_policy_binding_sha256:
+        details = cast(dict[str, object], payload["details"])
+        plugin_policy = cast(Mapping[str, object], details["plugin_policy"])
+        if plugin_policy["binding_sha256"] != expected_plugin_policy_binding_sha256:
             raise AcceptanceCheckError("plugin_policy_binding")
     return payload
 
@@ -924,14 +924,12 @@ def _validate_stored_receipt(
     ):
         raise AcceptanceCheckError("receipt_store_binding")
     if expected_plugin_policy_binding_sha256 is not None:
-        details = receipt["details"]
-        assert isinstance(details, dict)
-        plugin_policy = details.get("plugin_policy")
+        details = cast(dict[str, object], receipt["details"])
+        plugin_policy = cast(Mapping[str, object], details["plugin_policy"])
         if (
             kind != "verify-bedrock-guardrails"
             or _SHA256_PATTERN.fullmatch(expected_plugin_policy_binding_sha256) is None
-            or not isinstance(plugin_policy, Mapping)
-            or plugin_policy.get("binding_sha256") != expected_plugin_policy_binding_sha256
+            or plugin_policy["binding_sha256"] != expected_plugin_policy_binding_sha256
         ):
             raise AcceptanceCheckError("receipt_store_binding")
     return receipt
