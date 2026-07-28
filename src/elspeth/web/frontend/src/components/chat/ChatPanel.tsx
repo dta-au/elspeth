@@ -1092,24 +1092,40 @@ export function ChatPanel({
   // from the reloaded ready blobs — without this, the chooser silently
   // disappears and the outgoing request omits source_blob_id even though
   // multiple ready blobs exist.
+  //
+  // A mid-session turn_token rotation while still parked on
+  // step_1_source/single_select (e.g. the planner reissuing the step) hits
+  // the same symptom: `current` is scoped to the old token and must be
+  // invalidated. The effect has no dependency on the state it sets, so if
+  // invalidation simply returned null, the re-derive above would only run
+  // on the NEXT dependency change (typically the next blobs poll) — the
+  // chooser would vanish despite ready blobs being available right now.
+  // Falling through to re-derive in this same pass closes that window. The
+  // re-derived set mirrors the remount recovery above: it presents ALL
+  // ready session blobs, not just the ones accumulated via uploads during
+  // the (now-superseded) turn — that is the intended recovery surface.
   useEffect(() => {
+    const deriveFromReadyBlobs = (): GuidedSourceBlobCandidateSet | null => {
+      if (
+        activeSessionId === null ||
+        guidedSession?.step !== "step_1_source" ||
+        guidedNextTurn?.type !== "single_select" ||
+        readyGuidedSourceBlobs.size === 0
+      ) {
+        return null;
+      }
+      const candidates = [...readyGuidedSourceBlobs.values()];
+      return {
+        sessionId: activeSessionId,
+        turnToken: guidedNextTurn.turn_token,
+        candidates,
+        requiresExplicitChoice: candidates.length > 1,
+      };
+    };
+
     setGuidedSourceBlobCandidateSet((current) => {
       if (current === null) {
-        if (
-          activeSessionId === null ||
-          guidedSession?.step !== "step_1_source" ||
-          guidedNextTurn?.type !== "single_select" ||
-          readyGuidedSourceBlobs.size === 0
-        ) {
-          return current;
-        }
-        const candidates = [...readyGuidedSourceBlobs.values()];
-        return {
-          sessionId: activeSessionId,
-          turnToken: guidedNextTurn.turn_token,
-          candidates,
-          requiresExplicitChoice: candidates.length > 1,
-        };
+        return deriveFromReadyBlobs() ?? current;
       }
       if (
         activeSessionId === null ||
@@ -1118,7 +1134,7 @@ export function ChatPanel({
         current.sessionId !== activeSessionId ||
         current.turnToken !== guidedNextTurn.turn_token
       ) {
-        return null;
+        return deriveFromReadyBlobs();
       }
 
       const candidates = current.candidates.flatMap((candidate) => {
