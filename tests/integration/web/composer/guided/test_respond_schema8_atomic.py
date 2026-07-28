@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import inspect
 import json
 from collections.abc import Iterator
@@ -150,14 +151,30 @@ class _ReadRaceBlobService:
         self._record = record
         self._outcome = outcome
 
+    async def get_blob(self, _blob_id: UUID) -> object:
+        # An explicit source_blob_id resolves via get_blob (a direct,
+        # session-qualified lookup) rather than list_blobs + Python filter —
+        # see inspect_selected_ready_session_blob. Both tests using this fake
+        # select an explicit blob_id, so this is the method exercised now.
+        return self._record
+
     async def list_blobs(self, _session_id: UUID, limit: int | None = 50, offset: int = 0) -> list[object]:
         del limit, offset
         return [self._record]
 
-    async def read_blob_content(self, _blob_id: UUID) -> bytes:
+    async def read_blob_content_prefix_verified(self, _blob_id: UUID, *, prefix_bytes: int) -> tuple[bytes, str, int]:
+        # inspect_selected_ready_session_blob now streams+verifies via this
+        # method instead of read_blob_content. This fake stands in for a
+        # (possibly non-compliant) BlobServiceProtocol implementation: on the
+        # bytes-mismatch path it returns a hash genuinely computed from the
+        # changed bytes it "read", which will not match the original
+        # record.content_hash the caller already holds — that mismatch is
+        # exactly what source_inspection.py's own verification must catch.
         if isinstance(self._outcome, Exception):
             raise self._outcome
-        return self._outcome
+        content = self._outcome
+        computed_hash = hashlib.sha256(content).hexdigest()
+        return content[:prefix_bytes], computed_hash, len(content)
 
 
 def _guided_audit_events(client: TestClient, session_id: str) -> list[tuple[str, dict[str, object]]]:
@@ -528,10 +545,15 @@ def test_source_selection_rejects_blob_identity_outside_ready_session_set_before
 
 
 @pytest.mark.parametrize("failure_kind", ("deleted", "not_ready"))
-def test_source_selection_maps_list_to_read_lifecycle_drift_before_reservation(
+def test_source_selection_maps_get_to_read_lifecycle_drift_before_reservation(
     composer_test_client: TestClient,
     failure_kind: str,
 ) -> None:
+    # Renamed from ...maps_list_to_read...: an explicit selection now
+    # resolves via a direct get_blob lookup, not list_blobs + Python
+    # filter (see inspect_selected_ready_session_blob). The invariant this
+    # test pins — a blob that goes missing/not-ready between resolution and
+    # read raises SourceInspectionBlobLifecycleError -> 400 — is unchanged.
     session_id = _create_session(composer_test_client)
     uploaded = composer_test_client.post(
         f"/api/sessions/{session_id}/blobs/inline",
@@ -564,9 +586,18 @@ def test_source_selection_maps_list_to_read_lifecycle_drift_before_reservation(
     assert _respond_operation_count(composer_test_client, session_id) == 0
 
 
-def test_source_selection_fails_closed_when_read_bytes_do_not_match_listed_hash(
+def test_source_selection_fails_closed_when_read_bytes_do_not_match_fetched_hash(
     composer_test_client: TestClient,
 ) -> None:
+    # Renamed from ...match_listed_hash...: the record's content_hash now
+    # comes from get_blob rather than list_blobs. The invariant this test
+    # pins is unchanged and remains load-bearing: source_inspection.py's own
+    # hash re-verification against `record.content_hash` is not redundant
+    # with a compliant BlobServiceProtocol implementation's internal check —
+    # it independently certifies the content_hash_prefix this module stamps
+    # into redacted_identity, catching a case (simulated here by a fake that
+    # skips its own verification) where the bytes returned by read_blob_content
+    # don't match the hash on the record snapshot this module already holds.
     session_id = _create_session(composer_test_client)
     uploaded = composer_test_client.post(
         f"/api/sessions/{session_id}/blobs/inline",

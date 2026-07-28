@@ -84,6 +84,7 @@ _BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER = metrics.get_meter(__name__).create_counter
 
 _FORK_COPY_LEASE_CHECKPOINT_INTERVAL_SECONDS = 30.0
 _FORK_COPY_WRITE_CHUNK_BYTES = 1024 * 1024
+_STREAM_CHUNK_BYTES = 1024 * 1024
 
 _INLINE_CUSTODY_NAMESPACE = UUID("8ef5fd65-8a90-5fe4-9084-eab5b9d2d2db")
 _INLINE_CUSTODY_SCHEMA = "elspeth.inline-custody.v1"
@@ -1769,6 +1770,76 @@ class BlobServiceImpl:
                     raise BlobIntegrityError(blob_id_str, expected=row.content_hash, actual=actual)
 
                 return data
+
+        return await self._run_sync(_sync)
+
+    async def read_blob_content_prefix_verified(
+        self,
+        blob_id: UUID,
+        *,
+        prefix_bytes: int,
+    ) -> tuple[bytes, str, int]:
+        """Stream a ready blob, verifying its full content hash incrementally.
+
+        Mirrors ``read_blob_content``'s lifecycle/integrity guards exactly
+        (same status check, same missing-file check, same NULL-hash guard,
+        same hash-mismatch guard) but never holds the full blob in memory:
+        bytes are read and fed into one incremental sha256 digest in
+        ``_STREAM_CHUNK_BYTES``-sized chunks, and only the first
+        ``prefix_bytes`` of those bytes are retained. Memory use is bounded
+        by chunk size + ``prefix_bytes`` regardless of the blob's total size —
+        this is what lets a bounded preview (e.g. source inspection's 8 KiB
+        peek) verify a full-content hash without materializing a 100 MiB
+        upload to do it.
+        """
+        if prefix_bytes < 1:
+            raise ValueError("prefix_bytes must be >= 1")
+        blob_id_str = str(blob_id)
+
+        def _sync() -> tuple[bytes, str, int]:
+            with self._engine.connect() as conn:
+                row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
+                if row is None:
+                    raise BlobNotFoundError(blob_id_str)
+
+                # Lifecycle guard — only ready blobs have finalized content
+                if row.status != "ready":
+                    raise BlobStateError(
+                        blob_id_str,
+                        message=f"Cannot read blob {blob_id_str} — status is '{row.status}', expected 'ready'",
+                    )
+
+                storage = Path(row.storage_path)
+                if not storage.exists():
+                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path)
+
+                # Integrity verification — Tier 1: our data must be pristine.
+                # A ready blob must always have a content_hash — it is set
+                # by create_blob() and required by _finalize_blob_sync()
+                # when transitioning to ready. NULL here is a DB anomaly.
+                if row.content_hash is None:
+                    raise AuditIntegrityError(
+                        f"Tier 1: ready blob {blob_id_str} has NULL content_hash — DB integrity anomaly, cannot verify"
+                    )
+
+                digest = hashlib.sha256()
+                prefix = bytearray()
+                total_bytes = 0
+                with storage.open("rb") as handle:
+                    while True:
+                        chunk = handle.read(_STREAM_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        total_bytes += len(chunk)
+                        if len(prefix) < prefix_bytes:
+                            prefix.extend(chunk[: prefix_bytes - len(prefix)])
+
+                actual = digest.hexdigest()
+                if not hmac.compare_digest(actual, row.content_hash):
+                    raise BlobIntegrityError(blob_id_str, expected=row.content_hash, actual=actual)
+
+                return bytes(prefix[:prefix_bytes]), actual, total_bytes
 
         return await self._run_sync(_sync)
 

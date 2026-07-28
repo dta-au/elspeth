@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -65,7 +66,10 @@ from elspeth.web.plugin_policy.models import (
     PluginUnavailableReason,
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
+from elspeth.web.provider_config_policy import (
+    AWS_S3_ENDPOINT_URL_POLICY_ERROR,
+    AWS_S3_SOURCE_POLICY_ERROR,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -132,6 +136,11 @@ def _empty_state() -> CompositionState:
 
 
 _AWS_S3_ENDPOINT_SENTINEL = "https://composer-canary.attacker.invalid/private"
+_VALID_AWS_S3_OPTIONS: Mapping[str, Any] = {
+    "bucket": "test-bucket",
+    "key": "test-key",
+    "schema": {"mode": "observed"},
+}
 
 
 def _aws_s3_source_state() -> CompositionState:
@@ -316,6 +325,44 @@ def _trained_tool_context(catalog: CatalogService | None = None, **kwargs: Any) 
         plugin_snapshot=snapshot,
         **kwargs,
     )
+
+
+def _web_authored_tool_context(catalog: CatalogService | None = None, **kwargs: Any) -> Any:
+    """Non-trained (web-authored) ToolContext, for handlers invoked directly
+    (bypassing the ``execute_tool`` test shim's trained-operator default)."""
+    full_catalog = catalog or _mock_catalog()
+    view, snapshot = _web_authored_policy_pair(full_catalog)
+    return ToolContext(
+        catalog=view,
+        plugin_snapshot=snapshot,
+        **kwargs,
+    )
+
+
+def _web_authored_policy_pair(
+    catalog: CatalogService,
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Non-trained (web-authored) snapshot with full catalog availability.
+
+    Unlike ``_restricted_policy_pair`` (which additionally hides one
+    plugin), this mirrors the plugin_snapshot shape a real web/LLM
+    composer session carries: ``PluginSnapshotAuthority.RESTRICTED`` so
+    ``is_trained_operator`` is False, but nothing removed from
+    ``available`` — isolating the web-authored-policy gate under test
+    from the separate plugin-visibility gate.
+    """
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="web-authored-test-policy",
+        principal_scope="local:test-user",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="web-authored-test-generation",
+    )
+    return PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry)), snapshot
 
 
 def _restricted_policy_pair(
@@ -1111,6 +1158,179 @@ class TestAwsS3EndpointUrlComposerPolicy:
         )
 
         _assert_aws_s3_endpoint_url_rejected(result, state, forbidden_value=secret_name)
+
+
+class TestAwsS3SourceComposerPolicy:
+    """Mutation-time enforcement must not diverge from authoritative validation.
+
+    ``execution/validation.py`` unconditionally rejects any web-authored
+    (non-trained-operator) ``aws_s3`` source — independent of
+    ``endpoint_url`` — because S3 reads there would use the server AWS
+    credential chain with author-chosen bucket/key. ``set_source``
+    previously only enforced the narrower endpoint_url policy, so a
+    non-trained session could store an aws_s3 source with no
+    endpoint_url override that would then unconditionally fail every
+    subsequent dry-run/proposal validation — a state that can never be
+    made valid without deleting the source.
+    """
+
+    def test_set_source_rejects_aws_s3_for_web_authored_session_without_mutating_state(self) -> None:
+        state = _empty_state()
+        catalog = _mock_catalog()
+        view, snapshot = _web_authored_policy_pair(catalog)
+
+        result = execute_tool(
+            "set_source",
+            {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": _VALID_AWS_S3_OPTIONS,
+                "on_validation_failure": "discard",
+            },
+            state,
+            view,
+            plugin_snapshot=snapshot,
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.data is not None
+        assert result.data["error"] == AWS_S3_SOURCE_POLICY_ERROR
+        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+
+    def test_set_source_allows_aws_s3_for_trained_operator_session(self) -> None:
+        """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
+        state = _empty_state()
+
+        result = execute_tool(
+            "set_source",
+            {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": _VALID_AWS_S3_OPTIONS,
+                "on_validation_failure": "discard",
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is True
+        assert result.updated_state.sources["source"].plugin == "aws_s3"
+
+    def test_set_pipeline_rejects_aws_s3_named_source_for_web_authored_session_without_mutating_state(self) -> None:
+        state = _empty_state()
+        catalog = _mock_catalog()
+        view, snapshot = _web_authored_policy_pair(catalog)
+        args = _valid_pipeline_args()
+        args.pop("source")
+        args["sources"] = {
+            "archive": {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": _VALID_AWS_S3_OPTIONS,
+                "on_validation_failure": "discard",
+            }
+        }
+        args["nodes"] = []
+        args["edges"] = []
+
+        result = execute_tool("set_pipeline", args, state, view, plugin_snapshot=snapshot)
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.data is not None
+        assert result.data["error"] == f"Source 'archive': {AWS_S3_SOURCE_POLICY_ERROR}"
+        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+
+    def test_set_pipeline_rejects_aws_s3_legacy_source_for_web_authored_session_without_mutating_state(self) -> None:
+        state = _empty_state()
+        catalog = _mock_catalog()
+        view, snapshot = _web_authored_policy_pair(catalog)
+        args = _valid_pipeline_args()
+        args["source"]["plugin"] = "aws_s3"
+        args["source"]["options"] = dict(_VALID_AWS_S3_OPTIONS)
+
+        result = execute_tool("set_pipeline", args, state, view, plugin_snapshot=snapshot)
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.data is not None
+        assert result.data["error"] == AWS_S3_SOURCE_POLICY_ERROR
+        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+
+    def test_set_pipeline_allows_aws_s3_legacy_source_for_trained_operator_session(self) -> None:
+        """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
+        state = _empty_state()
+        args = _valid_pipeline_args()
+        args["source"]["plugin"] = "aws_s3"
+        args["source"]["options"] = dict(_VALID_AWS_S3_OPTIONS)
+
+        result = execute_tool("set_pipeline", args, state, _mock_catalog())
+
+        assert result.success is True
+        assert result.updated_state.sources["source"].plugin == "aws_s3"
+
+    def test_set_source_from_blob_rejects_aws_s3_for_web_authored_session_without_mutating_state(self) -> None:
+        from elspeth.web.composer.tools.sources import _execute_set_source_from_blob, _ResolvedSourceBlob
+
+        state = _empty_state()
+        resolved = _ResolvedSourceBlob(
+            plugin="aws_s3",
+            options=dict(_VALID_AWS_S3_OPTIONS),
+            payload={
+                "blob_id": str(uuid4()),
+                "filename": "input.jsonl",
+                "mime_type": "application/jsonl",
+                "size_bytes": 1,
+                "content_hash": _STUB_SHA256,
+            },
+            creation_modality=CreationModality.VERBATIM,
+        )
+
+        with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
+            result = _execute_set_source_from_blob(
+                {"blob_id": str(uuid4()), "on_success": "main", "options": {}},
+                state,
+                _web_authored_tool_context(),
+            )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.data is not None
+        assert result.data["error"] == AWS_S3_SOURCE_POLICY_ERROR
+        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+
+    def test_set_source_from_blob_allows_aws_s3_for_trained_operator_session(self) -> None:
+        """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
+        from elspeth.web.composer.tools.sources import _execute_set_source_from_blob, _ResolvedSourceBlob
+
+        state = _empty_state()
+        resolved = _ResolvedSourceBlob(
+            plugin="aws_s3",
+            options=dict(_VALID_AWS_S3_OPTIONS),
+            payload={
+                "blob_id": str(uuid4()),
+                "filename": "input.jsonl",
+                "mime_type": "application/jsonl",
+                "size_bytes": 1,
+                "content_hash": _STUB_SHA256,
+            },
+            creation_modality=CreationModality.VERBATIM,
+        )
+
+        with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
+            result = _execute_set_source_from_blob(
+                {"blob_id": str(uuid4()), "on_success": "main", "options": {}},
+                state,
+                _trained_tool_context(),
+            )
+
+        assert result.success is True
+        assert result.updated_state.sources["source"].plugin == "aws_s3"
 
 
 class TestSetSource:
@@ -9270,6 +9490,146 @@ class TestSetPipeline:
                 )
         finally:
             csv.field_size_limit(previous_limit)
+
+    def test_first_nonempty_csv_row_from_path_returns_header_when_complete_in_window(self, tmp_path: Path) -> None:
+        """A header row that terminates inside the window still parses normally."""
+        from elspeth.web.composer.tools.sources import _first_nonempty_csv_row_from_path
+
+        path = tmp_path / "small.csv"
+        path.write_text("name,email\nAlice,alice@example.com\n", encoding="utf-8")
+
+        assert _first_nonempty_csv_row_from_path(path) == ("name", "email")
+
+    def test_first_nonempty_csv_row_from_path_tolerates_first_record_crossing_window(self, tmp_path: Path) -> None:
+        """A well-formed CSV whose first record's quoted cell crosses the 64 KiB
+        bounded-inspection window must not be reported as a parse failure: the
+        file continues past the window (this is expected truncation, not
+        corruption), so the header is legitimately undeterminable here rather
+        than broken.
+        """
+        from elspeth.web.composer.tools.sources import _first_nonempty_csv_row_from_path
+
+        cell_a = "A" * 40000
+        cell_b = "B" * 40000
+        header_row = f'"{cell_a}","{cell_b}"\n'
+        assert len(header_row) > 64 * 1024
+        assert len(cell_a) < 64 * 1024
+        assert len(cell_b) < 64 * 1024
+        path = tmp_path / "wide_header.csv"
+        path.write_text(header_row + "trailer,row\n", encoding="utf-8")
+
+        # The full file parses without error...
+        full_rows = list(csv.reader(io.StringIO(path.read_text(encoding="utf-8")), strict=True))
+        assert full_rows[0] == [cell_a, cell_b]
+
+        # ...but the bounded reader, which only ever inspects a fixed-size
+        # prefix, cannot determine the header because the window closes
+        # mid-quote. It must report "undeterminable" (None), never raise.
+        assert _first_nonempty_csv_row_from_path(path) is None
+
+    def test_first_nonempty_csv_row_from_path_still_raises_for_genuine_corruption(self, tmp_path: Path) -> None:
+        """A small, fully-read file that is genuinely malformed CSV (not merely
+        truncated by the window) must still surface as a boundary error so
+        callers can escalate it.
+        """
+        from elspeth.web.composer.tools.sources import _CsvContentBoundaryError, _first_nonempty_csv_row_from_path
+
+        path = tmp_path / "malformed.csv"
+        path.write_text('"unterminated\n', encoding="utf-8")
+
+        with pytest.raises(_CsvContentBoundaryError):
+            _first_nonempty_csv_row_from_path(path)
+
+    def test_first_nonempty_csv_row_from_path_tolerates_multibyte_char_straddling_window(self, tmp_path: Path) -> None:
+        """A valid multi-byte UTF-8 character split across the window boundary
+        is expected truncation, not corruption or a decoding failure — the
+        file continues past the window, so a dangling partial byte sequence
+        at the cut point must not raise ``UnicodeDecodeError``.
+        """
+        from elspeth.web.composer.tools.sources import _first_nonempty_csv_row_from_path
+
+        # Pad so the multi-byte character's leading byte lands exactly at
+        # the window's last byte, splitting it across the boundary.
+        pad = "x" * ((64 * 1024) - 1)
+        content = pad + "あ" + ",trailer\ndata,row\n"
+        path = tmp_path / "straddled_char.csv"
+        path.write_text(content, encoding="utf-8")
+
+        assert path.read_bytes()[(64 * 1024) - 1 : (64 * 1024) + 2] == "あ".encode()
+
+        result = _first_nonempty_csv_row_from_path(path)
+
+        assert result is not None
+        assert result[0].startswith("x")
+
+    def test_set_pipeline_header_only_inline_csv_tolerates_candidate_first_record_crossing_window(self, tmp_path: Path) -> None:
+        """A ready uploaded CSV whose first record merely crosses the bounded
+        inspection window must not abort an unrelated header-only inline
+        set_pipeline call with AuditIntegrityError. The candidate's header is
+        legitimately undeterminable within the bounded window, so it is
+        treated as a non-match rather than escalated as corruption.
+        """
+        from datetime import UTC, datetime
+
+        state = _empty_state()
+        catalog = _mock_catalog()
+        engine, session_id = _session_engine_with_session()
+        uploaded_id = str(uuid4())
+        cell_a = "A" * 40000
+        cell_b = "B" * 40000
+        uploaded_content = f'"{cell_a}","{cell_b}"\n' + "trailer,row\n"
+        assert len(uploaded_content.encode("utf-8")) > 64 * 1024
+        uploaded_path = tmp_path / "blobs" / session_id / f"{uploaded_id}_wide_header.csv"
+        uploaded_path.parent.mkdir(parents=True)
+        uploaded_path.write_text(uploaded_content, encoding="utf-8")
+        now = datetime.now(UTC)
+        with engine.begin() as conn:
+            conn.execute(
+                blobs_table.insert().values(
+                    id=uploaded_id,
+                    session_id=session_id,
+                    filename="wide_header.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(uploaded_content.encode("utf-8")),
+                    content_hash=_STUB_SHA256,
+                    storage_path=str(uploaded_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description="uploaded rows with a wide first record",
+                    status="ready",
+                )
+            )
+
+        inline_content = "name,email\n"
+        args = _valid_pipeline_args()
+        args["source"] = {
+            "plugin": "csv",
+            "on_success": "source_out",
+            "options": {"schema": {"mode": "observed"}},
+            "inline_blob": {
+                "filename": "contacts.csv",
+                "mime_type": "text/csv",
+                "content": inline_content,
+            },
+            "on_validation_failure": "quarantine",
+        }
+        args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "out.csv")
+        args["outputs"][0]["options"]["mode"] = "write"
+        args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
+
+        result = execute_tool(
+            "set_pipeline",
+            args,
+            state,
+            catalog,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            **_verbatim_blob_context(engine, session_id, inline_content),
+        )
+
+        assert result.success is True, result.data
+        assert _default_source(result.updated_state) is not None
 
     @pytest.mark.parametrize(
         ("candidate_count", "match_on_read", "expected_reads", "expected_error"),

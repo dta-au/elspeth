@@ -16,17 +16,19 @@ from elspeth.contracts.blobs import (
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.pipeline_planner import PipelinePlannerError, PlannerOriginatingMessage
+from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PipelinePlannerError, PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.sessions.guided_replay import project_composition_proposal
+from elspeth.web.sessions.guided_replay import project_composition_proposal, project_guided_full_decline
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     GuidedAuditEvidence,
+    GuidedDeclinedResult,
+    GuidedFullPipelineDeclineCommand,
     GuidedFullPipelineProposalStageCommand,
     GuidedOperationFailureCode,
     GuidedOperationFailureCommand,
@@ -35,7 +37,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOriginatingUserMessageDraft,
     GuidedPipelineProposalResult,
 )
-from elspeth.web.sessions.schemas import CompositionProposalResponse, GuidedPlanRequest
+from elspeth.web.sessions.schemas import CompositionProposalResponse, GuidedPlanDeclinedResponse, GuidedPlanRequest
 
 from .._helpers import (
     APIRouter,
@@ -71,6 +73,14 @@ from .pipeline_settlement import (
 )
 
 router = APIRouter()
+
+# Escape-hatch decline text is the advisor's own free-text reply; an empty
+# reply is theoretically possible (a hatch-turn response with no tool calls
+# and blank content) but chat_messages forbids a contentless assistant row
+# with no raw_content/tool_calls (_assert_assistant_row_has_audit_content).
+# Mirrors the freeform surface's identical fallback in
+# ComposerServiceImpl.compose (service.py, PlannerDeclined handler).
+_EMPTY_DECLINE_FALLBACK = "I could not find a way to build this pipeline with the available components."
 
 
 def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
@@ -109,7 +119,7 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
     return "operation_failed"
 
 
-@router.post("/{session_id}/guided/plan", response_model=CompositionProposalResponse)
+@router.post("/{session_id}/guided/plan", response_model=CompositionProposalResponse | GuidedPlanDeclinedResponse)
 async def post_guided_plan(
     session_id: UUID,
     body: GuidedPlanRequest,
@@ -117,16 +127,34 @@ async def post_guided_plan(
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
     rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
     _inflight_tally: None = Depends(_track_compose_inflight),
-) -> CompositionProposalResponse:
-    """Plan and atomically stage one full guided proposal."""
+) -> CompositionProposalResponse | GuidedPlanDeclinedResponse:
+    """Plan and atomically stage one full guided proposal.
+
+    Two outcomes: a reviewable ``CompositionProposalResponse`` (the ordinary
+    case), or a ``GuidedPlanDeclinedResponse`` when the escape-hatch advisor
+    answers in text instead of proposing a pipeline — an honest decline is a
+    conversational outcome, not a provider failure, so it settles the
+    operation as completed rather than failed (mirrors the freeform
+    surface's identical PlannerDeclined handling).
+    """
 
     await rate_limiter.check(user.user_id)
     await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
 
-    async def replay(result: object) -> CompositionProposalResponse:
+    async def replay(result: object) -> CompositionProposalResponse | GuidedPlanDeclinedResponse:
+        if type(result) is GuidedDeclinedResult:
+            checkpoint = await service.get_state_in_session(result.checkpoint_state_id, session_id)
+            decline_rows = [
+                message
+                for message in await service.get_messages(session_id, limit=None)
+                if message.composition_state_id == checkpoint.id and message.role == "assistant"
+            ]
+            if len(decline_rows) != 1 or decline_rows[0].writer_principal != "compose_loop":
+                raise AuditIntegrityError("guided-full decline replay has a malformed assistant message locator")
+            return project_guided_full_decline(decline_rows[0])
         if type(result) is not GuidedPipelineProposalResult:
-            raise AuditIntegrityError("guided-full replay has a non-proposal result locator")
+            raise AuditIntegrityError("guided-full replay has an unsupported result locator")
         checkpoint = await service.get_state_in_session(result.checkpoint_state_id, session_id)
         authority = await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
@@ -213,8 +241,20 @@ async def post_guided_plan(
                 lease_seconds=300,
             )
 
+        state_dict = observed_state.to_dict()
+        checkpoint_data = CompositionStateData(
+            sources=state_dict["sources"],
+            nodes=state_dict["nodes"],
+            edges=state_dict["edges"],
+            outputs=state_dict["outputs"],
+            metadata_=state_dict["metadata"],
+            is_valid=observed_record.is_valid if observed_record is not None else False,
+            validation_errors=observed_record.validation_errors if observed_record is not None else None,
+            composer_meta=observed_record.composer_meta if observed_record is not None else None,
+        )
+
         async with _cancel_on_client_disconnect(request):
-            plan, _catalog_ids = await request.app.state.composer_service.plan_guided_full_pipeline(
+            outcome = await request.app.state.composer_service.plan_guided_full_pipeline(
                 intent=body.intent,
                 current_state=observed_state,
                 originating_message=PlannerOriginatingMessage(
@@ -234,6 +274,43 @@ async def post_guided_plan(
                 progress=progress,
             )
 
+        if isinstance(outcome, GuidedPlannerDecline):
+            # Honest decline from the escape-hatch advisor turn: a
+            # successful conversational outcome, not a planner failure.
+            # Persist the advisor's own words as an ordinary assistant
+            # message and complete the operation — never
+            # GuidedOperationFailureCode (mirrors the freeform surface's
+            # identical PlannerDeclined handling in ComposerServiceImpl).
+            decline_text = outcome.decline_text.strip() or _EMPTY_DECLINE_FALLBACK
+            async with compose_lock:
+                renewed_fence = await service.renew_guided_operation(
+                    fence,
+                    actor="composer_route",
+                    lease_seconds=300,
+                )
+                decline_settlement = await _await_guided_atomic_settlement(
+                    service.decline_guided_full_pipeline_proposal(
+                        GuidedFullPipelineDeclineCommand(
+                            fence=renewed_fence,
+                            expected_current_state_id=expected_state_id,
+                            expected_current_state_version=expected_state_version,
+                            expected_current_content_hash=expected_content_hash,
+                            checkpoint_state_id=checkpoint_id,
+                            state=checkpoint_data,
+                            decline_text=decline_text,
+                            actor="composer_route",
+                            originating_message=origin,
+                            audit_evidence=GuidedAuditEvidence(
+                                invocations=recorder.invocations,
+                                llm_calls=recorder.llm_calls,
+                                chat_turns=recorder.chat_turns,
+                            ),
+                        )
+                    )
+                )
+            return project_guided_full_decline(decline_settlement.decline_message)
+
+        plan, _catalog_ids = outcome
         redacted = redact_tool_call_arguments(
             "set_pipeline",
             deep_thaw(plan.proposal.pipeline),
@@ -243,17 +320,6 @@ async def post_guided_plan(
             tool_name="set_pipeline",
             arguments=deep_thaw(plan.proposal.pipeline),
             redacted_arguments=redacted,
-        )
-        state_dict = observed_state.to_dict()
-        checkpoint_data = CompositionStateData(
-            sources=state_dict["sources"],
-            nodes=state_dict["nodes"],
-            edges=state_dict["edges"],
-            outputs=state_dict["outputs"],
-            metadata_=state_dict["metadata"],
-            is_valid=observed_record.is_valid if observed_record is not None else False,
-            validation_errors=observed_record.validation_errors if observed_record is not None else None,
-            composer_meta=observed_record.composer_meta if observed_record is not None else None,
         )
         async with compose_lock:
             renewed_fence = await service.renew_guided_operation(

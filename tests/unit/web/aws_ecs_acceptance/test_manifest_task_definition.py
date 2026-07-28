@@ -72,6 +72,7 @@ def _task_definition_policy_payload(
     composer_advisor_model: str = "openrouter/anthropic/claude-opus-4.6",
     cloudwatch_config_json: bytes = CLOUDWATCH_AGENT_CONFIG_JSON,
     cloudwatch_otel_yaml: bytes = CLOUDWATCH_AGENT_OTEL_YAML,
+    with_cloudwatch_agent: bool = True,
 ) -> tuple[Path, str, dict[str, Any], dict[str, Any]]:
     manifest_path = tmp_path / "control.json"
 
@@ -187,6 +188,8 @@ def _task_definition_policy_payload(
             ],
         }
     }
+    if with_cloudwatch_agent:
+        _attach_cloudwatch_agent(inventory, payload, config_json=cloudwatch_config_json, otel_yaml=cloudwatch_otel_yaml)
     return manifest_path, container_name, inventory, payload
 
 
@@ -252,8 +255,7 @@ def test_task_definition_policy_binding_allows_bedrock_models_without_openrouter
 
 
 def test_task_definition_policy_binding_allows_only_the_cloudwatch_agent_sidecar(tmp_path: Path) -> None:
-    manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
-    _attach_cloudwatch_agent(inventory, payload)
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
 
     acceptance.validate_task_definition_policy_binding(
         payload,
@@ -278,8 +280,10 @@ def test_task_definition_policy_binding_requires_exact_published_web_command(tmp
 
 
 def test_task_definition_policy_binding_rejects_cloudwatch_sidecar_image_substitution(tmp_path: Path) -> None:
-    manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
-    sidecar = _attach_cloudwatch_agent(inventory, payload)
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    sidecar = next(
+        candidate for candidate in payload["taskDefinition"]["containerDefinitions"] if candidate.get("name") == "cloudwatch-agent"
+    )
     sidecar["image"] = "public.ecr.aws/attacker/cloudwatch-agent@sha256:" + "f" * 64
 
     with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
@@ -320,8 +324,10 @@ def test_task_definition_policy_binding_rejects_mutated_cloudwatch_sidecar(
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
-    sidecar = _attach_cloudwatch_agent(inventory, payload)
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    sidecar = next(
+        candidate for candidate in payload["taskDefinition"]["containerDefinitions"] if candidate.get("name") == "cloudwatch-agent"
+    )
     environment = sidecar["environment"]
     main = payload["taskDefinition"]["containerDefinitions"][0]
 
@@ -395,6 +401,7 @@ def test_task_definition_policy_binding_rejects_invalid_bound_cloudwatch_config(
         tmp_path,
         cloudwatch_config_json=config_json,
         cloudwatch_otel_yaml=otel_yaml,
+        with_cloudwatch_agent=False,
     )
     _attach_cloudwatch_agent(inventory, payload, config_json=config_json, otel_yaml=otel_yaml)
 
@@ -877,3 +884,36 @@ def test_task_definition_policy_binding_rejects_surplus_openrouter_secret(tmp_pa
             scenario_id="A",
             container_name=container_name,
         )
+
+
+def test_task_definition_policy_binding_requires_cloudwatch_agent_for_published_web_container(tmp_path: Path) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(
+        tmp_path,
+        with_cloudwatch_agent=False,
+    )
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+
+
+def test_task_definition_policy_binding_allows_missing_cloudwatch_agent_for_one_shot_task(tmp_path: Path) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(
+        tmp_path,
+        with_cloudwatch_agent=False,
+    )
+    container = payload["taskDefinition"]["containerDefinitions"][0]
+    container["user"] = "1654:1654"
+    container["entryPoint"] = ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
+
+    acceptance.validate_task_definition_policy_binding(
+        payload,
+        manifest_path=manifest_path,
+        scenario_id="A",
+        container_name=container_name,
+        expected_user="1654:1654",
+    )

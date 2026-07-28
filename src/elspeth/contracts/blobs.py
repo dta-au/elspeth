@@ -498,6 +498,30 @@ class BlobServiceProtocol(Protocol):
         """
         ...
 
+    async def read_blob_content_prefix_verified(
+        self,
+        blob_id: UUID,
+        *,
+        prefix_bytes: int,
+    ) -> tuple[bytes, str, int]:
+        """Stream a ready blob, verifying its full content hash incrementally.
+
+        Mirrors :meth:`read_blob_content`'s lifecycle and integrity guards
+        (only ready blobs readable; a missing backing file raises
+        ``BlobContentMissingError``; a hash mismatch raises
+        ``BlobIntegrityError``; a NULL stored hash raises
+        ``AuditIntegrityError``) but never materializes the full blob in
+        memory: content is read and hashed in bounded chunks, retaining
+        only the first ``prefix_bytes`` bytes. Memory use is O(chunk size +
+        ``prefix_bytes``) regardless of blob size.
+
+        Returns ``(prefix, verified_content_hash, total_size_bytes)`` where
+        ``prefix`` is at most ``prefix_bytes`` long and ``verified_content_hash``
+        is the sha256 hex digest already confirmed to match the blob's stored
+        ``content_hash``.
+        """
+        ...
+
     async def link_blob_to_run(
         self,
         blob_id: UUID,

@@ -18,12 +18,18 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+from datetime import UTC, datetime
 from types import MappingProxyType
-from uuid import uuid4
+from typing import Any, cast
+from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord
+from elspeth.contracts.enums import CreationModality
 from elspeth.web.composer import source_inspection
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
@@ -34,6 +40,7 @@ from elspeth.web.composer.source_inspection import (
     facts_to_dict,
     inspect_blob_content,
     inspect_csv_source_content,
+    inspect_selected_ready_session_blob,
 )
 
 
@@ -643,6 +650,202 @@ class TestSelectedBlobIdentity:
                 selected_blob_id=uuid4(),
                 ready_blob_ids=(uuid4(),),
             )
+
+
+def _blob_record_stub(
+    *,
+    blob_id: UUID | None = None,
+    session_id: UUID | None = None,
+    filename: str = "blob.csv",
+    mime_type: str = "text/csv",
+    size_bytes: int = 0,
+    content_hash: str | None = None,
+    storage_path: str = "/tmp/data/blobs/blob.csv",
+    status: str = "ready",
+) -> BlobRecord:
+    return BlobRecord(
+        id=blob_id or uuid4(),
+        session_id=session_id or uuid4(),
+        filename=filename,
+        mime_type=cast(Any, mime_type),
+        size_bytes=size_bytes,
+        content_hash=content_hash,
+        storage_path=storage_path,
+        created_at=datetime.now(UTC),
+        created_by="user",
+        source_description=None,
+        status=cast(Any, status),
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+
+
+class _NoListingBlobService:
+    """Spy blob service that fails the test if a full-session listing occurs.
+
+    Stands in for ``BlobServiceProtocol`` in a shape narrow enough for
+    ``inspect_selected_ready_session_blob``: an explicit ``selected_blob_id``
+    must resolve via ``get_blob`` (session-qualified single-row lookup), never
+    via ``list_blobs`` — a session can hold an unbounded number of blobs, and
+    materializing all of them just to find one explicitly-named blob is
+    exactly the cost Finding A flags.
+
+    Deliberately has **no** ``read_blob_content`` method: a large blob is
+    represented only through ``read_blob_content_prefix_verified``, so a
+    regression that reintroduces a full-content read (Finding B) fails loudly
+    with ``AttributeError`` instead of silently passing.
+    """
+
+    def __init__(self, record: BlobRecord, content: bytes) -> None:
+        self._record = record
+        self._content = content
+
+    async def get_blob(self, blob_id: UUID) -> BlobRecord:
+        if blob_id != self._record.id:
+            raise BlobNotFoundError(str(blob_id))
+        return self._record
+
+    async def list_blobs(self, session_id: UUID, limit: int | None = 50, offset: int = 0) -> list[BlobRecord]:
+        del session_id, limit, offset
+        raise AssertionError("explicit selection must not list session blobs")
+
+    async def read_blob_content_prefix_verified(self, blob_id: UUID, *, prefix_bytes: int) -> tuple[bytes, str, int]:
+        assert blob_id == self._record.id
+        verified_hash = hashlib.sha256(self._content).hexdigest()
+        return self._content[:prefix_bytes], verified_hash, len(self._content)
+
+
+class TestExplicitSelectionResolvesDirectly:
+    """Finding A: an explicit ``selected_blob_id`` must resolve with a direct,
+    session-qualified ``get_blob`` lookup — not ``list_blobs(limit=None)`` +
+    a Python filter over every blob in the session.
+    """
+
+    def test_explicit_selection_never_lists_session_blobs(self) -> None:
+        session_id = uuid4()
+        content = b"id\n1\n"
+        record = _blob_record_stub(
+            session_id=session_id,
+            content_hash=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+        )
+        service = _NoListingBlobService(record, content)
+
+        facts = asyncio.run(
+            inspect_selected_ready_session_blob(
+                cast(Any, service),
+                session_id,
+                selected_blob_id=record.id,
+            )
+        )
+
+        assert facts is not None
+        assert facts.source_kind == "csv"
+
+    def test_explicit_selection_rejects_blob_from_other_session(self) -> None:
+        session_id = uuid4()
+        content = b"id\n1\n"
+        record = _blob_record_stub(
+            session_id=uuid4(),  # a different session
+            content_hash=hashlib.sha256(content).hexdigest(),
+        )
+        service = _NoListingBlobService(record, content)
+
+        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
+            asyncio.run(
+                inspect_selected_ready_session_blob(
+                    cast(Any, service),
+                    session_id,
+                    selected_blob_id=record.id,
+                )
+            )
+
+    def test_explicit_selection_rejects_non_ready_blob(self) -> None:
+        session_id = uuid4()
+        content = b"id\n1\n"
+        record = _blob_record_stub(
+            session_id=session_id,
+            content_hash=hashlib.sha256(content).hexdigest(),
+            status="pending",
+        )
+        service = _NoListingBlobService(record, content)
+
+        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
+            asyncio.run(
+                inspect_selected_ready_session_blob(
+                    cast(Any, service),
+                    session_id,
+                    selected_blob_id=record.id,
+                )
+            )
+
+    def test_explicit_selection_rejects_unknown_blob_id(self) -> None:
+        session_id = uuid4()
+        record = _blob_record_stub(session_id=session_id)
+        service = _NoListingBlobService(record, b"")
+
+        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
+            asyncio.run(
+                inspect_selected_ready_session_blob(
+                    cast(Any, service),
+                    session_id,
+                    selected_blob_id=uuid4(),
+                )
+            )
+
+    def test_large_blob_never_requires_full_content_bytes(self) -> None:
+        """Finding B (memory): the module must never need — or be handed —
+        a full-content bytes object for a large blob. It only ever accepts a
+        bounded prefix plus a size/hash the store already verified.
+
+        The fake blob service below declares a 100 MiB blob but never
+        constructs 100 MiB of Python bytes anywhere (here or in
+        ``inspect_selected_ready_session_blob``/``inspect_blob_content``) —
+        only an ``int`` size and a bounded prefix cross the boundary.
+        """
+        session_id = uuid4()
+        total_size = 100 * 1024 * 1024  # 100 MiB — never materialized.
+        prefix = b"id,name\n1,a\n"
+        verified_hash = "a" * 64  # opaque digest the fake store "verified"
+        record = _blob_record_stub(
+            session_id=session_id,
+            content_hash=verified_hash,
+            size_bytes=total_size,
+            filename="huge.csv",
+        )
+
+        class _HugeBlobService:
+            async def get_blob(self, blob_id: UUID) -> BlobRecord:
+                assert blob_id == record.id
+                return record
+
+            async def list_blobs(self, *args: object, **kwargs: object) -> list[BlobRecord]:
+                raise AssertionError("explicit selection must not list session blobs")
+
+            async def read_blob_content_prefix_verified(self, blob_id: UUID, *, prefix_bytes: int) -> tuple[bytes, str, int]:
+                assert blob_id == record.id
+                # A real streaming store hashes chunk-by-chunk; this fake
+                # need only prove the module is satisfied by a small prefix
+                # + an already-verified hash + a total size — never the
+                # full 100 MiB.
+                return prefix[:prefix_bytes], verified_hash, total_size
+
+        facts = asyncio.run(
+            inspect_selected_ready_session_blob(
+                cast(Any, _HugeBlobService()),
+                session_id,
+                selected_blob_id=record.id,
+            )
+        )
+
+        assert facts is not None
+        assert int(facts.redacted_identity["byte_size"]) == total_size
+        assert facts.byte_range_inspected[1] <= source_inspection._MAX_BYTES
 
 
 # --------------------------------------------------------------------------

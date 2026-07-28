@@ -260,6 +260,25 @@ class CompositionProposalResponse(_StrictResponse):
     updated_at: datetime
 
 
+class GuidedPlanDeclinedResponse(_StrictResponse):
+    """Response for POST /api/sessions/{id}/guided/plan on an honest decline.
+
+    The escape-hatch advisor answered in text instead of proposing a
+    pipeline: no proposal was created. ``message`` is the ordinary
+    assistant chat message persisted from the advisor's own words —
+    same wire shape as ``MessageWithStateResponse.message`` on the
+    freeform surface, which handles the identical ``PlannerDeclined``
+    outcome the same way. Distinguished from ``CompositionProposalResponse``
+    (the same endpoint's other outcome) structurally: this shape's
+    ``outcome`` field never appears on a proposal response, and a proposal
+    response's ``id``/``status``/... fields never appear here, so FastAPI's
+    ``response_model`` union serializes each outcome unambiguously.
+    """
+
+    outcome: Literal["declined"]
+    message: ChatMessageResponse
+
+
 class AcceptProposalRequest(_RequestModel):
     draft_hash: str | None = None
 

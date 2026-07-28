@@ -764,7 +764,7 @@ guided_operations_table = Table(
         name="ck_guided_operations_lease_token_bounded",
     ),
     CheckConstraint(
-        "result_kind IS NULL OR result_kind IN ('composition_state', 'pipeline_proposal', 'session')",
+        "result_kind IS NULL OR result_kind IN ('composition_state', 'pipeline_proposal', 'session', 'declined')",
         name="ck_guided_operations_result_kind",
     ),
     CheckConstraint(
@@ -794,6 +794,8 @@ guided_operations_table = Table(
         "AND result_state_id IS NULL AND proposal_id IS NULL) OR "
         "(kind = 'guided_plan' AND result_kind = 'pipeline_proposal' "
         "AND result_state_id IS NOT NULL AND result_session_id IS NULL AND proposal_id IS NOT NULL) OR "
+        "(kind = 'guided_plan' AND result_kind = 'declined' "
+        "AND result_state_id IS NOT NULL AND result_session_id IS NULL AND proposal_id IS NULL) OR "
         "(kind NOT IN ('session_fork', 'guided_plan') AND result_kind = 'composition_state' "
         "AND result_state_id IS NOT NULL AND result_session_id IS NULL "
         "AND (proposal_id IS NULL OR kind IN ('guided_respond', 'guided_chat'))))) OR "

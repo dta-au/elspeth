@@ -206,6 +206,110 @@ def test_prompt_shield_input_coverage_uses_actual_template_fields() -> None:
     assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
 
 
+def _value_transform(
+    node_id: str,
+    input_stream: str,
+    on_success: str,
+    operations: object,
+) -> NodeSpec:
+    return _node(
+        node_id,
+        "value_transform",
+        input_stream,
+        on_success,
+        options={"schema": {"mode": "observed"}, "operations": operations},
+    )
+
+
+def test_prompt_shield_input_coverage_rejects_value_transform_overwrite_below_shield() -> None:
+    state = _state(
+        _shield("shield", "raw", "rewrite_in"),
+        _value_transform(
+            "rewrite",
+            "rewrite_in",
+            "llm_in",
+            [{"target": "prompt", "expression": "row['untrusted']"}],
+        ),
+        _llm(),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+
+
+def test_prompt_shield_input_coverage_allows_value_transform_writing_unshielded_fields() -> None:
+    state = _state(
+        _shield("shield", "raw", "rewrite_in"),
+        _value_transform(
+            "rewrite",
+            "rewrite_in",
+            "llm_in",
+            [{"target": "derived_score", "expression": "1"}],
+        ),
+        _llm(),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+@pytest.mark.parametrize(
+    "operations",
+    [
+        "not a list",
+        [{"expression": "1"}],
+        [{"target": 7, "expression": "1"}],
+        [{"target": "  ", "expression": "1"}],
+        ["not a mapping"],
+    ],
+)
+def test_prompt_shield_input_coverage_fails_closed_for_unprovable_value_transform(
+    operations: object,
+) -> None:
+    state = _state(
+        _shield("shield", "raw", "rewrite_in"),
+        _value_transform("rewrite", "rewrite_in", "llm_in", operations),
+        _llm(),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+
+def test_prompt_shield_input_coverage_passes_through_passthrough() -> None:
+    state = _state(
+        _shield("shield", "raw", "pass_in"),
+        _node("relay", "passthrough", "pass_in", "llm_in"),
+        _llm(),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_prompt_shield_input_coverage_fails_closed_for_unknown_write_set_transform() -> None:
+    # json_explode writes parsed fields into the row; coverage cannot prove the
+    # shielded prompt survives, so the path must fail closed.
+    state = _state(
+        _shield("shield", "raw", "explode_in"),
+        _node(
+            "explode",
+            "json_explode",
+            "explode_in",
+            "llm_in",
+            options={"schema": {"mode": "observed"}, "source_field": "payload", "fields": ["prompt"]},
+        ),
+        _llm(),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+
 def test_prompt_shield_input_coverage_follows_field_mapper_rename_upstream() -> None:
     state = _state(
         _shield("shield", "raw", "mapped_in", fields=("raw_prompt",)),

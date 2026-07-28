@@ -643,6 +643,50 @@ describe("ChatPanel mode discriminator", () => {
     expect(respondGuidedSpy.mock.calls[0][0].source_blob_id).toBe(earlierId);
   });
 
+  it("re-derives the source chooser from already-ready blobs after a remount", async () => {
+    // Simulates a page reload / component remount while parked on
+    // step_1_source with two ready blobs already uploaded in a prior mount.
+    // guidedSourceBlobCandidateSet is component-local state and does not
+    // survive the remount, but the ready blobs (fetched fresh from the
+    // backend) do. Without re-deriving the candidate set from those reloaded
+    // blobs, the chooser silently disappears and the request would carry no
+    // source_blob_id even though two ready blobs exist.
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const earlierId = "00000000-0000-4000-8000-000000000901";
+    const newerId = "00000000-0000-4000-8000-000000000902";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn("a".repeat(64)),
+      respondGuided: respondGuidedSpy,
+    });
+    useBlobStore.setState((state) => ({
+      blobs: [
+        ...state.blobs,
+        uploadedSource(earlierId, "earlier.csv"),
+        uploadedSource(newerId, "newer.csv"),
+      ],
+    }));
+
+    render(<ChatPanel />);
+
+    const sourceChooser = screen.getByRole("combobox", {
+      name: "Source file",
+    });
+    expect(sourceChooser).toHaveValue("");
+    expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
+
+    fireEvent.change(sourceChooser, { target: { value: earlierId } });
+    await act(async () => {
+      screen.getByRole("button", { name: "CSV" }).click();
+    });
+    expect(respondGuidedSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ chosen: ["csv"], source_blob_id: earlierId }),
+    );
+  });
+
   it("distinguishes duplicate source filenames and submits the intended exact blob", async () => {
     const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
     const earlierId = "00000000-0000-4000-8000-000000000801";

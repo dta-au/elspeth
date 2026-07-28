@@ -16,10 +16,34 @@ from typing import Any
 import jwt as pyjwt
 import pytest
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth import local as auth_local
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
+
+
+class _CommitFailingConnection:
+    """Delegating sqlite3 connection proxy whose commit always fails."""
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def commit(self) -> None:
+        raise sqlite3.OperationalError("simulated disk I/O error at commit")
+
+
+def _fail_commits(provider: LocalAuthProvider, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every subsequent provider transaction fail at commit time."""
+    real_get_conn = provider._get_conn
+
+    def failing_get_conn() -> Any:
+        return _CommitFailingConnection(real_get_conn())
+
+    monkeypatch.setattr(provider, "_get_conn", failing_get_conn)
 
 
 @pytest.fixture
@@ -163,7 +187,13 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         with pytest.raises(AuthenticationError, match="Invalid token"):
             await provider.authenticate(token)
 
-    def test_open_registration_is_invisible_until_required_audit_commits(self, provider) -> None:
+    def test_open_registration_audit_failure_removes_the_committed_user(self, provider) -> None:
+        """Audit runs after the durable commit; a failed audit compensates.
+
+        The user is durable while the required audit callback runs (so no
+        phantom token_issued record can precede the account), and an audit
+        failure deletes the unaudited account before the error propagates.
+        """
         audit_entered = threading.Event()
         release_audit = threading.Event()
 
@@ -182,12 +212,14 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
                 record_token_issued=fail_required_audit,
             )
             assert audit_entered.wait(timeout=2)
-            with pytest.raises(AuthenticationError, match="Invalid credentials"):
-                provider._login_sync("alice", "password123")
+            # The account is durable before the audit callback observes it.
+            token = provider._login_sync("alice", "password123")
+            assert len(token.split(".")) == 3
             release_audit.set()
             with pytest.raises(OSError, match="Landscape unavailable"):
                 future.result(timeout=2)
 
+        # The audit failure compensated: the unaudited account is gone.
         with pytest.raises(AuthenticationError, match="Invalid credentials"):
             provider._login_sync("alice", "password123")
 
@@ -221,6 +253,90 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         token = await provider.login("alice", "password123")
         assert len(token.split(".")) == 3
+
+    def test_registration_commit_failure_after_audit_emits_no_phantom_token_issued(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failed auth.db commit must not leave a token_issued audit record.
+
+        The external audit callback must only observe issuance once the user
+        row is durable; otherwise Landscape asserts a token was issued for a
+        user that never existed.
+        """
+        issued_tokens: list[str] = []
+        _fail_commits(provider, monkeypatch)
+
+        with pytest.raises(sqlite3.OperationalError, match="simulated disk I/O error"):
+            provider.register_open_user_with_audit(
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=issued_tokens.append,
+            )
+        monkeypatch.undo()
+
+        assert issued_tokens == []
+        with pytest.raises(AuthenticationError, match="Invalid credentials"):
+            provider._login_sync("alice", "password123")
+
+    def test_verification_commit_failure_after_audit_emits_no_phantom_token_issued(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failed verification commit must not leave a token_issued record."""
+        provider.create_user(
+            "alice",
+            "password123",
+            display_name="Alice",
+            email="alice@example.com",
+            email_verified=False,
+        )
+        token = provider.create_email_verification_token("alice")
+        issued_tokens: list[str] = []
+        _fail_commits(provider, monkeypatch)
+
+        with pytest.raises(sqlite3.OperationalError, match="simulated disk I/O error"):
+            provider.verify_email_and_issue_token(
+                token,
+                record_token_issued=lambda _identity, access_token: issued_tokens.append(access_token),
+            )
+        monkeypatch.undo()
+
+        assert issued_tokens == []
+        # The rollback restored the claimable token: verification still works.
+        access_token = provider.verify_email_and_issue_token(
+            token,
+            record_token_issued=lambda _identity, _access_token: None,
+        )
+        assert len(access_token.split(".")) == 3
+
+    def test_registration_audit_failure_with_failed_cleanup_surfaces_audit_integrity_error(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If the compensating cleanup fails too, the inconsistency is loud."""
+
+        def fail_required_audit(_token: str) -> None:
+            raise OSError("Landscape unavailable")
+
+        def fail_cleanup(_user_id: str) -> bool:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(provider, "delete_user", fail_cleanup)
+
+        with pytest.raises(AuditIntegrityError, match="cleanup"):
+            provider.register_open_user_with_audit(
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=fail_required_audit,
+            )
 
     def test_email_verification_token_has_exactly_one_concurrent_consumer(self, provider) -> None:
         provider.create_user(

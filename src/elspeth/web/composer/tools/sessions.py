@@ -127,7 +127,10 @@ from elspeth.web.interpretation_state import (
     validate_pipeline_decision_node_semantics,
 )
 from elspeth.web.plugin_policy.models import PluginId, PluginUnavailableReason
-from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+from elspeth.web.provider_config_policy import (
+    web_aws_s3_endpoint_url_policy_error,
+    web_aws_s3_source_policy_error,
+)
 from elspeth.web.validation import (
     _reject_credential_shaped_content,
     _validate_accepted_value_content,
@@ -609,6 +612,20 @@ def build_set_pipeline_candidate(
             plugin_error = _validate_plugin_name(context, "source", src_plugin)
             if plugin_error is not None:
                 return _plugin_policy_failure(state, plugin_error, component=f"Source '{source_name}'")
+            # Mirror execution/validation.py's unconditional aws_s3-source ban
+            # for non-trained-operator sessions (see _execute_set_source in
+            # sources.py for the full rationale). set_pipeline is a second
+            # door into the same trap: without this, a non-trained session
+            # could persist an aws_s3 source with no endpoint_url override
+            # here, bypassing the set_source gate entirely.
+            if not context.plugin_snapshot.is_trained_operator:
+                source_policy_error = web_aws_s3_source_policy_error(src_plugin)
+                if source_policy_error is not None:
+                    return _failure_result(
+                        state,
+                        f"Source '{source_name}': {source_policy_error}",
+                        error_code="aws_s3_source_not_allowed",
+                    )
             manual_blob_ref_error = None if reviewed_source else _reject_manual_source_blob_ref(src_options, tool_name="set_pipeline")
             if manual_blob_ref_error is not None:
                 return _failure_result(state, f"Source '{source_name}': {manual_blob_ref_error}")
@@ -786,6 +803,13 @@ def build_set_pipeline_candidate(
         plugin_error = _validate_plugin_name(context, "source", src_plugin)
         if plugin_error is not None:
             return _plugin_policy_failure(state, plugin_error)
+        # Mirror execution/validation.py's unconditional aws_s3-source ban for
+        # non-trained-operator sessions — see the named-sources branch above
+        # and _execute_set_source in sources.py for the full rationale.
+        if not context.plugin_snapshot.is_trained_operator:
+            source_policy_error = web_aws_s3_source_policy_error(src_plugin)
+            if source_policy_error is not None:
+                return _failure_result(state, source_policy_error, error_code="aws_s3_source_not_allowed")
         credential_error = _credential_wiring_contract_failure(
             state,
             component_id="source",
