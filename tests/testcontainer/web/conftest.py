@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import stat
 import subprocess
+import uuid
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from sqlalchemy.engine import make_url
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from xdist import is_xdist_worker
+
+from elspeth.web import aws_rds_trust
 
 _SEQUENTIAL_TEST_COMMAND = (
     "CI=1 uv run --frozen pytest -q -n 0 -m testcontainer "
@@ -56,6 +62,8 @@ def external_deployment_postgres_url(
             "/CN=localhost",
             "-addext",
             "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
             "-keyout",
             str(private_key),
             "-out",
@@ -84,12 +92,108 @@ exec /usr/local/bin/docker-entrypoint.sh "$@"
         (str(entrypoint), "/tls-source/tls-entrypoint.sh", "ro"),
     ]
     command = "postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/tls/server.crt -c ssl_key_file=/var/lib/postgresql/tls/server.key"
+    # testcontainers' default admin credentials are literally "test"/"test",
+    # which collides with the substring "test" inside pytest's own tmp-dir
+    # naming (`pytest-of-<user>/pytest-<n>/...`) once the doctor's rds_trust_root
+    # check starts reporting that tmp-dir path in its detail string (see
+    # aws_rds_trust_test_override below). Hex-only credentials cannot contain
+    # "test" (the hex alphabet excludes both "t" and "s"), so the existing
+    # redaction assertions stay meaningful instead of tripping on this
+    # test-harness coincidence.
+    admin_username = f"elspeth_admin_{uuid.uuid4().hex}"
+    admin_password = uuid.uuid4().hex
+    admin_dbname = f"elspeth_admin_{uuid.uuid4().hex}"
     with PostgresContainer(
         "postgres:16-alpine",
         driver="psycopg",
+        username=admin_username,
+        password=admin_password,
+        dbname=admin_dbname,
         command=command,
         entrypoint=["/bin/sh", "/tls-source/tls-entrypoint.sh"],
         volumes=volumes,
     ) as postgres:
         tls_url = make_url(postgres.get_connection_url()).update_query_dict({"sslmode": "verify-full", "sslrootcert": str(certificate)})
         yield tls_url.render_as_string(hide_password=False)
+
+
+@pytest.fixture
+def aws_rds_trust_test_override(
+    external_deployment_postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parsed = make_url(external_deployment_postgres_url)
+    root = parsed.query["sslrootcert"]
+    assert isinstance(root, str)
+    path = Path(root)
+    file_stat = path.stat()
+    monkeypatch.setattr(aws_rds_trust, "AWS_RDS_GLOBAL_BUNDLE_PATH", path)
+    monkeypatch.setattr(
+        aws_rds_trust,
+        "AWS_RDS_GLOBAL_BUNDLE_SHA256",
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        aws_rds_trust,
+        "AWS_RDS_GLOBAL_BUNDLE_CERTIFICATE_COUNT",
+        1,
+    )
+    monkeypatch.setattr(
+        aws_rds_trust,
+        "AWS_RDS_GLOBAL_BUNDLE_OWNER_UID",
+        file_stat.st_uid,
+    )
+    monkeypatch.setattr(
+        aws_rds_trust,
+        "AWS_RDS_GLOBAL_BUNDLE_MODE",
+        stat.S_IMODE(file_stat.st_mode),
+    )
+
+
+_SITECUSTOMIZE = '''\
+"""Test-only RDS trust override injected via PYTHONPATH by the test suite."""
+import os
+
+if os.environ.get("ELSPETH_TEST_RDS_TRUST_PATH"):
+    from pathlib import Path
+
+    from elspeth.web import aws_rds_trust
+
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH = Path(
+        os.environ["ELSPETH_TEST_RDS_TRUST_PATH"]
+    )
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256 = os.environ[
+        "ELSPETH_TEST_RDS_TRUST_SHA256"
+    ]
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_CERTIFICATE_COUNT = int(
+        os.environ["ELSPETH_TEST_RDS_TRUST_COUNT"]
+    )
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_OWNER_UID = int(
+        os.environ["ELSPETH_TEST_RDS_TRUST_UID"]
+    )
+    aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_MODE = int(
+        os.environ["ELSPETH_TEST_RDS_TRUST_MODE"]
+    )
+'''
+
+
+@pytest.fixture
+def aws_rds_trust_subprocess_env(
+    external_deployment_postgres_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, str]:
+    parsed = make_url(external_deployment_postgres_url)
+    root = parsed.query["sslrootcert"]
+    assert isinstance(root, str)
+    path = Path(root)
+    file_stat = path.stat()
+    shim_dir = tmp_path_factory.mktemp("rds-trust-shim")
+    (shim_dir / "sitecustomize.py").write_text(_SITECUSTOMIZE, encoding="utf-8")
+    return {
+        "PYTHONPATH": str(shim_dir),
+        "ELSPETH_TEST_RDS_TRUST_PATH": str(path),
+        "ELSPETH_TEST_RDS_TRUST_SHA256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "ELSPETH_TEST_RDS_TRUST_COUNT": "1",
+        "ELSPETH_TEST_RDS_TRUST_UID": str(file_stat.st_uid),
+        "ELSPETH_TEST_RDS_TRUST_MODE": str(stat.S_IMODE(file_stat.st_mode)),
+    }

@@ -29,7 +29,10 @@ from elspeth.web.schema_probe import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 
-pytestmark = pytest.mark.testcontainer
+pytestmark = [
+    pytest.mark.testcontainer,
+    pytest.mark.usefixtures("aws_rds_trust_test_override"),
+]
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 

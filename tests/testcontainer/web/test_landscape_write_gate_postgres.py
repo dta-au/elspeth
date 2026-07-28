@@ -40,7 +40,10 @@ from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.landscape_access import open_landscape_db
 from elspeth.web.schema_probe import SchemaState, init_landscape_schema, probe_landscape_schema
 
-pytestmark = pytest.mark.testcontainer
+pytestmark = [
+    pytest.mark.testcontainer,
+    pytest.mark.usefixtures("aws_rds_trust_test_override"),
+]
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 
