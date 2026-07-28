@@ -965,7 +965,7 @@ def test_inspect_database_forwards_pool_and_timeout_and_uses_one_connection(
     if require_authenticated_tls:
         connection.execute.return_value.one_or_none.return_value = (True, "TLSv1.3", 256)
     probe = create_autospec(probe_session_schema, return_value=SchemaState.CURRENT)
-    manager = Mock()
+    manager = Mock(spec_set=["execute", "probe"])
     manager.attach_mock(connection.execute, "execute")
     manager.attach_mock(probe, "probe")
     raw_url = "postgresql+psycopg://user:password@host/database"
