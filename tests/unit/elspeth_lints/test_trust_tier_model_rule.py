@@ -977,6 +977,69 @@ class TestR5IsinstanceClassification:
 
         assert len(self._r5_findings(source, filename="web/composer/service.py")) == 1
 
+    @pytest.mark.parametrize(
+        "assertion",
+        (
+            "assert isinstance(value, str)",
+            "assert isinstance(value, str) and value",
+            "assert ready and isinstance(value, str) and valid",
+            "assert ready and (valid and isinstance(value, str))",
+        ),
+    )
+    def test_fail_loud_assert_test_isinstance_not_flagged(self, assertion: str) -> None:
+        """A direct assert-test type check fails loudly instead of masking a bug."""
+        source = dedent(f"""\
+            def process(value, ready=True, valid=True):
+                {assertion}
+                return value
+        """)
+
+        assert self._r5_findings(source) == []
+
+    @pytest.mark.parametrize(
+        "assertion",
+        (
+            "assert isinstance(value, str) or ready",
+            "assert not isinstance(value, str)",
+            "assert all(isinstance(item, str) for item in value)",
+            "assert [isinstance(item, str) for item in value]",
+            "assert (lambda: isinstance(value, str))()",
+            "assert bool(isinstance(value, str))",
+            "assert ready, isinstance(value, str)",
+        ),
+    )
+    def test_isinstance_outside_direct_or_and_only_assert_test_still_flagged(self, assertion: str) -> None:
+        """Wrappers, inversion, disjunction, comprehensions, and messages remain R5."""
+        source = dedent(f"""\
+            def process(value, ready=True):
+                {assertion}
+                return value
+        """)
+
+        assert len(self._r5_findings(source)) == 1
+
+    def test_assert_isinstance_exemption_still_visits_nested_masking_calls(self) -> None:
+        """Exempt only the R5 call; nested masking calls retain their own findings."""
+        source = dedent("""\
+            def process(payload):
+                assert isinstance(payload.get("value"), str) and payload.get("ready")
+                return payload
+        """)
+
+        findings = parse_and_visit(source)
+
+        assert [finding.rule_id for finding in findings] == ["R1", "R1"]
+
+    def test_isinstance_in_assert_message_stays_flagged_when_test_is_direct_isinstance(self) -> None:
+        """The assert message is not part of the fail-loud test expression."""
+        source = dedent("""\
+            def process(value):
+                assert isinstance(value, str), isinstance(value, object)
+                return value
+        """)
+
+        assert len(self._r5_findings(source)) == 1
+
 
 # =============================================================================
 # Finding and canonical key generation

@@ -1215,10 +1215,33 @@ class TierModelVisitor(ast.NodeVisitor):
             return False
         return current_function.name in self._R5_NAMED_BOUNDARY_CONTEXTS.get(self.file_path, frozenset())
 
+    def _is_fail_loud_assert_test_isinstance(self, node: ast.Call) -> bool:
+        """Return True when ``node`` is a direct conjunct of an assert test.
+
+        The exemption follows only a direct chain of ``and`` nodes up to
+        ``Assert.test``. Any intervening wrapper, inversion, disjunction,
+        comprehension, lambda, or assert message keeps the R5 finding.
+        Descendants of the ``isinstance`` call are still visited normally, so
+        nested masking calls retain their own rule findings.
+        """
+        child: ast.AST = node
+        depth = 1
+        while True:
+            parent = self._ancestor_node(depth)
+            if isinstance(parent, ast.Assert):
+                return parent.test is child
+            if not isinstance(parent, ast.BoolOp) or not isinstance(parent.op, ast.And):
+                return False
+            if not any(value is child for value in parent.values):
+                return False
+            child = parent
+            depth += 1
+
     def _is_allowed_r5_context(self, node: ast.Call) -> bool:
         """Return True for R5a/R5b contexts where isinstance is the desired guard."""
         return (
-            self._is_tier1_frozen_dataclass_post_init_guard(node)
+            self._is_fail_loud_assert_test_isinstance(node)
+            or self._is_tier1_frozen_dataclass_post_init_guard(node)
             or self._is_pydantic_before_validator()
             or self._is_fastapi_route_handler()
             or self._is_named_tier3_boundary_context()
@@ -1690,29 +1713,31 @@ def scan_directory(
     return findings
 
 
+def iter_scannable_python_files(
+    root: Path,
+    exclude_patterns: list[str] | None = None,
+) -> Iterator[Path]:
+    """Yield exactly the Python paths consumed by the directory scanners."""
+    if exclude_patterns is None:
+        exclude_patterns = []
+    for py_file in root.rglob("*.py"):
+        relative = py_file.relative_to(root)
+        if any(part in _ALWAYS_EXCLUDED_DIRS for part in relative.parts):
+            continue
+        if any(relative.match(pattern) or str(relative).startswith(pattern.rstrip("*/")) for pattern in exclude_patterns):
+            continue
+        yield py_file
+
+
 def scan_directory_with_observations(
     root: Path,
     exclude_patterns: list[str] | None = None,
 ) -> tuple[list[Finding], list[Finding]]:
     """Scan all Python files and return violations plus suppression observations."""
-    exclude_patterns = exclude_patterns or []
     findings: list[Finding] = []
     suppressed_findings: list[Finding] = []
 
-    for py_file in root.rglob("*.py"):
-        relative = py_file.relative_to(root)
-        # Skip vendored/third-party directories
-        if any(part in _ALWAYS_EXCLUDED_DIRS for part in relative.parts):
-            continue
-        # Check user-specified exclusions
-        skip = False
-        for pattern in exclude_patterns:
-            if relative.match(pattern) or str(relative).startswith(pattern.rstrip("*/")):
-                skip = True
-                break
-        if skip:
-            continue
-
+    for py_file in iter_scannable_python_files(root, exclude_patterns):
         file_findings, file_suppressed_findings = scan_file_with_observations(py_file, root)
         findings.extend(file_findings)
         suppressed_findings.extend(file_suppressed_findings)
