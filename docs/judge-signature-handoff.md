@@ -153,10 +153,12 @@ transaction, and prints a paste-ready command containing
 `--resume <transaction-dir>`. Resume does not trust the scratch copy: it
 authenticates the journal, then re-checks the exact bundle bytes,
 source/bindings, active/candidate state, action evidence, and previously
-produced HMAC signatures before skipping completed judge work. The active tree
-must match either the recorded pre-transaction base or, only in the
-post-publish/pre-audit window, the authenticated published candidate. Any other
-tree change refuses recovery; re-stage against the new tree instead. On
+produced HMAC signatures before skipping completed judge work. Recovery accepts
+the recorded pre-transaction state, the exact authenticated published
+candidate, or a proven post-publish state where the private candidate contains
+the exact base and the active tree has since advanced under the shared writer
+lock. An ambiguous byte-for-byte return to the base fails closed. Any other tree
+change refuses recovery; re-stage against the new tree instead. On
 successful completion the
 coherent active tree is diagnosed and the canonical override-rate counter
 snapshot is refreshed. Resume also binds the original non-secret signing policy

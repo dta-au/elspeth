@@ -789,6 +789,72 @@ def test_sign_bundle_resume_finalizes_rotation_audit_after_published_interruptio
     assert _SPARE_PRE_JUDGE_KEY in (allowlist_dir / "later.yaml").read_text(encoding="utf-8")
 
 
+def test_publication_disposition_rejects_preexchange_candidate_replaced_with_base(
+    tmp_path: Path,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    active = _build_allowlist_dir(tmp_path)
+    tx_path = tmp_path / "tx"
+    candidate = tx_path / "candidate" / active.name
+    candidate.parent.mkdir(parents=True)
+    shutil.copytree(active, candidate)
+    (candidate / "_defaults.yaml").write_text(
+        (candidate / "_defaults.yaml").read_text(encoding="utf-8") + "# candidate\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "allowlist_dir": str(active),
+        "candidate_dir": str(candidate),
+        "base_snapshot": sign_bundle_transaction.tree_snapshot(active),
+        "candidate_snapshot": sign_bundle_transaction.tree_snapshot(candidate),
+        "publish_started_at": datetime.now(UTC).isoformat(),
+    }
+    # Candidate==base alone is not proof of publication: model a keyless
+    # scratch replacement after the pre-exchange timestamp but before exchange.
+    shutil.rmtree(candidate)
+    shutil.copytree(active, candidate)
+
+    with pytest.raises(
+        sign_bundle_transaction.SignBundleTransactionError,
+        match="cannot reconcile transaction publication",
+    ):
+        sign_bundle_transaction.publication_disposition(manifest)
+
+
+def test_create_transaction_fsyncs_each_new_parent_directory_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("{}\n", encoding="utf-8")
+    fsynced: list[Path] = []
+    real_fsync_directory = sign_bundle_transaction._fsync_directory
+
+    def _record_fsync(path: Path) -> None:
+        fsynced.append(path.resolve())
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(sign_bundle_transaction, "_fsync_directory", _record_fsync)
+    _tx_path, manifest = sign_bundle_transaction.create_transaction(
+        bundle_path=bundle_path,
+        bundle_id="fsync-order",
+        root=root,
+        allowlist_dir=allowlist_dir,
+        rotation_log=tmp_path / "rotations.log",
+        signing_policy={"operator_override": False},
+    )
+
+    active_parent = allowlist_dir.resolve().parent
+    tx_root = sign_bundle_transaction.transaction_root(allowlist_dir).resolve()
+    candidate_parent = Path(manifest["candidate_dir"]).resolve().parent
+    assert fsynced.index(active_parent) < fsynced.index(tx_root) < fsynced.index(candidate_parent)
+
+
 def test_sign_bundle_rotation_execute_minimal_plan_no_unfiltered_rescan(tmp_path: Path) -> None:
     """Third-consumer regression: no unfiltered re-scan at execute + no over-application.
 

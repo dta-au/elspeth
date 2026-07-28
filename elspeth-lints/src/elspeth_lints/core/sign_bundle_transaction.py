@@ -113,6 +113,7 @@ def create_transaction(
 
     tx_root = transaction_root(active)
     tx_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _fsync_directory(active.parent)
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", bundle_id).strip(".-") or "bundle"
     tx_path = Path(tempfile.mkdtemp(prefix=f"{safe_id}-", dir=tx_root))
     _fsync_directory(tx_root)
@@ -151,6 +152,7 @@ def create_transaction(
         "running_action": None,
     }
     _fsync_tree(candidate)
+    _fsync_directory(candidate_parent)
     _fsync_file(rotation_base)
     _fsync_file(rotation_staged)
     save_manifest(tx_path, manifest)
@@ -268,6 +270,7 @@ def publication_disposition(manifest: dict[str, Any]) -> str:
         return "published"
     if (
         manifest["candidate_snapshot"] != manifest["base_snapshot"]
+        and active_snapshot != manifest["base_snapshot"]
         and candidate_snapshot == manifest["base_snapshot"]
         and manifest.get("publish_started_at") is not None
     ):
