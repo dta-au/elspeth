@@ -418,6 +418,11 @@ class TestShippedExamples:
             monkeypatch.setenv(required_env_var, "test-openrouter-key")
         settings = load_settings(example_dir / settings_name)
 
+        # LandscapeDB.from_url never creates the audit DB's parent directory
+        # (the `elspeth run` preflight owns that), so the example must ship
+        # its runs/ directory via a tracked .gitkeep for direct construction
+        # to work against a fresh checkout.
+        assert (example_dir / "runs").is_dir(), f"examples/{example_name}/runs/ must ship a tracked .gitkeep"
         db = LandscapeDB.from_url(
             settings.landscape.url,
             dump_to_jsonl=settings.landscape.dump_to_jsonl,
