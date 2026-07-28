@@ -824,7 +824,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3dd388167196481e"
+    source_file_hash: str | None = "sha256:3dcc8fce87fa229e"
     config_model = AWSS3SourceConfig
 
     @classmethod
