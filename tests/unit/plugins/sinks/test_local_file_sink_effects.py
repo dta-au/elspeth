@@ -174,13 +174,89 @@ def test_local_effect_evidence_rejects_missing_or_unmatched_diversion_attributio
     plan = _prepare(sink, effect_id="ad" * 32, rows=[{"message": "accepted"}, {"message": 42}])
     evidence = dict(plan.safe_evidence)
     evidence.pop("diversion_attribution")
-    with pytest.raises(local_effects.LocalFilePreconditionError, match="diversion attribution"):
+    with pytest.raises(KeyError, match="diversion_attribution"):
         local_effects.LocalFileEffectPlanEvidence.from_mapping(evidence)
 
     evidence = dict(plan.safe_evidence)
     evidence["diversion_attribution"] = ()
     with pytest.raises(local_effects.LocalFilePreconditionError, match="diversion attribution"):
         local_effects.LocalFileEffectPlanEvidence.from_mapping(evidence)
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "accepted_ordinals",
+        "diverted_ordinals",
+        "encoding",
+        "format_name",
+        "lock_path",
+        "predecessor_declared",
+        "predecessor_exists",
+        "predecessor_file_id",
+        "predecessor_hash",
+        "predecessor_size",
+        "publication_kind",
+        "schema",
+        "staged_file_id",
+        "staged_hash",
+        "staged_size",
+        "staging_path",
+        "stream_sequence",
+        "target_path",
+    ],
+)
+def test_local_owned_plan_evidence_requires_every_field(tmp_path: Path, missing_key: str) -> None:
+    sink = TextSink({"path": str(tmp_path / "out.txt"), "field": "message", "schema": _SCHEMA})
+    plan = _prepare(sink, effect_id="a1" * 32, rows=[{"message": "accepted"}])
+    evidence = dict(plan.safe_evidence)
+    evidence.pop(missing_key)
+
+    with pytest.raises(KeyError, match=missing_key):
+        local_effects.LocalFileEffectPlanEvidence.from_mapping(evidence)
+
+
+@pytest.mark.parametrize(
+    ("missing_key", "observed_key"),
+    [
+        ("schema", None),
+        ("effect_id", None),
+        ("target_path", None),
+        ("observed", None),
+        ("predecessor_declared", None),
+        ("observed", "exists"),
+        ("observed", "hash"),
+        ("observed", "size"),
+        ("observed", "file_id"),
+    ],
+)
+def test_local_owned_inspection_evidence_requires_every_field(
+    tmp_path: Path,
+    missing_key: str,
+    observed_key: str | None,
+) -> None:
+    effect_id = "a2" * 32
+    inspection = local_effects.inspect_local_effect(
+        target_path=tmp_path / "out.txt",
+        request=SinkEffectInspectionRequest(
+            effect_id=effect_id,
+            target="{}",
+            predecessor_descriptor=None,
+        ),
+    )
+    evidence = dict(inspection.evidence)
+    if observed_key is None:
+        evidence.pop(missing_key)
+        expected_missing_key = missing_key
+    else:
+        observed = dict(evidence["observed"])
+        observed.pop(observed_key)
+        evidence["observed"] = observed
+        expected_missing_key = observed_key
+    divergent = replace(inspection, evidence=evidence)
+
+    with pytest.raises(KeyError, match=expected_missing_key):
+        local_effects._inspection_snapshot(divergent, effect_id=effect_id)
 
 
 def test_abandoned_atomic_replace_reconciles_by_staged_file_identity(

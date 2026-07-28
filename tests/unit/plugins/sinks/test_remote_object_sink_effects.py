@@ -7,7 +7,7 @@ import io
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import md5, sha256
 from pathlib import Path
@@ -565,13 +565,80 @@ def test_remote_effect_evidence_rejects_missing_or_invalid_diversion_attribution
 
     evidence = dict(plan.safe_evidence)
     evidence.pop("diversion_attribution")
-    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="diversion attribution"):
+    with pytest.raises(KeyError, match="diversion_attribution"):
         remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
 
     evidence = dict(plan.safe_evidence)
     evidence["diversion_attribution"] = ({"ordinal": 0, "reason_hash": "0" * 64, "error_hash": "not-hex"},)
     with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="diversion attribution"):
         remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "accepted_ordinals",
+        "checksum_algorithm",
+        "checksum_b64",
+        "diverted_ordinals",
+        "format_name",
+        "precondition",
+        "predecessor_etag",
+        "provider",
+        "publication_kind",
+        "schema",
+        "staged_hash",
+        "staged_size",
+        "staging_path",
+        "target",
+    ],
+)
+def test_remote_owned_plan_evidence_requires_every_field(missing_key: str) -> None:
+    store = _S3Store()
+    member = _member(0, {"id": 1})
+    plan = _prepare(_s3(store), effect_id="81" * 32, current=(member,), target_snapshot=(member,))
+    evidence = dict(plan.safe_evidence)
+    evidence.pop(missing_key)
+
+    with pytest.raises(KeyError, match=missing_key):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "schema",
+        "effect_id",
+        "provider",
+        "observed_exists",
+        "predecessor_declared",
+        "observed_etag",
+        "target",
+    ],
+)
+def test_remote_owned_inspection_evidence_requires_every_field(missing_key: str) -> None:
+    effect_id = "82" * 32
+    inspection = remote_effects.inspect_remote_object(
+        provider="aws_s3",
+        target="s3://bucket/key",
+        request=SinkEffectInspectionRequest(
+            effect_id=effect_id,
+            target="{}",
+            predecessor_descriptor=None,
+        ),
+        observation=remote_effects.RemoteObjectObservation(
+            exists=False,
+            etag=None,
+            content_hash=None,
+            size_bytes=None,
+        ),
+    )
+    evidence = dict(inspection.evidence)
+    evidence.pop(missing_key)
+    divergent = replace(inspection, evidence=evidence)
+
+    with pytest.raises(KeyError, match=missing_key):
+        remote_effects._inspection_values(divergent, effect_id=effect_id, provider="aws_s3")
 
 
 @pytest.mark.parametrize("factory", [_s3, _azure])

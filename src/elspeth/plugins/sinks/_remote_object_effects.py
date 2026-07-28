@@ -11,7 +11,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
@@ -96,40 +96,40 @@ class RemoteObjectPlanEvidence:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> RemoteObjectPlanEvidence:
-        if value.get("schema") != _EVIDENCE_SCHEMA:
+        if value["schema"] != _EVIDENCE_SCHEMA:
             raise RemoteObjectPreconditionError("remote object plan schema is missing or divergent")
-        accepted = _ordinals(value.get("accepted_ordinals"), "accepted_ordinals")
-        diverted = _ordinals(value.get("diverted_ordinals"), "diverted_ordinals")
+        accepted = _ordinals(value["accepted_ordinals"], "accepted_ordinals")
+        diverted = _ordinals(value["diverted_ordinals"], "diverted_ordinals")
         if set(accepted) & set(diverted):
             raise RemoteObjectPreconditionError("accepted and diverted ordinals overlap")
         try:
             diversion_attribution = parse_diversion_attribution(
-                value.get("diversion_attribution"),
+                value["diversion_attribution"],
                 diverted_ordinals=diverted,
             )
         except ValueError as exc:
             raise RemoteObjectPreconditionError(str(exc)) from exc
-        precondition = _string(value.get("precondition"), "precondition")
+        precondition = _string(value["precondition"], "precondition")
         if precondition not in {"if_none_match", "if_match"}:
             raise RemoteObjectPreconditionError("remote object precondition is not closed")
-        predecessor_etag = _optional_string(value.get("predecessor_etag"), "predecessor_etag")
+        predecessor_etag = _optional_string(value["predecessor_etag"], "predecessor_etag")
         if (precondition == "if_match") != (predecessor_etag is not None):
             raise RemoteObjectPreconditionError("remote object precondition and predecessor ETag diverge")
-        publication_kind = _string(value.get("publication_kind"), "publication_kind")
+        publication_kind = _string(value["publication_kind"], "publication_kind")
         if publication_kind not in {"conditional_create", "conditional_replace", "inherited", "virtual"}:
             raise RemoteObjectPreconditionError("remote object publication kind is not closed")
-        checksum_algorithm = _checksum_algorithm(value.get("checksum_algorithm"))
+        checksum_algorithm = _checksum_algorithm(value["checksum_algorithm"])
         return cls(
-            provider=_string(value.get("provider"), "provider"),
-            target=_string(value.get("target"), "target"),
-            staging_path=_string(value.get("staging_path"), "staging_path"),
+            provider=_string(value["provider"], "provider"),
+            target=_string(value["target"], "target"),
+            staging_path=_string(value["staging_path"], "staging_path"),
             precondition=precondition,
             predecessor_etag=predecessor_etag,
-            staged_hash=_lower_hex(value.get("staged_hash"), "staged_hash"),
-            staged_size=_integer(value.get("staged_size"), "staged_size"),
+            staged_hash=_lower_hex(value["staged_hash"], "staged_hash"),
+            staged_size=_integer(value["staged_size"], "staged_size"),
             checksum_algorithm=checksum_algorithm,
-            checksum_b64=_checksum_b64(value.get("checksum_b64"), checksum_algorithm),
-            format_name=_string(value.get("format_name"), "format_name"),
+            checksum_b64=_checksum_b64(value["checksum_b64"], checksum_algorithm),
+            format_name=_string(value["format_name"], "format_name"),
             accepted_ordinals=accepted,
             diverted_ordinals=diverted,
             diversion_attribution=diversion_attribution,
@@ -182,9 +182,10 @@ def _checksum_b64(value: object, algorithm: str) -> str:
 
 
 def _ordinals(value: object, field_name: str) -> tuple[int, ...]:
-    if not isinstance(value, (tuple, list)):
+    if type(value) not in {tuple, list}:
         raise RemoteObjectPreconditionError(f"{field_name} must be an ordered sequence")
-    result = tuple(_integer(item, field_name) for item in value)
+    sequence = cast("tuple[object, ...] | list[object]", value)
+    result = tuple(_integer(item, field_name) for item in sequence)
     if result != tuple(sorted(result)) or len(result) != len(set(result)):
         raise RemoteObjectPreconditionError(f"{field_name} must contain unique ascending ordinals")
     return result
@@ -255,24 +256,25 @@ def _inspection_values(
     provider: str,
 ) -> tuple[str, bool, str | None, bool]:
     evidence = inspection.evidence
-    if evidence.get("schema") != _INSPECTION_SCHEMA or evidence.get("effect_id") != effect_id:
+    if evidence["schema"] != _INSPECTION_SCHEMA or evidence["effect_id"] != effect_id:
         raise RemoteObjectPreconditionError("remote inspection is missing or bound to another effect")
-    if evidence.get("provider") != provider:
+    if evidence["provider"] != provider:
         raise RemoteObjectPreconditionError("remote inspection provider diverges")
-    exists = evidence.get("observed_exists")
-    predecessor_declared = evidence.get("predecessor_declared")
+    exists = evidence["observed_exists"]
+    predecessor_declared = evidence["predecessor_declared"]
     if type(exists) is not bool or type(predecessor_declared) is not bool:
         raise RemoteObjectPreconditionError("remote inspection boolean evidence is malformed")
-    etag = _optional_string(evidence.get("observed_etag"), "observed_etag")
+    etag = _optional_string(evidence["observed_etag"], "observed_etag")
     if exists != (etag is not None):
         raise RemoteObjectPreconditionError("remote inspection existence and ETag diverge")
-    return _string(evidence.get("target"), "target"), exists, etag, predecessor_declared
+    return _string(evidence["target"], "target"), exists, etag, predecessor_declared
 
 
 def _spool_root() -> Path:
-    configured = os.environ.get("ELSPETH_EFFECT_SPOOL_DIR")
-    if configured:
-        return Path(configured).resolve(strict=False)
+    if "ELSPETH_EFFECT_SPOOL_DIR" in os.environ:
+        configured = os.environ["ELSPETH_EFFECT_SPOOL_DIR"]
+        if configured != "":
+            return Path(configured).resolve(strict=False)
     # Staged bodies are referenced by durable PREPARED plans, so the spool
     # must share the landscape DB's durability the way local-file sinks stage
     # next to their targets. A gettempdir() spool loses parked bodies to
@@ -285,7 +287,7 @@ def _stage_path(effect_id: str, provider: str) -> Path:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
     finally:
