@@ -367,9 +367,33 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         auth_local._append_email_verification_record(outbox_path, record)
         assert [json.loads(line) for line in outbox_path.read_text().splitlines()] == [record]
 
-    def test_email_outbox_repairs_partial_crash_tail_before_republication(self, tmp_path) -> None:
+    def test_email_outbox_normalizes_valid_final_record_before_append(self, tmp_path) -> None:
         outbox_path = tmp_path / "email-verifications.jsonl"
-        outbox_path.write_bytes(b'{"delivery_id":"crashed"')
+        published = {"delivery_id": "published"}
+        record = {"delivery_id": "delivery-1"}
+        published_payload = json.dumps(published, sort_keys=True, separators=(",", ":")).encode()
+        record_payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        outbox_path.write_bytes(published_payload)
+
+        auth_local._append_email_verification_record(outbox_path, record)
+
+        assert outbox_path.read_bytes() == published_payload + b"\n" + record_payload + b"\n"
+
+    @pytest.mark.parametrize(
+        "existing",
+        [
+            b'{"delivery_id":"crashed"',
+            b'{"delivery_id":"published"}\n{"delivery_id":"crashed"',
+        ],
+        ids=["malformed-only", "mixed-valid-and-malformed"],
+    )
+    def test_email_outbox_rejects_malformed_final_record_without_mutation(
+        self,
+        tmp_path,
+        existing: bytes,
+    ) -> None:
+        outbox_path = tmp_path / "email-verifications.jsonl"
+        outbox_path.write_bytes(existing)
         record = {
             "delivery_id": "delivery-1",
             "user_id": "alice",
@@ -378,9 +402,38 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             "verification_url": "https://composer.example.test/?verify_token=verification-token",
         }
 
-        auth_local._append_email_verification_record(outbox_path, record)
+        with pytest.raises(auth_local.AuditIntegrityError, match="malformed"):
+            auth_local._append_email_verification_record(outbox_path, record)
 
-        assert [json.loads(line) for line in outbox_path.read_text().splitlines()] == [record]
+        assert outbox_path.read_bytes() == existing
+
+    @pytest.mark.parametrize(
+        "existing",
+        [
+            b'{"user_id":"corrupt"}',
+            b'{"delivery_id":"published"}\n{"user_id":"corrupt"}',
+        ],
+        ids=["invalid-only", "mixed-valid-and-invalid"],
+    )
+    def test_email_outbox_rejects_final_record_without_delivery_id_without_mutation(
+        self,
+        tmp_path,
+        existing: bytes,
+    ) -> None:
+        outbox_path = tmp_path / "email-verifications.jsonl"
+        outbox_path.write_bytes(existing)
+        record = {
+            "delivery_id": "delivery-1",
+            "user_id": "alice",
+            "email": "alice@example.com",
+            "token": "verification-token",
+            "verification_url": "https://composer.example.test/?verify_token=verification-token",
+        }
+
+        with pytest.raises(auth_local.AuditIntegrityError, match="delivery_id"):
+            auth_local._append_email_verification_record(outbox_path, record)
+
+        assert outbox_path.read_bytes() == existing
 
     def test_retry_after_expiry_rotates_pending_registration_delivery(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         now = [1_000]

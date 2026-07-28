@@ -68,7 +68,7 @@ def _verification_token_hash(token: str) -> str:
 
 
 def _read_jsonl_delivery_ids(fd: int) -> set[str]:
-    """Validate a locked verification outbox and repair only a partial tail."""
+    """Validate a locked verification outbox and normalize its final newline."""
     os.lseek(fd, 0, os.SEEK_SET)
     chunks: list[bytes] = []
     while chunk := os.read(fd, 64 * 1024):
@@ -77,38 +77,27 @@ def _read_jsonl_delivery_ids(fd: int) -> set[str]:
     if not content:
         return set()
 
-    complete = content
-    if not content.endswith(b"\n"):
-        tail_start = content.rfind(b"\n") + 1
-        tail = content[tail_start:]
-        try:
-            decoded_tail = json.loads(tail)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            os.ftruncate(fd, tail_start)
-            os.fsync(fd)
-            complete = content[:tail_start]
-        else:
-            if type(decoded_tail) is not dict:
-                raise AuditIntegrityError("Email verification outbox tail must be a JSON object")
-            os.lseek(fd, 0, os.SEEK_END)
-            if os.write(fd, b"\n") != 1:
-                raise OSError("Email verification outbox newline repair was incomplete")
-            os.fsync(fd)
-            complete = content + b"\n"
-
     delivery_ids: set[str] = set()
-    for line_number, raw_line in enumerate(complete.splitlines(), start=1):
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
         try:
             record = json.loads(raw_line)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise AuditIntegrityError(f"Email verification outbox line {line_number} is malformed") from exc
         if type(record) is not dict:
             raise AuditIntegrityError(f"Email verification outbox line {line_number} must be a JSON object")
-        delivery_id = record.get("delivery_id")
-        if delivery_id is not None:
-            if type(delivery_id) is not str or not delivery_id:
-                raise AuditIntegrityError(f"Email verification outbox line {line_number} has an invalid delivery_id")
-            delivery_ids.add(delivery_id)
+        try:
+            delivery_id = record["delivery_id"]
+        except KeyError as exc:
+            raise AuditIntegrityError(f"Email verification outbox line {line_number} is missing delivery_id") from exc
+        if type(delivery_id) is not str or not delivery_id:
+            raise AuditIntegrityError(f"Email verification outbox line {line_number} has an invalid delivery_id")
+        delivery_ids.add(delivery_id)
+
+    if not content.endswith(b"\n"):
+        os.lseek(fd, 0, os.SEEK_END)
+        if os.write(fd, b"\n") != 1:
+            raise OSError("Email verification outbox newline repair was incomplete")
+        os.fsync(fd)
     return delivery_ids
 
 
@@ -119,7 +108,10 @@ def _append_email_verification_record(outbox_path: Path, record: Mapping[str, ob
     publication. A crash after append but before acknowledgement is recovered
     by scanning the locked file and acknowledging the already-present ID.
     """
-    delivery_id = record.get("delivery_id")
+    try:
+        delivery_id = record["delivery_id"]
+    except KeyError as exc:
+        raise AuditIntegrityError("Email verification delivery_id is required") from exc
     if type(delivery_id) is not str or not delivery_id:
         raise AuditIntegrityError("Email verification delivery_id must be a non-empty string")
     payload = (json.dumps(dict(record), sort_keys=True, separators=(",", ":")) + "\n").encode()
