@@ -719,8 +719,10 @@ class TestShippedExamples:
         }
         launcher_env.pop("ELSPETH_BLOB_TRANSFORMS_PYTHON_BIN", None)
         launcher_env.pop("ELSPETH_BLOB_TRANSFORMS_CLI_BIN", None)
+        # Run under a permissive umask: the launcher must produce a private
+        # payload-store directory even when the host default would not.
         result = subprocess.run(
-            ["bash", copied_example_dir / "run.sh"],
+            ["bash", "-c", 'umask 0002 && exec bash "$1"', "bash", str(copied_example_dir / "run.sh")],
             cwd=tmp_path,
             capture_output=True,
             text=True,
