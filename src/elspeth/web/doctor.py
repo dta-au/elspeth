@@ -19,6 +19,7 @@ from typing import Any, cast
 from sqlalchemy import Connection, Engine, create_engine, text
 from sqlalchemy.engine import make_url
 
+from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import (
@@ -195,10 +196,6 @@ def _aws_operator_telemetry_check(settings: WebSettings | None) -> ContractCheck
     )
 
 
-def _capability_value(value: object) -> object:
-    return getattr(value, "value", value)
-
-
 def _bedrock_guardrail_plugins_check() -> ContractCheck:
     name = "bedrock_guardrail_plugins"
     try:
@@ -211,14 +208,14 @@ def _bedrock_guardrail_plugins_check() -> ContractCheck:
         prompt_declarations = cast(Any, prompt).policy_capabilities
         content_declarations = cast(Any, content).policy_capabilities
         prompt_ok = any(
-            _capability_value(declaration.capability) == "prompt_shield"
-            and _capability_value(declaration.control_role) == "input"
+            declaration.capability is PluginCapability.PROMPT_SHIELD
+            and declaration.control_role is ControlRole.INPUT
             and declaration.blocks_positive_detection is True
             for declaration in prompt_declarations
         )
         content_ok = any(
-            _capability_value(declaration.capability) == "content_safety"
-            and _capability_value(declaration.control_role) == "output"
+            declaration.capability is PluginCapability.CONTENT_SAFETY
+            and declaration.control_role is ControlRole.OUTPUT
             and declaration.blocks_positive_detection is True
             for declaration in content_declarations
         )

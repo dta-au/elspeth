@@ -11,7 +11,7 @@ import asyncio
 import dataclasses
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
@@ -23,6 +23,7 @@ from opentelemetry.metrics import Observation
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult, MetricsData, PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
+from opentelemetry.util.types import Attributes
 
 from elspeth import __version__
 from elspeth.core.config import ElspethSettings, ExporterSettings, TelemetrySettings
@@ -64,6 +65,8 @@ _log = structlog.get_logger(__name__)
 
 
 class _Provider(Protocol):
+    def get_meter(self, name: str, version: str) -> Any: ...
+
     def force_flush(self, timeout_millis: float = 10_000) -> bool: ...
 
     def shutdown(self, timeout_millis: float = 30_000) -> None: ...
@@ -74,7 +77,7 @@ class OperatorTelemetryFactories:
     """Resettable construction seam used by bootstrap unit tests."""
 
     prometheus_reader: Callable[[], object]
-    otlp_exporter: Callable[..., object]
+    otlp_exporter: Callable[..., MetricExporter]
     periodic_reader: Callable[..., object]
     meter_provider: Callable[..., _Provider]
     set_meter_provider: Callable[[object], None]
@@ -127,7 +130,7 @@ class _ExportHealth:
             self._queue_drops += count
 
 
-def _safe_point_attributes(attributes: Mapping[str, object] | None) -> Mapping[str, object] | None:
+def _safe_point_attributes(attributes: Attributes) -> Attributes:
     if attributes is None:
         return None
     return {key: value for key, value in attributes.items() if key in SAFE_CLOUDWATCH_METRIC_ATTRIBUTES}
@@ -143,17 +146,19 @@ def _sanitize_metric_data(metrics_data: MetricsData) -> MetricsData:
             sanitized_metrics = []
             for metric in scope_metric.metrics:
                 data = metric.data
-                points = getattr(data, "data_points", None)
-                if points is None:
-                    sanitized_metrics.append(metric)
-                    continue
                 sanitized_points = []
-                for point in points:
-                    replacements: dict[str, object] = {"attributes": _safe_point_attributes(point.attributes)}
-                    if hasattr(point, "exemplars"):
-                        replacements["exemplars"] = ()
-                    sanitized_points.append(dataclasses.replace(point, **replacements))
-                sanitized_data = dataclasses.replace(cast(Any, data), data_points=tuple(sanitized_points))
+                for point in data.data_points:
+                    sanitized_points.append(
+                        dataclasses.replace(
+                            point,
+                            attributes=_safe_point_attributes(point.attributes),
+                            exemplars=(),
+                        )
+                    )
+                sanitized_data = dataclasses.replace(
+                    cast(Any, data),
+                    data_points=tuple(sanitized_points),
+                )
                 sanitized_metrics.append(dataclasses.replace(metric, data=sanitized_data))
             scope_metrics.append(dataclasses.replace(scope_metric, metrics=tuple(sanitized_metrics)))
         resource_metrics.append(dataclasses.replace(resource_metric, scope_metrics=tuple(scope_metrics)))
@@ -274,10 +279,7 @@ def _required_aws_resource_identity(settings: WebSettings) -> dict[str, str]:
 
 
 def _wire_health_instruments(provider: _Provider, health: _ExportHealth) -> None:
-    get_meter = getattr(provider, "get_meter", None)
-    if get_meter is None:  # Narrow test-provider seam; real MeterProvider always exposes get_meter.
-        return
-    meter = get_meter("elspeth.web.operator_telemetry", __version__)
+    meter = provider.get_meter("elspeth.web.operator_telemetry", __version__)
     meter.create_observable_gauge(
         "operator.telemetry.last_success_age_seconds",
         callbacks=[
@@ -329,7 +331,9 @@ def bootstrap_operator_telemetry(
         if _runtime is not None:
             return _runtime
 
-        selected = factories or _production_factories()
+        selected = factories
+        if selected is None:
+            selected = _production_factories()
         resource_attributes: dict[str, str] = {
             "service.name": settings.operator_telemetry_service_name,
             "service.version": __version__,
@@ -348,7 +352,7 @@ def bootstrap_operator_telemetry(
         health = _ExportHealth()
         if settings.operator_telemetry == "aws-otlp":
             raw_exporter = selected.otlp_exporter(endpoint=AWS_OTLP_ENDPOINT, insecure=True, headers={})
-            exporter = _HealthTrackingMetricExporter(raw_exporter, health) if isinstance(raw_exporter, MetricExporter) else raw_exporter
+            exporter = _HealthTrackingMetricExporter(raw_exporter, health)
             readers.append(
                 selected.periodic_reader(
                     exporter,
@@ -358,6 +362,8 @@ def bootstrap_operator_telemetry(
             )
 
         provider = selected.meter_provider(readers, resource=resource, views=())
+        if settings.operator_telemetry == "aws-otlp":
+            _wire_health_instruments(provider, health)
         selected.set_meter_provider(provider)
         _runtime = OperatorTelemetryRuntime(
             mode=settings.operator_telemetry,
@@ -366,8 +372,6 @@ def bootstrap_operator_telemetry(
             resource=resource,
             health=health,
         )
-        if settings.operator_telemetry == "aws-otlp":
-            _wire_health_instruments(provider, health)
         return _runtime
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -176,12 +176,13 @@ class _FakeReader:
     interval_ms: int | None = None
 
 
-@dataclass
-class _FakeExporter:
-    endpoint: str
-    insecure: bool
-    headers: dict[str, str]
-    results: list[MetricExportResult] = field(default_factory=list)
+class _FakeExporter(MetricExporter):
+    def __init__(self, *, endpoint: str, insecure: bool, headers: dict[str, str]) -> None:
+        super().__init__()
+        self.endpoint = endpoint
+        self.insecure = insecure
+        self.headers = headers
+        self.results: list[MetricExportResult] = []
 
     def export(self, _data: object, timeout_millis: float = 10_000, **_kwargs: object) -> MetricExportResult:
         del timeout_millis
@@ -346,6 +347,65 @@ def test_process_bootstrap_aws_adds_one_fixed_otlp_reader_and_safe_resource() ->
         "aws.ecs.task.family": "elspeth-web-task",
         "aws.ecs.task.revision": "42",
     }
+
+
+def test_aws_bootstrap_rejects_provider_without_meter_contract() -> None:
+    @dataclass
+    class _ProviderWithoutMeter:
+        readers: list[object]
+        resource: object
+        views: tuple[object, ...]
+
+        def force_flush(self, timeout_millis: float = 10_000) -> bool:
+            del timeout_millis
+            return True
+
+        def shutdown(self, timeout_millis: float = 30_000) -> None:
+            del timeout_millis
+
+    record: dict[str, object] = {}
+    base = _factories(record)
+    factories = replace(
+        base,
+        meter_provider=lambda readers, *, resource, views: _ProviderWithoutMeter(readers, resource, views),
+    )
+
+    with pytest.raises(AttributeError, match="get_meter"):
+        bootstrap_operator_telemetry(
+            _web_settings(
+                deployment_target="aws-ecs",
+                operator_telemetry="aws-otlp",
+                operator_telemetry_environment="production",
+                operator_telemetry_release="git-deadbeef",
+                operator_telemetry_ecs_cluster="elspeth-production",
+                operator_telemetry_ecs_service="elspeth-web",
+                operator_telemetry_task_definition_family="elspeth-web-task",
+                operator_telemetry_task_definition_revision="42",
+            ),
+            factories=factories,
+        )
+
+    assert "set_provider" not in record
+
+
+def test_aws_bootstrap_rejects_exporter_outside_factory_contract() -> None:
+    base = _factories({})
+    factories = replace(base, otlp_exporter=lambda **_kwargs: object())
+
+    with pytest.raises(AttributeError):
+        bootstrap_operator_telemetry(
+            _web_settings(
+                deployment_target="aws-ecs",
+                operator_telemetry="aws-otlp",
+                operator_telemetry_environment="production",
+                operator_telemetry_release="git-deadbeef",
+                operator_telemetry_ecs_cluster="elspeth-production",
+                operator_telemetry_ecs_service="elspeth-web",
+                operator_telemetry_task_definition_family="elspeth-web-task",
+                operator_telemetry_task_definition_revision="42",
+            ),
+            factories=factories,
+        )
 
 
 @pytest.mark.parametrize(

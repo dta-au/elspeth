@@ -14,6 +14,11 @@ from unittest.mock import MagicMock, create_autospec
 import pytest
 from sqlalchemy import Connection, Engine, create_engine
 
+from elspeth.contracts.plugin_capabilities import (
+    CapabilityDeclaration,
+    ControlRole,
+    PluginCapability,
+)
 from elspeth.core.config import TelemetrySettings
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.web.config import WebSettings
@@ -424,7 +429,7 @@ def test_operator_telemetry_check_rejects_policy_shape_and_endpoint_drift(
     assert _aws_operator_telemetry_check(settings).ok is False
 
 
-def test_guardrail_registration_check_requires_positive_detection_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_guardrail_registration_check_rejects_string_capability_impostors(monkeypatch: pytest.MonkeyPatch) -> None:
     import elspeth.plugins.infrastructure.manager as manager_module
 
     class _Manager:
@@ -437,7 +442,7 @@ def test_guardrail_registration_check_requires_positive_detection_blocking(monke
                         SimpleNamespace(
                             capability="prompt_shield",
                             control_role="input",
-                            blocks_positive_detection=False,
+                            blocks_positive_detection=True,
                         ),
                     ),
                 ),
@@ -456,6 +461,40 @@ def test_guardrail_registration_check_requires_positive_detection_blocking(monke
     monkeypatch.setattr(manager_module, "get_shared_plugin_manager", _Manager)
 
     assert _bedrock_guardrail_plugins_check().ok is False
+
+
+def test_guardrail_registration_check_accepts_typed_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.infrastructure.manager as manager_module
+
+    class _Manager:
+        @staticmethod
+        def get_transforms() -> list[object]:
+            return [
+                SimpleNamespace(
+                    name="aws_bedrock_prompt_shield",
+                    policy_capabilities=(
+                        CapabilityDeclaration(
+                            capability=PluginCapability.PROMPT_SHIELD,
+                            control_role=ControlRole.INPUT,
+                            blocks_positive_detection=True,
+                        ),
+                    ),
+                ),
+                SimpleNamespace(
+                    name="aws_bedrock_content_safety",
+                    policy_capabilities=(
+                        CapabilityDeclaration(
+                            capability=PluginCapability.CONTENT_SAFETY,
+                            control_role=ControlRole.OUTPUT,
+                            blocks_positive_detection=True,
+                        ),
+                    ),
+                ),
+            ]
+
+    monkeypatch.setattr(manager_module, "get_shared_plugin_manager", _Manager)
+
+    assert _bedrock_guardrail_plugins_check().ok is True
 
 
 @pytest.mark.parametrize(
