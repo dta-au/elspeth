@@ -368,10 +368,10 @@ def _inspection_target(request: SinkEffectPrepareRequest, target_path: Path) -> 
     evidence = request.inspection.evidence
     if set(evidence) != {"effect_id", "schema", "target_kind", "target_path"}:
         raise AuditExportBundleInputError("bundle inspection evidence is not closed")
-    if evidence.get("schema") != INSPECTION_SCHEMA or evidence.get("effect_id") != request.effect_id:
+    if evidence["schema"] != INSPECTION_SCHEMA or evidence["effect_id"] != request.effect_id:
         raise AuditExportBundleInputError("bundle inspection evidence is divergent")
     target = _absolute_path(target_path)
-    if evidence.get("target_path") != str(target):
+    if evidence["target_path"] != str(target):
         raise AuditExportBundleInputError("bundle prepare target differs from inspection")
     return target
 
@@ -387,10 +387,13 @@ def _csv_relative_path(record_type: object, seen: dict[str, str]) -> str:
     _validate_relative_name(relative_path)
     if relative_path.casefold() == AUDIT_MANIFEST_NAME.casefold():
         raise AuditExportBundleInputError("generated CSV filename collides with the reserved audit manifest")
-    prior = seen.get(relative_path.casefold())
+    folded_path = relative_path.casefold()
+    prior: str | None = None
+    if folded_path in seen:
+        prior = seen[folded_path]
     if prior is not None and prior != relative_path:
         raise AuditExportBundleInputError("generated CSV filenames contain a case-fold collision")
-    seen[relative_path.casefold()] = relative_path
+    seen[folded_path] = relative_path
     return relative_path
 
 
@@ -424,10 +427,12 @@ def _parse_verified_records(
                 if type(value) is not dict or canonical_json(value).encode("utf-8") != frame:
                     raise AuditExportBundleInputError("verified data records must be exact canonical JSON objects")
                 record = cast(dict[str, object], value)
-                relative_path = _csv_relative_path(record.get("record_type"), seen_names)
+                relative_path = _csv_relative_path(record["record_type"], seen_names)
                 flattened = formatter.format(record)
                 safe_record = {key: _neutralize_csv_formula(item) for key, item in flattened.items()}
-                spool = spools.get(relative_path)
+                spool: _RecordSpool | None = None
+                if relative_path in spools:
+                    spool = spools[relative_path]
                 if spool is None:
                     if len(spools) >= MAX_BUNDLE_FILES - 1:
                         raise AuditExportBundleInputError("CSV record types exceed the bounded bundle-file limit")
@@ -456,8 +461,8 @@ def _parse_verified_records(
             raise AuditExportBundleInputError("final audit manifest is not valid JSON") from exc
         if (
             type(manifest) is not dict
-            or manifest.get("record_type") != "manifest"
-            or manifest.get("schema") != "elspeth.audit-export-manifest.v2"
+            or manifest["record_type"] != "manifest"
+            or manifest["schema"] != "elspeth.audit-export-manifest.v2"
             or canonical_json(manifest).encode("utf-8") != manifest_bytes
         ):
             raise AuditExportBundleInputError("final audit manifest is non-final or non-canonical")
@@ -497,8 +502,24 @@ def _write_exact_file(path: Path, content: bytes) -> BundleFileEntry:
     return BundleFileEntry(path.name, hashlib.sha256(content).hexdigest(), len(content))
 
 
+def _directory_read_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _regular_file_read_flags() -> int:
+    return os.O_RDONLY | os.O_NOFOLLOW
+
+
+def _require_secure_open_flags() -> None:
+    try:
+        _directory_read_flags()
+        _regular_file_read_flags()
+    except AttributeError as exc:
+        raise AuditExportBundlePreflightError("CSV audit-export bundles require os.O_DIRECTORY and os.O_NOFOLLOW") from exc
+
+
 def _tree_matches(path: Path, files: Sequence[BundleFileEntry]) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     try:
         directory_fd = os.open(path, flags)
     except OSError:
@@ -514,7 +535,7 @@ def _tree_matches(path: Path, files: Sequence[BundleFileEntry]) -> bool:
         if len({name.casefold() for name in names}) != len(names):
             return False
         for entry in files:
-            file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            file_flags = _regular_file_read_flags()
             try:
                 descriptor = os.open(entry.relative_path, file_flags, dir_fd=directory_fd)
             except OSError:
@@ -545,7 +566,7 @@ def _tree_matches(path: Path, files: Sequence[BundleFileEntry]) -> bool:
 def _remove_exact_tree(path: Path, files: Sequence[BundleFileEntry]) -> bool:
     if not _tree_matches(path, files):
         return False
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     try:
         directory_fd = os.open(path, flags)
     except OSError:
@@ -592,7 +613,7 @@ def _open_pinned_bundle_parent(target: Path) -> _PinnedBundleParent:
     parent = target.parent
     if not parent.is_absolute():
         raise AuditExportBundlePreconditionError("bundle target parent must be absolute")
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     current = os.open(parent.anchor, flags)
     parts = parent.parts[1:]
     if not parts:
@@ -624,7 +645,7 @@ def _directory_fd_matches(directory_fd: int, files: Sequence[BundleFileEntry]) -
     if len({name.casefold() for name in names}) != len(names):
         return False
     for entry in files:
-        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = _regular_file_read_flags()
         try:
             descriptor = os.open(entry.relative_path, file_flags, dir_fd=directory_fd)
         except OSError:
@@ -651,7 +672,7 @@ def _directory_fd_matches(directory_fd: int, files: Sequence[BundleFileEntry]) -
 
 
 def _tree_matches_at(parent_fd: int, name: str, files: Sequence[BundleFileEntry]) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     try:
         directory_fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError:
@@ -675,7 +696,7 @@ def _target_kind_at(parent_fd: int, name: str) -> str:
 
 
 def _remove_exact_tree_at(parent_fd: int, name: str, files: Sequence[BundleFileEntry]) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     try:
         directory_fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError:
@@ -702,7 +723,7 @@ def _remove_exact_tree_at(parent_fd: int, name: str, files: Sequence[BundleFileE
 
 
 def _fsync_tree_at(parent_fd: int, name: str, files: Sequence[BundleFileEntry]) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     try:
         directory_fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError:
@@ -915,8 +936,8 @@ def commit_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectCommitResult:
 
 def reconcile_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectReconcileResult:
     """Classify the target using the closed exact/not-applied/unknown set."""
+    evidence, target, staging, descriptor = _parse_plan(plan)
     try:
-        evidence, target, staging, descriptor = _parse_plan(plan)
         parent = _open_pinned_bundle_parent(target)
         try:
             if not parent.is_still_bound():
@@ -933,18 +954,19 @@ def reconcile_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectReconcileRe
             return SinkEffectReconcileResult.unknown(evidence={"staging": "divergent", "target": target_kind})
         finally:
             parent.close()
-    except (AuditExportBundleError, OSError, ValueError, TypeError) as exc:
+    except OSError as exc:
         return SinkEffectReconcileResult.unknown(evidence={"reason": type(exc).__name__})
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
-_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
 
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
-    if _RENAMEAT2 is None:
-        raise OSError(errno.ENOSYS, "libc does not expose renameat2")
-    result = _RENAMEAT2(
+    try:
+        renameat2 = _LIBC.renameat2
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "libc does not expose renameat2") from exc
+    result = renameat2(
         ctypes.c_int(_AT_FDCWD),
         ctypes.c_char_p(os.fsencode(source)),
         ctypes.c_int(_AT_FDCWD),
@@ -957,9 +979,11 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
 
 
 def _rename_noreplace_at(parent_fd: int, source_name: str, destination_name: str) -> None:
-    if _RENAMEAT2 is None:
-        raise OSError(errno.ENOSYS, "libc does not expose renameat2")
-    result = _RENAMEAT2(
+    try:
+        renameat2 = _LIBC.renameat2
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "libc does not expose renameat2") from exc
+    result = renameat2(
         ctypes.c_int(parent_fd),
         ctypes.c_char_p(os.fsencode(source_name)),
         ctypes.c_int(parent_fd),
@@ -972,9 +996,10 @@ def _rename_noreplace_at(parent_fd: int, source_name: str, destination_name: str
 
 
 def _statfs_type(path: Path) -> int:
-    statfs = getattr(_LIBC, "statfs", None)
-    if statfs is None:
-        raise OSError(errno.ENOSYS, "libc does not expose statfs")
+    try:
+        statfs = _LIBC.statfs
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "libc does not expose statfs") from exc
     buffer = ctypes.create_string_buffer(512)
     result = statfs(ctypes.c_char_p(os.fsencode(path)), ctypes.byref(buffer))
     if result != 0:
@@ -988,7 +1013,7 @@ def _device_id(path: Path) -> int:
 
 
 def _fsync_regular_file(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = _regular_file_read_flags()
     descriptor = os.open(path, flags)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
@@ -999,7 +1024,7 @@ def _fsync_regular_file(path: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     descriptor = os.open(path, flags)
     try:
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
@@ -1056,6 +1081,7 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
     """Exercise the exact Linux/filesystem durability primitive before reservation."""
     if sys.platform != "linux":
         raise AuditExportBundlePreflightError("CSV audit-export bundles require Linux renameat2 semantics")
+    _require_secure_open_flags()
     target = _absolute_path(target_path)
     if not target.name:
         raise AuditExportBundlePreflightError("bundle target must name a child directory")

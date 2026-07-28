@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -370,13 +371,14 @@ def test_divergent_existing_tree_is_unknown_and_never_replaced(tmp_path: Path, m
     assert bundle_effects.reconcile_audit_export_bundle(plan).kind is SinkEffectReconcileKind.UNKNOWN
 
 
-def test_reordered_durable_manifest_is_unknown(tmp_path: Path) -> None:
+def test_reordered_durable_manifest_is_tier_one_corruption(tmp_path: Path) -> None:
     plan = _prepare(tmp_path / "audit")
     changed = dict(plan.safe_evidence)
     changed["files"] = list(reversed(list(plan.safe_evidence["files"])))
     tampered = replace(plan, safe_evidence=changed)
 
-    assert bundle_effects.reconcile_audit_export_bundle(tampered).kind is SinkEffectReconcileKind.UNKNOWN
+    with pytest.raises(bundle_effects.AuditExportBundlePreconditionError):
+        bundle_effects.reconcile_audit_export_bundle(tampered)
 
 
 @pytest.mark.parametrize(
@@ -418,6 +420,13 @@ def test_casefold_filename_collision_fails_before_publication(tmp_path: Path) ->
     with pytest.raises(bundle_effects.AuditExportBundleInputError, match="case-fold"):
         _prepare(tmp_path / "audit", snapshot)
     assert not (tmp_path / "audit").exists()
+
+
+def test_verified_audit_record_missing_record_type_is_tier_one_corruption(tmp_path: Path) -> None:
+    snapshot, _objects = _forged_snapshot({"value": 1})
+
+    with pytest.raises(KeyError, match="record_type"):
+        _prepare(tmp_path / "audit", snapshot)
 
 
 def test_stale_sweep_removes_crashed_building_trees_and_probes_but_not_staging(tmp_path: Path) -> None:
@@ -465,11 +474,27 @@ def test_preflight_exercises_linux_noreplace_and_fsync_without_target_publicatio
 
 
 def test_preflight_rejects_non_linux_before_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bundle_effects.sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "platform", "darwin")
     target = tmp_path / "audit"
     with pytest.raises(bundle_effects.AuditExportBundlePreflightError, match="Linux"):
         bundle_effects.preflight_audit_export_bundle(target)
     assert not target.exists()
+
+
+@pytest.mark.parametrize("flag_name", ["O_DIRECTORY", "O_NOFOLLOW"])
+def test_preflight_requires_no_follow_directory_open_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag_name: str,
+) -> None:
+    monkeypatch.delattr(os, flag_name)
+    target = tmp_path / "audit"
+
+    with pytest.raises(bundle_effects.AuditExportBundlePreflightError, match=flag_name):
+        bundle_effects.preflight_audit_export_bundle(target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".elspeth-bundle-probe-*"))
 
 
 def test_preflight_rejects_enosys_unsupported_statfs_cross_device_and_fsync(
