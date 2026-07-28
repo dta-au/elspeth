@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
+from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
@@ -253,7 +254,12 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
     async def mutating_completion(**kwargs: Any) -> Any:
         kwargs["messages"][0]["content"] += "\nprovider-side mutation"
         requests.append(kwargs)
-        raise RuntimeError("provider unavailable")
+        raise LiteLLMAPIError(
+            status_code=503,
+            message="provider unavailable",
+            llm_provider="test-provider",
+            model="test/planner",
+        )
 
     monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)  # type: ignore[attr-defined]
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)

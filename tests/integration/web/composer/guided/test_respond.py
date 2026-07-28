@@ -22,6 +22,7 @@ import pytest
 import structlog
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import event, func, select
 from sqlalchemy.sql.dml import Insert, Update
 
@@ -750,7 +751,12 @@ class TestStep2IntraStep:
             kwargs["messages"][0]["content"] += "\nprovider-side mutation"
             requests.append(kwargs)
             if provider_outcome == "error":
-                raise RuntimeError("provider unavailable")
+                raise LiteLLMAPIError(
+                    status_code=503,
+                    message="provider unavailable",
+                    llm_provider="test-provider",
+                    model="test/guided-planner",
+                )
             if provider_outcome == "cancel":
                 raise asyncio.CancelledError()
             return _planner_terminal_response()

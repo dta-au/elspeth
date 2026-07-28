@@ -420,12 +420,13 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         assert [entry["component"] for entry in feedback["validation"]["errors"]] == ["rejected_mutation"]
         assert _candidate_rejection_codes(result) == ("validation_error",)
 
-    def test_validated_candidate_rejections_pass_through_ungated(self) -> None:
+    def test_validated_candidate_rejections_pass_through_ungated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Without a rejected_mutation entry, every real error must survive.
 
         Guards the instance-1 class (built candidate validated, real errors,
         e.g. coalesce_branch_unreachable) against over-gating.
         """
+        import elspeth.web.composer.pipeline_planner as planner_module
         from elspeth.web.composer.pipeline_planner import (
             _allowlisted_candidate_feedback,
             _candidate_rejection_codes,
@@ -442,11 +443,17 @@ class TestPlannerFeedbackCarriesStructuralFacts:
             validation=ValidationSummary(is_valid=False, errors=entries, warnings=(), suggestions=()),
             affected_nodes=(),
         )
+        monkeypatch.setattr(
+            planner_module,
+            "coalesce_reachability_facts",
+            lambda _state: {"merge": {"produced_connections": ["left", "right"]}},
+        )
         feedback = _allowlisted_candidate_feedback(result)
         assert [entry["error_code"] for entry in feedback["validation"]["errors"]] == [
             "coalesce_branch_unreachable",
             "node_input_not_reachable",
         ]
+        assert feedback["validation"]["errors"][0]["connectivity"] == {"produced_connections": ["left", "right"]}
         assert _candidate_rejection_codes(result) == ("coalesce_branch_unreachable", "node_input_not_reachable")
 
     def test_rejection_trail_codes_never_empty_when_entries_exist(self) -> None:
