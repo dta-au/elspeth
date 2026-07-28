@@ -32,7 +32,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.sink_effects import SINK_EFFECT_PROTOCOL_VERSION, AuditExportFormat, SinkEffectInputKind
+from elspeth.contracts.sink_effects import SINK_EFFECT_PROTOCOL_VERSION, AuditExportFormat, SinkEffectContract, SinkEffectInputKind
 from elspeth.core.landscape.factory import RecorderFactory as _RealRecorderFactory
 from elspeth.engine.orchestrator.export import (
     export_landscape as _production_export_landscape,
@@ -82,7 +82,7 @@ class _CallRecorder:
         assert self.calls == []
 
 
-class _SinkDouble:
+class _SinkDouble(SinkEffectContract):
     effect_call_type = CallType.FILESYSTEM
     name = "export_sink"
     plugin_version = "test"
@@ -102,6 +102,14 @@ class _SinkDouble:
     ) -> ResolvedSinkEffectMode:
         del cls, config, purpose
         return ResolvedSinkEffectMode("write")
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        del mode, required_input_kind
 
     def __init__(self, *, config: dict[str, Any] | None = None, **overrides: Any) -> None:
         self.config = config or {}

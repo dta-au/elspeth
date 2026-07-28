@@ -1344,6 +1344,15 @@ class RestrictedSinkEffectContext:
             raise TypeError("run_started_at must be datetime")
 
 
+class SinkEffectContract:
+    """Nominal participation marker for the recoverable effect contract.
+
+    Runtime plugin classes cross a genuine unknown-code boundary. Admission
+    uses this identity once, then trusts the declared contract directly and
+    fails loudly when any required declaration or method is missing.
+    """
+
+
 class MemberSinkEffectCapability:
     """Nominal opt-in for sinks that publish one durable effect per member."""
 
@@ -1398,6 +1407,7 @@ __all__ = [
     "SinkEffectAttemptState",
     "SinkEffectAuditExportSnapshotInput",
     "SinkEffectCommitResult",
+    "SinkEffectContract",
     "SinkEffectDescriptorMode",
     "SinkEffectExecutionPurpose",
     "SinkEffectFinalizationMember",

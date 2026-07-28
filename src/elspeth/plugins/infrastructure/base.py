@@ -66,7 +66,13 @@ if TYPE_CHECKING:
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.plugins.infrastructure.config_base import PluginConfig, TransformDataConfig
 
-from elspeth.contracts.sink_effects import AuditExportFormat, ResolvedSinkEffectMode, SinkEffectExecutionPurpose, SinkEffectInputKind
+from elspeth.contracts.sink_effects import (
+    AuditExportFormat,
+    ResolvedSinkEffectMode,
+    SinkEffectContract,
+    SinkEffectExecutionPurpose,
+    SinkEffectInputKind,
+)
 from elspeth.plugins.infrastructure.results import (
     TransformResult,
 )
@@ -887,7 +893,7 @@ class BaseTransform(ABC):
         return ()
 
 
-class BaseSink(ABC):
+class BaseSink(ABC, SinkEffectContract):
     """Base class for sink plugins.
 
     Subclass and implement write(), flush(), close().
@@ -969,6 +975,20 @@ class BaseSink(ABC):
         """Adapter-owned, local mode resolution seam for runtime construction."""
         del cls, config, purpose
         return None
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        """Validate adapter-specific state against effect admission.
+
+        Adapters whose live state can diverge from their resolved options
+        override this hook. The base implementation is an explicit no-op for
+        adapters whose validated configuration has no second representation.
+        """
+        del mode, required_input_kind
 
     def _resolve_audit_export_publication_preflight(
         self,

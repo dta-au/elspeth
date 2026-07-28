@@ -19,6 +19,7 @@ from elspeth.contracts import (
     ResolvedSinkEffectMode,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
+    SinkEffectContract,
     SinkEffectDescriptorMode,
     SinkEffectExecutionPurpose,
     SinkEffectInputKind,
@@ -155,7 +156,7 @@ class CallbackSource(_TestSourceBase):
                 self._after_yield_callback(i)
 
 
-class _TestSinkBase:
+class _TestSinkBase(SinkEffectContract):
     """Base class for test sinks implementing SinkProtocol."""
 
     name: str
@@ -191,6 +192,14 @@ class _TestSinkBase:
     ) -> ResolvedSinkEffectMode:
         del cls, config, purpose
         return ResolvedSinkEffectMode("write")
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        del mode, required_input_kind
 
     def _reset_diversion_log(self) -> None:
         self._diversion_log = []

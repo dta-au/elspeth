@@ -30,6 +30,7 @@ from elspeth.contracts.sink_effects import (
     ResolvedSinkEffectMode,
     RestagingSinkEffectCapability,
     SinkEffectCommitResult,
+    SinkEffectContract,
     SinkEffectExecutionPurpose,
     SinkEffectInputKind,
     SinkEffectReconcileResult,
@@ -62,7 +63,7 @@ class LegacyObservableSink:
         self.write_calls += 1
 
 
-class EffectCapableSink(LegacyObservableSink):
+class EffectCapableSink(LegacyObservableSink, SinkEffectContract):
     effect_call_type = CallType.FILESYSTEM
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     supported_effect_modes = frozenset({"write", "append", "overwrite", "conditional_put", "etag_guarded_upload"})
@@ -81,6 +82,14 @@ class EffectCapableSink(LegacyObservableSink):
     ) -> ResolvedSinkEffectMode:
         del cls, config, purpose
         return ResolvedSinkEffectMode("write")
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        del mode, required_input_kind
 
     def inspect_effect(self, _request: object, _ctx: object) -> None:
         return None

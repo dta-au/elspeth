@@ -33,8 +33,10 @@ if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.contracts.sink_effects import (
+        ResolvedSinkEffectMode,
         RestrictedSinkEffectContext,
         SinkEffectCommitResult,
+        SinkEffectExecutionPurpose,
         SinkEffectInputKind,
         SinkEffectInspection,
         SinkEffectInspectionRequest,
@@ -900,6 +902,25 @@ class SinkEffectProtocol(SinkProtocol, Protocol):
     supported_effect_modes: ClassVar[frozenset[str]]
     supported_effect_input_kinds: ClassVar[frozenset["SinkEffectInputKind"]]
     effect_mode_remediation: ClassVar[str | None]
+
+    @classmethod
+    def _resolve_sink_effect_mode(
+        cls,
+        config: Mapping[str, object],
+        *,
+        purpose: "SinkEffectExecutionPurpose",
+    ) -> "ResolvedSinkEffectMode | None":
+        """Resolve the adapter-owned effect mode from validated options."""
+        raise NotImplementedError
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: "SinkEffectInputKind",
+    ) -> None:
+        """Validate instance configuration against the admitted effect mode."""
+        raise NotImplementedError
 
     def inspect_effect(
         self,
