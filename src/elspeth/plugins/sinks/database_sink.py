@@ -215,7 +215,7 @@ class DatabaseSink(BaseSink):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4cb64957f47335f4"
+    source_file_hash: str | None = "sha256:b18cfa3366ecca05"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL
