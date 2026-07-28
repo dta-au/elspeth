@@ -14,6 +14,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -25,11 +26,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from elspeth_lints.core.atomic_io import atomic_update_text
+from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
+from elspeth_lints.core.strict_json import StrictJSONError, strict_json_loads
 
 SCHEMA_VERSION = 1
 TRANSACTION_DIRNAME = ".sign-bundle-transactions"
 MANIFEST_NAME = "transaction.json"
+_MANIFEST_HMAC_FIELD = "manifest_hmac"
+_MANIFEST_HMAC_LABEL = b"elspeth-sign-bundle-transaction-manifest-v1"
 _RENAME_EXCHANGE = 2
 _AT_FDCWD = -100
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -106,7 +110,6 @@ def create_transaction(
     source_root = root.resolve()
     bundle_resolved = bundle_path.resolve()
     rotation_resolved = rotation_log.resolve()
-    base_snapshot = tree_snapshot(active)
 
     tx_root = transaction_root(active)
     tx_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -116,7 +119,11 @@ def create_transaction(
     candidate_parent = tx_path / "candidate"
     candidate_parent.mkdir()
     candidate = candidate_parent / active.name
-    shutil.copytree(active, candidate)
+    with allowlist_mutation_lock(active):
+        base_snapshot = tree_snapshot(active)
+        shutil.copytree(active, candidate)
+        if tree_snapshot(candidate) != base_snapshot:
+            raise SignBundleTransactionError("active allowlist changed while creating its transaction candidate")
 
     rotation_base = tx_path / "rotation-base.bin"
     rotation_staged = tx_path / "rotation-staged.log"
@@ -135,22 +142,46 @@ def create_transaction(
         "signing_policy": signing_policy,
         "base_snapshot": base_snapshot,
         "candidate_snapshot": tree_snapshot(candidate),
+        "rotation_base_sha256": file_sha256(rotation_base),
+        "rotation_staged_sha256": file_sha256(rotation_staged),
+        "checkpoint_snapshot": None,
+        "publish_started_at": None,
         "completed_actions": [],
         "running_action": None,
     }
+    _fsync_tree(candidate)
+    _fsync_file(rotation_base)
+    _fsync_file(rotation_staged)
     save_manifest(tx_path, manifest)
     return tx_path, manifest
+
+
+def _transaction_manifest_key() -> bytes:
+    """Derive a purpose-separated journal key without persisting key material."""
+    from elspeth_lints.core.allowlist import _judge_metadata_hmac_key
+
+    operator_key = _judge_metadata_hmac_key()
+    return hmac.digest(operator_key, _MANIFEST_HMAC_LABEL, "sha256")
+
+
+def _manifest_hmac(manifest: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in manifest.items() if key != _MANIFEST_HMAC_FIELD}
+    canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hmac.new(_transaction_manifest_key(), canonical, hashlib.sha256).hexdigest()
 
 
 def load_manifest(tx_path: Path) -> dict[str, Any]:
     resolved = tx_path.resolve()
     manifest_path = resolved / MANIFEST_NAME
     try:
-        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = strict_json_loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, StrictJSONError) as exc:
         raise SignBundleTransactionError(f"cannot read transaction manifest {manifest_path}: {exc}") from exc
     if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
         raise SignBundleTransactionError(f"unsupported sign-bundle transaction manifest: {manifest_path}")
+    recorded_hmac = raw.get(_MANIFEST_HMAC_FIELD)
+    if not isinstance(recorded_hmac, str) or not hmac.compare_digest(recorded_hmac, _manifest_hmac(raw)):
+        raise SignBundleTransactionError("transaction manifest authentication failed; refusing untrusted recovery state")
     required_strings = ("bundle_path", "bundle_sha256", "root", "allowlist_dir", "candidate_dir", "rotation_log")
     for key in required_strings:
         if not isinstance(raw.get(key), str):
@@ -161,13 +192,30 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
         raise SignBundleTransactionError("transaction manifest signing_policy must be a mapping")
     if not isinstance(raw.get("completed_actions"), list):
         raise SignBundleTransactionError("transaction manifest completed_actions must be a list")
+    if not isinstance(raw.get("rotation_base_sha256"), str) or not isinstance(raw.get("rotation_staged_sha256"), str):
+        raise SignBundleTransactionError("transaction manifest rotation hashes must be strings")
+    if raw.get("checkpoint_snapshot") is not None and not isinstance(raw.get("checkpoint_snapshot"), dict):
+        raise SignBundleTransactionError("transaction manifest checkpoint_snapshot must be a mapping or null")
+    if raw.get("publish_started_at") is not None and not _is_timezone_aware_iso8601(raw.get("publish_started_at")):
+        raise SignBundleTransactionError("transaction manifest publish_started_at must be a timezone-aware timestamp or null")
     candidate = Path(raw["candidate_dir"]).resolve()
     if candidate.parent.parent != resolved:
         raise SignBundleTransactionError("transaction candidate path escapes its transaction directory")
+    rotation_base = resolved / "rotation-base.bin"
+    if not rotation_base.is_file() or file_sha256(rotation_base) != raw["rotation_base_sha256"]:
+        raise SignBundleTransactionError("transaction rotation-base authentication failed")
+    checkpoint_snapshot = raw.get("checkpoint_snapshot")
+    checkpoint = resolved / "checkpoint"
+    if checkpoint_snapshot is not None:
+        if not checkpoint.is_dir() or tree_snapshot(checkpoint) != checkpoint_snapshot:
+            raise SignBundleTransactionError("transaction checkpoint authentication failed")
+    elif checkpoint.exists():
+        raise SignBundleTransactionError("transaction has an unauthenticated checkpoint")
     return raw
 
 
 def save_manifest(tx_path: Path, manifest: dict[str, Any]) -> None:
+    manifest[_MANIFEST_HMAC_FIELD] = _manifest_hmac(manifest)
     rendered = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     atomic_update_text(tx_path / MANIFEST_NAME, lambda _current: rendered, encoding="utf-8", create_parent=False)
 
@@ -247,6 +295,8 @@ def checkpoint_action_file(tx_path: Path, manifest: dict[str, Any], relative_pat
     if judge_events.is_file():
         shutil.copy2(judge_events, checkpoint / "judge-decision-events.jsonl")
     (checkpoint / "metadata.json").write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+    _fsync_tree(checkpoint)
+    manifest["checkpoint_snapshot"] = tree_snapshot(checkpoint)
 
 
 def restore_action_checkpoint(tx_path: Path, manifest: dict[str, Any]) -> None:
@@ -254,7 +304,7 @@ def restore_action_checkpoint(tx_path: Path, manifest: dict[str, Any]) -> None:
     metadata_path = checkpoint / "metadata.json"
     if not metadata_path.is_file():
         return
-    raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    raw = strict_json_loads(metadata_path.read_text(encoding="utf-8"))
     relative = raw.get("relative_path")
     if isinstance(relative, str):
         relative = _local_allowlist_filename(relative)
@@ -276,8 +326,19 @@ def clear_action_checkpoint(tx_path: Path) -> None:
         shutil.rmtree(checkpoint)
 
 
-def mark_candidate_snapshot(manifest: dict[str, Any]) -> None:
+def mark_candidate_snapshot(tx_path: Path, manifest: dict[str, Any]) -> None:
+    """Durably record candidate and staged-audit bytes before journalling them."""
+    candidate = Path(manifest["candidate_dir"])
+    rotation_staged = tx_path / "rotation-staged.log"
+    _fsync_tree(candidate)
+    _fsync_file(rotation_staged)
     manifest["candidate_snapshot"] = tree_snapshot(Path(manifest["candidate_dir"]))
+    manifest["rotation_staged_sha256"] = file_sha256(rotation_staged)
+
+
+def clear_action_checkpoint_from_manifest(tx_path: Path, manifest: dict[str, Any]) -> None:
+    clear_action_checkpoint(tx_path)
+    manifest["checkpoint_snapshot"] = None
 
 
 def publish_candidate(tx_path: Path, manifest: dict[str, Any]) -> None:
@@ -287,24 +348,25 @@ def publish_candidate(tx_path: Path, manifest: dict[str, Any]) -> None:
     candidate_snapshot = manifest["candidate_snapshot"]
     base_snapshot = manifest["base_snapshot"]
 
-    current_active = tree_snapshot(active)
-    current_candidate = tree_snapshot(candidate)
-    if current_active == candidate_snapshot and current_candidate == base_snapshot:
-        return
-    if current_active != base_snapshot or current_candidate != candidate_snapshot:
-        raise SignBundleTransactionError("publish precondition failed: active or candidate bytes changed")
+    with allowlist_mutation_lock(active):
+        current_active = tree_snapshot(active)
+        current_candidate = tree_snapshot(candidate)
+        if current_active == candidate_snapshot and current_candidate == base_snapshot:
+            return
+        if current_active != base_snapshot or current_candidate != candidate_snapshot:
+            raise SignBundleTransactionError("publish precondition failed: active or candidate bytes changed")
 
-    _fsync_tree(candidate)
-    _rename_exchange(active, candidate)
-    for parent in {active.parent, candidate.parent}:
-        parent_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(parent_descriptor)
-        finally:
-            os.close(parent_descriptor)
+        _fsync_tree(candidate)
+        _rename_exchange(active, candidate)
+        for parent in {active.parent, candidate.parent}:
+            parent_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
 
-    if tree_snapshot(active) != candidate_snapshot or tree_snapshot(candidate) != base_snapshot:
-        raise SignBundleTransactionError("atomic exchange completed with unexpected directory content")
+        if tree_snapshot(active) != candidate_snapshot or tree_snapshot(candidate) != base_snapshot:
+            raise SignBundleTransactionError("atomic exchange completed with unexpected directory content")
 
 
 def finalize_rotation_log(tx_path: Path, manifest: dict[str, Any]) -> None:
@@ -317,6 +379,7 @@ def finalize_rotation_log(tx_path: Path, manifest: dict[str, Any]) -> None:
     delta = _canonical_rotation_delta(
         staged[len(base) :],
         allowlist_dir=Path(manifest["allowlist_dir"]),
+        publish_started_at=cast("str", manifest["publish_started_at"]),
     )
     if not delta:
         return
@@ -380,6 +443,15 @@ def run_sign_bundle_transaction(
     candidate_args.rotation_log = tx_path / "rotation-staged.log"
     candidate_args._defer_override_rate_counter_snapshot = True
     completed = {int(index) for index in manifest["completed_actions"]}
+    running = manifest.get("running_action")
+    recorded_rotation_hash = cast("str", manifest["rotation_staged_sha256"])
+    if running is None:
+        if file_sha256(tx_path / "rotation-staged.log") != recorded_rotation_hash:
+            raise SignBundleTransactionError("transaction staged rotation audit authentication failed")
+    else:
+        checkpoint_rotation = tx_path / "checkpoint" / "rotation-staged.log"
+        if not checkpoint_rotation.is_file() or file_sha256(checkpoint_rotation) != recorded_rotation_hash:
+            raise SignBundleTransactionError("transaction running-action rotation checkpoint authentication failed")
 
     if disposition == "published":
         if completed != set(range(len(bundle.actions))):
@@ -392,10 +464,15 @@ def run_sign_bundle_transaction(
             args=candidate_args,
             tx_path=tx_path,
         )
+        _assert_final_rotation_evidence(
+            bundle,
+            completed=completed,
+            verification=verification,
+            tx_path=tx_path,
+        )
         finalize_rotation_log(tx_path, manifest)
         return SignBundleRunResult(0, len(completed), recovered_publish=True)
 
-    running = manifest.get("running_action")
     if running is not None:
         running_index = int(running)
         if running_index < 0 or running_index >= len(bundle.actions):
@@ -406,16 +483,17 @@ def run_sign_bundle_transaction(
             verification=verification,
             specs_by_stale_key=specs_by_stale_key,
         )
+        running_expected_key = _expected_action_key(
+            running_action,
+            verification=verification,
+            repair_keys_by_stale_key=repair_keys_by_stale_key,
+        )
         _assert_action_scoped_candidate_changes(
             running_action,
             tx_path=tx_path,
             manifest=manifest,
             source_file=running_source_file,
-            expected_key=_expected_action_key(
-                running_action,
-                verification=verification,
-                repair_keys_by_stale_key=repair_keys_by_stale_key,
-            ),
+            expected_key=running_expected_key,
             verify_semantics=None,
         )
         running_complete = _action_is_complete(
@@ -427,45 +505,43 @@ def run_sign_bundle_transaction(
             authoritative=True,
         )
         if running_complete:
+            _prepare_completed_judge_evidence(
+                running_action,
+                tx_path=tx_path,
+                candidate_dir=Path(manifest["candidate_dir"]),
+                source_file=running_source_file,
+                expected_key=running_expected_key,
+            )
             _assert_action_scoped_candidate_changes(
                 running_action,
                 tx_path=tx_path,
                 manifest=manifest,
                 source_file=running_source_file,
-                expected_key=_expected_action_key(
-                    running_action,
-                    verification=verification,
-                    repair_keys_by_stale_key=repair_keys_by_stale_key,
-                ),
+                expected_key=running_expected_key,
                 verify_semantics=True,
             )
             completed.add(running_index)
         else:
-            expected_key = _expected_action_key(
-                running_action,
-                verification=verification,
-                repair_keys_by_stale_key=repair_keys_by_stale_key,
-            )
             _assert_judge_event_transition(
                 running_action,
                 tx_path=tx_path,
                 candidate_dir=Path(manifest["candidate_dir"]),
-                expected_key=expected_key,
+                expected_key=running_expected_key,
                 success=False,
             )
             _assert_rotation_staged_transition(
                 running_action,
                 tx_path=tx_path,
                 source_file=running_source_file,
-                expected_key=expected_key,
+                expected_key=running_expected_key,
                 success=False,
             )
             restore_action_checkpoint(tx_path, manifest)
         manifest["running_action"] = None
         manifest["completed_actions"] = sorted(completed)
-        mark_candidate_snapshot(manifest)
+        clear_action_checkpoint_from_manifest(tx_path, manifest)
+        mark_candidate_snapshot(tx_path, manifest)
         save_manifest(tx_path, manifest)
-        clear_action_checkpoint(tx_path)
 
     assert_candidate_unchanged(manifest)
     _verify_completed_actions(
@@ -474,6 +550,12 @@ def run_sign_bundle_transaction(
         verification=verification,
         repair_keys_by_stale_key=repair_keys_by_stale_key,
         args=candidate_args,
+        tx_path=tx_path,
+    )
+    _assert_final_rotation_evidence(
+        bundle,
+        completed=completed,
+        verification=verification,
         tx_path=tx_path,
     )
 
@@ -500,23 +582,32 @@ def run_sign_bundle_transaction(
             code = execute_action(action, candidate_args)
         except BaseException:
             raise
+        expected_key = _expected_action_key(
+            action,
+            verification=verification,
+            repair_keys_by_stale_key=repair_keys_by_stale_key,
+        )
+        if code == 0:
+            _prepare_completed_judge_evidence(
+                action,
+                tx_path=tx_path,
+                candidate_dir=Path(manifest["candidate_dir"]),
+                source_file=source_file,
+                expected_key=expected_key,
+            )
         _assert_action_scoped_candidate_changes(
             action,
             tx_path=tx_path,
             manifest=manifest,
             source_file=source_file,
-            expected_key=_expected_action_key(
-                action,
-                verification=verification,
-                repair_keys_by_stale_key=repair_keys_by_stale_key,
-            ),
+            expected_key=expected_key,
             verify_semantics=code == 0,
         )
         if code != 0:
             manifest["running_action"] = None
-            mark_candidate_snapshot(manifest)
+            clear_action_checkpoint_from_manifest(tx_path, manifest)
+            mark_candidate_snapshot(tx_path, manifest)
             save_manifest(tx_path, manifest)
-            clear_action_checkpoint(tx_path)
             return SignBundleRunResult(
                 code,
                 len(completed),
@@ -538,9 +629,9 @@ def run_sign_bundle_transaction(
         completed.add(index)
         manifest["completed_actions"] = sorted(completed)
         manifest["running_action"] = None
-        mark_candidate_snapshot(manifest)
+        clear_action_checkpoint_from_manifest(tx_path, manifest)
+        mark_candidate_snapshot(tx_path, manifest)
         save_manifest(tx_path, manifest)
-        clear_action_checkpoint(tx_path)
 
     _verify_completed_actions(
         bundle,
@@ -548,6 +639,12 @@ def run_sign_bundle_transaction(
         verification=verification,
         repair_keys_by_stale_key=repair_keys_by_stale_key,
         args=candidate_args,
+        tx_path=tx_path,
+    )
+    _assert_final_rotation_evidence(
+        bundle,
+        completed=completed,
+        verification=verification,
         tx_path=tx_path,
     )
     from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
@@ -565,6 +662,11 @@ def run_sign_bundle_transaction(
     # append idempotently. A kill in that narrow post-commit window resumes from
     # disposition="published" and finalizes the exact staged delta.
     assert_rotation_log_unchanged(tx_path, manifest)
+    if manifest.get("publish_started_at") is None:
+        from datetime import UTC, datetime
+
+        manifest["publish_started_at"] = datetime.now(UTC).isoformat()
+        save_manifest(tx_path, manifest)
     publish_candidate(tx_path, manifest)
     finalize_rotation_log(tx_path, manifest)
     return SignBundleRunResult(0, len(completed))
@@ -681,7 +783,7 @@ def _assert_judge_event_transition(
     success: bool | None,
 ) -> None:
     checkpoint = tx_path / "checkpoint"
-    metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    metadata = strict_json_loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
     saved = checkpoint / "judge-decision-events.jsonl"
     if metadata.get("judge_events_existed") is True and not saved.is_file():
         raise SignBundleTransactionError("judge-event checkpoint is missing its before-image")
@@ -696,6 +798,8 @@ def _assert_judge_event_transition(
         raise SignBundleTransactionError(f"{action.kind} {action.key!r} rewrote prior judge decision events")
     delta = after[len(before) :]
     if not delta:
+        if success is True and candidate_dir.name.startswith("enforce_"):
+            raise SignBundleTransactionError(f"{action.kind} {action.key!r} did not append its required decision event")
         return
     if before and not before.endswith(b"\n"):
         raise SignBundleTransactionError("judge decision-event before-image lacks a JSONL boundary")
@@ -703,8 +807,8 @@ def _assert_judge_event_transition(
         raise SignBundleTransactionError("judge decision-event delta lacks a JSONL boundary")
     try:
         lines = delta.decode("utf-8").splitlines()
-        records = [json.loads(line) for line in lines]
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        records = [strict_json_loads(line) for line in lines]
+    except (UnicodeDecodeError, StrictJSONError) as exc:
         raise SignBundleTransactionError("judge decision-event delta is not valid JSONL") from exc
     if len(records) != 1 or not isinstance(records[0], dict):
         raise SignBundleTransactionError(f"{action.kind} {action.key!r} must append at most one decision event")
@@ -786,8 +890,8 @@ def _assert_rotation_staged_transition(
         raise SignBundleTransactionError("staged rotation audit delta lacks a JSONL boundary")
     try:
         lines = delta.decode("utf-8").splitlines()
-        records = [json.loads(line) for line in lines]
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        records = [strict_json_loads(line) for line in lines]
+    except (UnicodeDecodeError, StrictJSONError) as exc:
         raise SignBundleTransactionError("staged rotation audit delta is not valid JSONL") from exc
     if len(records) != 1 or not isinstance(records[0], dict) or source_file is None:
         raise SignBundleTransactionError(f"rotation {action.key!r} must append exactly one staged audit record")
@@ -841,6 +945,154 @@ def _is_timezone_aware_iso8601(value: Any) -> bool:
     return parsed.utcoffset() is not None
 
 
+def _load_unique_yaml_mapping(
+    payload: bytes,
+    *,
+    error_context: str,
+) -> dict[str, Any]:
+    """Parse one YAML mapping while rejecting duplicate keys at every depth."""
+    import yaml
+
+    class UniqueKeySafeLoader(yaml.SafeLoader):
+        """SafeLoader variant that rejects duplicate keys at every depth."""
+
+    def construct_unique_mapping(
+        loader: Any,
+        node: Any,
+        deep: bool = False,
+    ) -> dict[Any, Any]:
+        loader.flatten_mapping(node)
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found an unhashable mapping key",
+                    key_node.start_mark,
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = loader.construct_object(value_node, deep=deep)
+        return mapping
+
+    UniqueKeySafeLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        construct_unique_mapping,
+    )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SignBundleTransactionError(f"{error_context} is not valid UTF-8 YAML") from exc
+    try:
+        raw = yaml.load(text, Loader=UniqueKeySafeLoader) if text else {}
+    except yaml.YAMLError as exc:
+        raise SignBundleTransactionError(f"{error_context} is not valid YAML") from exc
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise SignBundleTransactionError(f"{error_context} must be a YAML mapping")
+    return cast("dict[str, Any]", raw)
+
+
+def _prepare_completed_judge_evidence(
+    action: Any,
+    *,
+    tx_path: Path,
+    candidate_dir: Path,
+    source_file: str | None,
+    expected_key: str,
+) -> None:
+    """Ensure a completed signed action has its exact append-only audit event."""
+    if action.kind not in {"justify", "drift_repair"}:
+        return
+    if source_file is None:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} has no verified owning YAML")
+
+    _assert_target_yaml_transition(
+        action,
+        tx_path=tx_path,
+        candidate_dir=candidate_dir,
+        source_file=source_file,
+        expected_key=expected_key,
+        success=True,
+    )
+    if not candidate_dir.name.startswith("enforce_"):
+        return
+
+    checkpoint = tx_path / "checkpoint"
+    metadata = strict_json_loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    saved = checkpoint / "judge-decision-events.jsonl"
+    if metadata.get("judge_events_existed") is True and not saved.is_file():
+        raise SignBundleTransactionError("judge-event checkpoint is missing its before-image")
+    before = saved.read_bytes() if metadata.get("judge_events_existed") is True else b""
+    event_path = candidate_dir / ".judge-metrics" / "judge-decision-events.jsonl"
+    after = event_path.read_bytes() if event_path.is_file() else b""
+    if not after.startswith(before):
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} rewrote prior judge decision events")
+    if after[len(before) :]:
+        return
+
+    target = candidate_dir / _local_allowlist_filename(source_file)
+    mapping = _load_unique_yaml_mapping(
+        target.read_bytes() if target.is_file() else b"",
+        error_context=f"{action.kind} {action.key!r} candidate YAML",
+    )
+    entries = mapping.get("allow_hits", [])
+    if not isinstance(entries, list):
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} requires list-valued allow_hits in {source_file}")
+    matching = [entry for entry in entries if isinstance(entry, dict) and entry.get("key") == expected_key]
+    if len(matching) != 1:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} cannot reconstruct evidence without one expected entry")
+    entry = cast("dict[str, Any]", matching[0])
+    effective_verdict = entry.get("judge_verdict")
+    stored_model_verdict = entry.get("judge_model_verdict")
+    if effective_verdict == "ACCEPTED" and stored_model_verdict is None:
+        model_verdict = "ACCEPTED"
+    elif effective_verdict == "OVERRIDDEN_BY_OPERATOR" and stored_model_verdict in {"ACCEPTED", "BLOCKED"}:
+        model_verdict = stored_model_verdict
+    else:
+        raise SignBundleTransactionError(
+            f"{action.kind} {action.key!r} has signed verdict metadata that cannot reconstruct its decision event"
+        )
+    recorded_at = entry.get("judge_recorded_at")
+    key_parts = expected_key.split(":")
+    if len(key_parts) < 2 or not _is_timezone_aware_iso8601(recorded_at):
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} has signed metadata that cannot reconstruct its decision event")
+    payload = {
+        "schema_version": 1,
+        "source_file": key_parts[0],
+        "entry_key": expected_key,
+        "rule_id": key_parts[1],
+        "effective_verdict": effective_verdict,
+        "model_verdict": model_verdict,
+        "recorded_at": recorded_at,
+        "write_disposition": "written",
+    }
+    rendered = json.dumps(payload, sort_keys=True) + "\n"
+
+    def append_to_exact_before(existing: str | None) -> str:
+        current = (existing or "").encode("utf-8")
+        if current != before:
+            raise SignBundleTransactionError(f"{action.kind} {action.key!r} decision events changed while reconstructing recovery evidence")
+        return (existing or "") + rendered
+
+    atomic_update_text(
+        event_path,
+        append_to_exact_before,
+        encoding="utf-8",
+        create_parent=True,
+    )
+
+
 def _assert_target_yaml_transition(
     action: Any,
     *,
@@ -851,10 +1103,8 @@ def _assert_target_yaml_transition(
     success: bool,
 ) -> None:
     """Compare action-owned YAML semantically while preserving every sibling."""
-    import yaml
-
     checkpoint = tx_path / "checkpoint"
-    metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    metadata = strict_json_loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
     if metadata.get("relative_path") != source_file:
         raise SignBundleTransactionError(f"{action.kind} {action.key!r} checkpoint target does not match verified owner {source_file!r}")
     if metadata.get("existed") is True and not (checkpoint / "allowlist-file").is_file():
@@ -863,58 +1113,14 @@ def _assert_target_yaml_transition(
     target = candidate_dir / _local_allowlist_filename(source_file)
     after_bytes = target.read_bytes() if target.is_file() else b""
 
-    def load_mapping(payload: bytes, *, label: str) -> dict[str, Any]:
-        class UniqueKeySafeLoader(yaml.SafeLoader):
-            """SafeLoader variant that rejects duplicate keys at every depth."""
-
-        def construct_unique_mapping(
-            loader: Any,
-            node: Any,
-            deep: bool = False,
-        ) -> dict[Any, Any]:
-            loader.flatten_mapping(node)
-            mapping: dict[Any, Any] = {}
-            for key_node, value_node in node.value:
-                key = loader.construct_object(key_node, deep=deep)
-                try:
-                    duplicate = key in mapping
-                except TypeError as exc:
-                    raise yaml.constructor.ConstructorError(
-                        "while constructing a mapping",
-                        node.start_mark,
-                        "found an unhashable mapping key",
-                        key_node.start_mark,
-                    ) from exc
-                if duplicate:
-                    raise yaml.constructor.ConstructorError(
-                        "while constructing a mapping",
-                        node.start_mark,
-                        f"found duplicate key {key!r}",
-                        key_node.start_mark,
-                    )
-                mapping[key] = loader.construct_object(value_node, deep=deep)
-            return mapping
-
-        UniqueKeySafeLoader.add_constructor(
-            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
-            construct_unique_mapping,
-        )
-        try:
-            text = payload.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise SignBundleTransactionError(f"{action.kind} {action.key!r} left invalid {label} YAML") from exc
-        try:
-            raw = yaml.load(text, Loader=UniqueKeySafeLoader) if text else {}
-        except yaml.YAMLError as exc:
-            raise SignBundleTransactionError(f"{action.kind} {action.key!r} left invalid {label} YAML") from exc
-        if raw is None:
-            return {}
-        if not isinstance(raw, dict):
-            raise SignBundleTransactionError(f"{action.kind} {action.key!r} {label} YAML must be a mapping")
-        return cast("dict[str, Any]", raw)
-
-    before_mapping = load_mapping(before_bytes, label="checkpoint")
-    after_mapping = load_mapping(after_bytes, label="candidate")
+    before_mapping = _load_unique_yaml_mapping(
+        before_bytes,
+        error_context=f"{action.kind} {action.key!r} checkpoint YAML",
+    )
+    after_mapping = _load_unique_yaml_mapping(
+        after_bytes,
+        error_context=f"{action.kind} {action.key!r} candidate YAML",
+    )
     before_other = {key: value for key, value in before_mapping.items() if key != "allow_hits"}
     after_other = {key: value for key, value in after_mapping.items() if key != "allow_hits"}
     if before_other != after_other:
@@ -1095,6 +1301,62 @@ def _verify_completed_actions(
             raise SignBundleTransactionError(f"recorded deterministic action no longer verifies: {action.kind} {action.key}")
 
 
+def _assert_final_rotation_evidence(
+    bundle: Any,
+    *,
+    completed: set[int],
+    verification: Any,
+    tx_path: Path,
+) -> None:
+    """Require the staged audit delta to equal completed rotation actions exactly."""
+    expected: list[dict[str, str]] = []
+    for index in sorted(completed):
+        action = bundle.actions[index]
+        if action.kind != "rotation":
+            continue
+        if verification.rotation_plan is None:
+            raise SignBundleTransactionError("completed rotation has no verified rotation plan")
+        matching = [rotation for rotation in verification.rotation_plan.rotations if rotation.old_key == action.key]
+        if len(matching) != 1:
+            raise SignBundleTransactionError(f"rotation {action.key!r} has {len(matching)} verified audit owners")
+        expected.append(
+            {
+                "source_file": matching[0].entry_source_file,
+                "old_key": action.key,
+                "new_key": matching[0].new_key,
+            }
+        )
+
+    base = (tx_path / "rotation-base.bin").read_bytes()
+    staged = (tx_path / "rotation-staged.log").read_bytes()
+    if not staged.startswith(base):
+        raise SignBundleTransactionError("transaction rotation log does not extend its recorded base")
+    try:
+        lines = staged[len(base) :].decode("utf-8").splitlines()
+        records = [strict_json_loads(line) for line in lines if line.strip()]
+    except (UnicodeDecodeError, StrictJSONError) as exc:
+        raise SignBundleTransactionError("transaction staged rotation audit is not valid JSONL") from exc
+    if len(records) != len(expected):
+        raise SignBundleTransactionError("transaction staged rotation audit does not exactly match completed rotations")
+    actual: list[dict[str, str]] = []
+    for record in records:
+        if (
+            not isinstance(record, dict)
+            or record.get("kind") != "tier_model_rotation"
+            or not isinstance(record.get("rotations"), list)
+            or len(record["rotations"]) != 1
+            or not isinstance(record["rotations"][0], dict)
+            or record.get("stale_entries_removed") != []
+        ):
+            raise SignBundleTransactionError("transaction staged rotation audit contains an unrelated record")
+        rotation = record["rotations"][0]
+        if set(rotation) != {"source_file", "old_key", "new_key"} or not all(isinstance(value, str) for value in rotation.values()):
+            raise SignBundleTransactionError("transaction staged rotation audit contains malformed rotation evidence")
+        actual.append(cast("dict[str, str]", rotation))
+    if actual != expected:
+        raise SignBundleTransactionError("transaction staged rotation audit does not exactly match completed rotations")
+
+
 def _local_allowlist_filename(value: str) -> str:
     path = Path(value)
     if path.is_absolute() or len(path.parts) != 1 or path.name != value:
@@ -1119,15 +1381,20 @@ def _rotation_audit_recorded(
         "new_key": new_key,
     }
     try:
-        records = [json.loads(line) for line in staged[len(base) :].decode("utf-8").splitlines() if line.strip()]
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        records = [strict_json_loads(line) for line in staged[len(base) :].decode("utf-8").splitlines() if line.strip()]
+    except (UnicodeDecodeError, StrictJSONError):
         return False
     return any(
         isinstance(record, dict) and isinstance(record.get("rotations"), list) and expected in record["rotations"] for record in records
     )
 
 
-def _canonical_rotation_delta(delta: bytes, *, allowlist_dir: Path) -> bytes:
+def _canonical_rotation_delta(
+    delta: bytes,
+    *,
+    allowlist_dir: Path,
+    publish_started_at: str,
+) -> bytes:
     """Validate staged JSONL and rewrite scratch provenance to the active path."""
     if not delta:
         return b""
@@ -1140,12 +1407,13 @@ def _canonical_rotation_delta(delta: bytes, *, allowlist_dir: Path) -> bytes:
         if not line.strip():
             continue
         try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
+            record = strict_json_loads(line)
+        except StrictJSONError as exc:
             raise SignBundleTransactionError("transaction rotation audit delta is not valid JSONL") from exc
         if not isinstance(record, dict) or record.get("kind") != "tier_model_rotation":
             raise SignBundleTransactionError("transaction rotation audit delta has an unexpected record kind")
         record["allowlist_dir"] = str(allowlist_dir.resolve())
+        record["recorded_at"] = publish_started_at
         rendered.append(json.dumps(record, sort_keys=True, separators=(",", ":")))
     return (("\n".join(rendered) + "\n") if rendered else "").encode("utf-8")
 
@@ -1192,6 +1460,16 @@ def _fsync_tree(root: Path) -> None:
         finally:
             os.close(descriptor)
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
     finally:

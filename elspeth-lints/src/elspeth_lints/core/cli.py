@@ -23,7 +23,7 @@ from elspeth_lints.core.ast_walker import (
     PythonSyntaxError,
     walk_python_files,
 )
-from elspeth_lints.core.atomic_io import atomic_update_text
+from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
 from elspeth_lints.core.emitters.github import render_github
 from elspeth_lints.core.emitters.json import render_json
 from elspeth_lints.core.emitters.sarif import render_sarif
@@ -2007,21 +2007,22 @@ def _run_justify(args: argparse.Namespace) -> int:
         return 0
 
     yaml_entry = build_signed_yaml_entry()
-    _append_entry_to_yaml(
-        target_yaml,
-        yaml_entry,
-        entry_index=getattr(args, "_allow_hits_entry_index", None),
-    )
-    _append_judge_decision_event_after_judge(
-        allowlist_dir=allowlist_dir,
-        finding=finding,
-        effective_verdict=write_verdict,
-        model_verdict=response.verdict,
-        recorded_at=response.recorded_at,
-        write_disposition="written",
-    )
-    if not getattr(args, "_defer_override_rate_counter_snapshot", False):
-        _refresh_override_rate_counter_snapshot_after_allowlist_write(target_yaml)
+    with allowlist_mutation_lock(allowlist_dir):
+        _append_entry_to_yaml(
+            target_yaml,
+            yaml_entry,
+            entry_index=getattr(args, "_allow_hits_entry_index", None),
+        )
+        _append_judge_decision_event_after_judge(
+            allowlist_dir=allowlist_dir,
+            finding=finding,
+            effective_verdict=write_verdict,
+            model_verdict=response.verdict,
+            recorded_at=response.recorded_at,
+            write_disposition="written",
+        )
+        if not getattr(args, "_defer_override_rate_counter_snapshot", False):
+            _refresh_override_rate_counter_snapshot_after_allowlist_write(target_yaml)
     _emit_justify_output(
         args=args,
         verdict=write_verdict,
@@ -2853,7 +2854,8 @@ def _upsert_audit_review_in_yaml(target_yaml: Path, *, entry_key: str, review_te
         new_lines = [*lines[:entry_start], *cleaned_entry, *lines[entry_end:]]
         return "".join(new_lines)
 
-    atomic_update_text(target_yaml, upsert_in, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, upsert_in, encoding="utf-8", create_parent=False)
 
 
 def _append_entry_to_yaml(target_yaml: Path, entry_text: str, *, entry_index: int | None = None) -> None:
@@ -2957,7 +2959,8 @@ def _append_entry_to_yaml(target_yaml: Path, entry_text: str, *, entry_index: in
         new_lines = [*lines[:insertion_point], entry_text, *lines[insertion_point:]]
         return "".join(new_lines)
 
-    atomic_update_text(target_yaml, append_to, encoding="utf-8", create_parent=True)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, append_to, encoding="utf-8", create_parent=True)
 
 
 def _emit_justify_output(
@@ -3742,7 +3745,8 @@ def _pop_allow_hits_entry_with_position(target_yaml: Path, entry_key: str) -> _R
         new_lines = [*lines[:entry_start], *lines[entry_end:]]
         return _normalize_empty_allow_hits("".join(new_lines))
 
-    atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
     if removed_entry is None:
         raise ValueError(f"{target_yaml}: no allow_hits entry found for key {entry_key!r}")
     return removed_entry
@@ -3798,7 +3802,8 @@ def _remove_allow_hits_entries(target_yaml: Path, entry_keys: set[str]) -> None:
             del new_lines[entry_start:entry_end]
         return _normalize_empty_allow_hits("".join(new_lines))
 
-    atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
 
 
 def _namespace_for_signing_spec(
@@ -4677,7 +4682,8 @@ def _rekey_entries_in_yaml(target_yaml: Path, specs: list[_RekeyRewriteSpec]) ->
 
         return "".join(result_lines)
 
-    atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
 
 
 def _rekey_entry_signature_line(
@@ -5146,7 +5152,8 @@ def _rewrite_v1_entries_as_v2_in_yaml(target_yaml: Path, specs: list[_V2RewriteS
 
         return "".join(result_lines)
 
-    atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
 
 
 def _rewrite_entry_binding_lines(

@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -608,7 +610,9 @@ def test_sign_bundle_rotation_records_rotation_manifest(tmp_path: Path) -> None:
     bundle = _bundle(root, allowlist_dir, (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),))
     bundle_path = _write_bundle_file(tmp_path, bundle)
 
+    publish_window_start = datetime.now(UTC)
     rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(rot_log))))
+    publish_window_end = datetime.now(UTC)
 
     assert rc == 0
     assert f"- key: {live_key}" in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
@@ -616,6 +620,8 @@ def test_sign_bundle_rotation_records_rotation_manifest(tmp_path: Path) -> None:
     records = [json.loads(line) for line in rot_log.read_text(encoding="utf-8").splitlines() if line.strip()]
     rotations = [item for rec in records for item in rec.get("rotations", [])]
     assert {"source_file": "gadget.yaml", "old_key": stale_key, "new_key": live_key} in rotations
+    rotation_recorded_at = datetime.fromisoformat(records[0]["recorded_at"])
+    assert publish_window_start <= rotation_recorded_at <= publish_window_end
 
 
 def test_sign_bundle_rotation_log_conflict_fails_before_active_publish(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1434,6 +1440,50 @@ def test_sign_bundle_resume_rejects_written_event_for_incomplete_action(
     assert _tree_bytes(allowlist_dir) == before
 
 
+def test_sign_bundle_resume_reconstructs_missing_event_without_rejudging(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(
+            cli_module,
+            "_append_judge_decision_event_after_judge",
+            side_effect=KeyboardInterrupt(),
+        ),
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("authoritatively signed decision must not be re-judged"))):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 0
+    event_path = allowlist_dir / ".judge-metrics" / "judge-decision-events.jsonl"
+    records = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["entry_key"] == _canonical_key(finding)
+    assert records[0]["write_disposition"] == "written"
+
+
 @pytest.mark.parametrize("tamper", ("unrelated_record", "naive_timestamp"))
 def test_sign_bundle_rejects_unrelated_staged_rotation_record(
     tmp_path: Path,
@@ -1798,3 +1848,322 @@ def test_sign_bundle_noncanonical_allowlist_skips_baseline_regen(
     assert rc == 0
     assert calls == []  # never shelled the regen script
     assert "canonical-allowlist-only" in capsys.readouterr().out
+
+
+def test_sign_bundle_resume_rejects_candidate_and_manifest_co_tamper(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A keyless attacker cannot bless modified scratch bytes by editing hashes."""
+    from elspeth_lints.core.sign_bundle_transaction import tree_snapshot
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    with _patch_judge(lambda file_path: JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 1
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    manifest_path = transaction / "transaction.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidate = Path(manifest["candidate_dir"])
+    signed_yaml = candidate / "alpha.yaml"
+    signed_yaml.write_text(signed_yaml.read_text(encoding="utf-8") + "# keyless tamper\n", encoding="utf-8")
+    manifest["candidate_snapshot"] = tree_snapshot(candidate)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("tampered journal must not call judge"))):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert "authentication failed" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_rejects_checkpoint_staged_and_manifest_co_tamper(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Checkpoint/staged before-images cannot be replaced by a keyless attacker."""
+    from elspeth_lints.core import sign_bundle_transaction
+    from elspeth_lints.rules.trust_tier.tier_model import rotate
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    with patch.object(rotate, "_append_rotation_manifest", side_effect=KeyboardInterrupt()):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    manifest_path = transaction / "transaction.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    forged = b'{"kind":"tier_model_rotation","rotations":[]}\n'
+    checkpoint_staged = transaction / "checkpoint" / "rotation-staged.log"
+    checkpoint_staged.write_bytes(checkpoint_staged.read_bytes() + forged)
+    staged = transaction / "rotation-staged.log"
+    staged.write_bytes(staged.read_bytes() + forged)
+    manifest["checkpoint_snapshot"] = sign_bundle_transaction.tree_snapshot(transaction / "checkpoint")
+    manifest["rotation_staged_sha256"] = sign_bundle_transaction.file_sha256(staged)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert "authentication failed" in capsys.readouterr().err
+
+
+def test_publish_waits_for_active_writer_then_rechecks_without_stranding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writer paused inside the stable lock lands before publish rechecks."""
+    from elspeth_lints.core import cli as cli_module
+    from elspeth_lints.core import sign_bundle_transaction
+
+    active = _build_allowlist_dir(tmp_path)
+    target = active / "plugins.yaml"
+    target.write_text("allow_hits: []\n", encoding="utf-8")
+    tx_path = tmp_path / "tx"
+    candidate = tx_path / "candidate" / active.name
+    candidate.parent.mkdir(parents=True)
+    shutil.copytree(active, candidate)
+    (candidate / "plugins.yaml").write_text("allow_hits: []\n# candidate\n", encoding="utf-8")
+    manifest = {
+        "allowlist_dir": str(active),
+        "candidate_dir": str(candidate),
+        "base_snapshot": sign_bundle_transaction.tree_snapshot(active),
+        "candidate_snapshot": sign_bundle_transaction.tree_snapshot(candidate),
+    }
+
+    writer_paused = threading.Event()
+    release_writer = threading.Event()
+    real_atomic_update = cli_module.atomic_update_text
+
+    def _paused_update(*args: Any, **kwargs: Any) -> None:
+        writer_paused.set()
+        assert release_writer.wait(timeout=5)
+        real_atomic_update(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "atomic_update_text", _paused_update)
+    writer = threading.Thread(
+        target=cli_module._append_entry_to_yaml,
+        args=(target, "- key: plugins/x.py:R1:X:fp=1\n  owner: writer\n"),
+        daemon=True,
+    )
+    writer.start()
+    assert writer_paused.wait(timeout=5)
+
+    publish_error: list[BaseException] = []
+
+    def _publish() -> None:
+        try:
+            sign_bundle_transaction.publish_candidate(tx_path, manifest)
+        except BaseException as exc:
+            publish_error.append(exc)
+
+    publisher = threading.Thread(target=_publish, daemon=True)
+    publisher.start()
+    assert publisher.is_alive()
+    release_writer.set()
+    writer.join(timeout=5)
+    publisher.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not publisher.is_alive()
+    assert len(publish_error) == 1
+    assert "publish precondition failed" in str(publish_error[0])
+    assert "plugins/x.py" in target.read_text(encoding="utf-8")
+    assert "# candidate" in (candidate / "plugins.yaml").read_text(encoding="utf-8")
+
+
+def test_sign_bundle_resume_rejects_duplicate_manifest_json_key(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    with _patch_judge(_block_all):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 1
+    transaction = _recovery_path(capsys.readouterr().err)
+    manifest_path = transaction / "transaction.json"
+    text = manifest_path.read_text(encoding="utf-8")
+    manifest_path.write_text(
+        text.replace('"schema_version": 1,', '"schema_version": 1,\n  "schema_version": 1,', 1),
+        encoding="utf-8",
+    )
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert "duplicate JSON object key" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_rejects_duplicate_judge_event_json_key(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    with (
+        _patch_judge(_accept_all),
+        patch.object(cli_module, "_emit_justify_output", side_effect=KeyboardInterrupt()),
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    event_path = next(transaction.rglob("judge-decision-events.jsonl"))
+    text = event_path.read_text(encoding="utf-8")
+    event_path.write_text(
+        text.replace('"entry_key":', f'"entry_key": "{_canonical_key(finding)}", "entry_key":', 1),
+        encoding="utf-8",
+    )
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert "valid JSONL" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_rejects_duplicate_rotation_event_json_key(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_execute = cli_module._execute_rotation_action
+    rotation_log = tmp_path / "rotations.log"
+
+    def _execute_then_interrupt(action: Any, *, rotation_plan: Any, args: Any) -> int:
+        assert real_execute(action, rotation_plan=rotation_plan, args=args) == 0
+        raise KeyboardInterrupt
+
+    with patch.object(cli_module, "_execute_rotation_action", side_effect=_execute_then_interrupt):
+        assert (
+            main(
+                _argv(
+                    bundle_path,
+                    root,
+                    allowlist_dir,
+                    extra=("--yes", "--rotation-log", str(rotation_log)),
+                )
+            )
+            == 130
+        )
+    transaction = _recovery_path(capsys.readouterr().err)
+    staged = transaction / "rotation-staged.log"
+    text = staged.read_text(encoding="utf-8")
+    staged.write_text(
+        text.replace('"kind":', '"kind": "tier_model_rotation", "kind":', 1),
+        encoding="utf-8",
+    )
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert "staged rotation audit" in capsys.readouterr().err
+
+
+def test_sign_bundle_final_reconciliation_rejects_extra_rotation_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    before = _tree_bytes(allowlist_dir)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_verify = sign_bundle_transaction._verify_completed_actions
+    calls = 0
+
+    def _verify_then_inject(*args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        real_verify(*args, **kwargs)
+        calls += 1
+        if calls == 2:
+            staged = kwargs["tx_path"] / "rotation-staged.log"
+            record = staged.read_text(encoding="utf-8").splitlines()[-1]
+            staged.write_text(staged.read_text(encoding="utf-8") + record + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(sign_bundle_transaction, "_verify_completed_actions", _verify_then_inject)
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert "exactly match completed rotations" in capsys.readouterr().err

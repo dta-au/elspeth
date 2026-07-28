@@ -154,6 +154,25 @@ def test_load_bundle_rejects_unknown_key() -> None:
         load_bundle(json.dumps(data))
 
 
+def test_load_bundle_rejects_duplicate_json_keys_at_every_depth() -> None:
+    text = dump_bundle(_bundle((_new_judgment_action(),)))
+    duplicate_top_level = text.replace(
+        '"bundle_id": "sample-bundle",',
+        '"bundle_id": "sample-bundle",\n  "bundle_id": "sample-bundle",',
+        1,
+    )
+    with pytest.raises(ValueError, match="duplicate JSON object key 'bundle_id'"):
+        load_bundle(duplicate_top_level)
+
+    duplicate_nested = text.replace(
+        '"kind": "justify",',
+        '"kind": "justify",\n      "kind": "justify",',
+        1,
+    )
+    with pytest.raises(ValueError, match="duplicate JSON object key 'kind'"):
+        load_bundle(duplicate_nested)
+
+
 def test_write_then_read_bundle(tmp_path: Path) -> None:
     bundle = _bundle((_new_judgment_action(),))
     staged_dir = tmp_path / "staged-reviews"

@@ -134,22 +134,30 @@ directory. `stale_delete` and safe `rotation` actions run before paid judge
 calls. Each accepted authoritative decision is journalled, but the configured
 active allowlist remains byte-identical until every action succeeds, the bundle
 and live tree are re-verified, and every recovered signature verifies
-authoritatively. Any staged rotation audit records are conflict-checked before
-the coherent candidate publishes with one Linux
-`renameat2(RENAME_EXCHANGE)` directory swap, then the exact staged audit delta
-is appended idempotently. The private transaction is the durable pending record
-for the narrow cross-resource window: if publication commits before the audit
-append, resume detects the published bytes and finishes that append without
-repeating judge work.
+authoritatively. The transaction manifest is HMAC-authenticated with a
+purpose-separated key derived from the operator signing key; candidate,
+checkpoint, and staged-audit bytes are fsynced before their hashes are recorded,
+so scratch bytes and journal claims cannot be changed together by a keyless
+process. Publication shares a stable sibling mutation lock with the ordinary
+allowlist writers and rechecks both trees while holding it. Any staged rotation
+audit records are conflict-checked before the coherent candidate publishes with
+one Linux `renameat2(RENAME_EXCHANGE)` directory swap, then the exact staged
+audit delta is appended idempotently with the durable publish-start timestamp.
+The private transaction is the pending record for the narrow cross-resource
+window: if publication commits before the audit append, resume detects the
+published bytes and finishes that append without repeating judge work.
 
 A real-judge BLOCK, ordinary action failure, unexpected exception, or
 interruption exits non-zero (interrupts return 130), preserves the private
 transaction, and prints a paste-ready command containing
 `--resume <transaction-dir>`. Resume does not trust the scratch copy: it
-re-checks the exact bundle bytes, source/bindings, unchanged active allowlist,
-action journal, and previously produced HMAC signatures before skipping
-completed judge work. If the tree or active bytes changed, resume refuses before
-publish; re-stage against the new tree instead. On successful completion the
+authenticates the journal, then re-checks the exact bundle bytes,
+source/bindings, active/candidate state, action evidence, and previously
+produced HMAC signatures before skipping completed judge work. The active tree
+must match either the recorded pre-transaction base or, only in the
+post-publish/pre-audit window, the authenticated published candidate. Any other
+tree change refuses recovery; re-stage against the new tree instead. On
+successful completion the
 coherent active tree is diagnosed and the canonical override-rate counter
 snapshot is refreshed. Resume also binds the original non-secret signing policy
 (owner, override mode, judge transport/tools, token setting, roots, environment
@@ -239,9 +247,18 @@ acted on.
 ## Recovery versus re-staging
 
 Use the printed `--resume` command when the bundle and live tree are still
-current and the active allowlist has not changed. This reuses accepted
-authoritative decisions and retries only unfinished work. Do not re-run the
-judge merely because a later action BLOCKed or the process was interrupted.
+current and the active allowlist still matches the transaction base (or the
+authenticated published candidate awaiting its audit append). This reuses
+accepted authoritative decisions and retries only unfinished work. Do not
+re-run the judge merely because a later action BLOCKed or the process was
+interrupted.
+
+A BLOCK decision event is retained in the private transaction even though the
+active allowlist is unchanged. A later successful resume publishes the
+accumulated event history with the coherent candidate. If the transaction is
+abandoned, its BLOCK evidence remains visible only in that printed transaction
+directory; retain or remove that directory deliberately according to the
+operator's audit policy. `sign-bundle` does not silently prune it.
 
 Re-run `stage_scan` when the live source/bindings or active allowlist changed
 after the transaction began, or when the original preflight itself rejected the

@@ -43,8 +43,10 @@ from __future__ import annotations
 
 import fcntl
 import os
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -82,6 +84,53 @@ class AtomicWriteShortWriteError(RuntimeError):
     ``python -O`` strips asserts and the project's Tier-1 guarantees
     must survive optimisation.
     """
+
+
+_MUTATION_LOCKS_GUARD = threading.Lock()
+_MUTATION_LOCKS: dict[Path, threading.RLock] = {}
+_HELD_MUTATION_LOCKS: dict[Path, tuple[int, int]] = {}
+
+
+def allowlist_mutation_lock_path(allowlist_dir: Path) -> Path:
+    """Return the stable lock path shared by mutation and directory publish."""
+    resolved = Path(allowlist_dir).resolve()
+    return resolved.parent / ".sign-bundle-transactions" / f".{resolved.name}.mutation.lock"
+
+
+@contextmanager
+def allowlist_mutation_lock(allowlist_dir: Path) -> Iterator[None]:
+    """Serialize all writes against a stable inode outside a swappable directory.
+
+    The process-local ``RLock`` makes this context re-entrant for composite
+    writer entrypoints while still serializing threads. The outermost entry
+    also takes ``flock`` so independent CLI processes share the same boundary.
+    """
+    lock_path = allowlist_mutation_lock_path(allowlist_dir)
+    with _MUTATION_LOCKS_GUARD:
+        process_lock = _MUTATION_LOCKS.setdefault(lock_path, threading.RLock())
+    with process_lock:
+        held = _HELD_MUTATION_LOCKS.get(lock_path)
+        if held is not None:
+            lock_fd, depth = held
+            _HELD_MUTATION_LOCKS[lock_path] = (lock_fd, depth + 1)
+            try:
+                yield
+            finally:
+                _HELD_MUTATION_LOCKS[lock_path] = (lock_fd, depth)
+            return
+
+        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _HELD_MUTATION_LOCKS[lock_path] = (lock_fd, 1)
+            try:
+                yield
+            finally:
+                del _HELD_MUTATION_LOCKS[lock_path]
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 def _temp_path_for(path: Path) -> Path:

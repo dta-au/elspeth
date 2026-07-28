@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from elspeth_lints.core.atomic_io import atomic_update_text
+from elspeth_lints.core.strict_json import strict_json_loads
 
 SCHEMA_VERSION = 1
 
@@ -190,7 +191,7 @@ def load_bundle(text: str) -> ReviewBundle:
     Unknown keys raise, ``schema_version`` is checked, and each action is
     validated per-kind via ``BundleAction.__post_init__``.
     """
-    data = json.loads(text)
+    data = strict_json_loads(text)
     if not isinstance(data, dict):
         raise ValueError(f"review bundle must be a JSON object; got {type(data).__name__}")
     _reject_unknown_keys(data, _BUNDLE_FIELDS, "bundle")
