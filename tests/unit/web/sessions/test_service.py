@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import shutil
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import structlog
@@ -245,7 +247,27 @@ class TestSessionCRUD:
         def fail_rmtree(_path: object) -> None:
             raise OSError("permission denied removing staged blob directory")
 
-        monkeypatch.setattr("elspeth.web.sessions.service.shutil.rmtree", fail_rmtree)
+        class _FailingRmtreeShutil:
+            """Stand-in for the ``shutil`` name as seen from inside
+            ``elspeth.web.sessions.service``, scoped to that module only.
+
+            ``monkeypatch.setattr("...service.shutil.rmtree", ...)`` would
+            resolve ``...service.shutil`` to the *real* ``shutil`` module
+            (Python modules are process-wide singletons; the service module
+            merely imports the same object everyone else does) and replace
+            ``shutil.rmtree`` for the whole process during the test.
+            Rebinding the ``shutil`` *name inside the service module's own
+            namespace* keeps the failure local to the code path under test;
+            everything else delegates to the real module (the service module
+            only calls ``shutil.rmtree``).
+            """
+
+            rmtree = staticmethod(fail_rmtree)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(shutil, name)
+
+        monkeypatch.setattr("elspeth.web.sessions.service.shutil", _FailingRmtreeShutil())
 
         with pytest.raises(QuarantineCleanupError, match=r"delete committed.*quarantine cleanup failed") as exc_info:
             await service_with_dir.archive_session(session.id)
