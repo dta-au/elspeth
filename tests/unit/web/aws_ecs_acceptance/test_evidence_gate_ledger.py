@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from elspeth.web import aws_ecs_acceptance as acceptance
+from elspeth.web._aws_ecs_acceptance import gate_ledger as gate_ledger_owner
 from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import (
     _init_control_manifest,
     _terraform_receipt,
@@ -34,6 +35,16 @@ def test_facade_reexports_evidence_and_gate_ledger_owners_by_identity() -> None:
     assert facade.gate_ledger_record is gate_ledger.gate_ledger_record
     assert facade.gate_ledger_record_cleanup is gate_ledger.gate_ledger_record_cleanup
     assert facade.gate_ledger_finalize is gate_ledger.gate_ledger_finalize
+
+
+def test_cleanup_prefix_hash_fails_loudly_for_corrupt_internal_record() -> None:
+    with pytest.raises(KeyError, match="check_id"):
+        gate_ledger_owner._gate_ledger_cleanup_prefix_hash(
+            {
+                "records": [],
+                "cleanup_records": [{}],
+            }
+        )
 
 
 def test_sanitize_evidence_projects_logs_task_definitions_and_terraform_without_free_form_content() -> None:

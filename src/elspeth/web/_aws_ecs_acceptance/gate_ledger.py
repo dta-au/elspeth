@@ -67,12 +67,8 @@ def _gate_ledger_records_hash(ledger: Mapping[str, object]) -> str:
 
 
 def _gate_ledger_cleanup_prefix_hash(ledger: Mapping[str, object]) -> str:
-    cleanup_records = ledger["cleanup_records"]
-    if not isinstance(cleanup_records, list):
-        raise AcceptanceCheckError("gate_ledger_schema")
-    prefix_records = [
-        record for record in cleanup_records if not isinstance(record, dict) or record.get("check_id") != _TERMINAL_GATE_CHECK_ID
-    ]
+    cleanup_records = cast(list[dict[str, object]], ledger["cleanup_records"])
+    prefix_records = [record for record in cleanup_records if record["check_id"] != _TERMINAL_GATE_CHECK_ID]
     return _gate_ledger_records_hash({**ledger, "cleanup_records": prefix_records})
 
 
@@ -273,8 +269,7 @@ def _gate_ledger_bind_candidate_locked(
         raise AcceptanceCheckError("gate_ledger_conflict")
     if _GIT_SHA_PATTERN.fullmatch(candidate_sha) is None:
         raise AcceptanceCheckError("gate_ledger_schema")
-    records = ledger["records"]
-    assert isinstance(records, list)
+    records = cast(list[dict[str, object]], ledger["records"])
     if [record["check_id"] for record in records] != list(_TASK1_GATE_CHECK_ORDER):
         raise AcceptanceCheckError("gate_ledger_incomplete")
     if any(record["exit_status"] != 0 for record in records):
@@ -315,36 +310,34 @@ def _gate_ledger_record_stream(
     ledger = _read_gate_ledger(path)
     if ledger["finalized"] is not None:
         raise AcceptanceCheckError("gate_ledger_finalized")
-    records = ledger[stream]
-    assert isinstance(records, list)
+    records = cast(list[dict[str, object]], ledger[stream])
     bound_candidate = ledger["candidate_sha"]
     if bound_candidate is not None and candidate_sha != bound_candidate:
         raise AcceptanceCheckError("gate_ledger_candidate")
     existing = next(
-        (item for item in records if isinstance(item, dict) and item.get("check_id") == check_id),
+        (item for item in records if item["check_id"] == check_id),
         None,
     )
     if existing is not None:
         same_evidence = (
-            existing.get("candidate_sha") == candidate_sha
-            and existing.get("exit_status") == exit_status
-            and existing.get("receipt_hash") == receipt_hash
-            and (started_at is None or existing.get("started_at") == started_at)
-            and (ended_at is None or existing.get("ended_at") == ended_at)
+            existing["candidate_sha"] == candidate_sha
+            and existing["exit_status"] == exit_status
+            and existing["receipt_hash"] == receipt_hash
+            and (started_at is None or existing["started_at"] == started_at)
+            and (ended_at is None or existing["ended_at"] == ended_at)
         )
         if same_evidence:
             return ledger
         raise AcceptanceCheckError("gate_ledger_conflict")
     if stream == "records":
-        cleanup_records = ledger["cleanup_records"]
-        assert isinstance(cleanup_records, list)
+        cleanup_records = cast(list[dict[str, object]], ledger["cleanup_records"])
         if cleanup_records or (bound_candidate is None and check_id not in _TASK1_GATE_CHECK_ORDER):
             raise AcceptanceCheckError("gate_ledger_phase")
     expected_index = len(records)
     if expected_index >= len(order) or check_id != order[expected_index]:
         raise AcceptanceCheckError("gate_ledger_schema")
     timestamp = _utc_timestamp(now())
-    record = {
+    record: dict[str, object] = {
         "check_id": check_id,
         "candidate_sha": candidate_sha,
         "started_at": started_at or timestamp,
@@ -354,8 +347,7 @@ def _gate_ledger_record_stream(
     }
     candidate = {**ledger, stream: [*records, record], "updated_at": timestamp}
     if stream == "cleanup_records" and not records:
-        success_records = ledger["records"]
-        assert isinstance(success_records, list)
+        success_records = cast(list[dict[str, object]], ledger["records"])
         candidate["success_record_count_at_cleanup_start"] = len(success_records)
     _validate_gate_ledger(candidate)
     _write_protected_document(
@@ -449,17 +441,16 @@ def _gate_ledger_record_cleanup_bound(
             or _gate_ledger_cleanup_prefix_hash(ledger) != expected_prefix_records_sha256
         ):
             raise AcceptanceCheckError("gate_ledger_conflict")
-        cleanup_records = ledger["cleanup_records"]
-        assert isinstance(cleanup_records, list)
+        cleanup_records = cast(list[dict[str, object]], ledger["cleanup_records"])
         existing = next(
-            (record for record in cleanup_records if isinstance(record, dict) and record.get("check_id") == check_id),
+            (record for record in cleanup_records if record["check_id"] == check_id),
             None,
         )
         if existing is not None:
             if (
-                existing.get("candidate_sha") == candidate_sha
-                and existing.get("exit_status") == exit_status
-                and existing.get("receipt_hash") == receipt_hash
+                existing["candidate_sha"] == candidate_sha
+                and existing["exit_status"] == exit_status
+                and existing["receipt_hash"] == receipt_hash
             ):
                 return ledger
             raise AcceptanceCheckError("gate_ledger_conflict")
@@ -495,19 +486,17 @@ def _gate_ledger_finalize_locked(
 ) -> dict[str, object]:
     ledger = _read_gate_ledger(path)
     if ledger["finalized"] is not None:
-        finalized = ledger["finalized"]
-        if isinstance(finalized, dict) and finalized.get("candidate_sha") == candidate_sha:
+        finalized = cast(dict[str, object], ledger["finalized"])
+        if finalized["candidate_sha"] == candidate_sha:
             return ledger
         raise AcceptanceCheckError("gate_ledger_conflict")
-    records = ledger["records"]
-    cleanup_records = ledger["cleanup_records"]
-    assert isinstance(records, list)
+    records = cast(list[dict[str, object]], ledger["records"])
+    cleanup_records = cast(list[dict[str, object]], ledger["cleanup_records"])
     if not records:
         raise AcceptanceCheckError("gate_ledger_empty")
-    assert isinstance(cleanup_records, list)
-    if [record["check_id"] for record in records if isinstance(record, dict)] != list(_SUCCESS_GATE_CHECK_ORDER):
+    if [record["check_id"] for record in records] != list(_SUCCESS_GATE_CHECK_ORDER):
         raise AcceptanceCheckError("gate_ledger_incomplete")
-    if [record["check_id"] for record in cleanup_records if isinstance(record, dict)] != list(_CLEANUP_GATE_CHECK_ORDER):
+    if [record["check_id"] for record in cleanup_records] != list(_CLEANUP_GATE_CHECK_ORDER):
         raise AcceptanceCheckError("gate_ledger_incomplete")
     if ledger["candidate_sha"] != candidate_sha:
         raise AcceptanceCheckError("gate_ledger_candidate")
