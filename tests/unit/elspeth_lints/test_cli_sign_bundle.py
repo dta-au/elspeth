@@ -758,6 +758,15 @@ def test_sign_bundle_resume_finalizes_rotation_audit_after_published_interruptio
     assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
     assert not rotation_log.exists()
     transaction = _recovery_path(capsys.readouterr().err)
+    # The exchange committed, then the process died before the audit append.
+    # A coordinated writer legitimately mutates the newly active tree before
+    # resume; recovery must preserve it and still finalize the committed audit.
+    import elspeth_lints.core.cli as cli_module
+
+    cli_module._append_entry_to_yaml(
+        allowlist_dir / "later.yaml",
+        "\n".join(_pre_judge_entry_lines(_SPARE_PRE_JUDGE_KEY)) + "\n",
+    )
     rotation_log.write_text('{"kind":"external_append"}\n', encoding="utf-8")
 
     rc = main(
@@ -777,6 +786,7 @@ def test_sign_bundle_resume_finalizes_rotation_audit_after_published_interruptio
     )
     rotation_records = [record for record in records if record.get("kind") == "tier_model_rotation"]
     assert all(record["allowlist_dir"] == str(allowlist_dir.resolve()) for record in rotation_records)
+    assert _SPARE_PRE_JUDGE_KEY in (allowlist_dir / "later.yaml").read_text(encoding="utf-8")
 
 
 def test_sign_bundle_rotation_execute_minimal_plan_no_unfiltered_rescan(tmp_path: Path) -> None:
@@ -1484,6 +1494,51 @@ def test_sign_bundle_resume_reconstructs_missing_event_without_rejudging(
     assert records[0]["write_disposition"] == "written"
 
 
+def test_sign_bundle_resume_rejects_success_event_that_contradicts_signed_entry(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(cli_module, "_emit_justify_output", side_effect=KeyboardInterrupt()),
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    event_path = next(transaction.rglob("judge-decision-events.jsonl"))
+    event = json.loads(event_path.read_text(encoding="utf-8"))
+    event["effective_verdict"] = "OVERRIDDEN_BY_OPERATOR"
+    event["model_verdict"] = "BLOCKED"
+    event_path.write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
+
+    with _patch_judge(
+        lambda _file_path: (_ for _ in ()).throw(AssertionError("completed signed decision must not be re-judged"))
+    ):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert "contradicts its authoritative signed entry" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("tamper", ("unrelated_record", "naive_timestamp"))
 def test_sign_bundle_rejects_unrelated_staged_rotation_record(
     tmp_path: Path,
@@ -2167,3 +2222,139 @@ def test_sign_bundle_final_reconciliation_rejects_extra_rotation_record(
     assert rc == 2
     assert _tree_bytes(allowlist_dir) == before
     assert "exactly match completed rotations" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_tolerates_checkpoint_created_before_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    real_save = sign_bundle_transaction.save_manifest
+    saves = 0
+
+    def _interrupt_second_save(*args: Any, **kwargs: Any) -> None:
+        nonlocal saves
+        saves += 1
+        if saves == 2:
+            raise KeyboardInterrupt
+        real_save(*args, **kwargs)
+
+    monkeypatch.setattr(sign_bundle_transaction, "save_manifest", _interrupt_second_save)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    assert (transaction / "checkpoint").is_dir()
+
+    monkeypatch.setattr(sign_bundle_transaction, "save_manifest", real_save)
+    with _patch_judge(_accept_all) as calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 0
+    assert calls == ["plugins/gadget.py"]
+
+
+def test_sign_bundle_resume_tolerates_checkpoint_retired_after_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    real_clear = sign_bundle_transaction.clear_action_checkpoint
+
+    def _interrupt_before_delete(_tx_path: Path) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "clear_action_checkpoint", _interrupt_before_delete)
+    with _patch_judge(_accept_all):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    manifest = json.loads((transaction / "transaction.json").read_text(encoding="utf-8"))
+    assert manifest["running_action"] is None
+    assert manifest["completed_actions"] == [0]
+    assert manifest["checkpoint_snapshot"] is None
+    assert (transaction / "checkpoint").is_dir()
+
+    monkeypatch.setattr(sign_bundle_transaction, "clear_action_checkpoint", real_clear)
+    with _patch_judge(
+        lambda _file_path: (_ for _ in ()).throw(AssertionError("journaled accepted action must not be re-judged"))
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 0
+    assert _canonical_key(finding) in (allowlist_dir / "plugins.yaml").read_text(encoding="utf-8")
+
+
+def test_reaudit_sidecar_writer_blocks_publish_and_is_not_stranded(
+    tmp_path: Path,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+    from elspeth_lints.core.reaudit_sidecar import SidecarHeader, SidecarWriter
+
+    active = _build_allowlist_dir(tmp_path)
+    tx_path = tmp_path / "tx"
+    candidate = tx_path / "candidate" / active.name
+    candidate.parent.mkdir(parents=True)
+    shutil.copytree(active, candidate)
+    (candidate / "_defaults.yaml").write_text(
+        (candidate / "_defaults.yaml").read_text(encoding="utf-8") + "# candidate\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "allowlist_dir": str(active),
+        "candidate_dir": str(candidate),
+        "base_snapshot": sign_bundle_transaction.tree_snapshot(active),
+        "candidate_snapshot": sign_bundle_transaction.tree_snapshot(candidate),
+    }
+    run_id = "a" * 32
+    sidecar = active / ".reaudit-state" / f"{run_id}.jsonl"
+    header = SidecarHeader(
+        run_id=run_id,
+        started_at=datetime.now(UTC),
+        total_entries=0,
+        allowlist_path=str(active),
+        allowlist_hash="0" * 64,
+        judge_transport="openrouter",
+        rule_filter="trust_tier.tier_model",
+        since_iso=None,
+        limit=None,
+        include_pre_judge=False,
+    )
+    publish_error: list[BaseException] = []
+    publish_done = threading.Event()
+
+    def _publish() -> None:
+        try:
+            sign_bundle_transaction.publish_candidate(tx_path, manifest)
+        except BaseException as exc:
+            publish_error.append(exc)
+        finally:
+            publish_done.set()
+
+    with SidecarWriter(sidecar, header):
+        publisher = threading.Thread(target=_publish, daemon=True)
+        publisher.start()
+        assert not publish_done.wait(timeout=0.1)
+
+    publisher.join(timeout=5)
+    assert len(publish_error) == 1
+    assert "publish precondition failed" in str(publish_error[0])
+    assert sidecar.is_file()
+    assert not (candidate / ".reaudit-state").exists()

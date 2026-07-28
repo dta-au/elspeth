@@ -134,6 +134,59 @@ def test_load_bundle_rejects_incoherent_lane_kind() -> None:
         load_bundle(_serialize_with_actions([incoherent]))
 
 
+def test_load_bundle_rejects_duplicate_action_identity_across_kinds() -> None:
+    key = "plugins/widget.py:R1:Widget:lookup:fp=abc123"
+    actions = [
+        {
+            "lane": "resign",
+            "kind": "rotation",
+            "key": key,
+            "source_file": "plugins.yaml",
+        },
+        {
+            "lane": "resign",
+            "kind": "stale_delete",
+            "key": key,
+            "source_file": "plugins.yaml",
+        },
+    ]
+
+    with pytest.raises(ValueError, match="duplicate semantic action identity"):
+        load_bundle(_serialize_with_actions(actions))
+
+
+@pytest.mark.parametrize(
+    ("location", "field", "invalid"),
+    [
+        ("bundle", "source_rev", []),
+        ("bundle", "source_dirty", "false"),
+        ("action", "file_path", []),
+        ("action", "symbol", 7),
+        ("action", "rule", {}),
+        ("action", "fingerprint", []),
+        ("action", "scope_fingerprint", 7),
+        ("action", "ast_path", {}),
+        ("action", "draft_rationale", []),
+        ("action", "diagnosis_status", 7),
+        ("action", "source_file", []),
+        ("preview", "authoritative", 0),
+    ],
+)
+def test_load_bundle_rejects_truthy_and_wrong_typed_optional_fields(
+    location: str,
+    field: str,
+    invalid: Any,
+) -> None:
+    data = json.loads(dump_bundle(_bundle((_new_judgment_action(),))))
+    target = data if location == "bundle" else data["actions"][0]
+    if location == "preview":
+        target = data["actions"][0]["preview"]
+    target[field] = invalid
+
+    with pytest.raises(ValueError, match=field):
+        load_bundle(json.dumps(data))
+
+
 @pytest.mark.parametrize("source_file", ("../outside.yaml", "/tmp/outside.yaml", "nested/plugins.yaml"))
 @pytest.mark.parametrize("kind", ("rotation", "stale_delete"))
 def test_bundle_action_rejects_nonlocal_source_file(kind: str, source_file: str) -> None:

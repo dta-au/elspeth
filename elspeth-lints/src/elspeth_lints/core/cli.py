@@ -3955,7 +3955,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
                 rotation_log=args.rotation_log,
                 signing_policy=signing_policy,
             )
-            if publication_disposition(resume_manifest) == "published":
+            if publication_disposition(resume_manifest).startswith("published"):
                 # After the atomic swap the transaction's candidate path holds
                 # the original active tree. Re-derive bundle claims there while
                 # separately verifying journaled signatures in the live tree.

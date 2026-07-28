@@ -115,6 +115,7 @@ def create_transaction(
     tx_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", bundle_id).strip(".-") or "bundle"
     tx_path = Path(tempfile.mkdtemp(prefix=f"{safe_id}-", dir=tx_root))
+    _fsync_directory(tx_root)
     _probe_exchange_support(tx_path)
     candidate_parent = tx_path / "candidate"
     candidate_parent.mkdir()
@@ -206,11 +207,14 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
         raise SignBundleTransactionError("transaction rotation-base authentication failed")
     checkpoint_snapshot = raw.get("checkpoint_snapshot")
     checkpoint = resolved / "checkpoint"
-    if checkpoint_snapshot is not None:
-        if not checkpoint.is_dir() or tree_snapshot(checkpoint) != checkpoint_snapshot:
-            raise SignBundleTransactionError("transaction checkpoint authentication failed")
-    elif checkpoint.exists():
-        raise SignBundleTransactionError("transaction has an unauthenticated checkpoint")
+    if checkpoint_snapshot is not None and (
+        not checkpoint.is_dir() or tree_snapshot(checkpoint) != checkpoint_snapshot
+    ):
+        raise SignBundleTransactionError("transaction checkpoint authentication failed")
+    # An orphan checkpoint is the safe side of the two-phase protocol: the
+    # authenticated manifest says no action depends on it, so a crash before
+    # its best-effort deletion cannot strand recovery. The next action replaces
+    # it before journalling a new running_action.
     return raw
 
 
@@ -262,6 +266,16 @@ def publication_disposition(manifest: dict[str, Any]) -> str:
         return "not_published"
     if active_snapshot == manifest["candidate_snapshot"] and candidate_snapshot == manifest["base_snapshot"]:
         return "published"
+    if (
+        manifest["candidate_snapshot"] != manifest["base_snapshot"]
+        and candidate_snapshot == manifest["base_snapshot"]
+        and manifest.get("publish_started_at") is not None
+    ):
+        # The authenticated candidate path can contain the base snapshot only
+        # after RENAME_EXCHANGE. A coordinated writer may have changed the new
+        # active tree after a post-exchange process death; preserve that later
+        # mutation while still finalizing the already-committed rotation audit.
+        return "published_active_drift"
     raise SignBundleTransactionError(
         "cannot reconcile transaction publication: active/candidate bytes or signatures match neither recorded atomic state"
     )
@@ -336,9 +350,13 @@ def mark_candidate_snapshot(tx_path: Path, manifest: dict[str, Any]) -> None:
     manifest["rotation_staged_sha256"] = file_sha256(rotation_staged)
 
 
-def clear_action_checkpoint_from_manifest(tx_path: Path, manifest: dict[str, Any]) -> None:
-    clear_action_checkpoint(tx_path)
+def commit_action_state(tx_path: Path, manifest: dict[str, Any]) -> None:
+    """Authenticate durable action state before retiring its checkpoint."""
     manifest["checkpoint_snapshot"] = None
+    mark_candidate_snapshot(tx_path, manifest)
+    save_manifest(tx_path, manifest)
+    clear_action_checkpoint(tx_path)
+    _fsync_directory(tx_path)
 
 
 def publish_candidate(tx_path: Path, manifest: dict[str, Any]) -> None:
@@ -439,7 +457,7 @@ def run_sign_bundle_transaction(
         item.key: item.repair_key or item.key for item in verification.diagnosis.items if item.key in specs_by_stale_key
     }
     candidate_args = argparse.Namespace(**vars(args))
-    candidate_args.allowlist_dir = args.allowlist_dir if disposition == "published" else Path(manifest["candidate_dir"])
+    candidate_args.allowlist_dir = args.allowlist_dir if disposition.startswith("published") else Path(manifest["candidate_dir"])
     candidate_args.rotation_log = tx_path / "rotation-staged.log"
     candidate_args._defer_override_rate_counter_snapshot = True
     completed = {int(index) for index in manifest["completed_actions"]}
@@ -453,24 +471,26 @@ def run_sign_bundle_transaction(
         if not checkpoint_rotation.is_file() or file_sha256(checkpoint_rotation) != recorded_rotation_hash:
             raise SignBundleTransactionError("transaction running-action rotation checkpoint authentication failed")
 
-    if disposition == "published":
+    if disposition.startswith("published"):
         if completed != set(range(len(bundle.actions))):
             raise SignBundleTransactionError("published transaction journal does not contain every bundle action")
-        _verify_completed_actions(
-            bundle,
-            completed=completed,
-            verification=verification,
-            repair_keys_by_stale_key=repair_keys_by_stale_key,
-            args=candidate_args,
-            tx_path=tx_path,
-        )
+        if disposition == "published":
+            _verify_completed_actions(
+                bundle,
+                completed=completed,
+                verification=verification,
+                repair_keys_by_stale_key=repair_keys_by_stale_key,
+                args=candidate_args,
+                tx_path=tx_path,
+            )
         _assert_final_rotation_evidence(
             bundle,
             completed=completed,
             verification=verification,
             tx_path=tx_path,
         )
-        finalize_rotation_log(tx_path, manifest)
+        with allowlist_mutation_lock(Path(manifest["allowlist_dir"])):
+            finalize_rotation_log(tx_path, manifest)
         return SignBundleRunResult(0, len(completed), recovered_publish=True)
 
     if running is not None:
@@ -526,6 +546,7 @@ def run_sign_bundle_transaction(
                 running_action,
                 tx_path=tx_path,
                 candidate_dir=Path(manifest["candidate_dir"]),
+                source_file=running_source_file,
                 expected_key=running_expected_key,
                 success=False,
             )
@@ -539,9 +560,7 @@ def run_sign_bundle_transaction(
             restore_action_checkpoint(tx_path, manifest)
         manifest["running_action"] = None
         manifest["completed_actions"] = sorted(completed)
-        clear_action_checkpoint_from_manifest(tx_path, manifest)
-        mark_candidate_snapshot(tx_path, manifest)
-        save_manifest(tx_path, manifest)
+        commit_action_state(tx_path, manifest)
 
     assert_candidate_unchanged(manifest)
     _verify_completed_actions(
@@ -605,9 +624,7 @@ def run_sign_bundle_transaction(
         )
         if code != 0:
             manifest["running_action"] = None
-            clear_action_checkpoint_from_manifest(tx_path, manifest)
-            mark_candidate_snapshot(tx_path, manifest)
-            save_manifest(tx_path, manifest)
+            commit_action_state(tx_path, manifest)
             return SignBundleRunResult(
                 code,
                 len(completed),
@@ -629,9 +646,7 @@ def run_sign_bundle_transaction(
         completed.add(index)
         manifest["completed_actions"] = sorted(completed)
         manifest["running_action"] = None
-        clear_action_checkpoint_from_manifest(tx_path, manifest)
-        mark_candidate_snapshot(tx_path, manifest)
-        save_manifest(tx_path, manifest)
+        commit_action_state(tx_path, manifest)
 
     _verify_completed_actions(
         bundle,
@@ -662,13 +677,18 @@ def run_sign_bundle_transaction(
     # append idempotently. A kill in that narrow post-commit window resumes from
     # disposition="published" and finalizes the exact staged delta.
     assert_rotation_log_unchanged(tx_path, manifest)
-    if manifest.get("publish_started_at") is None:
-        from datetime import UTC, datetime
+    if manifest["candidate_snapshot"] == manifest["base_snapshot"]:
+        raise SignBundleTransactionError("refusing coherent publish without an authenticated candidate mutation")
+    from datetime import UTC, datetime
 
-        manifest["publish_started_at"] = datetime.now(UTC).isoformat()
-        save_manifest(tx_path, manifest)
-    publish_candidate(tx_path, manifest)
-    finalize_rotation_log(tx_path, manifest)
+    # Every fresh pre-exchange attempt gets a new authenticated start time.
+    # A prior failed attempt or pre-exchange process death must not make the
+    # eventual active mutation appear older than it is.
+    manifest["publish_started_at"] = datetime.now(UTC).isoformat()
+    save_manifest(tx_path, manifest)
+    with allowlist_mutation_lock(Path(manifest["allowlist_dir"])):
+        publish_candidate(tx_path, manifest)
+        finalize_rotation_log(tx_path, manifest)
     return SignBundleRunResult(0, len(completed))
 
 
@@ -753,6 +773,7 @@ def _assert_action_scoped_candidate_changes(
         action,
         tx_path=tx_path,
         candidate_dir=Path(manifest["candidate_dir"]),
+        source_file=source_file,
         expected_key=expected_key,
         success=verify_semantics,
     )
@@ -779,6 +800,7 @@ def _assert_judge_event_transition(
     *,
     tx_path: Path,
     candidate_dir: Path,
+    source_file: str | None,
     expected_key: str,
     success: bool | None,
 ) -> None:
@@ -856,6 +878,18 @@ def _assert_judge_event_transition(
         or not _is_timezone_aware_iso8601(record.get("recorded_at"))
     ):
         raise SignBundleTransactionError(f"{action.kind} {action.key!r} appended an unrelated decision event")
+    if success is True:
+        expected_record = _signed_judge_event_payload(
+            action,
+            tx_path=tx_path,
+            candidate_dir=candidate_dir,
+            source_file=source_file,
+            expected_key=expected_key,
+        )
+        if record != expected_record:
+            raise SignBundleTransactionError(
+                f"{action.kind} {action.key!r} decision event contradicts its authoritative signed entry"
+            )
 
 
 def _assert_rotation_staged_transition(
@@ -1027,6 +1061,13 @@ def _prepare_completed_judge_evidence(
     )
     if not candidate_dir.name.startswith("enforce_"):
         return
+    payload = _signed_judge_event_payload(
+        action,
+        tx_path=tx_path,
+        candidate_dir=candidate_dir,
+        source_file=source_file,
+        expected_key=expected_key,
+    )
 
     checkpoint = tx_path / "checkpoint"
     metadata = strict_json_loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
@@ -1040,43 +1081,6 @@ def _prepare_completed_judge_evidence(
         raise SignBundleTransactionError(f"{action.kind} {action.key!r} rewrote prior judge decision events")
     if after[len(before) :]:
         return
-
-    target = candidate_dir / _local_allowlist_filename(source_file)
-    mapping = _load_unique_yaml_mapping(
-        target.read_bytes() if target.is_file() else b"",
-        error_context=f"{action.kind} {action.key!r} candidate YAML",
-    )
-    entries = mapping.get("allow_hits", [])
-    if not isinstance(entries, list):
-        raise SignBundleTransactionError(f"{action.kind} {action.key!r} requires list-valued allow_hits in {source_file}")
-    matching = [entry for entry in entries if isinstance(entry, dict) and entry.get("key") == expected_key]
-    if len(matching) != 1:
-        raise SignBundleTransactionError(f"{action.kind} {action.key!r} cannot reconstruct evidence without one expected entry")
-    entry = cast("dict[str, Any]", matching[0])
-    effective_verdict = entry.get("judge_verdict")
-    stored_model_verdict = entry.get("judge_model_verdict")
-    if effective_verdict == "ACCEPTED" and stored_model_verdict is None:
-        model_verdict = "ACCEPTED"
-    elif effective_verdict == "OVERRIDDEN_BY_OPERATOR" and stored_model_verdict in {"ACCEPTED", "BLOCKED"}:
-        model_verdict = stored_model_verdict
-    else:
-        raise SignBundleTransactionError(
-            f"{action.kind} {action.key!r} has signed verdict metadata that cannot reconstruct its decision event"
-        )
-    recorded_at = entry.get("judge_recorded_at")
-    key_parts = expected_key.split(":")
-    if len(key_parts) < 2 or not _is_timezone_aware_iso8601(recorded_at):
-        raise SignBundleTransactionError(f"{action.kind} {action.key!r} has signed metadata that cannot reconstruct its decision event")
-    payload = {
-        "schema_version": 1,
-        "source_file": key_parts[0],
-        "entry_key": expected_key,
-        "rule_id": key_parts[1],
-        "effective_verdict": effective_verdict,
-        "model_verdict": model_verdict,
-        "recorded_at": recorded_at,
-        "write_disposition": "written",
-    }
     rendered = json.dumps(payload, sort_keys=True) + "\n"
 
     def append_to_exact_before(existing: str | None) -> str:
@@ -1091,6 +1095,66 @@ def _prepare_completed_judge_evidence(
         encoding="utf-8",
         create_parent=True,
     )
+
+
+def _signed_judge_event_payload(
+    action: Any,
+    *,
+    tx_path: Path,
+    candidate_dir: Path,
+    source_file: str | None,
+    expected_key: str,
+) -> dict[str, Any]:
+    """Derive the only valid success event from signed YAML and pinned policy."""
+    if source_file is None:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} has no verified owning YAML")
+    target = candidate_dir / _local_allowlist_filename(source_file)
+    mapping = _load_unique_yaml_mapping(
+        target.read_bytes() if target.is_file() else b"",
+        error_context=f"{action.kind} {action.key!r} candidate YAML",
+    )
+    entries = mapping.get("allow_hits", [])
+    if not isinstance(entries, list):
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} requires list-valued allow_hits in {source_file}")
+    matching = [entry for entry in entries if isinstance(entry, dict) and entry.get("key") == expected_key]
+    if len(matching) != 1:
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} cannot bind evidence without one expected entry")
+    entry = cast("dict[str, Any]", matching[0])
+
+    signing_policy = load_manifest(tx_path).get("signing_policy")
+    operator_override = signing_policy.get("operator_override") if isinstance(signing_policy, dict) else None
+    if not isinstance(operator_override, bool):
+        raise SignBundleTransactionError("transaction signing policy operator_override must be a boolean")
+
+    effective_verdict = entry.get("judge_verdict")
+    stored_model_verdict = entry.get("judge_model_verdict")
+    if not operator_override and effective_verdict == "ACCEPTED" and stored_model_verdict is None:
+        model_verdict = "ACCEPTED"
+    elif (
+        operator_override
+        and effective_verdict == "OVERRIDDEN_BY_OPERATOR"
+        and stored_model_verdict in {"ACCEPTED", "BLOCKED"}
+    ):
+        model_verdict = stored_model_verdict
+    else:
+        raise SignBundleTransactionError(
+            f"{action.kind} {action.key!r} signed verdict metadata contradicts the pinned operator-override policy"
+        )
+
+    recorded_at = entry.get("judge_recorded_at")
+    key_parts = expected_key.split(":")
+    if len(key_parts) < 2 or not _is_timezone_aware_iso8601(recorded_at):
+        raise SignBundleTransactionError(f"{action.kind} {action.key!r} has signed metadata that cannot bind its decision event")
+    return {
+        "schema_version": 1,
+        "source_file": key_parts[0],
+        "entry_key": expected_key,
+        "rule_id": key_parts[1],
+        "effective_verdict": effective_verdict,
+        "model_verdict": model_verdict,
+        "recorded_at": recorded_at,
+        "write_disposition": "written",
+    }
 
 
 def _assert_target_yaml_transition(
@@ -1470,6 +1534,14 @@ def _fsync_file(path: Path) -> None:
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
     descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
     finally:
