@@ -13,6 +13,7 @@ from typing import Literal
 from sqlalchemy.engine.url import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
+from elspeth.web import aws_rds_trust
 from elspeth.web.config import (
     DeploymentTarget,
     WebSettings,
@@ -117,7 +118,12 @@ def resolve_deployment_state_mode(settings: WebSettings) -> ResolvedDeploymentSt
 def _has_approved_aws_ecs_tls_query(parsed: URL) -> bool:
     sslmode = parsed.query.get("sslmode")
     sslrootcert = parsed.query.get("sslrootcert")
-    return type(sslmode) is str and sslmode == "verify-full" and type(sslrootcert) is str and bool(sslrootcert.strip())
+    return (
+        type(sslmode) is str
+        and sslmode == "verify-full"
+        and type(sslrootcert) is str
+        and sslrootcert == str(aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH)
+    )
 
 
 def _check_external_postgres_url(
@@ -143,7 +149,7 @@ def _check_external_postgres_url(
         return ContractCheck(
             name,
             False,
-            f"{env_var} must require authenticated PostgreSQL TLS with sslmode=verify-full and one non-blank sslrootcert",
+            f"{env_var} must require authenticated PostgreSQL TLS with sslmode=verify-full and the immutable ELSPETH AWS RDS trust root",
         )
     return ContractCheck(name, True, f"{env_var} is configured for supported synchronous PostgreSQL access")
 

@@ -16,6 +16,7 @@ from sqlalchemy import Connection, Engine, create_engine
 
 from elspeth.core.config import TelemetrySettings
 from elspeth.core.landscape.database import SchemaCompatibilityError
+from elspeth.web.aws_rds_trust import AWS_RDS_GLOBAL_BUNDLE_PATH
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ContractCheck
 from elspeth.web.doctor import (
@@ -58,8 +59,8 @@ def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
         "operator_telemetry_task_definition_family": "elspeth-web-task",
         "operator_telemetry_task_definition_revision": "1",
         "host": "0.0.0.0",
-        "session_db_url": ("postgresql+psycopg://doctor:secret@db/session?sslmode=verify-full&sslrootcert=system"),
-        "landscape_url": ("postgresql+psycopg://doctor:secret@db/landscape?sslmode=verify-full&sslrootcert=system"),
+        "session_db_url": (f"postgresql+psycopg://doctor:secret@db/session?sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"),
+        "landscape_url": (f"postgresql+psycopg://doctor:secret@db/landscape?sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"),
         "data_dir": data_dir,
         "payload_store_path": payload_dir,
         "secret_key": "this-doctor-secret-is-long-enough",

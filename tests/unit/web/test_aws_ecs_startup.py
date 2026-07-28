@@ -15,13 +15,14 @@ from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web import aws_ecs_startup as startup
 from elspeth.web import external_state_startup as external_startup
+from elspeth.web.aws_rds_trust import AWS_RDS_GLOBAL_BUNDLE_PATH
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ContractCheck
 from elspeth.web.schema_probe import SchemaState
 from elspeth.web.sessions.schema import SessionSchemaError
 
 _SENTINEL = "opaque-credential SELECT raw_secret /secret/runtime/path"
-_AWS_TLS_QUERY = "sslmode=verify-full&sslrootcert=system"
+_AWS_TLS_QUERY = f"sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
