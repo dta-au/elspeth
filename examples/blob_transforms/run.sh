@@ -11,6 +11,9 @@ ELSPETH_BIN="${ELSPETH_BLOB_TRANSFORMS_CLI_BIN:-$PROJECT_ROOT/.venv/bin/elspeth}
 cd "$PROJECT_ROOT"
 
 mkdir -p "$EXAMPLE_DIR/input" "$EXAMPLE_DIR/output" "$EXAMPLE_DIR/payloads/offline" "$EXAMPLE_DIR/runs"
+# FilesystemPayloadStore rejects group/world-writable roots; mkdir -p is
+# umask-filtered, so normalize the payload dir it pre-creates.
+chmod 700 "$EXAMPLE_DIR/payloads/offline"
 rm -f \
   "$EXAMPLE_DIR/input/csv_blob_manifest.csv" \
   "$EXAMPLE_DIR/output/expanded_csv_rows.csv" \
