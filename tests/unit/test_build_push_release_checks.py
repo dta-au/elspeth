@@ -376,3 +376,31 @@ def test_release_dockerfile_documents_orchestrator_owned_probe_wiring() -> None:
     assert "ALB target groups:     GET /api/ready" in dockerfile
     assert "Batch tasks:           process exit code" in dockerfile
     assert "elspeth health --port 8451" not in dockerfile
+
+
+RDS_BUNDLE_SHA256 = "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
+
+
+def test_release_image_bakes_the_reviewed_rds_trust_root() -> None:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    dockerignore = DOCKERIGNORE.read_text(encoding="utf-8")
+
+    assert "!deploy/aws-ecs/trust/global-bundle.pem" in dockerignore
+    assert "COPY deploy/aws-ecs/trust/global-bundle.pem " in dockerfile
+    assert "/runtime-root/etc/elspeth/rds/global-bundle.pem" in dockerfile
+    assert "chmod 0444" in dockerfile
+    assert RDS_BUNDLE_SHA256 in dockerfile
+    assert 'LABEL io.elspeth.rds-ca-bundle-sha256="$RDS_CA_BUNDLE_SHA256"' in dockerfile
+    assert 'LABEL io.elspeth.rds-ca-certificate-identifier="rds-ca-rsa2048-g1"' in dockerfile
+
+
+def test_release_workflow_verifies_trust_root_under_read_only_rootfs() -> None:
+    job = _build_push_job()
+    lean = _step_run(job, "Verify lean PostgreSQL image contract")
+    generic = _step_run(_job("smoke-test"), "Verify generic image runtime contract")
+
+    for script in (lean, generic):
+        assert "io.elspeth.rds-ca-bundle-sha256" in script
+        assert "deploy/aws-ecs/trust/global-bundle.pem.sha256" in script
+        assert "verify_aws_rds_trust_bundle" in script
+        assert "docker run --rm --read-only" in script

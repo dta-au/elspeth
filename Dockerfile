@@ -18,6 +18,11 @@
 # generic GHCR/ACR builds set this explicitly to "all".
 ARG INSTALL_EXTRAS="all"
 
+# SHA-256 of the reviewed AWS RDS global trust bundle baked into the image.
+# Must match deploy/aws-ecs/trust/global-bundle.pem.sha256; the builder-stage
+# COPY below fails the build if the checked-in file drifts from this pin.
+ARG RDS_CA_BUNDLE_SHA256="e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
+
 # =============================================================================
 # Stage 1: Frontend Builder
 # =============================================================================
@@ -92,6 +97,17 @@ RUN find /tmp/frontend-dist -type d -exec chmod 0755 {} + && \
     python -c 'from pathlib import Path; import shutil; import elspeth.web; target = Path(elspeth.web.__file__).parent / "frontend" / "dist"; shutil.rmtree(target, ignore_errors=True); target.parent.mkdir(parents=True, exist_ok=True); shutil.copytree("/tmp/frontend-dist", target)' && \
     rm -rf /tmp/frontend-dist
 
+# Bake the reviewed AWS RDS global trust bundle into the runtime root,
+# root-owned and read-only, with a build-time digest check so a tampered or
+# stale checked-in bundle fails the build instead of shipping silently.
+ARG RDS_CA_BUNDLE_SHA256
+COPY deploy/aws-ecs/trust/global-bundle.pem /runtime-root/etc/elspeth/rds/global-bundle.pem
+COPY deploy/aws-ecs/trust/global-bundle.pem.sha256 /runtime-root/etc/elspeth/rds/global-bundle.pem.sha256
+RUN test "$(sha256sum /runtime-root/etc/elspeth/rds/global-bundle.pem | cut -d' ' -f1)" = "$RDS_CA_BUNDLE_SHA256" && \
+    chown -R 0:0 /runtime-root/etc/elspeth && \
+    find /runtime-root/etc/elspeth -type d -exec chmod 0755 {} + && \
+    find /runtime-root/etc/elspeth -type f -exec chmod 0444 {} +
+
 # Prepare everything the final stage would otherwise need to manufacture.
 # The debug distroless variant retains BusyBox utilities for the documented
 # Docker smoke and the AWS ECS launch wrapper, while the application identity
@@ -128,6 +144,7 @@ RUN groupadd --gid 1654 elspeth && \
 FROM gcr.io/distroless/python3-debian13:debug-nonroot@sha256:6418f576f2011f5d265d03f53aee812b4efcba5c6646a3f4d855b9fb51cd2d72 AS runtime
 
 ARG INSTALL_EXTRAS
+ARG RDS_CA_BUNDLE_SHA256
 
 # Labels for container registry
 LABEL org.opencontainers.image.title="ELSPETH"
@@ -137,6 +154,8 @@ LABEL org.opencontainers.image.licenses="MIT"
 LABEL io.elspeth.install-extras="$INSTALL_EXTRAS"
 LABEL io.elspeth.runtime-uid="1654"
 LABEL io.elspeth.runtime-gid="1654"
+LABEL io.elspeth.rds-ca-bundle-sha256="$RDS_CA_BUNDLE_SHA256"
+LABEL io.elspeth.rds-ca-certificate-identifier="rds-ca-rsa2048-g1"
 
 # Copy the prepared identity, home, application roots, and virtual environment.
 COPY --from=builder /runtime-root/ /
