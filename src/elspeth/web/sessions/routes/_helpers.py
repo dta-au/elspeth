@@ -599,21 +599,70 @@ def _plugin_policy_findings(
     """Describe persisted components unavailable in the current snapshot."""
     if policy_catalog is None:
         return []
+
     components: list[tuple[str, PluginId]] = []
-    for source_name, source in (state.sources or {}).items():
-        plugin_name = source.get("plugin")
-        if isinstance(plugin_name, str):
-            components.append((source_name, PluginId("source", plugin_name)))
-    for node in state.nodes or ():
-        plugin_name = node.get("plugin")
-        component_id = node.get("id")
-        if isinstance(plugin_name, str) and isinstance(component_id, str):
+
+    # ``source`` is the documented bridge for rows written before the
+    # multi-source ``sources`` column. New writers always persist ``sources``;
+    # accepting both at once would make the source of truth ambiguous.
+    sources = state.sources
+    if sources is None:
+        sources = {}
+        if state.source is not None:
+            sources = {"source": state.source}
+    elif state.source is not None:
+        raise AuditIntegrityError("persisted plugin policy source projection has both source and sources")
+    for source_name, source in sources.items():
+        if type(source_name) is not str or source_name == "":
+            raise AuditIntegrityError("persisted plugin policy source name must be a non-empty string")
+        if "plugin" not in source:
+            raise AuditIntegrityError(f"persisted plugin policy source {source_name!r} has no plugin")
+        plugin_name = source["plugin"]
+        if type(plugin_name) is not str or plugin_name == "":
+            raise AuditIntegrityError(f"persisted plugin policy source {source_name!r} plugin must be a non-empty string")
+        components.append((source_name, PluginId("source", plugin_name)))
+
+    nodes = state.nodes
+    if nodes is None:
+        nodes = ()
+    for node in nodes:
+        if "id" not in node:
+            raise AuditIntegrityError("persisted plugin policy node has no id")
+        component_id = node["id"]
+        if type(component_id) is not str or component_id == "":
+            raise AuditIntegrityError("persisted plugin policy node id must be a non-empty string")
+        if "node_type" not in node:
+            raise AuditIntegrityError(f"persisted plugin policy node {component_id!r} has no node_type")
+        node_type = node["node_type"]
+        if "plugin" not in node:
+            raise AuditIntegrityError(f"persisted plugin policy {node_type} node {component_id!r} has no plugin")
+        plugin_name = node["plugin"]
+        if node_type == "transform" or node_type == "aggregation":
+            if type(plugin_name) is not str or plugin_name == "":
+                raise AuditIntegrityError(f"persisted plugin policy {node_type} node {component_id!r} plugin must be a non-empty string")
             components.append((component_id, PluginId("transform", plugin_name)))
-    for output in state.outputs or ():
-        plugin_name = output.get("plugin")
-        component_id = output.get("name", output.get("sink_name"))
-        if isinstance(plugin_name, str) and isinstance(component_id, str):
-            components.append((component_id, PluginId("sink", plugin_name)))
+        elif node_type == "gate" or node_type == "coalesce" or node_type == "queue":
+            if plugin_name is not None:
+                raise AuditIntegrityError(f"persisted plugin policy structural node {component_id!r} plugin must be explicitly null")
+        else:
+            raise AuditIntegrityError(f"persisted plugin policy node {component_id!r} has unknown node_type {node_type!r}")
+
+    outputs = state.outputs
+    if outputs is None:
+        outputs = ()
+    for output in outputs:
+        if "name" not in output:
+            raise AuditIntegrityError("persisted plugin policy output has no canonical name")
+        component_id = output["name"]
+        if type(component_id) is not str or component_id == "":
+            raise AuditIntegrityError("persisted plugin policy output name must be a non-empty string")
+        if "plugin" not in output:
+            raise AuditIntegrityError(f"persisted plugin policy output {component_id!r} has no plugin")
+        plugin_name = output["plugin"]
+        if type(plugin_name) is not str or plugin_name == "":
+            raise AuditIntegrityError(f"persisted plugin policy output {component_id!r} plugin must be a non-empty string")
+        components.append((component_id, PluginId("sink", plugin_name)))
+
     findings: list[PluginPolicyFindingResponse] = []
     for component_id, plugin_id in components:
         reason = policy_catalog.unavailable_reason(plugin_id)

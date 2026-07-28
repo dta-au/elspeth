@@ -6328,6 +6328,101 @@ sinks:
         assert "credential" not in exported_yaml
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("malformed_component", ["source", "transform", "output"])
+    async def test_saved_malformed_plugin_policy_component_fails_loudly(
+        self,
+        tmp_path: Path,
+        malformed_component: str,
+    ) -> None:
+        """A corrupt component must not disappear from a mixed persisted cohort."""
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        sources: dict[str, dict[str, Any]] = {
+            "valid_source": {
+                "plugin": "csv",
+                "on_success": "valid_node",
+                "options": {},
+                "on_validation_failure": "discard",
+            }
+        }
+        nodes: list[dict[str, Any]] = [
+            {
+                "id": "valid_node",
+                "node_type": "transform",
+                "plugin": "llm",
+            }
+        ]
+        outputs: list[dict[str, Any]] = [{"name": "valid_output", "plugin": "json"}]
+        if malformed_component == "source":
+            sources["corrupt_source"] = {}
+        elif malformed_component == "transform":
+            nodes.append({"id": "corrupt_node", "node_type": "transform"})
+        else:
+            # ``sink_name`` belonged to the retired runtime-event shape. A
+            # persisted composition output has one canonical identity key.
+            outputs.append({"sink_name": "corrupt_output", "plugin": "json"})
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Corrupt plugin projection", "local")
+        await service.save_composition_state(
+            session.id,
+            CompositionStateData(
+                sources=sources,
+                nodes=nodes,
+                outputs=outputs,
+                is_valid=False,
+            ),
+            provenance="session_seed",
+        )
+
+        with pytest.raises(AuditIntegrityError, match=malformed_component):
+            client.get(f"/api/sessions/{session.id}/state")
+
+    def test_plugin_policy_projection_preserves_legacy_source_and_node_variants(self, tmp_path: Path) -> None:
+        """The legacy source bridge is explicit; structural nodes are not plugins."""
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.sessions.routes._helpers import _plugin_policy_findings
+
+        app, _service = _make_app(tmp_path)
+        snapshot = _install_restricted_plugin_policy(app)
+        catalog = PolicyCatalogView(
+            app.state.catalog_service,
+            snapshot,
+            app.state.operator_profile_registry,
+        )
+        state = CompositionStateRecord(
+            id=uuid.uuid4(),
+            session_id=uuid.uuid4(),
+            version=1,
+            source={"plugin": "missing_source"},
+            sources=None,
+            nodes=[
+                {"id": "transform_node", "node_type": "transform", "plugin": "missing_transform"},
+                {"id": "aggregation_node", "node_type": "aggregation", "plugin": "missing_aggregation"},
+                {"id": "gate_node", "node_type": "gate", "plugin": None},
+                {"id": "coalesce_node", "node_type": "coalesce", "plugin": None},
+                {"id": "queue_node", "node_type": "queue", "plugin": None},
+            ],
+            edges=None,
+            outputs=[{"name": "missing_output", "plugin": "missing_sink"}],
+            metadata_=None,
+            is_valid=False,
+            validation_errors=None,
+            created_at=datetime.now(UTC),
+            derived_from_state_id=None,
+        )
+
+        findings = _plugin_policy_findings(state, catalog)
+
+        assert [(finding.component_id, finding.plugin_id, finding.reason_code) for finding in findings] == [
+            ("source", "source:missing_source", "plugin_not_installed"),
+            ("transform_node", "transform:missing_transform", "plugin_not_installed"),
+            ("aggregation_node", "transform:missing_aggregation", "plugin_not_installed"),
+            ("missing_output", "sink:missing_sink", "plugin_not_installed"),
+        ]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("invalid_component", ["source", "sink"])
     async def test_post_state_yaml_persists_aws_s3_endpoint_url_as_invalid(
         self,
