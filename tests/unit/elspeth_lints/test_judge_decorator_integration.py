@@ -231,7 +231,9 @@ def test_static_policy_teaches_both_valid_trust_boundary_metadata_forms() -> Non
     assert "MUST include both ``test_ref=<pytest nodeid>`` and ``test_fingerprint=<canonical AST fingerprint>``" in policy
     assert "current behavioral test" in policy
     assert "MUST omit ``non_raising=True``" in policy
-    assert "Non-raising boundary metadata (a genuinely mechanical classifier)" in policy
+    assert "Non-raising boundary metadata" in policy
+    assert "optional-extraction, advisory, and convert-to-result boundaries" in policy
+    assert "returns a sentinel or result on malformed input and never raises on it" in policy
     assert "MUST set ``non_raising=True``" in policy
     assert "MUST omit both ``test_ref`` and ``test_fingerprint``" in policy
     assert "mechanically verifies that malformed-input guards do not raise" in policy
@@ -244,6 +246,11 @@ def test_static_policy_rejects_missing_or_contradictory_decorator_metadata() -> 
     assert "A non-raising form carrying either test field is INVALID" in policy
     assert "``non_raising=True`` on code whose malformed-input path raises is INVALID" in policy
     assert "Do not emit a decorator recommendation with missing or contradictory metadata" in policy
+    assert "identify which metadata contract applies and enumerate its required and forbidden fields" in policy
+    assert "Never invent ``test_ref`` or ``test_fingerprint`` values" in policy
+    assert "Do not emit decorator code" in policy
+    assert "give that complete form" not in policy
+    assert "rationale describes a code-fix task" not in policy
 
 
 def test_static_policy_pins_explicit_tier1_synthesis_and_serialization_doctrine() -> None:

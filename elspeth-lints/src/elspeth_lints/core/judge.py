@@ -579,42 +579,33 @@ decorator, not an allowlist entry. Emit:
 * ``should_use_decorator``: the parameter name (e.g. ``"arguments"``)
   that the agent should pass as the decorator's ``source_param``;
 * ``rationale``: explain that this finding is a structural Tier-3
-  boundary case, identify which one of the two valid metadata contracts
-  below matches the visible behavior, give that complete form, and call
-  for deletion of any related allowlist entries.
+  boundary case, identify which metadata contract applies and enumerate
+  its required and forbidden fields, and call for deletion of any related
+  allowlist entries. Do not emit decorator code or propose a concrete code
+  fix. The structured nudge identifies the applicable contract; the agent
+  remains responsible for implementation and evidence.
 
 There are exactly two valid decorator metadata contracts:
 
 1. Raising boundary metadata (the function rejects malformed input by raising)
-   MUST include both ``test_ref=<pytest nodeid>`` and
-   ``test_fingerprint=<canonical AST fingerprint>`` and MUST omit
+   requires ``tier=3``, ``source``, ``source_param``, ``suppresses``, an
+   invariant naming the raised exception and malformed-input guarantee,
+   and MUST include both ``test_ref=<pytest nodeid>`` and
+   ``test_fingerprint=<canonical AST fingerprint>``. It MUST omit
    ``non_raising=True``. The nodeid must resolve to a current behavioral
    test that exercises the malformed-input rejection, and the fingerprint
-   must bind that current test body:
+   must bind that current test body. Never invent ``test_ref`` or
+   ``test_fingerprint`` values; enumerate them as required evidence and
+   leave their acquisition to the implementing agent.
 
-       @trust_boundary(
-           tier=3,
-           source=<one-line description of the external source>,
-           source_param=<the parameter name>,
-           suppresses=(<the rule_id>,),
-           invariant=<raised exception and malformed-input guarantee>,
-           test_ref=<pytest nodeid>,
-           test_fingerprint=<canonical AST fingerprint>,
-       )
-
-2. Non-raising boundary metadata (a genuinely mechanical classifier)
-   MUST set ``non_raising=True`` and MUST omit both ``test_ref`` and
+2. Non-raising boundary metadata covers genuinely non-raising
+   optional-extraction, advisory, and convert-to-result boundaries. Such
+   a boundary returns a sentinel or result on malformed input and never
+   raises on it. It requires ``tier=3``, ``source``, ``source_param``,
+   ``suppresses``, an invariant naming the sentinel/result behavior, and
+   MUST set ``non_raising=True``. It MUST omit both ``test_ref`` and
    ``test_fingerprint``. This form is valid only when the companion gate
-   mechanically verifies that malformed-input guards do not raise:
-
-       @trust_boundary(
-           tier=3,
-           source=<one-line description of the external source>,
-           source_param=<the parameter name>,
-           suppresses=(<the rule_id>,),
-           invariant=<sentinel/result behavior on malformed input>,
-           non_raising=True,
-       )
+   mechanically verifies that malformed-input guards do not raise.
 
 A raising form missing either test field is INVALID. A non-raising form
 carrying either test field is INVALID. ``non_raising=True`` on code whose
@@ -659,8 +650,10 @@ Example A — should suggest the decorator (BLOCKED + should_use_decorator):
   Verdict: ``BLOCKED``. Reason: all three conditions met (function
   takes external ``arguments``; R1 is in the suppressible set; the
   reported subject is rooted at ``arguments``). Emit
-  ``should_use_decorator: "arguments"`` and recommend the decorator
-  in the rationale.
+  ``should_use_decorator: "arguments"``. The rationale identifies the
+  raising metadata contract and enumerates its required and forbidden
+  fields; it does not generate decorator code or guess the behavioral
+  test's nodeid/fingerprint.
 
 Example B — regular ACCEPT inside an already-decorated function:
 
@@ -688,9 +681,9 @@ Example C — regular BLOCK (rationale shallow, no decorator help):
 
   Verdict: ``BLOCKED``. The decorator would not help (no external
   parameter; ``self._cache`` is not Tier-3 data). Emit
-  ``should_use_decorator: null``; the rationale describes a code-fix
-  task (use direct attribute access; let it KeyError if the cache
-  invariant is broken), not a legitimate suppression.
+  ``should_use_decorator: null``; the rationale identifies a
+  fixed-contract defensive-access violation and leaves the concrete
+  remediation to the agent.
 
 ================================================================
 Output schema

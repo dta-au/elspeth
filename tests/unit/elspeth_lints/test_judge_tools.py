@@ -459,7 +459,7 @@ def test_tool_mode_builds_streaming_hook_guarded_options(monkeypatch: pytest.Mon
 
 
 def test_static_policy_hash_is_pinned() -> None:
-    assert JUDGE_POLICY_HASH == "sha256:6dece6fccd4bad1c42c1130c44b976704c7502cb4ee9dc6ec1fffaf247d0afdd"
+    assert JUDGE_POLICY_HASH == "sha256:9596c10b1b731a89f37ec4cd2bcc4c3ce6e19f6c66cf9568dc74683536df522b"
 
 
 def test_tool_mode_turn_budget_exhaustion_is_classified(monkeypatch: pytest.MonkeyPatch, scope: AgentToolScope) -> None:
