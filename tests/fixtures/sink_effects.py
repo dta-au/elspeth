@@ -40,6 +40,7 @@ class DuplicateObservableSink:
     effect_call_type = CallType.FILESYSTEM
     declared_required_fields = frozenset()
     _on_write_failure = None
+    effect_mode_remediation: str | None = None
 
     class input_schema:
         @classmethod

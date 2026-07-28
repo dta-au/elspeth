@@ -39,6 +39,7 @@ from elspeth.engine.orchestrator.preflight import (
     require_sink_effect_admission,
     validate_pipeline_sink_effect_capabilities,
     validate_sink_effect_capability,
+    validate_sink_effect_type_capability,
 )
 
 
@@ -62,6 +63,7 @@ class EffectCapableSink(LegacyObservableSink):
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     supported_effect_modes = frozenset({"write", "append", "overwrite", "conditional_put", "etag_guarded_upload"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS, SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT})
+    effect_mode_remediation: str | None = None
 
     def __init__(self) -> None:
         super().__init__()
@@ -252,6 +254,37 @@ def test_preflight_fails_closed_on_inexact_declarations(
 
     assert sink.on_start_calls == 0
     assert sink.write_calls == 0
+
+
+@pytest.mark.parametrize("remediation", ["", "  ", 7])
+@pytest.mark.parametrize("validate_type", [False, True], ids=["instance", "type"])
+def test_preflight_rejects_malformed_effect_mode_remediation(
+    remediation: object,
+    *,
+    validate_type: bool,
+) -> None:
+    sink_type = type(
+        "MalformedRemediationSink",
+        (EffectCapableSink,),
+        {
+            "supported_effect_modes": frozenset({"append"}),
+            "effect_mode_remediation": remediation,
+        },
+    )
+
+    with pytest.raises(SinkEffectCapabilityError, match="effect_mode_remediation"):
+        if validate_type:
+            validate_sink_effect_type_capability(
+                sink_type,
+                mode="write",
+                required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+            )
+        else:
+            validate_sink_effect_capability(
+                sink_type(),
+                mode="write",
+                required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+            )
 
 
 def test_preflight_requires_class_level_protocol_opt_in() -> None:

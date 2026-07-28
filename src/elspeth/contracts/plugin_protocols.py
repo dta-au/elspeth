@@ -887,6 +887,7 @@ class SinkEffectProtocol(SinkProtocol, Protocol):
     effect_call_type: ClassVar[CallType]
     supported_effect_modes: ClassVar[frozenset[str]]
     supported_effect_input_kinds: ClassVar[frozenset["SinkEffectInputKind"]]
+    effect_mode_remediation: ClassVar[str | None]
 
     def inspect_effect(
         self,

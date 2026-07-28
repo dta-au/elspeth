@@ -172,6 +172,7 @@ class _TestSinkBase:
     effect_call_type = CallType.FILESYSTEM
     supported_effect_modes = frozenset({"write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
+    effect_mode_remediation: str | None = None
 
     def __init__(self) -> None:
         self.config: dict[str, Any] = {"schema": {"mode": "observed"}}

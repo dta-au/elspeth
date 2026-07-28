@@ -62,7 +62,7 @@ from elspeth.engine.orchestrator.validation import (
 from elspeth.engine.orchestrator.value_source_validation import ValueSourceFinding, ValueSourceValidationError
 
 if TYPE_CHECKING:
-    from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+    from elspeth.contracts import SinkEffectProtocol, SinkProtocol, SourceProtocol, TransformProtocol
     from elspeth.core.config import AggregationSettings, ElspethSettings
     from elspeth.core.dag.graph import ExecutionGraph
     from elspeth.core.dag.wiring import WiredTransform
@@ -70,6 +70,16 @@ if TYPE_CHECKING:
 
 _SINK_EFFECT_METHODS = ("inspect_effect", "prepare_effect", "commit_effect", "reconcile_effect")
 _MEMBER_SINK_EFFECT_METHODS = ("commit_member_effect", "reconcile_member_effect")
+
+
+def _effect_mode_guidance(sink_type: type[object]) -> str:
+    """Read the required BaseSink remediation declaration without probing."""
+    remediation = cast("type[SinkEffectProtocol]", sink_type).effect_mode_remediation
+    if remediation is None:
+        return ""
+    if type(remediation) is not str or not remediation.strip():
+        raise SinkEffectCapabilityError("Sink effect_mode_remediation must be None or a non-empty exact string")
+    return f"; remediation: {remediation}"
 
 
 @final
@@ -144,8 +154,7 @@ def validate_sink_effect_capability(
     if not isinstance(mode, str) or not mode.strip():
         raise SinkEffectCapabilityError(f"Sink {sink_name!r} requires a non-empty configured effect mode")
     if mode not in supported_modes:
-        remediation = inspect.getattr_static(sink_type, "effect_mode_remediation", None)
-        guidance = f"; remediation: {remediation}" if isinstance(remediation, str) and remediation.strip() else ""
+        guidance = _effect_mode_guidance(sink_type)
         raise SinkEffectCapabilityError(
             f"Sink {sink_name!r} does not support configured effect mode {mode!r}; declared modes: {sorted(supported_modes)!r}{guidance}"
         )
@@ -201,8 +210,7 @@ def validate_sink_effect_type_capability(
     if not isinstance(mode, str) or not mode.strip():
         raise SinkEffectCapabilityError(f"Sink {sink_name!r} requires a non-empty configured effect mode")
     if mode not in supported_modes:
-        remediation = inspect.getattr_static(sink_type, "effect_mode_remediation", None)
-        guidance = f"; remediation: {remediation}" if isinstance(remediation, str) and remediation.strip() else ""
+        guidance = _effect_mode_guidance(sink_type)
         raise SinkEffectCapabilityError(
             f"Sink {sink_name!r} does not support configured effect mode {mode!r}; declared modes: {sorted(supported_modes)!r}{guidance}"
         )
@@ -298,7 +306,7 @@ def _capability_fingerprint(sink: object) -> tuple[object, ...]:
         inspect.getattr_static(sink_type, "effect_protocol_version", None),
         inspect.getattr_static(sink_type, "supported_effect_modes", None),
         inspect.getattr_static(sink_type, "supported_effect_input_kinds", None),
-        inspect.getattr_static(sink_type, "effect_mode_remediation", None),
+        cast("type[SinkEffectProtocol]", sink_type).effect_mode_remediation,
         inspect.getattr_static(sink_type, "supports_member_effects", False),
         *(inspect.getattr_static(sink, method_name, None) for method_name in _SINK_EFFECT_METHODS),
         *(inspect.getattr_static(sink, method_name, None) for method_name in _MEMBER_SINK_EFFECT_METHODS),

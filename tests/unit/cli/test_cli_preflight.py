@@ -51,6 +51,7 @@ class _EffectCapableSink:
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     supported_effect_modes = frozenset({"write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
+    effect_mode_remediation: str | None = None
 
     @classmethod
     def _resolve_sink_effect_mode(cls, _options: object, *, purpose: object) -> object:

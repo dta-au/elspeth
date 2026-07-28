@@ -90,6 +90,7 @@ class _SinkDouble:
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     supported_effect_modes = frozenset({"write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT})
+    effect_mode_remediation: str | None = None
     supported_audit_export_formats = frozenset({AuditExportFormat.JSON, AuditExportFormat.CSV})
 
     @classmethod
