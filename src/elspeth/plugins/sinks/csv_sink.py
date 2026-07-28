@@ -145,7 +145,7 @@ class CSVSink(BaseSink):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a67f1d6397cb04ee"
+    source_file_hash: str | None = "sha256:146615184e08fe4e"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
