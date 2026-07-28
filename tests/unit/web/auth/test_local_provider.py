@@ -412,6 +412,100 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert len(token.split(".")) == 3
         assert _audit_intents(provider) == []
 
+    def test_reclaimed_active_registration_cannot_return_token(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A stale-intent sweep must fence a callback that later completes."""
+        now = [1_000_000]
+        monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+
+        def record_required_audit(_token: str) -> None:
+            audit_entered.set()
+            assert release_audit.wait(timeout=2)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                provider.register_open_user_with_audit,
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=record_required_audit,
+            )
+            assert audit_entered.wait(timeout=2)
+            now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
+            restarted = LocalAuthProvider(
+                db_path=provider._db_path,
+                secret_key="test-secret-key-for-unit-tests",
+            )
+            replacement_token = restarted.register_open_user_with_audit(
+                "alice",
+                "replacement456",
+                "Replacement Alice",
+                None,
+                record_token_issued=lambda _token: None,
+            )
+            release_audit.set()
+
+            with pytest.raises(AuditIntegrityError):
+                future.result(timeout=2)
+
+        with pytest.raises(AuthenticationError, match="Invalid credentials"):
+            provider._login_sync("alice", "password123")
+        assert len(replacement_token.split(".")) == 3
+        assert len(restarted._login_sync("alice", "replacement456").split(".")) == 3
+
+    def test_reclaimed_active_verification_cannot_return_token(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A reclaimed verification cannot publish a usable access token."""
+        now = [1_000_000]
+        monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
+        provider.create_user(
+            "alice",
+            "password123",
+            display_name="Alice",
+            email="alice@example.com",
+            email_verified=False,
+        )
+        verification_token = provider.create_email_verification_token("alice")
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+
+        def record_required_audit(_identity: UserIdentity, _access_token: str) -> None:
+            audit_entered.set()
+            assert release_audit.wait(timeout=2)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                provider.verify_email_and_issue_token,
+                verification_token,
+                record_token_issued=record_required_audit,
+            )
+            assert audit_entered.wait(timeout=2)
+            now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
+            restarted = LocalAuthProvider(
+                db_path=provider._db_path,
+                secret_key="test-secret-key-for-unit-tests",
+            )
+            retry_token = restarted.verify_email_and_issue_token(
+                verification_token,
+                record_token_issued=lambda _identity, _access_token: None,
+            )
+            release_audit.set()
+
+            with pytest.raises(AuditIntegrityError):
+                future.result(timeout=2)
+
+        assert len(retry_token.split(".")) == 3
+        assert len(restarted._login_sync("alice", "password123").split(".")) == 3
+
     def test_startup_reclaims_crashed_registration_audit_intent(self, provider) -> None:
         """Crash between commit and delivery: startup quarantines the account."""
         provider.create_user("alice", "password123", display_name="Alice")

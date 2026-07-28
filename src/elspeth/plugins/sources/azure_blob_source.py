@@ -15,6 +15,7 @@ import itertools
 import json
 import time
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
 import structlog
@@ -57,6 +58,11 @@ def _azure_provider_exception_types() -> tuple[type[Exception], ...]:
     from azure.core.exceptions import AzureError
 
     return (AzureError, ConnectionError, TimeoutError)
+
+
+@dataclass(frozen=True, slots=True)
+class _AzureBlobDownloadFailure:
+    provider_error_type: str
 
 
 # Sentinel distinguishing "iterator exhausted" from a real CSV row when peeking
@@ -368,7 +374,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8b4aa2a1ff232168"
+    source_file_hash: str | None = "sha256:cd59e1e54f759177"
     config_model = AzureBlobSourceConfig
 
     @classmethod
@@ -464,6 +470,15 @@ class AzureBlobSource(BaseSource):
 
         return self._blob_client
 
+    def _download_blob_payload(self) -> object | _AzureBlobDownloadFailure:
+        """Return the provider payload or a sanitized, explicit failure."""
+        try:
+            return self._get_blob_client().download_blob().readall()
+        except ImportError:
+            raise
+        except _azure_provider_exception_types() as error:
+            return _AzureBlobDownloadFailure(provider_error_type=type(error).__name__)
+
     def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
         """Load rows from Azure Blob Storage.
 
@@ -487,17 +502,9 @@ class AzureBlobSource(BaseSource):
         # EXTERNAL SYSTEM: Azure Blob SDK calls - wrap with try/except
         # Record call for audit trail (ctx.operation_id is set by orchestrator)
         start_time = time.perf_counter()
-        provider_error_type: str | None = None
-        try:
-            blob_client = self._get_blob_client()
-            blob_data = blob_client.download_blob().readall()
-        except ImportError:
-            raise
-        except _azure_provider_exception_types() as error:
-            provider_error_type = type(error).__name__
-
+        download_result = self._download_blob_payload()
         latency_ms = (time.perf_counter() - start_time) * 1000
-        if provider_error_type is not None:
+        if isinstance(download_result, _AzureBlobDownloadFailure):
             ctx.record_call(
                 call_type=CallType.HTTP,
                 status=CallStatus.ERROR,
@@ -506,12 +513,13 @@ class AzureBlobSource(BaseSource):
                     "container": self._container,
                     "blob_path": self._blob_path,
                 },
-                error={"type": provider_error_type},
+                error={"type": download_result.provider_error_type},
                 latency_ms=latency_ms,
                 provider="azure_blob_storage",
             )
             raise RuntimeError(f"Failed to download blob {self._blob_path!r} from container {self._container!r}.") from None
 
+        blob_data = download_result
         if type(blob_data) is not bytes:
             raise TypeError("Azure BlobClient.download_blob().readall() must return exact bytes")
 

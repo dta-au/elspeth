@@ -309,6 +309,16 @@ def test_collector_honors_ddl_if_dialect_filtering() -> None:
     assert _sqlite_issues(expected, actual) == ()
 
 
+def test_collector_honors_tuple_valued_ddl_if_dialect_filtering() -> None:
+    expected = _demo_metadata()
+    table = expected.tables["demo"]
+    dialects = ("postgresql", "mysql")
+    table.append_constraint(CheckConstraint("length(label) < 65", name="ck_demo_tuple_dialects").ddl_if(dialect=dialects))
+    Index("ix_demo_tuple_dialects", table.c.parent_id).ddl_if(dialect=dialects)
+
+    assert _sqlite_issues(expected, _demo_metadata()) == ()
+
+
 def test_fresh_full_session_schema_has_no_shape_issues() -> None:
     engine = create_session_engine("sqlite:///:memory:")
     session_metadata.create_all(engine)

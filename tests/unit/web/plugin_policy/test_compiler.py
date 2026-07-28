@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 
@@ -176,13 +176,21 @@ def test_allowlisted_bedrock_shield_without_profile_rejects_old_optional_sdk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     real_import = importlib.import_module
+    real_version = importlib.metadata.version
 
     def old_sdk(name: str, package: str | None = None) -> object:
         if name in {"boto3", "botocore"}:
-            return SimpleNamespace(__version__="1.39.99")
+            return object()
         return real_import(name, package)
 
     monkeypatch.setattr(importlib, "import_module", old_sdk)
+
+    def old_sdk_version(distribution_name: str) -> str:
+        if distribution_name in {"boto3", "botocore"}:
+            return "1.39.99"
+        return real_version(distribution_name)
+
+    monkeypatch.setattr(importlib.metadata, "version", old_sdk_version)
     runtime = RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("transform:aws_bedrock_prompt_shield",)))
 
     with pytest.raises(ValueError, match=r"^web plugin policy invalid: plugin_unavailable$"):

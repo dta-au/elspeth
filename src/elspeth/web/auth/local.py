@@ -435,7 +435,12 @@ class LocalAuthProvider:
             raise audit_error
         try:
             with self._connect(immediate=True) as conn:
-                conn.execute("DELETE FROM token_audit_intents WHERE intent_id = ?", (intent_id,))
+                delivery_owned = self._clear_token_audit_intent(
+                    conn,
+                    intent_id=intent_id,
+                    user_id=user_id,
+                    issuance_path="register",
+                )
         except BaseException as mark_error:
             try:
                 self._compensate_open_registration(user_id)
@@ -449,6 +454,11 @@ class LocalAuthProvider:
                 "cleared; the account was removed so the reclaim sweep cannot later quarantine an "
                 "audited account"
             ) from mark_error
+        if not delivery_owned:
+            # A reclaim sweep already resolved this issuance generation. Do
+            # not compensate by user_id: that could delete a later account
+            # created after the sweep released this identifier.
+            raise AuditIntegrityError("Token audit intent ownership was lost before delivery completion")
         return access_token
 
     def _compensate_open_registration(self, user_id: str) -> None:
@@ -464,6 +474,24 @@ class LocalAuthProvider:
         conn.execute("DELETE FROM email_verification_tokens WHERE user_id = ?", (user_id,))
         cursor = conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
         return cursor.rowcount > 0
+
+    @staticmethod
+    def _clear_token_audit_intent(
+        conn: sqlite3.Connection,
+        *,
+        intent_id: str,
+        user_id: str,
+        issuance_path: str,
+    ) -> bool:
+        """Return whether delivery consumed the exact intent it owns."""
+        cleared = conn.execute(
+            """
+            DELETE FROM token_audit_intents
+            WHERE intent_id = ? AND user_id = ? AND issuance_path = ?
+            """,
+            (intent_id, user_id, issuance_path),
+        )
+        return cleared.rowcount == 1
 
     def delete_user(self, user_id: str) -> bool:
         """Delete a local auth user and any pending verification tokens."""
@@ -840,7 +868,12 @@ class LocalAuthProvider:
             raise audit_error
         try:
             with self._connect(immediate=True) as conn:
-                conn.execute("DELETE FROM token_audit_intents WHERE intent_id = ?", (intent_id,))
+                delivery_owned = self._clear_token_audit_intent(
+                    conn,
+                    intent_id=intent_id,
+                    user_id=user_id,
+                    issuance_path="email_verification",
+                )
         except BaseException as mark_error:
             self._restore_retryable_verification_or_raise(
                 user_id,
@@ -852,6 +885,10 @@ class LocalAuthProvider:
                 "Email verification was audited but its audit intent could not be cleared; "
                 "the verification was restored for an audited retry"
             ) from mark_error
+        if not delivery_owned:
+            # The sweep that removed this exact intent already restored its
+            # auth state. A second compensation could clobber a later retry.
+            raise AuditIntegrityError("Token audit intent ownership was lost before delivery completion")
         return access_token
 
     async def login(self, username: str, password: str) -> str:

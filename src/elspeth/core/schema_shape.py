@@ -1499,8 +1499,12 @@ def _ddl_object_applies_to_dialect(obj: Constraint | Index, dialect: Dialect) ->
     ddl_if = obj._ddl_if
     if ddl_if is None:
         return True
-    target = ddl_if.dialect
+    # SQLAlchemy's runtime contract accepts tuple/list/set despite the narrower
+    # ``str | None`` annotation on DDLIf.dialect.
+    target: object = ddl_if.dialect
     if isinstance(target, str) and target != dialect.name:
+        return False
+    if isinstance(target, (tuple, list, set)) and dialect.name not in target:
         return False
     if ddl_if.callable_ is None:
         return True
