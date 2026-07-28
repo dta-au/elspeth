@@ -155,26 +155,23 @@ reasonable to let both authoring surfaces feed the same executor.
 
 ## What Changed In 0.7.2
 
-0.7.2 hardens the production paths introduced in 0.7.1, with emphasis on
-bounded trust boundaries and recovery after a worker loses ownership or a
-filesystem operation fails after commit.
+0.7.2 hardens the production paths introduced in 0.7.1 across deployment,
+Composer authoring, trust boundaries, and committed blob cleanup.
 
-- **Committed blob deletion is recoverable.** The session store retains the
-  exact staged tombstone until unlink and parent-directory fsync complete, so a
-  restart can resume direct or failed-fork cleanup without retaining
-  unaccounted bytes.
-- **Composer evidence remains request-bound.** Provider and prompt identity,
-  failed-turn audit evidence, source selection, and fork retention survive
-  durable retry without allowing stale or untrusted model data to replace the
-  current session state.
-- **Multi-worker recovery is more defensive.** Sink-effect preparation and
-  fork copying renew leases during I/O, stale workers are fenced after
-  ownership loss, and leadership release plus transition responses commit
-  atomically.
-- **AWS and PostgreSQL defaults are production-aligned.** Bedrock uses the AWS
-  default credential chain, both supported PostgreSQL URL driver forms work in
-  packaged images, X-Ray identifiers use the compatible format, and acceptance
-  manifests bind their final evidence.
+- **Deployment artifacts are production-shaped.** The release adds maintained
+  Docker Compose/PostgreSQL and native Linux systemd bundles, retains the AWS
+  ECS acceptance controller, and packages the Web Composer in a pinned,
+  non-root container image. Azure Container Apps remains deferred until the web
+  runtime can fence work across instances.
+- **Committed blob deletion is recoverable.** Durable cleanup state remains
+  until both the staged unlink and parent-directory fsync succeed, so restart
+  recovery does not retain unaccounted files.
+- **Composer validation stays bound to current state.** Runtime preflight is
+  keyed to the composition content that produced it instead of reusing a stale
+  result for different unsaved state.
+- **Trust boundaries fail closed.** Deployment admission rejects unsafe state
+  roots, weak uniform JWT secrets, and unauthenticated PostgreSQL transport for
+  ECS; provider and tool data remain bounded and redacted.
 
 **Operational:** 0.7.2 is a pre-1.0 session-store cutover. The session store moves
 from epoch 35 to 36; guided schema remains at 10, and Landscape remains at epoch 29.
@@ -523,6 +520,10 @@ Current 0.7.2 behaviour:
 - A run can be driven by a single process or by a leader plus claim-only
   followers across multiple processes on one host (`elspeth join`), backed by
   one WAL SQLite audit database.
+- Maintained web deployment profiles run one process or replica. Cross-instance
+  web coordination remains deferred; production Compose, AWS ECS, Azure VM, and
+  Kubernetes BYO deployments use external PostgreSQL where the deployment
+  contract requires it.
 
 Planned direction (design intentions, not release commitments):
 
@@ -867,16 +868,16 @@ have confirmed exists in the registry; do not derive a tag from the package
 version or assume an unverified release tag was published.
 
 The image contains PostgreSQL clients, not a PostgreSQL server or the `psql`
-command. These clients are the psycopg v3 and psycopg2 Python drivers, and the
-image supports both
-`postgresql+psycopg://` and `postgresql+psycopg2://` URLs. The final runtime is
-a pinned, non-root distroless image with no package manager; add runtime
-capabilities through locked Python extras or a reviewed derived image, not by
-installing packages in a running container. The shipped Compose bundle is the
-only maintained bundle that provisions PostgreSQL; AWS and the maintained
-Azure Ubuntu VM path use external PostgreSQL in production. Run one web
-process and preserve payload persistence separately from database persistence.
-See the
+command. These clients are the psycopg v3 and psycopg2 Python drivers. With the
+locked SQLAlchemy 2.0 line, `postgresql+psycopg://` selects psycopg 3 and a bare
+`postgresql://` URL selects psycopg2; explicit
+`postgresql+psycopg2://` URLs remain supported. The final runtime is a pinned,
+non-root distroless image with no package manager; add runtime capabilities
+through locked Python extras or a reviewed derived image, not by installing
+packages in a running container. The shipped Compose bundle is the only
+maintained bundle that provisions PostgreSQL; AWS and the maintained Azure
+Ubuntu VM path use external PostgreSQL in production. Run one web process and
+preserve payload persistence separately from database persistence. See the
 [deployment platform matrix](docs/reference/deployment-platforms.md) for the
 maintained Compose, AWS ECS, and native Linux paths plus the explicit Azure VM
 and Kubernetes boundaries. The AWS procedure validates operator-supplied

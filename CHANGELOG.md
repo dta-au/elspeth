@@ -8,46 +8,17 @@ All notable changes to ELSPETH are documented here.
 
 ### Deployment
 
-- **Release containers are minimal and scan-clean** — the final runtime now
-  uses a pinned non-root distroless Python image, keeps OS build packages and
-  package managers out of the release layer, preserves the BusyBox shell
-  compatibility required by the shipped Compose/ECS launch wrappers, and
-  normalizes generated frontend assets so the runtime identity can read them.
-  The locked frontend dependency tree audits clean, and the AWS redeploy path
-  scans the platform manifest rather than mistaking an unscannable OCI parent
-  index for a clean image.
-- **Everyday AWS redeploy is separate from full acceptance provisioning** —
-  the existing-service runbook discovers the live ECR/ECS contract, publishes
-  an immutable digest, records the full release SHA and actual task-definition
-  revision, runs doctor before service mutation, and verifies the candidate
-  task, target, liveness, readiness, and telemetry identity. The exhaustive
-  two-scenario Terraform acceptance runbook remains a separate,
-  release-specific procedure.
-- **Honest cross-platform deployment contract** — the release publishes a
-  maintained three-file Docker Compose/PostgreSQL bundle, the existing AWS ECS
-  acceptance/deployment controller for operator-supplied task-definition ARNs,
-  and a portable native Linux systemd bundle. Azure support uses exactly one
-  Azure Ubuntu VM with the Linux stop-before-start procedure. Kubernetes
-  exposes the provider-neutral runtime contract for BYO manifests but ships no
-  maintained manifest bundle, and Azure Container Apps remains deferred
-  pending cross-instance fencing.
-- **PostgreSQL ownership is explicit** — release images contain psycopg and
-  psycopg2 clients, not a PostgreSQL server. Compose is the only shipped bundle
-  that provisions the server; AWS ECS, Azure VM production, and Kubernetes BYO
-  deployments use external PostgreSQL. Native Linux may instead retain SQLite
-  on one persistent host.
-- **State bootstrap and replacement are operator-gated** — external schemas
-  initialize through `elspeth doctor deployment --init-schema` (or the
-  compatible AWS command), web deployments remain one process or replica, and
-  operators preserve payloads separately from database state.
+Release-candidate documentation now states the cross-platform deployment contract:
+Docker Compose, AWS ECS, native Linux, one Azure Ubuntu VM, and Kubernetes BYO.
+AWS uses operator-supplied task-definition ARNs; Azure Container Apps remains
+deferred pending cross-instance fencing.
 
-## 0.7.2 - 2026-07-24 (Release hardening and recovery correctness)
+## 0.7.2 - Release candidate (Release hardening and recovery correctness)
 
 0.7.2 separates the production-path hardening completed after 0.7.1. It
-tightens Composer, authentication, multi-worker recovery, packaging, and AWS
-acceptance boundaries, and it makes committed blob deletion cleanup durable
-across process restarts. The notes below intentionally cover only release-level
-changes and critical correctness or security fixes.
+tightens deployment packaging, Composer correctness, authentication, and
+recovery after committed blob deletion. The notes below intentionally cover
+only major changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 session-schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
 to 36. Guided checkpoints remain at schema 10 and Landscape
@@ -60,16 +31,18 @@ and repair this release forward.
 
 ### Major changes
 
-- **AWS and PostgreSQL runtime paths align with production defaults** —
-  Composer can use Bedrock through the AWS default credential chain, packaging
-  supports both standard PostgreSQL URL driver forms, X-Ray trace identifiers
-  use the AWS-compatible shape, and acceptance control manifests bind their
-  final evidence before release decisions.
-- **Composer evidence is bound more tightly to the request that produced it** —
-  provider and prompt identity survive durable retries, failed and cancelled
-  turns retain their audit evidence, source reselection and fork retention stay
-  session-scoped, and finalization stops when bounded proof collection is
-  exhausted.
+- **Deployment and packaging have maintained production profiles** — the
+  release adds Docker Compose/PostgreSQL and native Linux systemd bundles,
+  retains the AWS ECS acceptance controller, and builds a pinned non-root image
+  with its Web Composer assets and selected dependency extras.
+- **AWS and PostgreSQL paths align with their production contracts** — Composer
+  can use Bedrock through the AWS default credential chain, the packaged
+  PostgreSQL extra supports both locked SQLAlchemy driver paths, and acceptance
+  evidence is bound before release decisions.
+- **Composer evidence and validation are current-state bound** — durable retries
+  retain provider, prompt, failure, source, and fork evidence, while runtime
+  preflight and approved tutorial execution are keyed to the composition that
+  produced them.
 
 ### Critical fixes
 
@@ -78,18 +51,14 @@ and repair this release forward.
   directory fsync both succeed, allowing direct and failed-fork cleanup to
   resume safely after a process restart.
 - **Untrusted model and provider data stays inside its trust boundary** —
-  bounded JSON ingress, CSV custody inspection, structural unknown-source
-  handling, protected-field propagation, and value-safe audit redaction prevent
-  provider errors, option keys, pipeline metadata, and tool payloads from
-  escaping through user-visible or durable evidence surfaces.
-- **Lease loss and concurrency settle without stale mutation** — sink-effect
-  preparation and fork copying renew their leases during I/O, leadership
-  release and transition responses commit atomically, and post-plugin work is
-  fenced after ownership loss.
-- **Authentication state fails closed** — local authentication databases must
-  pass secure file admission, OIDC client identities must match exactly, JWKS
-  staleness has an absolute cap, and state changes remain bound to their audit
-  writes.
+  bounded ingress, source custody, protected-field propagation, and audit
+  redaction keep provider, pipeline, and tool payloads out of unapproved
+  surfaces.
+- **Composer preflight cannot silently reuse stale meaning** — the runtime
+  preflight cache is keyed by composition content, including unsaved state.
+- **Authentication and deployment state fail closed** — local auth files,
+  external identity keys, token expiry, JWT secrets, deployment roots, and ECS
+  PostgreSQL transport must pass their admission checks before use.
 
 ## 0.7.1 - 2026-07-23 (Recoverable effects and Composer proposal-validation coverage)
 
