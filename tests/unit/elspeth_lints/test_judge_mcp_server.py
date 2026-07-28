@@ -358,6 +358,37 @@ def test_stage_scan_builds_bundle(tmp_path: Path) -> None:
     assert all(a.kind != "rotation" for a in bundle.actions)
 
 
+def test_stage_scan_does_not_stage_per_file_rule_covered_finding(tmp_path: Path) -> None:
+    """Production-covered findings must not become redundant judgments."""
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+
+    _write_source(root, "plugins/covered.py", "covered")
+    _write_source(root, "plugins/uncovered.py", "uncovered")
+    uncovered_key = _canonical_key(_live_finding(root, "plugins/uncovered.py"))
+    (allowlist_dir / "plugins.yaml").write_text(
+        "\n".join(
+            [
+                "per_file_rules:",
+                "- pattern: plugins/covered.py",
+                "  rules: [R1]",
+                "  reason: existing production suppression",
+                "  expires: '2030-01-01'",
+                "  max_hits: 1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ctx = _context(root, allowlist_dir, staged_dir)
+    bundle = _scan_and_read(ctx, "scan-per-file-covered")
+
+    new_keys = [action.key for action in bundle.actions if action.kind == "justify"]
+    assert new_keys == [uncovered_key]
+
+
 def test_stage_scan_fp_shifted_judge_gated_drift_does_not_raise_and_routes_to_drift_repair_only(
     tmp_path: Path,
 ) -> None:

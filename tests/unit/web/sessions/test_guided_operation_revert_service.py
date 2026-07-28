@@ -458,7 +458,16 @@ async def _prepare_accept_revert_race(
         ),
         result_payload={
             "success": True,
-            "content_hash": content_hash,
+            "validation": {
+                "is_valid": True,
+                "errors": [],
+                "warnings": [],
+                "suggestions": [],
+                "semantic_contracts": [],
+                "graph_repair_suggestions": [],
+            },
+            "affected_nodes": [],
+            "version": current.version + 1,
             "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
             "pipeline_content_hash": content_hash,
         },

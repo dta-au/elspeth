@@ -16,8 +16,15 @@ source ─(source_out)─> llm (30 req/min) ─┬─ results.json
 Start the ChaosLLM server:
 
 ```bash
+export ELSPETH_FINGERPRINT_KEY="$(
+  .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
+)"
 chaosllm serve --port 8199 --preset=realistic
 ```
+
+`ELSPETH_FINGERPRINT_KEY` protects the audit fingerprint of the fake inline
+token. It is not an OpenRouter credential: the configured endpoint is the
+local server at `127.0.0.1`, and no request leaves the machine.
 
 ## Running
 

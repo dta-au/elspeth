@@ -62,7 +62,7 @@ New in 0.6.0: examples that demonstrate concurrent in-process token scheduling
 |---------|---------------------|
 | [`concurrent_scheduler`](concurrent_scheduler/) | Count-6 two-source rendezvous — proves the scheduler holds multiple token lifecycles open at once (pure-data, self-verifying) |
 | [`multi_worker`](multi_worker/) | `elspeth join` — leader + follower(s) share one RUNNING run; asserts ≥2 workers shared the rows (ChaosLLM, self-verifying) |
-| [`multi_worker_showcase`](multi_worker_showcase/) | 4-worker swarm spectacle with live stats card — demonstrative only, no assertion (ChaosLLM) |
+| [`multi_worker_showcase`](multi_worker_showcase/) | 4-worker swarm with live stats and a shared-work assertion (ChaosLLM, self-verifying) |
 
 ### OpenRouter LLM (real API — requires `OPENROUTER_API_KEY`)
 
@@ -88,9 +88,14 @@ export OPENROUTER_API_KEY="your-key-from-openrouter.ai"
 | [`azure_keyvault_secrets`](azure_keyvault_secrets/) | Secret resolution from Azure Key Vault |
 | [`multi_query_assessment`](multi_query_assessment/) | Azure-backed multi-query assessment matrix |
 
-### ChaosLLM / ChaosWeb (local fault injection — no API keys needed)
+### ChaosLLM / ChaosWeb (local fault injection — no provider API keys needed)
 
-These examples use ELSPETH's built-in fault injection servers to test pipeline resilience without real API credentials.
+These examples use local fault injection servers to test pipeline resilience
+without real API credentials or OpenRouter traffic. The ChaosLLM settings still
+contain a fake `api_key` field required by the OpenAI-compatible client.
+Convenience launchers generate a process-scoped `ELSPETH_FINGERPRINT_KEY` so
+ELSPETH can safely fingerprint that field; manual commands must set one as
+shown in the individual READMEs.
 
 | Example | What It Demonstrates |
 |---------|---------------------|

@@ -32,20 +32,37 @@ ls examples/retention_purge/runs/payloads/
 # Dry run — see what would be deleted
 elspeth purge --dry-run \
   --database examples/retention_purge/runs/audit.db \
-  --payload-dir examples/retention_purge/runs/payloads
+  --payload-dir examples/retention_purge/runs/payloads \
+  --retention-days 7
 
-# Execute purge (payloads older than retention_days are deleted)
+# Execute purge after the configured retention period has elapsed
 elspeth purge --yes \
   --database examples/retention_purge/runs/audit.db \
   --payload-dir examples/retention_purge/runs/payloads \
-  --retention-days 0    # Use 0 for demo (deletes everything)
+  --retention-days 7
 ```
+
+The CLI requires a positive retention period. A freshly completed run is
+therefore ineligible for deletion; both commands report no expired payloads
+until the run is more than seven days old. The explicit flag matters when
+running from the repository root: `purge` only auto-loads a `settings.yaml` in
+the current directory and otherwise defaults to 90 days.
 
 ### Step 4: Verify audit trail survives
 
 ```bash
-# The audit trail still has full metadata — only blob content is gone
+# interactive TUI (a row/token selector is optional in interactive mode)
 elspeth explain --run latest --database examples/retention_purge/runs/audit.db
+
+# Non-interactive text output requires a row or token selector
+DB=examples/retention_purge/runs/audit.db
+ROW_ID="$(sqlite3 "$DB" \
+  'SELECT row_id FROM rows ORDER BY row_index LIMIT 1')"
+elspeth explain \
+  --run latest \
+  --row "$ROW_ID" \
+  --no-tui \
+  --database "$DB"
 ```
 
 ## Payload Store Configuration

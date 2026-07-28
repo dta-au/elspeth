@@ -23,7 +23,7 @@ case "$RUN_ID" in
 esac
 
 OUTCOME_COUNTS="$(sqlite3 "file:${DB}?mode=ro" \
-    "PRAGMA query_only=ON; SELECT COUNT(*), COALESCE(SUM(outcome='success'), 0), COALESCE(SUM(outcome='failure'), 0) FROM token_outcomes WHERE run_id='$RUN_ID' AND completed=1;")"
+    "PRAGMA query_only=ON; SELECT COUNT(*), COALESCE(SUM(outcome='success'), 0), COALESCE(SUM(outcome='failure'), 0) FROM token_outcomes WHERE run_id='$RUN_ID' AND completed=1 AND outcome IN ('success','failure');")"
 
 if [[ ! "$OUTCOME_COUNTS" =~ ^[0-9]+\|[0-9]+\|[0-9]+$ ]]; then
     echo "invalid outcome counts returned by sqlite3: $OUTCOME_COUNTS" >&2

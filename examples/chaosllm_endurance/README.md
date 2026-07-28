@@ -16,8 +16,15 @@ source ─(source_out)─> llm ─┬─(output)─> results.csv
 Start the ChaosLLM server:
 
 ```bash
+export ELSPETH_FINGERPRINT_KEY="$(
+  .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
+)"
 chaosllm serve --port 8199 --config examples/chaosllm_endurance/chaos_config.yaml
 ```
+
+This key protects the audit fingerprint of the fake inline ChaosLLM token; it
+is not a provider credential. The convenience script generates a
+process-scoped value automatically. Manual runs need the export above.
 
 ## Running
 

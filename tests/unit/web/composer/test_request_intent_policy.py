@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from time import perf_counter
 
 import pytest
@@ -21,6 +23,17 @@ _REGISTERED_RECIPE_PREAMBLE = (
     "produces one output row containing both branches side-by-side."
 )
 _REGISTERED_RECIPE_CSV = "Customer rows (CSV):\nname,description\nalice,this is a moderately long description\nbob,short note"
+_PARITY_FIXTURE_DIR = Path(__file__).resolve().parents[4] / "evals" / "composer-parity" / "fixtures"
+_COMPLETE_MULTI_CLAUSE_REQUESTS = (
+    pytest.param(
+        "Build a pipeline that reads customers.csv and writes results.jsonl.",
+        id="ordinary-source-and-sink-clauses",
+    ),
+    *(
+        pytest.param(json.loads(path.read_text(encoding="utf-8"))["intent"], id=f"parity-{path.stem}")
+        for path in sorted(_PARITY_FIXTURE_DIR.glob("*.json"))
+    ),
+)
 
 
 def _registered_recipe_request(*, envelope_insertion: str = "") -> str:
@@ -344,6 +357,36 @@ def test_user_request_requires_explicit_positive_mutation_intent(
     expected: PipelineMutationIntentDecision,
 ) -> None:
     assert classify_pipeline_mutation_intent(message) is expected
+
+
+@pytest.mark.parametrize("message", _COMPLETE_MULTI_CLAUSE_REQUESTS)
+def test_complete_multi_clause_pipeline_request_is_explicit(message: str) -> None:
+    assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.EXPLICIT_MUTATION
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Actually, do not.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel that.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. I changed my mind.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not build it.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. It should not be built.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. I do not want you to build it.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel the request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel my request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Forget the build.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Disregard that request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. I no longer want it.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. This is only an example, not a request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Instead, explain what it would do.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl?",
+        "If needed, build a pipeline that reads customers.csv and writes results.jsonl.",
+        "The operator said: build a pipeline that reads customers.csv and writes results.jsonl.",
+    ],
+)
+def test_multi_clause_pipeline_request_still_requires_positive_root_authority(message: str) -> None:
+    assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.AMBIGUOUS
 
 
 @pytest.mark.parametrize(

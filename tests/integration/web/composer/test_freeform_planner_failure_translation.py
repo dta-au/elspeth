@@ -19,6 +19,7 @@ disposition record, but the disposition record is a separate row.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +58,17 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient
 _PROVIDER_LEAK_SENTINEL = "PROVIDER-LEAK-SENTINEL-9f13c7"
 
 _EMPTY_INTENT = "Build a CSV to JSONL pipeline."
+_PARITY_FIXTURE_DIR = Path(__file__).resolve().parents[4] / "evals" / "composer-parity" / "fixtures"
+_COMPLETE_MULTI_CLAUSE_REQUESTS = (
+    pytest.param(
+        "Build a pipeline that reads customers.csv and writes results.jsonl.",
+        id="ordinary-source-and-sink-clauses",
+    ),
+    *(
+        pytest.param(json.loads(path.read_text(encoding="utf-8"))["intent"], id=f"parity-{path.stem}")
+        for path in sorted(_PARITY_FIXTURE_DIR.glob("*.json"))
+    ),
+)
 
 
 @dataclass
@@ -344,6 +356,15 @@ def _registered_recipe_request(*, envelope_insertion: str) -> str:
         "Build the pipeline. I changed my mind.",
         "Build the pipeline. On second thought, leave it.",
         "Build the pipeline. Actually, skip it.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. It should not be built.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. I do not want you to build it.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel the request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel my request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Forget the build.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Disregard that request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. I no longer want it.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. This is only an example, not a request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Instead, explain what it would do.",
         "Avoid then build the pipeline.",
         "Refrain, then build the pipeline.",
         "Document then build the pipeline.",
@@ -385,6 +406,31 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
     assert response.status_code == 200, response.text
     ordinary_loop.assert_awaited_once()
     assert asyncio.run(sessions.list_composition_proposals(UUID(session_id))) == []
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
+
+
+@pytest.mark.parametrize("message", _COMPLETE_MULTI_CLAUSE_REQUESTS)
+def test_complete_multi_clause_request_enters_empty_pipeline_planner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+) -> None:
+    client, engine, _sessions = _build_app(tmp_path, monkeypatch, _timeout_completion())
+    session_id = client.post("/api/sessions", json={"title": "multi-clause build"}).json()["id"]
+    composer = client.app.state.composer_service
+    ordinary_loop = AsyncMock(
+        spec=composer._compose_loop,
+        return_value=ComposerResult(message="ordinary conversational response", state=_empty_state()),
+    )
+    monkeypatch.setattr(composer, "_compose_loop", ordinary_loop)
+
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": message})
+
+    assert response.status_code == 504, response.text
+    ordinary_loop.assert_not_awaited()
+    assert response.json()["detail"]["failure_code"] == "provider_timeout"
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0

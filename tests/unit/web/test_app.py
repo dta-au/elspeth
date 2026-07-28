@@ -108,14 +108,16 @@ def _external_settings(tmp_path: Path, deployment_target: str, **overrides: obje
     for directory in (data_dir, data_dir / "blobs", payload_dir):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
-    session_db_url = "postgresql+psycopg://runtime@db/session"
-    landscape_url = "postgresql+psycopg://runtime@db/landscape"
     if deployment_target == "aws-ecs":
         # aws-ecs uniquely requires authenticated TLS pinned to the immutable
         # RDS trust root (deployment_contract._has_approved_aws_ecs_tls_query).
-        aws_tls_query = f"sslmode=verify-full&sslrootcert={aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_PATH}"
-        session_db_url = f"{session_db_url}?{aws_tls_query}"
-        landscape_url = f"{landscape_url}?{aws_tls_query}"
+        tls_query = f"sslmode=verify-full&sslrootcert={aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_PATH}"
+    else:
+        # Non-aws external targets still exercise authenticated TLS, but may
+        # trust the platform's certificate store.
+        tls_query = "sslmode=verify-full&sslrootcert=system"
+    session_db_url = f"postgresql+psycopg://runtime:session-secret@db/session?{tls_query}"
+    landscape_url = f"postgresql+psycopg://runtime:landscape-secret@db/landscape?{tls_query}"
     values: dict[str, object] = {
         "deployment_target": deployment_target,
         "deployment_state_mode": "external-postgresql",

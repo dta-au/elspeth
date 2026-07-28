@@ -484,6 +484,79 @@ class TestShippedExamples:
         assert "CHAOSLLM_ENDURANCE_ROWS=20" in readme
         assert "not gate dogfood" in agent_guide
 
+    def test_local_chaosllm_launchers_configure_secret_fingerprinting(self, example_pipeline_dir: Path) -> None:
+        """Local fake-key launchers work without relying on an ignored .env."""
+        fingerprint_env = example_pipeline_dir / "chaosllm_env.sh"
+        assert fingerprint_env.is_file()
+
+        clean_env = {key: value for key, value in os.environ.items() if key not in {"ELSPETH_FINGERPRINT_KEY", "ELSPETH_ALLOW_RAW_SECRETS"}}
+        generated = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; printf "%s|%s\\n" "${ELSPETH_FINGERPRINT_KEY:-}" "${ELSPETH_ALLOW_RAW_SECRETS:-}"',
+                "bash",
+                str(fingerprint_env),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=clean_env,
+        )
+        assert generated.returncode == 0, generated.stderr
+        generated_key, raw_secret_override = generated.stdout.strip().split("|", maxsplit=1)
+        assert generated_key
+        assert raw_secret_override == ""
+
+        operator_key = "operator-supplied-fingerprint-key"
+        preserved = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; printf "%s\\n" "$ELSPETH_FINGERPRINT_KEY"',
+                "bash",
+                str(fingerprint_env),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**clean_env, "ELSPETH_FINGERPRINT_KEY": operator_key},
+        )
+        assert preserved.returncode == 0, preserved.stderr
+        assert preserved.stdout.strip() == operator_key
+
+        for example_name in (
+            "chaosllm_sentiment",
+            "chaosllm_endurance",
+            "multi_worker",
+            "multi_worker_showcase",
+        ):
+            run_sh = (example_pipeline_dir / example_name / "run.sh").read_text()
+            assert 'source "$PROJECT_ROOT/examples/chaosllm_env.sh"' in run_sh
+
+        assert "ELSPETH_FINGERPRINT_KEY" in (example_pipeline_dir / "rate_limited_llm" / "README.md").read_text()
+        assert "ELSPETH_FINGERPRINT_KEY" in (example_pipeline_dir / "AGENTS.md").read_text()
+
+    def test_multi_worker_showcase_creates_shareable_child_work(self, example_pipeline_dir: Path) -> None:
+        """Showcase fan-out creates durable child items followers can claim."""
+        example_dir = example_pipeline_dir / "multi_worker_showcase"
+        settings: dict[str, Any] = yaml.safe_load((example_dir / "settings.yaml").read_text())
+
+        assert list(settings["sources"]) == ["primary"]
+        source = settings["sources"]["primary"]
+        assert source["plugin"] == "json"
+        assert source["on_success"] == "exploded"
+
+        explode = settings["transforms"][0]
+        assert explode["plugin"] == "json_explode"
+        assert explode["input"] == "exploded"
+        assert explode["on_success"] == "llm_input"
+        assert settings["transforms"][1]["input"] == "llm_input"
+
+        input_path = example_pipeline_dir.parent / source["options"]["path"]
+        input_rows = [json.loads(line) for line in input_path.read_text().splitlines() if line.strip()]
+        assert sum(len(row["items"]) for row in input_rows) == 200
+
     def test_multi_worker_showcase_stats_use_completed_terminal_outcomes(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
         """Showcase stats distinguish successful and failed terminal outcomes."""
         run_id = "run-under-test"
@@ -515,6 +588,7 @@ class TestShippedExamples:
                     [{"run_id": run_id, "outcome": "success", "completed": 1} for _ in range(192)]
                     + [{"run_id": run_id, "outcome": "failure", "completed": 1} for _ in range(8)]
                     + [
+                        {"run_id": run_id, "outcome": "expanded", "completed": 1},
                         {"run_id": run_id, "outcome": "failure", "completed": 0},
                         {"run_id": "other-run", "outcome": "failure", "completed": 1},
                     ],
@@ -585,6 +659,19 @@ class TestShippedExamples:
         assert '2>/dev/null || echo "0|0|0"' not in run_sh
         assert "Failed outcomes:" in run_sh
         assert "Quarantined:" not in run_sh
+        assert "CONTRIBUTING_WORKERS" in run_sh
+        assert "expected at least 2" in run_sh
+        assert "WORKER_FAILED" in run_sh
+
+    def test_retention_purge_readme_uses_current_cli_contract(self, example_pipeline_dir: Path) -> None:
+        """Retention instructions use positive ages and selector-aware explain."""
+        readme = (example_pipeline_dir / "retention_purge" / "README.md").read_text()
+
+        assert "--retention-days 0" not in readme
+        assert readme.count("--retention-days 7") >= 2
+        assert '--row "$ROW_ID"' in readme
+        assert "--no-tui" in readme
+        assert "interactive TUI" in readme
 
     def test_blob_transform_offline_launcher_runs_from_clean_copy(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
         """blob_transforms ships a self-contained offline launcher."""

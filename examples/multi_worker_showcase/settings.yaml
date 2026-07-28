@@ -1,34 +1,31 @@
 sources:
-  feed_a:
-    plugin: csv
-    on_success: source_out
+  primary:
+    plugin: json
+    on_success: exploded
     options:
-      path: examples/multi_worker_showcase/input/feed_a.csv
+      path: examples/multi_worker_showcase/input/input.jsonl
       schema:
         mode: fixed
         fields:
-        - 'id: int'
-        - 'text: str'
+        - 'batch_id: int'
+        - 'items: any'
       on_validation_failure: discard
-  feed_b:
-    plugin: csv
-    on_success: source_out
-    options:
-      path: examples/multi_worker_showcase/input/feed_b.csv
-      schema:
-        mode: fixed
-        fields:
-        - 'id: int'
-        - 'text: str'
-      on_validation_failure: discard
-
-queues:
-  source_out: {}
 
 transforms:
+- name: explode
+  plugin: json_explode
+  input: exploded
+  on_success: llm_input
+  on_error: quarantine
+  options:
+    array_field: items
+    output_field: text
+    include_index: true
+    schema:
+      mode: observed
 - name: llm_0
   plugin: llm
-  input: source_out
+  input: llm_input
   on_success: output
   on_error: quarantine
   options:
@@ -50,11 +47,8 @@ transforms:
       '
     temperature: 0.0
     response_field: sentiment_analysis
-    # required_input_fields is empty here because the DAG validator cannot see
-    # through a named queue's dynamic schema to the fixed CSV source declarations.
-    # The 'text' field is enforced structurally: both CSV sources declare
-    # 'text: str' in their fixed schema, so any row reaching the llm carries it.
-    required_input_fields: []
+    required_input_fields:
+    - text
     schema:
       mode: observed
 

@@ -16,8 +16,16 @@ source ─(source_out)─> llm ─┬─(output)─> results.json
 Start the ChaosLLM server:
 
 ```bash
+export ELSPETH_FINGERPRINT_KEY="$(
+  .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
+)"
 chaosllm serve --port 8199 --config examples/chaosllm_sentiment/chaos_config.yaml
 ```
+
+The key above is an audit-fingerprinting key, not a provider credential. The
+pipeline uses a fake inline token against `127.0.0.1`; no request goes to
+OpenRouter. The convenience script generates a process-scoped fingerprint key
+automatically when neither supported secret mode is already configured.
 
 ## Running
 
@@ -36,6 +44,6 @@ elspeth run --settings examples/chaosllm_sentiment/settings.yaml --execute
 
 ## Key Concepts
 
-- **ChaosLLM testing**: Uses `base_url: http://127.0.0.1:8199/v1` with a fake API key — no real API credentials needed
+- **ChaosLLM testing**: Uses `base_url: http://127.0.0.1:8199/v1` with a fake API key — no real API credentials or OpenRouter service needed
 - **Same pipeline, different backend**: Compare with [`openrouter_sentiment`](../openrouter_sentiment/) which uses the real API
 - **Retry under faults**: ChaosLLM injects rate limits, timeouts, and malformed responses to exercise retry logic

@@ -120,6 +120,45 @@ _COMPLETE_EXPLICIT_REQUEST_PATTERNS: Final = (
     _SINGLE_CLAUSE_POLITE_REQUEST_PATTERN,
     *_NARROW_COMPLETE_REQUEST_PATTERNS,
 )
+_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR: Final = (
+    rf"{_POSITIVE_LEAD_GRAMMAR}"
+    rf"(?:(?:{_FIRST_PERSON_REQUEST_GRAMMAR})|(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?))?"
+    rf"{_POSITIVE_LEAD_GRAMMAR}"
+)
+_MULTI_CLAUSE_PIPELINE_BUILD_PATTERN: Final = re.compile(
+    rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}"
+    r"(?:build|create|make)\s+(?:a|an|the|this)\s+"
+    r"(?:(?:requested|csv|jsonl?|parquet)\s+)?(?:pipeline|workflow|automation)\s+"
+    r"(?:that|which)\b.+",
+    re.IGNORECASE,
+)
+_MULTI_CLAUSE_PIPELINE_READ_PATTERN: Final = re.compile(
+    rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}read\s+.+?\b(?:csv|jsonl?|parquet)\b.+",
+    re.IGNORECASE,
+)
+_MULTI_CLAUSE_PIPELINE_OPERATION_PATTERN: Final = re.compile(
+    r"\b(?:aggregat|batch|coerc|collect|expand|fan|hand|interleav|merg|pass|process|rout|send|transform|wait|writ)\w*\b",
+    re.IGNORECASE,
+)
+_REQUEST_REVOCATION_PATTERN: Final = re.compile(
+    rf"(?:"
+    rf"\b(?:do\s+not|don't|never)\s+{_MUTATION_ACTION_PATTERN}\b|"
+    rf"\b(?:do\s+not|don't)\s+want\s+(?:you\s+)?to\s+{_MUTATION_ACTION_PATTERN}\b|"
+    r"\b(?:actually,\s*)?(?:do\s+not|don't)\s*(?:[.!;]|$)|"
+    r"\bshould\s+not\s+be\s+(?:built|created|made|run|executed)\b|"
+    r"\bcancel\s+(?:(?:that|this|the|my)\s+)?(?:request|build|pipeline)\b|"
+    r"\bforget\s+(?:(?:that|this|the|my)\s+)?(?:request|build|pipeline)\b|"
+    r"\bdisregard\s+(?:(?:that|this|the|my)\s+)?(?:request|build|pipeline)\b|"
+    r"\bi\s+no\s+longer\s+(?:want|need)\b|"
+    r"\bonly\s+an?\s+example\b|"
+    r"\binstead,\s+(?:please\s+)?(?:describe|explain|show|tell)\b|"
+    r"\b(?:never\s+mind|cancel\s+that|scratch\s+that|forget\s+it|undo\s+that|revert\s+that|"
+    r"belay\s+that|hold\s+off|ignore\s+that|withdraw\s+that\s+request|i\s+take\s+that\s+back|"
+    r"i\s+changed\s+my\s+mind|on\s+second\s+thought|skip\s+it|without\s+changing\s+anything)\b|"
+    r"\babort\b"
+    rf")",
+    re.IGNORECASE,
+)
 _QUOTE_TERMINATORS: Final = {
     '"': '"',
     "`": "`",
@@ -406,15 +445,28 @@ def _matches_complete_registered_recipe_request(message: str) -> bool:
     return all(len(row) == column_count for row in rows[1:])
 
 
+def _matches_complete_multi_clause_pipeline_request(message: str) -> bool:
+    """Recognize a positive pipeline root followed by a complete specification."""
+    if "?" in message or _REQUEST_REVOCATION_PATTERN.search(message) is not None:
+        return False
+    if _MULTI_CLAUSE_PIPELINE_BUILD_PATTERN.fullmatch(message) is not None:
+        return True
+    return (
+        _MULTI_CLAUSE_PIPELINE_READ_PATTERN.fullmatch(message) is not None
+        and _MULTI_CLAUSE_PIPELINE_OPERATION_PATTERN.search(message) is not None
+    )
+
+
 def classify_pipeline_mutation_intent(message: str) -> PipelineMutationIntentDecision:
     """Classify whether the user explicitly authorizes pipeline mutation.
 
     Authority requires the complete bounded request to match a closed positive
     production. Quoted material cannot be elided to manufacture authority;
     only a complete registered recipe envelope may contain its prescribed
-    quotes. Unmatched governing prefixes, trailing clauses, bare questions,
-    unrelated objects, and oversized input fail closed to clarification on
-    the conversational path.
+    quotes. Multi-clause productions require an authorizing pipeline-build or
+    data-source root and reject request revocation. Unmatched governing
+    prefixes, bare questions, unrelated objects, and oversized input fail
+    closed to clarification on the conversational path.
     """
     if len(message) > _MAX_INTENT_CLASSIFICATION_CHARS:
         return PipelineMutationIntentDecision.AMBIGUOUS
@@ -425,13 +477,14 @@ def classify_pipeline_mutation_intent(message: str) -> PipelineMutationIntentDec
     unquoted = " ".join(unquoted_text.split())
     if not unquoted:
         return PipelineMutationIntentDecision.CONVERSATIONAL
-    if _ANY_MUTATION_ACTION_PATTERN.search(unquoted) is None:
+    multi_clause_request = _matches_complete_multi_clause_pipeline_request(unquoted)
+    if _ANY_MUTATION_ACTION_PATTERN.search(unquoted) is None and not multi_clause_request:
         return PipelineMutationIntentDecision.CONVERSATIONAL
     if _matches_complete_registered_recipe_request(message):
         return PipelineMutationIntentDecision.EXPLICIT_MUTATION
     if quoted_material_seen:
         return PipelineMutationIntentDecision.AMBIGUOUS
-    if any(pattern.fullmatch(unquoted) is not None for pattern in _COMPLETE_EXPLICIT_REQUEST_PATTERNS):
+    if multi_clause_request or any(pattern.fullmatch(unquoted) is not None for pattern in _COMPLETE_EXPLICIT_REQUEST_PATTERNS):
         return PipelineMutationIntentDecision.EXPLICIT_MUTATION
     return PipelineMutationIntentDecision.AMBIGUOUS
 

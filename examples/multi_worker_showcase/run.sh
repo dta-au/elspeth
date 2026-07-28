@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# multi_worker_showcase — elspeth join: 4-worker swarm spectacle (demo only)
+# multi_worker_showcase — elspeth join: self-verifying 4-worker swarm
 #
 # Backgrounds a LEADER (elspeth run), polls the audit DB read-only until the
 # run is RUNNING with >=1 claimed work item, then launches WORKERS (default 3)
 # FOLLOWERS via `elspeth join <run_id>`. After all processes exit it renders an
-# ASCII stats card (workers spawned, total rows, rows/sec, succeeded/failed).
-# ADR-030 "One-Host WAL Pack".
-#
-# This is a DEMONSTRATIVE example — there is no PASS/FAIL assertion.
-# For the rigorous correctness proof see examples/multi_worker/.
+# ASCII stats card (workers spawned, total rows, rows/sec, succeeded/failed)
+# and fails unless at least two workers processed outcomes. ADR-030
+# "One-Host WAL Pack".
 #
 # Usage:   ./examples/multi_worker_showcase/run.sh           # leader + 3 followers (4-way)
 #          WORKERS=1 ./examples/multi_worker_showcase/run.sh  # smaller swarm for quick dev
@@ -19,6 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
+source "$PROJECT_ROOT/examples/chaosllm_env.sh"
 
 CHAOS_CONFIG="examples/multi_worker_showcase/chaos_config.yaml"
 PIPELINE_CONFIG="examples/multi_worker_showcase/settings.yaml"
@@ -28,6 +27,11 @@ CHAOS_PID=""
 LEADER_PID=""
 FOLLOWER_PIDS=()
 WORKERS="${WORKERS:-3}"
+
+if [[ ! "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: WORKERS must be a positive integer." >&2
+    exit 2
+fi
 
 START=$(date +%s)
 
@@ -58,7 +62,7 @@ rm -f examples/multi_worker_showcase/output/results.json \
       examples/multi_worker_showcase/output/quarantined.json
 mkdir -p examples/multi_worker_showcase/runs examples/multi_worker_showcase/output
 
-echo "=== multi_worker_showcase — 4-worker swarm (~200 rows, demonstrative) ==="
+echo "=== multi_worker_showcase — self-verifying 4-worker swarm (200 outcomes) ==="
 echo "    leader + $WORKERS follower(s) = $((WORKERS+1))-way pack"
 echo ""
 
@@ -107,8 +111,7 @@ for attempt in $(seq 1 60); do
     sleep 0.5
 done
 if [ -z "$RUN_ID" ]; then
-    echo "WARNING: leader never reached RUNNING within poll window — stats card may show 0 rows." >&2
-    # Do not exit 1 — this is demonstrative-only, no assertion
+    echo "ERROR: leader never reached RUNNING within the poll window." >&2
 fi
 
 # --- Launch FOLLOWERS (same --settings => identical config_hash; NO --execute) ---
@@ -134,12 +137,24 @@ echo ""
 echo "--- Leader finished ---"
 echo ""
 
-# --- Reap leader + followers ---
-wait "$LEADER_PID"; LEADER_EXIT=$?
+# --- Reap leader + followers; every non-zero child exit fails the showcase ---
+WORKER_FAILED=0
+if wait "$LEADER_PID"; then
+    LEADER_EXIT=0
+else
+    LEADER_EXIT=$?
+    WORKER_FAILED=1
+fi
 echo "Leader exited ($LEADER_EXIT)."
 if [ ${#FOLLOWER_PIDS[@]} -gt 0 ]; then
     for pid in "${FOLLOWER_PIDS[@]}"; do
-        wait "$pid" || echo "Follower $pid exited non-zero ($?) (see exit-code semantics in README)."
+        if wait "$pid"; then
+            echo "Follower $pid exited cleanly (0)."
+        else
+            follower_exit=$?
+            echo "Follower $pid exited non-zero ($follower_exit) (see exit-code semantics in README)." >&2
+            WORKER_FAILED=1
+        fi
     done
 fi
 
@@ -153,9 +168,12 @@ echo "╔═══════════════════════�
 echo "║        multi_worker_showcase — run complete          ║"
 echo "╚══════════════════════════════════════════════════════╝"
 
+CONTRIBUTING_WORKERS=0
 if [ -n "$RUN_ID" ]; then
     WORKERS_SPAWNED="$(sqlite3 "file:${DB}?mode=ro" \
         "PRAGMA query_only=ON; SELECT COUNT(*) FROM run_workers WHERE run_id='$RUN_ID';" 2>/dev/null || echo 0)"
+    CONTRIBUTING_WORKERS="$(sqlite3 "file:${DB}?mode=ro" \
+        "PRAGMA query_only=ON; SELECT COUNT(*) FROM (SELECT from_lease_owner FROM scheduler_events WHERE run_id='$RUN_ID' AND event_type IN ('mark_pending_sink','mark_failed') AND from_lease_owner IS NOT NULL GROUP BY from_lease_owner HAVING COUNT(*) >= 1);" 2>/dev/null || echo 0)"
     OUTCOME_COUNTS="$(bash "$SCRIPT_DIR/outcome_stats.sh" "$DB" "$RUN_ID")"
     IFS='|' read -r TOTAL_ROWS SUCCEEDED FAILED EXTRA_COUNT <<< "$OUTCOME_COUNTS"
     if [ -n "${EXTRA_COUNT:-}" ] \
@@ -165,10 +183,16 @@ if [ -n "$RUN_ID" ]; then
         echo "ERROR: invalid outcome counts: $OUTCOME_COUNTS" >&2
         exit 1
     fi
+    if [[ ! "$WORKERS_SPAWNED" =~ ^[0-9]+$ ]] \
+        || [[ ! "$CONTRIBUTING_WORKERS" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: invalid worker counts: spawned=$WORKERS_SPAWNED contributing=$CONTRIBUTING_WORKERS" >&2
+        exit 1
+    fi
     ROWS_PER_SEC=$((TOTAL_ROWS / ELAPSED))
 
     echo ""
     printf "  Workers spawned:   %s\n" "$WORKERS_SPAWNED"
+    printf "  Workers with work: %s\n" "$CONTRIBUTING_WORKERS"
     printf "  Total rows done:   %s\n" "$TOTAL_ROWS"
     printf "  Succeeded:         %s\n" "$SUCCEEDED"
     printf "  Failed outcomes:   %s\n" "$FAILED"
@@ -200,7 +224,15 @@ else
 fi
 
 echo ""
-echo "  (Demonstrative only — see examples/multi_worker/ for the rigorous proof.)"
-echo ""
+if [ "$WORKER_FAILED" -ne 0 ]; then
+    echo "✗ FAIL: a worker process exited non-zero; the showcase did not complete cleanly." >&2
+    exit 1
+elif [ -z "$RUN_ID" ]; then
+    echo "✗ FAIL: no running run was captured." >&2
+    exit 1
+elif [ "$CONTRIBUTING_WORKERS" -lt 2 ]; then
+    echo "✗ FAIL: only $CONTRIBUTING_WORKERS worker(s) processed outcomes; expected at least 2." >&2
+    exit 1
+fi
 
-exit 0
+echo "✓ PASS: $CONTRIBUTING_WORKERS workers shared $TOTAL_ROWS completed outcomes."

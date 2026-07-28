@@ -315,7 +315,7 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
                 .where(chat_messages_table.c.role == "tool")
             ).scalars()
         )
-    assert any("not_installed" in content for content in persisted_tool_content)
+    assert all("not_installed" not in content for content in persisted_tool_content)
 
     assert len(result.tool_invocations) == 2
     assert result.tool_invocations[0].version_after == state.version
@@ -596,7 +596,7 @@ async def test_inline_proposal_gap_retry_reuses_one_custody_blob_and_quota_charg
     [
         (
             "disallowed_mime",
-            "arguments.source.inline_blob.mime_type must be one of the declared values",
+            "must be object conforming to SetPipelineArgumentsModel",
             "application/octet-stream",
             0,
         ),
@@ -884,8 +884,9 @@ async def test_unexpected_candidate_finalizer_exception_uses_plugin_crash_audit_
     assert exc_info.value.failed_turn.tool_calls_attempted == 1
     persisted_feedback = _persisted_tool_content(harness, "call_finalizer_crash")
     assert json.loads(persisted_feedback) == {
+        "_redaction_status": "plugin_crash",
         "error_class": "RuntimeError",
-        "error_message": "RuntimeError",
+        "error_message": "<redacted-failure-message>",
     }
     assert str(unexpected) not in persisted_feedback
 

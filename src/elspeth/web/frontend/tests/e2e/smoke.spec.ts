@@ -5,8 +5,8 @@
 //      (otherwise the app redirects to /login and these tests fail).
 //   2. Both webServer instances came up healthy on the Playwright-assigned
 //      backend and frontend ports.
-//   3. The frontend SPA loads, restores auth from localStorage, and renders
-//      the authenticated application shell.
+//   3. The frontend SPA loads, restores auth from localStorage, completes
+//      session bootstrap, and renders the authenticated application shell.
 //   4. The backend's /api/sessions endpoint accepts the bearer token and
 //      can create + delete a session.
 //
@@ -31,14 +31,30 @@ import {
 import { ComposerPage } from "./page-objects/composer-page";
 
 test.describe("smoke — boot + auth + application shell", () => {
-  test("frontend boots and renders the authenticated shell", async ({
+  test("frontend completes bootstrap and renders the authenticated shell", async ({
     page,
   }) => {
     const composer = new ComposerPage(page);
-    await composer.goto();
+    const sessionsLoaded = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        url.pathname === "/api/sessions" &&
+        url.searchParams.get("include_archived") === "true" &&
+        response.request().method() === "GET" &&
+        response.status() === 200
+      );
+    });
 
+    await composer.goto();
+    await sessionsLoaded;
+
+    // These shell elements are stable whether bootstrap finds no sessions or
+    // automatically resumes an existing session.
     await expect(
-      page.getByRole("button", { name: /session switcher/i }),
+      page.getByRole("heading", { name: "ELSPETH Pipeline Composer" }),
+    ).toBeAttached();
+    await expect(
+      page.getByRole("button", { name: /session switcher:/i }),
     ).toBeVisible();
     await expect(page.getByRole("main")).toBeVisible();
   });
