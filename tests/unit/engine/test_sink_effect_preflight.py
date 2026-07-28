@@ -26,9 +26,13 @@ from elspeth.contracts.audit_export import AuditExportContentStoreResolver
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     AuditExportFormat,
+    MemberSinkEffectCapability,
     ResolvedSinkEffectMode,
+    RestagingSinkEffectCapability,
+    SinkEffectCommitResult,
     SinkEffectExecutionPurpose,
     SinkEffectInputKind,
+    SinkEffectReconcileResult,
 )
 from elspeth.engine.orchestrator.core import Orchestrator
 from elspeth.engine.orchestrator.export import export_landscape
@@ -89,6 +93,21 @@ class EffectCapableSink(LegacyObservableSink):
 
     def reconcile_effect(self, _plan: object, _ctx: object) -> None:
         return None
+
+
+class _MemberEffectCapableSink(EffectCapableSink, MemberSinkEffectCapability):
+    def commit_member_effect(self, *args: object) -> SinkEffectCommitResult:
+        del args
+        raise AssertionError("preflight must not invoke member effects")
+
+    def reconcile_member_effect(self, *args: object) -> SinkEffectReconcileResult:
+        del args
+        raise AssertionError("preflight must not invoke member effects")
+
+
+class _RestagingEffectCapableSink(EffectCapableSink, RestagingSinkEffectCapability):
+    def restage_effect(self, *args: object) -> None:
+        del args
 
 
 def _audit_export_binding(sink_name: str, sink: object, mode: str | None) -> object:
@@ -387,6 +406,59 @@ def test_exact_admission_receipt_skips_duplicate_validation(monkeypatch: pytest.
     )
 
     assert accepted is admission
+
+
+def test_nominal_member_capability_cannot_be_registered_after_admission() -> None:
+    class _LocallyAdmittedSink(EffectCapableSink):
+        pass
+
+    sink = _LocallyAdmittedSink()
+    validate_pipeline_sink_effect_capabilities(
+        {"output": sink},  # type: ignore[dict-item]
+        configured_modes={"output": "write"},
+        required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+    )
+
+    with pytest.raises(AttributeError):
+        MemberSinkEffectCapability.register(_LocallyAdmittedSink)  # type: ignore[attr-defined]
+
+
+def test_nominal_member_capability_requires_concrete_methods() -> None:
+    class _IncompleteMemberSink(EffectCapableSink, MemberSinkEffectCapability):
+        pass
+
+    with pytest.raises(SinkEffectCapabilityError, match="does not implement"):
+        validate_sink_effect_type_capability(
+            _IncompleteMemberSink,
+            "write",
+            SinkEffectInputKind.PIPELINE_MEMBERS,
+        )
+
+
+@pytest.mark.parametrize("capability", ["member", "restaging"])
+def test_admission_fingerprint_rejects_nominal_capability_method_mutation(capability: str) -> None:
+    if capability == "member":
+        sink: EffectCapableSink = _MemberEffectCapableSink()
+    else:
+        sink = _RestagingEffectCapableSink()
+    sinks = {"output": sink}
+    admission = validate_pipeline_sink_effect_capabilities(
+        sinks,  # type: ignore[arg-type]
+        configured_modes={"output": "write"},
+        required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+    )
+    if capability == "member":
+        sink.commit_member_effect = None  # type: ignore[attr-defined,method-assign,assignment]
+    else:
+        sink.restage_effect = None  # type: ignore[attr-defined,method-assign,assignment]
+
+    with pytest.raises(SinkEffectCapabilityError, match="does not bind"):
+        require_sink_effect_admission(
+            sinks,  # type: ignore[arg-type]
+            configured_modes={"output": "write"},
+            required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+            admission=admission,
+        )
 
 
 def test_copied_admission_receipt_is_not_validator_issued() -> None:

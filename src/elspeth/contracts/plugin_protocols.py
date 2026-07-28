@@ -885,7 +885,15 @@ class SinkProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
 
 
 class SinkEffectProtocol(SinkProtocol, Protocol):
-    """Explicit opt-in contract for recoverable sink publication effects."""
+    """Explicit opt-in contract for recoverable sink publication effects.
+
+    Optional execution authorities are nominal, not structural. A sink that
+    publishes one effect per member must inherit
+    ``MemberSinkEffectCapability``; a sink that can rebuild a missing stage
+    must inherit ``RestagingSinkEffectCapability``. Merely exposing methods or
+    legacy boolean flags never grants either authority. Admission,
+    fingerprinting, and execution all use those same nominal identities.
+    """
 
     effect_protocol_version: ClassVar[str]
     effect_call_type: ClassVar[CallType]

@@ -18,6 +18,8 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
+    MemberSinkEffectCapability,
+    RestagingSinkEffectCapability,
     RestrictedSinkEffectContext,
     SinkEffectAttemptAction,
     SinkEffectCommitResult,
@@ -25,6 +27,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectInspection,
     SinkEffectInspectionMode,
     SinkEffectInspectionRequest,
+    SinkEffectMember,
     SinkEffectPipelineMembersInput,
     SinkEffectPlan,
     SinkEffectPrepareRequest,
@@ -300,6 +303,81 @@ def _execution_request(run_id: str, sink_id: str, members: tuple[object, ...]) -
             for member in identity.members
         ),
     )
+
+
+def test_sink_effect_capabilities_cannot_be_forged_by_attributes() -> None:
+    class _CapabilityPretender(_CumulativeObservableSink):
+        supports_member_effects = True
+
+        def restage_effect(self, *args: object) -> None:
+            del args
+
+        def commit_member_effect(self, *args: object) -> SinkEffectCommitResult:
+            del args
+            raise AssertionError("capability probe must not invoke the pretender")
+
+        def reconcile_member_effect(self, *args: object) -> SinkEffectReconcileResult:
+            del args
+            raise AssertionError("capability probe must not invoke the pretender")
+
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+        effect_input = _execution_request(run_id, sink_id, members).effect_input
+        pretender = _CapabilityPretender(_CumulativeTarget())
+
+        assert not SinkEffectCoordinator._is_restaging_adapter(pretender, effect_input)
+        assert not SinkEffectCoordinator._is_member_effect_adapter(pretender, effect_input)
+    finally:
+        db.close()
+
+
+def test_sink_effect_capabilities_require_nominal_opt_in() -> None:
+    class _DeclaredCapabilities(
+        _CumulativeObservableSink,
+        MemberSinkEffectCapability,
+        RestagingSinkEffectCapability,
+    ):
+        def restage_effect(
+            self,
+            plan: SinkEffectPlan,
+            effect_input: SinkEffectPipelineMembersInput,
+            ctx: RestrictedSinkEffectContext,
+        ) -> None:
+            del plan, effect_input, ctx
+
+        def commit_member_effect(
+            self,
+            plan: SinkEffectPlan,
+            member: SinkEffectMember,
+            effect_input: SinkEffectPipelineMembersInput,
+            ctx: RestrictedSinkEffectContext,
+        ) -> SinkEffectCommitResult:
+            del plan, member, effect_input, ctx
+            raise AssertionError("capability probe must not invoke the adapter")
+
+        def reconcile_member_effect(
+            self,
+            plan: SinkEffectPlan,
+            member: SinkEffectMember,
+            effect_input: SinkEffectPipelineMembersInput,
+            ctx: RestrictedSinkEffectContext,
+        ) -> SinkEffectReconcileResult:
+            del plan, member, effect_input, ctx
+            raise AssertionError("capability probe must not invoke the adapter")
+
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+        effect_input = _execution_request(run_id, sink_id, members).effect_input
+        adapter = _DeclaredCapabilities(_CumulativeTarget())
+
+        assert SinkEffectCoordinator._is_restaging_adapter(adapter, effect_input)
+        assert SinkEffectCoordinator._is_member_effect_adapter(adapter, effect_input)
+    finally:
+        db.close()
 
 
 def _production_calls(path: str, method: str) -> list[int]:

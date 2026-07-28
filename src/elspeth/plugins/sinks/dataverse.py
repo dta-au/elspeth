@@ -27,6 +27,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
+    MemberSinkEffectCapability,
     ResolvedSinkEffectMode,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
@@ -262,7 +263,7 @@ class DataverseSinkConfig(DataPluginConfig):
 DataverseSinkConfig.model_rebuild()
 
 
-class DataverseSink(BaseSink):
+class DataverseSink(BaseSink, MemberSinkEffectCapability):
     """Write rows to Microsoft Dataverse via OData v4 REST API.
 
     Day-one supports upsert mode only (PATCH with alternate key).
@@ -281,7 +282,6 @@ class DataverseSink(BaseSink):
     effect_call_type = CallType.HTTP
     supported_effect_modes = frozenset({"upsert"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
-    supports_member_effects = True
 
     @classmethod
     def _resolve_sink_effect_mode(

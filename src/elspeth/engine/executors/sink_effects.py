@@ -25,6 +25,8 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
+    MemberSinkEffectCapability,
+    RestagingSinkEffectCapability,
     RestrictedSinkEffectContext,
     SinkEffectAttemptAction,
     SinkEffectAttemptRequest,
@@ -572,16 +574,11 @@ class SinkEffectCoordinator:
 
     @staticmethod
     def _is_restaging_adapter(sink: object, effect_input: object) -> bool:
-        return isinstance(effect_input, SinkEffectPipelineMembersInput) and callable(getattr(sink, "restage_effect", None))
+        return type(effect_input) is SinkEffectPipelineMembersInput and isinstance(sink, RestagingSinkEffectCapability)
 
     @staticmethod
     def _is_member_effect_adapter(sink: object, effect_input: object) -> bool:
-        return (
-            isinstance(effect_input, SinkEffectPipelineMembersInput)
-            and getattr(type(sink), "supports_member_effects", False) is True
-            and callable(getattr(sink, "commit_member_effect", None))
-            and callable(getattr(sink, "reconcile_member_effect", None))
-        )
+        return type(effect_input) is SinkEffectPipelineMembersInput and isinstance(sink, MemberSinkEffectCapability)
 
     def _execute_member_effects(
         self,

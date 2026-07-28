@@ -31,6 +31,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
+    MemberSinkEffectCapability,
     ResolvedSinkEffectMode,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
@@ -180,7 +181,7 @@ class ChromaSinkConfig(DataPluginConfig):
         return self
 
 
-class ChromaSink(BaseSink):
+class ChromaSink(BaseSink, MemberSinkEffectCapability):
     """Write pipeline rows into a ChromaDB collection.
 
     Each row maps to a ChromaDB document via the configured field_mapping.
@@ -204,7 +205,6 @@ class ChromaSink(BaseSink):
     effect_call_type = CallType.VECTOR
     supported_effect_modes = frozenset({"overwrite"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
-    supports_member_effects = True
     effect_mode_remediation = "set on_duplicate=overwrite or choose a sink with a target-side effect marker"
 
     @classmethod

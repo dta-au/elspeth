@@ -29,6 +29,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
+    RestagingSinkEffectCapability,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
     SinkEffectExecutionPurpose,
@@ -705,7 +706,7 @@ def _validated_etag(response: Mapping[str, Any]) -> str | None:
     return value
 
 
-class AWSS3Sink(BaseSink):
+class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     """Write bounded cumulative CSV, JSON, or JSONL objects to AWS S3."""
 
     name = "aws_s3"

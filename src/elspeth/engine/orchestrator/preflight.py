@@ -37,7 +37,9 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     AuditExportFormat,
+    MemberSinkEffectCapability,
     ResolvedSinkEffectMode,
+    RestagingSinkEffectCapability,
     SinkEffectExecutionPurpose,
     SinkEffectInputKind,
     SinkEffectRuntimeBinding,
@@ -69,7 +71,6 @@ if TYPE_CHECKING:
 
 
 _SINK_EFFECT_METHODS = ("inspect_effect", "prepare_effect", "commit_effect", "reconcile_effect")
-_MEMBER_SINK_EFFECT_METHODS = ("commit_member_effect", "reconcile_member_effect")
 
 
 def _effect_mode_guidance(sink_type: type[object]) -> str:
@@ -80,6 +81,38 @@ def _effect_mode_guidance(sink_type: type[object]) -> str:
     if type(remediation) is not str or not remediation.strip():
         raise SinkEffectCapabilityError("Sink effect_mode_remediation must be None or a non-empty exact string")
     return f"; remediation: {remediation}"
+
+
+def _validate_instance_extension_capabilities(sink: object, sink_name: object) -> None:
+    if isinstance(sink, MemberSinkEffectCapability) and (
+        type(sink).commit_member_effect is MemberSinkEffectCapability.commit_member_effect
+        or type(sink).reconcile_member_effect is MemberSinkEffectCapability.reconcile_member_effect
+        or not callable(sink.commit_member_effect)
+        or not callable(sink.reconcile_member_effect)
+    ):
+        raise SinkEffectCapabilityError(
+            f"Sink {sink_name!r} nominally declares durable member effects but does not implement "
+            "callable commit_member_effect and reconcile_member_effect methods"
+        )
+    if isinstance(sink, RestagingSinkEffectCapability) and (
+        type(sink).restage_effect is RestagingSinkEffectCapability.restage_effect or not callable(sink.restage_effect)
+    ):
+        raise SinkEffectCapabilityError(
+            f"Sink {sink_name!r} nominally declares effect restaging but does not implement a callable restage_effect method"
+        )
+
+
+def _validate_type_extension_capabilities(sink_type: type[object], sink_name: object) -> None:
+    if issubclass(sink_type, MemberSinkEffectCapability) and (
+        sink_type.commit_member_effect is MemberSinkEffectCapability.commit_member_effect
+        or sink_type.reconcile_member_effect is MemberSinkEffectCapability.reconcile_member_effect
+    ):
+        raise SinkEffectCapabilityError(
+            f"Sink {sink_name!r} nominally declares durable member effects but does not implement "
+            "commit_member_effect and reconcile_member_effect"
+        )
+    if issubclass(sink_type, RestagingSinkEffectCapability) and sink_type.restage_effect is RestagingSinkEffectCapability.restage_effect:
+        raise SinkEffectCapabilityError(f"Sink {sink_name!r} nominally declares effect restaging but does not implement restage_effect")
 
 
 @final
@@ -178,13 +211,7 @@ def validate_sink_effect_capability(
             raise SinkEffectCapabilityError(
                 f"Sink {sink_name!r} declares effect protocol {SINK_EFFECT_PROTOCOL_VERSION!r} but {method_name} is not callable"
             )
-    supports_member_effects = inspect.getattr_static(sink_type, "supports_member_effects", False)
-    if type(supports_member_effects) is not bool:
-        raise SinkEffectCapabilityError(f"Sink {sink_name!r} supports_member_effects must be an exact bool declaration")
-    if supports_member_effects:
-        for method_name in _MEMBER_SINK_EFFECT_METHODS:
-            if not callable(inspect.getattr_static(sink, method_name, None)):
-                raise SinkEffectCapabilityError(f"Sink {sink_name!r} declares durable member effects but {method_name} is not callable")
+    _validate_instance_extension_capabilities(sink, sink_name)
 
 
 def validate_sink_effect_type_capability(
@@ -231,13 +258,7 @@ def validate_sink_effect_type_capability(
             raise SinkEffectCapabilityError(
                 f"Sink {sink_name!r} declares effect protocol {SINK_EFFECT_PROTOCOL_VERSION!r} but {method_name} is not callable"
             )
-    supports_member_effects = inspect.getattr_static(sink_type, "supports_member_effects", False)
-    if type(supports_member_effects) is not bool:
-        raise SinkEffectCapabilityError(f"Sink {sink_name!r} supports_member_effects must be an exact bool declaration")
-    if supports_member_effects:
-        for method_name in _MEMBER_SINK_EFFECT_METHODS:
-            if not callable(inspect.getattr_static(sink_type, method_name, None)):
-                raise SinkEffectCapabilityError(f"Sink {sink_name!r} declares durable member effects but {method_name} is not callable")
+    _validate_type_extension_capabilities(sink_type, sink_name)
 
 
 def validate_audit_export_sink_type_capability(
@@ -302,14 +323,30 @@ def sink_effect_modes_from_runtime_bindings(
 
 def _capability_fingerprint(sink: object) -> tuple[object, ...]:
     sink_type = type(sink)
+    member_methods: tuple[object, ...]
+    if isinstance(sink, MemberSinkEffectCapability):
+        member_capable = True
+        member_methods = (sink.commit_member_effect, sink.reconcile_member_effect)
+    else:
+        member_capable = False
+        member_methods = ()
+    restaging_methods: tuple[object, ...]
+    if isinstance(sink, RestagingSinkEffectCapability):
+        restaging_capable = True
+        restaging_methods = (sink.restage_effect,)
+    else:
+        restaging_capable = False
+        restaging_methods = ()
     return (
         inspect.getattr_static(sink_type, "effect_protocol_version", None),
         inspect.getattr_static(sink_type, "supported_effect_modes", None),
         inspect.getattr_static(sink_type, "supported_effect_input_kinds", None),
         cast("type[SinkEffectProtocol]", sink_type).effect_mode_remediation,
-        inspect.getattr_static(sink_type, "supports_member_effects", False),
+        member_capable,
+        restaging_capable,
         *(inspect.getattr_static(sink, method_name, None) for method_name in _SINK_EFFECT_METHODS),
-        *(inspect.getattr_static(sink, method_name, None) for method_name in _MEMBER_SINK_EFFECT_METHODS),
+        *member_methods,
+        *restaging_methods,
     )
 
 

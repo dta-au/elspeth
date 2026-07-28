@@ -33,6 +33,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
+    RestagingSinkEffectCapability,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
     SinkEffectExecutionPurpose,
@@ -314,7 +315,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
 AzureBlobSinkConfig.model_rebuild()
 
 
-class AzureBlobSink(BaseSink):
+class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     """Write rows to Azure Blob Storage.
 
     Config options:

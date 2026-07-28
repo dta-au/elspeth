@@ -1344,13 +1344,52 @@ class RestrictedSinkEffectContext:
             raise TypeError("run_started_at must be datetime")
 
 
+class MemberSinkEffectCapability:
+    """Nominal opt-in for sinks that publish one durable effect per member."""
+
+    def commit_member_effect(
+        self,
+        plan: SinkEffectPlan,
+        member: SinkEffectMember,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectCommitResult:
+        """Commit one member effect."""
+        raise NotImplementedError
+
+    def reconcile_member_effect(
+        self,
+        plan: SinkEffectPlan,
+        member: SinkEffectMember,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectReconcileResult:
+        """Reconcile one member effect."""
+        raise NotImplementedError
+
+
+class RestagingSinkEffectCapability:
+    """Nominal opt-in for sinks that can reconstruct a lost staged body."""
+
+    def restage_effect(
+        self,
+        plan: SinkEffectPlan,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> None:
+        """Rebuild and verify a staged body from durable input."""
+        raise NotImplementedError
+
+
 __all__ = [
     "SINK_EFFECT_PROTOCOL_VERSION",
     "AuditExportFormat",
     "AuditExportSignedManifestInput",
     "AuditExportSigningMode",
     "AuditExportSnapshotChunkInput",
+    "MemberSinkEffectCapability",
     "ResolvedSinkEffectMode",
+    "RestagingSinkEffectCapability",
     "RestrictedAuditExportSnapshotReader",
     "RestrictedSinkEffectContext",
     "SinkEffectAttemptAction",
