@@ -2039,10 +2039,12 @@ protected scenario inventory as `CLOUDWATCH_AGENT_CONFIG_JSON_SHA256` and
 single-line base64 plus its lowercase SHA-256 into the sidecar environment.
 Base64 is transport encoding, not a credential or secrecy mechanism. The
 sidecar entrypoint decodes both files into its task-local writable directory,
-verifies both hashes before use, then runs the agent's required `fetch-config`
-followed by `append-config` sequence. A mismatch or either control-script
-failure stops the sidecar. The task definition must refer to that exact
-manifest version; mutable “latest” configuration is not accepted.
+verifies both hashes before use, then runs `config-translator` to render the
+JSON config into the agent's TOML configuration file before `exec`ing
+`amazon-cloudwatch-agent` directly with that TOML plus the OTel YAML. A
+digest mismatch or translation failure stops the sidecar. The task definition
+must refer to that exact manifest version; mutable “latest” configuration is
+not accepted.
 
 CloudWatch Agent JSON (`elspeth.cloudwatch-agent.v1.json`):
 
@@ -2119,8 +2121,8 @@ into an unreviewed retention surface.
 Record the approved digest-only CloudWatch Agent reference in the protected
 scenario inventory as `CLOUDWATCH_AGENT_IMAGE`. The rendered image reference
 must equal it byte-for-byte and contain no tag. The approved ECS runtime variant must include
-the AWS control script plus `/bin/sh`, `base64`, `sha256sum`, `grep`, and
-`sleep`; those are part of the reviewed image contract and are exercised by
+the AWS config-translator, the `amazon-cloudwatch-agent` binary itself, plus `/bin/sh`, `base64`,
+and `sha256sum`; those are part of the reviewed image contract and are exercised by
 the entrypoint below. The web container must override the image's diagnostic
 default with the exact service command `web --host 0.0.0.0 --port 8451`:
 
@@ -2133,7 +2135,7 @@ default with the exact service command `web --host 0.0.0.0 --port 8451`:
       "essential": false,
       "memoryReservation": 192,
       "entryPoint": ["/bin/sh", "-ceu"],
-      "command": ["CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; CTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl; mkdir -p \"$CONFIG_DIR\"; printf '%s' \"$ELSPETH_CW_AGENT_CONFIG_JSON_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' \"$ELSPETH_CW_AGENT_OTEL_YAML_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' \"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" | sha256sum -c -; printf '%s\\n' \"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" | sha256sum -c -; \"$CTL\" -a fetch-config -m auto -c \"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" -s; \"$CTL\" -a append-config -m auto -c \"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" -s; while \"$CTL\" -a status -m auto | grep -q '\"status\": \"running\"'; do sleep 30; done; exit 1"],
+      "command": ["CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; TRANSLATOR=/opt/aws/amazon-cloudwatch-agent/bin/config-translator; AGENT=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent; mkdir -p \"$CONFIG_DIR\"; printf '%s' \"$ELSPETH_CW_AGENT_CONFIG_JSON_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' \"$ELSPETH_CW_AGENT_OTEL_YAML_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' \"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" | sha256sum -c -; printf '%s\\n' \"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" | sha256sum -c -; \"$TRANSLATOR\" -mode auto -os linux -input \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" -output \"/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml\"; exec \"$AGENT\" -config \"/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml\" -otelconfig \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\""],
       "environment": [
         {"name": "ELSPETH_CW_AGENT_CONFIG_JSON_B64", "value": "${CLOUDWATCH_AGENT_CONFIG_JSON_B64}"},
         {"name": "ELSPETH_CW_AGENT_CONFIG_JSON_SHA256", "value": "${CLOUDWATCH_AGENT_CONFIG_JSON_SHA256}"},
@@ -2141,7 +2143,7 @@ default with the exact service command `web --host 0.0.0.0 --port 8451`:
         {"name": "ELSPETH_CW_AGENT_OTEL_YAML_SHA256", "value": "${CLOUDWATCH_AGENT_OTEL_YAML_SHA256}"}
       ],
       "healthCheck": {
-        "command": ["CMD-SHELL", "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q '\"status\": \"running\"'"],
+        "command": ["CMD-SHELL", "kill -0 1"],
         "interval": 10,
         "timeout": 5,
         "retries": 6,
