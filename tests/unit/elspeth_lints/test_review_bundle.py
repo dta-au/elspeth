@@ -134,6 +134,18 @@ def test_load_bundle_rejects_incoherent_lane_kind() -> None:
         load_bundle(_serialize_with_actions([incoherent]))
 
 
+@pytest.mark.parametrize("source_file", ("../outside.yaml", "/tmp/outside.yaml", "nested/plugins.yaml"))
+@pytest.mark.parametrize("kind", ("rotation", "stale_delete"))
+def test_bundle_action_rejects_nonlocal_source_file(kind: str, source_file: str) -> None:
+    with pytest.raises(ValueError, match="source_file"):
+        BundleAction(
+            lane="resign",
+            kind=kind,
+            key="plugins/widget.py:R1:Widget:lookup:fp=abc123",
+            source_file=source_file,
+        )
+
+
 def test_load_bundle_rejects_unknown_key() -> None:
     bundle = _bundle((_new_judgment_action(),))
     data = json.loads(dump_bundle(bundle))

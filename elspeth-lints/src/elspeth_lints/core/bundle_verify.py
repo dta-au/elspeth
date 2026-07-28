@@ -187,6 +187,11 @@ def _verify_stale_delete(action: BundleAction, index: dict[str, Any]) -> list[st
         return [f"stale_delete {action.key!r}: no diagnosis row in the tree; cannot confirm the entry is an orphan"]
     if item.status not in _STALE_DELETE_ORPHAN_STATUSES:
         return [f"stale_delete {action.key!r}: tree reports {item.status!r}, not an orphan; the covered finding reappeared"]
+    if action.source_file != item.source_file:
+        return [
+            f"stale_delete {action.key!r}: staged source_file {action.source_file!r} does not match "
+            f"the fresh diagnosis owning YAML {item.source_file!r}"
+        ]
     return []
 
 

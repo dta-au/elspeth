@@ -354,6 +354,25 @@ def test_verify_aborts_on_reappeared_stale_delete_finding(tmp_path: Path) -> Non
     assert any(key in m for m in report.mismatches)
 
 
+def test_verify_rejects_stale_delete_wrong_owning_yaml(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    bundle = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="stale_delete", key=key, source_file="other.yaml"),),
+    )
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("owning YAML" in mismatch for mismatch in report.mismatches)
+
+
 def test_verify_aborts_on_rotation_no_longer_applicable(tmp_path: Path) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)

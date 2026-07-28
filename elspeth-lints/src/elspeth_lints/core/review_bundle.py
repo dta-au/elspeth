@@ -135,6 +135,13 @@ class BundleAction:
         missing = [name for name in _REQUIRED_FIELDS_BY_KIND[self.kind] if not getattr(self, name)]
         if missing:
             raise ValueError(f"BundleAction kind={self.kind!r} is missing required field(s): {missing}")
+        if self.kind in {"rotation", "stale_delete"}:
+            assert self.source_file is not None
+            source_path = Path(self.source_file)
+            if source_path.is_absolute() or len(source_path.parts) != 1 or source_path.name != self.source_file:
+                raise ValueError(
+                    f"BundleAction kind={self.kind!r} source_file must be one local allowlist filename; got {self.source_file!r}"
+                )
 
 
 @dataclass(frozen=True, slots=True)
