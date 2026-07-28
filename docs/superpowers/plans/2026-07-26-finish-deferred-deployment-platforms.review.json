@@ -4,6 +4,16 @@
   "verdict": "CHANGES_REQUESTED",
   "executable_after_amendments": true,
   "resequencing_required": false,
+  "post_go_adjudication": {
+    "verdict": "GO",
+    "reason": "The live schema and Task 11 define composer progress as one durable latest snapshot, not an append-only event log.",
+    "supersedes": "Any Task 5 wording that requires gap-free composer event replay or sequence deduplication.",
+    "accepted_contract": [
+      "Persist the fenced latest snapshot and durable inflight state before local broadcast; peers and reconnects read those committed rows and intermediate phases may coalesce.",
+      "Use a versioned operation-qualified fsynced quarantine manifest outside the session cascade for physical-archive cleanup obligations.",
+      "Finalize BLOB_READ in the still-unshipped epoch-37 and protocol-1 persisted vocabulary without a compatibility bump."
+    ]
+  },
   "blockers": [
     {
       "area": "Task 5 scope and authority inventory",

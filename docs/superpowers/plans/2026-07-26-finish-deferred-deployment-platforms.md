@@ -486,6 +486,8 @@ later README claim edits are cryptographically disjoint from image inputs.
 - Modify: `src/elspeth/web/sessions/models.py`
 - Modify: `src/elspeth/web/sessions/schema.py`
 - Modify: `src/elspeth/web/sessions/protocol.py`
+- Modify: `src/elspeth/web/sessions/models.py`
+- Modify: `src/elspeth/web/sessions/schema.py`
 - Modify: `src/elspeth/web/secrets/user_store.py`
 - Modify: `src/elspeth/web/_aws_ecs_acceptance/receipt_contracts.py`
 - Modify: `README.md`
@@ -723,6 +725,8 @@ deleted state or take a fallback write path.
 - Modify: `src/elspeth/web/execution/service.py`
 - Modify: `src/elspeth/web/execution/outputs.py`
 - Create: `tests/unit/architecture/test_session_db_mutation_authority.py`
+- Modify: `tests/unit/web/coordination/test_contracts.py`
+- Modify: `tests/unit/web/sessions/test_schema.py`
 - Create: `tests/unit/web/sessions/test_operation_fence_wiring.py`
 - Modify: `tests/unit/web/sessions/test_static_direct_writers.py`
 - Test: `tests/unit/web/blobs/test_service.py`
@@ -778,12 +782,21 @@ deleted state or take a fallback write path.
    transfers it to the background coordinator before returning `202` and holds
    it through progress/output/terminal writes and blob compensation.
    Process-local locks and broadcasters remain UX/capacity optimizations only.
-6. Add explicit read authority for standalone blob download/preview so metadata
-   and bytes serialize with deletion. Use the existing durable composer
-   progress tables as correctness state: two independent services and
-   broadcasters over one database must replay/tail ordered progress without a
-   gap, deduplicate by sequence after reconnect, and emit no local-only event
-   when persistence fails.
+6. Add exact `SessionOperationKind.BLOB_READ = "blob_read"` authority for
+   standalone blob download/preview so metadata and bytes serialize with
+   deletion. Widen the epoch-37 fence-kind constraint and bounded contract/
+   schema tests atomically. Epoch 37 and coordination protocol 1 remain
+   unchanged because neither has shipped or been accepted from this platform
+   branch; making this persisted-vocabulary change after shipment would require
+   a hard-cut schema/protocol bump. Use the existing durable composer progress
+   tables as a fenced latest-value register plus durable request-liveness
+   bookkeeping. Persist/upsert under the exact operation fence before any local
+   broadcast. Two independent services and broadcasters over one database must
+   reconnect to the latest committed snapshot plus durable inflight state,
+   never regress `(operation_epoch, updated_at)`, and emit no local-only state
+   when persistence fails. Intermediate phases may coalesce. Task 11 keeps the
+   intentional one-latest-snapshot contract; Task 5 does not invent or claim
+   gap-free replay for an append-only composer progress event log.
 7. Add typed fork and archive lifecycles. Fork verifies the parent session and
    guided fences, server-mints an inaccessible child, atomically creates the
    child and closed epoch-1 fence, and uses canonical parent/hidden-child
@@ -798,7 +811,16 @@ deleted state or take a fallback write path.
    publish/purge. Never hold a DB connection over long filesystem/network
    work. Publish/restore/purge is idempotent, stale cleanup cannot remove
    winner-owned state, and an unprovable post-commit cleanup records a durable
-   recovery obligation. Task 5 owns safe production and immediate
+   recovery obligation. Ordinary blob deletion uses
+   `blob_deletion_cleanups` while the session remains. Physical session
+   deletion first writes and fsyncs a versioned operation-ID/epoch-qualified
+   quarantine manifest outside `blobs/<session>`, renames the whole directory,
+   fsyncs both parents, and rechecks archive authority before the cascade. On
+   commit, purge quarantine then retire the manifest; on rollback, restore then
+   retire it; unknown outcome reconciles against Sessions state. The manifest
+   is the discoverable obligation and stale manifests never alter a winner's
+   canonical path. `sessions_cleanup_claims` coordinates later scanning but is
+   not the obligation ledger. Task 5 owns safe production and immediate
    reconciliation; Task 12 adds distributed retention/claim processing.
 9. Run:
 
@@ -824,8 +846,8 @@ deleted state or take a fallback write path.
     tests/unit/web/sessions`. The PostgreSQL gate uses separate production
     services, repositories, engines/connections, and broadcasters with one
     shared data directory; it proves DB-time expiry/blocked takeover ordering,
-    dual fencing, archive/delete refusal, contiguous sequences, durable tailing,
-    and blob rename/finalize compensation.
+    dual fencing, archive/delete refusal, contiguous domain-event sequences,
+    durable latest-snapshot reconnect, and blob rename/finalize compensation.
 12. Commit:
 
    ```bash
