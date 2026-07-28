@@ -39,6 +39,7 @@ from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError
 from elspeth.web.composer.redaction import (
+    REDACTED_UNKNOWN_RESPONSE_FIELD,
     REDACTED_UNKNOWN_RESPONSE_KEY,
     redact_tool_call_arguments,
 )
@@ -821,8 +822,9 @@ async def test_cl_pp_13_unknown_response_key_redacted_in_persisted_tool_row(
     result = await _run_one_turn_for_characterization(service, llm=llm, session_id=session_id)
 
     persisted_tool_row = json.loads(result.persisted_tool_row_content[0])
-    assert persisted_tool_row["stray_provider_field"] == REDACTED_UNKNOWN_RESPONSE_KEY
-    assert persisted_tool_row["stray_provider_field"] == "<redacted-unknown-response-key>"
+    assert "stray_provider_field" not in persisted_tool_row
+    assert persisted_tool_row[REDACTED_UNKNOWN_RESPONSE_FIELD] == REDACTED_UNKNOWN_RESPONSE_KEY
+    assert persisted_tool_row[REDACTED_UNKNOWN_RESPONSE_FIELD] == "<redacted-unknown-response-key>"
     assert "do-not-persist" not in result.persisted_tool_row_content[0]
     assert redaction_telemetry.unknown_response_key_calls == [{"tool_name": "set_metadata"}]
 

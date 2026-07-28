@@ -9,7 +9,8 @@ minimal representative payload, asserting:
      replaced with the summarizer output (or no-summarizer sentinel) when
      present in the payload; absent keys are no-ops (not added).
   3. For entries with ``sensitive_response_keys``: the named keys are
-     replaced when present; unknown keys substitute the fixed sentinel
+     replaced when present; unknown keys are aggregated under the fixed
+     ``_unknown_response`` field with sentinel
      ``<redacted-unknown-response-key>``.
   4. For ``handles_no_sensitive_data=True`` entries with no
      ``sensitive_argument_keys``: argument redaction is a passthrough
@@ -32,6 +33,7 @@ import pytest
 
 from elspeth.web.composer.redaction import (
     MANIFEST,
+    REDACTED_UNKNOWN_RESPONSE_FIELD,
     REDACTED_UNKNOWN_RESPONSE_KEY,
     ToolRedaction,
     redact_tool_call_arguments,
@@ -150,7 +152,8 @@ def test_declarative_entry_response_redaction_runtime(tool_name: str, entry: Too
     Spec §4.2.6 disposition for declarative response paths:
       * key in ``sensitive_response_keys``         → no-summarizer sentinel
       * key in ``known_response_keys`` only         → passthrough
-      * key in neither                              → REDACTED_UNKNOWN_RESPONSE_KEY
+      * key in neither                              → aggregate under
+                                                      REDACTED_UNKNOWN_RESPONSE_FIELD
 
     handles_no_sensitive_data=True entries currently DO traverse
     redact_tool_call_response (the manifest_dispatch beacon fires and the
@@ -180,13 +183,17 @@ def test_declarative_entry_response_redaction_runtime(tool_name: str, entry: Too
                 f"(typo in sensitive_response_keys tuple)."
             )
 
-    # Unknown-key fail-closed path: a key not in known_response_keys substitutes
-    # REDACTED_UNKNOWN_RESPONSE_KEY.  Pick a key name unlikely to collide with
-    # any tool's declared response shape.
+    # Unknown-key fail-closed path: a key not in known_response_keys is
+    # aggregated under a fixed field so the untrusted key name cannot become
+    # a persistence channel. Pick a key unlikely to collide with any tool's
+    # declared response shape.
     unknown_key = "__runtime_smoke_unknown_key__"
     unknown_out = redact_tool_call_response(tool_name, {unknown_key: "x"}, telemetry=telemetry)
-    assert unknown_out[unknown_key] == REDACTED_UNKNOWN_RESPONSE_KEY, (
+    assert unknown_key not in unknown_out
+    assert unknown_out[REDACTED_UNKNOWN_RESPONSE_FIELD] == REDACTED_UNKNOWN_RESPONSE_KEY, (
         f"Tool {tool_name!r}: unknown-key fail-closed sentinel did not fire. "
-        f"redact_tool_call_response must replace any key not in known_response_keys "
-        f"with the fixed sentinel. Got: {unknown_out[unknown_key]!r}."
+        "redact_tool_call_response must aggregate keys not in "
+        f"known_response_keys under {REDACTED_UNKNOWN_RESPONSE_FIELD!r} "
+        f"with the fixed sentinel. Got: {unknown_out!r}."
     )
+    assert telemetry.unknown_response_key_calls == [{"tool_name": tool_name}]
