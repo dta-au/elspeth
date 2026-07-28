@@ -20,6 +20,7 @@ BEDROCK_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-bedrock-opus-sonnet
 RUNBOOK_INDEX = REPO_ROOT / "docs" / "runbooks" / "index.md"
 DOCKER_GUIDE = REPO_ROOT / "docs" / "guides" / "docker.md"
 OIDC_PLAYWRIGHT_CONFIG = REPO_ROOT / "src" / "elspeth" / "web" / "frontend" / "playwright.oidc.config.ts"
+TERRAFORM_README = REPO_ROOT / "deploy" / "aws-ecs" / "terraform" / "README.md"
 
 
 def _text() -> str:
@@ -993,3 +994,26 @@ def test_bedrock_runbook_normalizes_and_asserts_composer_model_switch() -> None:
         assert f'.name != "{name}"' in verification
     assert ".ELSPETH_WEB__COMPOSER_MODEL == $composer_model" in verification
     assert ".ELSPETH_WEB__COMPOSER_ADVISOR_MODEL == $composer_advisor_model" in verification
+
+
+def test_runbook_requires_immutable_rds_trust_before_release_promotion() -> None:
+    text = _text()
+    assert "/etc/elspeth/rds/global-bundle.pem" in text
+    assert "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3" in text
+    assert "rds-ca-rsa2048-g1" in text
+    assert "readonlyRootFilesystem" in text
+    assert "session_tls" in text
+    assert "landscape_tls" in text
+    assert "c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700" in text
+    assert text.index("session_tls") < text.index("0.7.2-RC-280726")
+    assert text.index("landscape_tls") < text.index("0.7.2-RC-280726")
+
+
+def test_terraform_readme_requires_immutable_rds_trust_before_release_promotion() -> None:
+    text = TERRAFORM_README.read_text(encoding="utf-8")
+    assert "/etc/elspeth/rds/global-bundle.pem" in text
+    assert "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3" in text
+    assert "rds-ca-rsa2048-g1" in text
+    assert "readonlyRootFilesystem" in text
+    assert "session_tls" in text
+    assert "landscape_tls" in text

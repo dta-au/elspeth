@@ -1965,6 +1965,101 @@ docker image inspect --format '{{ index .Config.Labels "io.elspeth.install-extra
 Acceptance/lean images instead report `webui llm aws postgres`; never retag
 one of those digests as the generic GHCR/ACR release image.
 
+## Immutable RDS trust-root admission
+
+The image must contain `/etc/elspeth/rds/global-bundle.pem` with SHA-256
+`e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3`.
+Its OCI CA label must be `rds-ca-rsa2048-g1`. Every ELSPETH container in the
+task definitions except the web container (`elspeth-web`, candidate and
+rollback) must set `readonlyRootFilesystem` to `true`. The web container is
+exempt because ECS Exec — which runs the acceptance checks inside it — is
+unsupported by AWS with a read-only root filesystem, and its multipart and
+telemetry paths write to `/tmp`; its trust root remains immutable through
+startup digest verification of the 0444 root-owned baked file.
+
+The schema and runtime doctor JSON must report all of these checks as green
+before the web service is enabled:
+
+- `rds_trust_root`
+- `session_tls`
+- `landscape_tls`
+- `session_schema`
+- `landscape_schema`
+
+`session_tls` and `landscape_tls` attest only the connection that inspected
+each schema: TLS is proven on the same connection the schema probe ran over,
+not on every connection a run opens. A `--init-schema` DDL connection uses
+the identical URL and `sslmode` posture but is not itself separately probed.
+
+The task definitions and bootstrap must not contain
+`truststore.pki.rds.amazonaws.com`, `/tmp/rds-global-bundle.pem`, or
+`/var/lib/elspeth/rds-global-bundle.pem`.
+
+OCI digest
+`sha256:c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700`
+predates this contract. It is an acceptance-attempt artifact and is not
+eligible for `0.7.2-RC-280726`.
+
+Verify the baked trust root and its OCI CA labels against the candidate
+image directly:
+
+```bash
+docker buildx imagetools inspect "$CANDIDATE_IMAGE"
+test "$(docker inspect --format \
+  '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
+  "$CANDIDATE_IMAGE")" = \
+  e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3
+test "$(docker inspect --format \
+  '{{ index .Config.Labels "io.elspeth.rds-ca-certificate-identifier" }}' \
+  "$CANDIDATE_IMAGE")" = rds-ca-rsa2048-g1
+```
+
+Verify the live Aurora CA identifier and the task definitions'
+`readonlyRootFilesystem` split through the protected capture wrappers
+defined in [Protected command capture](#protected-command-capture):
+
+```bash
+CA_IDENTIFIER=$(aws_capture aws rds describe-db-instances \
+  --db-instance-identifier "$DB_INSTANCE_IDENTIFIER" \
+  --query 'DBInstances[0].CACertificateIdentifier' --output text)
+test "$CA_IDENTIFIER" = rds-ca-rsa2048-g1
+
+NON_WEB_READONLY_JSON=$(aws_capture aws ecs describe-task-definition \
+  --task-definition "$TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name!=`cloudwatch-agent` && name!=`elspeth-web`].readonlyRootFilesystem' \
+  --output json)
+jq -e 'length > 0 and all(.[]; . == true)' <<<"$NON_WEB_READONLY_JSON" >/dev/null
+
+WEB_READONLY_JSON=$(aws_capture aws ecs describe-task-definition \
+  --task-definition "$TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].readonlyRootFilesystem' \
+  --output json)
+jq -e 'all(.[]; . != true)' <<<"$WEB_READONLY_JSON" >/dev/null
+```
+
+Run the first check against a task definition that carries non-web ELSPETH
+containers (doctor, schema-init, or verifier); a web-only task definition
+projects an empty array there, and `length > 0` fails closed rather than
+silently passing. Run the second check against the web task definition: its
+`readonlyRootFilesystem` field is absent, so the projection yields `[null]`,
+and `. != true` proves the documented exemption rather than a silent `true`
+that would break ECS Exec.
+
+### Upgrading an existing install
+
+Applying this module version to an existing install rotates all five Secrets
+Manager database URLs to the canonical immutable-trust query immediately,
+while `aws_ecs_service.web` ignores task-definition changes
+(`lifecycle.ignore_changes`). An old-image task that restarts inside that
+window injects the new canonical URL, lacks the baked bundle, and
+crash-loops. Apply and roll the service in one operation: run
+`terraform apply`, then immediately
+`aws ecs update-service --force-new-deployment` with the new qualified image
+digest. Pinning `ca_cert_identifier` on an existing Aurora instance triggers
+a database modification with engine-dependent restart semantics — expect and
+schedule it. No pre-trust-root image digest is rollback-eligible after the
+upgrade (see the rollback section).
+
 ## Storage provisioning and cold start
 
 Before doctor, run `provision_scenario_storage` above. It provisions
@@ -3016,6 +3111,12 @@ the refusal/forward-recovery record. If the candidate is unhealthy, keep traffic
 drained and repair forward with epoch-36 session/epoch-29 Landscape code.
 Predecessor database restoration and code downgrade are not supported repair
 paths. Never roll old code over the recreated schema.
+
+No image digest that predates the immutable trust-root contract is
+rollback-eligible: such images lack the baked bundle and are rejected by the
+canonical URL contract at startup. Scenario B rollback evidence is therefore
+structurally impossible until a second, independently qualified trust-root
+digest exists; until then, record live rollback as unavailable.
 
 For first/first-recovery, remove traffic before compute, verify the listener's
 fixed 503 action, then scale to zero:
