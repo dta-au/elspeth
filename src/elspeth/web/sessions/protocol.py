@@ -812,8 +812,11 @@ class GuidedForkSettlementCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("GuidedForkSettlementCommand.fence must be exact")
-        for field_name in ("child_session_id", "edited_message_id"):
-            if type(getattr(self, field_name)) is not UUID:
+        for field_name, value in (
+            ("child_session_id", self.child_session_id),
+            ("edited_message_id", self.edited_message_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"GuidedForkSettlementCommand.{field_name} must be a UUID")
         if self.expected_current_state_id is not None and type(self.expected_current_state_id) is not UUID:
             raise AuditIntegrityError("GuidedForkSettlementCommand.expected_current_state_id must be a UUID or None")
@@ -1376,17 +1379,16 @@ class PreparedGuidedInterpretationDraft:
     def __post_init__(self) -> None:
         if type(self.event_id) is not UUID:
             raise AuditIntegrityError("PreparedGuidedInterpretationDraft.event_id must be a UUID")
-        for field_name in (
-            "affected_node_id",
-            "tool_call_id",
-            "user_term",
-            "llm_draft",
-            "model_identifier",
-            "model_version",
-            "provider",
-            "composer_skill_hash",
+        for field_name, value in (
+            ("affected_node_id", self.affected_node_id),
+            ("tool_call_id", self.tool_call_id),
+            ("user_term", self.user_term),
+            ("llm_draft", self.llm_draft),
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+            ("composer_skill_hash", self.composer_skill_hash),
         ):
-            value = getattr(self, field_name)
             if type(value) is not str or not value:
                 raise AuditIntegrityError(f"PreparedGuidedInterpretationDraft.{field_name} must be a non-empty exact string")
         if type(self.kind) is not InterpretationKind:
@@ -1532,8 +1534,12 @@ class GuidedPipelineProposalStageCommand:
 
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("GuidedPipelineProposalStageCommand.fence must be exact")
-        for field_name in ("expected_current_state_id", "checkpoint_state_id", "proposal_id"):
-            if type(getattr(self, field_name)) is not UUID:
+        for field_name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("checkpoint_state_id", self.checkpoint_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"GuidedPipelineProposalStageCommand.{field_name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("expected_current_state_version must be a positive exact integer")
@@ -1637,16 +1643,22 @@ class GuidedFullPipelineProposalStageCommand:
             raise AuditIntegrityError("guided-full expected state version must be positive or None")
         if self.expected_current_content_hash is not None:
             _require_guided_sha256(self.expected_current_content_hash, "guided-full expected content hash")
-        for field_name in ("checkpoint_state_id", "proposal_id"):
-            if type(getattr(self, field_name)) is not UUID:
+        for field_name, uuid_value in (
+            ("checkpoint_state_id", self.checkpoint_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(uuid_value) is not UUID:
                 raise AuditIntegrityError(f"guided-full {field_name} must be a UUID")
         if type(self.state) is not CompositionStateData:
             raise AuditIntegrityError("guided-full checkpoint state must be exact")
         if type(self.plan) is not PipelinePlanResult:
             raise AuditIntegrityError("guided-full plan must be exact")
-        for field_name in ("summary", "rationale", "actor"):
-            value = getattr(self, field_name)
-            if type(value) is not str or not value:
+        for field_name, text_value in (
+            ("summary", self.summary),
+            ("rationale", self.rationale),
+            ("actor", self.actor),
+        ):
+            if type(text_value) is not str or not text_value:
                 raise AuditIntegrityError(f"guided-full {field_name} must be non-empty")
         if type(self.affects) is not tuple or any(type(value) is not str or not value for value in self.affects):
             raise AuditIntegrityError("guided-full affects must be an exact non-empty-string tuple")
@@ -1809,13 +1821,20 @@ class GuidedPipelineProposalAcceptCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided accept fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, uuid_value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(uuid_value) is not UUID:
                 raise AuditIntegrityError(f"guided accept {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided accept expected version must be positive")
-        for name in ("draft_hash", "candidate_content_hash", "executor_content_hash"):
-            _require_guided_sha256(getattr(self, name), f"guided accept {name}")
+        for name, hash_value in (
+            ("draft_hash", self.draft_hash),
+            ("candidate_content_hash", self.candidate_content_hash),
+            ("executor_content_hash", self.executor_content_hash),
+        ):
+            _require_guided_sha256(hash_value, f"guided accept {name}")
         if type(self.reviewed_facts) not in {dict, MappingProxyType}:
             raise AuditIntegrityError("guided accept reviewed facts must be a mapping")
         from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -1846,8 +1865,11 @@ class GuidedPipelineConfirmationAdmissionCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided confirmation admission fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided confirmation admission {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided confirmation admission expected version must be positive")
@@ -1873,8 +1895,11 @@ class GuidedPipelineDispatchRecordCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided dispatch record fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided dispatch record {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided dispatch record expected version must be positive")
@@ -1914,8 +1939,11 @@ class GuidedPipelineProposalBackEditCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided back-edit fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided back-edit {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided back-edit expected version must be positive")
@@ -1963,8 +1991,11 @@ class GuidedPipelineProposalRejectCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided reject fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided reject {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided reject expected version must be positive")
@@ -2062,9 +2093,16 @@ class RunRecord:
             raise AuditIntegrityError("Tier 1: failed run is missing error")
 
     def _validate_counters(self) -> None:
-        for field_name in _RUN_COUNTER_FIELDS:
+        for field_name, value in (
+            ("rows_processed", self.rows_processed),
+            ("rows_succeeded", self.rows_succeeded),
+            ("rows_failed", self.rows_failed),
+            ("rows_routed_success", self.rows_routed_success),
+            ("rows_routed_failure", self.rows_routed_failure),
+            ("rows_quarantined", self.rows_quarantined),
+        ):
             try:
-                require_int(getattr(self, field_name), f"runs.{field_name}", min_value=0)
+                require_int(value, f"runs.{field_name}", min_value=0)
             except (TypeError, ValueError) as exc:
                 raise AuditIntegrityError(f"Tier 1: {exc}") from exc
 
