@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from .contracts import AcceptanceCheckError, _sha256, _utc_timestamp
 from .evidence import (
@@ -67,13 +67,16 @@ def _validate_committed_cleanup_replay(
     receipts_sha256: str,
 ) -> bool:
     final_evidence = manifest["final_evidence"]
-    if not (isinstance(final_evidence, dict) and final_evidence["phase"] == "committed" and manifest["cleanup_required"] is False):
+    if final_evidence is None:
+        return False
+    final_evidence_record = cast(dict[str, object], final_evidence)
+    if final_evidence_record["phase"] != "committed" or manifest["cleanup_required"] is not False:
         return False
     ledger_sha256 = _gate_ledger_records_hash(ledger)
     if (
-        final_evidence["ledger_sha256"] != ledger_sha256
-        or final_evidence["receipts_sha256"] != receipts_sha256
-        or type(final_evidence["committed_at"]) is not str
+        final_evidence_record["ledger_sha256"] != ledger_sha256
+        or final_evidence_record["receipts_sha256"] != receipts_sha256
+        or type(final_evidence_record["committed_at"]) is not str
     ):
         raise AcceptanceCheckError("cleanup_finalize_conflict")
     _verify_final_cleanup_receipt(manifest_path, manifest)
@@ -95,22 +98,17 @@ def cleanup_evidence_finalize(
     if manifest["gate_ledger_path"] != str(ledger_path):
         raise AcceptanceCheckError("cleanup_finalize_binding")
     ledger = _read_gate_ledger(ledger_path)
-    cleanup_records = ledger["cleanup_records"]
-    assert isinstance(cleanup_records, list)
-    terminal_records = [
-        record for record in cleanup_records if isinstance(record, dict) and record.get("check_id") == _TERMINAL_GATE_CHECK_ID
-    ]
+    cleanup_records = cast(list[object], ledger["cleanup_records"])
+    cleanup_record_items = [cast(dict[str, object], record) for record in cleanup_records]
+    terminal_records = [record for record in cleanup_record_items if record["check_id"] == _TERMINAL_GATE_CHECK_ID]
     if len(terminal_records) > 1:
         raise AcceptanceCheckError("gate_ledger_conflict")
-    prefix_records = [
-        record for record in cleanup_records if not isinstance(record, dict) or record.get("check_id") != _TERMINAL_GATE_CHECK_ID
-    ]
-    if [record["check_id"] for record in prefix_records if isinstance(record, dict)] != list(_CLEANUP_GATE_CHECK_ORDER[:-1]):
+    prefix_records = [record for record in cleanup_record_items if record["check_id"] != _TERMINAL_GATE_CHECK_ID]
+    if [record["check_id"] for record in prefix_records] != list(_CLEANUP_GATE_CHECK_ORDER[:-1]):
         raise AcceptanceCheckError("gate_ledger_incomplete")
     receipt_count, receipts_sha256 = _verify_stored_receipts(manifest_path, manifest)
     ledger_records_sha256 = _gate_ledger_records_hash({**ledger, "cleanup_records": prefix_records})
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, Mapping)
+    evidence = cast(Mapping[str, object], manifest["evidence"])
     export_receipt_path = evidence["final_export_receipt_path"]
     export_receipt_sha256 = evidence["final_export_receipt_sha256"]
     if type(export_receipt_path) is not str or type(export_receipt_sha256) is not str:
@@ -124,8 +122,7 @@ def cleanup_evidence_finalize(
     if observed_export_sha256 != export_receipt_sha256:
         raise AcceptanceCheckError("cleanup_finalize_export")
     timestamp = _utc_timestamp(now())
-    candidate_sha = manifest["candidate_sha"]
-    assert isinstance(candidate_sha, str)
+    candidate_sha = cast(str, manifest["candidate_sha"])
     terminal_receipt_hash = _sha256(
         json.dumps(
             {
@@ -160,16 +157,17 @@ def cleanup_evidence_finalize(
             "committed_at": None,
             "ledger_sha256": None,
         }
-        if isinstance(existing, dict):
-            comparable = {**prepared, "prepared_at": existing["prepared_at"]}
-            if existing != comparable:
+        if existing is not None:
+            existing_record = cast(dict[str, object], existing)
+            comparable = {**prepared, "prepared_at": existing_record["prepared_at"]}
+            if existing_record != comparable:
                 raise AcceptanceCheckError("cleanup_finalize_conflict")
             if terminal_records:
                 terminal = terminal_records[0]
                 if (
-                    terminal.get("candidate_sha") != candidate_sha
-                    or terminal.get("exit_status") != 0
-                    or terminal.get("receipt_hash") != terminal_receipt_hash
+                    terminal["candidate_sha"] != candidate_sha
+                    or terminal["exit_status"] != 0
+                    or terminal["receipt_hash"] != terminal_receipt_hash
                 ):
                     raise AcceptanceCheckError("cleanup_finalize_conflict")
             return manifest
@@ -196,9 +194,9 @@ def cleanup_evidence_finalize(
         receipts_sha256=receipts_sha256,
     ):
         return manifest
-    if manifest["cleanup_required"] is not True or not isinstance(final_evidence, dict):
+    if manifest["cleanup_required"] is not True or final_evidence is None:
         raise AcceptanceCheckError("cleanup_finalize_pending")
-    assert isinstance(final_evidence, dict)
+    final_evidence = cast(dict[str, object], final_evidence)
     if final_evidence["phase"] != "prepared":
         raise AcceptanceCheckError("cleanup_finalize_pending")
     if (
@@ -207,8 +205,7 @@ def cleanup_evidence_finalize(
         or final_evidence["ledger_records_sha256"] != ledger_records_sha256
     ):
         raise AcceptanceCheckError("cleanup_finalize_conflict")
-    cleanup_states = manifest["cleanup_states"]
-    assert isinstance(cleanup_states, dict)
+    cleanup_states = cast(dict[str, object], manifest["cleanup_states"])
     for surface, state_value in cleanup_states.items():
         if surface == "coordinator":
             continue
@@ -237,14 +234,11 @@ def cleanup_evidence_finalize(
         if exc.check == "gate_ledger_conflict":
             raise AcceptanceCheckError("cleanup_finalize_conflict") from None
         raise
-    cleanup_records = ledger["cleanup_records"]
-    assert isinstance(cleanup_records, list)
-    terminal = cleanup_records[-1]
-    if not isinstance(terminal, dict) or terminal.get("check_id") != _TERMINAL_GATE_CHECK_ID:
+    cleanup_records = cast(list[object], ledger["cleanup_records"])
+    terminal = cast(dict[str, object], cleanup_records[-1])
+    if terminal["check_id"] != _TERMINAL_GATE_CHECK_ID:
         raise AcceptanceCheckError("cleanup_finalize_conflict")
-    committed_at = terminal.get("ended_at")
-    if type(committed_at) is not str:
-        raise AcceptanceCheckError("cleanup_finalize_conflict")
+    committed_at = cast(str, terminal["ended_at"])
     ledger_sha256 = _gate_ledger_records_hash(ledger)
     precommit_manifest_sha256 = _sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     final_evidence.update(

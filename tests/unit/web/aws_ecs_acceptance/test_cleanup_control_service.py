@@ -61,6 +61,19 @@ def test_control_manifest_validate_fails_loudly_for_corrupt_final_evidence(
         )
 
 
+def test_committed_cleanup_replay_fails_loudly_for_corrupt_internal_state(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        cleanup._validate_committed_cleanup_replay(
+            tmp_path / "control.json",
+            {
+                "final_evidence": "corrupt",
+                "cleanup_required": False,
+            },
+            {},
+            receipts_sha256="a" * 64,
+        )
+
+
 def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(tmp_path: Path) -> None:
     manifest_path = tmp_path / "control.json"
     _init_control_manifest(manifest_path)

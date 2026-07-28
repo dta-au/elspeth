@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from elspeth.web import aws_ecs_acceptance as acceptance
+from elspeth.web._aws_ecs_acceptance import evidence as evidence_owner
 from elspeth.web._aws_ecs_acceptance import gate_ledger as gate_ledger_owner
 from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import (
     _init_control_manifest,
@@ -44,6 +45,26 @@ def test_cleanup_prefix_hash_fails_loudly_for_corrupt_internal_record() -> None:
                 "records": [],
                 "cleanup_records": [{}],
             }
+        )
+
+
+def test_evidence_export_fails_loudly_for_corrupt_internal_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        evidence_owner,
+        "_read_control_manifest",
+        lambda _path: {"candidate_sha": "a" * 40},
+    )
+    monkeypatch.setattr(evidence_owner, "_read_gate_ledger", lambda _path: {})
+
+    with pytest.raises(KeyError, match="candidate_sha"):
+        evidence_owner.create_evidence_export_receipt(
+            tmp_path / "control.json",
+            ledger_path=tmp_path / "ledger.json",
+            output_path=tmp_path / "export.json",
+            artifact_count=1,
         )
 
 
