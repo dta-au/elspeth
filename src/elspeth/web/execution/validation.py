@@ -1215,45 +1215,78 @@ def validate_pipeline(
         for node in state.nodes:
             if node.plugin != "blob_fetch":
                 continue
-            http_options = node.options["http"] if "http" in node.options else None
+            if "http" not in node.options:
+                continue
+            http_options = node.options["http"]
             if not isinstance(http_options, Mapping):
+                web_fetch_resource_errors.append(
+                    ValidationError(
+                        component_id=node.id,
+                        component_type="transform",
+                        message=f"blob_fetch.http must be a mapping; got {type(http_options).__name__}.",
+                        suggestion="Set blob_fetch.http to a mapping of HTTP resource options.",
+                        error_code="web_fetch_resource_config_invalid",
+                    )
+                )
                 continue
 
-            try:
-                timeout = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(http_options.get("timeout"))
-            except PydanticValidationError:
-                timeout = None
-            if timeout is not None and timeout > _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS:
-                web_fetch_resource_errors.append(
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=(
-                            f"blob_fetch.http.timeout={timeout} exceeds the web execution limit of "
-                            f"{_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} seconds."
-                        ),
-                        suggestion=f"Set blob_fetch.http.timeout to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} or less.",
-                        error_code="web_fetch_resource_limit_exceeded",
+            if "timeout" in http_options:
+                raw_timeout = http_options["timeout"]
+                try:
+                    timeout = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(raw_timeout)
+                except PydanticValidationError:
+                    web_fetch_resource_errors.append(
+                        ValidationError(
+                            component_id=node.id,
+                            component_type="transform",
+                            message=f"blob_fetch.http.timeout must be an integer; got {type(raw_timeout).__name__}.",
+                            suggestion=f"Set blob_fetch.http.timeout to an integer from 0 to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS}.",
+                            error_code="web_fetch_resource_config_invalid",
+                        )
                     )
-                )
+                else:
+                    if timeout > _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS:
+                        web_fetch_resource_errors.append(
+                            ValidationError(
+                                component_id=node.id,
+                                component_type="transform",
+                                message=(
+                                    f"blob_fetch.http.timeout={timeout} exceeds the web execution limit of "
+                                    f"{_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} seconds."
+                                ),
+                                suggestion=f"Set blob_fetch.http.timeout to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} or less.",
+                                error_code="web_fetch_resource_limit_exceeded",
+                            )
+                        )
 
-            try:
-                max_body_bytes = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(http_options.get("max_body_bytes"))
-            except PydanticValidationError:
-                max_body_bytes = None
-            if max_body_bytes is not None and max_body_bytes > _WEB_BLOB_FETCH_MAX_BODY_BYTES:
-                web_fetch_resource_errors.append(
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=(
-                            f"blob_fetch.http.max_body_bytes={max_body_bytes} exceeds the web execution limit of "
-                            f"{_WEB_BLOB_FETCH_MAX_BODY_BYTES} bytes."
-                        ),
-                        suggestion=f"Set blob_fetch.http.max_body_bytes to {_WEB_BLOB_FETCH_MAX_BODY_BYTES} or less.",
-                        error_code="web_fetch_resource_limit_exceeded",
+            if "max_body_bytes" in http_options:
+                raw_max_body_bytes = http_options["max_body_bytes"]
+                try:
+                    max_body_bytes = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(raw_max_body_bytes)
+                except PydanticValidationError:
+                    web_fetch_resource_errors.append(
+                        ValidationError(
+                            component_id=node.id,
+                            component_type="transform",
+                            message=(f"blob_fetch.http.max_body_bytes must be an integer; got {type(raw_max_body_bytes).__name__}."),
+                            suggestion=(f"Set blob_fetch.http.max_body_bytes to an integer from 0 to {_WEB_BLOB_FETCH_MAX_BODY_BYTES}."),
+                            error_code="web_fetch_resource_config_invalid",
+                        )
                     )
-                )
+                else:
+                    if max_body_bytes > _WEB_BLOB_FETCH_MAX_BODY_BYTES:
+                        web_fetch_resource_errors.append(
+                            ValidationError(
+                                component_id=node.id,
+                                component_type="transform",
+                                message=(
+                                    f"blob_fetch.http.max_body_bytes={max_body_bytes} exceeds the web execution limit of "
+                                    f"{_WEB_BLOB_FETCH_MAX_BODY_BYTES} bytes."
+                                ),
+                                suggestion=f"Set blob_fetch.http.max_body_bytes to {_WEB_BLOB_FETCH_MAX_BODY_BYTES} or less.",
+                                error_code="web_fetch_resource_limit_exceeded",
+                            )
+                        )
 
     if web_fetch_resource_errors:
         affected_nodes = tuple(error.component_id for error in web_fetch_resource_errors if error.component_id is not None)
@@ -1261,7 +1294,7 @@ def validate_pipeline(
             ValidationCheck(
                 name=_CHECK_WEB_FETCH_RESOURCE_POLICY,
                 passed=False,
-                detail="blob_fetch resource limits exceed the web execution policy",
+                detail="blob_fetch resource configuration violates the web execution policy",
                 affected_nodes=affected_nodes,
                 outcome_code=None,
             )
@@ -1273,7 +1306,7 @@ def validate_pipeline(
             errors=web_fetch_resource_errors,
             readiness=_blocked_readiness(
                 code=_CHECK_WEB_FETCH_RESOURCE_POLICY,
-                detail="blob_fetch resource limits exceed the web execution policy.",
+                detail="blob_fetch resource configuration violates the web execution policy.",
                 component_id=web_fetch_resource_errors[0].component_id,
                 component_type="transform",
             ),

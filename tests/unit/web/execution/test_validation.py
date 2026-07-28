@@ -1060,6 +1060,46 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         assert result.readiness.blockers[0].code == "web_fetch_resource_policy"
         mock_yaml_gen.generate_yaml.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("http_options", "expected_fragment"),
+        [
+            ("not-an-http-mapping", "blob_fetch.http must be a mapping"),
+            ({"timeout": "not-an-integer"}, "blob_fetch.http.timeout must be an integer"),
+            ({"max_body_bytes": "not-an-integer"}, "blob_fetch.http.max_body_bytes must be an integer"),
+        ],
+    )
+    def test_blob_fetch_invalid_resource_config_rejected_before_yaml_generation(
+        self,
+        http_options: object,
+        expected_fragment: str,
+    ) -> None:
+        options = self._blob_fetch_options()
+        options["http"] = http_options
+        state = _make_state(
+            nodes=(
+                _make_node(
+                    plugin="blob_fetch",
+                    options=options,
+                ),
+            ),
+            outputs=(_make_output(name="results"),),
+        )
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+            mock_load.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_web_principal(state, _make_settings(), mock_yaml_gen)
+
+        assert result.is_valid is False
+        assert _check(result, "web_scrape_network_policy").passed is True
+        assert _check(result, "web_fetch_resource_policy").passed is False
+        assert {error.error_code for error in result.errors} == {"web_fetch_resource_config_invalid"}
+        assert expected_fragment in result.errors[0].message
+        assert result.readiness.execution_ready is False
+        assert result.readiness.blockers[0].code == "web_fetch_resource_policy"
+        mock_yaml_gen.generate_yaml.assert_not_called()
+
     def test_blob_fetch_default_resource_limits_allowed_to_reach_yaml_generation(self) -> None:
         state = _make_state(
             nodes=(
