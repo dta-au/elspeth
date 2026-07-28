@@ -2606,6 +2606,102 @@ class TestC83InFileTransplantDefence:
         assert matched is entry
         assert entry.matched is True
 
+    def test_matcher_raises_for_stale_scope_binding(self) -> None:
+        """The direct matcher preserves the binding verifier's strict failure."""
+        finding = Finding(
+            rule_id="R1",
+            file_path="plugins/widget.py",
+            line=10,
+            col=4,
+            symbol_context=("Widget", "lookup"),
+            fingerprint="livefp00",
+            code_snippet="payload.get(...)",
+            message="dict.get on Tier-2 data",
+            ast_path="body[0]/body[1]/body[2]/value",
+            scope_fingerprint="b" * 64,
+        )
+        entry = AllowlistEntry(
+            key=finding.canonical_key,
+            owner="historic-agent",
+            reason="r",
+            safety="s",
+            expires=None,
+            ast_path=finding.ast_path,
+            scope_fingerprint="a" * 64,
+            judge_signature_version=2,
+            judge_transport="codex_cli",
+            judge_verdict=JudgeVerdict.ACCEPTED,
+            judge_recorded_at=datetime(2026, 5, 1, tzinfo=UTC),
+            judge_model=DEFAULT_JUDGE_MODEL,
+            judge_policy_hash=JUDGE_POLICY_HASH,
+            judge_rationale="judge accepted the former enclosing scope",
+            judge_metadata_signature=f"hmac-sha256:{'0' * 64}",
+        )
+        allowlist = Allowlist(entries=[entry], per_file_rules=[])
+
+        with pytest.raises(ValueError, match=r"scope_fingerprint mismatch.*plugins/widget\.py"):
+            _match_finding(allowlist, finding)
+        assert entry.matched is False
+        assert allowlist.get_unused_entries() == [entry]
+
+    def test_run_check_reports_stale_scope_binding_as_live_violation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Collection fails closed without replacing ordinary finding output."""
+        import elspeth_lints.rules.trust_tier.tier_model.rule as tier_rule
+
+        finding = Finding(
+            rule_id="R1",
+            file_path="plugins/widget.py",
+            line=10,
+            col=4,
+            symbol_context=("Widget", "lookup"),
+            fingerprint="livefp00",
+            code_snippet="payload.get(...)",
+            message="dict.get on Tier-2 data",
+            ast_path="body[0]/body[1]/body[2]/value",
+            scope_fingerprint="b" * 64,
+        )
+        entry = AllowlistEntry(
+            key=finding.canonical_key,
+            owner="historic-agent",
+            reason="r",
+            safety="s",
+            expires=None,
+            ast_path=finding.ast_path,
+            scope_fingerprint="a" * 64,
+            judge_signature_version=2,
+            judge_transport="codex_cli",
+            judge_verdict=JudgeVerdict.ACCEPTED,
+            judge_recorded_at=datetime(2026, 5, 1, tzinfo=UTC),
+            judge_model=DEFAULT_JUDGE_MODEL,
+            judge_policy_hash=JUDGE_POLICY_HASH,
+            judge_rationale="judge accepted the former enclosing scope",
+            judge_metadata_signature=f"hmac-sha256:{'0' * 64}",
+        )
+        allowlist = Allowlist(entries=[entry], per_file_rules=[])
+        monkeypatch.setattr(tier_rule, "_load_tier_model_allowlist", lambda *_args, **_kwargs: allowlist)
+        monkeypatch.setattr(tier_rule, "scan_directory_with_observations", lambda *_args: ([finding], []))
+        monkeypatch.setattr(tier_rule, "scan_layer_imports_directory", lambda *_args: ([], []))
+        args = argparse.Namespace(
+            root=tmp_path,
+            allowlist=tmp_path / "allowlist",
+            exclude=[],
+            format="text",
+            files=[],
+        )
+
+        assert run_check(args) == 1
+        captured = capsys.readouterr()
+        assert "VIOLATIONS FOUND: 1" in captured.out
+        assert finding.canonical_key in captured.out
+        assert "STALE ALLOWLIST ENTRIES: 1" in captured.out
+        assert "Error:" not in captured.err
+        assert "Traceback" not in captured.out + captured.err
+
     def test_matcher_skips_binding_check_for_pre_judge_entry(self) -> None:
         """Pre-judge entries (no judge_verdict) carry no binding fields; matcher must skip the check.
 

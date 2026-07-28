@@ -2556,6 +2556,14 @@ def _match_finding(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | P
     return None
 
 
+def _match_finding_for_collection(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | PerFileRule | None:
+    """Fail closed on stale judge bindings while preserving direct diagnostics."""
+    try:
+        return _match_finding(allowlist, finding)
+    except ValueError:
+        return None
+
+
 def _load_tier_model_allowlist(path: Path, *, source_root: Path | None = None) -> Allowlist:
     """Load the tier-model allowlist via core's loader, then apply local governance.
 
@@ -2745,12 +2753,12 @@ def collect_check_result(
 
     violations: list[Finding] = []
     for finding in all_findings:
-        if finding.rule_id in _BANNED_RULES or _match_finding(allowlist, finding) is None:
+        if finding.rule_id in _BANNED_RULES or _match_finding_for_collection(allowlist, finding) is None:
             violations.append(finding)
 
     layer_warnings: list[Finding] = []
     for tc_finding in all_tc_findings:
-        if _match_finding(allowlist, tc_finding) is None:
+        if _match_finding_for_collection(allowlist, tc_finding) is None:
             layer_warnings.append(tc_finding)
 
     if files:
