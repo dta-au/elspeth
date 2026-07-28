@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -373,8 +374,15 @@ class DatabaseSink(BaseSink):
             "diverted_ordinals_json",
             "evidence_json",
         }
-        if any(bool(ledger_columns[name].get("nullable")) for name in required_not_null):
-            raise DatabaseEffectLedgerError("Database target-side effect ledger required columns must be NOT NULL")
+        for name in required_not_null:
+            column = ledger_columns[name]
+            if "nullable" not in column:
+                raise DatabaseEffectLedgerError("Database target-side effect ledger provider omitted nullable metadata")
+            nullable = column["nullable"]
+            if type(nullable) is not bool:
+                raise DatabaseEffectLedgerError("Database target-side effect ledger provider returned non-boolean nullable metadata")
+            if nullable:
+                raise DatabaseEffectLedgerError("Database target-side effect ledger required columns must be NOT NULL")
 
         if not inspector.has_table(self._table_name):
             raise DatabaseEffectLedgerError(
@@ -482,17 +490,17 @@ class DatabaseSink(BaseSink):
         if inspection.mode is not SinkEffectInspectionMode.INSPECTED:
             raise DatabaseEffectLedgerError("Database sink effects require a completed read-only target inspection")
         target = self._target_reference()
-        if inspection.reference != target or inspection.evidence.get("effect_id") != request.effect_id:
+        if inspection.reference != target or inspection.evidence["effect_id"] != request.effect_id:
             raise DatabaseEffectLedgerError("Database sink effect inspection does not bind this exact target and effect")
         ledger = self._require_effect_ledger_config()
         if (
-            inspection.evidence.get("ledger_table") != ledger.table
-            or inspection.evidence.get("ledger_schema_version") != ledger.schema_version
-            or inspection.evidence.get("target_table") != self._table_name
-            or inspection.evidence.get("dialect") not in _DATABASE_EFFECT_SUPPORTED_DIALECTS
+            inspection.evidence["ledger_table"] != ledger.table
+            or inspection.evidence["ledger_schema_version"] != ledger.schema_version
+            or inspection.evidence["target_table"] != self._table_name
+            or inspection.evidence["dialect"] not in _DATABASE_EFFECT_SUPPORTED_DIALECTS
         ):
             raise DatabaseEffectLedgerError("Database sink effect inspection is divergent from configured target authority")
-        target_columns_value = inspection.evidence.get("target_columns")
+        target_columns_value = inspection.evidence["target_columns"]
         if not isinstance(target_columns_value, tuple) or any(not isinstance(value, str) for value in target_columns_value):
             raise DatabaseEffectLedgerError("Database sink effect inspection lacks exact target columns")
         target_columns = set(target_columns_value)
@@ -709,18 +717,18 @@ class DatabaseSink(BaseSink):
         member_count: int,
     ) -> SinkEffectCommitResult:
         if (
-            marker.get("effect_id") != plan.effect_id
-            or marker.get("schema_version") != _DATABASE_EFFECT_LEDGER_SCHEMA_VERSION
-            or marker.get("protocol_version") != SINK_EFFECT_PROTOCOL_VERSION
-            or marker.get("plan_hash") != plan.plan_hash
-            or marker.get("payload_hash") != plan.payload_hash
-            or marker.get("completed") is not True
+            marker["effect_id"] != plan.effect_id
+            or marker["schema_version"] != _DATABASE_EFFECT_LEDGER_SCHEMA_VERSION
+            or marker["protocol_version"] != SINK_EFFECT_PROTOCOL_VERSION
+            or marker["plan_hash"] != plan.plan_hash
+            or marker["payload_hash"] != plan.payload_hash
+            or marker["completed"] is not True
         ):
             raise DatabaseEffectMarkerDivergence("Database effect marker does not exactly bind this effect plan")
-        accepted_value = self._require_canonical_json(marker.get("accepted_ordinals_json"), field_name="accepted_ordinals_json")
-        diverted_value = self._require_canonical_json(marker.get("diverted_ordinals_json"), field_name="diverted_ordinals_json")
-        diversion_hashes = self._require_canonical_json(marker.get("diversion_hashes_json"), field_name="diversion_hashes_json")
-        evidence_value = self._require_canonical_json(marker.get("evidence_json"), field_name="evidence_json")
+        accepted_value = self._require_canonical_json(marker["accepted_ordinals_json"], field_name="accepted_ordinals_json")
+        diverted_value = self._require_canonical_json(marker["diverted_ordinals_json"], field_name="diverted_ordinals_json")
+        diversion_hashes = self._require_canonical_json(marker["diversion_hashes_json"], field_name="diversion_hashes_json")
+        evidence_value = self._require_canonical_json(marker["evidence_json"], field_name="evidence_json")
         if (
             type(accepted_value) is not list
             or type(diverted_value) is not list
@@ -751,16 +759,16 @@ class DatabaseSink(BaseSink):
                 or re.fullmatch(r"[0-9a-f]{16}", item["error_hash"]) is None
             ):
                 raise DatabaseEffectMarkerDivergence("Database effect marker diversion hashes are invalid")
-        descriptor = self._descriptor_from_json(marker.get("descriptor_json"))
-        accepted_payload_hash = marker.get("accepted_payload_hash")
+        descriptor = self._descriptor_from_json(marker["descriptor_json"])
+        accepted_payload_hash = marker["accepted_payload_hash"]
         if accepted_payload_hash != descriptor.content_hash:
             raise DatabaseEffectMarkerDivergence("Database effect marker accepted payload hash diverges from descriptor")
         metadata = None if descriptor.metadata is None else deep_thaw(descriptor.metadata)
         if (
             descriptor.artifact_type != "database"
             or type(metadata) is not dict
-            or metadata.get("table") != self._table_name
-            or metadata.get("row_count") != len(accepted)
+            or metadata["table"] != self._table_name
+            or metadata["row_count"] != len(accepted)
         ):
             raise DatabaseEffectMarkerDivergence("Database effect marker descriptor does not bind the configured target/result")
         expected_descriptor = ArtifactDescriptor.for_database(
@@ -774,7 +782,7 @@ class DatabaseSink(BaseSink):
             raise DatabaseEffectMarkerDivergence("Database effect marker descriptor does not bind the configured database URL")
         expected_evidence = {
             "accepted_ordinals": list(accepted),
-            "descriptor": self._require_canonical_json(marker.get("descriptor_json"), field_name="descriptor_json"),
+            "descriptor": self._require_canonical_json(marker["descriptor_json"], field_name="descriptor_json"),
             "diversion_attribution": list(diversion_hashes),
             "diverted_ordinals": list(diverted),
         }
@@ -834,8 +842,8 @@ class DatabaseSink(BaseSink):
                     # the outer transaction whose RELEASE commits accepted rows
                     # before the marker insert. Establish a real outer write
                     # transaction so every savepoint and the marker share it.
-                    driver_connection = conn.connection.driver_connection
-                    if not bool(getattr(driver_connection, "in_transaction", False)):
+                    driver_connection = cast("sqlite3.Connection", conn.connection.driver_connection)
+                    if not driver_connection.in_transaction:
                         conn.exec_driver_sql("BEGIN IMMEDIATE")
                 target_columns = set(target.columns.keys())
                 planned_columns = set(deep_thaw(plan.safe_evidence)["target_columns"])
