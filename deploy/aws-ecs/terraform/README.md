@@ -36,6 +36,13 @@ temporarily; this is not a production certificate strategy.
 - A digest-pinned ELSPETH application image.
 - Two distinct `bedrock/...` provider IDs plus the exact inference-profile and
   foundation-model ARNs those IDs may invoke.
+- An active Bedrock model-access agreement for each chosen model id in the
+  target account. Confirm with `aws bedrock get-foundation-model-availability
+  --model-id <id>` that `agreementAvailability` reports `AVAILABLE`.
+  Third-party models may additionally require an AWS Marketplace
+  subscription the account must complete first; first-party Amazon models
+  generally have the agreement by default. A correct IAM policy still fails
+  invocation until this agreement exists.
 
 The normal provider still requires an explicit AWS profile, account, and region;
 the lifecycle provider adds a second explicit profile for the same account and

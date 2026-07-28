@@ -2106,8 +2106,20 @@ single region-pinned foundation-model grant does not match it. The
 run-scoped permissions boundary must independently allow the same
 wildcard-region resource — a task-role grant the boundary does not also
 allow is intersected away to nothing. Configure the ordinary `region_name`
-and a `bedrock/anthropic...` model identifier; do not embed AWS keys. For
-the two run-scoped Guardrails, grant resource-scoped
+and a `bedrock/anthropic...` model identifier; do not embed AWS keys.
+
+A correctly-shaped IAM policy is not sufficient on its own: the chosen model
+id also needs an active model-access agreement in the target account.
+Confirm with `aws bedrock get-foundation-model-availability --model-id <id>`
+that `agreementAvailability` reports `AVAILABLE` before granting access or
+running acceptance. First-party Amazon models generally have that agreement
+by default; third-party models (for example Anthropic's) may additionally
+require an AWS Marketplace subscription the account must complete first —
+without it, Bedrock invocation fails with an `AccessDeniedException` naming
+the missing Marketplace subscription even though the resource ARNs and
+boundary are correct.
+
+For the two run-scoped Guardrails, grant resource-scoped
 `bedrock:ApplyGuardrail` and grant `bedrock:GetGuardrail` only if the approved
 preflight uses it. Terraform creates two acceptance-run-tagged Guardrails,
 publishes immutable numeric versions, injects private identifier/version/
