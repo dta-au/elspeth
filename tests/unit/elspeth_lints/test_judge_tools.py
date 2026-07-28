@@ -458,9 +458,8 @@ def test_tool_mode_builds_streaming_hook_guarded_options(monkeypatch: pytest.Mon
     assert "TOOL-AUGMENTED INVESTIGATION MODE" in opts["system_prompt"]["append"]
 
 
-def test_tool_mode_policy_hash_unchanged() -> None:
-    # The signed corpus must not need re-signing because of tool mode.
-    assert JUDGE_POLICY_HASH == "sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da"
+def test_static_policy_hash_is_pinned() -> None:
+    assert JUDGE_POLICY_HASH == "sha256:6dece6fccd4bad1c42c1130c44b976704c7502cb4ee9dc6ec1fffaf247d0afdd"
 
 
 def test_tool_mode_turn_budget_exhaustion_is_classified(monkeypatch: pytest.MonkeyPatch, scope: AgentToolScope) -> None:

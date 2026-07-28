@@ -2640,16 +2640,17 @@ def test_t6b_fsync_called_per_outcome(tmp_path: Path, monkeypatch: pytest.Monkey
         ``os.fsync`` for the whole process during the test — the same
         dotted-path pattern that crashed a full-suite run when a sibling
         test globally replaced ``os.environ``. Rebinding the ``os`` *name
-        inside the sidecar's own namespace* keeps the spy local to the
-        code path under test; everything except ``fsync`` delegates to
-        the real module (the sidecar also uses ``os.ftruncate``,
-        ``os.open``, ``os.close``, and the ``O_*`` flag constants).
+        inside the sidecar's own namespace* keeps the spy local. This
+        double exposes the exact sidecar contract used by the test:
+        ``fsync``, ``ftruncate``, ``open``, ``close``, and the two flags.
         """
 
         fsync = staticmethod(spy_fsync)
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(_os, name)
+        ftruncate = staticmethod(_os.ftruncate)
+        open = staticmethod(_os.open)
+        close = staticmethod(_os.close)
+        O_RDONLY = _os.O_RDONLY
+        O_DIRECTORY = _os.O_DIRECTORY
 
     monkeypatch.setattr("elspeth_lints.core.reaudit_sidecar.os", _FsyncSpyOs())
 
