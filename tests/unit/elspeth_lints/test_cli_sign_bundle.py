@@ -913,9 +913,18 @@ def test_sign_bundle_resume_rejects_unrelated_same_yaml_stale_delete(
     assert _tree_bytes(allowlist_dir) == before
 
 
+@pytest.mark.parametrize(
+    "duplicate_header",
+    (
+        "allow_hits: # duplicate",
+        "allow_hits :",
+        '"allow_hits":',
+    ),
+)
 def test_sign_bundle_resume_rejects_duplicate_allow_hits_block(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    duplicate_header: str,
 ) -> None:
     import elspeth_lints.core.cli as cli_module
 
@@ -956,7 +965,8 @@ def test_sign_bundle_resume_rejects_duplicate_allow_hits_block(
         assert real_delete(action, source_file=source_file, args=args) == 0
         target = args.allowlist_dir / source_file
         current = target.read_text(encoding="utf-8")
-        target.write_text(current + "\n" + current, encoding="utf-8")
+        duplicate = current.replace("allow_hits:", duplicate_header, 1)
+        target.write_text(current + "\n" + duplicate, encoding="utf-8")
         raise KeyboardInterrupt
 
     with patch.object(
@@ -1313,7 +1323,14 @@ def test_sign_bundle_rejects_unrelated_candidate_mutation(tmp_path: Path) -> Non
     assert _tree_bytes(allowlist_dir) == before
 
 
-def test_sign_bundle_rejects_judge_decision_event_rewrite(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "tamper",
+    ("unrelated_record", "impossible_verdict_pair", "naive_timestamp"),
+)
+def test_sign_bundle_rejects_judge_decision_event_rewrite(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
     import elspeth_lints.core.cli as cli_module
 
     root = _build_root(tmp_path)
@@ -1330,21 +1347,25 @@ def test_sign_bundle_rejects_judge_decision_event_rewrite(tmp_path: Path) -> Non
     def _execute_then_rewrite_events(action: Any, *, args: Any) -> int:
         code = real_execute(action, args=args)
         event_path = args.allowlist_dir / ".judge-metrics" / "judge-decision-events.jsonl"
+        record = json.loads(event_path.read_text(encoding="utf-8"))
+        if tamper == "impossible_verdict_pair":
+            record["effective_verdict"] = "ACCEPTED"
+            record["model_verdict"] = "BLOCKED"
+        elif tamper == "naive_timestamp":
+            record["recorded_at"] = "2026-01-01T00:00:00"
+        else:
+            record = {
+                "schema_version": 1,
+                "source_file": "unrelated.py",
+                "entry_key": "unrelated.py:R1:X:y:fp=deadbeefdeadbeef",
+                "rule_id": "R1",
+                "effective_verdict": "ACCEPTED",
+                "model_verdict": "ACCEPTED",
+                "recorded_at": "2026-01-01T00:00:00+00:00",
+                "write_disposition": "written",
+            }
         event_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "source_file": "unrelated.py",
-                    "entry_key": "unrelated.py:R1:X:y:fp=deadbeefdeadbeef",
-                    "rule_id": "R1",
-                    "effective_verdict": "ACCEPTED",
-                    "model_verdict": "ACCEPTED",
-                    "judge_recorded_at": "2026-01-01T00:00:00+00:00",
-                    "write_disposition": "written",
-                },
-                sort_keys=True,
-            )
-            + "\n",
+            json.dumps(record, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         return code
@@ -1363,7 +1384,11 @@ def test_sign_bundle_rejects_judge_decision_event_rewrite(tmp_path: Path) -> Non
     assert _tree_bytes(allowlist_dir) == before
 
 
-def test_sign_bundle_rejects_unrelated_staged_rotation_record(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tamper", ("unrelated_record", "naive_timestamp"))
+def test_sign_bundle_rejects_unrelated_staged_rotation_record(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
     import elspeth_lints.core.cli as cli_module
 
     root = _build_root(tmp_path)
@@ -1399,28 +1424,34 @@ def test_sign_bundle_rejects_unrelated_staged_rotation_record(tmp_path: Path) ->
         args: Any,
     ) -> int:
         code = real_rotation(action, rotation_plan=rotation_plan, args=args)
-        unrelated = {
-            "schema_version": 1,
-            "kind": "tier_model_rotation",
-            "recorded_at": "2026-01-01T00:00:00+00:00",
-            "allowlist_dir": str(args.allowlist_dir),
-            "rotations": [
+        records = [json.loads(line) for line in args.rotation_log.read_text(encoding="utf-8").splitlines()]
+        if tamper == "naive_timestamp":
+            records[-1]["recorded_at"] = "2026-01-01T00:00:00"
+        else:
+            records.append(
                 {
-                    "source_file": "other.yaml",
-                    "old_key": "other.py:R1:X:y:fp=deadbeefdeadbeef",
-                    "new_key": "other.py:R1:X:y:fp=feedfacefeedface",
+                    "schema_version": 1,
+                    "kind": "tier_model_rotation",
+                    "recorded_at": "2026-01-01T00:00:00+00:00",
+                    "allowlist_dir": str(args.allowlist_dir),
+                    "rotations": [
+                        {
+                            "source_file": "other.yaml",
+                            "old_key": "other.py:R1:X:y:fp=deadbeefdeadbeef",
+                            "new_key": "other.py:R1:X:y:fp=feedfacefeedface",
+                        }
+                    ],
+                    "stale_entries_removed": [],
+                    "applied": {
+                        "other.yaml": {
+                            "rotations_applied": 1,
+                            "stale_entries_removed": 0,
+                        }
+                    },
                 }
-            ],
-            "stale_entries_removed": [],
-            "applied": {
-                "other.yaml": {
-                    "rotations_applied": 1,
-                    "stale_entries_removed": 0,
-                }
-            },
-        }
+            )
         args.rotation_log.write_text(
-            args.rotation_log.read_text(encoding="utf-8") + json.dumps(unrelated, sort_keys=True, separators=(",", ":")) + "\n",
+            "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
             encoding="utf-8",
         )
         return code

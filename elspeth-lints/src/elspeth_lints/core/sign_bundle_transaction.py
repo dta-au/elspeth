@@ -704,13 +704,23 @@ def _assert_judge_event_transition(
     expected_dispositions = (
         {"written"} if success is True else {"blocked_without_override"} if success is False else {"written", "blocked_without_override"}
     )
-    expected_effective_verdicts = (
-        {"ACCEPTED", "OVERRIDDEN_BY_OPERATOR"}
+    expected_verdict_pairs = (
+        {
+            ("ACCEPTED", "ACCEPTED"),
+            ("OVERRIDDEN_BY_OPERATOR", "ACCEPTED"),
+            ("OVERRIDDEN_BY_OPERATOR", "BLOCKED"),
+        }
         if success is True
-        else {"BLOCKED"}
+        else {("BLOCKED", "BLOCKED")}
         if success is False
-        else {"ACCEPTED", "BLOCKED", "OVERRIDDEN_BY_OPERATOR"}
+        else {
+            ("ACCEPTED", "ACCEPTED"),
+            ("BLOCKED", "BLOCKED"),
+            ("OVERRIDDEN_BY_OPERATOR", "ACCEPTED"),
+            ("OVERRIDDEN_BY_OPERATOR", "BLOCKED"),
+        }
     )
+    verdict_pair = (record.get("effective_verdict"), record.get("model_verdict"))
     if (
         set(record) != required_fields
         or record.get("schema_version") != 1
@@ -719,9 +729,8 @@ def _assert_judge_event_transition(
         or record.get("source_file") != key_parts[0]
         or record.get("rule_id") != key_parts[1]
         or record.get("write_disposition") not in expected_dispositions
-        or record.get("effective_verdict") not in expected_effective_verdicts
-        or record.get("model_verdict") not in {"ACCEPTED", "BLOCKED"}
-        or not isinstance(record.get("recorded_at"), str)
+        or verdict_pair not in expected_verdict_pairs
+        or not _is_timezone_aware_iso8601(record.get("recorded_at"))
     ):
         raise SignBundleTransactionError(f"{action.kind} {action.key!r} appended an unrelated decision event")
 
@@ -792,13 +801,25 @@ def _assert_rotation_staged_transition(
         set(record) != required_fields
         or record.get("schema_version") != 1
         or record.get("kind") != "tier_model_rotation"
-        or not isinstance(record.get("recorded_at"), str)
+        or not _is_timezone_aware_iso8601(record.get("recorded_at"))
         or not recorded_allowlist_is_candidate
         or record.get("rotations") != [expected_rotation]
         or record.get("stale_entries_removed") != []
         or record.get("applied") != expected_applied
     ):
         raise SignBundleTransactionError(f"rotation {action.key!r} appended an unrelated staged audit record")
+
+
+def _is_timezone_aware_iso8601(value: Any) -> bool:
+    from datetime import datetime
+
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.utcoffset() is not None
 
 
 def _assert_target_yaml_transition(
@@ -824,17 +845,47 @@ def _assert_target_yaml_transition(
     after_bytes = target.read_bytes() if target.is_file() else b""
 
     def load_mapping(payload: bytes, *, label: str) -> dict[str, Any]:
+        class UniqueKeySafeLoader(yaml.SafeLoader):
+            """SafeLoader variant that rejects duplicate keys at every depth."""
+
+        def construct_unique_mapping(
+            loader: Any,
+            node: Any,
+            deep: bool = False,
+        ) -> dict[Any, Any]:
+            loader.flatten_mapping(node)
+            mapping: dict[Any, Any] = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                try:
+                    duplicate = key in mapping
+                except TypeError as exc:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        "found an unhashable mapping key",
+                        key_node.start_mark,
+                    ) from exc
+                if duplicate:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        f"found duplicate key {key!r}",
+                        key_node.start_mark,
+                    )
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        UniqueKeySafeLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            construct_unique_mapping,
+        )
         try:
             text = payload.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise SignBundleTransactionError(f"{action.kind} {action.key!r} left invalid {label} YAML") from exc
-        headers = [line_number for line_number, line in enumerate(text.splitlines(), start=1) if line in {"allow_hits:", "allow_hits: []"}]
-        if len(headers) > 1:
-            raise SignBundleTransactionError(
-                f"{action.kind} {action.key!r} {label} YAML has duplicate allow_hits blocks at lines {headers}"
-            )
         try:
-            raw = yaml.safe_load(text) if text else {}
+            raw = yaml.load(text, Loader=UniqueKeySafeLoader) if text else {}
         except yaml.YAMLError as exc:
             raise SignBundleTransactionError(f"{action.kind} {action.key!r} left invalid {label} YAML") from exc
         if raw is None:
