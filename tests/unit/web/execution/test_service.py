@@ -41,6 +41,7 @@ from elspeth.contracts.run_result import RunResult
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
+    SinkEffectContract,
     SinkEffectExecutionPurpose,
     SinkEffectInputKind,
 )
@@ -204,7 +205,7 @@ def _blob_record_stub(
     )
 
 
-class _EffectCapableSinkStub:
+class _EffectCapableSinkStub(SinkEffectContract):
     effect_call_type = CallType.FILESYSTEM
     name = "effect-capable"
     _on_write_failure = "discard"
@@ -222,6 +223,14 @@ class _EffectCapableSinkStub:
     ) -> ResolvedSinkEffectMode:
         del cls, config, purpose
         return ResolvedSinkEffectMode("write")
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        del mode, required_input_kind
 
     def inspect_effect(self, _request: object, _ctx: object) -> None: ...
 

@@ -20,7 +20,7 @@ from typer.testing import CliRunner
 from elspeth.cli import _preflight_follower_sink_effects, _preflight_raw_settings_sink_effects, app
 from elspeth.contracts import CallType
 from elspeth.contracts.preflight import DependencyRunResult, PreflightResult
-from elspeth.contracts.sink_effects import SINK_EFFECT_PROTOCOL_VERSION, SinkEffectInputKind
+from elspeth.contracts.sink_effects import SINK_EFFECT_PROTOCOL_VERSION, SinkEffectContract, SinkEffectInputKind
 
 runner = CliRunner()
 
@@ -45,7 +45,7 @@ class _FakeGraph:
         """Match the ExecutionGraph API used by the CLI run command."""
 
 
-class _EffectCapableSink:
+class _EffectCapableSink(SinkEffectContract):
     effect_call_type = CallType.FILESYSTEM
     name = "effect-capable"
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -58,6 +58,14 @@ class _EffectCapableSink:
         from elspeth.contracts.sink_effects import ResolvedSinkEffectMode
 
         return ResolvedSinkEffectMode("write")
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        del mode, required_input_kind
 
     def inspect_effect(self, _request: object, _ctx: object) -> None: ...
 
