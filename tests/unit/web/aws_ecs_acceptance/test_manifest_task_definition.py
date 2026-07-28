@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from elspeth.web import aws_ecs_acceptance as acceptance
+from elspeth.web._aws_ecs_acceptance import task_definition
 from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import (
     CLOUDWATCH_AGENT_CONFIG_JSON,
     CLOUDWATCH_AGENT_OTEL_YAML,
@@ -50,8 +51,17 @@ def test_manifest_and_task_definition_modules_exist() -> None:
     assert importlib.util.find_spec("elspeth.web._aws_ecs_acceptance.task_definition") is not None
 
 
+def test_cloudwatch_sidecar_fails_loudly_for_incomplete_bound_inventory_contract() -> None:
+    with pytest.raises(KeyError, match="CLOUDWATCH_AGENT_IMAGE"):
+        task_definition._validate_cloudwatch_agent_sidecar(
+            {"name": "cloudwatch-agent", "image": "example.invalid/agent"},
+            {},
+            {},
+        )
+
+
 def test_manifest_and_task_definition_owners_are_facade_reexports_by_identity() -> None:
-    from elspeth.web._aws_ecs_acceptance import manifest, task_definition
+    from elspeth.web._aws_ecs_acceptance import manifest
 
     for name in (
         "control_manifest_bind_retained_evidence",
