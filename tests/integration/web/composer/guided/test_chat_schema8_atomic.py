@@ -571,6 +571,41 @@ def test_matching_uploaded_source_missing_required_failure_policy_raises(
         )
 
 
+def test_matching_uploaded_source_missing_required_path_raises(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    asyncio.run(
+        composer_test_client.app.state.blob_service.create_blob(
+            UUID(session_id),
+            "orders.csv",
+            b"order_id,total\n1,10\n",
+            "text/csv",
+            created_by="user",
+        )
+    )
+
+    def missing_path_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
+        assert inspection_facts is not None
+        return {
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        }
+
+    monkeypatch.setattr(guided_route, "build_step_1_source_prefill", missing_path_prefill)
+
+    with pytest.raises(InvariantError, match="matching source prefill is missing required path"):
+        asyncio.run(
+            guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
+                message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
+                plugin_hint="csv",
+                blob_service=composer_test_client.app.state.blob_service,
+                session_id=UUID(session_id),
+            )
+        )
+
+
 @pytest.mark.parametrize("malformed_policy", [None, 0, ""])
 def test_matching_uploaded_source_malformed_failure_policy_raises(
     composer_test_client: TestClient,

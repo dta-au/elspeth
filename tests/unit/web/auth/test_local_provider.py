@@ -369,8 +369,20 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
     def test_email_outbox_normalizes_valid_final_record_before_append(self, tmp_path) -> None:
         outbox_path = tmp_path / "email-verifications.jsonl"
-        published = {"delivery_id": "published"}
-        record = {"delivery_id": "delivery-1"}
+        published = {
+            "delivery_id": "published",
+            "user_id": "alice",
+            "email": "alice@example.com",
+            "token": "published-token",
+            "verification_url": "https://composer.example.test/?verify_token=published-token",
+        }
+        record = {
+            "delivery_id": "delivery-1",
+            "user_id": "bob",
+            "email": "bob@example.com",
+            "token": "next-token",
+            "verification_url": "https://composer.example.test/?verify_token=next-token",
+        }
         published_payload = json.dumps(published, sort_keys=True, separators=(",", ":")).encode()
         record_payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
         outbox_path.write_bytes(published_payload)
@@ -383,7 +395,11 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         "existing",
         [
             b'{"delivery_id":"crashed"',
-            b'{"delivery_id":"published"}\n{"delivery_id":"crashed"',
+            (
+                b'{"delivery_id":"published","email":"published@example.com","token":"published-token",'
+                b'"user_id":"published-user","verification_url":'
+                b'"https://composer.example.test/?verify_token=published-token"}\n{"delivery_id":"crashed"'
+            ),
         ],
         ids=["malformed-only", "mixed-valid-and-malformed"],
     )
@@ -411,7 +427,11 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         "existing",
         [
             b'{"user_id":"corrupt"}',
-            b'{"delivery_id":"published"}\n{"user_id":"corrupt"}',
+            (
+                b'{"delivery_id":"published","email":"published@example.com","token":"published-token",'
+                b'"user_id":"published-user","verification_url":'
+                b'"https://composer.example.test/?verify_token=published-token"}\n{"user_id":"corrupt"}'
+            ),
         ],
         ids=["invalid-only", "mixed-valid-and-invalid"],
     )
@@ -485,6 +505,64 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         records = [json.loads(line) for line in outbox_path.read_text().splitlines()]
         assert len(records) == 1
+
+    def test_publish_retry_rejects_divergent_payload_for_existing_delivery_id(self, tmp_path) -> None:
+        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        outbox_path = tmp_path / "email-verifications.jsonl"
+        provider.register_email_verified_user(
+            "alice",
+            "password123",
+            "Alice",
+            "alice@example.com",
+            verification_origin="https://composer.example.test",
+            outbox_path=outbox_path,
+        )
+        intended = json.loads(outbox_path.read_text().splitlines()[0])
+        divergent = dict(intended)
+        divergent["user_id"] = "mallory"
+        divergent["email"] = "mallory@example.com"
+        divergent["token"] = "wrong-token"
+        divergent["verification_url"] = "https://composer.example.test/?verify_token=wrong-token"
+        original_bytes = (json.dumps(divergent, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        outbox_path.write_bytes(original_bytes)
+        with provider._connect() as conn:
+            conn.execute("UPDATE email_verification_outbox SET published_at = NULL")
+
+        with pytest.raises(auth_local.AuditIntegrityError, match="does not match"):
+            provider.publish_pending_email_verifications(outbox_path)
+
+        assert outbox_path.read_bytes() == original_bytes
+        with provider._connect() as conn:
+            published_at = conn.execute(
+                "SELECT published_at FROM email_verification_outbox WHERE delivery_id = ?",
+                (intended["delivery_id"],),
+            ).fetchone()[0]
+        assert published_at is None
+
+    def test_email_outbox_rejects_duplicate_delivery_id_records(self, tmp_path) -> None:
+        outbox_path = tmp_path / "email-verifications.jsonl"
+        published = {
+            "delivery_id": "published",
+            "user_id": "alice",
+            "email": "alice@example.com",
+            "token": "verification-token",
+            "verification_url": "https://composer.example.test/?verify_token=verification-token",
+        }
+        record = {
+            "delivery_id": "delivery-1",
+            "user_id": "bob",
+            "email": "bob@example.com",
+            "token": "second-token",
+            "verification_url": "https://composer.example.test/?verify_token=second-token",
+        }
+        published_line = (json.dumps(published, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        original_bytes = published_line + published_line
+        outbox_path.write_bytes(original_bytes)
+
+        with pytest.raises(auth_local.AuditIntegrityError, match="duplicate delivery_id"):
+            auth_local._append_email_verification_record(outbox_path, record)
+
+        assert outbox_path.read_bytes() == original_bytes
 
     def test_startup_reclaims_pending_registration_after_retention_window(
         self,

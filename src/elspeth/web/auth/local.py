@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlencode
 
 import bcrypt
@@ -33,6 +34,15 @@ _EMAIL_VERIFICATION_TOKEN_BYTES = 32
 _EMAIL_VERIFICATION_TOKEN_TTL_SECONDS = 24 * 60 * 60
 _EMAIL_VERIFICATION_AUDIT_RETRY_SECONDS = 5 * 60
 _PENDING_REGISTRATION_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_EMAIL_VERIFICATION_DELIVERY_FIELDS = frozenset(
+    {
+        "delivery_id",
+        "email",
+        "token",
+        "user_id",
+        "verification_url",
+    }
+)
 MAX_BCRYPT_PASSWORD_BYTES = 72
 
 
@@ -67,7 +77,26 @@ def _verification_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def _read_jsonl_delivery_ids(fd: int) -> set[str]:
+def _canonical_email_verification_delivery(
+    record: Mapping[str, object],
+    *,
+    context: str,
+) -> tuple[str, bytes]:
+    """Validate and canonically bind one first-party delivery record."""
+    if "delivery_id" not in record:
+        raise AuditIntegrityError(f"{context} is missing delivery_id")
+    if set(record) != _EMAIL_VERIFICATION_DELIVERY_FIELDS:
+        raise AuditIntegrityError(f"{context} must contain exactly the required delivery fields")
+    for field_name in _EMAIL_VERIFICATION_DELIVERY_FIELDS:
+        value = record[field_name]
+        if type(value) is not str or value == "":
+            raise AuditIntegrityError(f"{context} has an invalid {field_name}")
+    delivery_id = cast(str, record["delivery_id"])
+    canonical = json.dumps(dict(record), sort_keys=True, separators=(",", ":")).encode()
+    return delivery_id, canonical
+
+
+def _read_jsonl_deliveries(fd: int) -> dict[str, bytes]:
     """Validate a locked verification outbox and normalize its final newline."""
     os.lseek(fd, 0, os.SEEK_SET)
     chunks: list[bytes] = []
@@ -75,9 +104,9 @@ def _read_jsonl_delivery_ids(fd: int) -> set[str]:
         chunks.append(chunk)
     content = b"".join(chunks)
     if not content:
-        return set()
+        return {}
 
-    delivery_ids: set[str] = set()
+    deliveries: dict[str, bytes] = {}
     for line_number, raw_line in enumerate(content.splitlines(), start=1):
         try:
             record = json.loads(raw_line)
@@ -85,20 +114,20 @@ def _read_jsonl_delivery_ids(fd: int) -> set[str]:
             raise AuditIntegrityError(f"Email verification outbox line {line_number} is malformed") from exc
         if type(record) is not dict:
             raise AuditIntegrityError(f"Email verification outbox line {line_number} must be a JSON object")
-        try:
-            delivery_id = record["delivery_id"]
-        except KeyError as exc:
-            raise AuditIntegrityError(f"Email verification outbox line {line_number} is missing delivery_id") from exc
-        if type(delivery_id) is not str or not delivery_id:
-            raise AuditIntegrityError(f"Email verification outbox line {line_number} has an invalid delivery_id")
-        delivery_ids.add(delivery_id)
+        delivery_id, canonical = _canonical_email_verification_delivery(
+            record,
+            context=f"Email verification outbox line {line_number}",
+        )
+        if delivery_id in deliveries:
+            raise AuditIntegrityError(f"Email verification outbox line {line_number} has a duplicate delivery_id")
+        deliveries[delivery_id] = canonical
 
     if not content.endswith(b"\n"):
         os.lseek(fd, 0, os.SEEK_END)
         if os.write(fd, b"\n") != 1:
             raise OSError("Email verification outbox newline repair was incomplete")
         os.fsync(fd)
-    return delivery_ids
+    return deliveries
 
 
 def _append_email_verification_record(outbox_path: Path, record: Mapping[str, object]) -> None:
@@ -108,20 +137,20 @@ def _append_email_verification_record(outbox_path: Path, record: Mapping[str, ob
     publication. A crash after append but before acknowledgement is recovered
     by scanning the locked file and acknowledging the already-present ID.
     """
-    try:
-        delivery_id = record["delivery_id"]
-    except KeyError as exc:
-        raise AuditIntegrityError("Email verification delivery_id is required") from exc
-    if type(delivery_id) is not str or not delivery_id:
-        raise AuditIntegrityError("Email verification delivery_id must be a non-empty string")
-    payload = (json.dumps(dict(record), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    delivery_id, canonical = _canonical_email_verification_delivery(
+        record,
+        context="Email verification delivery",
+    )
+    payload = canonical + b"\n"
     outbox_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(outbox_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
-        published_ids = _read_jsonl_delivery_ids(fd)
-        if delivery_id in published_ids:
+        published = _read_jsonl_deliveries(fd)
+        if delivery_id in published:
+            if published[delivery_id] != canonical:
+                raise AuditIntegrityError("Published email verification delivery does not match the durable intent")
             return
         original_size = os.lseek(fd, 0, os.SEEK_END)
         try:
@@ -551,7 +580,13 @@ class LocalAuthProvider:
                 record = json.loads(payload_json)
             except json.JSONDecodeError as exc:
                 raise AuditIntegrityError("Stored email verification outbox payload is malformed") from exc
-            if type(record) is not dict or record.get("delivery_id") != delivery_id:
+            if type(record) is not dict:
+                raise AuditIntegrityError("Stored email verification outbox binding is malformed")
+            try:
+                stored_delivery_id = record["delivery_id"]
+            except KeyError as exc:
+                raise AuditIntegrityError("Stored email verification outbox binding is malformed") from exc
+            if stored_delivery_id != delivery_id:
                 raise AuditIntegrityError("Stored email verification outbox binding is malformed")
             _append_email_verification_record(outbox_path, record)
             with self._connect(immediate=True) as conn:

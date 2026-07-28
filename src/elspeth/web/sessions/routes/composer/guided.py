@@ -13,7 +13,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.chat_solver import (
     build_step_chat_context_block,  # noqa: F401  # Preserve signed module statement positions.
 )
-from elspeth.web.composer.guided.emitters import build_component_review_turn
+from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin, build_component_review_turn
 from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE, WorkflowProfileKind, profile_for_kind
 from elspeth.web.composer.guided.protocol import Turn, validate_current_turn
 from elspeth.web.composer.guided.resolved import SinkResolved
@@ -518,6 +518,8 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
         return None
     prefilled = build_step_1_source_prefill(plugin_hint, inspection_facts=inspection_facts)
     if "path" not in prefilled:
+        if _inspection_matches_source_plugin(plugin_hint, inspection_facts):
+            raise InvariantError("matching source prefill is missing required path")
         # A ready upload with incompatible inspected content is not the same
         # thing as no upload. Preserve the facts so the chat boundary can
         # acknowledge the file and report the type mismatch without asking a
