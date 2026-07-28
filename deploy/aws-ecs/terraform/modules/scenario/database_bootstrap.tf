@@ -1,12 +1,14 @@
 locals {
   database_bootstrap_script = <<-PY
     import os
-    import urllib.request
-    from pathlib import Path
     from urllib.parse import urlsplit, urlunsplit
 
     import psycopg
     from psycopg import sql
+
+    from elspeth.web.aws_rds_trust import verify_aws_rds_trust_bundle
+
+    verify_aws_rds_trust_bundle()
 
     admin_url = os.environ["ELSPETH_DB_ADMIN_URL"]
     schema_role = os.environ["ELSPETH_DB_SCHEMA_ROLE"]
@@ -17,13 +19,6 @@ locals {
         os.environ["ELSPETH_DB_SESSION_DATABASE"],
         os.environ["ELSPETH_DB_LANDSCAPE_DATABASE"],
     ]
-    rds_ca = Path("/tmp/rds-global-bundle.pem")
-    rds_ca.write_bytes(
-        urllib.request.urlopen(
-            "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem",
-            timeout=20,
-        ).read()
-    )
 
     def database_url(database: str) -> str:
         parsed = urlsplit(admin_url)
@@ -106,11 +101,12 @@ locals {
   PY
 
   database_bootstrap_container = {
-    name       = "database-bootstrap"
-    image      = var.candidate_image
-    essential  = true
-    entryPoint = ["python", "-c"]
-    command    = [local.database_bootstrap_script]
+    name                   = "database-bootstrap"
+    image                  = var.candidate_image
+    essential              = true
+    readonlyRootFilesystem = true
+    entryPoint             = ["python", "-c"]
+    command                = [local.database_bootstrap_script]
     environment = [
       { name = "ELSPETH_DB_SCHEMA_ROLE", value = local.database_schema_role },
       { name = "ELSPETH_DB_RUNTIME_ROLE", value = local.database_runtime_role },

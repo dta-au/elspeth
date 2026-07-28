@@ -33,6 +33,10 @@ locals {
   data_dir               = "/var/lib/elspeth"
   payload_store_path     = "/var/lib/elspeth/payloads"
 
+  rds_ca_bundle_path = "/etc/elspeth/rds/global-bundle.pem"
+
+  rds_ca_identifier = "rds-ca-rsa2048-g1"
+
   web_family                = "${local.namespace}-web"
   schema_init_doctor_family = "${local.namespace}-schema-init-doctor"
   runtime_doctor_family     = "${local.namespace}-runtime-doctor"

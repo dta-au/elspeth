@@ -11,10 +11,6 @@ resource "aws_ecs_cluster" "scenario" {
 
 locals {
   ecs_identity_wrapper = <<-SHELL
-    rds_ca="${local.data_dir}/rds-global-bundle.pem"
-    if [ ! -s "$rds_ca" ]; then
-      RDS_CA_PATH="$rds_ca" python -c 'import os,tempfile,urllib.request; from pathlib import Path; target=Path(os.environ["RDS_CA_PATH"]); target.parent.mkdir(parents=True,exist_ok=True); data=urllib.request.urlopen("https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem",timeout=20).read(); assert data.startswith(b"-----BEGIN CERTIFICATE-----"); fd,tmp=tempfile.mkstemp(prefix=".rds-ca.",dir=target.parent); os.write(fd,data); os.close(fd); os.chmod(tmp,0o644); os.replace(tmp,target)'
-    fi
     metadata_url="$ECS_CONTAINER_METADATA_URI_V4/task"
     family=$(python -c 'import json,sys,urllib.request; print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Family"])' "$metadata_url")
     revision=$(python -c 'import json,sys,urllib.request; print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Revision"])' "$metadata_url")
@@ -123,53 +119,57 @@ locals {
   }
 
   schema_init_doctor_container = {
-    name             = local.doctor_name
-    image            = var.candidate_image
-    essential        = true
-    entryPoint       = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
-    command          = ["doctor", "aws-ecs", "--init-schema", "--json"]
-    environment      = local.runtime_environment
-    secrets          = local.schema_owner_secrets
-    mountPoints      = local.mount_points
-    logConfiguration = local.doctor_log_configuration
+    name                   = local.doctor_name
+    image                  = var.candidate_image
+    essential              = true
+    readonlyRootFilesystem = true
+    entryPoint             = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
+    command                = ["doctor", "aws-ecs", "--init-schema", "--json"]
+    environment            = local.runtime_environment
+    secrets                = local.schema_owner_secrets
+    mountPoints            = local.mount_points
+    logConfiguration       = local.doctor_log_configuration
   }
 
   runtime_doctor_container = {
-    name             = local.doctor_name
-    image            = var.candidate_image
-    essential        = true
-    entryPoint       = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
-    command          = ["doctor", "aws-ecs", "--json"]
-    environment      = local.runtime_environment
-    secrets          = local.runtime_secrets
-    mountPoints      = local.mount_points
-    logConfiguration = local.doctor_log_configuration
+    name                   = local.doctor_name
+    image                  = var.candidate_image
+    essential              = true
+    readonlyRootFilesystem = true
+    entryPoint             = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
+    command                = ["doctor", "aws-ecs", "--json"]
+    environment            = local.runtime_environment
+    secrets                = local.runtime_secrets
+    mountPoints            = local.mount_points
+    logConfiguration       = local.doctor_log_configuration
   }
 
   payload_container = {
-    name             = local.web_container_name
-    image            = var.candidate_image
-    essential        = true
-    user             = "1654:1654"
-    entryPoint       = ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
-    command          = ["provision-storage"]
-    environment      = local.runtime_environment
-    secrets          = local.runtime_secrets
-    mountPoints      = local.mount_points
-    logConfiguration = local.web_log_configuration
+    name                   = local.web_container_name
+    image                  = var.candidate_image
+    essential              = true
+    readonlyRootFilesystem = true
+    user                   = "1654:1654"
+    entryPoint             = ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
+    command                = ["provision-storage"]
+    environment            = local.runtime_environment
+    secrets                = local.runtime_secrets
+    mountPoints            = local.mount_points
+    logConfiguration       = local.web_log_configuration
   }
 
   local_auth_container = {
-    name             = local.web_container_name
-    image            = var.candidate_image
-    essential        = true
-    user             = "1654:1654"
-    entryPoint       = ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
-    command          = ["verify-local-auth"]
-    environment      = local.runtime_environment
-    secrets          = local.runtime_secrets
-    mountPoints      = local.mount_points
-    logConfiguration = local.web_log_configuration
+    name                   = local.web_container_name
+    image                  = var.candidate_image
+    essential              = true
+    readonlyRootFilesystem = true
+    user                   = "1654:1654"
+    entryPoint             = ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
+    command                = ["verify-local-auth"]
+    environment            = local.runtime_environment
+    secrets                = local.runtime_secrets
+    mountPoints            = local.mount_points
+    logConfiguration       = local.web_log_configuration
   }
 
   rollback_environment = [

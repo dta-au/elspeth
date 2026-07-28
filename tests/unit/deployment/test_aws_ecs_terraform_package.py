@@ -218,15 +218,23 @@ def test_database_topology_is_aurora_with_separate_databases_and_roles() -> None
     assert "ALTER ROLE IF EXISTS" not in bootstrap
     assert "aws_secretsmanager_secret_version.bootstrap" in bootstrap
     assert "landscape_passphrase" not in _all_text().lower()
+    canonical_root = "/etc/elspeth/rds/global-bundle.pem"
     assert storage.count("sslmode=verify-full") == 5
-    assert storage.count("sslrootcert=${local.data_dir}/rds-global-bundle.pem") == 4
-    assert storage.count("sslrootcert=/tmp/rds-global-bundle.pem") == 1
+    assert storage.count("sslrootcert=${local.rds_ca_bundle_path}") == 5
+    assert canonical_root in _text("modules/scenario/locals.tf")
+    assert 'rds_ca_identifier = "rds-ca-rsa2048-g1"' in _text("modules/scenario/locals.tf")
+    assert re.search(
+        r"ca_cert_identifier\s+=\s+local\.rds_ca_identifier",
+        storage,
+    )
+    assert "truststore.pki.rds.amazonaws.com" not in _all_text()
+    assert "urllib.request" not in _text("modules/scenario/database_bootstrap.tf")
+    assert "/tmp/rds-global-bundle.pem" not in _all_text()
+    assert "${local.data_dir}/rds-global-bundle.pem" not in _all_text()
     assert '?sslmode=require"' not in storage
     assert re.search(r"posix_user\s*{\s*uid\s*=\s*1654\s*gid\s*=\s*1654", storage, re.DOTALL)
     assert re.search(r"creation_info\s*{\s*owner_uid\s*=\s*1654\s*owner_gid\s*=\s*1654", storage, re.DOTALL)
     assert 'path = "/elspeth-${local.namespace}"' in storage
-    assert "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" in bootstrap
-    assert "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" in _text("modules/scenario/ecs.tf")
     for relative in (
         "modules/scenario/variables.tf",
         "scenario-a/variables.tf",
@@ -242,6 +250,24 @@ def test_database_topology_is_aurora_with_separate_databases_and_roles() -> None
     ):
         assert "16.13" in _text(relative)
     assert "`ap-southeast-1`" in _text("README.md")
+
+
+def test_read_only_root_filesystem_matches_the_container_contract() -> None:
+    ecs = _text("modules/scenario/ecs.tf")
+    bootstrap = _text("modules/scenario/database_bootstrap.tf")
+    assert ecs.count("readonlyRootFilesystem = true") == 4
+    assert "readonlyRootFilesystem = true" in bootstrap
+    assert "readonlyRootFilesystem" not in ecs[ecs.index("cloudwatch_agent_container = {") : ecs.index("candidate_web_container = {")]
+    assert "readonlyRootFilesystem" not in ecs[ecs.index("candidate_web_container = {") : ecs.index("schema_init_doctor_container = {")]
+    assert "rollback_web_container = merge(local.candidate_web_container" in ecs
+    assert "rollback_doctor_container = merge(local.runtime_doctor_container" in ecs
+
+
+def test_database_bootstrap_uses_the_image_trust_verifier() -> None:
+    bootstrap = _text("modules/scenario/database_bootstrap.tf")
+    assert "verify_aws_rds_trust_bundle" in bootstrap
+    assert "urllib.request" not in bootstrap
+    assert "Path(" not in bootstrap
 
 
 def test_bedrock_composer_uses_the_task_role_without_static_credentials() -> None:
@@ -763,10 +789,10 @@ def test_schema_init_and_runtime_doctors_have_separate_credentials_and_commands(
 
     schema_container = ecs[ecs.index("schema_init_doctor_container = {") : ecs.index("runtime_doctor_container = {")]
     runtime_container = ecs[ecs.index("runtime_doctor_container = {") : ecs.index("payload_container = {")]
-    assert 'command          = ["doctor", "aws-ecs", "--init-schema", "--json"]' in schema_container
-    assert "secrets          = local.schema_owner_secrets" in schema_container
-    assert 'command          = ["doctor", "aws-ecs", "--json"]' in runtime_container
-    assert "secrets          = local.runtime_secrets" in runtime_container
+    assert 'command                = ["doctor", "aws-ecs", "--init-schema", "--json"]' in schema_container
+    assert "secrets                = local.schema_owner_secrets" in schema_container
+    assert 'command                = ["doctor", "aws-ecs", "--json"]' in runtime_container
+    assert "secrets                = local.runtime_secrets" in runtime_container
     assert 'resource "aws_ecs_task_definition" "schema_init_doctor"' in ecs
     assert 'resource "aws_ecs_task_definition" "runtime_doctor"' in ecs
     assert "DOCTOR_TASK_DEFINITION                          = aws_ecs_task_definition.runtime_doctor.arn" in outputs
