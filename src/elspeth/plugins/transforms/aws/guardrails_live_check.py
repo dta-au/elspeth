@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any
 
 from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
@@ -15,6 +13,9 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
     HARMFUL_CONTENT_FILTERS,
     PROMPT_ATTACK_FILTERS,
     BedrockGuardrailsClient,
+    BedrockRuntimeClient,
+    GuardrailResponseError,
+    GuardrailServiceError,
     GuardrailSource,
 )
 
@@ -58,12 +59,12 @@ def run_guardrail_live_check(
     state_id: str,
     run_id: str,
     telemetry_emit: TelemetryEmitCallback,
-    sdk_client: Any | None = None,
+    sdk_client: BedrockRuntimeClient | None = None,
 ) -> GuardrailLiveReceipt:
     """Run operator-approved safe/blocked cases and return no raw live data."""
-    policy = _PLUGIN_POLICIES.get(profile.plugin)
-    if policy is None or len(profile.alias) > 64:
+    if profile.plugin not in _PLUGIN_POLICIES or len(profile.alias) > 64:
         raise GuardrailLiveCheckError("Bedrock Guardrail live profile is invalid")
+    policy = _PLUGIN_POLICIES[profile.plugin]
     source, required_filters = policy
     owns_sdk_client = sdk_client is None
     client: BedrockGuardrailsClient | None = None
@@ -102,13 +103,8 @@ def run_guardrail_live_check(
         )
     except GuardrailLiveCheckError:
         raise
-    except Exception:
+    except (GuardrailResponseError, GuardrailServiceError, ValueError):
         raise GuardrailLiveCheckError("Bedrock Guardrail live check failed") from None
     finally:
         if owns_sdk_client and client is not None:
-            close = getattr(client.sdk_client, "close", None)
-            if callable(close):
-                # The live proof must never let an SDK cleanup message bypass
-                # its receipt-only error boundary.
-                with suppress(Exception):
-                    close()
+            client.sdk_client.close()

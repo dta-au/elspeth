@@ -223,10 +223,8 @@ def test_full_optional_sections_are_validated_and_private_details_are_discarded(
         {},
         {"guardrailProcessingLatency": 17},
         {"usage": _required_usage()},
-        {"guardrailCoverage": {"textCharacters": {}}},
-        {"guardrailCoverage": {"textCharacters": {"guarded": 3}, "images": {"total": 0}}},
     ],
-    ids=("empty", "latency-only", "required-usage-only", "empty-coverage-bucket", "one-sided-coverage"),
+    ids=("empty", "latency-only", "required-usage-only"),
 )
 def test_model_conforming_partial_invocation_metrics_are_accepted(invocation_metrics: dict[str, object]) -> None:
     provider_response = response(full_optional_sections=True)
@@ -242,12 +240,8 @@ def test_model_conforming_partial_invocation_metrics_are_accepted(invocation_met
     "coverage",
     [
         {},
-        {"textCharacters": {}},
-        {"textCharacters": {"guarded": 3}},
-        {"textCharacters": {"total": 12}},
-        {"images": {"guarded": 0}},
     ],
-    ids=("empty", "empty-bucket", "guarded-only", "total-only", "images-guarded-only"),
+    ids=("empty",),
 )
 def test_model_conforming_partial_root_coverage_is_accepted(coverage: dict[str, object]) -> None:
     provider_response = response(full_optional_sections=True)
@@ -257,6 +251,32 @@ def test_model_conforming_partial_root_coverage_is_accepted(coverage: dict[str, 
 
     assert decision.detected is False
     assert attempts == 1
+
+
+@pytest.mark.parametrize(
+    "coverage",
+    [
+        {"textCharacters": {}},
+        {"textCharacters": {"guarded": 3}},
+        {"textCharacters": {"total": 12}},
+        {"images": {"guarded": 0}},
+        {"textCharacters": {"guarded": 3}, "images": {"total": 0}},
+    ],
+    ids=("empty-bucket", "guarded-only", "total-only", "images-guarded-only", "mixed-one-sided"),
+)
+@pytest.mark.parametrize("location", ["root", "invocation_metrics"])
+def test_incomplete_guardrail_coverage_bucket_fails_closed(
+    coverage: dict[str, object],
+    location: str,
+) -> None:
+    provider_response = response(full_optional_sections=True)
+    if location == "root":
+        provider_response["guardrailCoverage"] = coverage
+    else:
+        provider_response["assessments"][0]["invocationMetrics"]["guardrailCoverage"] = coverage
+
+    with pytest.raises(GuardrailResponseError):
+        parse_guardrail_response(provider_response, required_filters=PROMPT_FILTERS)
 
 
 @pytest.mark.parametrize("location", ["root", "invocation_metrics"])
@@ -431,6 +451,59 @@ def test_service_error_is_sanitized_audited_then_telemetered() -> None:
     assert execution.calls[0]["status"] is CallStatus.ERROR
     assert execution.calls[0]["response_data"].to_dict()["attempts"] == 3
     assert marker not in repr((execution.calls, events))
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        AssertionError("our bug"),
+        AttributeError("our bug"),
+        KeyError("our bug"),
+        NotImplementedError("our bug"),
+    ],
+)
+def test_internal_failures_escape_without_false_provider_audit(failure: Exception) -> None:
+    class FailingSDK:
+        def apply_guardrail(self, **_kwargs: object) -> object:
+            raise failure
+
+    execution = FakeExecution()
+    with pytest.raises(type(failure)) as exc_info:
+        _client(FailingSDK(), execution, []).apply_guardrail(
+            text="marker",
+            source="INPUT",
+            required_filters=PROMPT_FILTERS,
+        )
+
+    assert exc_info.value is failure
+    assert execution.calls == []
+
+
+def test_exception_with_forged_response_attribute_is_not_a_provider_failure() -> None:
+    class PretenderError(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("not botocore")
+            self.response = {
+                "Error": {"Code": "ThrottlingException"},
+                "ResponseMetadata": {"RetryAttempts": 2},
+            }
+
+    failure = PretenderError()
+
+    class FailingSDK:
+        def apply_guardrail(self, **_kwargs: object) -> object:
+            raise failure
+
+    execution = FakeExecution()
+    with pytest.raises(PretenderError) as exc_info:
+        _client(FailingSDK(), execution, []).apply_guardrail(
+            text="marker",
+            source="INPUT",
+            required_filters=PROMPT_FILTERS,
+        )
+
+    assert exc_info.value is failure
+    assert execution.calls == []
 
 
 def test_malformed_response_audits_sdk_attempt_count_before_decision_parsing() -> None:

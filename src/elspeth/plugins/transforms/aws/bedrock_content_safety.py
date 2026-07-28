@@ -39,7 +39,7 @@ class AWSBedrockContentSafety(BedrockGuardrailTransformBase):
         }
     )
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6f796eb6a8db2678"
+    source_file_hash: str | None = "sha256:78f075241edbabda"
     config_model = AWSBedrockContentSafetyConfig
     _required_filters = HARMFUL_CONTENT_FILTERS
     _detected_reason = "content_safety_violation"
@@ -55,7 +55,10 @@ class AWSBedrockContentSafety(BedrockGuardrailTransformBase):
     ) -> bool:
         if not super().is_effective_blocking_control(capability=capability, role=role, options=options):
             return False
-        return options.get("source", "OUTPUT") == "OUTPUT"
+        source: object = "OUTPUT"
+        if "source" in options:
+            source = options["source"]
+        return type(source) is str and source == "OUTPUT"
 
     def __init__(self, config: dict[str, Any]) -> None:
         cfg = AWSBedrockContentSafetyConfig.from_dict(config, plugin_name=self.name)

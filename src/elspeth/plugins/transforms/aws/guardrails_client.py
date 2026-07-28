@@ -9,7 +9,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import structlog
 
@@ -115,6 +115,22 @@ class GuardrailDecision:
     request_id: str | None
 
 
+class BedrockRuntimeClient(Protocol):
+    """SDK operations ELSPETH owns at the Bedrock Runtime boundary."""
+
+    def apply_guardrail(
+        self,
+        *,
+        guardrailIdentifier: str,
+        guardrailVersion: str,
+        source: GuardrailSource,
+        outputScope: str,
+        content: list[dict[str, object]],
+    ) -> object: ...
+
+    def close(self) -> None: ...
+
+
 def _mapping(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or not all(type(key) is str for key in value):
         raise GuardrailResponseError
@@ -148,7 +164,9 @@ def _parse_retry_attempts(value: object) -> int:
     if value is None:
         return 1
     metadata = _mapping(value)
-    retry_count = metadata.get("RetryAttempts", 0)
+    retry_count: object = 0
+    if "RetryAttempts" in metadata:
+        retry_count = metadata["RetryAttempts"]
     if type(retry_count) is not int or not 0 <= retry_count <= 10:
         raise GuardrailResponseError
     return retry_count + 1
@@ -159,7 +177,9 @@ def _parse_request_metadata(value: object) -> tuple[str | None, int]:
     if value is None:
         return None, attempts
     metadata = _mapping(value)
-    request_id = metadata.get("RequestId")
+    request_id: object = None
+    if "RequestId" in metadata:
+        request_id = metadata["RequestId"]
     if request_id is not None and (type(request_id) is not str or not 1 <= len(request_id) <= 256):
         raise GuardrailResponseError
     return request_id, attempts
@@ -171,16 +191,15 @@ def _validate_coverage(value: object) -> None:
         raise GuardrailResponseError
     for coverage_key, raw_counts in coverage.items():
         counts = _mapping(raw_counts)
-        if not set(counts) <= {"guarded", "total"}:
+        if set(counts) != {"guarded", "total"}:
             raise GuardrailResponseError
-        for name in ("guarded", "total"):
-            if name in counts:
-                count = counts[name]
-                if type(count) is not int or not 0 <= count <= _MAX_USAGE_UNITS:
-                    raise GuardrailResponseError
-        guarded = counts.get("guarded")
-        total = counts.get("total")
-        if type(guarded) is int and type(total) is int and guarded != total:
+        guarded = counts["guarded"]
+        total = counts["total"]
+        if type(guarded) is not int or not 0 <= guarded <= _MAX_USAGE_UNITS:
+            raise GuardrailResponseError
+        if type(total) is not int or not 0 <= total <= _MAX_USAGE_UNITS:
+            raise GuardrailResponseError
+        if guarded != total:
             raise GuardrailPartialCoverageError(coverage_key=coverage_key, guarded=guarded, total=total)
 
 
@@ -204,27 +223,37 @@ def _validate_applied_guardrail_details(value: object) -> None:
     if not set(details) <= allowed:
         raise GuardrailResponseError
 
-    guardrail_id = details.get("guardrailId")
+    guardrail_id: object = None
+    if "guardrailId" in details:
+        guardrail_id = details["guardrailId"]
     if guardrail_id is not None and (
         type(guardrail_id) is not str
         or len(guardrail_id) > 2048
         or (guardrail_id != "" and _APPLIED_GUARDRAIL_ID.fullmatch(guardrail_id) is None)
     ):
         raise GuardrailResponseError
-    version = details.get("guardrailVersion")
+    version: object = None
+    if "guardrailVersion" in details:
+        version = details["guardrailVersion"]
     if version is not None and (type(version) is not str or (version != "" and _APPLIED_GUARDRAIL_VERSION.fullmatch(version) is None)):
         raise GuardrailResponseError
-    arn = details.get("guardrailArn")
+    arn: object = None
+    if "guardrailArn" in details:
+        arn = details["guardrailArn"]
     if arn is not None and (type(arn) is not str or len(arn) > 2048 or _APPLIED_GUARDRAIL_ARN.fullmatch(arn) is None):
         raise GuardrailResponseError
-    origins = details.get("guardrailOrigin")
+    origins: object = None
+    if "guardrailOrigin" in details:
+        origins = details["guardrailOrigin"]
     if origins is not None:
         raw_origins = _list(origins, minimum=0, maximum=len(_GUARDRAIL_ORIGINS))
         if any(type(origin) is not str or origin not in _GUARDRAIL_ORIGINS for origin in raw_origins):
             raise GuardrailResponseError
         if len(set(raw_origins)) != len(raw_origins):
             raise GuardrailResponseError
-    ownership = details.get("guardrailOwnership")
+    ownership: object = None
+    if "guardrailOwnership" in details:
+        ownership = details["guardrailOwnership"]
     if ownership is not None and (type(ownership) is not str or ownership not in _GUARDRAIL_OWNERSHIP):
         raise GuardrailResponseError
 
@@ -266,7 +295,9 @@ def parse_guardrail_response(
     action = root["action"]
     if action not in ("NONE", "GUARDRAIL_INTERVENED"):
         raise GuardrailResponseError
-    action_reason = root.get("actionReason")
+    action_reason: object = None
+    if "actionReason" in root:
+        action_reason = root["actionReason"]
     if action_reason is not None and (type(action_reason) is not str or len(action_reason) > _MAX_ACTION_REASON):
         raise GuardrailResponseError
     if "guardrailCoverage" in root:
@@ -301,7 +332,9 @@ def parse_guardrail_response(
             raise GuardrailResponseError
         if confidence not in _FILTER_CONFIDENCE or filter_action not in _FILTER_ACTIONS or type(detected) is not bool:
             raise GuardrailResponseError
-        strength = item.get("filterStrength")
+        strength: object = None
+        if "filterStrength" in item:
+            strength = item["filterStrength"]
         if strength is not None and strength not in _FILTER_CONFIDENCE:
             raise GuardrailResponseError
         if filter_action == "BLOCKED" and not detected:
@@ -323,7 +356,10 @@ def parse_guardrail_response(
         raise GuardrailResponseError
     _validate_outputs(root["outputs"], intervened=intervened)
     usage = _parse_usage(root["usage"])
-    request_id, attempts = _parse_request_metadata(root.get("ResponseMetadata"))
+    response_metadata: object = None
+    if "ResponseMetadata" in root:
+        response_metadata = root["ResponseMetadata"]
+    request_id, attempts = _parse_request_metadata(response_metadata)
     return (
         GuardrailDecision(
             detected=detected_any,
@@ -343,7 +379,12 @@ def _is_retryable_sdk_error(error: Exception) -> bool:
         return True
     if not isinstance(error, ClientError):
         return False
-    code = str(error.response.get("Error", {}).get("Code", ""))
+    error_data: object = error.response["Error"]
+    if not isinstance(error_data, Mapping) or "Code" not in error_data:
+        return False
+    code = error_data["Code"]
+    if type(code) is not str:
+        return False
     return code in {
         "InternalServerException",
         "ServiceUnavailableException",
@@ -366,7 +407,7 @@ class BedrockGuardrailsClient(AuditedClientBase):
         guardrail_version: str,
         region: str,
         audit_salt: bytes,
-        sdk_client: Any | None = None,
+        sdk_client: BedrockRuntimeClient | None = None,
         token_id: str | None = None,
     ) -> None:
         super().__init__(execution, state_id, run_id, telemetry_emit, token_id=token_id)
@@ -383,10 +424,10 @@ class BedrockGuardrailsClient(AuditedClientBase):
         self._sdk_client = sdk_client if sdk_client is not None else self._build_sdk_client()
 
     @property
-    def sdk_client(self) -> Any:
+    def sdk_client(self) -> BedrockRuntimeClient:
         return self._sdk_client
 
-    def _build_sdk_client(self) -> Any:
+    def _build_sdk_client(self) -> BedrockRuntimeClient:
         return build_bedrock_runtime_client(self._region)
 
     def _emit_after_audit(
@@ -464,7 +505,10 @@ class BedrockGuardrailsClient(AuditedClientBase):
                 content=[{"text": {"text": text, "qualifiers": ["guard_content"]}}],
             )
             response_root = _mapping(response)
-            attempts = _parse_retry_attempts(response_root.get("ResponseMetadata"))
+            response_metadata: object = None
+            if "ResponseMetadata" in response_root:
+                response_metadata = response_root["ResponseMetadata"]
+            attempts = _parse_retry_attempts(response_metadata)
             decision, parsed_attempts = parse_guardrail_response(response_root, required_filters=required_filters)
             if parsed_attempts != attempts:
                 raise GuardrailResponseError
@@ -503,14 +547,19 @@ class BedrockGuardrailsClient(AuditedClientBase):
             call_status = CallStatus.ERROR
             error_payload = RawCallPayload({"type": "malformed_response", "retryable": False})
             decision = None
-        except Exception as error:
+        except _bedrock_provider_exception_types() as error:
             retryable = _is_retryable_sdk_error(error)
             terminal_error = GuardrailServiceError(retryable=retryable)
-            response_metadata = getattr(error, "response", {}).get("ResponseMetadata", {})
-            if isinstance(response_metadata, Mapping):
-                raw_retries = response_metadata.get("RetryAttempts", 0)
-                if type(raw_retries) is int and 0 <= raw_retries <= 10:
-                    attempts = raw_retries + 1
+            from botocore.exceptions import ClientError
+
+            if isinstance(error, ClientError) and "ResponseMetadata" in error.response:
+                response_metadata = error.response["ResponseMetadata"]
+                if isinstance(response_metadata, Mapping):
+                    raw_retries: object = 0
+                    if "RetryAttempts" in response_metadata:
+                        raw_retries = response_metadata["RetryAttempts"]
+                    if type(raw_retries) is int and 0 <= raw_retries <= 10:
+                        attempts = raw_retries + 1
             response_payload = RawCallPayload({"operation": "apply_guardrail", "status": "service_error", "attempts": attempts})
             call_status = CallStatus.ERROR
             error_payload = RawCallPayload({"type": "service_error", "retryable": retryable})
@@ -538,17 +587,27 @@ class BedrockGuardrailsClient(AuditedClientBase):
         return decision
 
 
-def build_bedrock_runtime_client(region: str) -> Any:
+def _bedrock_provider_exception_types() -> tuple[type[Exception], ...]:
+    """Declared botocore failures raised by Bedrock Runtime operations."""
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    return (BotoCoreError, ClientError)
+
+
+def build_bedrock_runtime_client(region: str) -> BedrockRuntimeClient:
     """Build the SDK client with botocore as the sole retry owner."""
     import boto3
     from botocore.config import Config
 
-    return boto3.client(
-        "bedrock-runtime",
-        region_name=region,
-        config=Config(
-            retries={"mode": "standard", "total_max_attempts": 3},
-            connect_timeout=5,
-            read_timeout=15,
+    return cast(
+        "BedrockRuntimeClient",
+        boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(
+                retries={"mode": "standard", "total_max_attempts": 3},
+                connect_timeout=5,
+                read_timeout=15,
+            ),
         ),
     )

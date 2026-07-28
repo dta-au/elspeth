@@ -24,6 +24,7 @@ class _SequencedSDK:
     def __init__(self, *responses: object) -> None:
         self._responses = iter(responses)
         self.calls: list[dict[str, object]] = []
+        self.close_count = 0
 
     def apply_guardrail(self, **kwargs: object) -> object:
         self.calls.append(kwargs)
@@ -31,6 +32,9 @@ class _SequencedSDK:
         if isinstance(item, Exception):
             raise item
         return item
+
+    def close(self) -> None:
+        self.close_count += 1
 
 
 def _profile(plugin: str = "aws_bedrock_prompt_shield") -> BedrockGuardrailProfileSettings:
@@ -175,3 +179,32 @@ def test_missing_provider_request_ids_are_receipted_without_values() -> None:
     receipt, _execution, _events = _run(_SequencedSDK(safe, blocked))
 
     assert receipt.request_ids_present is False
+
+
+def test_live_check_closes_owned_sdk_client_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk = _SequencedSDK(response(), response(detected="PROMPT_ATTACK"))
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.guardrails_client.build_bedrock_runtime_client",
+        lambda _region: sdk,
+    )
+
+    execution = FakeExecution()
+    run_guardrail_live_check(
+        profile=_profile(),
+        safe_text="safe",
+        blocked_text="blocked",
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+    )
+
+    assert sdk.close_count == 1
+
+
+def test_live_check_does_not_close_borrowed_sdk_client() -> None:
+    sdk = _SequencedSDK(response(), response(detected="PROMPT_ATTACK"))
+
+    _run(sdk)
+
+    assert sdk.close_count == 0
