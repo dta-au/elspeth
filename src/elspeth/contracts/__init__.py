@@ -344,6 +344,7 @@ from elspeth.contracts.types import (
     CoalesceName,
     GateName,
     NodeID,
+    RowUnionName,
     SinkName,
     StepResolver,
 )
@@ -510,6 +511,7 @@ __all__ = [  # Grouped by category for readability
     "AggregationName",
     "BranchName",
     "CoalesceName",
+    "RowUnionName",
     "GateName",
     "NODE_ID_MAX_LENGTH",
     "NodeID",

@@ -16,6 +16,7 @@ NodeID = NewType("NodeID", str)
 
 # Semantic names for pipeline components
 CoalesceName = NewType("CoalesceName", str)
+RowUnionName = NewType("RowUnionName", str)
 """User-defined name for coalesce point (e.g., 'merge_results')"""
 
 BranchName = NewType("BranchName", str)
