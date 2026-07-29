@@ -54,6 +54,7 @@ from elspeth.plugins.infrastructure.display_headers import (
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sinks._diversion_attribution import DiversionAttribution, build_diversion_attribution
 from elspeth.plugins.sinks._remote_object_effects import (
+    RemoteObjectCollisionError,
     RemoteObjectObservation,
     RemoteObjectPreconditionError,
     inspect_remote_object,
@@ -61,6 +62,7 @@ from elspeth.plugins.sinks._remote_object_effects import (
     reconcile_remote_observation,
     remote_commit_result,
     remote_stage_missing,
+    require_commit_authority,
     restage_remote_object,
     validate_remote_plan,
 )
@@ -712,7 +714,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:aee489e1efe41c1e"
+    source_file_hash: str | None = "sha256:a92df38a58c1b855"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -889,8 +891,11 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
         key = self._effect_key(ctx)
         target = f"s3://{self._bucket}/{key}"
         observation = self._observe_effect_target(key)
-        if observation.exists and not self._overwrite and request.predecessor_descriptor is None:
-            raise S3ConditionalWriteRejectedError from None
+        # No rejection here: an existing object's content identity is not yet
+        # known (the staged body doesn't exist until prepare_effect). The
+        # overwrite=False guard now lives in prepare_remote_object's decision
+        # block, where it can distinguish an idempotent re-affirmation from a
+        # genuine collision instead of rejecting on existence alone.
         return inspect_remote_object(
             provider="aws_s3",
             target=target,
@@ -1002,8 +1007,11 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
                 diverted_ordinals=diverted,
                 predecessor_descriptor=predecessor,
                 checksum_algorithm="sha256",
+                allow_replace=self._overwrite,
                 diversion_attribution=diversion_attribution,
             )
+        except RemoteObjectCollisionError:
+            raise S3ConditionalWriteRejectedError from None
         finally:
             serialized.close()
 
@@ -1049,6 +1057,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectCommitResult:
         evidence, stage = validate_remote_plan(plan, provider="aws_s3", require_stage=True)
+        require_commit_authority(evidence, overwrite=self._overwrite)
         expected_target = f"s3://{self._bucket}/{self._effect_key(ctx)}"
         if evidence.target != expected_target:
             raise RemoteObjectPreconditionError("S3 effect target diverges from the configured run target")

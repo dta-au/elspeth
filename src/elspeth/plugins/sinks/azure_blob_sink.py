@@ -66,6 +66,7 @@ from elspeth.plugins.sinks._remote_object_effects import (
     reconcile_remote_observation,
     remote_commit_result,
     remote_stage_missing,
+    require_commit_authority,
     restage_remote_object,
     validate_remote_plan,
 )
@@ -348,7 +349,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5a6df2a0548c91fa"
+    source_file_hash: str | None = "sha256:d8b04581f0fb6696"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -561,8 +562,12 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         blob_path = self._effect_blob_path(ctx)
         target = f"azure://{self._container}/{blob_path}"
         observation = self._observe_effect_target(blob_path)
-        if observation.exists and not self._overwrite and request.predecessor_descriptor is None:
-            raise ValueError(f"Blob '{blob_path}' already exists and overwrite=False") from None
+        # No rejection here: an existing blob's content identity is not yet
+        # known (the staged body doesn't exist until prepare_effect). The
+        # overwrite=False guard now lives in prepare_remote_object's decision
+        # block (raising the shared, typed RemoteObjectCollisionError), where
+        # it can distinguish an idempotent re-affirmation from a genuine
+        # collision instead of rejecting on existence alone.
         return inspect_remote_object(
             provider="azure_blob",
             target=target,
@@ -639,6 +644,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
             diverted_ordinals=diverted,
             predecessor_descriptor=predecessor,
             checksum_algorithm="md5",
+            allow_replace=self._overwrite,
             diversion_attribution=diversion_attribution,
         )
 
@@ -688,6 +694,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectCommitResult:
         evidence, stage = validate_remote_plan(plan, provider="azure_blob", require_stage=True)
+        require_commit_authority(evidence, overwrite=self._overwrite)
         expected_target = f"azure://{self._container}/{self._effect_blob_path(ctx)}"
         if evidence.target != expected_target:
             raise RemoteObjectPreconditionError("Azure effect target diverges from the configured run target")

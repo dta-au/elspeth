@@ -34,7 +34,7 @@ from elspeth.contracts.sink_effects import (
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.orchestrator.preflight import validate_sink_effect_capability
 from elspeth.plugins.sinks import _remote_object_effects as remote_effects
-from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink
+from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink, S3ConditionalWriteRejectedError
 from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSink
 from tests.fixtures.base_classes import inject_write_failure
 
@@ -1283,6 +1283,139 @@ def test_plan_evidence_rejects_reaffirmed_with_replace_authority_or_if_match() -
     # reaffirmed-specific precondition check is exercised here.
     with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="reaffirmed evidence must carry"):
         remote_effects.RemoteObjectPlanEvidence.from_mapping(tampered_precondition)
+
+
+# ---------------------------------------------------------------------------
+# Sink wiring (elspeth-9a78b3a02f): the inspect-time overwrite=False guard is
+# gone; prepare_effect decides reaffirm-vs-collision, and commit_effect
+# re-checks replace authority so a stale/replayed plan cannot clobber an
+# object under a sink now configured overwrite=False.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("factory", [_s3, _azure])
+def test_second_independent_sink_reaffirms_identical_content_without_overwrite(factory: Any) -> None:
+    """The bug fix: overwrite=False must no-op on an idempotent re-drive of
+    identical content instead of hard-rejecting it (elspeth-9a78b3a02f)."""
+    store = _S3Store() if factory is _s3 else _AzureStore()
+    member = _member(0, {"id": 1})
+    first_sink = factory(store, overwrite=False)
+    first_plan = _prepare(first_sink, effect_id="10" * 32, current=(member,), target_snapshot=(member,))
+    first_sink.commit_effect(first_plan, _CTX)
+    requests_before = len(store.requests)
+
+    second_member = _member(0, {"id": 1})
+    second_sink = factory(store, overwrite=False)
+    second_plan = _prepare(second_sink, effect_id="11" * 32, current=(second_member,), target_snapshot=(second_member,))
+
+    assert second_plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert second_plan.safe_evidence["publication_kind"] == "reaffirmed"
+    assert second_plan.safe_evidence["replace_authority"] == "none"
+    assert second_plan.expected_descriptor == first_plan.expected_descriptor
+    write_op = "put" if factory is _s3 else "upload"
+    assert [request for request in store.requests[requests_before:] if request["operation"] == write_op] == []
+
+
+def test_s3_second_independent_sink_rejects_true_collision_without_overwrite() -> None:
+    store = _S3Store()
+    member = _member(0, {"id": 1})
+    first_sink = _s3(store, overwrite=False)
+    first_plan = _prepare(first_sink, effect_id="12" * 32, current=(member,), target_snapshot=(member,))
+    first_sink.commit_effect(first_plan, _CTX)
+
+    different_member = _member(0, {"id": 999})
+    second_sink = _s3(store, overwrite=False)
+    with pytest.raises(S3ConditionalWriteRejectedError):
+        _prepare(second_sink, effect_id="13" * 32, current=(different_member,), target_snapshot=(different_member,))
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": 1}]
+
+
+def test_azure_second_independent_sink_rejects_true_collision_without_overwrite() -> None:
+    store = _AzureStore()
+    member = _member(0, {"id": 1})
+    first_sink = _azure(store, overwrite=False)
+    first_plan = _prepare(first_sink, effect_id="14" * 32, current=(member,), target_snapshot=(member,))
+    first_sink.commit_effect(first_plan, _CTX)
+
+    different_member = _member(0, {"id": 999})
+    second_sink = _azure(store, overwrite=False)
+    with pytest.raises(remote_effects.RemoteObjectCollisionError):
+        _prepare(second_sink, effect_id="15" * 32, current=(different_member,), target_snapshot=(different_member,))
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": 1}]
+
+
+@pytest.mark.parametrize("factory", [_s3, _azure])
+def test_predecessor_lineage_authorizes_replace_even_without_overwrite_config(factory: Any) -> None:
+    """The resume/predecessor lane must keep working under overwrite=False:
+    declared lineage is its own replace authority (elspeth-9a78b3a02f)."""
+    store = _S3Store() if factory is _s3 else _AzureStore()
+    first_member = _member(0, {"id": 1})
+    first_sink = factory(store, overwrite=False)
+    first_plan = _prepare(first_sink, effect_id="16" * 32, current=(first_member,), target_snapshot=(first_member,))
+    first_result = first_sink.commit_effect(first_plan, _CTX)
+
+    second_member = _member(1, {"id": 2}, identity=1)
+    second_current = _member(0, {"id": 2}, identity=1)
+    second_sink = factory(store, overwrite=False)
+    second_plan = _prepare(
+        second_sink,
+        effect_id="17" * 32,
+        current=(second_current,),
+        target_snapshot=(first_member, second_member),
+        predecessor=first_result.descriptor,
+    )
+
+    assert second_plan.safe_evidence["publication_kind"] == "conditional_replace"
+    assert second_plan.safe_evidence["replace_authority"] == "predecessor_lineage"
+    second_sink.commit_effect(second_plan, _CTX)
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": 1}, {"id": 2}]
+
+
+def test_s3_commit_rejects_a_stale_overwrite_config_authority_plan() -> None:
+    """Closing the blind IfMatch hole: a plan sealed under overwrite=True
+    must not replace under a sink now configured overwrite=False, even
+    though the provider conditional alone would accept it (elspeth-9a78b3a02f)."""
+    store = _S3Store()
+    seed_member = _member(0, {"id": "seed"})
+    seed_sink = _s3(store, overwrite=True)
+    seed_plan = _prepare(seed_sink, effect_id="18" * 32, current=(seed_member,), target_snapshot=(seed_member,))
+    seed_sink.commit_effect(seed_plan, _CTX)
+
+    differing_member = _member(0, {"id": "replacement"})
+    permissive_sink = _s3(store, overwrite=True)
+    plan = _prepare(permissive_sink, effect_id="19" * 32, current=(differing_member,), target_snapshot=(differing_member,))
+    assert plan.safe_evidence["replace_authority"] == "overwrite_config"
+    assert plan.safe_evidence["precondition"] == "if_match"
+
+    strict_sink = _s3(store, overwrite=False)
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="commit authority"):
+        strict_sink.commit_effect(plan, _CTX)
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": "seed"}]
+
+
+def test_azure_commit_rejects_a_stale_overwrite_config_authority_plan() -> None:
+    """Azure counterpart of the blind IfMatch hole closure (elspeth-9a78b3a02f)."""
+    store = _AzureStore()
+    seed_member = _member(0, {"id": "seed"})
+    seed_sink = _azure(store, overwrite=True)
+    seed_plan = _prepare(seed_sink, effect_id="1a" * 32, current=(seed_member,), target_snapshot=(seed_member,))
+    seed_sink.commit_effect(seed_plan, _CTX)
+
+    differing_member = _member(0, {"id": "replacement"})
+    permissive_sink = _azure(store, overwrite=True)
+    plan = _prepare(permissive_sink, effect_id="1b" * 32, current=(differing_member,), target_snapshot=(differing_member,))
+    assert plan.safe_evidence["replace_authority"] == "overwrite_config"
+    assert plan.safe_evidence["precondition"] == "if_match"
+
+    strict_sink = _azure(store, overwrite=False)
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="commit authority"):
+        strict_sink.commit_effect(plan, _CTX)
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": "seed"}]
 
 
 @pytest.mark.parametrize("factory", [_s3, _azure])
