@@ -102,6 +102,8 @@ class InvokePlan(BaseModel):
                 raise ValueError("header values must be str")
             if len(value) > _MAX_HEADER_VALUE_LENGTH:
                 raise ValueError(f"header value for {lowered!r} exceeds {_MAX_HEADER_VALUE_LENGTH} chars")
+            if lowered in normalized:
+                raise ValueError(f"header name {lowered!r} collides with another header after lower-casing")
             normalized[lowered] = value
         object.__setattr__(self, "headers", normalized)
         return self

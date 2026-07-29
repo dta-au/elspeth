@@ -151,6 +151,11 @@ def test_invoke_plan_normalizes_header_names_to_lowercase():
     assert plan.headers == {"x-custom-header": "value"}
 
 
+def test_invoke_plan_rejects_case_colliding_header_names():
+    with pytest.raises(ValidationError):
+        InvokePlan(path="v1/chat", headers={"X-Foo": "a", "x-foo": "b"}, body={})
+
+
 def test_invoke_plan_rejects_oversized_header_value():
     with pytest.raises(ValidationError):
         InvokePlan(path="v1/chat", headers={"x-custom": "a" * 1025}, body={})
