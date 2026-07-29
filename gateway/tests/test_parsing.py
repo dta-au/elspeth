@@ -26,3 +26,19 @@ def test_rejections(raw, reason):
 def test_nested_duplicate_key_rejected():
     with pytest.raises(StrictJsonError):
         parse_strict_json(b'{"x": {"b":1,"b":2}}', max_bytes=100)
+
+
+def test_overflow_float_in_object_rejected():
+    with pytest.raises(StrictJsonError) as exc:
+        parse_strict_json(b'{"t": 1e400}', max_bytes=100)
+    assert exc.value.reason == "non_finite"
+
+
+def test_overflow_float_in_array_rejected():
+    with pytest.raises(StrictJsonError) as exc:
+        parse_strict_json(b"[-1e400]", max_bytes=100)
+    assert exc.value.reason == "non_finite"
+
+
+def test_normal_float_still_parses():
+    assert parse_strict_json(b'{"t": 1.5}', max_bytes=100) == {"t": 1.5}
