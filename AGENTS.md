@@ -134,23 +134,22 @@ clean/allowed state. warpline facts are advisory and never gate. See the
 `warpline-workflow` skill for the full loop.
 <!-- /warpline:instructions -->
 
-<!-- legis:instructions:v1.5.0:6604fe0c -->
+<!-- legis:instructions:v1.5.0:37065fbc -->
 ## Legis (git/CI + governance)
 
-Legis is the git/CI and governance layer of the Weft suite. Reach for it when a policy fires at the CI/git boundary and a change needs a *recordable* override or human sign-off, when you need governance attestations keyed to stable code identity (SEI), or when you need git/CI context — branches, commits, pull requests, check outcomes, and the Loomweave-bound rename feed — around the work. Enforcement is graded: agent-programmable policy cells decide whether a violation self-clears with an audit trail, is judged inline, or escalates to a human; every decision lands in an append-only, SEI-keyed audit trail that survives rename/move.
+Legis is the git/CI and governance layer of the Weft suite: graded policy
+enforcement over branch/commit/PR/check context, recorded in an append-only
+audit trail keyed to stable code identity (SEI), so it survives rename/move.
 
-Prefer the `mcp__legis__*` MCP tools when available; fall back to the `legis` CLI.
+Reach for it when a policy fires at the CI/git boundary, when a change needs a
+recordable override or human sign-off, or when you need git/CI context.
 
-CLI subcommands:
+- Prefer the `mcp__legis__*` MCP tools; fall back to the `legis` CLI.
+- Clear a fired policy through `override_submit` (MCP-only), which grades it
+  (self-clear / judged / escalated) and records it — routing around it leaves
+  no trail.
 
-- `serve` — run the Legis API server.
-- `mcp` — run the Legis MCP stdio server (launch-bound `--agent-id`).
-- `check-override-rate` — exit 1 if the override-rate gate is FAIL (for CI).
-- `governance-gate` — run governance CI gates (currently the override-rate gate).
-- `sei-backfill` — resolve legacy locator-keyed governance records through Loomweave batch resolve.
-- `policy-boundary-check` — fail when `@policy_boundary` metadata lacks current behavioural evidence.
-
-Full command + MCP-tool reference: see the `legis-workflow` skill.
+Full reference: the `legis-workflow` skill, `legis --help`, MCP schemas.
 <!-- /legis:instructions -->
 
 <!-- wardline:instructions:v1:bcd19330 -->
