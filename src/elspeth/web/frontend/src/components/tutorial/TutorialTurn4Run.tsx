@@ -236,15 +236,19 @@ export function TutorialTurn4Run({
   /**
    * Which prompt-shield teaching moment is true for THIS deployment.
    *
-   * `null` until the policy answers, and on any failure. Both strings state a
-   * fact about the pipeline the user is watching run, so neither may be
-   * rendered on a guess — showing nothing costs a teaching moment, showing the
-   * wrong one teaches the reader that the interface lies. The signal is the
-   * deployment's prompt-shield *selection*: whenever one is selected the
-   * composer wires it (it stopped merely recommending it), so "proceeding
-   * without a prompt shield" is false exactly when a selection exists.
+   * Both strings state a checkable fact about the pipeline the user is watching
+   * run, so neither may be rendered on a guess. Three states, not two:
+   *
+   * - `"wired"` — a shield is selected AND the control mode is `required`. Only
+   *   then is every clause true: coverage validation would have refused the
+   *   pipeline otherwise, so a shield is certainly in it.
+   * - `"absent"` — no shield selected, so the deployment cannot have wired one.
+   * - `null` — selected but merely `recommend`, or the policy is unreadable.
+   *   Under `recommend` the aid asks for a shield and nothing enforces it, so
+   *   whether this pipeline has one is unknowable from policy alone; claiming
+   *   either way would be the same falsehood this conditional exists to remove.
    */
-  const [shieldSelected, setShieldSelected] = useState<boolean | null>(null);
+  const [shieldNote, setShieldNote] = useState<"wired" | "absent" | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -257,11 +261,19 @@ export function TutorialTurn4Run({
           (selection) =>
             selection.capability === "prompt_shield" && selection.plugin_id !== null,
         );
-        setShieldSelected(selected);
+        if (!selected) {
+          setShieldNote("absent");
+          return;
+        }
+        const required = snapshot.data.control_modes.some(
+          (control) =>
+            control.capability === "prompt_shield" && control.mode === "required",
+        );
+        setShieldNote(required ? "wired" : null);
       })
       .catch(() => {
         if (!cancelled) {
-          setShieldSelected(null);
+          setShieldNote(null);
         }
       });
     return () => {
@@ -280,9 +292,9 @@ export function TutorialTurn4Run({
       <AlertBanner tone="info" className="tutorial-disclosure">
         {TUTORIAL_RUN_PREAMBLE}
       </AlertBanner>
-      {shieldSelected !== null && (
+      {shieldNote !== null && (
         <p className="tutorial-callout">
-          {shieldSelected ? TUTORIAL_SHIELD_WIRED_NOTE : TUTORIAL_SHIELD_OVERRIDE_CAVEAT}
+          {shieldNote === "wired" ? TUTORIAL_SHIELD_WIRED_NOTE : TUTORIAL_SHIELD_OVERRIDE_CAVEAT}
         </p>
       )}
       {result === null && error === null && (

@@ -2107,7 +2107,7 @@ database-operator-approved schema-owner secret. The EFS task role has only
 `elasticfilesystem:ClientMount` and `elasticfilesystem:ClientWrite` scoped to
 the exact filesystem/access point; `ClientRootAccess` needs separate approval.
 
-## Bedrock, Guardrails, and S3 task-role shape
+## Bedrock, Guardrails, Textract, and S3 task-role shape
 
 Grant the runtime task role resource-scoped `bedrock:InvokeModel`. Whichever
 of Composer primary/advisor is a cross-region (`global.`/`us.`/`eu.`/`apac.`)
@@ -2121,6 +2121,21 @@ run-scoped permissions boundary must independently allow the same
 wildcard-region resource — a task-role grant the boundary does not also
 allow is intersected away to nothing. Configure the ordinary `region_name`
 and a `bedrock/anthropic...` model identifier; do not embed AWS keys.
+
+When the deployment authorizes `transform:aws_textract_document_analysis`,
+grant the task role `textract:StartDocumentAnalysis` and
+`textract:GetDocumentAnalysis`, and grant the same pair in the run-scoped
+permissions boundary — as with Bedrock, a task-role grant the boundary does not
+also allow is intersected away. Neither action names an ARN, so `"*"` is the
+only expressible resource; the effective scope remains the S3 object grant,
+because Textract reads `DocumentLocation.S3Object` under the task role's own
+credentials and can therefore only analyse objects already inside this run's
+prefix. No additional S3 permission is required beyond that prefix grant, and
+no Textract environment variable exists — the plugin is configured per node and
+authenticates through the default credential chain. Omitting the grant is a
+late failure: the pipeline composes and validates cleanly, then fails at run
+time with `AccessDenied`, because authorization is not checked until the job is
+submitted.
 
 A correctly-shaped IAM policy is not sufficient on its own: the chosen model
 id also needs an active model-access agreement in the target account.

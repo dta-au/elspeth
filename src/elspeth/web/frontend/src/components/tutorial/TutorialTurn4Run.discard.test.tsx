@@ -5,7 +5,7 @@ import { TutorialTurn4Run } from "./TutorialTurn4Run";
 
 vi.mock("@/api/client", () => ({
   runTutorialPipeline: vi.fn(),
-  fetchPluginPolicy: vi.fn().mockResolvedValue({ data: { selections: [] }, snapshotFingerprint: "fp" }),
+  fetchPluginPolicy: vi.fn().mockResolvedValue({ data: { selections: [], control_modes: [] }, snapshotFingerprint: "fp" }),
 }));
 
 function noop(): void {}

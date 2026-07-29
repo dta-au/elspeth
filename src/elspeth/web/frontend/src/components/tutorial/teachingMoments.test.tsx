@@ -15,8 +15,13 @@ vi.mock("@/api/client", () => ({
   fetchPluginPolicy: vi.fn(),
 }));
 
-/** Policy snapshot whose prompt-shield capability is/is not selected. */
-function policyWithShield(selected: boolean) {
+/**
+ * Policy snapshot varying BOTH axes that decide the shield teaching moment:
+ * whether an implementation is selected, and whether the control is enforced.
+ * A selected-but-`recommend` deployment asks for a shield without requiring it,
+ * so policy alone cannot say whether this pipeline has one.
+ */
+function policyWithShield(selected: boolean, mode: "required" | "recommend" = "required") {
   return {
     data: {
       selections: [
@@ -25,6 +30,7 @@ function policyWithShield(selected: boolean) {
           plugin_id: selected ? "transform:aws_bedrock_prompt_shield" : null,
         },
       ],
+      control_modes: [{ capability: "prompt_shield", mode }],
     },
     snapshotFingerprint: "fp-1",
   } as unknown as Awaited<ReturnType<typeof api.fetchPluginPolicy>>;
@@ -129,6 +135,29 @@ describe("tutorial teaching moments — render at the right turn", () => {
       />,
     );
     expect(await screen.findByText(TUTORIAL_SHIELD_WIRED_NOTE)).toBeInTheDocument();
+    expect(screen.queryByText(TUTORIAL_SHIELD_OVERRIDE_CAVEAT)).toBeNull();
+  });
+
+  it("Turn 4 (run) states neither shield fact when the shield is only recommended", async () => {
+    // The wired note asserts the deployment REQUIRES the shield. Under
+    // 'recommend' the aid asks for one and nothing enforces it, so the pipeline
+    // may or may not have a shield — asserting either way repeats the falsehood
+    // this conditional exists to remove, just pointed the other way.
+    stubRun();
+    vi.mocked(api.fetchPluginPolicy).mockResolvedValue(
+      policyWithShield(true, "recommend"),
+    );
+    render(
+      <TutorialTurn4Run
+        sessionId="sess-shield-recommended"
+        onCompleted={noop}
+        onCancelled={noop}
+      />,
+    );
+    await waitFor(() => {
+      expect(api.runTutorialPipeline).toHaveBeenCalled();
+    });
+    expect(screen.queryByText(TUTORIAL_SHIELD_WIRED_NOTE)).toBeNull();
     expect(screen.queryByText(TUTORIAL_SHIELD_OVERRIDE_CAVEAT)).toBeNull();
   });
 
