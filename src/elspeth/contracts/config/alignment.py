@@ -91,6 +91,7 @@ EXEMPT_SETTINGS: Final[frozenset[str]] = frozenset(
         "AggregationSettings",
         "GateSettings",
         "CoalesceSettings",
+        "RowUnionSettings",
         "TriggerConfig",
         # Infrastructure - passed to components directly
         "DatabaseSettings",

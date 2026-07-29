@@ -1082,6 +1082,65 @@ class SourceSettings(BaseModel):
         return _validate_connection_or_sink_name(value, field_label="Source on_success connection name")
 
 
+class RowUnionSettings(BaseModel):
+    """Configuration for row_union (fork-branch UNION ALL) barriers.
+
+    row_union is a correlated, same-row_id, N->N barrier over declared fork
+    branches (elspeth-a5b86149d4 product decision, 2026-07-16). It waits for
+    every declared branch of a row's fork group, then releases the original
+    branch tokens as one indivisible group in declared branch order. It does
+    NOT merge fields, deduplicate rows, or synthesize a wide row — payloads
+    pass through untouched. v1 arrival policy is require_all only; lost,
+    duplicate, or late branches fail the whole group closed with no partial
+    release.
+
+    Contrast with its siblings:
+    - coalesce: correlated N->1 FIELD merge of fork siblings.
+    - queue: UNcorrelated stream interleave with no group semantics.
+
+    Example YAML:
+        row_unions:
+          - name: variant_union
+            branches:
+              control_branch: control_scored
+              treatment_branch: treatment_scored
+            on_success: experiment_in
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    name: str = Field(description="Unique identifier for this row_union barrier")
+    branches: dict[str, str] = Field(
+        min_length=2,
+        description="Branch identity → input connection mapping. List format normalized to identity dict. Declared order is the group release order.",
+    )
+
+    @field_validator("branches", mode="before")
+    @classmethod
+    def normalize_branches(cls, v: Any) -> dict[str, str]:
+        """Normalize list format to identity dict, rejecting duplicates.
+
+        branches: [a, b] becomes branches: {a: a, b: b}. Duplicate branch
+        names in list form are rejected — a dict comprehension would
+        silently discard them, hiding a config error.
+        """
+        if isinstance(v, list):
+            if len(v) != len(set(v)):
+                dupes = sorted({b for b in v if v.count(b) > 1})
+                raise ValueError(f"Duplicate branch names in list: {dupes}")
+            return {b: b for b in v}
+        return v  # type: ignore[no-any-return]  # Pydantic validates dict[str, str]
+
+    on_success: str = Field(
+        description="Connection the released group continues on (one output contract for all branches)",
+    )
+    timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="Max wait for the full group; on timeout the whole group fails closed. None = wait until end-of-source flush.",
+    )
+
+
 class QueueSettings(BaseModel):
     """Pass-through scheduling queue declared as a DAG fan-in node.
 
@@ -1751,6 +1810,13 @@ class ElspethSettings(BaseModel):
         description="Coalesce configurations for merging forked paths",
     )
 
+    # Optional - row_union barriers (fork-branch UNION ALL, elspeth-a5b86149d4)
+    row_unions: list[RowUnionSettings] = Field(
+        default_factory=list,
+        max_length=100,
+        description="row_union barrier configurations for releasing fork branches as indivisible groups",
+    )
+
     # Optional - aggregations (config-driven batching)
     aggregations: list[AggregationSettings] = Field(
         default_factory=list,
@@ -1838,6 +1904,8 @@ class ElspethSettings(BaseModel):
             all_names.append((a.name, "aggregation"))
         for c in self.coalesce:
             all_names.append((c.name, "coalesce"))
+        for u in self.row_unions:
+            all_names.append((u.name, "row_union"))
         for source_name in self.sources:
             all_names.append((source_name, "source"))
         for queue_name in self.queues:
@@ -1851,7 +1919,7 @@ class ElspethSettings(BaseModel):
                 raise ValueError(
                     f"Node name '{name}' is used by both {seen[name]} and {node_type}. "
                     f"All node names must be unique across transforms, gates, "
-                    f"aggregations, coalesce nodes, sources, queues, and sinks."
+                    f"aggregations, coalesce nodes, row_union nodes, sources, queues, and sinks."
                 )
             seen[name] = node_type
         return self
