@@ -151,6 +151,19 @@ The psycopg2 spelling is also supported:
 Store credentials in an operator secret system and render them only on the VM.
 For Azure production, make these URLs point to Azure Database for PostgreSQL.
 
+### Web LLM configuration
+
+The example file ships the web LLM configuration commented out. Uncomment and
+set `ELSPETH_WEB__COMPOSER_MODEL`, `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`,
+`ELSPETH_WEB__LLM_PROFILES`, and `ELSPETH_WEB__TUTORIAL_LLM_PROFILE`, and
+supply the provider API key each choice requires. Left unset, the service
+boots with development-default Composer models whose OpenAI and Anthropic
+keys this file does not provide — the Composer stays unavailable — and with
+zero LLM profiles, so the web surface offers no `llm` nodes and no user gets
+the first-run tutorial. See
+[Web LLM Configuration](../reference/environment-variables.md#web-llm-configuration)
+for the full contract.
+
 ## Initialize external schemas once
 
 Web startup never creates schemas. Before the first start, temporarily supply
