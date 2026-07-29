@@ -444,8 +444,13 @@ Two things gate it instead of an environment variable:
 - **The allowlist.** It is not part of the required web core, so
   `ELSPETH_WEB__PLUGIN_ALLOWLIST` must include
   `"transform:aws_textract_document_analysis"` before any web surface offers it.
-- **IAM.** The task role needs `textract:StartDocumentAnalysis` and
-  `textract:GetDocumentAnalysis`. Without them the pipeline composes and
+- **IAM, in both places.** The task role needs
+  `textract:StartDocumentAnalysis` and `textract:GetDocumentAnalysis`, **and
+  the permissions boundary attached to that role must allow the same two
+  actions** — a role can never hold a permission its boundary denies, so
+  granting only the role policy still fails. The AWS ECS scenario module
+  carries the statement in both roots (`modules/scenario` for the task role,
+  `bootstrap` for the boundary). Without either half the pipeline composes and
   validates cleanly and then fails at run time with `AccessDenied`, because
   authorization is not checked until the job is submitted.
 

@@ -917,7 +917,10 @@ class TestPromptShieldRules:
         assert "web_scrape" in rendered
         assert "llm" in rendered
         # Shielded deployment: the attachment point is the wiring, not a card.
-        assert "between the fetch step and" in rendered
+        # Producer-neutral wording — "the fetch step" misdescribed a document
+        # extraction producer once aws_textract_document_analysis joined the
+        # untrusted set.
+        assert "between that producer node and" in rendered
 
         from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
 
@@ -925,6 +928,28 @@ class TestPromptShieldRules:
         assert "web_scrape" in shieldless
         assert "llm" in shieldless
         assert "interpretation_requirements" in shieldless
+
+    def test_rules_teach_every_untrusted_producer_in_the_contract_set(self) -> None:
+        """The taught producers come from the contract set, so a new one is taught automatically.
+
+        The aids intersect the contract's untrusted-producer set with the
+        policy-visible transforms, so membership is the only thing that decides
+        whether a producer is taught. Document extraction is in that set:
+        Textract returns whatever text the uploaded document carried.
+        """
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+        from elspeth.web.interpretation_state import _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS
+
+        assert "aws_textract_document_analysis" in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS
+
+        rendered = "\n".join(
+            _prompt_shield_rules(
+                shield_plugin="aws_bedrock_prompt_shield",
+                untrusted_producers=tuple(sorted(_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS)),
+            )
+        )
+        for producer in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+            assert producer in rendered
 
     def test_section_renders_under_the_live_profile_posture(self, tmp_path: Path) -> None:
         # The failing surface is the tutorial/guided walk under the operator-
