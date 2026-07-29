@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
@@ -2062,6 +2063,22 @@ async def _plan_pipeline_inner(
                 continue
             except _PipelineCandidateRejected as exc:
                 last_rejection_codes = _candidate_rejection_codes(exc.result)
+                if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") == "1":
+                    # Operator-opted diagnostic seam: candidate-rejection detail is
+                    # otherwise withheld everywhere (repair feedback is code-only and
+                    # ephemeral), which makes exhausted-repair loops undiagnosable.
+                    # Full validator messages can quote authored option values, so
+                    # this stays hard-gated off unless the operator sets the flag.
+                    slog.warning(
+                        "composer.planner_rejection_detail",
+                        session_id=trail.session_id,
+                        operation_id=trail.operation_id,
+                        attempt=trail.attempts,
+                        entries=[
+                            {"component": entry.component, "error_code": entry.error_code, "message": entry.message}
+                            for entry in _rejection_entries(exc.result)
+                        ],
+                    )
                 if is_hatch_turn:
                     trail.log_attempt("hatch", "candidate_rejected", codes=last_rejection_codes, led_to="terminal")
                     assert hatch_error is not None
