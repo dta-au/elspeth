@@ -568,6 +568,28 @@ class TestForkCoalesceExemplar:
             assert "guardrail_identifier" not in control["options"]
             assert "guardrail_version" not in control["options"]
 
+    def test_forked_exemplar_passes_required_control_coverage_at_completion(self, tmp_path: Path) -> None:
+        """The accepted exemplar must clear the completion-validation coverage gate.
+
+        ``build_set_pipeline_candidate`` does not run required-control
+        coverage — completion validation does. The exemplar's
+        one-shield-above-the-fork placement is only teachable if that gate
+        accepts a shield dominating both branches through the fan-out gate.
+        """
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+        assert candidate.acceptable is True, (candidate.result.data or {}).get("error")
+
+        result = view.validate_authored_state(candidate.result.updated_state)
+        coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
+        assert coverage == [], [finding.message for finding in coverage]
+
     def test_recommended_controls_remain_advisory_and_do_not_mutate_the_exemplar(self, tmp_path: Path) -> None:
         from elspeth.web.interpretation_state import PROMPT_SHIELD_AVAILABLE_DRAFT
 
