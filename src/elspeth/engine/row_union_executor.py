@@ -42,6 +42,11 @@ if TYPE_CHECKING:
 
 slog = structlog.get_logger(__name__)
 
+#: Why a pending group stopped accepting arrivals. Stored per closed key so a
+#: straggler's audit record names the actual cause.
+_CLOSED_BY_RELEASE = "released"
+_CLOSED_BY_BRANCH_LOSS = "row_union_branch_lost"
+
 
 @dataclass(frozen=True, slots=True)
 class RowUnionOutcome:
@@ -137,7 +142,10 @@ class RowUnionExecutor:
         self._pending: dict[tuple[str, str], _PendingRowUnion] = {}
         # Completed groups (released OR failed): bounded FIFO cache backed by
         # the Landscape fallback in accept() — cache, not correctness.
-        self._completed_keys: OrderedDict[tuple[str, str], None] = OrderedDict()
+        # key -> the reason the group closed, so a straggler is told WHY its
+        # group is gone (released vs killed by a lost branch) instead of a
+        # generic late-arrival message.
+        self._completed_keys: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._max_completed_keys = max_completed_keys
         # Recorded branch losses for §E.5 replay dedup:
         # (row_union_name, row_id, branch_name)
@@ -202,7 +210,13 @@ class RowUnionExecutor:
         now = arrival_time if arrival_time is not None else self._clock.monotonic()
 
         if key in self._completed_keys or self._check_landscape_for_completion(row_union_name, token.row_id):
-            return self._fail_late_arrival(token, settings, node_id, step)
+            return self._fail_late_arrival(
+                token,
+                settings,
+                node_id,
+                step,
+                closed_reason=self._completed_keys.get(key, _CLOSED_BY_RELEASE),
+            )
 
         if key not in self._pending:
             self._pending[key] = _PendingRowUnion(branches={}, first_arrival=now)
@@ -268,7 +282,7 @@ class RowUnionExecutor:
             released.append(entry.token)
 
         del self._pending[key]
-        self._mark_completed(key)
+        self._mark_completed(key, _CLOSED_BY_RELEASE)
 
         return RowUnionOutcome(
             held=False,
@@ -312,7 +326,7 @@ class RowUnionExecutor:
             )
 
         del self._pending[key]
-        self._mark_completed(key)
+        self._mark_completed(key, failure_reason)
 
         return RowUnionOutcome(
             held=False,
@@ -328,9 +342,17 @@ class RowUnionExecutor:
         settings: RowUnionSettings,
         node_id: NodeID,
         step: int,
+        *,
+        closed_reason: str = _CLOSED_BY_RELEASE,
     ) -> RowUnionOutcome:
-        """Fail-closed arm for a token arriving after its group completed."""
-        failure_reason = "late_arrival_after_release"
+        """Fail-closed arm for a token arriving after its group closed.
+
+        The recorded reason distinguishes a genuine straggler (its group
+        already released) from a token whose group was killed before it ever
+        arrived — a lost sibling branch. Both fail closed; only the audit
+        trail tells the operator which happened.
+        """
+        failure_reason = "row_union_branch_lost" if closed_reason == _CLOSED_BY_BRANCH_LOSS else "late_arrival_after_release"
         error_hash = compute_error_hash(failure_reason)
         state = self._execution.begin_node_state(
             token_id=token.token_id,
@@ -422,7 +444,7 @@ class RowUnionExecutor:
         if key not in self._pending:
             # Nothing held yet: mark the group dead so future arrivals
             # fail closed instead of holding forever.
-            self._mark_completed(key)
+            self._mark_completed(key, _CLOSED_BY_BRANCH_LOSS)
             slog.info(
                 "row_union branch lost before any sibling arrived; group marked dead",
                 row_union=row_union_name,
@@ -444,12 +466,12 @@ class RowUnionExecutor:
             return False
         node_id = self._node_ids[row_union_name]
         if self._barrier_restore_reads.has_completed_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id):
-            self._mark_completed((row_union_name, row_id))
+            self._mark_completed((row_union_name, row_id), _CLOSED_BY_RELEASE)
             return True
         return False
 
-    def _mark_completed(self, key: tuple[str, str]) -> None:
-        """Mark a group completed with bounded memory (FIFO eviction)."""
-        self._completed_keys[key] = None
+    def _mark_completed(self, key: tuple[str, str], reason: str) -> None:
+        """Mark a group closed, with its cause, under bounded memory."""
+        self._completed_keys[key] = reason
         while len(self._completed_keys) > self._max_completed_keys:
             self._completed_keys.popitem(last=False)

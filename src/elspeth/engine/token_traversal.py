@@ -157,7 +157,7 @@ class TokenTraversalEngine:
                 path=TerminalPath.UNROUTED,
             )
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
                 "max_retries_exceeded",
                 child_items,
@@ -205,7 +205,7 @@ class TokenTraversalEngine:
                     outcome=TerminalOutcome.SUCCESS,
                     path=TerminalPath.FILTER_DROPPED,
                 )
-                sibling_results = self._processor._notify_coalesce_of_lost_branch(
+                sibling_results = self._processor._notify_barrier_of_lost_branch(
                     current_token,
                     "dropped_by_filter",
                     child_items,
@@ -318,7 +318,7 @@ class TokenTraversalEngine:
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
             )
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
                 f"quarantined:{error_detail}",
                 child_items,
@@ -349,7 +349,7 @@ class TokenTraversalEngine:
             )
         error_detail = str(transform_result.reason)
 
-        sibling_results = self._processor._notify_coalesce_of_lost_branch(
+        sibling_results = self._processor._notify_barrier_of_lost_branch(
             current_token,
             f"error_routed:{error_detail}",
             child_items,
@@ -424,7 +424,7 @@ class TokenTraversalEngine:
             # NOTE: Do NOT record ROUTED outcome here - the token hasn't been written yet.
             # SinkExecutor.write() records the outcome AFTER sink durability is achieved.
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
                 f"gate_routed_to_sink:{outcome.sink_name}",
                 child_items,
@@ -458,7 +458,7 @@ class TokenTraversalEngine:
                     outcome=TerminalOutcome.SUCCESS,
                     path=TerminalPath.GATE_DISCARDED,
                 )
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
                 "gate_discarded",
                 child_items,

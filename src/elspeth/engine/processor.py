@@ -1381,7 +1381,7 @@ class RowProcessor:
                 )
             )
             results.extend(
-                self._notify_coalesce_of_lost_branch(
+                self._notify_barrier_of_lost_branch(
                     token,
                     "dropped_by_filter",
                     child_items,
@@ -2845,6 +2845,29 @@ class RowProcessor:
             )
             for consumed in outcome.consumed_tokens
         ]
+
+    def _notify_barrier_of_lost_branch(
+        self,
+        current_token: TokenInfo,
+        reason: str,
+        child_items: list[WorkItem],
+    ) -> list[RowResult]:
+        """Notify whichever barrier owns this fork branch that it was lost.
+
+        THE single seam every early-exit path calls. Loss is discovered in
+        many places (retry exhaustion, filter drop, quarantine, error
+        routing, gate routing, gate discard, batch-flush drop), and each one
+        used to name the coalesce notifier directly — so adding a second
+        barrier kind silently left every one of those paths unnotified and
+        its held siblings waiting for the end-of-source sweep. Dispatching
+        here means a future barrier kind is wired by editing one method.
+
+        A branch belongs to at most ONE barrier — enforced at build time and
+        re-checked in this constructor — so at most one arm yields results.
+        """
+        results = self._notify_coalesce_of_lost_branch(current_token, reason, child_items)
+        results.extend(self._notify_row_union_of_lost_branch(current_token, reason))
+        return results
 
     def _notify_coalesce_of_lost_branch(
         self,

@@ -3485,13 +3485,15 @@ class TestProcessRowGateBranching:
 
         inherited_sinks: list[str | None] = []
 
-        def continuation_side_effect(*, token, current_node_id, coalesce_name=None, on_success_sink=None):
+        def continuation_side_effect(*, token, current_node_id, coalesce_name=None, row_union_name=None, on_success_sink=None):
             inherited_sinks.append(on_success_sink)
             return WorkItem(
                 token=token,
                 current_node_id=None,
                 coalesce_node_id=None,
                 coalesce_name=coalesce_name,
+                row_union_node_id=NodeID(f"row_union::{row_union_name}") if row_union_name is not None else None,
+                row_union_name=row_union_name,
                 on_success_sink=on_success_sink,
             )
 
