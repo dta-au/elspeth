@@ -392,7 +392,9 @@ class LocalAuthProvider:
         created, and a crash between commit and delivery leaves an intent
         that the reclaim sweep resolves by quarantining the unaudited
         account. A failed audit remains fatal: the just-committed user is
-        compensatingly deleted and the audit error propagates; if cleanup
+        compensatingly deleted — fenced to this call's intent generation, so
+        a replacement account registered after a reclaim sweep released the
+        user_id is never touched — and the audit error propagates; if cleanup
         itself fails, the inconsistency surfaces as
         :class:`AuditIntegrityError` and the surviving intent keeps the
         account reclaimable. A cancelled async caller may abandon the worker
@@ -426,7 +428,7 @@ class LocalAuthProvider:
             record_token_issued(access_token)
         except BaseException as audit_error:
             try:
-                self._compensate_open_registration(user_id)
+                self._compensate_open_registration(user_id, intent_id=intent_id)
             except BaseException as cleanup_error:
                 raise AuditIntegrityError(
                     f"Open registration for {user_id!r} committed, its required token_issued "
@@ -443,17 +445,19 @@ class LocalAuthProvider:
                 )
         except BaseException as mark_error:
             try:
-                self._compensate_open_registration(user_id)
+                owned = self._compensate_open_registration(user_id, intent_id=intent_id)
             except BaseException as cleanup_error:
                 raise AuditIntegrityError(
                     f"Open registration for {user_id!r} was audited but its audit intent could not "
                     f"be cleared ({mark_error!r}) and the compensating cleanup also failed"
                 ) from cleanup_error
-            raise AuditIntegrityError(
-                f"Open registration for {user_id!r} was audited but its audit intent could not be "
-                "cleared; the account was removed so the reclaim sweep cannot later quarantine an "
-                "audited account"
-            ) from mark_error
+            if owned:
+                raise AuditIntegrityError(
+                    f"Open registration for {user_id!r} was audited but its audit intent could not be "
+                    "cleared; the account was removed so the reclaim sweep cannot later quarantine an "
+                    "audited account"
+                ) from mark_error
+            raise AuditIntegrityError("Token audit intent ownership was lost before delivery completion") from mark_error
         if not delivery_owned:
             # A reclaim sweep already resolved this issuance generation. Do
             # not compensate by user_id: that could delete a later account
@@ -461,10 +465,25 @@ class LocalAuthProvider:
             raise AuditIntegrityError("Token audit intent ownership was lost before delivery completion")
         return access_token
 
-    def _compensate_open_registration(self, user_id: str) -> None:
-        """Remove a committed open registration together with its audit intent."""
+    def _compensate_open_registration(self, user_id: str, *, intent_id: str) -> bool:
+        """Remove a committed open registration while its audit intent is still owned.
+
+        The compensating delete is fenced to the intent generation this call
+        created: once a reclaim sweep has consumed the intent, the same
+        user_id may belong to a replacement registration, which must survive.
+        Returns whether this generation still owned the intent (and therefore
+        removed the account).
+        """
         with self._connect(immediate=True) as conn:
-            self._delete_user_rows(conn, user_id)
+            owned = self._clear_token_audit_intent(
+                conn,
+                intent_id=intent_id,
+                user_id=user_id,
+                issuance_path="register",
+            )
+            if owned:
+                self._delete_user_rows(conn, user_id)
+            return owned
 
     @staticmethod
     def _delete_user_rows(conn: sqlite3.Connection, user_id: str) -> bool:

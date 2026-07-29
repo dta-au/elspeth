@@ -459,6 +459,69 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert len(replacement_token.split(".")) == 3
         assert len(restarted._login_sync("alice", "replacement456").split(".")) == 3
 
+    def test_reclaimed_registration_audit_failure_spares_replacement_account(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A late audit failure must not compensate away a replacement account.
+
+        Once the stale-intent sweep has reclaimed the original registration,
+        the same user_id may belong to a replacement registration; the
+        original call's compensating cleanup is fenced to its own intent
+        generation and must leave the replacement untouched.
+        """
+        now = [1_000_000]
+        monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+
+        def fail_required_audit(_token: str) -> None:
+            audit_entered.set()
+            assert release_audit.wait(timeout=2)
+            raise OSError("Landscape unavailable")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                provider.register_open_user_with_audit,
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=fail_required_audit,
+            )
+            assert audit_entered.wait(timeout=2)
+            now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
+            restarted = LocalAuthProvider(
+                db_path=provider._db_path,
+                secret_key="test-secret-key-for-unit-tests",
+            )
+            replacement_token = restarted.register_open_user_with_audit(
+                "alice",
+                "replacement456",
+                "Replacement Alice",
+                None,
+                record_token_issued=lambda _token: None,
+            )
+            release_audit.set()
+
+            with pytest.raises(OSError, match="Landscape unavailable"):
+                future.result(timeout=2)
+
+        # The replacement account survived the fenced compensation.
+        assert len(replacement_token.split(".")) == 3
+        assert len(restarted._login_sync("alice", "replacement456").split(".")) == 3
+        assert _audit_intents(provider) == []
+
+    def test_compensation_is_noop_once_intent_ownership_is_lost(self, provider) -> None:
+        """Compensation keyed to a consumed intent must not touch a replacement."""
+        provider.create_user("alice", "replacement456", display_name="Replacement Alice")
+
+        owned = provider._compensate_open_registration("alice", intent_id="original-generation")
+
+        assert owned is False
+        assert len(provider._login_sync("alice", "replacement456").split(".")) == 3
+
     def test_reclaimed_active_verification_cannot_return_token(
         self,
         provider,
