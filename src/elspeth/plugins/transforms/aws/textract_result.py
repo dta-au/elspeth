@@ -18,6 +18,9 @@ class MalformedTextractResponse(ValueError):
         super().__init__(message)
 
 
+_MAX_DOCUMENT_PAGES = 3_000
+
+
 @dataclass(frozen=True, slots=True)
 class NormalizedTextractResult:
     """Validated normalized projections plus the bounded provider aggregate."""
@@ -172,11 +175,12 @@ def _warning(value: Any, path: str, page_count: int) -> tuple[dict[str, Any], di
     return {"ErrorCode": code, "Pages": pages}, {"error_code": code, "pages": pages}
 
 
-def _validate_known_block_members(block: Mapping[str, Any], path: str) -> None:
+def _validate_known_block_members(block: Mapping[str, Any], path: str, *, page_count: int) -> None:
     _required_str(block, "BlockType", path, max_length=128)
     _required_str(block, "Id", path, max_length=256)
-    if "Page" in block:
-        _page(block, path)
+    if "Page" not in block:
+        _malformed(path, "missing required key Page")
+    _bounded_int(block["Page"], f"{path}.Page", maximum=page_count)
     if "Confidence" in block:
         _confidence(block, path)
     if "Geometry" in block:
@@ -238,28 +242,50 @@ def _text_from_children(
     index: Mapping[str, Mapping[str, Any]],
     *,
     path: str,
-    active_ids: frozenset[str] = frozenset(),
 ) -> str:
-    block_id = _required_str(block, "Id", path)
-    if block_id in active_ids:
-        _malformed(path, f"cyclic CHILD relationship through block {block_id!r}")
-    active = active_ids | {block_id}
-    child_ids = _child_ids(block, path)
-    if child_ids:
-        parts: list[str] = []
-        for child_id in child_ids:
+    root_id = _required_str(block, "Id", path)
+    state: dict[str, int] = {}
+    resolved: dict[str, str] = {}
+    paths = {root_id: path}
+    stack: list[tuple[str, bool]] = [(root_id, False)]
+    while stack:
+        block_id, expanded = stack.pop()
+        block_path = paths.get(block_id, f"block {block_id!r}")
+        if expanded:
+            candidate = index[block_id]
+            child_ids = _child_ids(candidate, block_path)
+            if child_ids:
+                resolved[block_id] = " ".join(resolved[child_id] for child_id in child_ids if resolved.get(child_id))
+            else:
+                text = candidate.get("Text", "")
+                if type(text) is not str:
+                    _malformed(f"{block_path}.Text", "must be a string")
+                resolved[block_id] = text
+            state[block_id] = 2
+            continue
+
+        candidate_state = state.get(block_id, 0)
+        if candidate_state == 2:
+            continue
+        if candidate_state == 1:
+            _malformed(block_path, f"cyclic CHILD relationship through block {block_id!r}")
+        state[block_id] = 1
+        stack.append((block_id, True))
+        child_ids = _child_ids(index[block_id], block_path)
+        for child_id in reversed(child_ids):
             child = index[child_id]
-            child_type = _required_str(child, "BlockType", f"block {child_id!r}")
+            child_path = f"block {child_id!r}"
+            paths[child_id] = child_path
+            child_type = _required_str(child, "BlockType", child_path)
             if child_type == "SELECTION_ELEMENT":
+                resolved[child_id] = ""
+                state[child_id] = 2
                 continue
-            child_text = _text_from_children(child, index, path=f"block {child_id!r}", active_ids=active)
-            if child_text:
-                parts.append(child_text)
-        return " ".join(parts)
-    text = block.get("Text", "")
-    if type(text) is not str:
-        _malformed(f"{path}.Text", "must be a string")
-    return text
+            if state.get(child_id) == 1:
+                _malformed(child_path, f"cyclic CHILD relationship through block {child_id!r}")
+            if state.get(child_id) != 2:
+                stack.append((child_id, False))
+    return resolved[root_id]
 
 
 def _ordered_candidates(
@@ -278,21 +304,29 @@ def _ordered_candidates(
 
 
 def _validate_child_graph(index: Mapping[str, Mapping[str, Any]]) -> None:
-    complete: set[str] = set()
-
-    def visit(block_id: str, active: frozenset[str]) -> None:
-        if block_id in active:
-            _malformed(f"block {block_id!r}", "cyclic CHILD relationship")
-        if block_id in complete:
-            return
-        block = index[block_id]
-        next_active = active | {block_id}
-        for child_id in _child_ids(block, f"block {block_id!r}"):
-            visit(child_id, next_active)
-        complete.add(block_id)
-
+    state: dict[str, int] = {}
     for candidate_id in index:
-        visit(candidate_id, frozenset())
+        if state.get(candidate_id) == 2:
+            continue
+        stack: list[tuple[str, bool]] = [(candidate_id, False)]
+        while stack:
+            block_id, expanded = stack.pop()
+            if expanded:
+                state[block_id] = 2
+                continue
+            candidate_state = state.get(block_id, 0)
+            if candidate_state == 2:
+                continue
+            if candidate_state == 1:
+                _malformed(f"block {block_id!r}", "cyclic CHILD relationship")
+            state[block_id] = 1
+            stack.append((block_id, True))
+            for child_id in reversed(_child_ids(index[block_id], f"block {block_id!r}")):
+                child_state = state.get(child_id, 0)
+                if child_state == 1:
+                    _malformed(f"block {child_id!r}", "cyclic CHILD relationship")
+                if child_state != 2:
+                    stack.append((child_id, False))
 
 
 def _project_tables(blocks: Sequence[Mapping[str, Any]], index: Mapping[str, Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
@@ -314,7 +348,7 @@ def _project_tables(blocks: Sequence[Mapping[str, Any]], index: Mapping[str, Map
             for member in ("RowIndex", "ColumnIndex", "RowSpan", "ColumnSpan"):
                 if member not in cell:
                     _malformed(cell_path, f"missing required key {member}")
-                coordinates[member] = _bounded_int(cell[member], f"{cell_path}.{member}")
+                coordinates[member] = _bounded_int(cell[member], f"{cell_path}.{member}", maximum=len(blocks))
             coordinate = (coordinates["RowIndex"], coordinates["ColumnIndex"])
             if coordinate in occupied:
                 _malformed(table_path, f"duplicate cell coordinate {coordinate}")
@@ -481,7 +515,11 @@ def normalize_textract_result(
         document_metadata = _mapping(result.get("DocumentMetadata"), f"{result_path}.DocumentMetadata")
         if "Pages" not in document_metadata:
             _malformed(f"{result_path}.DocumentMetadata", "missing required key Pages")
-        candidate_page_count = _bounded_int(document_metadata["Pages"], f"{result_path}.DocumentMetadata.Pages")
+        candidate_page_count = _bounded_int(
+            document_metadata["Pages"],
+            f"{result_path}.DocumentMetadata.Pages",
+            maximum=_MAX_DOCUMENT_PAGES,
+        )
         candidate_model_version = _required_str(result, "AnalyzeDocumentModelVersion", result_path, max_length=128)
         if page_count is None:
             page_count = candidate_page_count
@@ -515,7 +553,7 @@ def normalize_textract_result(
     block_index: dict[str, Mapping[str, Any]] = {}
     for index, block in enumerate(blocks):
         path = f"Blocks[{index}]"
-        _validate_known_block_members(block, path)
+        _validate_known_block_members(block, path, page_count=page_count)
         block_id = _required_str(block, "Id", path)
         if block_id in block_index:
             _malformed(path, f"duplicate block id {block_id!r}")
@@ -543,7 +581,7 @@ def normalize_textract_result(
     }
     try:
         result_size = len(canonical_json(native_result).encode("utf-8"))
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, RecursionError, UnicodeError) as error:
         raise MalformedTextractResponse("native result contains a non-canonical value") from error
     if result_size > max_result_bytes:
         _malformed("native_result", f"serialized result exceeds max_result_bytes={max_result_bytes}")

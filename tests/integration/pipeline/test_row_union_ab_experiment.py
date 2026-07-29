@@ -185,3 +185,106 @@ def test_two_variant_fork_unions_into_paired_preference(tmp_path: Path) -> None:
     # treatment strictly beats control in every pair (x1.5 on positive amounts)
     assert preference["wins"] == 4
     assert preference["losses"] == 0
+
+
+def test_branch_local_aggregation_flush_still_enters_row_union(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "out.jsonl"
+    input_path.write_text('{"id": 1, "copies": 1}\n')
+    settings = load_settings_from_yaml_string(
+        f"""
+sources:
+  rows:
+    plugin: json
+    on_success: routed
+    options:
+      path: {input_path}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+gates:
+  - name: variant_fork
+    input: routed
+    condition: "True"
+    routes:
+      'true': fork
+      'false': output
+    fork_to: [control_branch, treatment_branch]
+transforms:
+  - name: treatment_identity
+    plugin: passthrough
+    input: treatment_branch
+    on_success: treatment_ready
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: union_tail
+    plugin: passthrough
+    input: union_out
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+aggregations:
+  - name: control_batch
+    plugin: batch_replicate
+    input: control_branch
+    on_success: control_ready
+    on_error: discard
+    trigger: {{}}
+    output_mode: passthrough
+    options:
+      schema:
+        mode: observed
+      copies_field: copies
+      default_copies: 1
+      include_copy_index: false
+row_unions:
+  - name: variant_union
+    branches:
+      control_branch: control_ready
+      treatment_branch: treatment_ready
+    on_success: union_out
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {output_path}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+    )
+    bundle = instantiate_plugins_from_config(settings)
+    graph = ExecutionGraph.from_plugin_instances(
+        sources=bundle.sources,
+        source_settings_map=bundle.source_settings_map,
+        transforms=bundle.transforms,
+        sinks=bundle.sinks,
+        aggregations=bundle.aggregations,
+        gates=list(settings.gates),
+        queues=settings.queues,
+        row_union_settings=list(settings.row_unions),
+    )
+    config = assemble_and_validate_pipeline_config(
+        sources=bundle.sources,
+        transforms=bundle.transforms,
+        sinks=bundle.sinks,
+        aggregations=bundle.aggregations,
+        settings=settings,
+        graph=graph,
+    )
+
+    result = Orchestrator(LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")).run(
+        config,
+        graph=graph,
+        settings=settings,
+        payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
+    )
+
+    assert result.rows_failed == 0
+    assert len(output_path.read_text().splitlines()) == 2

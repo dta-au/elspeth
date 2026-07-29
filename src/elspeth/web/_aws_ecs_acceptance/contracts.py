@@ -45,10 +45,9 @@ _GIT_SHA_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 # ``core.ids.generate_id()`` default is a bare ``uuid4().hex`` (32 lowercase
 # hex chars, no dashes). Neither shape is a canonical dashed UUID, unlike
 # session/blob/run/landscape-run identities (all genuine
-# ``str(uuid.uuid4())`` DB values elsewhere in the web layer). Bounded to the
-# column's max width and a safe hex charset for Tier-1 external-data read
-# discipline.
-_ARTIFACT_ID_PATTERN = re.compile(r"[0-9a-f]{1,64}\Z")
+# ``str(uuid.uuid4())`` DB values elsewhere in the web layer). Only the two
+# live producer widths are valid.
+_ARTIFACT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{32}|[0-9a-f]{64})\Z")
 _SCENARIO_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _TERMINAL_RUN_STATUSES = frozenset({"completed", "completed_with_failures", "failed", "empty", "cancelled"})
 FORBIDDEN_AWS_OVERRIDE_ENV = frozenset(

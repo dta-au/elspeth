@@ -492,6 +492,7 @@ def run_end_of_input_barrier_flush(
             flush_row_union_pending(
                 row_union_executor=row_union_executor,
                 processor=processor,
+                ctx=ctx,
                 counters=counters,
             )
 

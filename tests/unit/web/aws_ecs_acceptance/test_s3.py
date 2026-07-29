@@ -286,6 +286,35 @@ def test_verify_s3_does_not_delete_when_primary_effect_fails_before_ownership() 
     assert "sentinel" not in str(raised.value)
 
 
+def test_verify_s3_rejects_reaffirmed_preexisting_object_without_deleting_it() -> None:
+    events: list[str] = []
+    target = {
+        "descriptor": ArtifactDescriptor(
+            artifact_type="file",
+            path_or_uri=f"s3://acceptance-bucket/{_S3_PREFIX}/verify-s3.jsonl",
+            content_hash=_S3_HASH,
+            size_bytes=len(s3._S3_ACCEPTANCE_BYTES),
+        )
+    }
+
+    class Sink(_EffectS3SinkBase):
+        def __init__(self) -> None:
+            super().__init__(index=1, events=events, target=target)
+
+        def close(self) -> None:
+            events.append("sink-close")
+
+    with pytest.raises(AcceptanceCheckError, match="s3_sink_write"):
+        s3.verify_s3(
+            _s3_env(),
+            sink_factory=lambda _config: Sink(),
+            source_factory=lambda _config: pytest.fail("no publication must stop before source verification"),
+            s3_client_factory=lambda _region, _endpoint: pytest.fail("pre-existing object is not cleanup-owned"),
+        )
+
+    assert "delete" not in events
+
+
 @pytest.mark.parametrize("post_commit_observation", ["exact", "mismatched-exact", "unknown"])
 def test_verify_s3_deletes_after_ambiguous_commit_only_with_exact_reconciliation(
     post_commit_observation: str,

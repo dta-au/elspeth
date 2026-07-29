@@ -400,6 +400,8 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
         # object construction.
         raise RuntimeYamlImportError(f"YAML parse failed: {exc.__class__.__name__}") from exc
     doc = _require_mapping(parsed, "pipeline YAML")
+    if "row_unions" in doc:
+        raise RuntimeYamlImportError("row_unions are not supported by Composer import; use the runtime YAML authoring surface")
     if not _PIPELINE_SECTION_KEYS & doc.keys():
         # A pasted document can be syntactically valid YAML *and* a mapping
         # (so it clears _require_mapping above) while describing nothing

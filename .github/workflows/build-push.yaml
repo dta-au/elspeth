@@ -217,6 +217,8 @@ jobs:
             # Semantic version from tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.revision=${{ env.IMAGE_SHA }}
 
       # -----------------------------------------------------------------------
       # Login to registries

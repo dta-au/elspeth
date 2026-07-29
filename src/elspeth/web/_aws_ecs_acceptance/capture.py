@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 import sqlite3
 import stat
 import time
@@ -17,6 +16,7 @@ from urllib.parse import quote
 import httpx
 import yaml
 
+from elspeth.contracts.hashing import canonical_json
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -55,7 +55,11 @@ def build_fixed_pipeline_yaml(*, session_id: str, source_path: str = "blobs/aws-
     """Return the fixed no-LLM CSV source-to-sink acceptance pipeline."""
 
     canonical_session_id = _canonical_uuid(session_id, label="session identity")
-    document = {
+    return yaml.safe_dump(_fixed_pipeline_document(canonical_session_id, source_path=source_path), sort_keys=False)
+
+
+def _fixed_pipeline_document(canonical_session_id: str, *, source_path: str) -> dict[str, object]:
+    return {
         "sources": {
             "source": {
                 "plugin": "csv",
@@ -84,7 +88,14 @@ def build_fixed_pipeline_yaml(*, session_id: str, source_path: str = "blobs/aws-
             }
         },
     }
-    return yaml.safe_dump(document, sort_keys=False)
+
+
+def _fixed_output_sink_node_id(session_id: str) -> str:
+    canonical_session_id = _canonical_uuid(session_id, label="session identity")
+    document = _fixed_pipeline_document(canonical_session_id, source_path="blobs/aws-ecs-acceptance-input.csv")
+    sinks = cast(dict[str, dict[str, object]], document["sinks"])
+    sink_options = cast(dict[str, object], sinks["output"]["options"])
+    return f"sink_output_{_sha256(canonical_json(sink_options).encode('utf-8'))[:12]}"
 
 
 def _canonical_tutorial_policy_state(*, profile_alias: str) -> CompositionState:
@@ -145,35 +156,12 @@ def _run_facts(payload: object, *, check: str) -> tuple[str, int, int]:
     return landscape_run_id, source_rows, failed_tokens
 
 
-# The outputs manifest (`RunOutputArtifact` / the `artifacts` table,
-# elspeth.core.landscape.schema) has no field carrying the sink's YAML key
-# directly -- only `sink_node_id`, the engine's *generated* node identity.
-# `node_id()` in `elspeth.core.dag.builder` assigns every sink node
-# `f"sink_{yaml_key}_{sha256(config).hexdigest()[:12]}"`, never the bare
-# YAML key. This fixed pipeline (`build_fixed_pipeline_yaml` above) hard-codes
-# exactly one sink under the YAML key "output", so its `sink_node_id` is
-# schema-guaranteed to be either the literal "output" (kept for forward/
-# backward compatibility with a manifest that ever reports the bare key) or
-# exactly `sink_output_<12 lowercase hex chars>`. The 12-hex-digit anchor is
-# required, not just a `startswith` prefix: a differently-named sink such as
-# "output_extra" would also generate an id starting "sink_output_" (e.g.
-# "sink_output_extra_<hash>") without matching this exact shape.
-_GENERATED_OUTPUT_SINK_NODE_ID = re.compile(r"^sink_output_[0-9a-f]{12}$")
-
-
-def _is_output_sink_artifact(artifact: Mapping[str, object]) -> bool:
-    sink_node_id = artifact.get("sink_node_id")
-    if sink_node_id == "output":
-        return True
-    return isinstance(sink_node_id, str) and _GENERATED_OUTPUT_SINK_NODE_ID.fullmatch(sink_node_id) is not None
-
-
-def _select_output_artifact(payload: object, *, check: str) -> tuple[str, str]:
+def _select_output_artifact(payload: object, *, expected_sink_node_id: str, check: str) -> tuple[str, str]:
     manifest = _mapping(payload, check=check)
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list):
         raise AcceptanceCheckError(check)
-    matches = [artifact for artifact in artifacts if isinstance(artifact, dict) and _is_output_sink_artifact(artifact)]
+    matches = [artifact for artifact in artifacts if isinstance(artifact, dict) and artifact.get("sink_node_id") == expected_sink_node_id]
     if len(matches) != 1:
         raise AcceptanceCheckError(check)
     artifact = matches[0]
@@ -268,7 +256,11 @@ def capture(
         if _run_facts(results, check="run_results") != (landscape_run_id, source_rows, failed_tokens):
             raise AcceptanceCheckError("run_results")
         manifest = client.request_json("GET", f"/api/runs/{run_id}/outputs", expected_statuses={200})
-        artifact_id, manifest_artifact_sha256 = _select_output_artifact(manifest, check="artifact_manifest")
+        artifact_id, manifest_artifact_sha256 = _select_output_artifact(
+            manifest,
+            expected_sink_node_id=_fixed_output_sink_node_id(session_id),
+            check="artifact_manifest",
+        )
         artifact_content = client.request_bytes(
             "GET",
             f"/api/runs/{run_id}/outputs/{artifact_id}/content",
@@ -436,7 +428,11 @@ def verify_api(
         if _run_facts(results, check="results_readback") != expected_facts:
             raise AcceptanceCheckError("results_readback")
         manifest = client.request_json("GET", f"/api/runs/{state.run_id}/outputs", expected_statuses={200})
-        artifact_id, artifact_sha256 = _select_output_artifact(manifest, check="artifact_manifest")
+        artifact_id, artifact_sha256 = _select_output_artifact(
+            manifest,
+            expected_sink_node_id=_fixed_output_sink_node_id(state.session_id),
+            check="artifact_manifest",
+        )
         if artifact_id != state.artifact_id or artifact_sha256 != state.artifact_sha256:
             raise AcceptanceCheckError("artifact_manifest")
         artifact_content = client.request_bytes(

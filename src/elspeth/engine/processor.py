@@ -224,6 +224,8 @@ class _FlushContext:
     triggering_token: TokenInfo | None
     coalesce_node_id: NodeID | None
     coalesce_name: CoalesceName | None
+    row_union_node_id: NodeID | None = None
+    row_union_name: RowUnionName | None = None
 
     def __post_init__(self) -> None:
         if not self.node_id:
@@ -242,6 +244,15 @@ class _FlushContext:
                 f"_FlushContext: coalesce_node_id and coalesce_name must be both set or both None, "
                 f"got node_id={self.coalesce_node_id!r}, name={self.coalesce_name!r}"
             )
+        has_row_union_id = self.row_union_node_id is not None
+        has_row_union_name = self.row_union_name is not None
+        if has_row_union_id != has_row_union_name:
+            raise ValueError(
+                f"_FlushContext: row_union_node_id and row_union_name must be both set or both None, "
+                f"got node_id={self.row_union_node_id!r}, name={self.row_union_name!r}"
+            )
+        if has_id and has_row_union_id:
+            raise ValueError("_FlushContext cannot target both coalesce and row_union barriers")
 
 
 def _validated_quarantined_indices(result: TransformResult, *, buffered_token_count: int, aggregation_name: str) -> set[int]:
@@ -723,7 +734,11 @@ class RowProcessor:
                 coalesce_node_ids=self._coalesce_node_ids,
                 coordination_token=self._require_coordination_token(),
                 scheduler_lease_owner=self._scheduler_lease_owner,
+                row_union_executor=self._row_union_executor,
                 row_union_node_ids=self._row_union_node_ids,
+                released_row_union_items=self.released_row_union_items,
+                complete_row_union_fire=self._complete_row_union_fire,
+                emit_token_completed=self._emit_token_completed,
             ).restore_from_journal(barrier_restore)
 
     @property
@@ -1013,6 +1028,37 @@ class RowProcessor:
             if branch_name and BranchName(branch_name) in self._branch_to_coalesce:
                 coalesce_name = self._branch_to_coalesce[BranchName(branch_name)]
                 return self._coalesce_node_ids[coalesce_name], coalesce_name
+        return None, None
+
+    def _derive_row_union_from_scheduler(
+        self,
+        node_id: NodeID,
+        buffered_tokens: list[TokenInfo],
+    ) -> tuple[NodeID | None, RowUnionName | None]:
+        """Recover pending row_union context from the durable aggregation arrivals.
+
+        ``branch_name`` survives a row_union release by design, so it cannot
+        prove that an aggregation is still upstream of that barrier.  The
+        scheduler row is the authority: its ``row_union_name`` is present only
+        while the work item still owes that barrier.
+        """
+        token_ids = {token.token_id for token in buffered_tokens}
+        if not token_ids:
+            return None, None
+        names = {
+            row.row_union_name
+            for row in self._scheduler.list_blocked_barrier_items(run_id=self._run_id)
+            if row.barrier_key == str(node_id) and row.token_id in token_ids
+        }
+        if len(names) > 1:
+            raise AuditIntegrityError(
+                f"Aggregation {node_id!r} buffered tokens with inconsistent durable row_union context: {sorted(str(name) for name in names)}"
+            )
+        if names:
+            raw_name = next(iter(names))
+            if raw_name is not None:
+                row_union_name = RowUnionName(raw_name)
+                return self._row_union_node_ids[row_union_name], row_union_name
         return None, None
 
     def _handle_flush_error(
@@ -1422,21 +1468,33 @@ class RowProcessor:
         has_downstream = self._nav.resolve_next_node(fctx.node_id) is not None
         first_branch = fctx.buffered_tokens[0].branch_name if fctx.buffered_tokens else None
         needs_coalesce = fctx.coalesce_node_id is not None and fctx.coalesce_name is not None and first_branch is not None
+        needs_row_union = fctx.row_union_node_id is not None and fctx.row_union_name is not None and first_branch is not None
 
         results: list[RowResult] = []
         child_items: list[WorkItem] = []
 
-        if has_downstream or needs_coalesce:
+        if has_downstream or needs_coalesce or needs_row_union:
             work_item_coalesce_name = fctx.coalesce_name if needs_coalesce else None
+            work_item_row_union_name = fctx.row_union_name if needs_row_union else None
             for token, enriched_data in zip(fctx.buffered_tokens, pipeline_rows, strict=True):
                 updated_token = token.with_updated_data(enriched_data)
-                child_items.append(
-                    self._work_items.create_continuation(
-                        token=updated_token,
-                        current_node_id=fctx.node_id,
-                        coalesce_name=work_item_coalesce_name,
+                if needs_row_union and not has_downstream:
+                    child_items.append(
+                        self._work_items.create(
+                            token=updated_token,
+                            current_node_id=fctx.row_union_node_id,
+                            row_union_name=work_item_row_union_name,
+                        )
                     )
-                )
+                else:
+                    child_items.append(
+                        self._work_items.create_continuation(
+                            token=updated_token,
+                            current_node_id=fctx.node_id,
+                            coalesce_name=work_item_coalesce_name,
+                            row_union_name=work_item_row_union_name,
+                        )
+                    )
         else:
             for token, enriched_data in zip(fctx.buffered_tokens, pipeline_rows, strict=True):
                 updated_token = token.with_updated_data(enriched_data)
@@ -1605,17 +1663,29 @@ class RowProcessor:
             has_downstream = self._nav.resolve_next_node(fctx.node_id) is not None
             first_expanded_branch = expanded_tokens[0].branch_name if expanded_tokens else None
             needs_coalesce = fctx.coalesce_node_id is not None and fctx.coalesce_name is not None and first_expanded_branch is not None
+            needs_row_union = fctx.row_union_node_id is not None and fctx.row_union_name is not None and first_expanded_branch is not None
 
-            if has_downstream or needs_coalesce:
+            if has_downstream or needs_coalesce or needs_row_union:
                 work_item_coalesce_name = fctx.coalesce_name if needs_coalesce else None
+                work_item_row_union_name = fctx.row_union_name if needs_row_union else None
                 for token in expanded_tokens:
-                    child_items.append(
-                        self._work_items.create_continuation(
-                            token=token,
-                            current_node_id=fctx.node_id,
-                            coalesce_name=work_item_coalesce_name,
+                    if needs_row_union and not has_downstream:
+                        child_items.append(
+                            self._work_items.create(
+                                token=token,
+                                current_node_id=fctx.row_union_node_id,
+                                row_union_name=work_item_row_union_name,
+                            )
                         )
-                    )
+                    else:
+                        child_items.append(
+                            self._work_items.create_continuation(
+                                token=token,
+                                current_node_id=fctx.node_id,
+                                coalesce_name=work_item_coalesce_name,
+                                row_union_name=work_item_row_union_name,
+                            )
+                        )
             else:
                 for token in expanded_tokens:
                     results.append(
@@ -1663,6 +1733,7 @@ class RowProcessor:
         )
 
         coalesce_node_id, coalesce_name = self._derive_coalesce_from_tokens(buffered_tokens)
+        row_union_node_id, row_union_name = self._derive_row_union_from_scheduler(node_id, buffered_tokens)
 
         fctx = _FlushContext(
             node_id=node_id,
@@ -1675,6 +1746,8 @@ class RowProcessor:
             triggering_token=None,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_node_id=row_union_node_id,
+            row_union_name=row_union_name,
         )
 
         if result.status != "success":
@@ -2564,6 +2637,7 @@ class RowProcessor:
         current_node_id: NodeID | None,
         coalesce_node_id: NodeID | None = None,
         coalesce_name: CoalesceName | None = None,
+        row_union_name: RowUnionName | None = None,
     ) -> list[RowResult]:
         """Process an existing token through the pipeline starting at current_node_id.
 
@@ -2579,6 +2653,7 @@ class RowProcessor:
                 current_node_id=current_node_id,
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
+                row_union_name=row_union_name,
             ),
             ctx,
         )
@@ -2810,20 +2885,28 @@ class RowProcessor:
         """Notify the row_union executor that a forked branch was diverted.
 
         v1 is fail-closed with no partial release, so a lost branch fails the
-        whole pending group immediately. SPIKE NOTE: unlike the coalesce twin
-        (§E.5), no durable BranchLossSpec lane exists yet for row_union —
-        the in-memory leader notify is authoritative for the spike; the
-        durable record-then-notify lane is production follow-up
-        (elspeth-a5b86149d4).
+        whole pending group immediately. The durable loss record is staged
+        before the in-memory notify, including on followers; the leader
+        replays it during barrier intake.
         """
         if current_token.branch_name is None:
             return []
         branch_name = BranchName(current_token.branch_name)
         if branch_name not in self._branch_to_row_union:
             return []
+        row_union_name = self._branch_to_row_union[branch_name]
+        self._pending_branch_losses.append(
+            BranchLossSpec(
+                coalesce_name=str(row_union_name),
+                row_id=current_token.row_id,
+                branch_name=str(branch_name),
+                token_id=current_token.token_id,
+                reason=reason,
+                recorded_by=self._scheduler_lease_owner,
+            )
+        )
         if self._row_union_executor is None:
             return []
-        row_union_name = self._branch_to_row_union[branch_name]
         outcome = self._row_union_executor.notify_branch_lost(
             row_union_name=str(row_union_name),
             row_id=current_token.row_id,
@@ -2837,6 +2920,18 @@ class RowProcessor:
             consumed_tokens=outcome.consumed_tokens,
             scope_row_id=current_token.row_id,
         )
+        for consumed in outcome.consumed_tokens:
+            with best_effort(
+                "TokenCompleted telemetry after row_union branch-loss audit",
+                run_id=self._run_id,
+                token_id=consumed.token_id,
+                row_union_name=row_union_name,
+            ):
+                self._emit_token_completed(
+                    consumed,
+                    outcome=TerminalOutcome.FAILURE,
+                    path=TerminalPath.UNROUTED,
+                )
         return [
             RowResult(
                 token=consumed,

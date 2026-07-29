@@ -286,6 +286,23 @@ def _argv(
     owner: str = "test-operator",
     extra: tuple[str, ...] = (),
 ) -> list[str]:
+    """Build a ``sign-bundle`` argv bound to this test's tmp_path.
+
+    ``--rotation-log`` defaults to the CWD-relative ``.elspeth/rotations.log``,
+    which ``create_transaction`` resolves against the *process* CWD -- under
+    pytest that is the checkout, so an unqualified invocation binds the
+    repository's own tracked rotation manifest: the transaction snapshots its
+    bytes into ``rotation-base.bin``, ``assert_rotation_log_unchanged`` gates on
+    them, and a rotation that reaches ``finalize_rotation_log`` appends a
+    tmp-dir record to a tracked file. Bind every invocation to the test's
+    tmp_path instead (``allowlist_dir.parent``: ``_build_allowlist_dir`` always
+    returns ``tmp_path / <name>``), which is the same ``tmp_path /
+    "rotations.log"`` the rotation tests already pass explicitly. Callers that
+    supply their own ``--rotation-log`` in ``extra`` keep it -- resume runs
+    authenticate ``rotation_log`` against the transaction manifest
+    (``assert_resume_identity``), so both legs must select the same path.
+    """
+    rotation_log = () if "--rotation-log" in extra else ("--rotation-log", str(allowlist_dir.parent / "rotations.log"))
     return [
         "sign-bundle",
         str(bundle_path),
@@ -295,6 +312,7 @@ def _argv(
         str(allowlist_dir),
         "--owner",
         owner,
+        *rotation_log,
         *extra,
     ]
 
@@ -352,6 +370,27 @@ def _recovery_path(stderr: str) -> Path:
 # =========================================================================== #
 # Task 2.1 -- subparser, dispatch, fail-closed key hoist, load + integrity
 # =========================================================================== #
+
+
+def test_argv_never_selects_the_repository_rotation_manifest(tmp_path: Path) -> None:
+    """No sign-bundle invocation may bind the checkout's tracked rotations.log.
+
+    Regression for the CWD-relative ``--rotation-log`` default: a leaked
+    binding lets a rotation append a tmp-dir record to a tracked file, which
+    dirties the tree and trips pre-commit dirty-checks. Asserted at ``_argv``
+    because that is the single chokepoint every test invocation passes through.
+    """
+    from elspeth_lints.core.cli import _build_parser
+
+    repo_manifest = (Path.cwd() / ".elspeth" / "rotations.log").resolve()
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    explicit = str(tmp_path / "explicit-rotations.log")
+    for extra in ((), ("--yes",), ("--yes", "--resume", str(tmp_path / "tx")), ("--yes", "--rotation-log", explicit)):
+        argv = _argv(tmp_path / "bundle.json", tmp_path / "src_root", allowlist_dir, extra=extra)
+        assert argv.count("--rotation-log") == 1, f"{extra!r} produced a duplicate/missing --rotation-log: {argv!r}"
+        selected = _build_parser().parse_args(argv).rotation_log.resolve()
+        assert selected != repo_manifest, f"{extra!r} selected the repository rotation manifest"
+        assert tmp_path.resolve() in selected.parents, f"{extra!r} selected {selected} outside tmp_path"
 
 
 def test_sign_bundle_fails_closed_without_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -858,6 +897,53 @@ def test_sign_bundle_resume_migrates_legacy_pending_publication_journal(
     assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
     records = [json.loads(line) for line in rotation_log.read_text(encoding="utf-8").splitlines()]
     assert any({"source_file": "gadget.yaml", "old_key": stale_key, "new_key": live_key} in record["rotations"] for record in records)
+
+
+def test_sign_bundle_resume_does_not_roll_back_completed_legacy_rotation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(rotation_log)))) == 0
+    transaction = _recovery_path(capsys.readouterr().err)
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    manifest.pop("source_validation_state")
+    sign_bundle_transaction.save_manifest(transaction, manifest)
+    before_allowlist = _tree_bytes(allowlist_dir)
+    before_rotation = rotation_log.read_bytes()
+
+    _write_source(root, "plugins/gadget.py", "gadget", active=False)
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before_allowlist
+    assert rotation_log.read_bytes() == before_rotation
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
 
 
 def test_publication_disposition_rejects_preexchange_writer_and_base_mimic(
@@ -2185,6 +2271,57 @@ def test_sign_bundle_dry_run_writes_nothing(tmp_path: Path, capsys: pytest.Captu
     assert not (allowlist_dir.parent / ".sign-bundle-transactions").exists()
     out = capsys.readouterr().out
     assert "new_judgment" in out
+
+
+def test_sign_bundle_resume_dry_run_never_rolls_back_published_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _interrupt_after_publish(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _interrupt_after_publish)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(rotation_log)))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+
+    _write_source(root, "plugins/gadget.py", "gadget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--dry-run", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
 
 
 def test_sign_bundle_dry_run_reports_planned_override_count(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

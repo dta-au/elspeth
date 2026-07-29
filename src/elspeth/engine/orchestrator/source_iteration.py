@@ -185,6 +185,7 @@ class SourceIterationDriver:
             handle_row_union_timeouts(
                 row_union_executor=row_union_executor,
                 processor=loop_ctx.processor,
+                ctx=ctx,
                 counters=loop_ctx.counters,
             )
 
@@ -730,6 +731,7 @@ class SourceIterationDriver:
                             handle_row_union_timeouts(
                                 row_union_executor=row_union_executor,
                                 processor=processor,
+                                ctx=ctx,
                                 counters=counters,
                             )
 

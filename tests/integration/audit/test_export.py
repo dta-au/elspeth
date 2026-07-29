@@ -181,13 +181,18 @@ class TestLandscapeExport:
         assert run_record["status"] == "completed", "Status should be completed"
 
     @pytest.fixture
-    def export_disabled_settings(self, tmp_path: Path) -> Path:
+    def export_disabled_settings(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         """Create settings file with export disabled.
 
         NOTE: When export is disabled, we don't define an audit_export sink.
         If export is disabled but the sink is still defined, graph validation
         will fail because the sink is unreachable (nothing routes to it).
         """
+        # Mirror ``export_settings_yaml``: run from tmp_path so CWD-relative
+        # config defaults (payload_store.base_path -> .elspeth/payloads) land
+        # in the temp tree instead of the checkout.
+        monkeypatch.chdir(tmp_path)
+
         input_csv = tmp_path / "input.csv"
         input_csv.write_text("id,name\n1,Test\n")
 

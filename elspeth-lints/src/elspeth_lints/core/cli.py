@@ -3980,6 +3980,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
     except ValueError as exc:
         if (
             args.resume is not None
+            and not args.dry_run
             and resume_manifest is not None
             and resume_disposition is not None
             and resume_disposition.startswith("published")
@@ -3997,6 +3998,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
     if not verification.ok:
         if (
             args.resume is not None
+            and not args.dry_run
             and resume_manifest is not None
             and resume_disposition is not None
             and resume_disposition.startswith("published")

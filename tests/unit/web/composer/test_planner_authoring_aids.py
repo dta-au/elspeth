@@ -189,7 +189,11 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
     return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
 
 
-def _guardrail_profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+def _guardrail_profile_view(
+    tmp_path: Path,
+    *,
+    control_mode: str = "required",
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     """Control-required posture: LLM profile plus both Bedrock Guardrail profiles.
 
     Mirrors the AWS scenario module, which authorizes the two Bedrock controls,
@@ -227,8 +231,8 @@ def _guardrail_profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAv
             PluginCapability.CONTENT_SAFETY: ("transform:aws_bedrock_content_safety",),
         },
         plugin_control_modes={
-            PluginCapability.PROMPT_SHIELD: ControlMode.REQUIRED,
-            PluginCapability.CONTENT_SAFETY: ControlMode.REQUIRED,
+            PluginCapability.PROMPT_SHIELD: ControlMode(control_mode),
+            PluginCapability.CONTENT_SAFETY: ControlMode(control_mode),
         },
         bedrock_guardrail_profiles=(
             BedrockGuardrailProfileSettings(
@@ -564,6 +568,23 @@ class TestForkCoalesceExemplar:
             assert "guardrail_identifier" not in control["options"]
             assert "guardrail_version" not in control["options"]
 
+    def test_recommended_controls_remain_advisory_and_do_not_mutate_the_exemplar(self, tmp_path: Path) -> None:
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_AVAILABLE_DRAFT
+
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        plugins = {node.get("plugin") for node in args["nodes"]}
+        assert "aws_bedrock_prompt_shield" not in plugins
+        assert "aws_bedrock_content_safety" not in plugins
+
+        aids = build_planner_authoring_aids(view)
+        rendered = "\n".join(aids["prompt_shield"]["rules"])
+        assert PROMPT_SHIELD_AVAILABLE_DRAFT in rendered
+        assert "required, not advisory" not in rendered
+        assert "content_safety" not in aids
+
     def test_topology_exemplar_renders_and_validates_without_a_usable_llm_profile(self, tmp_path: Path) -> None:
         """No usable llm profile -> the SAME topology with non-LLM branches.
 
@@ -834,31 +855,18 @@ class TestPromptShieldRules:
     imported constants, so the aids can never drift from the contract.
     """
 
-    def test_available_shield_is_wired_not_merely_recommended(self) -> None:
-        """A deployment that ships a shield gets the shield wired in.
-
-        The aids used to teach the advisory card in BOTH regimes and named
-        wiring only as a reason to SKIP the card, so no planner ever wired an
-        available shield (run 06c9ec49, 2026-07-29) — and where a deployment
-        marks the capability ``required``, coverage could never be met. With a
-        shield selected the rules now mandate wiring it BY ITS DEPLOYMENT NAME
-        (aws_bedrock_prompt_shield, azure_prompt_shield, …) and suppress the
-        card, whose exposure no longer exists.
-        """
+    def test_selected_recommended_shield_stays_an_advisory(self) -> None:
         from elspeth.contracts.plugin_capabilities import PluginCapability
-        from elspeth.web.interpretation_state import PROMPT_SHIELD_WARNING_DRAFT
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_AVAILABLE_DRAFT
 
         view, snapshot = _trained_view()
         selected = dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD)
         assert selected is not None
 
         rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
-        # The live selection names itself — never a hardcoded vendor.
         assert selected.name in rendered
-        assert "WIRE" in rendered
-        assert "required, not advisory" in rendered
-        # The advisory regime's draft must not ride along and re-teach the card.
-        assert PROMPT_SHIELD_WARNING_DRAFT not in rendered
+        assert PROMPT_SHIELD_AVAILABLE_DRAFT in rendered
+        assert "required, not advisory" not in rendered
 
     def test_shieldless_view_quotes_the_warning_draft_verbatim(self) -> None:
         from unittest.mock import MagicMock

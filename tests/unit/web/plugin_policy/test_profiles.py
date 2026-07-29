@@ -204,14 +204,8 @@ def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
     assert settings_fields == runtime_fields
 
 
-def test_llm_profiles_require_a_designated_standard_profile() -> None:
-    """Offering LLM authoring without naming the standard profile is refused.
-
-    Leaving it unset does not mean "no default" — the resolver would fall back to
-    whichever alias happens to sort first, making an arbitrary profile the alias
-    authors see first and the one the Composer's worked examples cite. Fail
-    closed instead of letting that be decided by alphabetical accident.
-    """
+def test_llm_profiles_without_a_standard_profile_start_in_degraded_mode() -> None:
+    """Ordinary authoring remains available while tutorial readiness is degraded."""
     profiles = {
         "standard": {
             "provider": "bedrock",
@@ -225,8 +219,9 @@ def test_llm_profiles_require_a_designated_standard_profile() -> None:
         },
     }
 
-    with pytest.raises(ValidationError):
-        _settings(llm_profiles=profiles)
+    degraded = _settings(llm_profiles=profiles)
+    assert degraded.llm_profiles
+    assert degraded.default_llm_profile is None
 
     settings = _settings(llm_profiles=profiles, default_llm_profile="standard")
     assert settings.default_llm_profile == "standard"

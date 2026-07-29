@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import threading
 import time
@@ -192,6 +193,20 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
     max_result_pages: int = Field(default=1000, gt=0, description="Maximum GetDocumentAnalysis result pages retained for one document.")
     max_blocks: int = Field(default=200_000, gt=0, description="Maximum combined Textract block count for one document.")
     max_result_bytes: int = Field(default=50_000_000, gt=0, description="Maximum canonical JSON bytes retained for one document result.")
+
+    @field_validator(
+        "poll_interval_seconds",
+        "poll_backoff_multiplier",
+        "poll_max_interval_seconds",
+        "poll_timeout_seconds",
+        "batch_wait_timeout_seconds",
+    )
+    @classmethod
+    def _finite_timing(cls, value: float, info: object) -> float:
+        if not math.isfinite(value):
+            field_name = getattr(info, "field_name", "timing value")
+            raise ValueError(f"{field_name} must be finite")
+        return value
 
     @field_validator("region")
     @classmethod
@@ -617,9 +632,12 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         seen_tokens: set[str] = set()
         pages: list[Mapping[str, Any]] = []
         block_count = 0
+        retained_result_bytes = 0
         while True:
             if self._shutdown.is_set():
                 return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
+            if time.monotonic() >= deadline:
+                return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
             try:
                 page = client.get_document_analysis(job_id=receipt.job_id, next_token=next_token)
             except TextractIdempotencyInvariantError as error:
@@ -632,6 +650,11 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             except TextractResponseError as error:
                 poll_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
                 return TransformResult.error({"reason": poll_reason, "error_type": "poll_response"}, retryable=False)
+
+            if self._shutdown.is_set():
+                return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
+            if time.monotonic() >= deadline:
+                return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
 
             status = page.semantic_response.get("JobStatus")
             if type(status) is not str:
@@ -654,6 +677,13 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             if status != "SUCCEEDED":
                 return TransformResult.error({"reason": "malformed_response", "error_type": "unknown_status"}, retryable=False)
 
+            try:
+                page_bytes = len(canonical_json(page.semantic_response).encode("utf-8"))
+            except (TypeError, ValueError, RecursionError, UnicodeError):
+                return TransformResult.error({"reason": "malformed_response", "error_type": "result_encoding"}, retryable=False)
+            retained_result_bytes += page_bytes
+            if retained_result_bytes > self._max_result_bytes:
+                return TransformResult.error({"reason": "result_too_large"}, retryable=False)
             pages.append(page.semantic_response)
             raw_blocks = page.semantic_response.get("Blocks")
             if isinstance(raw_blocks, Sequence) and not isinstance(raw_blocks, (str, bytes, bytearray)):

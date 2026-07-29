@@ -87,6 +87,9 @@ sinks:
         - 'copy_index: int'
 landscape:
   url: sqlite:///{audit_db}
+payload_store:
+  backend: filesystem
+  base_path: {example_dst / "payloads"}
 """
     )
 
@@ -193,6 +196,9 @@ sinks:
         - 'copy_index: int'
 landscape:
   url: sqlite:///{audit_db}
+payload_store:
+  backend: filesystem
+  base_path: {example_dst / "payloads"}
 """
     )
 

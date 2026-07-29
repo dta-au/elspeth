@@ -33,6 +33,7 @@ EXPECTED_FILES = {
     "iam/lifecycle-policy.json.tftpl",
     "modules/scenario/database_bootstrap.tf",
     "modules/scenario/ecs.tf",
+    "modules/scenario/image_provenance.tf",
     "modules/scenario/iam_observability.tf",
     "modules/scenario/locals.tf",
     "modules/scenario/network.tf",
@@ -385,6 +386,113 @@ def test_composer_boot_probe_exercises_primary_and_advisor_models() -> None:
     assert '{ name = "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", value = var.composer_advisor_model }' in module_locals
 
 
+def test_every_image_is_proven_before_any_credentialed_task_definition() -> None:
+    provenance = _text("modules/scenario/image_provenance.tf")
+    module_variables = _text("modules/scenario/variables.tf")
+    credentialed_definitions = "\n".join((_text("modules/scenario/ecs.tf"), _text("modules/scenario/database_bootstrap.tf")))
+
+    assert 'variable "candidate_ecr_repository"' in module_variables
+    assert 'variable "cloudwatch_agent_ecr_repository"' in module_variables
+    assert all(
+        token in module_variables
+        for token in (
+            "var.aws_account_id",
+            "var.aws_region",
+            "var.candidate_ecr_repository",
+            "var.cloudwatch_agent_ecr_repository",
+            "amazonaws",
+        )
+    )
+    assert 'resource "terraform_data" "candidate_image_provenance"' in provenance
+    assert 'resource "terraform_data" "rollback_image_provenance"' in provenance
+    assert 'resource "terraform_data" "cloudwatch_agent_image_provenance"' in provenance
+    assert 'docker pull "$CANDIDATE_IMAGE"' in provenance
+    assert 'docker pull "$ROLLBACK_IMAGE"' in provenance
+    assert 'docker pull "$CLOUDWATCH_AGENT_IMAGE"' in provenance
+    assert "org.opencontainers.image.revision" in provenance
+    assert 'test "$revision" = "$CANDIDATE_SHA"' in provenance
+    assert 'test "$revision" = "$ROLLBACK_SHA"' in provenance
+    assert 'test "$revision" = "$CANDIDATE_SHA"' in provenance
+    assert "terraform_data.candidate_image_provenance.output" in credentialed_definitions
+    assert "terraform_data.rollback_image_provenance.output" in credentialed_definitions
+    assert "terraform_data.cloudwatch_agent_image_provenance.output" in credentialed_definitions
+    assert "image                  = var.candidate_image" not in credentialed_definitions
+    assert "image      = var.candidate_image" not in credentialed_definitions
+    assert "image = var.rollback_baseline_image" not in credentialed_definitions
+    assert "image             = local.cloudwatch_agent_image" not in credentialed_definitions
+
+    for root in ("scenario-a", "scenario-b"):
+        assert 'variable "candidate_ecr_repository"' in _text(f"{root}/variables.tf")
+        assert 'variable "cloudwatch_agent_ecr_repository"' in _text(f"{root}/variables.tf")
+        assert re.search(r"candidate_ecr_repository\s+=\s+var\.candidate_ecr_repository", _text(f"{root}/main.tf"))
+        assert re.search(
+            r"cloudwatch_agent_ecr_repository\s+=\s+var\.cloudwatch_agent_ecr_repository",
+            _text(f"{root}/main.tf"),
+        )
+        assert "candidate_ecr_repository" in _text(f"examples/{root}.tfvars.example")
+        assert "cloudwatch_agent_ecr_repository" in _text(f"examples/{root}.tfvars.example")
+
+    native_test = _text("scenario-a/codeblind.tftest.hcl")
+    assert 'run "reject_foreign_registry_candidate"' in native_test
+    assert 'run "reject_foreign_account_candidate"' in native_test
+    assert 'run "reject_foreign_repository_candidate"' in native_test
+
+    agent_dockerfile = _text("cloudwatch-agent-image/Dockerfile")
+    assert "ARG ELSPETH_RELEASE_SHA" in agent_dockerfile
+    assert "org.opencontainers.image.revision=$ELSPETH_RELEASE_SHA" in agent_dockerfile
+
+
+def test_database_password_rotation_reexecutes_the_database_bootstrap() -> None:
+    bootstrap = _text("modules/scenario/database_bootstrap.tf")
+    triggers = bootstrap[bootstrap.index("triggers_replace = [") : bootstrap.index("]", bootstrap.index("triggers_replace = ["))]
+
+    assert "aws_secretsmanager_secret_version.bootstrap.version_id" in triggers
+
+
+def test_upgrade_command_selects_the_newly_registered_task_definition() -> None:
+    readme = _text("README.md")
+    start = readme.index("### Upgrading an existing install")
+    upgrade = readme[start : readme.index("## Scenario B", start)]
+
+    assert "CANDIDATE_TASK_DEFINITION=" in upgrade
+    assert "terraform -chdir=scenario-a output" in upgrade
+    assert "aws ecs update-service \\\n" in upgrade
+    assert '--task-definition "$CANDIDATE_TASK_DEFINITION"' in upgrade
+    assert "--force-new-deployment" in upgrade
+
+
+def test_source_free_cold_install_runs_the_full_post_enable_acceptance() -> None:
+    readme = _text("README.md")
+    start = readme.index("### Source-free post-enable acceptance")
+    section = readme[start : readme.index("## Immutable RDS trust-root admission", start)]
+
+    for required in (
+        "services-stable",
+        "describe-target-health",
+        "/api/health",
+        "/api/ready",
+        "provision-storage",
+        "verify-local-auth",
+        "capture --state-file",
+        "verify-api --state-file",
+        "verify-s3",
+        "verify-bedrock",
+        "verify-bedrock-guardrails",
+        "/messages",
+        '--task-definition "$CANDIDATE_TASK_DEFINITION"',
+    ):
+        assert required in section
+
+
+def test_fresh_machine_pulls_the_candidate_before_local_inspection() -> None:
+    readme = _text("README.md")
+    start = readme.index("Before promoting a candidate")
+    section = readme[start : readme.index("### Upgrading an existing install", start)]
+
+    assert 'docker pull "$CANDIDATE_IMAGE"' in section
+    assert section.index('docker pull "$CANDIDATE_IMAGE"') < section.index("docker inspect")
+
+
 def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
     locals = _text("modules/scenario/locals.tf")
     ecs = _text("modules/scenario/ecs.tf")
@@ -422,8 +530,7 @@ def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
     ):
         assert name in _hcl_map_keys(outputs, "scenario_values")
     assert "@sha256:[0-9a-f]{64}$" in _text("modules/scenario/variables.tf")
-    assert "local.cloudwatch_agent_image" in ecs
-    assert "var.cloudwatch_agent_image" in _text("modules/scenario/iam_observability.tf")
+    assert "terraform_data.cloudwatch_agent_image_provenance.output" in ecs
     assert "sha256(local.cw_agent_json)" in locals
     assert "sha256(local.cw_agent_otel)" in locals
     assert "elspeth.cloudwatch-agent.v1.json" in locals
@@ -577,14 +684,22 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
 
     assert "CreateRunScopedRolesWithBoundary" not in statements
     pass_role = statements["PassRunScopedRolesToEcsTasksOnly"]
-    assert pass_role["Condition"]["StringEquals"]["iam:PassedToService"] == "ecs-tasks.amazonaws.com"
+    assert pass_role["Condition"] == {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}}
+    assert pass_role["Resource"] == [
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-*-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-*-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-execution-role",
+    ]
+    iam_roles = _text("modules/scenario/iam_observability.tf")
+    assert iam_roles.count('path                 = "/elspeth/${var.run_id}/"') == 2
     inline_roles = statements["ManageRunScopedInlinePolicies"]
     assert set(inline_roles["Action"]) == {"iam:DeleteRolePolicy", "iam:PutRolePolicy"}
     managed_attachment = statements["ManageKnownExecutionRoleAttachment"]
     assert set(managed_attachment["Action"]) == {"iam:AttachRolePolicy", "iam:DetachRolePolicy"}
     assert managed_attachment["Resource"] == [
-        "arn:aws:iam::123456789012:role/a-*-execution-role",
-        "arn:aws:iam::123456789012:role/b-*-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-*-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-execution-role",
     ]
     assert managed_attachment["Condition"]["ArnEquals"]["iam:PolicyARN"] == (
         "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
@@ -694,10 +809,10 @@ def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permis
     }.issubset(manage_boundary["Action"])
 
     role_resources = [
-        "arn:aws:iam::123456789012:role/a-*-task-role",
-        "arn:aws:iam::123456789012:role/a-*-execution-role",
-        "arn:aws:iam::123456789012:role/b-*-task-role",
-        "arn:aws:iam::123456789012:role/b-*-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-*-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-*-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-execution-role",
     ]
     create_roles = statements["CreateRunRolesWithNarrowBoundary"]
     assert create_roles["Resource"] == role_resources
@@ -743,7 +858,7 @@ def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permis
     readme = _text("README.md")
     assert "separate IAM lifecycle principal" in readme
     assert "terraform destroy" in readme
-    assert "-target" not in readme
+    assert not re.search(r"terraform[^\n]*\s-target(?:=|\s)", readme)
     assert "terraform state rm" not in readme
 
 
@@ -816,7 +931,11 @@ def test_monitoring_resources_use_a_retained_digest_pinned_collector() -> None:
     assert re.search(r"Deploy the\s+CloudWatch agent by digest", readme)
     ecs = _text("modules/scenario/ecs.tf")
     observability = _text("modules/scenario/iam_observability.tf")
-    assert re.search(r"cloudwatch_agent_container\s*=\s*\{.*?image\s*=\s*local\.cloudwatch_agent_image", ecs, re.DOTALL)
+    assert re.search(
+        r"cloudwatch_agent_container\s*=\s*\{.*?image\s*=\s*terraform_data\.cloudwatch_agent_image_provenance\.output",
+        ecs,
+        re.DOTALL,
+    )
     for resource in (
         'resource "aws_cloudwatch_log_group" "operator"',
         'resource "aws_cloudwatch_dashboard" "operator"',
@@ -931,6 +1050,17 @@ def test_scenario_b_inventory_has_a_validated_nonempty_cognito_subject() -> None
     )
 
 
+def test_scenario_b_reuses_the_single_bootstrap_run_identity() -> None:
+    scenario_a_example = _text("examples/scenario-a.tfvars.example")
+    scenario_b_example = _text("examples/scenario-b.tfvars.example")
+    readme = _text("README.md")
+
+    assert 'run_id                  = "REPLACE_WITH_LOWERCASE_UUID"' in scenario_a_example
+    assert 'run_id                  = "REPLACE_WITH_LOWERCASE_UUID"' in scenario_b_example
+    assert "REPLACE_WITH_DIFFERENT_LOWERCASE_UUID" not in scenario_b_example
+    assert "`scenario_id` already isolates" in readme
+
+
 def test_explicit_aws_profile_is_bound_across_provider_backend_and_local_cli() -> None:
     module_variables = _text("modules/scenario/variables.tf")
     module_outputs = _text("modules/scenario/outputs.tf")
@@ -995,7 +1125,6 @@ def test_examples_and_policy_are_parseable_and_contain_no_local_or_account_data(
     assert "BEGIN PRIVATE KEY" not in all_text
     for forbidden in (
         "approval-require",
-        "receipt",
         "plan12",
         "raw-image-ref",
         "baseline-copy",

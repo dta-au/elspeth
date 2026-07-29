@@ -45,10 +45,10 @@
         "iam:TagRole"
       ],
       "Resource": [
-        "arn:aws:iam::${aws_account_id}:role/a-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/a-*-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
       ],
       "Condition": {
         "StringEquals": {
@@ -67,10 +67,10 @@
         "iam:UntagRole"
       ],
       "Resource": [
-        "arn:aws:iam::${aws_account_id}:role/a-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/a-*-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
       ],
       "Condition": {
         "StringEquals": {

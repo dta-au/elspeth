@@ -61,6 +61,12 @@ const composerSettingsEnv: Record<string, string> = {
       model: "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
     },
   }),
+  // A deployment that configures llm_profiles must designate its standard
+  // profile: WebSettings refuses to start otherwise (see the
+  // _validate_default_llm_profile_alias model validator in
+  // src/elspeth/web/config.py). Without this the Playwright-managed backend
+  // raises before binding its port and every spec fails on webServer timeout.
+  ELSPETH_WEB__default_llm_profile: "e2e-bedrock",
   // Placeholder JWT signing key for the local webServer instance. The
   // backend refuses startup if cors_origins contains a non-loopback host
   // and secret_key is left at its default; here we set it explicitly so

@@ -405,6 +405,7 @@ def handle_coalesce_timeouts(
 def _handle_failed_row_union_outcome(
     outcome: RowUnionOutcome,
     processor: CoalesceCompletionPort,
+    ctx: PluginContext,
     counters: ExecutionCounters,
 ) -> None:
     """Reconcile one fail-closed row_union outcome with the durable journal.
@@ -431,27 +432,31 @@ def _handle_failed_row_union_outcome(
         consumed_tokens=tuple(outcome.consumed_tokens),
     )
     counters.rows_failed += len(outcome.consumed_tokens)
+    for token in outcome.consumed_tokens:
+        _emit_failed_token_completed(ctx, token)
 
 
 def handle_row_union_timeouts(
     row_union_executor: RowUnionExecutor,
     processor: CoalesceCompletionPort,
+    ctx: PluginContext,
     counters: ExecutionCounters,
 ) -> None:
     """Sweep row_union barriers for timed-out groups and fail them closed."""
     for row_union_name in row_union_executor.get_registered_names():
         for outcome in row_union_executor.check_timeouts(row_union_name):
-            _handle_failed_row_union_outcome(outcome, processor, counters)
+            _handle_failed_row_union_outcome(outcome, processor, ctx, counters)
 
 
 def flush_row_union_pending(
     row_union_executor: RowUnionExecutor,
     processor: CoalesceCompletionPort,
+    ctx: PluginContext,
     counters: ExecutionCounters,
 ) -> None:
     """Fail every incomplete row_union group closed at end-of-source (v1)."""
     for outcome in row_union_executor.flush_pending():
-        _handle_failed_row_union_outcome(outcome, processor, counters)
+        _handle_failed_row_union_outcome(outcome, processor, ctx, counters)
 
 
 def flush_coalesce_pending(

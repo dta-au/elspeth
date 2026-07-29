@@ -871,6 +871,55 @@ async def test_delayed_older_surface_without_current_card_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_delayed_surface_after_review_site_removal_abandons_the_previous_card(
+    service: SessionServiceImpl,
+) -> None:
+    """A post-commit stale surfacer must not leave an impossible card pending."""
+    kind = InterpretationKind.VAGUE_TERM
+    old_state, affected_node_id, user_term = _event_liveness_state(
+        kind,
+        draft="the reviewed interpretation",
+    )
+    session_id = uuid4()
+    old_state_id = await _seed_event_liveness_session(service, session_id, old_state)
+    previous_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=old_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="original-surface",
+        user_term=user_term,
+        kind=kind,
+        llm_draft="the reviewed interpretation",
+        **_provenance_kwargs(),
+    )
+
+    # A different worker commits a state that removes this review site before
+    # the delayed surfacer reaches the session lock.
+    await _save_event_liveness_state(
+        service,
+        session_id,
+        _state_with(_llm_node(node_id="replacement-node", term="other")),
+    )
+
+    reconciled = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=old_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="delayed-after-removal",
+        user_term=user_term,
+        kind=kind,
+        llm_draft="the reviewed interpretation",
+        **_provenance_kwargs(),
+    )
+
+    rows = await service.list_interpretation_events(session_id, status="all")
+    assert reconciled.id == previous_event.id
+    assert [(row.id, row.choice) for row in rows] == [
+        (previous_event.id, InterpretationChoice.ABANDONED),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("kind", "draft"),
     [

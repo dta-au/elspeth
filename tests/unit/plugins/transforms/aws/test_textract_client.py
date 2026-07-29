@@ -283,6 +283,52 @@ def test_malformed_get_response_is_audited_and_fails_closed(response: object) ->
     assert recorder.calls[0]["status"] is CallStatus.ERROR
 
 
+def test_unencodable_next_token_is_audited_before_failure() -> None:
+    sdk = FakeSDK(
+        get_responses=[
+            {
+                "JobStatus": "SUCCEEDED",
+                "Blocks": [],
+                "NextToken": "\ud800",
+                "ResponseMetadata": _metadata(),
+            }
+        ]
+    )
+    client, recorder, _, _ = _client(sdk)
+
+    with pytest.raises(TextractResponseError):
+        client.get_document_analysis(job_id="job-1", next_token=None)
+
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["status"] is CallStatus.ERROR
+
+
+def test_deep_provider_shape_is_audited_before_failure() -> None:
+    nested: dict[str, object] = {}
+    cursor = nested
+    for _ in range(2_000):
+        child: dict[str, object] = {}
+        cursor["child"] = child
+        cursor = child
+    sdk = FakeSDK(
+        get_responses=[
+            {
+                "JobStatus": "SUCCEEDED",
+                "Blocks": [],
+                "Deep": nested,
+                "ResponseMetadata": _metadata(),
+            }
+        ]
+    )
+    client, recorder, _, _ = _client(sdk)
+
+    with pytest.raises(TextractResponseError):
+        client.get_document_analysis(job_id="job-1", next_token=None)
+
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["status"] is CallStatus.ERROR
+
+
 def test_oversized_semantic_response_is_audited_and_fails_closed() -> None:
     sdk = FakeSDK(
         get_responses=[
@@ -351,6 +397,7 @@ def test_transport_error_is_retryable_and_sanitized() -> None:
 
     assert exc_info.value.code == "transport_error"
     assert exc_info.value.retryable is True
+    assert recorder.calls[0]["response_data"].to_dict()["attempts"] == 3
     assert "private.example.invalid" not in repr((exc_info.value, recorder.calls, events))
 
 

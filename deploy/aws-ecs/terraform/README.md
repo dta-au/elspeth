@@ -167,10 +167,17 @@ shell-bearing CloudWatch agent. Temporary application tags may expire. The
 agent repository expires only untagged images after 30 days. Deploy the
 CloudWatch agent by digest (`repository@sha256:...`), never by tag.
 
-Build `cloudwatch-agent-image/Dockerfile`, publish it to that dedicated
+Build `cloudwatch-agent-image/Dockerfile` with
+`--build-arg ELSPETH_RELEASE_SHA="$CANDIDATE_SHA"`, publish it to that dedicated
 repository under a retained tag, resolve the immutable digest, and place the
-digest reference in the scenario tfvars. The resolved inventory binds the
-digest and SHA-256 hashes of both tracked telemetry configuration files.
+digest reference in `cloudwatch_agent_image`. Set
+`cloudwatch_agent_ecr_repository` from the bootstrap output of the same name;
+set `candidate_ecr_repository` from the bootstrap `ecr_repository` output. The
+scenario refuses foreign registry, account, region, or repository references,
+then pulls every credential-bearing image and verifies its baked
+`org.opencontainers.image.revision` label before Terraform may register any
+task definition. The resolved inventory also binds the digest and SHA-256
+hashes of both tracked telemetry configuration files.
 
 ## 2. Generate partial backend inputs
 
@@ -277,6 +284,176 @@ schema-init check.
 The service lifecycle ignores later desired-count and task-definition changes
 so ordinary image deployments remain an explicit operator action.
 
+### Source-free post-enable acceptance
+
+The Terraform package and the candidate image are sufficient for acceptance;
+do not require a source checkout after apply. Run the following immediately
+after the two doctor tasks pass. It selects the candidate task definition,
+waits for the service and target, and proves both HTTP gates:
+
+```sh
+acceptance_dir=$(mktemp -d -p /tmp elspeth-source-free-acceptance.XXXXXX)
+chmod 700 "$acceptance_dir"
+trap 'rm -rf -- "$acceptance_dir"' EXIT
+
+INVENTORY=$(terraform -chdir=scenario-a output -json resolved_inventory)
+ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
+ECS_SERVICE=$(terraform -chdir=scenario-a output -raw service_name)
+PUBLIC_URL=$(terraform -chdir=scenario-a output -raw public_url)
+CANDIDATE_TASK_DEFINITION=$(printf '%s' "$INVENTORY" | jq -er '.values.CANDIDATE_TASK_DEFINITION')
+TARGET_GROUP_ARN=$(printf '%s' "$INVENTORY" | jq -er '.values.TARGET_GROUP_ARN')
+CANDIDATE_IMAGE=$(aws ecs describe-task-definition \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].image | [0]' \
+  --output text)
+terraform -chdir=scenario-a output -raw acceptance_tls_ca_pem >"$acceptance_dir/ca.pem"
+chmod 600 "$acceptance_dir/ca.pem"
+
+aws ecs update-service \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
+  --desired-count 1 --force-new-deployment >/dev/null
+aws ecs wait services-stable \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+aws elbv2 describe-target-health \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --target-group-arn "$TARGET_GROUP_ARN" \
+  --output json | jq -e \
+  '[.TargetHealthDescriptions[] | select(.TargetHealth.State == "healthy")] | length == 1'
+curl --fail --silent --show-error --cacert "$acceptance_dir/ca.pem" \
+  "$PUBLIC_URL/api/health" | jq -e '.status == "ok"'
+curl --fail --silent --show-error --cacert "$acceptance_dir/ca.pem" \
+  "$PUBLIC_URL/api/ready" | jq -e '.ready == true'
+```
+
+Run the two EFS-backed one-shot definitions. Both must stop with exit code
+zero; `provision-storage` proves the runtime UID can create, fsync, read, and
+remove bounded probes, while `verify-local-auth` proves the mounted auth store
+is readable through the intended local-auth contract:
+
+```sh
+NETWORK=$(terraform -chdir=scenario-a output -raw runtime_doctor_network_configuration)
+run_one_shot() {
+  task_definition=$1
+  expected_command=$2
+  task_arn=$(aws ecs run-task \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$ECS_CLUSTER" --task-definition "$task_definition" \
+    --launch-type FARGATE --network-configuration "$NETWORK" --count 1 \
+    --query 'tasks[0].taskArn' --output text)
+  aws ecs wait tasks-stopped \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$ECS_CLUSTER" --tasks "$task_arn"
+  test "$(aws ecs describe-tasks \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$ECS_CLUSTER" --tasks "$task_arn" \
+    --query 'tasks[0].containers[?name==`elspeth-web`].exitCode | [0]' \
+    --output text)" = 0
+  printf '%s: ok\n' "$expected_command"
+}
+run_one_shot \
+  "$(printf '%s' "$INVENTORY" | jq -er '.values.PAYLOAD_VERIFIER_TASK_DEFINITION')" \
+  provision-storage
+run_one_shot \
+  "$(printf '%s' "$INVENTORY" | jq -er '.values.LOCAL_AUTH_VERIFIER_TASK_DEFINITION')" \
+  verify-local-auth
+```
+
+Use a protected environment file for a disposable local acceptance account.
+The candidate image contains the bounded acceptance client, so this creates and
+executes a real pipeline, downloads the blob and output, and records only a
+non-secret state file. Then replace the running task and re-read the same
+database/EFS artifacts to prove durability across task replacement:
+
+```sh
+read -r -p 'Disposable acceptance username: ' acceptance_username
+read -r -s -p 'Disposable acceptance password: ' acceptance_password
+printf '\n'
+umask 077
+{
+  printf 'ELSPETH_ACCEPTANCE_BASE_URL=%s\n' "$PUBLIC_URL"
+  printf 'ELSPETH_ACCEPTANCE_USERNAME=%s\n' "$acceptance_username"
+  printf 'ELSPETH_ACCEPTANCE_PASSWORD=%s\n' "$acceptance_password"
+  printf 'ELSPETH_ACCEPTANCE_REGISTER=1\n'
+  printf 'ELSPETH_WEB__DEFAULT_LLM_PROFILE=%s\n' \
+    "$(printf '%s' "$INVENTORY" | jq -er '.values.ELSPETH_WEB__DEFAULT_LLM_PROFILE')"
+  printf 'SSL_CERT_FILE=/acceptance/ca.pem\n'
+} >"$acceptance_dir/acceptance.env"
+
+docker pull "$CANDIDATE_IMAGE"
+docker run --rm --entrypoint python \
+  --env-file "$acceptance_dir/acceptance.env" \
+  --mount "type=bind,src=$acceptance_dir,dst=/acceptance" \
+  "$CANDIDATE_IMAGE" -m elspeth.web.aws_ecs_acceptance \
+  capture --state-file /acceptance/state.json
+
+aws ecs update-service \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
+  --force-new-deployment >/dev/null
+aws ecs wait services-stable \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+sed -i '/^ELSPETH_ACCEPTANCE_REGISTER=/d' "$acceptance_dir/acceptance.env"
+docker run --rm --entrypoint python \
+  --env-file "$acceptance_dir/acceptance.env" \
+  --mount "type=bind,src=$acceptance_dir,dst=/acceptance" \
+  "$CANDIDATE_IMAGE" -m elspeth.web.aws_ecs_acceptance \
+  verify-api --state-file /acceptance/state.json
+```
+
+Finally prove the real Composer endpoint and the task role's S3/Bedrock
+capabilities. The Composer request must return a non-empty assistant response.
+ECS Exec must already be enabled and its managed agent must be `RUNNING`; the
+Session Manager plugin is a prerequisite. Each in-task verifier must return an
+`ELSPETH_ACCEPTANCE_RECEIPT_V1` line and exit zero:
+
+```sh
+LOGIN=$(curl --fail --silent --show-error --cacert "$acceptance_dir/ca.pem" \
+  -H 'content-type: application/json' \
+  -d "$(jq -nc --arg u "$acceptance_username" --arg p "$acceptance_password" \
+    '{username:$u,password:$p}')" "$PUBLIC_URL/api/auth/login")
+TOKEN=$(printf '%s' "$LOGIN" | jq -er 'select(.token_type == "bearer") | .access_token')
+COMPOSER_SESSION=$(curl --fail --silent --show-error --cacert "$acceptance_dir/ca.pem" \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{}' "$PUBLIC_URL/api/sessions" | jq -er '.id')
+curl --fail --silent --show-error --max-time 180 --cacert "$acceptance_dir/ca.pem" \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"content":"Create a pipeline that reads a CSV blob and writes JSON without an LLM transform."}' \
+  "$PUBLIC_URL/api/sessions/$COMPOSER_SESSION/messages" \
+  | jq -e '.message.role == "assistant" and (.message.content | length > 0)'
+
+RUNNING_TASK=$(aws ecs list-tasks \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" \
+  --desired-status RUNNING --query 'taskArns | [0]' --output text)
+test "$(aws ecs describe-tasks \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --tasks "$RUNNING_TASK" \
+  --query 'tasks[0].enableExecuteCommand' --output text)" = True
+test "$(aws ecs describe-tasks \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --tasks "$RUNNING_TASK" \
+  --query 'tasks[0].containers[?name==`elspeth-web`].managedAgents[?name==`ExecuteCommandAgent`].lastStatus | [0]' \
+  --output text)" = RUNNING
+for check in verify-s3 verify-bedrock verify-bedrock-guardrails; do
+  aws ecs execute-command \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$ECS_CLUSTER" --task "$RUNNING_TASK" \
+    --container elspeth-web --interactive \
+    --command "python -m elspeth.web.aws_ecs_acceptance $check" \
+    | grep -F ELSPETH_ACCEPTANCE_RECEIPT_V1
+done
+```
+
+Any failed step is a failed cold install. Do not report acceptance from doctor
+checks alone, from a stable service running a different task definition, or
+from host-side AWS credentials standing in for the ECS task role.
+
 The ECS task role is the only Bedrock credential source. The package does not
 accept static AWS keys, a profile, a custom endpoint, a model gateway, or an
 AgentCore setting. Composer model names are ordinary non-secret environment
@@ -341,6 +518,7 @@ Before promoting a candidate, verify the baked bundle, the OCI CA labels, the
 live Aurora CA identifier, and the `readonlyRootFilesystem` split:
 
 ```sh
+docker pull "$CANDIDATE_IMAGE"
 docker buildx imagetools inspect "$CANDIDATE_IMAGE"
 test "$(docker inspect --format \
   '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
@@ -412,9 +590,27 @@ while `aws_ecs_service.web` ignores task-definition changes
 (`lifecycle.ignore_changes`). An old-image task that restarts inside that
 window injects the new canonical URL, lacks the baked bundle, and
 crash-loops. Apply and roll the service in one operation: run
-`terraform apply`, then immediately
-`aws ecs update-service --force-new-deployment` with the new qualified image
-digest. Pinning `ca_cert_identifier` on an existing Aurora instance triggers
+`terraform apply`, then immediately select the registered candidate task
+definition explicitly and deploy that revision:
+
+```sh
+CANDIDATE_TASK_DEFINITION=$(terraform -chdir=scenario-a output -json resolved_inventory \
+  | jq -er '.values.CANDIDATE_TASK_DEFINITION')
+ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
+ECS_SERVICE=$(terraform -chdir=scenario-a output -raw service_name)
+test -n "$CANDIDATE_TASK_DEFINITION"
+aws ecs update-service \
+  --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" \
+  --service "$ECS_SERVICE" \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
+  --force-new-deployment
+```
+
+`--force-new-deployment` by itself restarts the service's currently selected
+task definition; it does not select the revision Terraform just registered.
+Pinning `ca_cert_identifier` on an existing Aurora instance triggers
 a database modification with engine-dependent restart semantics — expect and
 schedule it. No pre-trust-root image digest is rollback-eligible after the
 upgrade.
@@ -422,7 +618,9 @@ upgrade.
 ## Scenario B
 
 Use the B backend and tfvars examples only when the OIDC acceptance variant is
-required:
+required. Reuse the same `run_id` and permissions-boundary output from the
+single bootstrap; `scenario_id` already isolates Scenario B's names, networks,
+state, and resources from Scenario A:
 
 ```sh
 terraform -chdir=scenario-b init \

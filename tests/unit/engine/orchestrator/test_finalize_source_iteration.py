@@ -389,11 +389,14 @@ class TestFinalizeSourceIterationContext:
                 active_source=_make_active_source(),
             )
 
-        flush_row_union.assert_called_once_with(
-            row_union_executor=row_union_executor,
-            processor=loop_ctx.processor,
-            counters=loop_ctx.counters,
-        )
+        flush_row_union.assert_called_once()
+        call = flush_row_union.call_args.kwargs
+        assert call["row_union_executor"] is row_union_executor
+        assert call["processor"] is loop_ctx.processor
+        assert call["counters"] is loop_ctx.counters
+        assert call["ctx"].run_id == "test-run"
+        assert call["ctx"].node_id == "source-refunds"
+        assert call["ctx"].operation_id == "op-source-load-refunds"
 
     def test_aggregation_flush_is_skipped_for_source_local_finalization(self) -> None:
         """Multi-source source completion must not flush shared aggregations."""

@@ -208,14 +208,45 @@ def _source_validation_state(manifest: dict[str, Any]) -> str:
     if "source_validation_state" in manifest:
         value = manifest["source_validation_state"]
     else:
-        # Schema-v1 journals created before the explicit state field still
-        # authenticated publish_started_at. A timestamp means publication was
-        # attempted but never durably recorded as source-validated, regardless
-        # of whether recovery observes the pre- or post-exchange orientation.
-        value = _SOURCE_VALIDATION_PENDING if manifest.get("publish_started_at") is not None else _SOURCE_VALIDATION_NOT_STARTED
+        # A finalized rotation-log delta is a durable post-validation witness:
+        # finalize_rotation_log runs only after source validation succeeds.
+        # Without that witness, a legacy publish timestamp remains pending.
+        value = (
+            _SOURCE_VALIDATION_VALIDATED
+            if manifest.get("publish_started_at") is not None and _legacy_rotation_log_finalized(manifest)
+            else (_SOURCE_VALIDATION_PENDING if manifest.get("publish_started_at") is not None else _SOURCE_VALIDATION_NOT_STARTED)
+        )
     if not isinstance(value, str) or value not in _SOURCE_VALIDATION_STATES:
         raise SignBundleTransactionError("transaction manifest source_validation_state is invalid")
     return value
+
+
+def _legacy_rotation_log_finalized(manifest: dict[str, Any]) -> bool:
+    """Whether a field-less legacy journal has a committed rotation witness."""
+    try:
+        candidate = Path(manifest["candidate_dir"])
+        tx_path = candidate.parent.parent
+        base = (tx_path / "rotation-base.bin").read_bytes()
+        staged = (tx_path / "rotation-staged.log").read_bytes()
+        if not staged.startswith(base):
+            return False
+        delta = _canonical_rotation_delta(
+            staged[len(base) :],
+            allowlist_dir=Path(manifest["allowlist_dir"]),
+            publish_started_at=cast("str", manifest["publish_started_at"]),
+        )
+        if not delta:
+            return False
+        current = Path(manifest["rotation_log"]).read_bytes()
+        if not current.startswith(base):
+            return False
+        suffix_lines = current[len(base) :].splitlines(keepends=True)
+        delta_lines = delta.splitlines(keepends=True)
+        return any(
+            suffix_lines[index : index + len(delta_lines)] == delta_lines for index in range(len(suffix_lines) - len(delta_lines) + 1)
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
 
 
 def source_validation_pending(manifest: dict[str, Any]) -> bool:

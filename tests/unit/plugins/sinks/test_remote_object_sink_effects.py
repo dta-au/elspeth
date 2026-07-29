@@ -1044,6 +1044,45 @@ def test_reaffirmed_noop_recognizes_independently_reprepared_identical_content(
     assert not Path(str(plan.safe_evidence["staging_path"])).exists()
 
 
+def test_reaffirmed_result_survives_owned_stage_cleanup_failure(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":1}'
+    staged_hash, staged_size, checksum_b64 = _genesis_identity(
+        effect_id="1" * 64,
+        provider="aws_s3",
+        body=body,
+        checksum_algorithm="sha256",
+    )
+    target_stage = remote_effects._stage_path("2" * 64, "aws_s3")
+    original_unlink = Path.unlink
+
+    def fail_target_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == target_stage:
+            raise OSError("owned cleanup failed")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_target_unlink)
+    present = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"existing-etag"',
+        content_hash=staged_hash,
+        size_bytes=staged_size,
+        protocol_version="sink-effect-v1",
+        checksum_algorithm="sha256",
+        checksum_b64=checksum_b64,
+    )
+
+    plan = _raw_prepare(
+        effect_id="2" * 64,
+        provider="aws_s3",
+        body=body,
+        checksum_algorithm="sha256",
+        observation=present,
+    )
+
+    assert plan.safe_evidence["publication_kind"] == "reaffirmed"
+
+
 @pytest.mark.parametrize(
     "divergence",
     ["content_hash", "size_bytes", "protocol_version", "checksum_algorithm", "checksum_b64"],
@@ -1098,6 +1137,34 @@ def test_reaffirm_requires_the_full_verified_identity_set_not_partial_match(
         )
 
     assert not remote_effects._stage_path("d" * 64, "aws_s3").exists()
+
+
+def test_collision_error_survives_owned_stage_cleanup_failure(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    target_stage = remote_effects._stage_path("3" * 64, "aws_s3")
+    original_unlink = Path.unlink
+
+    def fail_target_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == target_stage:
+            raise OSError("owned cleanup failed")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_target_unlink)
+    foreign = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"foreign"',
+        content_hash=None,
+        size_bytes=len(b'{"id":1}'),
+    )
+
+    with pytest.raises(remote_effects.RemoteObjectCollisionError):
+        _raw_prepare(
+            effect_id="3" * 64,
+            provider="aws_s3",
+            body=b'{"id":1}',
+            checksum_algorithm="sha256",
+            observation=foreign,
+        )
 
 
 def cast_str_or_none(value: object) -> str | None:

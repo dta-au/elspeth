@@ -98,6 +98,14 @@ worktrees/
 payloads/
 landscape.db
 
+# Terraform working data and operator-specific deployment inputs
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+
 # Secrets (never include in image!)
 .env
 .env.*

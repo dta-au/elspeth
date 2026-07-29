@@ -29,8 +29,21 @@ variable "candidate_image" {
   type = string
 
   validation {
-    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.candidate_image))
-    error_message = "candidate_image must be immutable by digest."
+    condition = can(regex(
+      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${var.candidate_ecr_repository}@sha256:[0-9a-f]{64}$",
+      var.candidate_image,
+    ))
+    error_message = "candidate_image must be a digest in the explicitly approved account, region, and ECR repository."
+  }
+}
+
+variable "candidate_ecr_repository" {
+  type        = string
+  description = "Exact application-image ECR repository output by the shared bootstrap."
+
+  validation {
+    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.candidate_ecr_repository))
+    error_message = "candidate_ecr_repository must be the bootstrap-created elspeth-prefixed repository name."
   }
 }
 
@@ -110,8 +123,21 @@ variable "cloudwatch_agent_image" {
   description = "Immutable digest reference for the retained shell-bearing CloudWatch agent image."
 
   validation {
-    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.cloudwatch_agent_image))
-    error_message = "cloudwatch_agent_image must be an immutable digest reference."
+    condition = can(regex(
+      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${var.cloudwatch_agent_ecr_repository}@sha256:[0-9a-f]{64}$",
+      var.cloudwatch_agent_image,
+    ))
+    error_message = "cloudwatch_agent_image must be a digest in the explicitly approved account, region, and agent ECR repository."
+  }
+}
+
+variable "cloudwatch_agent_ecr_repository" {
+  type        = string
+  description = "Exact CloudWatch-agent ECR repository output by the shared bootstrap."
+
+  validation {
+    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.cloudwatch_agent_ecr_repository))
+    error_message = "cloudwatch_agent_ecr_repository must be the bootstrap-created elspeth-prefixed repository name."
   }
 }
 

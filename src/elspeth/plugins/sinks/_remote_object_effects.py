@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import stat
 import tempfile
@@ -33,6 +34,16 @@ _INSPECTION_SCHEMA: Final = "remote-object-effect-inspection-v1"
 _COPY_BYTES: Final = 64 * 1024
 _PUBLICATION_KINDS: Final = frozenset({"conditional_create", "conditional_replace", "inherited", "virtual", "reaffirmed"})
 _REPLACE_AUTHORITIES: Final = frozenset({"none", "overwrite_config", "predecessor_lineage"})
+
+logger = logging.getLogger(__name__)
+
+
+def _unlink_owned_stage(path: Path) -> None:
+    """Best-effort cleanup that cannot replace a primary effect outcome."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("remote effect owned-stage cleanup failed")
 
 
 class RemoteObjectEffectError(RuntimeError):
@@ -421,7 +432,7 @@ def _write_stage(
         os.replace(building, path)
         _fsync_directory(path.parent)
     except BaseException:
-        building.unlink(missing_ok=True)
+        _unlink_owned_stage(building)
         raise
     return digest.hexdigest(), total, base64.b64encode(checksum.digest()).decode("ascii")
 
@@ -479,7 +490,7 @@ def prepare_remote_object(
     # object already at the target. Existing targets stay untouched.
     virtual_no_publication = not accepted and predecessor_descriptor is None
     if virtual_no_publication:
-        path.unlink(missing_ok=True)
+        _unlink_owned_stage(path)
         staged_hash = hashlib.sha256(b"").hexdigest()
         staged_size = 0
         checksum = hashlib.sha256(b"") if algorithm == "sha256" else hashlib.md5(b"", usedforsecurity=False)
@@ -513,7 +524,7 @@ def prepare_remote_object(
         publication_kind = "inherited"
         descriptor_mode = SinkEffectDescriptorMode.NO_PUBLICATION
         replace_authority = "predecessor_lineage"
-        path.unlink(missing_ok=True)
+        _unlink_owned_stage(path)
     else:
         # Content-identity idempotence: the existing object's full verified
         # identity (hash, size, protocol, checksum algorithm, checksum
@@ -537,7 +548,7 @@ def prepare_remote_object(
             replace_authority = "none"
             precondition = "if_none_match"
             predecessor_etag = None
-            path.unlink(missing_ok=True)
+            _unlink_owned_stage(path)
         else:
             if predecessor_descriptor is not None:
                 replace_authority = "predecessor_lineage"
@@ -549,7 +560,7 @@ def prepare_remote_object(
                 # Existing object, no predecessor lineage, no overwrite
                 # authority, and not provably identical: fail closed rather
                 # than silently clobbering or crediting unproven equality.
-                path.unlink(missing_ok=True)
+                _unlink_owned_stage(path)
                 raise RemoteObjectCollisionError("remote object already exists and cannot be verified as identical or replaced")
             publication_kind = "conditional_replace" if exists else "conditional_create"
             descriptor_mode = SinkEffectDescriptorMode.PRECOMPUTED
@@ -559,7 +570,7 @@ def prepare_remote_object(
             diverted_ordinals=diverted,
         )
     except ValueError as exc:
-        path.unlink(missing_ok=True)
+        _unlink_owned_stage(path)
         raise RemoteObjectPreconditionError(str(exc)) from exc
     value = RemoteObjectPlanEvidence(
         provider=provider,
@@ -700,7 +711,7 @@ def restage_remote_object(
         checksum_algorithm=evidence.checksum_algorithm,
     )
     if staged_hash != evidence.staged_hash or staged_size != evidence.staged_size or checksum_b64 != evidence.checksum_b64:
-        stage.unlink(missing_ok=True)
+        _unlink_owned_stage(stage)
         raise RemoteObjectPreconditionError("re-derived remote object body diverges from the durable plan")
 
 
@@ -712,7 +723,7 @@ def remote_commit_result(plan: SinkEffectPlan, evidence: RemoteObjectPlanEvidenc
     and is removed to keep ordinary batches from accumulating spool files.
     """
     assert plan.expected_descriptor is not None
-    Path(evidence.staging_path).unlink(missing_ok=True)
+    _unlink_owned_stage(Path(evidence.staging_path))
     return SinkEffectCommitResult(
         descriptor=plan.expected_descriptor,
         evidence={
@@ -747,7 +758,7 @@ def reconcile_remote_observation(
         # durable body has been applied and its spool can be released. All
         # other outcomes keep the stage: NOT_APPLIED may still commit, and
         # UNKNOWN must preserve evidence for investigation.
-        Path(evidence.staging_path).unlink(missing_ok=True)
+        _unlink_owned_stage(Path(evidence.staging_path))
         return SinkEffectReconcileResult.applied(
             plan.expected_descriptor,
             evidence={"effect_id": plan.effect_id, "provider": evidence.provider, "reconciled": "exact_metadata"},
