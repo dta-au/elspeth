@@ -147,7 +147,7 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert "elspeth composer users add" in html and "--password" in html
     assert "SESSION_SCHEMA_EPOCH" in html and "35 → 37" in html
     assert "guided schema remains at 10" in html
-    assert "SQLITE_SCHEMA_EPOCH" in html and "remains at 29" in html
+    assert "SQLITE_SCHEMA_EPOCH" in html and "29 → 30" in html
     assert "aws-ecs-deployment.md" in html
 
 

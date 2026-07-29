@@ -170,7 +170,7 @@ C4Container
 | **Rate Limiting** | pyrate-limiter | ~300 | External call throttling with persistence |
 | **Core** | Python | ~5,000 | Config, canonical JSON, DAG package, payload store |
 | **Contracts** | Python | ~28,300 | Shared dataclasses, enums, protocols (leaf module) |
-| **Audit DB** | SQLite/SQLCipher/PostgreSQL | — | Complete audit trail and effect storage (41 tables; SQLite schema epoch 29) |
+| **Audit DB** | SQLite/SQLCipher/PostgreSQL | — | Complete audit trail and effect storage (41 tables; SQLite schema epoch 30) |
 | **Payload Store** | Filesystem | — | Content-addressable blob storage with retention |
 
 **Inventory measured from committed `HEAD` on 2026-07-23:** ~310,600 production
@@ -250,7 +250,7 @@ C4Component
         Component(query_repo, "QueryRepository", "Python", "Lineage and investigation queries")
         Component(effect_repo, "SinkEffectRepository", "Python", "Effect reservation, fencing, attempts, and finalization")
         Component(database, "LandscapeDB", "SQLAlchemy Core", "Connection management")
-        Component(schema, "Schema", "SQLAlchemy Core", "41 tables and epoch-29 invariants")
+        Component(schema, "Schema", "SQLAlchemy Core", "41 tables and epoch-30 invariants")
         Component(exporter, "Exporter", "Python", "Audit exports and sealed snapshots")
         Component(journal, "Journal Outbox", "Python", "Transaction-owned JSONL publication")
     }
@@ -283,7 +283,7 @@ C4Component
 | **SchedulerRepository** | `scheduler_repository.py` | Durable work items, compare-and-swap leases, recovery, and run coordination. |
 | **QueryRepository** | `query_repository.py` | Operator lineage and investigation queries. |
 | **LandscapeDB** | `database.py` | Connection handling, schema validation, SQLite/SQLCipher/PostgreSQL support. |
-| **Schema** | `schema.py` | Authoritative 41-table, epoch-29 schema and constraints. |
+| **Schema** | `schema.py` | Authoritative 41-table, epoch-30 schema and constraints. |
 | **Exporter** | `exporter.py` | Complete audit export, including effect streams and attempts. |
 | **Journal** | `journal.py` | Transaction-owned sidecar-journal outbox and recovery drain. |
 

@@ -397,6 +397,8 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("token_work_items", "expand_group_id"),
     ("token_work_items", "coalesce_node_id"),
     ("token_work_items", "coalesce_name"),
+    # Epoch 30: row_union barrier attribution, the sibling of coalesce_name.
+    ("token_work_items", "row_union_name"),
     ("token_work_items", "attempt"),
     ("token_work_items", "lease_owner"),
     ("token_work_items", "lease_expires_at"),

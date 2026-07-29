@@ -173,11 +173,11 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   roots, weak uniform JWT secrets, and unauthenticated PostgreSQL transport for
   ECS; provider and tool data remain bounded and redacted.
 
-**Operational:** 0.7.2 is a pre-1.0 session-store cutover. The session store moves
-from epoch 35 to 37; guided schema remains at 10, and Landscape remains at epoch 29.
-Archive or export evidence as required, stop the old service, recreate a stale
-session store, and install 0.7.2. A Landscape store already at epoch 29 remains
-current. Do not roll older code back over the recreated session database.
+**Operational:** 0.7.2 is a pre-1.0 database cutover. The session store moves
+from epoch 35 to 37; guided schema remains at 10, and Landscape moves from epoch
+29 to 30. Archive or export evidence as required, stop the old service, recreate
+a stale session store and a Landscape store left at epoch 29, and install 0.7.2.
+Do not roll older code back over the recreated databases.
 `data/auth.db` remains separate; recreating the session store does not remove
 local user accounts.
 

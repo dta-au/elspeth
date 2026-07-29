@@ -25,7 +25,7 @@ def test_readme_advertises_current_release_surface() -> None:
     assert "Current 0.7.1 behaviour:" not in text
     assert "session store moves\nfrom epoch 35 to 37" in text
     assert "guided schema remains at 10" in text
-    assert "Landscape remains at epoch 29" in text
+    assert "Landscape moves from epoch\n29 to 30" in text
 
     # Key evaluator-facing release references remain.
     assert "[Audit and Lineage Guarantees](docs/release/guarantees.md)" in text

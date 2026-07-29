@@ -687,7 +687,7 @@ def test_compatibility_schema_facts_track_current_epochs() -> None:
         "landscape_epoch": 29,
         "run_web_plugin_policy_present": True,
     }
-    assert label == "session_epoch_35_to_37_blob_cleanup_and_guided_decline_contract"
+    assert label == "session_epoch_35_to_37_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier"
     facts_a = acceptance._expected_schema_facts("A")
     assert facts_a["previous"] is None
     assert facts_a["structural_changes"] == "initial_create"

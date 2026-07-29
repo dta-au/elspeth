@@ -20,15 +20,17 @@ tightens deployment packaging, Composer correctness, authentication, and
 recovery after committed blob deletion. The notes below intentionally cover
 only major changes and critical correctness or security fixes.
 
-**Breaking pre-1.0 session-schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
+**Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
 to 37. Epoch 36 adds retryable blob-deletion cleanup and epoch 37 adds the
 completed guided-plan decline contract. Guided checkpoints remain at schema 10 and Landscape
-`SQLITE_SCHEMA_EPOCH` remains at 29. ELSPETH does not migrate the predecessor
-session database in place before 1.0. Archive or export required evidence, stop
-the old service, recreate a stale session store, then install
-0.7.2. A Landscape database already at epoch 29 remains current. Do not roll
-older code back over the recreated session database; keep the service drained
-and repair this release forward.
+`SQLITE_SCHEMA_EPOCH` advances from 29 to 30, which adds the durable row_union
+barrier attribution column to scheduler work items. ELSPETH does not migrate
+either predecessor database in place before 1.0. Archive or export required
+evidence, stop the old service, recreate stale session and Landscape stores,
+then install
+0.7.2. A Landscape database at epoch 29 is not current and must be recreated.
+Do not roll older code back over the recreated databases; keep the service
+drained and repair this release forward.
 
 ### Major changes
 

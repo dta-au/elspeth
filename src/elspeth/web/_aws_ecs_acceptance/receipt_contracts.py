@@ -126,7 +126,7 @@ _ROLLBACK_BASELINE_SESSION_EPOCH = 35
 
 _ROLLBACK_BASELINE_LANDSCAPE_EPOCH = 29
 
-_SCENARIO_B_STRUCTURAL_CHANGES = "session_epoch_35_to_37_blob_cleanup_and_guided_decline_contract"
+_SCENARIO_B_STRUCTURAL_CHANGES = "session_epoch_35_to_37_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier"
 
 
 def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
