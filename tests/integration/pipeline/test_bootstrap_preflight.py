@@ -107,6 +107,7 @@ def _make_bootstrap_config() -> SimpleNamespace:
         collection_probes=[],
         gates=[],
         coalesce=[],
+        row_unions=[],
         queues={},
         checkpoint=SimpleNamespace(enabled=True),
         rate_limit=SimpleNamespace(),

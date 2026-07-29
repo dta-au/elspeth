@@ -753,6 +753,7 @@ def run(
             gates=list(config.gates),
             coalesce_settings=list(config.coalesce) if config.coalesce else None,
             queues=config.queues,
+            row_union_settings=list(config.row_unions) if config.row_unions else None,
         )
         graph.validate()
     except GraphValidationError as e:
@@ -1532,6 +1533,7 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
         gates=list(config.gates),
         queues=config.queues,
         coalesce_settings=list(config.coalesce) if config.coalesce else None,
+        row_union_settings=list(config.row_unions) if config.row_unions else None,
     )
     graph.validate()
 
@@ -1766,6 +1768,7 @@ def validate(
             gates=list(config.gates),
             coalesce_settings=list(config.coalesce) if config.coalesce else None,
             queues=config.queues,
+            row_union_settings=list(config.row_unions) if config.row_unions else None,
         )
         graph.validate()
     except GraphValidationError as e:
@@ -2232,6 +2235,7 @@ def _build_resume_graphs(
     """
     gate_settings = list(settings_config.gates)
     coalesce_settings = list(settings_config.coalesce) if settings_config.coalesce else None
+    row_union_settings = list(settings_config.row_unions) if settings_config.row_unions else None
 
     # Both resume graphs use the ORIGINAL source topology to match the topology
     # hash and source node IDs computed during the original run. The runtime
@@ -2247,6 +2251,7 @@ def _build_resume_graphs(
         gates=gate_settings,
         coalesce_settings=coalesce_settings,
         queues=settings_config.queues,
+        row_union_settings=row_union_settings,
     )
     validation_graph.validate()
 
@@ -2259,6 +2264,7 @@ def _build_resume_graphs(
         gates=gate_settings,
         coalesce_settings=coalesce_settings,
         queues=settings_config.queues,
+        row_union_settings=row_union_settings,
     )
     execution_graph.validate()
 

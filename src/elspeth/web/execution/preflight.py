@@ -500,6 +500,7 @@ def build_runtime_graph(settings: ElspethSettings, bundle: PluginBundle) -> Exec
         gates=list(settings.gates),
         coalesce_settings=(list(settings.coalesce) if settings.coalesce else None),
         queues=settings.queues,
+        row_union_settings=(list(settings.row_unions) if settings.row_unions else None),
     )
 
 

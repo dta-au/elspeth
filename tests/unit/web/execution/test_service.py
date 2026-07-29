@@ -369,6 +369,7 @@ def _mock_pipeline_settings() -> SimpleNamespace:
         sinks={"primary": SimpleNamespace(plugin="json", options={})},
         gates=[],
         coalesce=[],
+        row_unions=[],
         queues={},
         landscape=SimpleNamespace(export=SimpleNamespace(enabled=False, sink=None)),
         rate_limit=RateLimitSettings(enabled=False),

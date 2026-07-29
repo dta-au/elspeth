@@ -417,6 +417,7 @@ def _fake_config(*, with_depends_on: bool) -> SimpleNamespace:
         collection_probes=[SimpleNamespace(name="probe")] if with_depends_on else [],
         gates=[],
         coalesce=[],
+        row_unions=[],
         queues={},
         sinks={"output": SimpleNamespace(options={})},
         landscape=SimpleNamespace(export=SimpleNamespace(enabled=False, sink=None)),
