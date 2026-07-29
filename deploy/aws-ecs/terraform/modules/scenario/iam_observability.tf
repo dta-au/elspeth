@@ -89,6 +89,16 @@ data "aws_iam_policy_document" "task" {
   }
 
   statement {
+    # Neither Textract async action names an ARN, so "*" is the only expressible resource
+    # (the permissions boundary carries the same statement). Scope comes from the object
+    # grant above: StartDocumentAnalysis reads DocumentLocation.S3Object under this role's
+    # own credentials, so it can only analyse documents already inside this run's prefix.
+    sid       = "RunDocumentAnalysis"
+    actions   = ["textract:StartDocumentAnalysis", "textract:GetDocumentAnalysis"]
+    resources = ["*"]
+  }
+
+  statement {
     sid = "MountAcceptanceEFS"
     actions = [
       "elasticfilesystem:ClientMount",
