@@ -67,16 +67,13 @@ def test_user_manual_describes_tutorial_as_shared_planner_profile() -> None:
     assert "not a separate or reduced-capability mode" in manual
 
 
-def test_user_manual_honestly_notes_guided_staged_known_limitations() -> None:
+def test_user_manual_states_guided_staged_full_canonical_parity() -> None:
     manual = _manual()
-    # Both tracked guided-staged gaps must be named with their issue ids so the
-    # honesty is auditable, and framed as defects rather than a capability wall.
-    assert "elspeth-93dd908354" in manual  # require-all (union) coalesce
-    assert "elspeth-b83b5b3204" in manual  # cross-sink on_write_failure fallback
-    assert "require-all (union) coalesce" in manual
-    assert "cross-sink `on_write_failure` fallback" in manual
-    assert "seven of the nine canonical structures" in manual
-    assert "not capability boundaries" in manual
+    assert "authors all nine canonical structures directly" in manual
+    assert "require-all coalesces" in manual
+    assert "cross-sink `on_write_failure` fallbacks" in manual
+    assert "seven of the nine canonical structures" not in manual
+    assert "not yet authorable" not in manual
 
 
 def test_user_manual_rejects_switch_to_freeform_for_a_supported_topology() -> None:

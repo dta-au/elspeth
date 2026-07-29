@@ -630,22 +630,12 @@ substitute a tutorial-only planner, remove capabilities from the planner schema,
 or rewrite the guided rules. Whatever you author in the tutorial transfers
 directly to a real guided session.
 
-### Known limitations of the staged conversation
+### Staged-conversation topology coverage
 
-Two topologies are not yet authorable through the staged guided conversation:
-
-- a **require-all (union) coalesce** — a fork whose parallel branches merge with
-  a require-all union (elspeth-93dd908354); and
-- a **cross-sink `on_write_failure` fallback** — an output whose write-failure
-  route targets another sink (elspeth-b83b5b3204).
-
-These are specific, tracked defects in how the staged conversation projects
-connections and sink options — not capability boundaries. The staged
-conversation therefore authors seven of the nine canonical structures directly.
-The same shared planner represents both topologies without trouble, so full
-parity is available today: build these two shapes in **freeform** (the
-single-turn `/guided/plan` endpoint authors them too). Both defects are being
-fixed so the staged conversation reaches the other two as well.
+The staged guided conversation authors all nine canonical structures directly,
+including require-all coalesces and cross-sink `on_write_failure` fallbacks.
+Those shapes use the same shared planner, validation, and commit path as
+freeform and the single-turn `/guided/plan` endpoint.
 
 ### See also
 

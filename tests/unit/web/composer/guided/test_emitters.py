@@ -312,7 +312,18 @@ class TestBuildSchemaFormTurns:
         assert payload["mode"] == "plugin_options"
         assert payload["plugin"] == "json"
         assert payload["knobs"]["fields"][0]["label"] == "Path"
-        assert payload["prefilled"] == {"schema": {"mode": "observed"}}
+        assert payload["knobs"]["fields"][-1] == {
+            "name": "on_write_failure",
+            "label": "On Write Failure",
+            "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
+            "kind": "text",
+            "required": False,
+            "nullable": False,
+        }
+        assert payload["prefilled"] == {
+            "schema": {"mode": "observed"},
+            "on_write_failure": "discard",
+        }
 
 
 class TestComponentReviewTurn:

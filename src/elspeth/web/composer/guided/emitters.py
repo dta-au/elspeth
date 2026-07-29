@@ -291,10 +291,11 @@ def build_step_2_schema_form_turn(
     prefilled: dict[str, Any] = {"schema": {"mode": "observed"}}
     if prefilled_options is not None:
         prefilled.update(deep_thaw(prefilled_options))
+    prefilled.setdefault("on_write_failure", "discard")
     payload: SchemaFormPayload = {
         "mode": "plugin_options",
         "plugin": plugin,
-        "knobs": cast(KnobSchema, schema_info.knob_schema),
+        "knobs": _sink_knobs_with_write_failure(cast(KnobSchema, schema_info.knob_schema)),
         "prefilled": prefilled,
     }
     return Turn(
@@ -302,6 +303,24 @@ def build_step_2_schema_form_turn(
         step_index=_step_index(GuidedStep.STEP_2_SINK),
         payload=payload,
     )
+
+
+def _sink_knobs_with_write_failure(knobs: KnobSchema) -> KnobSchema:
+    """Expose the sink wrapper's write-failure route beside plugin knobs."""
+
+    fields = list(knobs["fields"])
+    if not any(field["name"] == "on_write_failure" for field in fields):
+        fields.append(
+            {
+                "name": "on_write_failure",
+                "label": "On Write Failure",
+                "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
+                "kind": "text",
+                "required": False,
+                "nullable": False,
+            }
+        )
+    return {"fields": fields}
 
 
 def build_component_review_turn(
@@ -416,7 +435,7 @@ def build_step_2_schema_form_turn_from_resolved(
     payload: SchemaFormPayload = {
         "mode": "plugin_options",
         "plugin": output.plugin,
-        "knobs": cast(KnobSchema, schema_info.knob_schema),
+        "knobs": _sink_knobs_with_write_failure(cast(KnobSchema, schema_info.knob_schema)),
         "prefilled": prefilled,
     }
     return Turn(

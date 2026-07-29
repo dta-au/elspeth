@@ -65,18 +65,11 @@ authoring-form requirements beyond the Task 2 argument shape:
   (`default` / `passthrough` / `transform`) rejects the `None` a bare
   `set_pipeline` commit would persist.
 
-### Guided-staged capability gaps (Task 3)
+### Guided-staged coverage (Task 3)
 
-The guided-staged column drives six fixtures; three cannot be authored through
-the guided stage protocol at HEAD and are reported as blockers (they commit
-identically on the freeform + guided-full surfaces, so the fixtures are not at
-fault). Each is documented with its exact mechanism and code location in
-`_GUIDED_STAGED_CAPABILITY_GAPS` in `test_fixture_matrix.py`: `multi_source_queue`
-(queue `input == id` self-loops the wire projection — likely a product bug in
-`canonical_connection_consumers`), `multi_output` (the structured sink review
-locks `on_write_failure` to `discard`, so a cross-sink fallback is unauthorable),
-and `fork_coalesce` (the consumer model keys on a single `node.input`, so a
-require-all coalesce's extra branch connection is orphaned).
+The guided-staged column drives all nine fixtures. Queue fan-in, require-all
+coalesce, and cross-sink write-failure fallback remain explicit real-path
+regressions for their repaired stage-protocol boundaries.
 
 ## Byte canonicalization (Ruling C)
 
