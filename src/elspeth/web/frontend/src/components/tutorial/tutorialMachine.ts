@@ -20,8 +20,8 @@ export const CANONICAL_TUTORIAL_PROMPT =
 // prompt names the `url` column so the source declares it as a guaranteed field
 // (surface-or-record); the runtime-resolved sample URLs are appended to it.
 export const TUTORIAL_SOURCE_PROMPT =
-  "Create the source for this pipeline. The rows are these three project-brief " +
-  "pages; each row carries the page's address in a `url` column:";
+  "Please create a CSV source for this pipeline. The rows are these three " +
+  "project-brief pages; each row carries the page's address in a `url` column:";
 
 export const TUTORIAL_SINK_PROMPT =
   "Save the pipeline's results to a JSON file.";
