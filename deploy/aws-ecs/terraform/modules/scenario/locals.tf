@@ -92,8 +92,10 @@ locals {
     "transform:aws_bedrock_content_safety",
     "transform:aws_bedrock_prompt_shield",
     "transform:aws_textract_document_analysis",
+    "transform:field_mapper",
     "transform:llm",
     "transform:passthrough",
+    "transform:web_scrape",
   ])
   plugin_preferences = jsonencode({
     prompt_shield  = ["transform:aws_bedrock_prompt_shield"]
