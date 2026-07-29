@@ -30,6 +30,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
     SinkEffectRole,
+    SinkEffectState,
 )
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
@@ -924,6 +925,20 @@ def test_reaffirmed_effect_finalizes_no_publication_without_lease_commit_or_reco
         outcome = factory.data_flow.get_token_outcome(token.token_id)
         assert outcome is not None
         assert outcome.outcome is TerminalOutcome.SUCCESS
+
+        # The Artifact row only ever carries the coarse "inherited" evidence
+        # kind (design deliberately did not add a first-class "reaffirmed"
+        # ArtifactPublicationEvidenceKind). The finer distinction must still
+        # survive durably in the finalized effect's own persisted plan, or
+        # a reaffirmed no-op is genuinely indistinguishable from a real
+        # inherited no-op in the audit trail — the opposite of what the
+        # design traded evidence-schema churn to preserve.
+        effects = factory.execution.sink_effects.get_effects_for_run(run.run_id)
+        (finalized_effect,) = [effect for effect in effects if effect.sink_node_id == sink_id]
+        assert finalized_effect.state is SinkEffectState.FINALIZED
+        assert finalized_effect.plan_json is not None
+        persisted_plan = json.loads(finalized_effect.plan_json)
+        assert persisted_plan["safe_evidence"]["publication_kind"] == "reaffirmed"
     finally:
         db.close()
 
