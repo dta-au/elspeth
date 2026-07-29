@@ -1137,8 +1137,64 @@ class RowUnionSettings(BaseModel):
     timeout_seconds: float | None = Field(
         default=None,
         gt=0,
+        # allow_inf_nan=False closes the `inf` hole that `gt=0` leaves open:
+        # RowUnionExecutor.check_timeouts compares `elapsed > timeout_seconds`,
+        # so an infinite timeout silently disables the sweep instead of
+        # bounding the wait. NaN is already rejected by gt=0 (nan > 0 is False).
+        allow_inf_nan=False,
         description="Max wait for the full group; on timeout the whole group fails closed. None = wait until end-of-source flush.",
     )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Validate row_union name is not empty, reserved, or system-prefixed."""
+        if not v or not v.strip():
+            raise ValueError("row_union name must not be empty")
+        value = v.strip()
+        _validate_max_length(value, field_label="row_union name", max_length=_MAX_NODE_NAME_LENGTH)
+        _validate_node_name_chars(value, field_label="row_union name")
+        if value in _RESERVED_EDGE_LABELS:
+            raise ValueError(f"row_union name '{value}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+        if value.startswith("__"):
+            raise ValueError(f"row_union name '{value}' starts with '__', which is reserved for system edges")
+        return value
+
+    @field_validator("branches")
+    @classmethod
+    def validate_branch_names(cls, v: dict[str, str]) -> dict[str, str]:
+        """Ensure row_union branch names (keys) and input connections (values) are valid."""
+        validated: dict[str, str] = {}
+        for branch_name, input_connection in v.items():
+            if not branch_name or not branch_name.strip():
+                raise ValueError("row_union branch names must not be empty")
+            if not input_connection or not input_connection.strip():
+                raise ValueError(f"row_union branch '{branch_name}' input connection must not be empty")
+            key = branch_name.strip()
+            val = input_connection.strip()
+            _validate_connection_or_sink_name(key, field_label="row_union branch name")
+            _validate_connection_or_sink_name(val, field_label=f"row_union branch '{key}' input connection")
+            # min_length=2 is enforced on the raw mapping, so trimming must not
+            # be allowed to collapse two declared branches into one — group size
+            # is the barrier's release contract, not a cosmetic detail.
+            if key in validated:
+                raise ValueError(f"row_union branch names collide after trimming whitespace: '{key}' is declared twice")
+            validated[key] = val
+        return validated
+
+    @field_validator("on_success")
+    @classmethod
+    def validate_on_success(cls, v: str) -> str:
+        """Ensure on_success names a usable connection.
+
+        Unlike coalesce, on_success is required and must name a processing
+        connection: the DAG builder rejects a row_union whose on_success names
+        a sink (terminal group release is not supported in v1).
+        """
+        if not v or not v.strip():
+            raise ValueError("row_union on_success must not be empty")
+        value = v.strip()
+        return _validate_connection_or_sink_name(value, field_label="row_union on_success connection name")
 
 
 class QueueSettings(BaseModel):

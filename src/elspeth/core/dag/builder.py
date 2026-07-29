@@ -50,7 +50,7 @@ if TYPE_CHECKING:
         SourceSettings,
     )
     from elspeth.core.dag.graph import ExecutionGraph
-    from elspeth.core.dag.models import NodeConfig
+    from elspeth.core.dag.models import GraphValidationWarning, NodeConfig
     from elspeth.core.dag.wiring import WiredTransform
 
 
@@ -560,6 +560,7 @@ def build_execution_graph(
     # correlated on row_id, require_all only, pass-through payloads. Like
     # queues, it promises no schema synthesis — its contract is observed.
     row_union_ids: dict[RowUnionName, NodeID] = {}
+    row_union_id_to_config: dict[NodeID, RowUnionSettings] = {}
     row_union_branch_specs: dict[BranchName, _RowUnionBranchSpec] = {}
     if row_union_settings:
         observed_row_union_schema = SchemaConfig(mode="observed", fields=None)
@@ -582,6 +583,7 @@ def build_execution_graph(
 
             uid = node_id("row_union", union_config.name, union_node_config)
             row_union_ids[union_name] = uid
+            row_union_id_to_config[uid] = union_config
 
             for branch_name, input_connection in union_config.branches.items():
                 branch_key = BranchName(branch_name)
@@ -1259,9 +1261,16 @@ def build_execution_graph(
     # PHASE 2 VALIDATION: Validate schema compatibility AFTER graph is built
     graph.validate_edge_compatibility()
 
-    # Warn about DIVERT edges feeding require_all coalesces (non-fatal).
-    if coalesce_id_to_config:
-        graph.set_validation_warnings(graph.warn_divert_coalesce_interactions(coalesce_id_to_config))
+    # Warn about DIVERT edges feeding correlated barriers (non-fatal).
+    # set_validation_warnings ASSIGNS, so both barrier kinds contribute to one
+    # list and one call — a second call would silently displace the first.
+    if coalesce_id_to_config or row_union_id_to_config:
+        build_warnings: list[GraphValidationWarning] = []
+        if coalesce_id_to_config:
+            build_warnings.extend(graph.warn_divert_coalesce_interactions(coalesce_id_to_config))
+        if row_union_id_to_config:
+            build_warnings.extend(graph.warn_divert_row_union_interactions(row_union_id_to_config))
+        graph.set_validation_warnings(build_warnings)
 
     # Deep-freeze all NodeInfo configs now that schema resolution is complete.
     # NodeInfo.__post_init__ cannot freeze config because graph construction
@@ -1276,10 +1285,21 @@ def build_execution_graph(
     # row_union may use only the implicit end_of_source trigger, which cannot
     # split a group. Group-aware count/timeout/condition triggers are the
     # production follow-up on elspeth-a5b86149d4.
+    #
+    # The same walk rejects a correlated barrier (coalesce or row_union)
+    # downstream of a row_union. Both barrier kinds key their pending map on
+    # (barrier name, row_id) with no fork_group_id, and row_union is the first
+    # N-to-N primitive in the engine — it puts N same-row_id tokens on the wire.
+    # A downstream coalesce therefore accepts one arrival per branch and rejects
+    # the rest as late arrivals (silent loss of half of every group); a
+    # downstream row_union crashes mid-run with a duplicate-arrival error that
+    # blames fork/retry/resume for a topology the builder accepted.
     if row_union_ids:
         aggregation_settings_by_node: dict[NodeID, AggregationSettings] = {
             aggregation_ids[AggregationName(agg_name)]: agg_settings for agg_name, (_transform, agg_settings) in aggregations.items()
         }
+        barrier_display_names: dict[NodeID, str] = {nid: str(name) for name, nid in coalesce_ids.items()}
+        barrier_display_names.update({nid: str(name) for name, nid in row_union_ids.items()})
         for union_name, union_node_id in row_union_ids.items():
             visited: set[NodeID] = set()
             frontier: list[NodeID] = [union_node_id]
@@ -1290,8 +1310,23 @@ def build_execution_graph(
                     if downstream in visited:
                         continue
                     visited.add(downstream)
-                    if graph.get_node_info(downstream).node_type == NodeType.SINK:
+                    downstream_type = graph.get_node_info(downstream).node_type
+                    if downstream_type == NodeType.SINK:
                         continue
+                    if downstream_type in (NodeType.COALESCE, NodeType.ROW_UNION):
+                        barrier_kind = downstream_type.value
+                        barrier_name = barrier_display_names.get(downstream, str(downstream))
+                        raise GraphValidationError(
+                            f"{barrier_kind} '{barrier_name}' is downstream of row_union '{union_name}' "
+                            f"with no intervening sink. row_union releases N tokens that share one row_id, "
+                            f"and a correlated barrier cannot consume an N-to-N group: it keys pending "
+                            f"arrivals on (barrier, row_id), so the second arrival on each branch is treated "
+                            f"as a late arrival — silently discarding part of every group, or failing mid-run "
+                            f"with a duplicate-arrival error. Move '{barrier_name}' upstream of the fork that "
+                            f"feeds '{union_name}', or terminate the released group at a sink.",
+                            component_id=str(union_name),
+                            component_type="row_union",
+                        )
                     downstream_agg = aggregation_settings_by_node.get(downstream)
                     if downstream_agg is not None:
                         trigger = downstream_agg.trigger

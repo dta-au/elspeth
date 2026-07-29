@@ -4,9 +4,9 @@ Construction logic lives in builder.py; this module contains the graph
 class with all runtime methods. The from_plugin_instances() classmethod
 is a thin facade that delegates to builder.build_execution_graph().
 Schema/contract validation policy lives in schema_validation.py,
-coalesce_warnings.py, guarantees.py and schema_factory.py; the
-corresponding ExecutionGraph methods are thin delegating facades
-(elspeth-b2c6ab6db8).
+coalesce_warnings.py, row_union_warnings.py, guarantees.py and
+schema_factory.py; the corresponding ExecutionGraph methods are thin
+delegating facades (elspeth-b2c6ab6db8).
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from elspeth.contracts.types import (
     RowUnionName,
     SinkName,
 )
-from elspeth.core.dag import coalesce_warnings, guarantees, schema_validation
+from elspeth.core.dag import coalesce_warnings, guarantees, row_union_warnings, schema_validation
 from elspeth.core.dag.guarantees import EffectiveGuaranteeVote as _EffectiveGuaranteeVote
 from elspeth.core.dag.models import (
     BranchInfo,
@@ -922,18 +922,21 @@ class ExecutionGraph:
     def get_branch_first_nodes(self) -> dict[str, NodeID]:
         """Get mapping of branch names to their first processing node.
 
-        For every branch that routes to a coalesce node, returns the first
-        node the token should visit:
-        - Identity branches (COPY edge gate→coalesce): maps to coalesce node ID
-        - Transform branches (MOVE edge chain→coalesce): maps to the first
+        For every branch that routes to a correlated barrier — a coalesce node
+        or a row_union node — returns the first node the token should visit:
+        - Identity branches (COPY edge gate→barrier): maps to the barrier node ID
+        - Transform branches (MOVE edge chain→barrier): maps to the first
           transform's node ID in the branch chain
 
-        The mapping covers ALL coalesce branches, eliminating the need for
-        defensive .get() at runtime.
+        The mapping covers ALL coalesce branches AND all row_union branches,
+        eliminating the need for defensive .get() at runtime. Coalesce branches
+        resolve their fork gate through ``_branch_info``; row_union branches are
+        not in ``_branch_info``, so their gate comes from
+        ``_row_union_branch_gates`` and is passed to the trace explicitly.
 
         Returns:
             Dict mapping branch name (str) to the first processing NodeID.
-            Empty dict if no coalesce branches exist.
+            Empty dict if no barrier branches exist.
         """
         result: dict[str, NodeID] = {}
 
@@ -985,12 +988,12 @@ class ExecutionGraph:
         branch_name: str,
         fork_gate_nid: NodeID | None = None,
     ) -> tuple[NodeID, NodeID]:
-        """Trace backwards from coalesce to find the first AND last transforms in a branch chain.
+        """Trace backwards from a barrier to find the first AND last transforms in a branch chain.
 
-        Walks backwards through MOVE edges from the coalesce node to find both
-        endpoints of the transform chain for a given branch. The chain terminates
-        at the fork gate node (which produces the branch via a MOVE edge labelled
-        with the branch name).
+        Walks backwards through MOVE edges from the barrier node — a coalesce
+        node or a row_union node — to find both endpoints of the transform chain
+        for a given branch. The chain terminates at the fork gate node (which
+        produces the branch via a MOVE edge labelled with the branch name).
 
         The backward walk follows ANY MOVE edge, not just ``"continue"`` edges,
         because branch chains may include intermediate routing gates whose
@@ -1001,16 +1004,23 @@ class ExecutionGraph:
         may produce MOVE edges whose labels collide with the branch name.
 
         Args:
-            coalesce_nid: The coalesce node to trace back from
+            coalesce_nid: The barrier node to trace back from (coalesce or
+                row_union; the parameter name predates row_union).
             branch_name: The branch name to trace
+            fork_gate_nid: The gate that originates this branch. Optional for
+                coalesce branches, which resolve their gate through
+                ``_branch_info``; REQUIRED for row_union branches, which are
+                not recorded in ``_branch_info`` and would otherwise KeyError.
 
         Returns:
             ``(first_node, last_node)`` — first_node is the first transform
             after the gate (receives the branch_name MOVE edge); last_node is
-            the immediate MOVE predecessor of the coalesce.
+            the immediate MOVE predecessor of the barrier.
 
         Raises:
-            GraphValidationError: If the branch chain cannot be traced
+            GraphValidationError: If the branch chain cannot be traced. The
+                diagnostic reports the barrier's actual node type, so a
+                row_union failure is not mislabelled as a coalesce failure.
         """
         # Resolve the fork gate that originates this specific branch.
         # Coalesce branches resolve through _branch_info; row_union callers
@@ -1059,12 +1069,17 @@ class ExecutionGraph:
                     break  # No MOVE predecessor — try next candidate
                 current = predecessor
 
+        # Report the barrier's ACTUAL node type: this trace serves both coalesce
+        # and row_union, and a hardcoded "coalesce" mislabels row_union failures.
+        # NodeType.COALESCE.value == "coalesce", so the coalesce-path message and
+        # component_type are byte-identical to the pre-row_union behaviour.
+        barrier_kind = self.get_node_info(coalesce_nid).node_type.value
         raise GraphValidationError(
             f"Cannot trace first transform for branch '{branch_name}' leading to "
-            f"coalesce node '{coalesce_nid}'. This indicates a graph construction bug — "
-            f"transform branches must have MOVE edge chains from gate to coalesce.",
+            f"{barrier_kind} node '{coalesce_nid}'. This indicates a graph construction bug — "
+            f"transform branches must have MOVE edge chains from gate to {barrier_kind}.",
             component_id=str(coalesce_nid),
-            component_type="coalesce",
+            component_type=barrier_kind,
         )
 
     def get_branch_to_sink_map(self) -> dict[BranchName, SinkName]:
@@ -1168,6 +1183,16 @@ class ExecutionGraph:
         Delegates to ``dag.coalesce_warnings.warn_divert_coalesce_interactions``.
         """
         return coalesce_warnings.warn_divert_coalesce_interactions(self, coalesce_configs)
+
+    def warn_divert_row_union_interactions(
+        self,
+        row_union_configs: dict[NodeID, RowUnionSettings],
+    ) -> list[GraphValidationWarning]:
+        """Detect DIVERT edges in branch chains feeding a row_union.
+
+        Delegates to ``dag.row_union_warnings.warn_divert_row_union_interactions``.
+        """
+        return row_union_warnings.warn_divert_row_union_interactions(self, row_union_configs)
 
     def _validate_single_edge(
         self,
