@@ -19,6 +19,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy import func, select, update
 
 from elspeth.contracts import CallType
+from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.schema import (
     artifacts_table,
@@ -76,6 +77,28 @@ _TUTORIAL_BASE_TRANSFORMS = frozenset(
         PluginId("transform", "field_mapper"),
     }
 )
+# Capabilities a deployment may declare `required` (WebSettings.plugin_control_modes).
+# The tutorial scrapes untrusted remote pages into an LLM, so it is exactly the
+# shape those controls exist for.
+_TUTORIAL_CONTROL_CAPABILITIES = frozenset({PluginCapability.PROMPT_SHIELD, PluginCapability.CONTENT_SAFETY})
+
+
+def _tutorial_control_transforms(snapshot: PluginAvailabilitySnapshot) -> frozenset[PluginId]:
+    """Control transforms a tutorial pipeline may carry beyond its base set.
+
+    A deployment that sets prompt_shield/content_safety to ``required``
+    (the AWS scenario module does) makes coverage a launch condition, while
+    a fixed three-transform contract makes satisfying it impossible: adding
+    the shield trips ``tutorial_plugin_set``, omitting it trips
+    ``required_control_coverage``. The tutorial admits whichever control
+    plugins THIS deployment selected, so a compliant pipeline exists
+    wherever the controls do — and where they do not, the run proceeds and
+    the composer's standing prompt-injection recommendation teaches why the
+    exposure matters.
+    """
+    return frozenset(
+        plugin_id for capability, plugin_id in snapshot.selected if capability in _TUTORIAL_CONTROL_CAPABILITIES and plugin_id is not None
+    )
 
 
 class TutorialRunIntegrityError(RuntimeError):
@@ -131,11 +154,15 @@ def _tutorial_launch_blocker(
             "tutorial_transforms_missing",
             "The saved tutorial pipeline has no transform steps — it wires the source directly to the sink.",
         )
+    # The base three are mandatory; this deployment's own control transforms are
+    # additionally admitted so a control-required policy stays satisfiable.
+    transform_set = set(transform_ids)
     if (
         not source_valid
         or not output_valid
-        or len(transform_ids) != len(_TUTORIAL_BASE_TRANSFORMS)
-        or set(transform_ids) != _TUTORIAL_BASE_TRANSFORMS
+        or len(transform_ids) != len(transform_set)
+        or not transform_set >= _TUTORIAL_BASE_TRANSFORMS
+        or not (transform_set - _TUTORIAL_BASE_TRANSFORMS) <= _tutorial_control_transforms(snapshot)
         or any(node.plugin is None for node in state.nodes)
     ):
         return ("tutorial_plugin_set", "The saved tutorial pipeline does not match the supported tutorial plugin set.")
