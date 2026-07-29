@@ -274,10 +274,10 @@ def _prompt_shield_rules(*, shield_plugin: str | None, untrusted_producers: tupl
         # control-required deployment that left coverage permanently unmet.
         return [
             f"An authorized prompt-injection shield is available in this deployment: {shield_plugin}. "
-            f"When an llm transform consumes externally-fetched content (any path from a {producers} "
-            f"output reaches its input), WIRE a {shield_plugin} transform between the fetch step and "
-            "that llm node — its input is the fetch step's on_success connection, and its on_success "
-            "is the llm node's input. This is required, not advisory: untrusted remote text must not "
+            f"When an llm transform consumes externally-controlled content (any path from a {producers} "
+            f"output reaches its input), WIRE a {shield_plugin} transform between that producer node and "
+            "the llm node — its input is the producer node's on_success connection, and its on_success "
+            "is the llm node's input. This is required, not advisory: untrusted text must not "
             "reach the model unshielded.",
             "Load the shield's schema and assistance through the capability catalog before authoring "
             "it, and configure it from that schema alone.",
@@ -286,7 +286,7 @@ def _prompt_shield_rules(*, shield_plugin: str | None, untrusted_producers: tupl
         ]
     draft = PROMPT_SHIELD_WARNING_DRAFT
     return [
-        f"When an llm transform consumes externally-fetched content (any path from a {producers} "
+        f"When an llm transform consumes externally-controlled content (any path from a {producers} "
         "output reaches its input), stage the prompt-injection shield review ON THAT LLM NODE: "
         "add one pending pipeline_decision entry to its options.interpretation_requirements "
         "(a sibling of the node's other options).",
@@ -294,7 +294,7 @@ def _prompt_shield_rules(*, shield_plugin: str | None, untrusted_producers: tupl
         "— copy the user_term and draft strings verbatim.",
         "The review is advisory and never blocks the pipeline, but omitting it hides a "
         "prompt-injection exposure decision from the operator's review cards.",
-        "Skip the row only when an authorized prompt-injection shield transform is already wired between the fetch step and the llm node.",
+        "Skip the row only when an authorized prompt-injection shield transform is already wired between that producer node and the llm node.",
     ]
 
 

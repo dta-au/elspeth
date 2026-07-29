@@ -708,6 +708,24 @@ def _web_scrape(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec
     )
 
 
+def _textract(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec:
+    return NodeSpec(
+        id=node_id,
+        node_type="transform",
+        plugin="aws_textract_document_analysis",
+        input=input_stream,
+        on_success=on_success,
+        on_error="stop",
+        options={"bucket_field": "bucket", "key_field": "key", "feature_types": ["TABLES"], "text_field": "content"},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
 def _shield(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec:
     return NodeSpec(
         id=node_id,
@@ -808,6 +826,73 @@ def test_queue_fan_in_untrusted_on_any_predecessor_marks_downstream_untrusted() 
     assert warning_pairs
     message = next(msg for component, msg in warning_pairs if component == "node:classify")
     assert "consumes externally-fetched content from a web_scrape upstream" in message
+
+
+# ── Document-extraction producers are untrusted too ──────────────────────
+# Text extracted from an uploaded document is attacker-controlled in exactly
+# the way scraped web content is: the author does not write it, and it lands
+# in an LLM prompt. Classifying it as trusted let a
+# source -> textract -> llm pipeline claim it consumed no untrusted content.
+
+
+def test_textract_upstream_marks_downstream_llm_as_consuming_untrusted_content() -> None:
+    """Document-extracted text is externally controlled, so it taints a downstream LLM."""
+    state = _state(
+        (
+            _textract("extract", input_stream="rows", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(state)
+
+    assert warning_pairs
+    message = next(msg for component, msg in warning_pairs if component == "node:classify")
+    assert "consumes externally-fetched content from a aws_textract_document_analysis upstream" in message
+
+
+def test_untrusted_producer_lead_names_the_actual_producer_not_web_scrape() -> None:
+    """The advisory must name the producer it found — never assert a web_scrape that is absent."""
+    state = _state(
+        (
+            _textract("extract", input_stream="rows", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    message = next(msg for component, msg in prompt_shield_recommendation_warning_pairs(state) if component == "node:classify")
+
+    assert "web_scrape" not in message
+
+
+def test_web_scrape_untrusted_lead_is_unchanged() -> None:
+    """Regression guard: the web_scrape wording is pinned by the tutorial e2e spec."""
+    state = _state(
+        (
+            _web_scrape("scrape", input_stream="rows", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    message = next(msg for component, msg in prompt_shield_recommendation_warning_pairs(state) if component == "node:classify")
+
+    assert (
+        "consumes externally-fetched content from a web_scrape upstream without an authorized prompt-injection shield between them. "
+        in message
+    )
+
+
+def test_shield_between_textract_and_llm_is_silent() -> None:
+    """An authorized shield downstream of the extraction sanitizes it (State A)."""
+    state = _state(
+        (
+            _textract("extract", input_stream="rows", on_success="extracted"),
+            _shield("shield", input_stream="extracted", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    assert prompt_shield_recommendation_warning_pairs(state) == ()
 
 
 def test_queue_fan_in_shield_authorized_only_when_all_predecessors_shielded() -> None:
