@@ -28,6 +28,7 @@ from elspeth.contracts import (
     RoutingMode,
     RoutingReason,
     RoutingSpec,
+    RowUnionFailureReason,
 )
 from elspeth.contracts.advisory_locks import ELSPETH_ROUTING_GROUP_LOCK_CLASSID
 from elspeth.contracts.audit import validate_node_state_completion_fields
@@ -426,7 +427,7 @@ class NodeStateRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
         conn: Connection | None = None,
@@ -465,7 +466,7 @@ class NodeStateRepository:
         # ExecutionError and CoalesceFailureReason are frozen dataclasses with
         # to_dict(); TransformErrorReason is a TypedDict (already a dict).
         if error is not None:
-            error_data = error.to_dict() if isinstance(error, (ExecutionError, CoalesceFailureReason)) else error
+            error_data = error.to_dict() if isinstance(error, (ExecutionError, CoalesceFailureReason, RowUnionFailureReason)) else error
             error_json = canonical_json(error_data)
         else:
             error_json = None

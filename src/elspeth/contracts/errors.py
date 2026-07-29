@@ -234,6 +234,20 @@ class RowUnionFailureReason:
             raise ValueError(f"RowUnionFailureReason.timeout_ms must be non-negative, got {self.timeout_ms}")
         freeze_fields(self, "expected_branches", "branches_arrived")
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to audit-trail dict.
+
+        Omits None-valued optional fields for compact JSON.
+        """
+        d: dict[str, Any] = {
+            "failure_reason": self.failure_reason,
+            "expected_branches": list(self.expected_branches),
+            "branches_arrived": list(self.branches_arrived),
+        }
+        if self.timeout_ms is not None:
+            d["timeout_ms"] = self.timeout_ms
+        return d
+
 
 @dataclass(frozen=True, slots=True)
 class CoalesceFailureReason:

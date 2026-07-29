@@ -44,6 +44,7 @@ from elspeth.contracts import (
     RoutingMode,
     RoutingReason,
     RoutingSpec,
+    RowUnionFailureReason,
     TriggerType,
 )
 from elspeth.contracts.call_data import CallPayload
@@ -253,7 +254,7 @@ class ExecutionRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         context_after: NodeStateContext | None = None,
     ) -> NodeStatePending: ...
 
@@ -265,7 +266,7 @@ class ExecutionRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
     ) -> NodeStateCompleted: ...
@@ -278,7 +279,7 @@ class ExecutionRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         context_after: NodeStateContext | None = None,
     ) -> NodeStateFailed: ...
 
@@ -289,7 +290,7 @@ class ExecutionRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
     ) -> NodeStatePending | NodeStateCompleted | NodeStateFailed:
