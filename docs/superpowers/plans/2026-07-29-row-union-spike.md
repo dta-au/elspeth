@@ -71,7 +71,7 @@ Composer state/importer/generator/MCP tools/guided authoring; frontend graph+wir
 
 ## Outcome record (2026-07-29 spike; corrected 2026-07-30 after review)
 
-The original record here claimed "full engine wiring" shipped. It was written before cross-model review, which found several gaps. Most are now fixed (58269867a, 4d44801bf, 922cb3078, ad42dd5a0, 0f6159bcc, 36696f6d0, e317abafb); four remain open. This section states what is true now.
+The original record here claimed "full engine wiring" shipped. It was written before cross-model review, which found several gaps. Most are now fixed (58269867a, 4d44801bf, 922cb3078, ad42dd5a0, 0f6159bcc, 36696f6d0, e317abafb, 136b5e3cb, 10cc7b9c0, d24dc8bf7); two remain open, and two that this section previously recorded as open are narrower than first stated. This section states what is true now.
 
 ### Landed on release/0.7.2
 
@@ -87,9 +87,53 @@ The original record here claimed "full engine wiring" shipped. It was written be
 
 ### Still open
 
-- **Branch-loss notification is unwired.** `Processor._notify_row_union_of_lost_branch` exists but has **zero call sites in `src/` or `tests/`** — the coalesce twin is called from `token_traversal.py` and the processor, the row_union twin from nowhere. It is not, as its own docstring and the deferred-surfaces list above say, an "in-memory leader notify" pending only its durable §E.5 lane: it never runs at all. A branch diverted out of a row_union group therefore produces no barrier notification by either route.
-- **No fail-closed resume guard.** `BarrierRecoveryCoordinator.restore_from_journal` has no row_union arm; its partition knows only coalesce names and aggregation node ids. A BLOCKED row_union row falls through to the orphan-`barrier_key` `AuditIntegrityError`, so resume does abort rather than silently dropping the group — but the diagnostic blames a barrier "this pipeline no longer has" instead of stating the designed posture ("resume across pending row_union groups is not yet supported").
-- **Batch-flush continuations drop the binding.** `_FlushContext` carries `coalesce_node_id`/`coalesce_name` and no row_union fields, and `_route_passthrough_results` / `_route_transform_results` thread `coalesce_name` only. This is the same defect class 922cb3078 fixed for expanding transforms, at the aggregation-flush sites. (Not proven reachable: whether a branch-internal aggregation feeding a row_union builds has not been tested.)
+- **Branch-loss notification is wired, but leader-only.** `136b5e3cb` gave
+  `Processor._notify_row_union_of_lost_branch` a live call site: every early-exit path now
+  routes through one barrier-agnostic seam, `_notify_barrier_of_lost_branch`
+  (`processor.py:2857`), so retry exhaustion, filter drop, quarantine, error routing, gate
+  routing and gate discard all reach the row_union executor. The earlier record here — that
+  the method had zero call sites and never ran — is superseded. What remains open is the
+  durable §E.5 lane: the record-then-notify path is still coalesce-only
+  (`coalesce_branch_losses`, `record_coalesce_branch_loss`, and `_replay_branch_losses` at
+  `barrier_coordination.py:702` have no row_union arm; `coalesce_branch_losses.coalesce_name`
+  is `nullable=False`, so the table structurally cannot represent a row_union loss), and
+  `_notify_row_union_of_lost_branch` returns early when the worker holds no executor. On a
+  single worker the in-memory notify is authoritative and the group fails closed naming the
+  loss; under ADR-030's leader plus claim-only followers, a branch lost on a follower is
+  recorded nowhere and the group instead waits for the end-of-source flush, failing with the
+  generic `row_union_incomplete_at_flush` — the exact misattribution 136b5e3cb set out to
+  kill. `examples/row_union_ab_experiment/README.md` states the fail-closed guarantee
+  unconditionally and should be scoped until this lands.
+- **Resume refuses pending row_union groups accurately, by design.** `d24dc8bf7` gave
+  `BarrierRecoveryCoordinator.restore_from_journal` the registered row_union names solely so
+  it can recognise this case: a BLOCKED row whose `barrier_key` names a registered row_union
+  now raises `OrchestrationInvariantError` with "Resume across pending row_union groups is
+  not yet supported" (`barrier_coordination.py:882`) instead of falling through to the
+  orphan-`barrier_key` `AuditIntegrityError`, whose message blamed a barrier the pipeline
+  "no longer has" and sent operators hunting a config change that never happened. Restore of
+  pending groups remains genuinely unimplemented — it would have to rebuild per-branch
+  executor state and reconcile the crash window where a released group's node states are
+  already COMPLETED while its journal rows are still BLOCKED. The run cannot resume mid-group
+  and must be re-run. This restriction is not yet covered in
+  `docs/runbooks/resume-failed-run.md`.
+- **Batch-flush continuations drop the binding — PROVEN REACHABLE.** `_FlushContext`
+  (`processor.py:202-226`) carries `coalesce_node_id`/`coalesce_name` and no row_union fields,
+  and the flush routers' two `create_continuation` calls (`processor.py:1434`, `:1613`) thread
+  `coalesce_name` only. This is the same defect class 922cb3078 fixed for expanding
+  transforms, at the aggregation-flush sites. Reachability is no longer open: a fork branch
+  containing `aggregation(plugin: batch_replicate, trigger: {count: 2}, output_mode:
+  transform)` feeding a row_union **builds clean** — it passes `graph.validate()` and
+  `validate_edge_compatibility()`. The group-indivisibility guard does not catch it because
+  that guard walks FORWARD from the row_union and this aggregation is UPSTREAM of it. The
+  binding is field-carried, not map-derived (traversal reads `item.row_union_name` at
+  `scheduler_drain.py:597`; `_maybe_row_union_token` bails when it is None at
+  `processor.py:2791`), so the flushed branch's continuations are neither held nor marked
+  BLOCKED — they walk through the barrier, the sibling branch is failed at EOF flush as
+  incomplete, and `batch_experiment_compare` receives a half-group and emits a wrong statistic
+  with no audit signal for the split. This is the only known row_union path that produces a
+  plausible-looking wrong answer rather than failing loudly. Fix by threading the row_union
+  binding through `_FlushContext` and both routers, or by rejecting the topology at build
+  time.
 - **No composer/web authoring surface.** `src/elspeth/composer_mcp/` contains no occurrence of `row_union` at all, and in `src/elspeth/web/` (including `web/frontend/`) it appears only in `preflight.py`'s runtime-graph threading and an acceptance-receipt label — nothing in composer state, importer, generator, MCP tools, guided authoring, or the frontend graph/wire surfaces. YAML is the only authoring path. (Tracked with the rest of the deferred surfaces on elspeth-a5b86149d4.)
 
 Notable verification finding: adding `row_unions` to `ElspethSettings` rotated `semantic_settings_sha256` for every recorded run (full-dump settings material). Resolved in the corpus semantic lens (`tests/fixtures/dag_scenario_corpus/harness.py::_semantic_run_settings` drops post-pin empty sections) so the Wave-owned manifest pins stay untouched; the corpus process owns any holistic re-baseline (elspeth-ef29ef6ba4).
