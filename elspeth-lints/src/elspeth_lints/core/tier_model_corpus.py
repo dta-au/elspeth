@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from elspeth_lints.core.allowlist import _JUDGE_METADATA_SIGNATURE_ENV_VAR
-from elspeth_lints.core.atomic_io import atomic_write_text
+from elspeth_lints.core.atomic_io import AtomicWriteConflictError, atomic_update_text
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, load_bundle
 from elspeth_lints.core.strict_json import strict_json_loads
 from elspeth_lints.rules.trust_tier.tier_model.rule import iter_scannable_python_files
@@ -153,6 +153,15 @@ class CorpusSummary:
     actions_total: int
     drift_actions_total: int
     classified_total: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveCorpusState:
+    """One stable observation of the revision, inputs, and derived actions."""
+
+    git_head: str
+    source_snapshot_sha256: str
+    actions: tuple[BundleAction, ...]
 
 
 def action_scan_sha256(actions: Iterable[BundleAction]) -> str:
@@ -295,7 +304,7 @@ def verify_classification_corpus(
 
     classified_total = 0
     drift_actions_total = 0
-    unclassified: list[str] = []
+    incomplete: list[str] = []
     for key in sorted(expected_keys):
         action = live_action_map[key]
         entry = row_map[key]
@@ -303,12 +312,14 @@ def verify_classification_corpus(
             raise CorpusReconciliationError(f"classification corpus structural facts are stale or edited for {key!r}")
         if action.kind == "drift_repair":
             drift_actions_total += 1
-        if entry.classification is None:
-            unclassified.append(key)
+        if entry.classification is None or entry.producer_provenance is None:
+            incomplete.append(key)
         else:
             classified_total += 1
-    if require_classified and unclassified:
-        raise CorpusReconciliationError(f"classification corpus has unclassified action rows: {unclassified!r}")
+    if require_classified and incomplete:
+        raise CorpusReconciliationError(
+            f"classification corpus has unclassified or missing producer provenance action rows: {incomplete!r}"
+        )
 
     return CorpusSummary(
         actions_total=len(expected_keys),
@@ -376,27 +387,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             value=Path(args.bundle),
             label="bundle",
         )
-        live_actions = live_stage_scan_actions(root=root, allowlist_dir=allowlist_dir)
-        git_head = current_git_head(repo_root)
-        snapshot_sha256 = source_snapshot_sha256(source_root=root, allowlist_dir=allowlist_dir)
+        live_state = _capture_stable_live_state(
+            repo_root=repo_root,
+            root=root,
+            allowlist_dir=allowlist_dir,
+        )
         if args.command == "create":
             report_path = _resolve_report_path(repo_root=repo_root, value=Path(args.output))
-            if report_path.exists() and not args.overwrite:
-                raise CorpusReconciliationError(f"classification report already exists: {report_path}; pass --overwrite to replace it")
             corpus = create_classification_corpus(
                 bundle_path=bundle_path,
-                git_head=git_head,
-                source_snapshot_sha256_value=snapshot_sha256,
-                live_actions=live_actions,
+                git_head=live_state.git_head,
+                source_snapshot_sha256_value=live_state.source_snapshot_sha256,
+                live_actions=live_state.actions,
             )
-            report_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            atomic_write_text(report_path, dump_classification_corpus(corpus))
             summary = verify_classification_corpus(
                 corpus=corpus,
                 bundle_path=bundle_path,
-                git_head=git_head,
-                source_snapshot_sha256_value=snapshot_sha256,
-                live_actions=live_actions,
+                git_head=live_state.git_head,
+                source_snapshot_sha256_value=live_state.source_snapshot_sha256,
+                live_actions=live_state.actions,
+            )
+            _publish_report(
+                report_path=report_path,
+                content=dump_classification_corpus(corpus),
+                overwrite=args.overwrite,
             )
             _write_summary(report_path=report_path, summary=summary)
             return 0
@@ -406,15 +420,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary = verify_classification_corpus(
                 corpus=corpus,
                 bundle_path=bundle_path,
-                git_head=git_head,
-                source_snapshot_sha256_value=snapshot_sha256,
-                live_actions=live_actions,
+                git_head=live_state.git_head,
+                source_snapshot_sha256_value=live_state.source_snapshot_sha256,
+                live_actions=live_state.actions,
                 require_classified=args.require_classified,
             )
             _write_summary(report_path=report_path, summary=summary)
             return 0
         raise AssertionError(f"unhandled tier-model-corpus command {args.command!r}")
-    except (OSError, ValueError) as exc:
+    except (AtomicWriteConflictError, OSError, ValueError) as exc:
         sys.stderr.write(f"tier-model-corpus: {exc}\n")
         return 2
 
@@ -499,6 +513,8 @@ def _resolve_repo_path(*, repo_root: Path, value: Path, label: str) -> Path:
 
 def _resolve_report_path(*, repo_root: Path, value: Path) -> Path:
     allowed_root = (repo_root / ".elspeth/tier-model-corpus").resolve()
+    if not allowed_root.is_relative_to(repo_root):
+        raise ValueError(f"classification report directory must resolve inside --repo-root {repo_root}: {allowed_root}")
     candidate = value
     if not candidate.is_absolute():
         candidate = repo_root / candidate
@@ -508,6 +524,44 @@ def _resolve_report_path(*, repo_root: Path, value: Path) -> Path:
     if resolved.suffix != ".json":
         raise ValueError(f"classification report must use a .json suffix: {resolved}")
     return resolved
+
+
+def _capture_stable_live_state(
+    *,
+    repo_root: Path,
+    root: Path,
+    allowlist_dir: Path,
+) -> _LiveCorpusState:
+    """Derive actions only while the bound revision and scanned inputs stay stable."""
+    head_before = current_git_head(repo_root)
+    source_before = source_snapshot_sha256(source_root=root, allowlist_dir=allowlist_dir)
+    actions = live_stage_scan_actions(root=root, allowlist_dir=allowlist_dir)
+    source_after = source_snapshot_sha256(source_root=root, allowlist_dir=allowlist_dir)
+    head_after = current_git_head(repo_root)
+    changed: list[str] = []
+    if head_before != head_after:
+        changed.append("Git HEAD")
+    if source_before != source_after:
+        changed.append("source/allowlist snapshot")
+    if changed:
+        raise CorpusStaleError(f"{', '.join(changed)} changed while deriving live actions")
+    return _LiveCorpusState(
+        git_head=head_after,
+        source_snapshot_sha256=source_after,
+        actions=actions,
+    )
+
+
+def _publish_report(*, report_path: Path, content: str, overwrite: bool) -> None:
+    """Publish under one lock so the no-overwrite decision cannot race."""
+
+    def update(current: str | None) -> str:
+        if current is not None and not overwrite:
+            raise CorpusReconciliationError(f"classification report already exists: {report_path}; pass --overwrite to replace it")
+        return content
+
+    report_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    atomic_update_text(report_path, update, create_parent=False)
 
 
 def _write_summary(*, report_path: Path, summary: CorpusSummary) -> None:

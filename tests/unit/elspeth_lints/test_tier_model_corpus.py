@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -10,6 +12,7 @@ import pytest
 
 from elspeth_lints.core import tier_model_corpus as corpus_module
 from elspeth_lints.core.allowlist import _JUDGE_METADATA_SIGNATURE_ENV_VAR
+from elspeth_lints.core.atomic_io import AtomicWriteConflictError
 from elspeth_lints.core.review_bundle import (
     SCHEMA_VERSION,
     BundleAction,
@@ -328,6 +331,24 @@ def test_verify_can_require_every_manual_classification(tmp_path: Path) -> None:
     assert summary.classified_total == 1
 
 
+def test_verify_requires_manual_producer_provenance_for_completed_rows(tmp_path: Path) -> None:
+    actions = (_justify("plugins/widget.py:R1:Widget:lookup:fp=aaaa"),)
+    bundle_path, corpus = _create(tmp_path, actions)
+    payload = json.loads(dump_classification_corpus(corpus))
+    payload["entries"][0]["classification"] = "repair"
+    missing_provenance = load_classification_corpus(json.dumps(payload))
+
+    with pytest.raises(CorpusReconciliationError, match="producer provenance"):
+        verify_classification_corpus(
+            corpus=missing_provenance,
+            bundle_path=bundle_path,
+            git_head=_HEAD,
+            source_snapshot_sha256_value=_SOURCE_SHA256,
+            live_actions=actions,
+            require_classified=True,
+        )
+
+
 def test_source_snapshot_digest_covers_source_and_allowlist_bytes(tmp_path: Path) -> None:
     source_root = tmp_path / "src"
     allowlist_dir = tmp_path / "allowlist"
@@ -462,6 +483,7 @@ def test_public_cli_creates_and_verifies_real_stage_scan_corpus(
     create_payload = json.loads(capsys.readouterr().out)
     assert create_payload["actions_total"] == 1
     assert create_payload["report_path"] == str(output.resolve())
+    assert stat.S_IMODE(output.parent.stat().st_mode) == 0o700
     corpus = load_classification_corpus(output.read_text(encoding="utf-8"))
     assert len(corpus.entries) == 1
     assert corpus.entries[0].classification is None
@@ -474,6 +496,36 @@ def test_public_cli_creates_and_verifies_real_stage_scan_corpus(
         "drift_actions_total": 0,
         "report_path": str(output.resolve()),
     }
+
+
+def test_public_cli_creates_private_corpus_directory_under_permissive_umask(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, root, allowlist_dir, bundle_path = _real_staged_repo(tmp_path)
+    output = repo / ".elspeth/tier-model-corpus/manual-review.json"
+    previous_umask = os.umask(0o022)
+    try:
+        result = corpus_main(
+            [
+                "create",
+                str(bundle_path),
+                "--repo-root",
+                str(repo),
+                "--root",
+                str(root),
+                "--allowlist-dir",
+                str(allowlist_dir),
+                "--output",
+                str(output),
+            ]
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert result == 0
+    capsys.readouterr()
+    assert stat.S_IMODE(output.parent.stat().st_mode) == 0o700
 
 
 def test_public_cli_require_classified_enforces_manual_completion(
@@ -532,6 +584,37 @@ def test_public_cli_refuses_output_outside_ignored_corpus_directory(
     assert ".elspeth/tier-model-corpus" in capsys.readouterr().err
 
 
+def test_public_cli_refuses_symlinked_corpus_directory_outside_repo(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, root, allowlist_dir, bundle_path = _real_staged_repo(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    corpus_dir = repo / ".elspeth/tier-model-corpus"
+    corpus_dir.symlink_to(outside, target_is_directory=True)
+    output = corpus_dir / "escaped.json"
+
+    result = corpus_main(
+        [
+            "create",
+            str(bundle_path),
+            "--repo-root",
+            str(repo),
+            "--root",
+            str(root),
+            "--allowlist-dir",
+            str(allowlist_dir),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert not (outside / "escaped.json").exists()
+    assert "inside --repo-root" in capsys.readouterr().err
+
+
 def test_public_cli_refuses_overwrite_without_explicit_flag(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -558,6 +641,118 @@ def test_public_cli_refuses_overwrite_without_explicit_flag(
     assert output.read_bytes() == original
     assert "--overwrite" in capsys.readouterr().err
     assert corpus_main([*common, "--overwrite"]) == 0
+
+
+def test_public_cli_checks_no_overwrite_inside_atomic_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, root, allowlist_dir, bundle_path = _real_staged_repo(tmp_path)
+    output = repo / ".elspeth/tier-model-corpus/manual-review.json"
+    atomic_update_called = False
+
+    def simulate_concurrent_create(
+        path: Path,
+        update: object,
+        *,
+        create_parent: bool,
+    ) -> None:
+        nonlocal atomic_update_called
+        atomic_update_called = True
+        assert path == output
+        assert create_parent is False
+        assert callable(update)
+        update("concurrent corpus")
+
+    monkeypatch.setattr(corpus_module, "atomic_update_text", simulate_concurrent_create, raising=False)
+
+    result = corpus_main(
+        [
+            "create",
+            str(bundle_path),
+            "--repo-root",
+            str(repo),
+            "--root",
+            str(root),
+            "--allowlist-dir",
+            str(allowlist_dir),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert atomic_update_called is True
+    assert result == 2
+    assert "--overwrite" in capsys.readouterr().err
+
+
+def test_public_cli_reports_atomic_write_contention_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, root, allowlist_dir, bundle_path = _real_staged_repo(tmp_path)
+    output = repo / ".elspeth/tier-model-corpus/manual-review.json"
+
+    def reject_contended_write(*args: object, **kwargs: object) -> None:
+        raise AtomicWriteConflictError("another writer owns the report lock")
+
+    monkeypatch.setattr(corpus_module, "atomic_update_text", reject_contended_write, raising=False)
+
+    result = corpus_main(
+        [
+            "create",
+            str(bundle_path),
+            "--repo-root",
+            str(repo),
+            "--root",
+            str(root),
+            "--allowlist-dir",
+            str(allowlist_dir),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert "another writer owns the report lock" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("drift_surface", ("head", "source"))
+def test_public_cli_rejects_identity_change_during_live_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    drift_surface: str,
+) -> None:
+    repo, root, allowlist_dir, bundle_path = _real_staged_repo(tmp_path)
+    output = repo / ".elspeth/tier-model-corpus/manual-review.json"
+    stable_head = corpus_module.current_git_head(repo)
+    stable_source = source_snapshot_sha256(source_root=root, allowlist_dir=allowlist_dir)
+    heads = iter((stable_head, "f" * 40) if drift_surface == "head" else (stable_head, stable_head))
+    sources = iter((stable_source, "e" * 64) if drift_surface == "source" else (stable_source, stable_source))
+    monkeypatch.setattr(corpus_module, "current_git_head", lambda repo_root: next(heads))
+    monkeypatch.setattr(corpus_module, "source_snapshot_sha256", lambda **kwargs: next(sources))
+
+    result = corpus_main(
+        [
+            "create",
+            str(bundle_path),
+            "--repo-root",
+            str(repo),
+            "--root",
+            str(root),
+            "--allowlist-dir",
+            str(allowlist_dir),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert not output.exists()
+    assert "changed while deriving live actions" in capsys.readouterr().err
 
 
 def test_public_cli_is_key_free_before_creating_output(
