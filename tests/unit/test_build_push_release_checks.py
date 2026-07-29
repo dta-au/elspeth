@@ -216,8 +216,13 @@ def test_release_build_context_excludes_terraform_state_plans_and_real_tfvars() 
     raw_lines = DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
     patterns = {line.strip() for line in raw_lines if line.strip() and not line.lstrip().startswith("#")}
 
-    assert {"**/.terraform/", "*.tfstate", "*.tfstate.*", "*.tfplan", "*.tfvars"}.issubset(patterns)
+    assert {"**/.terraform/", "*.tfstate", "*.tfstate.*", "*.tfplan", "*.tfvars", "*.tfvars.json"}.issubset(patterns)
     assert "!*.tfvars.example" in patterns
+
+    import fnmatch
+
+    assert fnmatch.fnmatch("terraform.tfvars.json", "*.tfvars.json")
+    assert fnmatch.fnmatch("scenario-a.auto.tfvars.json", "*.tfvars.json")
 
 
 def test_release_dockerfile_copies_local_uv_sources_before_dependency_sync() -> None:

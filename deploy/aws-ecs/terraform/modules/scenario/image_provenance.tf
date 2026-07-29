@@ -13,6 +13,8 @@ resource "terraform_data" "candidate_image_provenance" {
       registry="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
       work=$(mktemp -d -p /tmp elspeth-candidate-provenance.XXXXXX)
       chmod 700 "$work"
+      mkdir -m 700 "$work/docker-config"
+      export DOCKER_CONFIG="$work/docker-config"
       trap 'docker logout "$registry" >/dev/null 2>&1 || true; rm -rf -- "$work"' EXIT
 
       aws ecr get-login-password \
@@ -61,6 +63,8 @@ resource "terraform_data" "rollback_image_provenance" {
       registry="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
       work=$(mktemp -d -p /tmp elspeth-rollback-provenance.XXXXXX)
       chmod 700 "$work"
+      mkdir -m 700 "$work/docker-config"
+      export DOCKER_CONFIG="$work/docker-config"
       trap 'docker logout "$registry" >/dev/null 2>&1 || true; rm -rf -- "$work"' EXIT
 
       aws ecr get-login-password \
@@ -109,6 +113,8 @@ resource "terraform_data" "cloudwatch_agent_image_provenance" {
       registry="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
       work=$(mktemp -d -p /tmp elspeth-cloudwatch-agent-provenance.XXXXXX)
       chmod 700 "$work"
+      mkdir -m 700 "$work/docker-config"
+      export DOCKER_CONFIG="$work/docker-config"
       trap 'docker logout "$registry" >/dev/null 2>&1 || true; rm -rf -- "$work"' EXIT
 
       aws ecr get-login-password \

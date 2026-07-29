@@ -30,7 +30,7 @@ variable "candidate_image" {
 
   validation {
     condition = can(regex(
-      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${var.candidate_ecr_repository}@sha256:[0-9a-f]{64}$",
+      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${replace(var.candidate_ecr_repository, ".", "\\.")}@sha256:[0-9a-f]{64}$",
       var.candidate_image,
     ))
     error_message = "candidate_image must be a digest in the explicitly approved account, region, and ECR repository."
@@ -52,7 +52,7 @@ variable "rollback_baseline_image" {
 
   validation {
     condition = can(regex(
-      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${var.candidate_ecr_repository}@sha256:[0-9a-f]{64}$",
+      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${replace(var.candidate_ecr_repository, ".", "\\.")}@sha256:[0-9a-f]{64}$",
       var.rollback_baseline_image,
     ))
     error_message = "rollback_baseline_image must be a digest in the explicitly approved account, region, and application ECR repository."
@@ -128,7 +128,7 @@ variable "cloudwatch_agent_image" {
 
   validation {
     condition = can(regex(
-      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${var.cloudwatch_agent_ecr_repository}@sha256:[0-9a-f]{64}$",
+      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${replace(var.cloudwatch_agent_ecr_repository, ".", "\\.")}@sha256:[0-9a-f]{64}$",
       var.cloudwatch_agent_image,
     ))
     error_message = "cloudwatch_agent_image must be a digest in the explicitly approved account, region, and agent ECR repository."

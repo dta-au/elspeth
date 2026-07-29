@@ -343,15 +343,24 @@ run_one_shot() {
     --profile "$AWS_PROFILE" --region "$AWS_REGION" \
     --cluster "$ECS_CLUSTER" --task-definition "$task_definition" \
     --launch-type FARGATE --network-configuration "$NETWORK" --count 1 \
-    --query 'tasks[0].taskArn' --output text)
+    --query 'tasks[0].taskArn' --output text) || {
+    printf '%s: FAILED (run-task)\n' "$expected_command" >&2
+    return 1
+  }
   aws ecs wait tasks-stopped \
     --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-    --cluster "$ECS_CLUSTER" --tasks "$task_arn"
+    --cluster "$ECS_CLUSTER" --tasks "$task_arn" || {
+    printf '%s: FAILED (wait tasks-stopped)\n' "$expected_command" >&2
+    return 1
+  }
   test "$(aws ecs describe-tasks \
     --profile "$AWS_PROFILE" --region "$AWS_REGION" \
     --cluster "$ECS_CLUSTER" --tasks "$task_arn" \
     --query 'tasks[0].containers[?name==`elspeth-web`].exitCode | [0]' \
-    --output text)" = 0
+    --output text)" = 0 || {
+    printf '%s: FAILED (nonzero container exit code)\n' "$expected_command" >&2
+    return 1
+  }
   printf '%s: ok\n' "$expected_command"
 }
 run_one_shot \
@@ -380,6 +389,8 @@ umask 077
   printf 'ELSPETH_ACCEPTANCE_REGISTER=1\n'
   printf 'ELSPETH_WEB__DEFAULT_LLM_PROFILE=%s\n' \
     "$(printf '%s' "$INVENTORY" | jq -er '.values.ELSPETH_WEB__DEFAULT_LLM_PROFILE')"
+  printf 'ELSPETH_WEB__DATA_DIR=%s\n' \
+    "$(printf '%s' "$INVENTORY" | jq -er '.values.ELSPETH_WEB__DATA_DIR')"
   printf 'SSL_CERT_FILE=/acceptance/ca.pem\n'
 } >"$acceptance_dir/acceptance.env"
 

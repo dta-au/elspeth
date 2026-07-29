@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import itertools
 import json
 import re
 import shutil
@@ -550,10 +551,45 @@ def test_every_image_is_proven_before_any_credentialed_task_definition() -> None
     assert 'run "reject_foreign_registry_candidate"' in native_test
     assert 'run "reject_foreign_account_candidate"' in native_test
     assert 'run "reject_foreign_repository_candidate"' in native_test
+    assert 'run "reject_dot_wildcard_repository_candidate"' in native_test
 
     agent_dockerfile = _text("cloudwatch-agent-image/Dockerfile")
     assert "ARG ELSPETH_RELEASE_SHA" in agent_dockerfile
     assert "org.opencontainers.image.revision=$ELSPETH_RELEASE_SHA" in agent_dockerfile
+
+
+def test_repository_regexes_escape_dots_before_interpolation() -> None:
+    for relative in (
+        "modules/scenario/variables.tf",
+        "scenario-a/variables.tf",
+        "scenario-b/variables.tf",
+    ):
+        text = _text(relative)
+        assert "${var.candidate_ecr_repository}@sha256" not in text
+        assert "${var.cloudwatch_agent_ecr_repository}@sha256" not in text
+        assert r'${replace(var.candidate_ecr_repository, ".", "\\.")}@sha256' in text
+        assert r'${replace(var.cloudwatch_agent_ecr_repository, ".", "\\.")}@sha256' in text
+
+
+def test_image_provenance_isolates_docker_credentials_from_the_operator_default() -> None:
+    provenance = _text("modules/scenario/image_provenance.tf")
+
+    assert provenance.count('mkdir -m 700 "$work/docker-config"') == 3
+    assert provenance.count('export DOCKER_CONFIG="$work/docker-config"') == 3
+
+    boundaries = [
+        provenance.index('resource "terraform_data" "candidate_image_provenance"'),
+        provenance.index('resource "terraform_data" "rollback_image_provenance"'),
+        provenance.index('resource "terraform_data" "cloudwatch_agent_image_provenance"'),
+        len(provenance),
+    ]
+    for start, end in itertools.pairwise(boundaries):
+        block = provenance[start:end]
+        export_index = block.index('export DOCKER_CONFIG="$work/docker-config"')
+        assert export_index < block.index("trap ")
+        assert export_index < block.index("docker login")
+        assert export_index < block.index("docker pull")
+        assert export_index < block.index("docker image inspect")
 
 
 def test_database_password_rotation_reexecutes_the_database_bootstrap() -> None:

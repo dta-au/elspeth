@@ -87,3 +87,14 @@ run "reject_foreign_repository_candidate" {
 
   expect_failures = [var.candidate_image]
 }
+
+run "reject_dot_wildcard_repository_candidate" {
+  command = plan
+
+  variables {
+    candidate_ecr_repository = "elspeth-web.prod"
+    candidate_image          = format("%s.dkr.ecr.ap-southeast-1.amazonaws.com/elspeth-webXprod@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join("", ["123456", "789012"]))
+  }
+
+  expect_failures = [var.candidate_image]
+}

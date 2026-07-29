@@ -359,6 +359,7 @@ class TestExplainScreenLoading:
             self._make_node(node_id="gate-1", plugin_name="threshold", node_type=NodeType.GATE),
             self._make_node(node_id="agg-1", plugin_name="batch", node_type=NodeType.AGGREGATION),
             self._make_node(node_id="coal-1", plugin_name="merge", node_type=NodeType.COALESCE),
+            self._make_node(node_id="union-1", plugin_name="union_all", node_type=NodeType.ROW_UNION),
             self._make_node(node_id="sink-1", plugin_name="output", node_type=NodeType.SINK),
         ]
         edges = [
@@ -366,7 +367,8 @@ class TestExplainScreenLoading:
             FakeEdge(edge_id="edge-tfm-gate", from_node_id="tfm-1", to_node_id="gate-1", label="default"),
             FakeEdge(edge_id="edge-gate-agg", from_node_id="gate-1", to_node_id="agg-1", label="default"),
             FakeEdge(edge_id="edge-agg-coal", from_node_id="agg-1", to_node_id="coal-1", label="default"),
-            FakeEdge(edge_id="edge-coal-sink", from_node_id="coal-1", to_node_id="sink-1", label="default"),
+            FakeEdge(edge_id="edge-coal-union", from_node_id="coal-1", to_node_id="union-1", label="default"),
+            FakeEdge(edge_id="edge-union-sink", from_node_id="union-1", to_node_id="sink-1", label="default"),
         ]
         factory = FakeRecorderFactory(data_flow=FakeDataFlow(nodes=nodes, edges=edges))
 
@@ -384,6 +386,7 @@ class TestExplainScreenLoading:
             "Gate: threshold",
             "Aggregation: batch",
             "Coalesce: merge",
+            "Row union: union_all",
             "Sink: output",
         ]
 

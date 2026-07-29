@@ -167,6 +167,9 @@ class ExecutionReadRepository:
     def get_completed_row_ids_for_nodes(self, *args: Any, **kwargs: Any) -> set[tuple[str, str]]:
         return self._repo.get_completed_row_ids_for_nodes(*args, **kwargs)
 
+    def get_released_row_ids_for_nodes(self, *args: Any, **kwargs: Any) -> set[tuple[str, str]]:
+        return self._repo.get_released_row_ids_for_nodes(*args, **kwargs)
+
     def get_operation(self, operation_id: str) -> Any | None:
         return self._repo.get_operation(operation_id)
 

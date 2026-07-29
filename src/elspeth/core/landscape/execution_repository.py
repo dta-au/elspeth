@@ -344,6 +344,18 @@ class ExecutionRepository:
         """Return whether one row completed at one node in one run."""
         return self.node_states.has_completed_row_for_node(run_id=run_id, node_id=node_id, row_id=row_id)
 
+    def get_released_row_ids_for_nodes(
+        self,
+        run_id: str,
+        node_ids: frozenset[str],
+    ) -> set[tuple[str, str]]:
+        """Get (node_id, row_id) pairs where a node_state completed as COMPLETED."""
+        return self.node_states.get_released_row_ids_for_nodes(run_id, node_ids)
+
+    def has_released_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
+        """Return whether one row completed as COMPLETED at one node in one run."""
+        return self.node_states.has_released_row_for_node(run_id=run_id, node_id=node_id, row_id=row_id)
+
     def record_routing_event(
         self,
         state_id: str,
