@@ -357,8 +357,8 @@ policy rollout") and the
 the service's environment file (the Linux runbook installs
 `deploy/linux-systemd/elspeth-web.env.example` as
 `/etc/elspeth/elspeth-web.env`), each JSON value on a single line, then
-restart the web service. The example file does not pre-populate the LLM
-variables, so add them explicitly. A typical OpenRouter-backed deployment
+restart the web service. The example file carries the LLM variables as a
+commented block — uncomment and set them. A typical OpenRouter-backed deployment
 sets `ELSPETH_WEB__COMPOSER_MODEL` and `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`
 (`openrouter/...` ids), `OPENROUTER_API_KEY`, `ELSPETH_WEB__LLM_PROFILES`
 (a server-scoped OpenRouter profile referencing `OPENROUTER_API_KEY`), and
