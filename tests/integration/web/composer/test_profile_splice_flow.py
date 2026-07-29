@@ -84,6 +84,7 @@ def _policy_context() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
                     "region_name": "ap-southeast-1",
                 }
             },
+            "default_llm_profile": "llm-default",
         }
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)

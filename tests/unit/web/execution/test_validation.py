@@ -293,6 +293,7 @@ def test_operator_profile_lowering_preserves_authored_state() -> None:
                     "credential_ref": "OPENROUTER_API_KEY",
                 }
             },
+            "default_llm_profile": "tutorial",
         }
     )
     runtime_config = RuntimeWebPluginConfig.from_settings(settings)

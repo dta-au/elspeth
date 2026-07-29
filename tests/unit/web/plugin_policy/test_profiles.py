@@ -33,7 +33,7 @@ def _settings(**overrides: object) -> WebSettings:
 
 def test_openrouter_profile_requires_explicit_scoped_credential() -> None:
     with pytest.raises(ValidationError):
-        _settings(llm_profiles={"tutorial": {"provider": "openrouter", "model": "openai/gpt-5-mini"}})
+        _settings(llm_profiles={"tutorial": {"provider": "openrouter", "model": "openai/gpt-5-mini"}}, default_llm_profile="tutorial")
 
 
 @pytest.mark.parametrize(
@@ -66,7 +66,7 @@ def test_openrouter_profile_requires_explicit_scoped_credential() -> None:
 )
 def test_llm_profiles_reject_provider_options_runtime_cannot_honor(profile: dict[str, object]) -> None:
     with pytest.raises(ValidationError, match="does not support"):
-        _settings(llm_profiles={"invalid": profile})
+        _settings(llm_profiles={"invalid": profile}, default_llm_profile="invalid")
 
 
 def test_bedrock_profile_is_keyless_and_uses_canonical_provider_registry() -> None:
@@ -133,6 +133,7 @@ def test_runtime_conversion_is_frozen_and_canonical() -> None:
                 "credential_ref": "TOP_SECRET_MARKER",
             }
         },
+        default_llm_profile="tutorial",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
 
@@ -156,7 +157,8 @@ def test_profile_reprs_hide_provider_and_provider_specific_settings() -> None:
                 "api_version": "PRIVATE_API_VERSION_MARKER",
                 "max_tokens": 12345,
             }
-        }
+        },
+        default_llm_profile="private-binding",
     )
 
     settings_repr = repr(settings.llm_profiles["private-binding"])
@@ -182,7 +184,8 @@ def test_profile_aliases_are_opaque_canonical_identifiers() -> None:
                     "provider": "bedrock",
                     "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
                 }
-            }
+            },
+            default_llm_profile="Not Valid",
         )
 
 
@@ -441,7 +444,8 @@ def _profile_registry() -> OperatorProfileRegistry:
                     "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
                     "region_name": "ap-southeast-2",
                 },
-            }
+            },
+            default_llm_profile="tutorial",
         )
     )
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -496,7 +500,8 @@ def test_azure_profile_lowering_honors_deployment_derived_model_contract() -> No
                     "endpoint": "https://example.openai.azure.com",
                     "deployment_name": "operator-deployment",
                 }
-            }
+            },
+            default_llm_profile="azure-task",
         )
     )
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -528,7 +533,8 @@ def test_azure_profile_rejects_model_that_disagrees_with_deployment() -> None:
                         "endpoint": "https://example.openai.azure.com",
                         "deployment_name": "operator-deployment",
                     }
-                }
+                },
+                default_llm_profile="azure-task",
             )
         )
 

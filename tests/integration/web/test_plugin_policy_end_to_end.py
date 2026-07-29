@@ -865,6 +865,7 @@ def test_server_profile_scope_survives_lowering_and_same_name_user_shadow(
                 "credential_ref": "SHARED_LLM_KEY",
             }
         },
+        default_llm_profile="server-profile",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -923,6 +924,7 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
                 "credential_ref": "SHARED_LLM_KEY",
             }
         },
+        default_llm_profile="server-profile",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)

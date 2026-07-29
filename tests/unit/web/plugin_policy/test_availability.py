@@ -82,7 +82,8 @@ def test_bedrock_profile_is_locally_available_without_secret() -> None:
                     "provider": "bedrock",
                     "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
                 }
-            }
+            },
+            default_llm_profile="task-role",
         )
     )
 
@@ -130,7 +131,8 @@ def test_profile_aliases_and_hash_are_principal_scoped() -> None:
                 "credential_scope": "user",
                 "credential_ref": "OPENROUTER_API_KEY",
             }
-        }
+        },
+        default_llm_profile="personal",
     )
     inventory = _Inventory(users={"local:alice": frozenset({"OPENROUTER_API_KEY"})})
     alice = _build(settings, principal="local:alice", inventory=inventory)
@@ -152,7 +154,8 @@ def test_in_place_profile_credential_rotation_changes_snapshot_identity(scope: s
                 "credential_scope": scope,
                 "credential_ref": "OPENROUTER_API_KEY",
             }
-        }
+        },
+        default_llm_profile="rotating",
     )
     principal = "local:alice"
     availability = {"OPENROUTER_API_KEY"}
@@ -231,9 +234,9 @@ def test_llm_operator_binding_change_changes_snapshot_identity(
     after_profile: dict[str, object],
     inventory: _Inventory,
 ) -> None:
-    before = _build(_settings(llm_profiles={"stable": before_profile}), inventory=inventory)
-    repeated = _build(_settings(llm_profiles={"stable": before_profile}), inventory=inventory)
-    after = _build(_settings(llm_profiles={"stable": after_profile}), inventory=inventory)
+    before = _build(_settings(llm_profiles={"stable": before_profile}, default_llm_profile="stable"), inventory=inventory)
+    repeated = _build(_settings(llm_profiles={"stable": before_profile}, default_llm_profile="stable"), inventory=inventory)
+    after = _build(_settings(llm_profiles={"stable": after_profile}, default_llm_profile="stable"), inventory=inventory)
 
     assert before.available == after.available
     assert before.binding_generation_fingerprint == repeated.binding_generation_fingerprint
@@ -281,7 +284,8 @@ def test_fresh_snapshot_detects_request_scoped_credential_deletion_without_resta
                 "credential_scope": "user",
                 "credential_ref": "OPENROUTER_API_KEY",
             }
-        }
+        },
+        default_llm_profile="personal",
     )
     principal = "local:alice"
 
