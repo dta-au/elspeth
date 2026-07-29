@@ -862,8 +862,10 @@ git commit -m "test(textract): cover discovery and secret refs"
 
 - Create: `tests/integration/plugins/transforms/aws/test_textract_document_analysis_pipeline.py`
 - Create: `tests/integration/plugins/transforms/aws/test_textract_document_analysis_live.py`
+- Modify: `src/elspeth/plugins/transforms/aws/textract_result.py` (production-path frozen-response fix)
+- Modify: `tests/unit/plugins/transforms/aws/test_textract_result.py`
 
-- [ ] **Step 1: Write the production-path integration test**
+- [x] **Step 1: Write the production-path integration test**
 
 Create a temporary observed-schema CSV source, Textract transform, and JSON sink settings document. Load it through the real settings loader, call `instantiate_plugins_from_config()`, and build the real execution graph. Monkeypatch only `build_textract_sdk_client` beneath the plugin boundary with a fake SDK that returns `IN_PROGRESS`, then two paginated `SUCCEEDED` responses.
 
@@ -877,7 +879,7 @@ Execute one row using the existing integration helper/orchestrator fixture. Asse
 - no credential value or raw `NextToken` appears in retrieved call payloads; and
 - the output state contract is aligned and locked.
 
-- [ ] **Step 2: Run the production-path integration test**
+- [x] **Step 2: Run the production-path integration test**
 
 Run:
 
@@ -887,13 +889,13 @@ pytest tests/integration/plugins/transforms/aws/test_textract_document_analysis_
 
 Expected: PASS.
 
-- [ ] **Step 3: Add the opt-in live AWS test**
+- [x] **Step 3: Add the opt-in live AWS test**
 
 Create `tests/integration/plugins/transforms/aws/test_textract_document_analysis_live.py` with `@pytest.mark.live_aws`. Require gate `ELSPETH_RUN_LIVE_TEXTRACT=1` plus `ELSPETH_TEST_TEXTRACT_REGION`, `ELSPETH_TEST_TEXTRACT_BUCKET`, `ELSPETH_TEST_TEXTRACT_KEY`, and `ELSPETH_TEST_TEXTRACT_EXPECTED_TEXT`. Skip if the gate is absent; fail with a static message if the gate is present but inputs are incomplete.
 
 Use default-chain auth, `LAYOUT`, text and metadata outputs, an in-memory Landscape recorder, and the real plugin lifecycle. Assert success, expected text containment, positive page/block counts, and at least one audited start/get call. Failure messages must never render the document text, bucket/key, credentials, or raw AWS exception.
 
-- [ ] **Step 4: Verify the live test is safely skipped by default**
+- [x] **Step 4: Verify the live test is safely skipped by default**
 
 Run:
 
@@ -903,7 +905,7 @@ pytest tests/integration/plugins/transforms/aws/test_textract_document_analysis_
 
 Expected: one skipped test and no AWS call.
 
-- [ ] **Step 5: Commit Task 6**
+- [x] **Step 5: Commit Task 6**
 
 ```bash
 git add tests/integration/plugins/transforms/aws/test_textract_document_analysis_pipeline.py tests/integration/plugins/transforms/aws/test_textract_document_analysis_live.py
