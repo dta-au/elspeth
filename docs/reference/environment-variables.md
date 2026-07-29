@@ -12,6 +12,7 @@ Reference for ELSPETH environment variables and `.env` configuration.
 - [LLM Provider Variables](#llm-provider-variables)
 - [Web Deployment Variables](#web-deployment-variables)
 - [Web LLM Configuration](#web-llm-configuration)
+- [AWS Service Variables](#aws-service-variables)
 - [Azure Service Variables](#azure-service-variables)
 - [Telemetry Variables](#telemetry-variables)
 - [Secret Field Detection](#secret-field-detection)
@@ -365,6 +366,75 @@ sets `ELSPETH_WEB__COMPOSER_MODEL` and `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`
 `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` together, alongside
 `ELSPETH_FINGERPRINT_KEY` so server-scoped credentials resolve. See the
 [Ansible Ubuntu deployment runbook](../runbooks/ansible-ubuntu-deployment.md).
+
+---
+
+## AWS Service Variables
+
+### Web control selection (prompt shield and content safety)
+
+These four variables decide which safety controls the web surface offers, how
+strictly it enforces them, and which operator-owned Guardrail each control
+binds to. They are part of the same protected plugin-policy assignment as the
+LLM variables above, and the process policy is frozen at startup — restart the
+web service after changing any of them.
+
+| Variable | Purpose |
+|----------|---------|
+| `ELSPETH_WEB__PLUGIN_PREFERENCES` | Ordered implementation choice per capability, e.g. `{"prompt_shield":["transform:aws_bedrock_prompt_shield"]}` |
+| `ELSPETH_WEB__PLUGIN_CONTROL_MODES` | `required` or `recommend` per capability |
+| `ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES` | Operator-owned Guardrail bindings, each with `alias`, `plugin`, `guardrail_identifier`, `guardrail_version`, `region` |
+| `ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES` | Which alias each control plugin uses by default |
+
+`required` is the consequential setting. Under `required`, a web-authored
+pipeline is rejected unless every LLM node is covered: the prompt shield must
+dominate the node's input, and content safety must dominate **every** one of
+its output streams. Authors cannot opt out, and the planner wires the controls
+rather than recommending them. Under `recommend` the control is advisory and an
+uncovered LLM node is allowed.
+
+Guardrail profiles keep the same operator/author separation as LLM profiles.
+Web authors select only an opaque `profile` alias, row `fields`, `schema`, and —
+for content safety — `source`. The Guardrail identifier, immutable numeric
+version, and region are operator-owned and lowered only for validation and
+execution, so an author can never read or forge them. Credentials come from the
+AWS default SDK chain; grant Bedrock permissions to the task role and never put
+access keys or custom endpoints in profile or pipeline configuration.
+
+See [configuration.md](configuration.md#environment-configuration) for a
+complete worked example, and the plugin's YAML options under
+[AWS Bedrock Guardrail shields](configuration.md#aws-bedrock-guardrail-shields).
+
+### Amazon Textract
+
+The `aws_textract_document_analysis` transform has **no environment
+variables**. It is user-configurable per node (region, the row fields carrying
+the S3 bucket and key, and the requested feature types), and it authenticates
+through the ordinary AWS credential chain — the ECS task role in a container
+deployment.
+
+Two things gate it instead of an environment variable:
+
+- **The allowlist.** It is not part of the required web core, so
+  `ELSPETH_WEB__PLUGIN_ALLOWLIST` must include
+  `"transform:aws_textract_document_analysis"` before any web surface offers it.
+- **IAM.** The task role needs `textract:StartDocumentAnalysis` and
+  `textract:GetDocumentAnalysis`. Without them the pipeline composes and
+  validates cleanly and then fails at run time with `AccessDenied`, because
+  authorization is not checked until the job is submitted.
+
+See [AWS Textract document analysis](configuration.md#aws-textract-document-analysis)
+for the plugin options, the output-field choices, and why extracted document
+text must be treated as untrusted content.
+
+### AWS credentials
+
+AWS-backed plugins (`aws_s3` source and sink, the two Bedrock Guardrail
+controls, Textract, and the `llm` transform with `provider: bedrock`) resolve
+credentials through the standard AWS SDK chain rather than ELSPETH-specific
+variables. In a container deployment that means the task role; locally it means
+whatever `AWS_PROFILE` / `AWS_REGION` and the usual `AWS_*` variables resolve
+to. Do not place access keys in plugin options.
 
 ---
 

@@ -621,6 +621,7 @@ fields = extract_jinja2_fields(template)  # frozenset({'customer_id', 'message_t
 | `azure_prompt_shield` | Detect prompt injection via Azure AI |
 | `aws_bedrock_content_safety` | Detect configured harmful-content categories through Bedrock Guardrails |
 | `aws_bedrock_prompt_shield` | Detect prompt attacks through Bedrock Guardrails |
+| `aws_textract_document_analysis` | Extract text, tables, forms, and layout from S3-hosted documents through Amazon Textract |
 | `rag_retrieval` | Enriches rows with retrieval-augmented context from search providers |
 
 ### AWS Bedrock LLM
@@ -692,6 +693,73 @@ including provider-generated text in row data or error details.
 The harmful-content categories required by this AWS plugin do not include
 Azure Content Safety's `self_harm` category. A deployment must not claim Azure
 coverage parity unless an additional approved control covers that category.
+
+### AWS Textract document analysis
+
+`aws_textract_document_analysis` runs Amazon Textract's asynchronous
+document-analysis job over a document already stored in S3, and adds the
+extracted text, tables, forms, and layout to the row.
+
+Unlike most transforms, it takes its S3 references **from row data, not from
+static options**: `bucket_field` and `key_field` name the input fields holding
+the bucket and key, so one manifest row drives one document. `version_field` is
+optional and pins a specific S3 object version.
+
+```yaml
+transforms:
+  - name: extract_invoice
+    plugin: aws_textract_document_analysis
+    input: manifest_rows
+    on_success: summarize_in
+    on_error: discard
+    options:
+      region: ap-southeast-2
+      bucket_field: doc_bucket
+      key_field: doc_key
+      feature_types: [TABLES, FORMS]
+      text_field: document_text
+      page_count_field: page_count
+      required_input_fields: [doc_bucket, doc_key]
+      schema:
+        mode: observed
+```
+
+`feature_types` is a unique selection from `TABLES`, `FORMS`, `QUERIES`,
+`SIGNATURES`, and `LAYOUT`. `QUERIES` is only valid together with a `queries`
+array defining the questions to ask of each document.
+
+Choose at least one output field or the extraction has nowhere to land:
+`text_field` (page-ordered `LINE` text), `page_count_field`,
+`metadata_field` (bounded job metadata), `result_field` (the bounded
+provider-shaped aggregate), or `extract` (mappings from normalized document
+facets to row fields).
+
+**Credentials.** `auth_mode` defaults to `default_chain`, which uses the
+ordinary AWS credential chain — on ECS, the task role. `secret_refs` mode
+exists for CLI and batch pipelines that resolve credentials from ELSPETH secret
+references; web-authored pipelines must not carry access keys.
+
+**IAM.** The calling identity needs `textract:StartDocumentAnalysis` and
+`textract:GetDocumentAnalysis`. Neither action names an ARN, so `"*"` is the
+only expressible resource — the effective scope is the S3 object grant, because
+Textract reads `DocumentLocation.S3Object` under the caller's own credentials
+and can therefore only analyse documents the identity could already read. The
+AWS ECS scenario module grants both actions to the task role and carries the
+same statement in the permissions boundary.
+
+**Bounds and polling.** Each document is capped by `max_result_pages`,
+`max_blocks`, and `max_result_bytes`, and the job poll is governed by
+`poll_interval_seconds`, `poll_backoff_multiplier`, `poll_max_interval_seconds`,
+`poll_timeout_seconds`, and `batch_wait_timeout_seconds`. The defaults suit
+ordinary business documents; raise the caps deliberately, because they bound
+how much provider-shaped data can enter one row.
+
+**Extracted text is untrusted third-party content.** A document supplied by an
+outside party can carry text crafted to steer a downstream model, exactly like
+a scraped web page. Put a prompt shield between this transform and any `llm`
+node that consumes its output. When `ELSPETH_WEB__PLUGIN_CONTROL_MODES` sets
+`prompt_shield` to `required`, web-authored pipelines cannot omit that shield;
+under `recommend` it is the author's responsibility.
 
 ---
 
