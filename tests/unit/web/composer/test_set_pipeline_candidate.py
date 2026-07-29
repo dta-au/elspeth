@@ -1635,7 +1635,8 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
     credential_error = (
         "Credential field(s) contain literal value(s): classify:api_key. Literal credential values were not stored. "
         "Set `<field>: {secret_ref: NAME}` directly in the node's options when calling set_pipeline / upsert_node. "
-        "(The marker is stripped before option validation and resolved at execution time.) This rejection left pipeline "
+        "(The marker is handled without resolving its value during option validation and resolved at execution time.) "
+        "This rejection left pipeline "
         "state unchanged: repair by re-issuing only the rejected call with the marker substituted for the literal value "
         "— do not rebuild the pipeline from scratch. For a component already in state, patching just that component "
         "(patch_source_options / patch_node_options / patch_output_options) with the marker is the minimal correction. "

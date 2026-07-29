@@ -91,6 +91,7 @@ locals {
     "sink:text",
     "transform:aws_bedrock_content_safety",
     "transform:aws_bedrock_prompt_shield",
+    "transform:aws_textract_document_analysis",
     "transform:llm",
     "transform:passthrough",
   ])

@@ -8695,6 +8695,47 @@ class TestSetPipeline:
         node = result.updated_state.nodes[0]
         assert node.options["api_key"] == {"secret_ref": "OPENROUTER_API_KEY"}
 
+    def test_set_pipeline_accepts_textract_paired_secret_ref_markers(self) -> None:
+        state = _empty_state()
+        catalog = _mock_catalog()
+        catalog.list_transforms.return_value = [
+            *catalog.list_transforms.return_value,
+            PluginSummary(
+                name="aws_textract_document_analysis",
+                description="Asynchronous S3-backed document analysis",
+                plugin_type="transform",
+                config_fields=[],
+            ),
+        ]
+        args = _valid_pipeline_args()
+        args["nodes"][0] = {
+            "id": "analyze_document",
+            "node_type": "transform",
+            "plugin": "aws_textract_document_analysis",
+            "input": "source_out",
+            "on_success": "main",
+            "on_error": "discard",
+            "options": {
+                "region": "ap-southeast-2",
+                "auth_mode": "secret_refs",
+                "aws_access_key_id": {"secret_ref": "AWS_ACCESS_KEY_ID"},
+                "aws_secret_access_key": {"secret_ref": "AWS_SECRET_ACCESS_KEY"},
+                "bucket_field": "document_bucket",
+                "key_field": "document_key",
+                "feature_types": ["FORMS"],
+                "text_field": "textract_text",
+                "schema": {"mode": "observed"},
+            },
+        }
+        args["edges"][0]["to_node"] = "analyze_document"
+
+        result = execute_tool("set_pipeline", args, state, catalog)
+
+        assert result.success is True
+        node = result.updated_state.nodes[0]
+        assert node.options["aws_access_key_id"] == {"secret_ref": "AWS_ACCESS_KEY_ID"}
+        assert node.options["aws_secret_access_key"] == {"secret_ref": "AWS_SECRET_ACCESS_KEY"}
+
     def test_set_pipeline_rejects_user_supplied_llm_runtime_hash_without_mutating_state(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()

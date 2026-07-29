@@ -43,6 +43,7 @@ from elspeth.core.secrets import (
     collect_credential_field_violations,
     collect_disallowed_secret_ref_markers,
     parse_secret_ref_marker,
+    redact_secret_refs_for_validation,
 )
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -1268,9 +1269,9 @@ def _credential_wiring_contract_failure(
       rolls back — meaning ``wire_secret_ref`` cannot be used to attach
       the secret post-hoc (the node never lands in state).
     - ``collect_credential_field_violations`` short-circuits on
-      ``{secret_ref: NAME}`` markers and ``set_pipeline`` strips those
-      markers before pydantic validation, so passing the marker inline
-      in the node's options is the supported new-node path.
+      ``{secret_ref: NAME}`` markers and ``set_pipeline`` validates those
+      deferred fields without resolving their values, so passing the marker
+      inline in the node's options is the supported new-node path.
 
     The post-hoc ``wire_secret_ref`` sequence is still documented as
     the secondary path for nodes that already exist in state.
@@ -1295,8 +1296,9 @@ def _credential_wiring_contract_failure(
     repair_text = "list_secret_refs -> validate_secret_ref -> wire_secret_ref"
     inline_instruction = (
         "Set `<field>: {secret_ref: NAME}` directly in the node's options "
-        "when calling set_pipeline / upsert_node. (The marker is stripped "
-        "before option validation and resolved at execution time.) This "
+        "when calling set_pipeline / upsert_node. (The marker is handled "
+        "without resolving its value during option validation and resolved at "
+        "execution time.) This "
         "rejection left pipeline state unchanged: repair by re-issuing only "
         "the rejected call with the marker substituted for the literal "
         "value — do not rebuild the pipeline from scratch. For a component "
@@ -1599,11 +1601,12 @@ def _prevalidate_plugin_options(
     function asks the plugin what it needs rather than hardcoding
     knowledge about individual plugins.
 
-    Secret-ref markers (``{"secret_ref": "NAME"}``) are stripped before
-    validation. The underlying Pydantic errors are filtered to exclude
-    errors on secret-ref'd fields — those fields ARE provisioned, just
-    deferred to execution time when ``resolve_secret_refs`` replaces them
-    with actual values.
+    Secret-ref markers (``{"secret_ref": "NAME"}``) are withheld from the
+    primary config-model validation and field-level errors on those fields are
+    filtered because they ARE provisioned. If a model-level validator needs to
+    observe paired or conditional credential presence, validation is retried
+    with the shared non-secret placeholder. Real secret values remain
+    unavailable to authoring and are resolved only at execution time.
 
     Args:
         plugin_type: "source", "transform", or "sink".
@@ -1647,13 +1650,13 @@ def _prevalidate_plugin_options(
     if plugin_type == "transform" and plugin_name == "llm":
         _mask_pending_interpretation_placeholders_for_authoring_validation(merged)
 
-    # Strip secret_ref markers before validation.  A secret-ref'd field
-    # IS provisioned (the user called wire_secret_ref, or operator-profile
-    # lowering injected the credential as a scoped marker), just deferred to
-    # execution time.  Stripping it may cause Pydantic to report
-    # "field required" — we filter those errors out below.  The canonical
-    # parser accepts both the bare {"secret_ref"} form and the scoped
-    # {"secret_ref", "secret_scope"} form profile lowering emits.
+    # Withhold secret_ref markers from the primary validation pass. A
+    # secret-ref'd field IS provisioned (the user called wire_secret_ref, or
+    # operator-profile lowering injected the credential as a scoped marker),
+    # just deferred to execution time. The canonical parser accepts both the
+    # bare {"secret_ref"} form and the scoped {"secret_ref", "secret_scope"}
+    # form profile lowering emits.
+    placeholder_options = redact_secret_refs_for_validation(merged)
     secret_ref_keys: set[str] = set()
     for key, value in list(merged.items()):
         if parse_secret_ref_marker(value) is not None:
@@ -1670,6 +1673,7 @@ def _prevalidate_plugin_options(
         if shape is not None and shape.mode == "inline_content":
             blob_inline_ref_keys.add(key)
             del merged[key]
+            del placeholder_options[key]
 
     try:
         config = config_cls.from_dict(merged, plugin_name=plugin_name)
@@ -1679,15 +1683,31 @@ def _prevalidate_plugin_options(
             msg = exc.cause if exc.cause is not None else str(exc)
             return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-        # Secret refs were stripped.  Filter out errors on those fields.
         cause = exc.__cause__
+        has_model_level_error = not isinstance(cause, PydanticValidationError) or any(not error["loc"] for error in cause.errors())
+        if secret_ref_keys and has_model_level_error:
+            # Presence-dependent model validators cannot distinguish a withheld
+            # marker from an absent credential. Retry structure-only validation
+            # with the same non-secret placeholder used by export preflight.
+            # Return immediately on success to preserve the established deferred
+            # secret path, which intentionally does not inspect secret values or
+            # advance into value-source checks that the primary pass did not reach.
+            try:
+                config_cls.from_dict(placeholder_options, plugin_name=plugin_name)
+            except PluginConfigError as placeholder_exc:
+                msg = placeholder_exc.cause if placeholder_exc.cause is not None else str(placeholder_exc)
+                return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
+            return None
+
+        # Secret refs were withheld. Filter out field-level errors on those
+        # fields while retaining every unrelated validation failure.
         if not isinstance(cause, PydanticValidationError):
             # ValueError path (model validators) — can't filter per-field.
             msg = exc.cause if exc.cause is not None else str(exc)
             return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-        stripped_keys = secret_ref_keys | blob_inline_ref_keys
-        remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in stripped_keys)]
+        deferred_keys = secret_ref_keys | blob_inline_ref_keys
+        remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in deferred_keys)]
         if not remaining:
             return None
 

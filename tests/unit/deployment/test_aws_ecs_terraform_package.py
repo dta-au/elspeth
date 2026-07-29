@@ -133,6 +133,18 @@ def test_package_contains_only_the_supported_source_and_operator_inputs() -> Non
     assert "!*.tfbackend.example" in ignored
 
 
+def test_scenario_web_plugin_allowlist_exposes_textract_to_composer() -> None:
+    locals_text = _text("modules/scenario/locals.tf")
+    allowlist_match = re.search(
+        r"plugin_allowlist\s*=\s*jsonencode\(\[(?P<body>.*?)\]\)",
+        locals_text,
+        re.DOTALL,
+    )
+
+    assert allowlist_match is not None
+    assert '"transform:aws_textract_document_analysis"' in allowlist_match.group("body")
+
+
 def test_terraform_and_provider_versions_are_current_and_locked() -> None:
     for relative in (
         "bootstrap/versions.tf",
