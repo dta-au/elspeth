@@ -108,6 +108,20 @@ Authorize every optional web plugin with its kind-qualified ID in
 available to CLI and batch runs but is hidden from every web discovery,
 authoring, import, validation, and execution surface.
 
+The required authorization set above is always authorized regardless of
+`plugin_allowlist`; the allowlist only adds optional plugins on top of it,
+and repeating a required ID is harmless. An empty or unset allowlist
+therefore authorizes exactly the required core — it does not mean "allow
+every installed plugin". Startup fails when an allowlisted plugin is not
+installed.
+
+The Composer's own chat and advisor models are configured separately from
+the plugin policy (`ELSPETH_WEB__COMPOSER_MODEL`,
+`ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`). See
+[Web LLM Configuration](environment-variables.md#web-llm-configuration) for
+how every web LLM surface — Composer models, operator LLM profiles, the
+tutorial profile, and the allowlist — fits together.
+
 ### Environment configuration
 
 Collection and mapping values use JSON. This example enables the AWS Bedrock
@@ -143,6 +157,19 @@ operator-owned `credential_ref`. A server-scoped profile resolves only through
 the server store; a user-scoped profile resolves only through that principal's
 store. Web-authored pipeline state stores the opaque profile alias, not the
 provider, model, endpoint, or credential binding.
+
+`ELSPETH_WEB__TUTORIAL_LLM_PROFILE` must name a configured profile or the
+service refuses to start. Setting it enables the first-run tutorial, whose
+launch contract needs more than the profile alone: the tutorial pipeline is
+exactly one `csv`/`json` source, the `web_scrape`, `llm`, and `field_mapper`
+transforms, and one `json` sink, and every one of those plugins must be
+installed and available (with required-control coverage satisfied when
+prompt-shield/content-safety modes are `required`). The three tutorial
+transforms are part of the required core, but keep them listed explicitly in
+deployment allowlist templates so the tutorial's dependency set stays
+visible, and verify the tutorial rows in `GET /api/system/status` after any
+policy change. See
+[Web LLM Configuration](environment-variables.md#web-llm-configuration).
 
 Bedrock Guardrail profiles follow the same separation. Web authors select only
 an opaque `profile`, row `fields`, `schema`, and, for content safety, `source`.

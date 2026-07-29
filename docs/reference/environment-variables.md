@@ -10,6 +10,7 @@ Reference for ELSPETH environment variables and `.env` configuration.
 - [Required Variables](#required-variables)
 - [Optional Variables](#optional-variables)
 - [Web Deployment Variables](#web-deployment-variables)
+- [Web LLM Configuration](#web-llm-configuration)
 - [LLM Provider Variables](#llm-provider-variables)
 - [Azure Service Variables](#azure-service-variables)
 - [Telemetry Variables](#telemetry-variables)
@@ -100,6 +101,10 @@ query, or fragment.
 
 ## LLM Provider Variables
 
+These keys serve CLI/batch pipelines directly. The web application reads the
+same names for its Composer models and for server-scoped LLM profile
+credentials — see [Web LLM Configuration](#web-llm-configuration).
+
 ### OpenRouter
 
 | Variable | Purpose |
@@ -151,6 +156,215 @@ The image includes both PostgreSQL clients, not the PostgreSQL server. Use
 psycopg2. Initialize new external databases once with
 `elspeth doctor deployment --init-schema`; ordinary web startup validates but
 does not create schemas.
+
+---
+
+## Web LLM Configuration
+
+The web application has **three independent LLM surfaces**. Configuring one
+does not configure the others, and a deployment that sets only some of them
+fails in the specific ways described below. All of these settings are read
+once at startup: restart the web service after changing any of them.
+
+| Surface | What it powers | Configured by |
+| --- | --- | --- |
+| Composer primary model | The Composer chat/tool loop that authors pipelines | `ELSPETH_WEB__COMPOSER_MODEL` |
+| Composer advisor model | The mandatory independent reviewer inside the compose loop | `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` |
+| Operator LLM profiles | The `llm` transform inside web-authored pipelines | `ELSPETH_WEB__LLM_PROFILES` |
+| Tutorial profile | Which profile the first-run tutorial's `llm` node uses | `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` |
+
+### Composer models
+
+`ELSPETH_WEB__COMPOSER_MODEL` and `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` are
+LiteLLM model identifiers. Use a provider-prefixed form (`bedrock/...`,
+`openrouter/...`); the provider is inferred from the prefix. Unprefixed
+`gpt-*`, `o1*`, `o3*`, and `o4*` names infer OpenAI, and unprefixed `claude*`
+names infer Anthropic; any other unprefixed name makes the Composer
+unavailable with a provider-inference error.
+
+The defaults (`gpt-5.5` primary, `anthropic/claude-sonnet-4-6` advisor) are
+development conveniences. Production deployments should set both explicitly.
+
+**The two models must differ.** The advisor is the independent reviewer of
+the primary Composer's work, so the service refuses to start when both
+resolve to the same canonical model id. Distinctness is checked on the final
+path segment, so a provider prefix cannot mask a same-model pairing:
+`bedrock/anthropic.claude-x` and `openrouter/anthropic/claude-x` count as the
+same model.
+
+Composer credentials come from the web process environment, keyed by the
+inferred provider. Both the primary and the advisor contract must be
+satisfied:
+
+| Inferred provider | Required environment variable |
+| --- | --- |
+| `bedrock` | None. LiteLLM uses the ambient AWS credential chain (ECS task role, instance profile, `AWS_*` variables). Never inject static access keys, profiles, or endpoint overrides. |
+| `openrouter` | `OPENROUTER_API_KEY` |
+| `openai` | `OPENAI_API_KEY` |
+| `anthropic` | `ANTHROPIC_API_KEY` |
+| `azure` / `azure_ai` | `AZURE_API_KEY` |
+
+A missing or empty required key does not stop the service: the Composer is
+reported unavailable, with the missing variable named, through the sanitized
+`GET /api/system/status` surface, and compose requests fail until the key is
+provided.
+
+At startup the service also sends one trivial probe request to each Composer
+model (`ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED`, default `true`). A
+provider *bad request* — for example a model that rejects the configured
+`ELSPETH_WEB__COMPOSER_TEMPERATURE` or `ELSPETH_WEB__COMPOSER_SEED` — fails
+startup, because that is a fixable operator configuration error. Transient
+provider, auth, or network failures do not block boot; the Composer is
+exercised again at first use.
+
+### Operator LLM profiles (`ELSPETH_WEB__LLM_PROFILES`)
+
+Web authors never choose a provider, model, endpoint, or credential for an
+`llm` transform. The operator defines named **profiles**, and the web `llm`
+node's public schema exposes exactly one selector: a required `profile`
+field whose enum is the set of profile aliases usable by that signed-in
+user. Every private binding (`provider`, `model`, `api_key`, `endpoint`,
+`region_name`, `deployment_name`, ...) is rejected if authored directly, and
+pipeline state and audit records store only the opaque alias.
+
+`ELSPETH_WEB__LLM_PROFILES` is a JSON object mapping alias → profile
+definition. Aliases are lowercase identifiers (letters/digits, words joined
+with `-` or `_`).
+
+| Field | Applies to | Notes |
+| --- | --- | --- |
+| `provider` | all | `bedrock`, `openrouter`, or `azure` |
+| `model` | all | Bedrock: LiteLLM `bedrock/<model-id>` form. Azure: must equal `deployment_name`. |
+| `credential_scope` | openrouter, azure | `server` or `user`. Required for these providers; forbidden for Bedrock. |
+| `credential_ref` | openrouter, azure | Uppercase secret name (for example `OPENROUTER_API_KEY`). Required for these providers; forbidden for Bedrock. |
+| `region_name` | bedrock | Optional; the ambient AWS region applies when omitted. Forbidden for OpenRouter and Azure. |
+| `endpoint`, `deployment_name`, `api_version` | azure | `endpoint` (HTTPS, credential-free) and `deployment_name` are required for Azure; all three are forbidden for other providers. |
+| `timeout_seconds` | openrouter | Only OpenRouter profiles accept an explicit timeout (default 60, max 300 seconds). |
+| `max_tokens` | all | Optional completion-token cap. |
+
+Credential rules:
+
+- **Bedrock profiles are keyless.** They authenticate through the AWS default
+  credential chain of the web process (the ECS task role on AWS). Setting
+  `credential_scope` or `credential_ref` on a Bedrock profile is a startup
+  error.
+- **OpenRouter and Azure profiles are credentialed.** With
+  `credential_scope: server`, the `credential_ref` name resolves as an
+  environment variable of the web process; the name must appear in
+  `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST` (JSON array; default
+  `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `AZURE_API_KEY`), the variable must be set and non-empty, and
+  `ELSPETH_FINGERPRINT_KEY` must be set because secret use is fingerprinted
+  into the audit trail. With `credential_scope: user`, the reference resolves
+  through the signed-in user's own uploaded secret store instead.
+
+A profile whose credential cannot be resolved for a given user is unusable
+for that user. When a user has no usable profile at all, the `llm` transform
+is hidden from that user's discovery and authoring surfaces entirely;
+CSV/JSON/text authoring is unaffected.
+
+Example — one keyless Bedrock profile and one server-credentialed OpenRouter
+profile (collapse each value to a single line in an environment file):
+
+```bash
+ELSPETH_WEB__LLM_PROFILES='{
+  "bedrock-haiku": {"provider": "bedrock", "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "region_name": "ap-southeast-2"},
+  "sonnet": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "credential_scope": "server", "credential_ref": "OPENROUTER_API_KEY"}
+}'
+ELSPETH_WEB__TUTORIAL_LLM_PROFILE=sonnet
+```
+
+Malformed values fail startup with sanitized errors: JSON fields report
+"must be valid JSON object/array", and profile validation names the failing
+field path without echoing the raw value.
+
+### Tutorial profile and the launch contract
+
+`ELSPETH_WEB__TUTORIAL_LLM_PROFILE` names the profile alias the first-run
+tutorial's `llm` node must select.
+
+- It must name a key of `ELSPETH_WEB__LLM_PROFILES`; the service refuses to
+  start otherwise.
+- When unset, the first-run tutorial is disabled — the launch path returns a
+  typed HTTP 409 (`tutorial_profile_unavailable`) — without hiding ordinary
+  CSV/JSON/text authoring.
+- The named alias is listed first in the `profile` enum that authors see.
+
+The tutorial pipeline has a fixed shape: one `csv` or `json` source →
+`web_scrape`, `llm`, and `field_mapper` transforms → one `json` sink. The
+authenticated launch path re-checks the complete contract immediately before
+creating a run and returns a typed HTTP 409 naming the first failure:
+
+- the tutorial profile is configured and usable by the launching user;
+- `transform:web_scrape`, `transform:llm`, and `transform:field_mapper` are
+  all installed and available;
+- when the prompt-shield / content-safety control modes are `required`, the
+  selected implementations must be authorized, available, and able to cover
+  the tutorial pipeline.
+
+**Configuring the tutorial profile is not sufficient by itself.** After any
+change to the policy variables, verify the tutorial rows in
+`GET /api/system/status` before signing off a deployment.
+
+### Interplay with the plugin allowlist
+
+`ELSPETH_WEB__PLUGIN_ALLOWLIST` (JSON array of kind-qualified ids such as
+`"transform:passthrough"`) authorizes *optional* plugins on top of the
+required web core, which is always authorized:
+
+- sources: `source:csv`, `source:json`, `source:text`
+- transforms: `transform:field_mapper`, `transform:llm`,
+  `transform:web_scrape`
+- sinks: `sink:csv`, `sink:json`, `sink:text`
+
+Consequences:
+
+- An empty or unset allowlist authorizes exactly the required core — it does
+  **not** mean "allow every installed plugin". Any other installed plugin
+  stays hidden from every web surface until listed.
+- The tutorial transforms (`web_scrape`, `llm`, `field_mapper`) are part of
+  the required core, so this release cannot lose them through the allowlist.
+  Deployment templates should still list them explicitly next to the
+  tutorial profile (as the AWS scenario module does) so the tutorial's
+  dependency set stays visible in the deployment configuration.
+- Listing a plugin that is not installed fails startup with a sanitized
+  policy error.
+- Authorization is not availability: `transform:llm` is always authorized,
+  but it is *available* to a user only when at least one profile in
+  `ELSPETH_WEB__LLM_PROFILES` is usable by that user. With no profiles
+  configured, no user can author LLM nodes.
+
+### Where each deployment sets these
+
+**AWS ECS (Terraform scenario module).**
+`deploy/aws-ecs/terraform/modules/scenario/locals.tf` renders the seven
+protected plugin-policy variables (`ELSPETH_WEB__PLUGIN_ALLOWLIST`,
+`ELSPETH_WEB__PLUGIN_PREFERENCES`, `ELSPETH_WEB__PLUGIN_CONTROL_MODES`,
+`ELSPETH_WEB__LLM_PROFILES`, `ELSPETH_WEB__TUTORIAL_LLM_PROFILE`, and the
+two Bedrock Guardrail variables) plus `ELSPETH_WEB__COMPOSER_MODEL` and
+`ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` into the web task definition. Its
+`variables.tf` requires both Composer models to be `bedrock/...` ids and
+requires them to differ. The scenario defines one keyless Bedrock profile
+aliased `tutorial` (reusing the Composer model id) and points
+`ELSPETH_WEB__TUTORIAL_LLM_PROFILE` at it; all Bedrock access flows through
+the ECS task role, and no `OPENROUTER_API_KEY` secret is wired when both
+Composer models are Bedrock. See the
+[AWS ECS deployment runbook](../runbooks/aws-ecs-deployment.md) ("Web plugin
+policy rollout") and the
+[Bedrock model-selection runbook](../runbooks/aws-ecs-bedrock-opus-sonnet.md).
+
+**Plain environment file (systemd / staging).** Set the same variables in
+the service's environment file (the Linux runbook installs
+`deploy/linux-systemd/elspeth-web.env.example` as
+`/etc/elspeth/elspeth-web.env`), each JSON value on a single line, then
+restart the web service. The example file does not pre-populate the LLM
+variables, so add them explicitly. A typical OpenRouter-backed deployment
+sets `ELSPETH_WEB__COMPOSER_MODEL` and `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`
+(`openrouter/...` ids), `OPENROUTER_API_KEY`, `ELSPETH_WEB__LLM_PROFILES`
+(a server-scoped OpenRouter profile referencing `OPENROUTER_API_KEY`), and
+`ELSPETH_WEB__TUTORIAL_LLM_PROFILE` together, alongside
+`ELSPETH_FINGERPRINT_KEY` so server-scoped credentials resolve. See the
+[Ansible Ubuntu deployment runbook](../runbooks/ansible-ubuntu-deployment.md).
 
 ---
 

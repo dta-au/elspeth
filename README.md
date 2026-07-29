@@ -310,6 +310,15 @@ Then open `http://localhost:5173`.
   `data/email-verifications.jsonl` for an operator or mailer to deliver.
   For controlled local setups or closed registration, manage users with
   `elspeth composer users add ...` and `elspeth composer users remove ...`.
+- The web application has three separately configured LLM surfaces: the
+  Composer's primary and advisor models (`ELSPETH_WEB__COMPOSER_MODEL` and
+  `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` — two different models; the defaults
+  need `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in the environment), and the
+  operator LLM profiles that web-authored `llm` transform nodes select by
+  alias (`ELSPETH_WEB__LLM_PROFILES`, with
+  `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` naming the profile the first-run
+  tutorial uses). See
+  [Web LLM Configuration](docs/reference/environment-variables.md#web-llm-configuration).
 - Session state is stored in `data/sessions.db`; local auth users are stored in
   `data/auth.db`.
 - Run audit data defaults to `data/runs/audit.db`; payloads default to

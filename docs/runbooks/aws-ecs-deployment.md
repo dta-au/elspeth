@@ -117,7 +117,11 @@ reference, and both lowercase configuration digests are identical in the
 immutable preapply and resolved inventories.
 
 Values use the JSON/opaque-alias contract in
-[`configuration.md`](../reference/configuration.md). Never retain their raw
+[`configuration.md`](../reference/configuration.md); how these variables, the
+Composer model variables, and the tutorial launch contract relate is
+documented in
+[Web LLM Configuration](../reference/environment-variables.md#web-llm-configuration).
+Never retain their raw
 values or rendered task-definition JSON as evidence. Changing any member
 requires the operator to register a new task-definition revision. The operator
 must force a new deployment and restart candidate acceptance; ECS Exec cannot
