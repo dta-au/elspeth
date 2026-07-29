@@ -51,6 +51,7 @@ from elspeth.engine.orchestrator.leader_drain import run_end_of_input_barrier_fl
 from elspeth.engine.orchestrator.outcomes import (
     accumulate_row_outcomes,
     handle_coalesce_timeouts,
+    handle_row_union_timeouts,
 )
 from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
 from elspeth.engine.orchestrator.run_state import AggNodeEntry, LoopContext, LoopResult
@@ -170,6 +171,14 @@ class SourceIterationDriver:
                 ctx=ctx,
                 counters=loop_ctx.counters,
                 pending_tokens=loop_ctx.pending_tokens,
+            )
+
+        row_union_executor = loop_ctx.processor.row_union_executor
+        if row_union_executor is not None:
+            handle_row_union_timeouts(
+                row_union_executor=row_union_executor,
+                processor=loop_ctx.processor,
+                counters=loop_ctx.counters,
             )
 
     def _build_idle_timeout_pump(

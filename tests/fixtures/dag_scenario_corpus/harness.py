@@ -442,6 +442,15 @@ def _semantic_run_settings(raw_settings: object) -> dict[str, object]:
     if not isinstance(raw_settings, Mapping):
         raise AssertionError("DAG corpus run lacks material settings")
     settings = json.loads(json.dumps(raw_settings))
+    # Schema-growth stability: the settings material is a full model dump, so
+    # a settings field added AFTER a pin was authored appears as its empty
+    # default in every run and would rotate every pinned
+    # semantic_settings_sha256 with no semantic change to the pipeline.
+    # Sections listed here entered the schema after the v1 pins; drop them
+    # when empty — non-empty declarations still enter the hash.
+    for post_pin_section in ("row_unions",):
+        if settings.get(post_pin_section) == []:
+            settings.pop(post_pin_section)
     for section in ("sources", "sinks"):
         declarations = settings.get(section)
         if not isinstance(declarations, dict):

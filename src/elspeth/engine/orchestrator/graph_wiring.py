@@ -28,7 +28,7 @@ from elspeth.engine.processor import DAGTraversalContext
 
 # Node types that legitimately appear in traversal with no plugin to execute.
 # Closed vocabulary — extend deliberately, never derive by complement.
-_STRUCTURAL_NODE_TYPES = frozenset({NodeType.SOURCE, NodeType.QUEUE, NodeType.COALESCE})
+_STRUCTURAL_NODE_TYPES = frozenset({NodeType.SOURCE, NodeType.QUEUE, NodeType.COALESCE, NodeType.ROW_UNION})
 
 if TYPE_CHECKING:
     from elspeth.contracts import SinkProtocol, SourceProtocol
@@ -177,6 +177,8 @@ def build_dag_traversal_context(
         node_to_next[node_id] = graph.get_next_node(node_id)
     for coalesce_node_id in graph.get_coalesce_id_map().values():
         node_to_next[coalesce_node_id] = graph.get_next_node(coalesce_node_id)
+    for row_union_node_id in graph.get_row_union_id_map().values():
+        node_to_next[row_union_node_id] = graph.get_next_node(row_union_node_id)
 
     # Structural nodes are the explicit closed set of node types that carry no
     # plugin: sources (traversal origins), queues (ADR-025 fan-in primitives),
@@ -199,5 +201,6 @@ def build_dag_traversal_context(
         node_to_next=node_to_next,
         coalesce_node_map=graph.get_coalesce_id_map(),
         branch_first_node=graph.get_branch_first_nodes(),
+        row_union_node_map=graph.get_row_union_id_map(),
         structural_node_ids=structural_node_ids,
     )

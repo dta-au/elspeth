@@ -24,7 +24,7 @@ from typing import Protocol
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.scheduler import BarrierEmission, TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
 from elspeth.engine.work_items import WorkItem
 
 #: Legacy durable node-cursor marker for terminal-lane rows. Current writers
@@ -42,6 +42,7 @@ class WorkItemFactory(Protocol):
         current_node_id: NodeID | None,
         coalesce_name: CoalesceName | None = None,
         coalesce_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
         on_success_sink: str | None = None,
     ) -> WorkItem: ...
 
@@ -70,6 +71,7 @@ class ScheduledWorkFields:
     expand_group_id: str | None
     coalesce_node_id: str | None
     coalesce_name: str | None
+    row_union_name: str | None
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,7 @@ class SchedulerWorkCodec:
             expand_group_id=token.expand_group_id,
             coalesce_node_id=str(item.coalesce_node_id) if item.coalesce_node_id is not None else None,
             coalesce_name=str(item.coalesce_name) if item.coalesce_name is not None else None,
+            row_union_name=str(item.row_union_name) if item.row_union_name is not None else None,
         )
 
     def ready_emission(self, item: WorkItem) -> BarrierEmission:
@@ -130,6 +133,7 @@ class SchedulerWorkCodec:
             expand_group_id=fields.expand_group_id,
             coalesce_node_id=fields.coalesce_node_id,
             coalesce_name=fields.coalesce_name,
+            row_union_name=fields.row_union_name,
         )
 
     def work_item_from_scheduler(self, scheduled: TokenWorkItem) -> WorkItem:
@@ -149,5 +153,6 @@ class SchedulerWorkCodec:
             current_node_id=current_node_id,
             coalesce_node_id=NodeID(scheduled.coalesce_node_id) if scheduled.coalesce_node_id is not None else None,
             coalesce_name=CoalesceName(scheduled.coalesce_name) if scheduled.coalesce_name is not None else None,
+            row_union_name=RowUnionName(scheduled.row_union_name) if scheduled.row_union_name is not None else None,
             on_success_sink=scheduled.on_success_sink,
         )

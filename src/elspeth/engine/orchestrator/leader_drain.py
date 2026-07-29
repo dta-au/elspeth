@@ -39,7 +39,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.engine.orchestrator.aggregation import flush_remaining_aggregation_buffers
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins
 from elspeth.engine.orchestrator.leader_follower_drain import LeaderFollowerDrain
-from elspeth.engine.orchestrator.outcomes import accumulate_row_outcomes, flush_coalesce_pending
+from elspeth.engine.orchestrator.outcomes import accumulate_row_outcomes, flush_coalesce_pending, flush_row_union_pending
 from elspeth.engine.orchestrator.run_state import LoopContext, LoopResult, _RunFailedWithPartialResultError
 from elspeth.engine.orchestrator.runtime_preflight import run_transform_runtime_preflights
 from elspeth.engine.orchestrator.types import (
@@ -485,6 +485,14 @@ def run_end_of_input_barrier_flush(
                 ctx=ctx,
                 counters=counters,
                 pending_tokens=pending_tokens,
+            )
+
+        row_union_executor = processor.row_union_executor
+        if row_union_executor is not None:
+            flush_row_union_pending(
+                row_union_executor=row_union_executor,
+                processor=processor,
+                counters=counters,
             )
 
         if not processor.has_blocked_barrier_work():

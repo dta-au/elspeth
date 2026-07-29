@@ -42,7 +42,7 @@ from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariant
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, TokenWorkItem
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
 from elspeth.core.landscape.scheduler_repository import token_from_journal_item
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.work_items import WorkItem, WorkItemFactory
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
     from elspeth.engine.dag_navigator import DAGNavigator
     from elspeth.engine.executors import AggregationExecutor
+    from elspeth.engine.row_union_executor import RowUnionExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,10 @@ class BarrierIntakeCoordinator:
         terminal_coalesce_row_result: Callable[..., RowResult],
         emit_token_completed: Callable[..., None],
         mark_coalesce_consumed_terminal: Callable[..., None],
+        row_union_executor: RowUnionExecutor | None = None,
+        row_union_node_ids: Mapping[RowUnionName, NodeID] | None = None,
+        complete_row_union_fire: Callable[..., None] | None = None,
+        released_row_union_items: Callable[..., tuple[WorkItem, ...]] | None = None,
     ) -> None:
         self._run_id = run_id
         self._scheduler = scheduler
@@ -231,6 +236,10 @@ class BarrierIntakeCoordinator:
         self._terminal_coalesce_row_result = terminal_coalesce_row_result
         self._emit_token_completed = emit_token_completed
         self._mark_coalesce_consumed_terminal = mark_coalesce_consumed_terminal
+        self._row_union_executor = row_union_executor
+        self._row_union_node_ids: Mapping[RowUnionName, NodeID] = row_union_node_ids or {}
+        self._complete_row_union_fire = complete_row_union_fire
+        self._released_row_union_items = released_row_union_items
 
     def _require_coordination_token(self) -> CoordinationToken:
         """The leader fencing token, REQUIRED for the slice-3 adoption verbs."""
@@ -308,7 +317,7 @@ class BarrierIntakeCoordinator:
         results/child_items reproduces the pre-extraction append ordering.
         """
         dispositions: list[BarrierIntakeDisposition] = []
-        if not self._aggregation_settings and self._coalesce_executor is None:
+        if not self._aggregation_settings and self._coalesce_executor is None and self._row_union_executor is None:
             return BarrierIntakePassOutcome(dispositions=())
 
         # ADR-030 §E.2 intake scan shape: only intake-pending rows
@@ -318,17 +327,21 @@ class BarrierIntakeCoordinator:
         pending_rows = self._scheduler.list_pending_blocked_barrier_items(run_id=self._run_id)
         if pending_rows:
             coalesce_keys = {str(name) for name in self._coalesce_node_ids}
+            row_union_keys = {str(name) for name in self._row_union_node_ids}
             aggregation_keys = {str(node_id) for node_id in self._aggregation_settings}
             for row in pending_rows:
                 if row.barrier_key in aggregation_keys:
                     disposition = self._adopt_aggregation_row(row, ctx)
                 elif row.barrier_key in coalesce_keys:
                     disposition = self._adopt_coalesce_row(row)
+                elif row.barrier_key in row_union_keys:
+                    disposition = self._adopt_row_union_row(row)
                 else:
                     raise AuditIntegrityError(
                         f"Intake-pending BLOCKED row for token {row.token_id!r} (run {self._run_id!r}) carries "
                         f"orphan barrier_key {row.barrier_key!r}: not a configured coalesce "
-                        f"({sorted(coalesce_keys)}) or aggregation node ({sorted(aggregation_keys)})."
+                        f"({sorted(coalesce_keys)}), row_union ({sorted(row_union_keys)}), "
+                        f"or aggregation node ({sorted(aggregation_keys)})."
                     )
                 if disposition is not None:
                     dispositions.append(disposition)
@@ -502,6 +515,127 @@ class BarrierIntakeCoordinator:
             f"CoalesceOutcome for token {token.token_id} in coalesce '{coalesce_name}' is in invalid state: "
             f"held={outcome.held}, merged_token={outcome.merged_token is not None}, "
             f"failure_reason={outcome.failure_reason!r}"
+        )
+
+    def _adopt_row_union_row(self, row: TokenWorkItem) -> BarrierIntakeDisposition | None:
+        """Adopt one row_union barrier row and run the intake-time accept.
+
+        Mirrors the coalesce arm's fenced adoption and outcome dispatch, with
+        the N->N release shape: a completed group emits every ORIGINAL branch
+        token as a READY continuation in ONE atomic ``complete_barrier``
+        transaction, in declared branch order.
+        """
+        if row.barrier_key is None:  # pragma: no cover - excluded by the query contract
+            raise AuditIntegrityError(f"Intake row_union row {row.work_item_id!r} has no barrier_key.")
+        if self._row_union_executor is None:  # pragma: no cover - partition guarantees a row_union key
+            raise OrchestrationInvariantError(f"Intake row_union row for {row.barrier_key!r} but no RowUnionExecutor is configured.")
+        if self._complete_row_union_fire is None or self._released_row_union_items is None:
+            raise OrchestrationInvariantError(f"Intake row_union row for {row.barrier_key!r} but the fire-completion seams are not wired.")
+        row_union_name = RowUnionName(row.barrier_key)
+        coordination_token = self._require_coordination_token()
+        token = self._token_for_intake(row)
+        adoption = self._scheduler.adopt_blocked_barrier_item(
+            run_id=self._run_id,
+            work_item_id=row.work_item_id,
+            token_id=row.token_id,
+            barrier_key=row.barrier_key,
+            membership=None,
+            buffered_outcome=None,
+            now=self._clock.now_utc(),
+            coordination_token=coordination_token,
+        )
+        if not adoption.adopted:
+            return None
+        outcome = self._row_union_executor.accept(
+            token=token,
+            row_union_name=str(row_union_name),
+            arrival_time=self._backdated_accept_monotonic(row),
+        )
+
+        if outcome.held:
+            return BarrierIntakeDisposition(kind=BarrierIntakeDispositionKind.HELD)
+
+        if outcome.late_arrival:
+            released = self._scheduler.mark_blocked_barrier_terminal(
+                run_id=self._run_id,
+                barrier_key=str(row_union_name),
+                token_ids=(token.token_id,),
+                now=self._clock.now_utc(),
+                coordination_token=coordination_token,
+                release_context={
+                    "late_arrival": True,
+                    "reason": outcome.failure_reason,
+                    "released_by": self._scheduler_lease_owner,
+                    "scope_row_id": row.row_id,
+                },
+            )
+            if released != 1:
+                raise AuditIntegrityError(
+                    f"Late-arrival release for token {token.token_id!r} at row_union {row_union_name!r} "
+                    f"(run {self._run_id!r}) terminalized {released} rows; expected exactly one."
+                )
+            self._emit_token_completed(token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
+            return BarrierIntakeDisposition(
+                kind=BarrierIntakeDispositionKind.TERMINAL,
+                results=(
+                    RowResult(
+                        token=token,
+                        final_data=token.row_data,
+                        outcome=TerminalOutcome.FAILURE,
+                        path=TerminalPath.UNROUTED,
+                        error=FailureInfo(exception_type="RowUnionFailure", message=outcome.failure_reason or "late_arrival_after_release"),
+                    ),
+                ),
+            )
+
+        if outcome.released_tokens:
+            released_items = self._released_row_union_items(
+                row_union_name=row_union_name,
+                released_tokens=outcome.released_tokens,
+            )
+            self._complete_row_union_fire(
+                row_union_name=row_union_name,
+                consumed_tokens=tuple(outcome.consumed_tokens),
+                scope_row_id=row.row_id,
+                released_items=released_items,
+            )
+            return BarrierIntakeDisposition(
+                kind=BarrierIntakeDispositionKind.READY_CONTINUATION,
+                child_items=released_items,
+            )
+
+        if outcome.failure_reason:
+            # Whole-group failure completed by this arrival (v1 fail-closed):
+            # every held branch — this one included — holds a BLOCKED row.
+            self._scheduler.mark_blocked_barrier_terminal(
+                run_id=self._run_id,
+                barrier_key=str(row_union_name),
+                token_ids=tuple(consumed.token_id for consumed in outcome.consumed_tokens),
+                now=self._clock.now_utc(),
+                coordination_token=coordination_token,
+                release_context={
+                    "reason": outcome.failure_reason,
+                    "released_by": self._scheduler_lease_owner,
+                    "scope_row_id": row.row_id,
+                },
+            )
+            self._emit_token_completed(token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
+            return BarrierIntakeDisposition(
+                kind=BarrierIntakeDispositionKind.TERMINAL,
+                results=(
+                    RowResult(
+                        token=token,
+                        final_data=token.row_data,
+                        outcome=TerminalOutcome.FAILURE,
+                        path=TerminalPath.UNROUTED,
+                        error=FailureInfo(exception_type="RowUnionFailure", message=outcome.failure_reason),
+                    ),
+                ),
+            )
+
+        raise OrchestrationInvariantError(
+            f"RowUnionOutcome for token {token.token_id} in row_union '{row_union_name}' is in invalid state: "
+            f"held={outcome.held}, released={len(outcome.released_tokens)}, failure_reason={outcome.failure_reason!r}"
         )
 
     def _fire_coalesce_merge(

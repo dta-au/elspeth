@@ -130,6 +130,7 @@ class TokenWorkItem:
     expand_group_id: str | None = None
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None
+    row_union_name: str | None = None
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
     barrier_blocked_at: datetime | None = None
@@ -182,6 +183,7 @@ class BarrierEmission:
     expand_group_id: str | None = None
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None
+    row_union_name: str | None = None
     attempt: int = 1
 
     def __post_init__(self) -> None:

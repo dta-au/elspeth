@@ -97,7 +97,7 @@ def resolve_node_audit_metadata(
     for raw_node_id in graph.topological_order():
         node_id = NodeID(raw_node_id)
         node_info = graph.get_node_info(raw_node_id)
-        if node_id in config_gate_node_ids or node_id in coalesce_node_ids or node_info.node_type == NodeType.QUEUE:
+        if node_id in config_gate_node_ids or node_id in coalesce_node_ids or node_info.node_type in (NodeType.QUEUE, NodeType.ROW_UNION):
             metadata_by_node[node_id] = _ENGINE_NODE_AUDIT_METADATA
             continue
 

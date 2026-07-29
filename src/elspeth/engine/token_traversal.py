@@ -29,7 +29,7 @@ from elspeth.contracts.enums import RoutingKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import MaxRetriesExceeded, OrchestrationInvariantError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import FailureInfo
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID
+from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine._error_hash import compute_error_hash
@@ -540,17 +540,25 @@ class TokenTraversalEngine:
             _GateTerminal with FORKED outcome for the parent token.
         """
         for child_token in outcome.child_tokens:
-            # Look up coalesce info for this branch
+            # Look up barrier info for this branch (coalesce or row_union)
             cfg_branch_name = child_token.branch_name
             cfg_coalesce_name: CoalesceName | None = None
+            cfg_row_union_name: RowUnionName | None = None
 
             if cfg_branch_name and BranchName(cfg_branch_name) in self._processor._branch_to_coalesce:
                 cfg_coalesce_name = self._processor._branch_to_coalesce[BranchName(cfg_branch_name)]
+            elif cfg_branch_name and BranchName(cfg_branch_name) in self._processor._branch_to_row_union:
+                cfg_row_union_name = self._processor._branch_to_row_union[BranchName(cfg_branch_name)]
 
             # See config gate fork handler above for routing logic.
             # Children born during a re-drive get fresh token_ids with no prior node_states,
             # so they use the default resume_attempt_offset=0 / resume_checkpoint_id=None.
-            if cfg_coalesce_name is None and cfg_branch_name and BranchName(cfg_branch_name) in self._processor._branch_to_sink:
+            if (
+                cfg_coalesce_name is None
+                and cfg_row_union_name is None
+                and cfg_branch_name
+                and BranchName(cfg_branch_name) in self._processor._branch_to_sink
+            ):
                 child_items.append(
                     self._processor._work_items.create(
                         token=child_token,
@@ -563,6 +571,7 @@ class TokenTraversalEngine:
                         token=child_token,
                         current_node_id=node_id,
                         coalesce_name=cfg_coalesce_name,
+                        row_union_name=cfg_row_union_name,
                     )
                 )
 
@@ -665,6 +674,8 @@ class TokenTraversalEngine:
         coalesce_name: CoalesceName | None = None,
         on_success_sink: str | None = None,
         attempt_offset: int = 0,
+        row_union_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
         """Process a single token through processing nodes starting at node_id.
 
@@ -741,6 +752,15 @@ class TokenTraversalEngine:
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
                 child_items=child_items,
+            )
+            if handled:
+                return (result, child_items)
+
+            handled, result = self._processor._maybe_row_union_token(
+                current_token,
+                current_node_id=node_id,
+                row_union_node_id=row_union_node_id,
+                row_union_name=row_union_name,
             )
             if handled:
                 return (result, child_items)

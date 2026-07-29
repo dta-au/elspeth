@@ -9438,13 +9438,14 @@ class TestReadyEmissionEnqueueParity:
             expand_group_id=emission.expand_group_id,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
+            row_union_name=emission.row_union_name,
         )
 
         assert values_from_emission == values_from_enqueue
         # Pin the projected column count: adding a journal column to ONE of
         # the two builders (or to the mapper) must force this pin to be
         # revisited rather than silently desync the reconciliation contract.
-        assert len(values_from_emission) == 29
+        assert len(values_from_emission) == 30
 
         # Spot-check the per-flavor derived keys so a failure localizes.
         if flavor == "coalesce_cursor":

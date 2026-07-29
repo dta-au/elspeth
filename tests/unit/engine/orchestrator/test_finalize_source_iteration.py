@@ -80,6 +80,7 @@ class _ConfigDouble:
 
 class _ProcessorDouble:
     run_id = "test-run"
+    row_union_executor = None
 
     def __init__(self) -> None:
         self.get_aggregation_buffer_count = _CallRecorder(0)

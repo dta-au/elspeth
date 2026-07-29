@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import PipelineRow
     from elspeth.contracts.types import CoalesceName, NodeID
     from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
+    from elspeth.engine.row_union_executor import RowUnionExecutor
 
 
 class TelemetryManagerProtocol(Protocol):
@@ -220,10 +221,22 @@ class SinkStepResolver(Protocol):
         raise NotImplementedError
 
 
+class RowUnionExecutorSource(Protocol):
+    """Processor surface exposing the leader's row_union barrier executor.
+
+    ``None`` on followers and on pipelines with no row_union nodes — the
+    timeout/EOF sweep arms treat that as nothing-to-sweep.
+    """
+
+    @property
+    def row_union_executor(self) -> RowUnionExecutor | None: ...
+
+
 class EndOfInputBarrierProcessorPort(
     AggregationProcessorPort,
     BarrierIntakePort,
     CoalesceCompletionPort,
+    RowUnionExecutorSource,
     Protocol,
 ):
     """Combined surface needed by the end-of-input barrier flush loop."""
@@ -236,6 +249,7 @@ class RowProcessorHandle(
     SchedulerJournalPort,
     BarrierIntakePort,
     CoalesceCompletionPort,
+    RowUnionExecutorSource,
     SinkTerminalizationPort,
     BarrierScalarsSource,
     ResumeContinuationPort,

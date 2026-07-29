@@ -89,6 +89,7 @@ class ExecutionGraph:
         self._branch_info: dict[BranchName, BranchInfo] = {}  # branch_name -> coalesce + gate info
         self._row_union_id_map: dict[RowUnionName, NodeID] = {}  # row_union_name -> node_id
         self._branch_to_row_union: dict[BranchName, RowUnionName] = {}  # fork branch -> row_union
+        self._row_union_branch_gates: dict[BranchName, NodeID] = {}  # fork branch -> owning gate node
         self._route_label_map: dict[tuple[NodeID, SinkName], str] = {}  # (gate_node, sink_name) -> route_label
         self._route_resolution_map: dict[tuple[NodeID, str], RouteDestination] = {}
         self._pipeline_nodes: list[NodeID] | None = None  # Ordered processing nodes (no source/sinks); None = not yet populated
@@ -762,6 +763,11 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         self._branch_to_row_union = dict(mapping)
 
+    def set_row_union_branch_gates(self, mapping: dict[BranchName, NodeID]) -> None:
+        """Set the row_union fork branch_name -> owning gate node mapping."""
+        self._assert_build_metadata_mutable()
+        self._row_union_branch_gates = dict(mapping)
+
     def set_branch_info(self, mapping: dict[BranchName, BranchInfo]) -> None:
         """Set the branch_name -> BranchInfo mapping (coalesce + gate)."""
         self._assert_build_metadata_mutable()
@@ -953,9 +959,32 @@ class ExecutionGraph:
                 first_node, _last_node = self._trace_branch_endpoints(coalesce_nid, branch_name)
                 result[branch_name] = first_node
 
+        # row_union branches use the same identity-vs-chain shapes with the
+        # union node as the barrier endpoint.
+        for branch_name, row_union_name in self._branch_to_row_union.items():
+            union_nid = self._row_union_id_map[row_union_name]
+            is_identity = any(
+                data["mode"] == RoutingMode.COPY and data["label"] == branch_name
+                for _from_id, _to_id, _key, data in self._graph.in_edges(union_nid, keys=True, data=True)
+            )
+            if is_identity:
+                result[branch_name] = union_nid
+            else:
+                first_node, _last_node = self._trace_branch_endpoints(
+                    union_nid,
+                    branch_name,
+                    fork_gate_nid=self._row_union_branch_gates[branch_name],
+                )
+                result[branch_name] = first_node
+
         return result
 
-    def _trace_branch_endpoints(self, coalesce_nid: NodeID, branch_name: str) -> tuple[NodeID, NodeID]:
+    def _trace_branch_endpoints(
+        self,
+        coalesce_nid: NodeID,
+        branch_name: str,
+        fork_gate_nid: NodeID | None = None,
+    ) -> tuple[NodeID, NodeID]:
         """Trace backwards from coalesce to find the first AND last transforms in a branch chain.
 
         Walks backwards through MOVE edges from the coalesce node to find both
@@ -984,7 +1013,10 @@ class ExecutionGraph:
             GraphValidationError: If the branch chain cannot be traced
         """
         # Resolve the fork gate that originates this specific branch.
-        fork_gate_nid = self._branch_info[BranchName(branch_name)].gate_node_id
+        # Coalesce branches resolve through _branch_info; row_union callers
+        # pass their gate explicitly (row_union branches are not in _branch_info).
+        if fork_gate_nid is None:
+            fork_gate_nid = self._branch_info[BranchName(branch_name)].gate_node_id
 
         visited: set[NodeID] = set()
         candidates: list[NodeID] = []

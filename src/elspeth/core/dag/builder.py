@@ -729,6 +729,7 @@ def build_execution_graph(
                     component_type="row_union",
                 )
         graph.set_branch_to_row_union_map({branch: spec.row_union_name for branch, spec in row_union_branch_specs.items()})
+        graph.set_row_union_branch_gates({branch: gate_node_id for branch, (_gate_name, gate_node_id) in row_union_branch_gates.items()})
 
     # ===== BUILD PRODUCER REGISTRY =====
     producers: dict[str, tuple[NodeID, str]] = {}
@@ -1146,6 +1147,7 @@ def build_execution_graph(
     processing_node_ids.update(aggregation_ids.values())
     processing_node_ids.update(config_gate_ids.values())
     processing_node_ids.update(coalesce_ids.values())
+    processing_node_ids.update(row_union_ids.values())
 
     pipeline_nodes = graph.topological_processing_order(processing_node_ids)
 

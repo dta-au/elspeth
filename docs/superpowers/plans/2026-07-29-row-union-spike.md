@@ -67,7 +67,13 @@ New validation in graph construction: walk successors of each row_union node; ev
 
 ## Deferred surfaces (production follow-up, tracked on elspeth-a5b86149d4)
 
-Composer state/importer/generator/MCP tools/guided authoring; frontend graph+wire surfaces; group-aware count/timeout triggers; resume restore of pending groups; multi-worker/distributed finalization (must rebase over deferred-platform); TUI/explain; scenario-corpus manifest promotion; docs (elspeth-c4eff6c8cb).
+Composer state/importer/generator/MCP tools/guided authoring; frontend graph+wire surfaces; group-aware count/timeout triggers; resume restore of pending groups (resume with row_union BLOCKED rows is unwired — `resume.py` untouched per the deferred-platform deconfliction rule); the durable §E.5 branch-loss lane for row_union (in-memory leader notify only in the spike); multi-worker/distributed finalization (must rebase over deferred-platform); TUI/explain; scenario-corpus manifest promotion; docs (elspeth-c4eff6c8cb).
+
+## Outcome record (2026-07-29, spike complete)
+
+Shipped on release/0.7.2: contracts (`NodeType.ROW_UNION`, `RowUnionName`, `RowUnionFailureReason` in the node-state error union), `RowUnionSettings` + `row_unions:` section, DAG build/validation with the group-indivisibility trigger guard, `RowUnionExecutor` (17 unit tests), full engine wiring (work items + durable `row_union_name` journal column + codec, traversal threading, intake third arm, atomic N-ready `complete_barrier` release, timeout/EOF fail-closed pumps), and the two-variant A/B acceptance tests driving `batch_experiment_compare` and `batch_paired_preference` end to end.
+
+Notable verification finding: adding `row_unions` to `ElspethSettings` rotated `semantic_settings_sha256` for every recorded run (full-dump settings material). Resolved in the corpus semantic lens (`tests/fixtures/dag_scenario_corpus/harness.py::_semantic_run_settings` drops post-pin empty sections) so the Wave-owned manifest pins stay untouched; the corpus process owns any holistic re-baseline (elspeth-ef29ef6ba4).
 
 ## Settings + YAML shape
 

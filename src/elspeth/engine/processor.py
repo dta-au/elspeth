@@ -25,7 +25,7 @@ from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingSca
 from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.schema_contract import PipelineRow
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID, SinkName, StepResolver
+from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName, SinkName, StepResolver
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.barrier_coordination import (
@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from elspeth.engine.executors import GateOutcome
     from elspeth.engine.orchestrator.plugin_types import RowPlugin
     from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
+    from elspeth.engine.row_union_executor import RowUnionExecutor
 
 from elspeth.contracts import BatchTransformProtocol, SourceProtocol, TransformProtocol
 from elspeth.contracts.declaration_contracts import (
@@ -175,10 +176,12 @@ class DAGTraversalContext:
     node_to_next: Mapping[NodeID, NodeID | None]
     coalesce_node_map: Mapping[CoalesceName, NodeID]
     branch_first_node: Mapping[str, NodeID] = MappingProxyType({})
+    row_union_node_map: Mapping[RowUnionName, NodeID] = MappingProxyType({})
     # Explicit allowlist of non-plugin traversal nodes (sources, queues,
-    # coalesce points). Nodes in node_to_next that are neither plugin-bearing
-    # nor in this set fail closed at resolution instead of being skipped.
-    # Coalesce nodes are structural by definition and always unioned in.
+    # coalesce points, row_union barriers). Nodes in node_to_next that are
+    # neither plugin-bearing nor in this set fail closed at resolution
+    # instead of being skipped. Barrier nodes are structural by definition
+    # and always unioned in.
     structural_node_ids: frozenset[NodeID] = frozenset()
 
     def __post_init__(self) -> None:
@@ -187,10 +190,11 @@ class DAGTraversalContext:
         object.__setattr__(self, "node_to_next", deep_freeze(self.node_to_next))
         object.__setattr__(self, "coalesce_node_map", deep_freeze(self.coalesce_node_map))
         object.__setattr__(self, "branch_first_node", deep_freeze(self.branch_first_node))
+        object.__setattr__(self, "row_union_node_map", deep_freeze(self.row_union_node_map))
         object.__setattr__(
             self,
             "structural_node_ids",
-            frozenset(self.structural_node_ids) | frozenset(self.coalesce_node_map.values()),
+            frozenset(self.structural_node_ids) | frozenset(self.coalesce_node_map.values()) | frozenset(self.row_union_node_map.values()),
         )
 
 
@@ -350,6 +354,8 @@ class RowProcessor:
         retry_manager: RetryManager | None = None,
         coalesce_executor: CoalesceExecutor | None = None,
         branch_to_coalesce: dict[BranchName, CoalesceName] | None = None,
+        row_union_executor: RowUnionExecutor | None = None,
+        branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
         branch_to_sink: dict[BranchName, SinkName] | None = None,
         sink_names: frozenset[str] | None = None,
         coalesce_on_success_map: dict[CoalesceName, str] | None = None,
@@ -466,12 +472,21 @@ class RowProcessor:
         # skipped plugin nodes missing from the mapping (fail-open).
         self._structural_node_ids: frozenset[NodeID] = traversal.structural_node_ids
         self._branch_to_coalesce: dict[BranchName, CoalesceName] = branch_to_coalesce or {}
+        self._row_union_executor = row_union_executor
+        self._row_union_node_ids: dict[RowUnionName, NodeID] = dict(traversal.row_union_node_map)
+        self._branch_to_row_union: dict[BranchName, RowUnionName] = branch_to_row_union or {}
         self._branch_to_sink: dict[BranchName, SinkName] = branch_to_sink or {}
         overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_sink.keys())
         if overlap:
             raise OrchestrationInvariantError(
                 f"Branch names {sorted(overlap)} appear in both branch_to_coalesce and branch_to_sink. "
                 "A fork branch must route to EITHER a coalesce node OR a direct sink, not both."
+            )
+        barrier_overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_row_union.keys())
+        if barrier_overlap:
+            raise OrchestrationInvariantError(
+                f"Branch names {sorted(barrier_overlap)} appear in both branch_to_coalesce and branch_to_row_union. "
+                "A fork branch must join at exactly one barrier."
             )
         self._sink_names: frozenset[str] = sink_names or frozenset()
         self._coalesce_on_success_map: dict[CoalesceName, str] = coalesce_on_success_map or {}
@@ -656,6 +671,10 @@ class RowProcessor:
             terminal_coalesce_row_result=self._terminal_coalesce_row_result,
             emit_token_completed=self._emit_token_completed,
             mark_coalesce_consumed_terminal=self._mark_coalesce_consumed_scheduler_work_terminal,
+            row_union_executor=self._row_union_executor,
+            row_union_node_ids=self._row_union_node_ids,
+            complete_row_union_fire=self._complete_row_union_fire,
+            released_row_union_items=self.released_row_union_items,
         )
         # Scheduler-drain subsystem (elspeth-c49f33d6e4 component 3): the
         # coordinator owns the durable claim/drain loop, dispositions,
@@ -710,6 +729,11 @@ class RowProcessor:
     def token_manager(self) -> TokenManager:
         """Expose token manager for orchestrator to create tokens for quarantined rows."""
         return self._token_manager
+
+    @property
+    def row_union_executor(self) -> RowUnionExecutor | None:
+        """The leader's row_union barrier executor (None on followers)."""
+        return self._row_union_executor
 
     @property
     def coordination_token(self) -> CoordinationToken | None:
@@ -2289,6 +2313,7 @@ class RowProcessor:
             expand_group_id=fields.expand_group_id,
             coalesce_node_id=fields.coalesce_node_id,
             coalesce_name=fields.coalesce_name,
+            row_union_name=fields.row_union_name,
         )
         return scheduled
 
@@ -2745,6 +2770,81 @@ class RowProcessor:
             barrier_key=str(coalesce_name),
         )
         return True, None
+
+    def _maybe_row_union_token(
+        self,
+        current_token: TokenInfo,
+        *,
+        current_node_id: NodeID,
+        row_union_node_id: NodeID | None,
+        row_union_name: RowUnionName | None,
+    ) -> tuple[bool, RowResult | None]:
+        """Hold a fork-branch token arriving at its row_union barrier.
+
+        Same journal-first shape as ``_maybe_coalesce_token`` (§E.2): the
+        arrival is never accepted in-claim — the live token is stashed and
+        the drain marks its journal row BLOCKED under
+        ``barrier_key=row_union_name``; the leader's next intake adopts it
+        and runs the executor accept. Followers hold without stashing.
+        """
+        if current_token.branch_name is None or row_union_name is None or row_union_node_id is None or current_node_id != row_union_node_id:
+            return False, None
+
+        if self._row_union_executor is None:
+            logger.debug(
+                "follower: row_union barrier hold for token %r at node %r (row_union=%r) — marking blocked; leader adopts via journal-intake",
+                current_token.token_id,
+                current_node_id,
+                row_union_name,
+            )
+            return True, None
+
+        self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
+            token=current_token,
+            barrier_key=str(row_union_name),
+        )
+        return True, None
+
+    def _notify_row_union_of_lost_branch(self, current_token: TokenInfo, reason: str) -> list[RowResult]:
+        """Notify the row_union executor that a forked branch was diverted.
+
+        v1 is fail-closed with no partial release, so a lost branch fails the
+        whole pending group immediately. SPIKE NOTE: unlike the coalesce twin
+        (§E.5), no durable BranchLossSpec lane exists yet for row_union —
+        the in-memory leader notify is authoritative for the spike; the
+        durable record-then-notify lane is production follow-up
+        (elspeth-a5b86149d4).
+        """
+        if current_token.branch_name is None:
+            return []
+        branch_name = BranchName(current_token.branch_name)
+        if branch_name not in self._branch_to_row_union:
+            return []
+        if self._row_union_executor is None:
+            return []
+        row_union_name = self._branch_to_row_union[branch_name]
+        outcome = self._row_union_executor.notify_branch_lost(
+            row_union_name=str(row_union_name),
+            row_id=current_token.row_id,
+            lost_branch=current_token.branch_name,
+            reason=reason,
+        )
+        if outcome is None or not outcome.consumed_tokens:
+            return []
+        self._complete_row_union_fire(
+            row_union_name=row_union_name,
+            consumed_tokens=outcome.consumed_tokens,
+            scope_row_id=current_token.row_id,
+        )
+        return [
+            RowResult(
+                token=consumed,
+                final_data=consumed.row_data,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.UNROUTED,
+            )
+            for consumed in outcome.consumed_tokens
+        ]
 
     def _notify_coalesce_of_lost_branch(
         self,
@@ -3262,6 +3362,54 @@ class RowProcessor:
             pending_sink_lease_owner=self._scheduler_lease_owner,
         )
 
+    def _complete_row_union_fire(
+        self,
+        *,
+        row_union_name: RowUnionName,
+        consumed_tokens: tuple[TokenInfo, ...],
+        scope_row_id: str,
+        released_items: tuple[WorkItem, ...] = (),
+    ) -> None:
+        """Complete a fired row_union barrier as ONE atomic journal transition.
+
+        Consumes the group's BLOCKED rows and emits every released branch
+        token as a READY continuation in the same F1 ``complete_barrier``
+        transaction — the emission order is the declared branch order, so
+        in-group release order is durable. A failure fire passes no
+        ``released_items`` and only consumes the failed group's rows.
+        """
+        consumed_token_ids = tuple(token.token_id for token in consumed_tokens)
+        if not consumed_token_ids and not released_items:
+            return
+        self._scheduler.complete_barrier(
+            run_id=self._run_id,
+            barrier_key=str(row_union_name),
+            consumed_token_ids=consumed_token_ids,
+            emitted_pending_sink=(),
+            emitted_ready=tuple(self._work_codec.ready_emission(item) for item in released_items),
+            now=self._clock.now_utc(),
+            intake_snapshot_token_ids=frozenset(consumed_token_ids),
+            scope_row_id=scope_row_id,
+            coordination_token=self._require_coordination_token(),
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+        )
+
+    def released_row_union_items(
+        self,
+        *,
+        row_union_name: RowUnionName,
+        released_tokens: tuple[TokenInfo, ...],
+    ) -> tuple[WorkItem, ...]:
+        """Build READY continuations for a released group, in declared order.
+
+        Continuations start AT the row_union node with NO row_union fields —
+        the barrier is passed, so traversal steps straight through the
+        structural node to the on_success consumer instead of re-entering
+        the barrier (released tokens still carry branch_name).
+        """
+        union_node_id = self._row_union_node_ids[row_union_name]
+        return tuple(self._work_items.create(token=token, current_node_id=union_node_id) for token in released_tokens)
+
     def complete_coalesce_merge(
         self,
         *,
@@ -3558,6 +3706,8 @@ class RowProcessor:
             return str(item.current_node_id)
         if item.coalesce_name is not None:
             return str(item.coalesce_name)
+        if item.row_union_name is not None:
+            return str(item.row_union_name)
         return None
 
     # --- TokenTraversalEngine delegates (c49 component 4) ---
@@ -3577,6 +3727,8 @@ class RowProcessor:
         coalesce_name: CoalesceName | None = None,
         on_success_sink: str | None = None,
         attempt_offset: int = 0,
+        row_union_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
         return self._token_traversal.process_single_token(
             token,
@@ -3586,6 +3738,8 @@ class RowProcessor:
             coalesce_name,
             on_success_sink,
             attempt_offset,
+            row_union_node_id,
+            row_union_name,
         )
 
     def _handle_transform_node(

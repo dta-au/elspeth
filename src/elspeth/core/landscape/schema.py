@@ -653,6 +653,7 @@ token_work_items_table = Table(
     Column("expand_group_id", String(128)),
     Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH)),
     Column("coalesce_name", String(128)),
+    Column("row_union_name", String(128)),
     Column("attempt", Integer, nullable=False),
     Column("lease_owner", String(128)),
     Column("lease_expires_at", DateTime(timezone=True)),
