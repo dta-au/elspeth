@@ -3592,6 +3592,9 @@ class TestValidatePipelineFabricatedCredentials:
     """
 
     _PLACEHOLDER = "WILL_BE_WIRED_FROM_OPENROUTER_API_KEY"
+    _TEXTRACT_ACCESS_ID = "TEXTRACT_LITERAL_ACCESS_ID"  # secret-scan: allow-this-line
+    _TEXTRACT_SECRET_KEY = "TEXTRACT_LITERAL_SECRET_KEY"  # secret-scan: allow-this-line
+    _TEXTRACT_SESSION_TOKEN = "TEXTRACT_LITERAL_SESSION_TOKEN"  # secret-scan: allow-this-line
 
     def _assert_value_redacted(self, result, *, value: str) -> None:
         """Audit hygiene: the literal placeholder value MUST NOT be echoed
@@ -3779,6 +3782,90 @@ class TestValidatePipelineFabricatedCredentials:
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
         secret_svc = FakeSecretService(available_refs={"REAL_KEY"})
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
+            mock_load.side_effect = ValueError("invalid settings")
+            result = validate_pipeline_for_trained_operator(
+                state,
+                settings,
+                mock_yaml_gen,
+                secret_service=secret_svc,
+                user_id="user-1",
+            )
+
+        assert _check(result, "secret_refs").passed is True
+
+    def test_textract_literal_credentials_are_rejected_and_redacted(self) -> None:
+        state = _make_state(
+            source_options={},
+            nodes=(
+                _make_node(
+                    plugin="aws_textract_document_analysis",
+                    options={
+                        "region": "ap-southeast-2",
+                        "auth_mode": "secret_refs",
+                        "aws_access_key_id": self._TEXTRACT_ACCESS_ID,
+                        "aws_secret_access_key": self._TEXTRACT_SECRET_KEY,
+                        "aws_session_token": self._TEXTRACT_SESSION_TOKEN,
+                        "bucket_field": "document_bucket",
+                        "key_field": "document_key",
+                        "feature_types": ["FORMS"],
+                        "text_field": "textract_text",
+                        "schema": {"mode": "observed"},
+                    },
+                ),
+            ),
+        )
+        settings = _make_settings()
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        secret_svc = FakeSecretService(available_refs=set())
+
+        result = validate_pipeline_for_trained_operator(
+            state,
+            settings,
+            mock_yaml_gen,
+            secret_service=secret_svc,
+            user_id="user-1",
+        )
+
+        assert result.is_valid is False
+        secret_check = _check(result, "secret_refs")
+        assert secret_check.passed is False
+        for field_name in ("aws_access_key_id", "aws_secret_access_key", "aws_session_token"):
+            assert field_name in secret_check.detail
+            assert any(field_name in error.message for error in result.errors)
+        for value in (self._TEXTRACT_ACCESS_ID, self._TEXTRACT_SECRET_KEY, self._TEXTRACT_SESSION_TOKEN):
+            self._assert_value_redacted(result, value=value)
+        mock_yaml_gen.generate_yaml.assert_not_called()
+
+    def test_textract_secret_refs_pass_secret_shape_validation(self) -> None:
+        refs = {
+            "aws_access_key_id": "TEST_TEXTRACT_ACCESS_KEY_ID",
+            "aws_secret_access_key": "TEST_TEXTRACT_SECRET_ACCESS_KEY",
+            "aws_session_token": "TEST_TEXTRACT_SESSION_TOKEN",
+        }
+        state = _make_state(
+            source_options={},
+            nodes=(
+                _make_node(
+                    plugin="aws_textract_document_analysis",
+                    options={
+                        "region": "ap-southeast-2",
+                        "auth_mode": "secret_refs",
+                        **{field: {"secret_ref": name} for field, name in refs.items()},
+                        "bucket_field": "document_bucket",
+                        "key_field": "document_key",
+                        "feature_types": ["FORMS"],
+                        "text_field": "textract_text",
+                        "schema": {"mode": "observed"},
+                    },
+                ),
+            ),
+        )
+        settings = _make_settings()
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
+        secret_svc = FakeSecretService(available_refs=set(refs.values()))
 
         with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
             mock_load.side_effect = ValueError("invalid settings")

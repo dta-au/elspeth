@@ -795,7 +795,7 @@ git commit -m "feat(textract): add asynchronous enrichment transform"
 - Modify: `tests/unit/web/catalog/test_service.py`
 - Create: `tests/golden/web/catalog/knob_schema/transform__aws_textract_document_analysis.json`
 
-- [ ] **Step 1: Write failing discovery and catalog tests**
+- [x] **Step 1: Write failing discovery and catalog tests**
 
 Add to `tests/unit/web/catalog/test_service.py`:
 
@@ -815,11 +815,11 @@ def test_textract_transform_is_discoverable_with_credentials_characteristic(
 
 Also assert `get_shared_plugin_manager().get_transform_by_name(...)` returns `AWSTextractDocumentAnalysis` and that assistance/example text contains S3, async analysis, and `{secret_ref: ...}` guidance without literal credentials.
 
-- [ ] **Step 2: Add web secret-shape tests for all explicit AWS credential fields**
+- [x] **Step 2: Add web secret-shape tests for all explicit AWS credential fields**
 
 In `TestValidatePipelineFabricatedCredentials`, add a Textract node with literal `aws_access_key_id`, `aws_secret_access_key`, and `aws_session_token`; assert validation fails, names all three fields, and echoes none of the values. Add a positive node using three available `{secret_ref: ...}` markers; mock settings loading as the neighboring positive-control test does and assert the `secret_refs` check passes.
 
-- [ ] **Step 3: Run focused catalog/web tests**
+- [x] **Step 3: Run focused catalog/web tests**
 
 Run:
 
@@ -829,7 +829,7 @@ pytest tests/unit/web/catalog/test_service.py tests/unit/web/execution/test_vali
 
 Expected: catalog discovery passes once the plugin class exists; secret-shape cases expose any central-policy or config-preflight drift.
 
-- [ ] **Step 4: Generate the exact knob-schema snapshot**
+- [x] **Step 4: Generate the exact knob-schema snapshot**
 
 Run this mechanical snapshot command:
 
@@ -837,7 +837,7 @@ Run this mechanical snapshot command:
 .venv/bin/python -c 'import json; from pathlib import Path; from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager; from elspeth.web.catalog.service import CatalogServiceImpl; info=CatalogServiceImpl(get_shared_plugin_manager()).get_schema("transform", "aws_textract_document_analysis"); payload={"plugin_kind":"transform","plugin_name":"aws_textract_document_analysis","knob_schema":info.knob_schema}; Path("tests/golden/web/catalog/knob_schema/transform__aws_textract_document_analysis.json").write_text(json.dumps(payload, indent=2, sort_keys=True)+"\n", encoding="utf-8")'
 ```
 
-- [ ] **Step 5: Run the golden and built-in metadata tests**
+- [x] **Step 5: Run the golden and built-in metadata tests**
 
 Run:
 
@@ -847,7 +847,7 @@ pytest tests/unit/web/catalog/test_knob_schema_golden.py tests/unit/plugins/test
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 5**
+- [x] **Step 6: Commit Task 5**
 
 ```bash
 git add tests/unit/web/execution/test_validation.py tests/unit/web/catalog/test_service.py tests/golden/web/catalog/knob_schema/transform__aws_textract_document_analysis.json
