@@ -723,6 +723,7 @@ class RowProcessor:
                 coalesce_node_ids=self._coalesce_node_ids,
                 coordination_token=self._require_coordination_token(),
                 scheduler_lease_owner=self._scheduler_lease_owner,
+                row_union_node_ids=self._row_union_node_ids,
             ).restore_from_journal(barrier_restore)
 
     @property

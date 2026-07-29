@@ -784,6 +784,7 @@ class BarrierRecoveryCoordinator:
         coalesce_node_ids: Mapping[CoalesceName, NodeID],
         coordination_token: CoordinationToken,
         scheduler_lease_owner: str,
+        row_union_node_ids: Mapping[RowUnionName, NodeID] | None = None,
     ) -> None:
         self._run_id = run_id
         self._scheduler = scheduler
@@ -796,6 +797,10 @@ class BarrierRecoveryCoordinator:
         self._coalesce_node_ids = coalesce_node_ids
         self._coordination_token = coordination_token
         self._scheduler_lease_owner = scheduler_lease_owner
+        # Restore of pending row_union groups is NOT implemented; the names are
+        # carried purely so a held group is refused with an accurate diagnosis
+        # instead of being mistaken for a barrier the pipeline no longer has.
+        self._row_union_node_ids: Mapping[RowUnionName, NodeID] = row_union_node_ids or {}
 
     def restore_from_journal(self, restore: BarrierJournalRestoreContext) -> None:
         """Rebuild aggregation buffers and coalesce pendings from journal BLOCKED rows.
@@ -863,6 +868,22 @@ class BarrierRecoveryCoordinator:
                 raise AuditIntegrityError(
                     f"list_blocked_barrier_items returned a row without barrier_key "
                     f"(work_item_id={item.work_item_id!r}, run {self._run_id!r})."
+                )
+            if item.barrier_key in {str(name) for name in self._row_union_node_ids}:
+                # Fail-closed, and say why. row_union restore is genuinely not
+                # implemented yet: rebuilding a pending group would have to
+                # reconstruct per-branch executor state AND reconcile the
+                # crash window where a released group's node states are
+                # already COMPLETED while its journal rows are still BLOCKED.
+                # Refusing with an accurate message beats resuming into a
+                # half-restored barrier, and beats the orphan-key error below,
+                # which would tell the operator their pipeline config changed.
+                raise OrchestrationInvariantError(
+                    f"Resume across pending row_union groups is not yet supported: BLOCKED journal row for "
+                    f"token {item.token_id!r} (run {self._run_id!r}, resume checkpoint "
+                    f"{restore.resume_checkpoint_id!r}) is held at row_union {item.barrier_key!r}. "
+                    "The pipeline configuration is intact — this run cannot be resumed while a row_union "
+                    "group is mid-flight. Re-run it from the start."
                 )
             if item.barrier_key not in coalesce_keys and item.barrier_key not in aggregation_keys:
                 raise AuditIntegrityError(

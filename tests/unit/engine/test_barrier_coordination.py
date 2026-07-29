@@ -32,16 +32,21 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts import TokenInfo, TransformProtocol
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath, TriggerType
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.results import RowResult
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
+from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.barrier_coordination import (
     BarrierIntakeCoordinator,
     BarrierIntakeDispositionKind,
+    BarrierJournalRestoreContext,
+    BarrierRecoveryCoordinator,
     _LiveBarrierHold,
 )
 from elspeth.engine.clock import MockClock
@@ -385,3 +390,44 @@ class TestIntakeFailClosed:
 
         with pytest.raises(AuditIntegrityError, match="orphan barrier_key"):
             coordinator.run_intake_pass(_ctx())
+
+
+class TestRecoveryFailClosed:
+    """Resume must refuse a pending row_union group with an accurate diagnosis.
+
+    Restore of row_union groups is genuinely unimplemented. Before this guard
+    the refusal still happened, but through the orphan-barrier_key arm, whose
+    message tells the operator the journal names "a barrier this pipeline no
+    longer has" — sending them to hunt a config change that never occurred.
+    """
+
+    def test_pending_row_union_group_refuses_resume_naming_the_real_reason(self) -> None:
+        row = _blocked_row(barrier_key="variant_union")
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        with pytest.raises(OrchestrationInvariantError, match="row_union groups is not yet supported"):
+            coordinator.restore_from_journal(
+                BarrierJournalRestoreContext(
+                    resume_checkpoint_id="ckpt-1",
+                    barrier_scalars=None,
+                    batch_id_remap={},
+                )
+            )
