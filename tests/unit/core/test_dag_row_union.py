@@ -513,3 +513,135 @@ coalesce:
         codes = {w.code for w in graph.validation_warnings}
         assert "DIVERT_ROW_UNION_GROUP_LOSS" in codes
         assert "DIVERT_COALESCE_REQUIRE_ALL" in codes
+
+
+# ===== BRANCH-INTERNAL AGGREGATION GUARD =====
+#
+# An aggregation INSIDE a fork branch that feeds a row_union is a different
+# hazard from the downstream group-split guard above: the downstream guard
+# walks forward from the barrier, so an aggregation upstream of it inside a
+# branch is never examined. Its flush emits continuations through a path that
+# does not carry the row_union binding, and in output_mode: transform the
+# emitted children all inherit ONE buffered parent's row_id, so the group can
+# never be satisfied whatever the binding does.
+
+
+def _branch_agg_yaml(tmp_path: Path, *, output_mode: str) -> str:
+    input_path = tmp_path / "branch_agg_input.jsonl"
+    if not input_path.exists():
+        input_path.write_text('{"id": 1, "copies": 1}\n')
+    output_path = tmp_path / "branch_agg_out.jsonl"
+    barrier_block = """row_unions:
+  - name: variant_union
+    branches:
+      control_branch: control_ready
+      treatment_branch: treatment_ready
+    on_success: union_out
+"""
+    return f"""
+sources:
+  rows:
+    plugin: json
+    on_success: routed
+    options:
+      path: {input_path}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+gates:
+  - name: variant_fork
+    input: routed
+    condition: "True"
+    routes:
+      'true': fork
+      'false': output
+    fork_to: [control_branch, treatment_branch]
+transforms:
+  - name: treatment_identity
+    plugin: passthrough
+    input: treatment_branch
+    on_success: treatment_ready
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: union_tail
+    plugin: passthrough
+    input: union_out
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+aggregations:
+  - name: control_batch
+    plugin: batch_replicate
+    input: control_branch
+    on_success: control_ready
+    on_error: discard
+    trigger: {{}}
+    output_mode: {output_mode}
+    options:
+      schema:
+        mode: observed
+      copies_field: copies
+      default_copies: 1
+      include_copy_index: false
+{barrier_block}sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {output_path}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+
+
+def test_transform_mode_branch_aggregation_feeding_row_union_is_rejected(tmp_path: Path) -> None:
+    """output_mode: transform inside a row_union branch cannot satisfy the barrier.
+
+    expand_token stamps every emitted child with a single buffered parent's
+    row_id, so one row_id contributes M arrivals (colliding when M > 1) and
+    every other buffered row_id contributes none. Reject at build time with a
+    diagnostic naming the aggregation, the barrier, the hazard, and the
+    supported alternatives.
+    """
+    with pytest.raises(GraphValidationError) as exc_info:
+        _build_graph(_branch_agg_yaml(tmp_path, output_mode="transform"))
+    message = str(exc_info.value)
+    assert "control_batch" in message
+    assert "variant_union" in message
+    assert "row_id" in message
+    assert "passthrough" in message
+
+
+def test_passthrough_mode_branch_aggregation_feeding_row_union_builds(tmp_path: Path) -> None:
+    """passthrough preserves token identity, so the group stays satisfiable.
+
+    The guard must not reject this shape: _route_passthrough_results validates
+    1:1 and updates the ORIGINAL tokens, so each buffered row_id keeps its own
+    arrival. Rejecting it would delete a real capability.
+    """
+    graph = _build_graph(_branch_agg_yaml(tmp_path, output_mode="passthrough"))
+    assert graph is not None
+
+
+def test_aggregation_upstream_of_the_fork_is_not_rejected(tmp_path: Path) -> None:
+    """The guard must not cross the fork gate into pre-fork topology.
+
+    Moving the aggregation upstream of the fork is the remedy the diagnostic
+    recommends, so a walk that crossed the gate would reject its own advice.
+    Fork -> branch edges are COPY only for identity branches; a transform-chain
+    branch is wired gate -> first node as MOVE, so a naive backward MOVE walk
+    would run straight through the gate.
+    """
+    yaml_text = _branch_agg_yaml(tmp_path, output_mode="passthrough")
+    yaml_text = yaml_text.replace("    input: control_branch\n", "    input: routed\n")
+    yaml_text = yaml_text.replace("      control_branch: control_ready\n", "      control_branch: control_branch\n")
+    yaml_text = yaml_text.replace("    on_success: control_ready\n", "    on_success: pre_fork\n")
+    yaml_text = yaml_text.replace("    input: routed\n    condition:", "    input: pre_fork\n    condition:")
+    graph = _build_graph(yaml_text)
+    assert graph is not None

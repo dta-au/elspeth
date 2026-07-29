@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts import RouteDestination, RoutingMode, error_edge_label
-from elspeth.contracts.enums import NodeType
+from elspeth.contracts.enums import NodeType, OutputMode
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.schema import SchemaConfig, get_raw_schema_config
 from elspeth.contracts.types import (
@@ -1342,6 +1342,62 @@ def build_execution_graph(
                                 component_type="row_union",
                             )
                     frontier.append(downstream)
+
+        # ===== BRANCH-INTERNAL AGGREGATION GUARD =====
+        # The forward walk above cannot see an aggregation that sits INSIDE a
+        # fork branch, upstream of the barrier — it walks away from the union,
+        # not toward it. That shape has its own hazard, and it is not the
+        # group-split one.
+        #
+        # A branch aggregation's flush routes through _route_transform_results,
+        # which calls expand_token with a SINGLE buffered parent token. Every
+        # emitted child therefore inherits that one parent's row_id: one row_id
+        # contributes M arrivals to the group (colliding on (row_id, branch)
+        # when M > 1) while every other buffered row_id contributes none. The
+        # group can never be satisfied, whatever the flush path does with the
+        # barrier binding.
+        #
+        # output_mode: passthrough is deliberately NOT rejected.
+        # _route_passthrough_results validates 1:1 and updates the ORIGINAL
+        # tokens, so every buffered row_id keeps its own arrival and the group
+        # stays satisfiable. Note OutputMode defaults to TRANSFORM, so an
+        # aggregation that simply omits the field lands in the rejected arm —
+        # hence the diagnostic names the field explicitly.
+        #
+        # The walk runs BACKWARD and MUST stop at the fork gate. Fork -> branch
+        # is a COPY edge only for an identity branch; a transform-chain branch
+        # is wired gate -> first node as MOVE, so an unbounded backward walk
+        # would cross into pre-fork topology and reject an aggregation that
+        # sits before the fork — the very remedy this diagnostic recommends.
+        fork_gate_node_ids = {gate_node_id for _gate_name, gate_node_id in row_union_branch_gates.values()}
+        for union_name, union_node_id in row_union_ids.items():
+            seen_upstream: set[NodeID] = set()
+            upstream_frontier: list[NodeID] = [union_node_id]
+            while upstream_frontier:
+                current = upstream_frontier.pop()
+                for in_edge in graph.get_incoming_edges(current):
+                    upstream = in_edge.from_node
+                    if upstream in seen_upstream or upstream in fork_gate_node_ids:
+                        continue
+                    seen_upstream.add(upstream)
+                    if graph.get_node_info(upstream).node_type == NodeType.SINK:
+                        continue
+                    upstream_agg = aggregation_settings_by_node.get(upstream)
+                    if upstream_agg is not None and upstream_agg.output_mode == OutputMode.TRANSFORM:
+                        raise GraphValidationError(
+                            f"Aggregation '{upstream_agg.name}' is inside a fork branch that feeds "
+                            f"row_union '{union_name}' and uses output_mode 'transform' (the default). "
+                            f"A transform-mode flush emits its rows from a single buffered parent token, "
+                            f"so every emitted row carries that one parent's row_id: one row_id would "
+                            f"contribute several arrivals to the union group while every other buffered "
+                            f"row_id contributes none, and the group can never be satisfied. Set "
+                            f"'output_mode: passthrough' on '{upstream_agg.name}' so each row keeps its "
+                            f"own identity, or move the aggregation upstream of the fork that feeds "
+                            f"'{union_name}'.",
+                            component_id=str(union_name),
+                            component_type="row_union",
+                        )
+                    upstream_frontier.append(upstream)
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)
