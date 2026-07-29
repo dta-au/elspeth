@@ -5,6 +5,14 @@ must not import anything from ``elspeth_llm_gateway.core`` or from the
 surrounding ELSPETH repository.
 """
 
+from elspeth_llm_gateway.sdk.protocol import (
+    CLASSIFIABLE_CODES,
+    AdapterDescriptor,
+    AdapterProtocol,
+    ErrorClassification,
+    InvokePlan,
+    UpstreamFailure,
+)
 from elspeth_llm_gateway.sdk.types import (
     CanonicalMessage,
     CanonicalRequest,
@@ -18,6 +26,9 @@ from elspeth_llm_gateway.sdk.types import (
 )
 
 __all__ = [
+    "CLASSIFIABLE_CODES",
+    "AdapterDescriptor",
+    "AdapterProtocol",
     "CanonicalMessage",
     "CanonicalRequest",
     "CanonicalResponse",
@@ -25,6 +36,9 @@ __all__ = [
     "CanonicalToolDef",
     "CanonicalUsage",
     "Capability",
+    "ErrorClassification",
     "FinishReason",
+    "InvokePlan",
     "ResponseFormatSpec",
+    "UpstreamFailure",
 ]
