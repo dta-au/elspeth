@@ -275,7 +275,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0000000000000000"
+    source_file_hash: str | None = "sha256:b7447ff1319f0ce5"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
