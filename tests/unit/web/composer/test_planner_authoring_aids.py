@@ -286,6 +286,84 @@ def _guardrail_profile_view(
     return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
 
 
+def _direct_control_view(
+    tmp_path: Path,
+    *,
+    control_mode: str = "required",
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Control posture with NO operator profile aliases for the controls.
+
+    The Azure safety plugins are USER_CONFIGURABLE_WITH_POLICY: selected and
+    available (their credential is in the inventory) but carrying zero
+    operator profile aliases — the direct-configuration deployment shape.
+    """
+    from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.web.config import WebSettings
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        default_llm_profile="sonnet",
+        plugin_allowlist=("transform:azure_prompt_shield", "transform:azure_content_safety"),
+        plugin_preferences={
+            PluginCapability.PROMPT_SHIELD: ("transform:azure_prompt_shield",),
+            PluginCapability.CONTENT_SAFETY: ("transform:azure_content_safety",),
+        },
+        plugin_control_modes={
+            PluginCapability.PROMPT_SHIELD: ControlMode(control_mode),
+            PluginCapability.CONTENT_SAFETY: ControlMode(control_mode),
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    class _ServerKeyInventory:
+        _names = frozenset({"OPENROUTER_API_KEY", "AZURE_CONTENT_SAFETY_KEY"})
+
+        def has_server_ref(self, name: str) -> bool:
+            return name in self._names
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return name in self._names
+
+        def server_generation(self, name: str) -> str | None:
+            return "gen-1" if name in self._names else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=create_catalog_service(),
+        profiles=profiles,
+        principal_scope="local:authoring-aids-direct-control",
+        secret_inventory=_ServerKeyInventory(),
+        generation_key=b"authoring-aids-key",
+    )
+    return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
+
+
 def _session_with_user_message(content: str) -> tuple[Any, str, str, str]:
     """Session + user chat message whose text contains ``content`` verbatim."""
     engine = create_session_engine(
@@ -585,6 +663,63 @@ class TestForkCoalesceExemplar:
         assert "required, not advisory" not in rendered
         assert "content_safety" not in aids
 
+    def test_required_controls_without_profile_aliases_are_still_wired_into_the_exemplar(self, tmp_path: Path) -> None:
+        """Zero profile aliases must not drop a REQUIRED control from the exemplar.
+
+        A selected control can be usable without operator profile aliases
+        (direct user-configurable plugins such as the Azure safety pair).
+        Omitting the control nodes taught exactly the uncovered fork this
+        deployment's required-control-coverage validator rejects. The
+        alias-less form authors the control directly: no ``profile`` option,
+        the credential wired as the supported inline ``secret_ref`` marker,
+        and the remaining required service bindings as placeholders.
+        """
+        view, _snapshot = _direct_control_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        nodes = {node["id"]: node for node in args["nodes"]}
+        shield = next(node for node in nodes.values() if node.get("plugin") == "azure_prompt_shield")
+        safety = next(node for node in nodes.values() if node.get("plugin") == "azure_content_safety")
+        gate = next(node for node in nodes.values() if node["node_type"] == "gate")
+        coalesce = next(node for node in nodes.values() if node["node_type"] == "coalesce")
+
+        # Same dominance wiring as the profiled variant.
+        assert shield["input"] == args["source"]["on_success"]
+        assert gate["input"] == shield["on_success"]
+        assert safety["input"] == coalesce["id"]
+
+        for control in (shield, safety):
+            assert "profile" not in control["options"]
+            assert control["options"]["fields"]
+            assert control["options"]["api_key"] == {"secret_ref": "AZURE_CONTENT_SAFETY_KEY"}
+        # Effective blocking posture — all-6 thresholds are a coverage no-op.
+        thresholds = safety["options"]["thresholds"]
+        assert any(value < 6 for value in thresholds.values())
+
+    def test_alias_less_control_exemplar_validates_through_the_real_candidate_builder(self, tmp_path: Path) -> None:
+        """The exact alias-less control exemplar bytes must build."""
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _direct_control_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"alias-less control exemplar rejected: {rejection}"
+
+    def test_recommended_alias_less_controls_do_not_mutate_the_exemplar(self, tmp_path: Path) -> None:
+        view, _snapshot = _direct_control_view(tmp_path, control_mode="recommend")
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        plugins = {node.get("plugin") for node in args["nodes"]}
+        assert "azure_prompt_shield" not in plugins
+        assert "azure_content_safety" not in plugins
+
     def test_topology_exemplar_renders_and_validates_without_a_usable_llm_profile(self, tmp_path: Path) -> None:
         """No usable llm profile -> the SAME topology with non-LLM branches.
 
@@ -643,6 +778,51 @@ class TestForkCoalesceExemplar:
 
         section = payload["fork_coalesce"]
         assert section["set_pipeline_exemplar"] == fork_coalesce_exemplar_args(view)
+
+
+class TestSelectedControlProfile:
+    """Selection contract for the exemplar's required-control wiring."""
+
+    def test_required_with_aliases_returns_plugin_and_alias(self, tmp_path: Path) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
+
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+
+        assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) == (
+            "aws_bedrock_prompt_shield",
+            "prompt-approved",
+        )
+        assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) == (
+            "aws_bedrock_content_safety",
+            "content-approved",
+        )
+
+    def test_required_without_aliases_returns_plugin_with_no_alias(self, tmp_path: Path) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
+
+        view, snapshot = _direct_control_view(tmp_path)
+        # Precondition: the controls really are selected with zero aliases.
+        aliases_by_plugin = dict(snapshot.usable_profile_aliases)
+        for capability in (PluginCapability.PROMPT_SHIELD, PluginCapability.CONTENT_SAFETY):
+            selected = dict(snapshot.selected)[capability]
+            assert selected is not None
+            assert not aliases_by_plugin.get(selected, ())
+
+        assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) == ("azure_prompt_shield", None)
+        assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) == ("azure_content_safety", None)
+
+    def test_recommend_mode_returns_none_even_with_a_selection(self, tmp_path: Path) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
+
+        for view, _snapshot in (
+            _guardrail_profile_view(tmp_path, control_mode="recommend"),
+            _direct_control_view(tmp_path, control_mode="recommend"),
+        ):
+            assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) is None
+            assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) is None
 
 
 class TestExemplarDomainDisjointness:

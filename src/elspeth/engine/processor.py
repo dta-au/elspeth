@@ -655,6 +655,10 @@ class RowProcessor:
         # so the re-driven sink node_state does not collide at attempt 0.
         self._resume_checkpoint_id: str | None = barrier_restore.resume_checkpoint_id if barrier_restore is not None else None
         restore_reads = barrier_restore_reads if barrier_restore_reads is not None else execution
+        # Retained for the row_union post-release divert discriminator: a
+        # released group's status-COMPLETED node state is the durable proof
+        # that a later terminal divert is not a pre-barrier branch loss.
+        self._barrier_restore_reads = restore_reads
         # Barrier subsystem (elspeth-e76a186916): the intake and recovery
         # coordinators own the crash-window adoption/restore ordering (open
         # batch -> fenced adopt -> feed memory -> evaluate trigger) behind one
@@ -2888,6 +2892,14 @@ class RowProcessor:
         whole pending group immediately. The durable loss record is staged
         before the in-memory notify, including on followers; the leader
         replays it during barrier intake.
+
+        Released tokens deliberately retain their branch_name, so any
+        terminal divert DOWNSTREAM of the union (gate-to-sink route, drop,
+        error) re-enters this helper. A group that already released is not a
+        pre-barrier loss — staging one would persist a false
+        coalesce_branch_losses record on a healthy run. A genuine pre-barrier
+        loss can never coincide with a released group (release requires every
+        branch to arrive), so the guard changes no legitimate loss.
         """
         if current_token.branch_name is None:
             return []
@@ -2895,6 +2907,8 @@ class RowProcessor:
         if branch_name not in self._branch_to_row_union:
             return []
         row_union_name = self._branch_to_row_union[branch_name]
+        if self._row_union_group_released(row_union_name, current_token.row_id):
+            return []
         self._pending_branch_losses.append(
             BranchLossSpec(
                 coalesce_name=str(row_union_name),
@@ -2941,6 +2955,22 @@ class RowProcessor:
             )
             for consumed in outcome.consumed_tokens
         ]
+
+    def _row_union_group_released(self, row_union_name: RowUnionName, row_id: str) -> bool:
+        """Whether the (row_union, row) group already released.
+
+        Leaders read the executor's in-memory closure reason; followers (no
+        executor) and post-resume processes fall back to the durable
+        status-COMPLETED node state at the union node. A release always
+        commits its COMPLETED states before the released tokens route
+        downstream, so the durable read is race-free.
+        """
+        if self._row_union_executor is not None and self._row_union_executor.is_group_released(str(row_union_name), row_id):
+            return True
+        if row_union_name not in self._row_union_node_ids:
+            return False
+        node_id = self._row_union_node_ids[row_union_name]
+        return self._barrier_restore_reads.has_released_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id)
 
     def _notify_barrier_of_lost_branch(
         self,

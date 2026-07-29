@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib.parse import quote
 
@@ -90,11 +90,35 @@ def _fixed_pipeline_document(canonical_session_id: str, *, source_path: str) -> 
     }
 
 
-def _fixed_output_sink_node_id(session_id: str) -> str:
+def _server_data_dir(env: Mapping[str, str]) -> str:
+    """Return the canonical absolute data directory the web service runs with.
+
+    The value must be the server's own canonical data dir (the deployment
+    inventory's ``ELSPETH_WEB__DATA_DIR``, e.g. ``/var/lib/elspeth``): the
+    server rewrites relative sink paths under it before execution, and the
+    expected sink node identity is derived from that rewritten path.
+    """
+
+    data_dir = env.get("ELSPETH_WEB__DATA_DIR")
+    if type(data_dir) is not str or not data_dir:
+        raise AcceptanceInputError("ELSPETH_WEB__DATA_DIR must be the canonical absolute data dir the web service runs with")
+    path = PurePosixPath(data_dir)
+    if not path.is_absolute() or str(path) != data_dir or any(part in {".", ".."} for part in path.parts):
+        raise AcceptanceInputError("ELSPETH_WEB__DATA_DIR must be the canonical absolute data dir the web service runs with")
+    return data_dir
+
+
+def _fixed_output_sink_node_id(session_id: str, *, data_dir: str) -> str:
     canonical_session_id = _canonical_uuid(session_id, label="session identity")
     document = _fixed_pipeline_document(canonical_session_id, source_path="blobs/aws-ecs-acceptance-input.csv")
     sinks = cast(dict[str, dict[str, object]], document["sinks"])
-    sink_options = cast(dict[str, object], sinks["output"]["options"])
+    sink_options = dict(cast(dict[str, object], sinks["output"]["options"]))
+    # Mirror the server-side resolve_sink_data_path() rewrite textually:
+    # the client filesystem is not the server filesystem, so the resolved
+    # path is composed as a string, never via Path.resolve().
+    sink_options["path"] = str(
+        PurePosixPath(data_dir) / "outputs" / canonical_session_id / f"aws-ecs-acceptance-{canonical_session_id}.csv"
+    )
     return f"sink_output_{_sha256(canonical_json(sink_options).encode('utf-8'))[:12]}"
 
 
@@ -189,6 +213,7 @@ def capture(
     tutorial_profile = env.get("ELSPETH_WEB__DEFAULT_LLM_PROFILE")
     if type(tutorial_profile) is not str or not tutorial_profile.strip() or tutorial_profile != tutorial_profile.strip():
         raise AcceptanceInputError("tutorial profile alias is invalid")
+    server_data_dir = _server_data_dir(env)
     captured_at = _utc_timestamp(now())
     client = AcceptanceHttpClient.from_env(env, transport=transport)
     register = register_value == "1"
@@ -258,7 +283,7 @@ def capture(
         manifest = client.request_json("GET", f"/api/runs/{run_id}/outputs", expected_statuses={200})
         artifact_id, manifest_artifact_sha256 = _select_output_artifact(
             manifest,
-            expected_sink_node_id=_fixed_output_sink_node_id(session_id),
+            expected_sink_node_id=_fixed_output_sink_node_id(session_id, data_dir=server_data_dir),
             check="artifact_manifest",
         )
         artifact_content = client.request_bytes(
@@ -389,6 +414,7 @@ def verify_api(
     """Re-authenticate and verify the captured API resources without mutation."""
 
     state = read_acceptance_state(state_file)
+    server_data_dir = _server_data_dir(env)
     client = AcceptanceHttpClient.from_env(env, transport=transport)
     with client:
         client.authenticate(register=False)
@@ -430,7 +456,7 @@ def verify_api(
         manifest = client.request_json("GET", f"/api/runs/{state.run_id}/outputs", expected_statuses={200})
         artifact_id, artifact_sha256 = _select_output_artifact(
             manifest,
-            expected_sink_node_id=_fixed_output_sink_node_id(state.session_id),
+            expected_sink_node_id=_fixed_output_sink_node_id(state.session_id, data_dir=server_data_dir),
             check="artifact_manifest",
         )
         if artifact_id != state.artifact_id or artifact_sha256 != state.artifact_sha256:

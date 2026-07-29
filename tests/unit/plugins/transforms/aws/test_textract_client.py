@@ -15,6 +15,7 @@ from elspeth.plugins.transforms.aws.textract_client import (
     TextractIdempotencyInvariantError,
     TextractResponseError,
     TextractServiceError,
+    _record_send_attempt,
     build_textract_sdk_client,
 )
 
@@ -348,6 +349,28 @@ def test_oversized_semantic_response_is_audited_and_fails_closed() -> None:
     assert "x" * 1000 not in repr(recorder.calls)
 
 
+def test_oversized_semantic_response_is_rejected_before_deep_freeze(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_freeze(value: object) -> object:
+        raise AssertionError("deep_freeze must not run for oversized responses")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_client.deep_freeze", forbidden_freeze)
+    sdk = FakeSDK(
+        get_responses=[
+            {
+                "JobStatus": "SUCCEEDED",
+                "Blocks": [{"BlockType": "LINE", "Id": "line-1", "Text": "x" * 1000}],
+                "ResponseMetadata": _metadata(),
+            }
+        ]
+    )
+    client, recorder, _, _ = _client(sdk, max_response_bytes=100)
+
+    with pytest.raises(TextractResponseError, match="maximum response size"):
+        client.get_document_analysis(job_id="job-1", next_token=None)
+
+    assert recorder.calls[0]["error"].to_dict()["type"] == "response_too_large"
+
+
 def _client_error(code: str, *, message: str = "provider-private-message", retries: int = 0) -> ClientError:
     return ClientError(
         {
@@ -397,8 +420,65 @@ def test_transport_error_is_retryable_and_sanitized() -> None:
 
     assert exc_info.value.code == "transport_error"
     assert exc_info.value.retryable is True
-    assert recorder.calls[0]["response_data"].to_dict()["attempts"] == 3
+    assert recorder.calls[0]["response_data"].to_dict()["attempts"] == 1
     assert "private.example.invalid" not in repr((exc_info.value, recorder.calls, events))
+
+
+class AttemptFiringSDK(FakeSDK):
+    """Fake SDK that fires the per-attempt send handler the way botocore does."""
+
+    attempts_per_call: int = 1
+
+    def start_document_analysis(self, **kwargs: Any) -> object:
+        for _ in range(self.attempts_per_call):
+            _record_send_attempt(request=object(), event_name="before-send.textract.StartDocumentAnalysis")
+        return super().start_document_analysis(**kwargs)
+
+    def get_document_analysis(self, **kwargs: Any) -> object:
+        for _ in range(self.attempts_per_call):
+            _record_send_attempt(request=object(), event_name="before-send.textract.GetDocumentAnalysis")
+        return super().get_document_analysis(**kwargs)
+
+
+def test_transport_error_records_observed_attempts_not_configured_max() -> None:
+    sdk = AttemptFiringSDK(get_responses=[EndpointConnectionError(endpoint_url="https://private.example.invalid")])
+    sdk.attempts_per_call = 2
+    client, recorder, events, _ = _client(sdk)
+
+    with pytest.raises(TextractServiceError) as exc_info:
+        client.get_document_analysis(job_id="job-1", next_token=None)
+
+    assert exc_info.value.code == "transport_error"
+    assert recorder.calls[0]["response_data"].to_dict()["attempts"] == 2
+    assert events[0].response_payload.to_dict()["attempts"] == 2
+
+
+def test_transport_attempt_counter_resets_between_calls() -> None:
+    sdk = AttemptFiringSDK(
+        start_response=EndpointConnectionError(endpoint_url="https://private.example.invalid"),
+        get_responses=[EndpointConnectionError(endpoint_url="https://private.example.invalid")],
+    )
+    sdk.attempts_per_call = 2
+    client, recorder, _, _ = _client(sdk)
+
+    with pytest.raises(TextractServiceError):
+        _start(client)
+    sdk.attempts_per_call = 1
+    with pytest.raises(TextractServiceError):
+        client.get_document_analysis(job_id="job-1", next_token=None)
+
+    assert recorder.calls[0]["response_data"].to_dict()["attempts"] == 2
+    assert recorder.calls[1]["response_data"].to_dict()["attempts"] == 1
+
+
+def test_success_attempts_still_derive_from_response_metadata() -> None:
+    sdk = AttemptFiringSDK(start_response={"JobId": "job-1", "ResponseMetadata": _metadata(retries=2)})
+    sdk.attempts_per_call = 1
+    client, recorder, _, _ = _client(sdk)
+
+    _start(client)
+
+    assert recorder.calls[0]["response_data"].to_dict()["attempts"] == 3
 
 
 def test_idempotency_mismatch_raises_distinct_invariant_error_after_audit() -> None:
@@ -422,9 +502,17 @@ def test_audit_failure_suppresses_telemetry() -> None:
     assert events == []
 
 
+def _fake_boto3_client(registrations: list[tuple[str, Any]]) -> SimpleNamespace:
+    return SimpleNamespace(
+        close=lambda: None,
+        meta=SimpleNamespace(events=SimpleNamespace(register=lambda event, handler: registrations.append((event, handler)))),
+    )
+
+
 def test_builder_uses_standard_retry_policy_and_explicit_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
-    sentinel = SimpleNamespace(close=lambda: None)
+    registrations: list[tuple[str, Any]] = []
+    sentinel = _fake_boto3_client(registrations)
 
     def fake_client(service: str, **kwargs: Any) -> object:
         captured["service"] = service
@@ -450,14 +538,35 @@ def test_builder_uses_standard_retry_policy_and_explicit_credentials(monkeypatch
     assert kwargs["config"].connect_timeout == 10
     assert kwargs["config"].read_timeout == 30
     assert kwargs["config"].retries == {"mode": "standard", "total_max_attempts": 3}
+    assert registrations == [("before-send.textract", _record_send_attempt)]
+
+
+def test_registered_send_event_fires_per_attempt_on_real_botocore() -> None:
+    from elspeth.plugins.transforms.aws import textract_client as module
+
+    built = build_textract_sdk_client(
+        region="ap-southeast-2",
+        aws_access_key_id=None,
+        aws_secret_access_key=None,
+        aws_session_token=None,
+    )
+    try:
+        module._reset_send_attempts()
+        events = built.meta.events  # type: ignore[attr-defined]
+        events.emit("before-send.textract.GetDocumentAnalysis", request=None)
+        events.emit("before-send.textract.GetDocumentAnalysis", request=None)
+        assert module._observed_send_attempts() == 2
+    finally:
+        built.close()
 
 
 def test_builder_omits_all_explicit_credentials_for_default_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
+    registrations: list[tuple[str, Any]] = []
 
     def fake_client(service: str, **kwargs: Any) -> object:
         captured.update(kwargs)
-        return SimpleNamespace(close=lambda: None)
+        return _fake_boto3_client(registrations)
 
     monkeypatch.setattr("boto3.client", fake_client)
 

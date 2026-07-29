@@ -91,6 +91,7 @@ class LineageTree:
             "gate": "Gate",
             "aggregation": "Aggregation",
             "coalesce": "Coalesce",
+            "row_union": "Row union",
         }
 
         run_id = self._data["run_id"]

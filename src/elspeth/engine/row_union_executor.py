@@ -47,6 +47,11 @@ slog = structlog.get_logger(__name__)
 #: straggler's audit record names the actual cause.
 _CLOSED_BY_RELEASE = "released"
 _CLOSED_BY_BRANCH_LOSS = "row_union_branch_lost"
+#: Conservative closure reason for a group whose FAILED node states were
+#: found through the Landscape point read (cache miss after eviction or
+#: resume): the state proves the group failed closed, but the original
+#: reason (timeout / EOF flush) is not cheaply recoverable from that read.
+_CLOSED_BY_PRIOR_FAILURE = "row_union_group_failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,10 +490,11 @@ class RowUnionExecutor:
 
         The recorded reason distinguishes a genuine straggler (its group
         already released) from a token whose group was killed before it ever
-        arrived — a lost sibling branch. Both fail closed; only the audit
-        trail tells the operator which happened.
+        arrived — timeout, EOF flush, or a lost sibling branch. Both fail
+        closed; only the audit trail tells the operator which happened, so a
+        non-release closure must carry the group's true closure reason.
         """
-        failure_reason = "row_union_branch_lost" if closed_reason == _CLOSED_BY_BRANCH_LOSS else "late_arrival_after_release"
+        failure_reason = "late_arrival_after_release" if closed_reason == _CLOSED_BY_RELEASE else closed_reason
         error_hash = compute_error_hash(failure_reason)
         state = self._execution.begin_node_state(
             token_id=token.token_id,
@@ -556,6 +562,15 @@ class RowUnionExecutor:
         """Idempotency check for §E.5 branch-loss replay dedup."""
         return (row_union_name, row_id, branch_name) in self._recorded_losses
 
+    def is_group_released(self, row_union_name: str, row_id: str) -> bool:
+        """Whether this group's in-memory closure reason is a release.
+
+        Leader fast path for the processor's post-release divert
+        discrimination; followers and post-resume processes fall back to the
+        durable status-COMPLETED node state read.
+        """
+        return self._completed_keys.get((row_union_name, row_id)) == _CLOSED_BY_RELEASE
+
     def notify_branch_lost(
         self,
         row_union_name: str,
@@ -569,12 +584,19 @@ class RowUnionExecutor:
         arrived siblings fail immediately. When nothing has arrived yet the
         key is marked completed so later siblings fail closed via the
         late-arrival arm instead of waiting forever.
+
+        A group that already RELEASED is exempt entirely: released tokens
+        keep their branch_name, so a terminal divert downstream of the union
+        re-enters this path — that is not a pre-barrier loss, and recording
+        it would poison the loss indexes for this key.
         """
         if row_union_name not in self._settings:
             raise OrchestrationInvariantError(f"row_union '{row_union_name}' not registered")
+        key = (row_union_name, row_id)
+        if self._completed_keys.get(key) == _CLOSED_BY_RELEASE:
+            return None
         self._recorded_losses.add((row_union_name, row_id, lost_branch))
 
-        key = (row_union_name, row_id)
         self._recorded_loss_groups.add(key)
         if key in self._completed_keys:
             return None
@@ -598,14 +620,22 @@ class RowUnionExecutor:
     # ------------------------------------------------------------------
 
     def _check_landscape_for_completion(self, row_union_name: str, row_id: str) -> bool:
-        """Landscape fallback for late-arrival detection (cache-miss path)."""
+        """Landscape fallback for late-arrival detection (cache-miss path).
+
+        A completed state alone does not prove a release: _fail_pending's
+        FAILED closures carry completed_at too. The released-only point read
+        distinguishes them so the recached closure reason stays truthful.
+        """
         if row_union_name not in self._node_ids:
             return False
         node_id = self._node_ids[row_union_name]
-        if self._barrier_restore_reads.has_completed_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id):
+        if not self._barrier_restore_reads.has_completed_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id):
+            return False
+        if self._barrier_restore_reads.has_released_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id):
             self._mark_completed((row_union_name, row_id), _CLOSED_BY_RELEASE)
-            return True
-        return False
+        else:
+            self._mark_completed((row_union_name, row_id), _CLOSED_BY_PRIOR_FAILURE)
+        return True
 
     def _mark_completed(self, key: tuple[str, str], reason: str) -> None:
         """Mark a group closed, with its cause, under bounded memory."""

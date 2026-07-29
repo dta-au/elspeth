@@ -1120,17 +1120,24 @@ class BarrierRecoveryCoordinator:
             holdless = [item for item in row_union_items if item.token_id not in row_union_state_ids]
             if holdless:
                 node_id_to_row_union_name = {str(node_id): str(name) for name, node_id in self._row_union_node_ids.items()}
-                completed_pairs = self._barrier_restore_reads.get_completed_row_ids_for_nodes(
+                # Released-only read: a group failed closed by _fail_pending
+                # (timeout / EOF-incomplete / branch loss) has FAILED node
+                # states with completed_at set, but it never released —
+                # reconcile_released_group would refuse it and wedge the
+                # resume. Failed-closure holdless rows fall through to the
+                # intake-pending reset below and fail closed as late arrivals
+                # on re-accept.
+                released_pairs = self._barrier_restore_reads.get_released_row_ids_for_nodes(
                     self._run_id,
                     frozenset(node_id_to_row_union_name),
                 )
-                completed_keys = {
+                released_group_keys = {
                     (node_id_to_row_union_name[node_id], row_id)
-                    for node_id, row_id in completed_pairs
+                    for node_id, row_id in released_pairs
                     if node_id in node_id_to_row_union_name
                 }
                 released_keys = {
-                    (str(item.barrier_key), item.row_id) for item in holdless if (str(item.barrier_key), item.row_id) in completed_keys
+                    (str(item.barrier_key), item.row_id) for item in holdless if (str(item.barrier_key), item.row_id) in released_group_keys
                 }
                 for released_key in sorted(released_keys):
                     row_union_released_groups.append(
@@ -1315,17 +1322,55 @@ class BarrierRecoveryCoordinator:
                         f"Row_union restore reset {reset_count} adopted holdless rows; expected {len(row_union_holdless_items)}."
                     )
 
-            self._row_union_executor.restore_branch_losses(
-                tuple(
-                    (loss.coalesce_name, loss.row_id, loss.branch_name)
-                    for loss in durable_branch_losses
-                    if loss.coalesce_name in row_union_keys
+            row_union_durable_losses = [loss for loss in durable_branch_losses if loss.coalesce_name in row_union_keys]
+            if row_union_durable_losses:
+                # A durable branch-loss row must never replay over a group
+                # whose union node states prove RELEASE (status COMPLETED):
+                # it would poison _recorded_loss_groups, and the
+                # reconcile_released_group pristine-group guard would wedge
+                # every leader takeover. Mirror the coalesce-scalar precedent
+                # above: drop-with-log, the durable release evidence wins. The
+                # read spans ALL row-union node ids — not just the current
+                # released-group classification — so fully-terminalized
+                # prior-epoch released groups are also protected (a straggler
+                # for such a group must fail as late_arrival_after_release,
+                # not row_union_branch_lost). The ledger row itself is left
+                # untouched; only the in-memory replay is filtered.
+                node_id_to_row_union_name = {str(node_id): str(name) for name, node_id in self._row_union_node_ids.items()}
+                released_pairs = self._barrier_restore_reads.get_released_row_ids_for_nodes(
+                    self._run_id,
+                    frozenset(node_id_to_row_union_name),
                 )
+                released_loss_keys = {
+                    (node_id_to_row_union_name[node_id], row_id)
+                    for node_id, row_id in released_pairs
+                    if node_id in node_id_to_row_union_name
+                }
+                replayable_losses = []
+                for loss in row_union_durable_losses:
+                    if (loss.coalesce_name, loss.row_id) in released_loss_keys:
+                        logger.warning(
+                            "row_union restore: durable branch-loss ledger row for %s/%s/%s (%r) contradicts "
+                            "durable release evidence (union node states prove RELEASE); release wins — "
+                            "the loss is not replayed",
+                            loss.coalesce_name,
+                            loss.row_id,
+                            loss.branch_name,
+                            loss.reason,
+                        )
+                        continue
+                    replayable_losses.append(loss)
+                row_union_durable_losses = replayable_losses
+            self._row_union_executor.restore_branch_losses(
+                tuple((loss.coalesce_name, loss.row_id, loss.branch_name) for loss in row_union_durable_losses)
             )
             now_monotonic = self._clock.monotonic()
             for group in row_union_released_groups:
-                release_outcome = self._row_union_executor.reconcile_released_group(
-                    entries=tuple(
+                group_entries: list[RowUnionRestoreEntry] = []
+                for item in group:
+                    if item.barrier_blocked_at is None:
+                        raise AuditIntegrityError(f"BLOCKED row_union journal row for token {item.token_id!r} has NULL barrier_blocked_at.")
+                    group_entries.append(
                         RowUnionRestoreEntry(
                             token=token_from_journal_item(
                                 item,
@@ -1334,13 +1379,10 @@ class BarrierRecoveryCoordinator:
                             ),
                             row_union_name=str(item.barrier_key),
                             state_id=row_union_state_ids.get(item.token_id),
-                            arrival_time=now_monotonic - max(0.0, (now - item.barrier_blocked_at).total_seconds())
-                            if item.barrier_blocked_at is not None
-                            else now_monotonic,
+                            arrival_time=now_monotonic - max(0.0, (now - item.barrier_blocked_at).total_seconds()),
                         )
-                        for item in group
                     )
-                )
+                release_outcome = self._row_union_executor.reconcile_released_group(entries=tuple(group_entries))
                 self._commit_restored_row_union_outcome(release_outcome)
 
             restore_entries: list[RowUnionRestoreEntry] = []
