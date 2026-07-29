@@ -134,14 +134,34 @@ locals {
     if prefix != null
   ])
 
-  bedrock_litellm_model = var.composer_model
+  bedrock_litellm_model      = var.composer_model
+  bedrock_fast_litellm_model = var.composer_advisor_model
+  # Two profiles so a pipeline can pick a tier, and web authors keep selecting an
+  # opaque alias rather than a model id.
+  #
+  # Both models are taken from the configured Composer pair on purpose: IAM grants
+  # bedrock:InvokeModel for exactly `bedrock_configured_model_ids`, which is derived
+  # from composer_model and composer_advisor_model. A profile naming any other model
+  # would validate at startup and then fail at invoke time with AccessDenied, so
+  # adding a genuinely third model means extending that grant too.
+  #
+  # `fast` is named for the tier it provides, not the vendor's current model name —
+  # the alias outlives a model swap, where "flash" or "glm47" would start lying the
+  # first time composer_advisor_model changes.
   llm_profiles = jsonencode({
     tutorial = {
       provider    = "bedrock"
       model       = local.bedrock_litellm_model
       region_name = var.aws_region
     }
+    fast = {
+      provider    = "bedrock"
+      model       = local.bedrock_fast_litellm_model
+      region_name = var.aws_region
+    }
   })
+  # Stays the tutorial's profile AND the resolver's preferred alias, so adding
+  # profiles never changes which one the planner teaches by default.
   tutorial_llm_profile = "tutorial"
   guardrail_profiles = jsonencode([
     {
