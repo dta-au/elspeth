@@ -1998,7 +1998,7 @@ The task definitions and bootstrap must not contain
 OCI digest
 `sha256:c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700`
 predates this contract. It is an acceptance-attempt artifact and is not
-eligible for `0.7.2-RC-280726`.
+eligible for `0.7.2-RC-290726`.
 
 Verify the baked trust root and its OCI CA labels against the candidate
 image directly:
