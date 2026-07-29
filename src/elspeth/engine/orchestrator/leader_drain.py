@@ -435,7 +435,8 @@ def run_end_of_input_barrier_flush(
     INSIDE the loop by the intake's §E.3a arm. Terminates because step 2
     guarantees nothing outside the loop can newly ``mark_blocked``.
     """
-    if not config.aggregation_settings and coalesce_executor is None:
+    row_union_executor = processor.row_union_executor
+    if not config.aggregation_settings and coalesce_executor is None and row_union_executor is None:
         return
 
     unquiesced = processor.count_unquiesced_scheduler_work()
@@ -487,7 +488,6 @@ def run_end_of_input_barrier_flush(
                 pending_tokens=pending_tokens,
             )
 
-        row_union_executor = processor.row_union_executor
         if row_union_executor is not None:
             flush_row_union_pending(
                 row_union_executor=row_union_executor,

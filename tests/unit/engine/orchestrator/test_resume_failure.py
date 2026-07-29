@@ -82,6 +82,13 @@ def _make_orchestrator(db: LandscapeDB | None = None) -> Orchestrator:
     return Orchestrator(db)
 
 
+def _mock_processor() -> MagicMock:
+    """Create a RowProcessor mock with optional runtime collaborators absent."""
+    processor = MagicMock(spec=RowProcessor)
+    processor.row_union_executor = None
+    return processor
+
+
 def _insert_failed_run(db: LandscapeDB, run_id: str) -> None:
     """Insert the FAILED ``runs`` row the resume-under-test claims to resume.
 
@@ -450,7 +457,7 @@ class TestResumeFinalizesAsFailed:
 
     def test_resume_loop_drains_scheduler_work_before_replaying_rows(self) -> None:
         """Persisted scheduler work supersedes the old unprocessed-row replay path."""
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
         processor.has_scheduled_work.return_value = True
         processor.has_unresolved_scheduler_work.return_value = False
         processor.active_scheduled_row_ids.return_value = frozenset({"row-should-not-replay"})
@@ -501,7 +508,7 @@ class TestResumeFinalizesAsFailed:
         """Run-level scheduler presence must not suppress uncovered recovery rows."""
         from elspeth.contracts.errors import AuditIntegrityError
 
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
         processor.has_scheduled_work.return_value = True
         processor.active_scheduled_row_ids.return_value = frozenset({"row-scheduled"})
         processor.drain_scheduled_work.return_value = [make_row_result({"value": 1}, sink_name="default")]
@@ -555,7 +562,7 @@ class TestResumeFinalizesAsFailed:
         orch = _make_orchestrator(make_landscape_db())
         source = _specced_source()
         source.on_success = "default"
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
         processor.run_id = "run-with-blocked-work"
         processor.has_scheduled_work.return_value = True
         processor.has_unresolved_scheduler_work.return_value = True
@@ -627,7 +634,7 @@ class TestResumeFinalizesAsFailed:
             transforms=(transform,),
             sinks={"default": sink},
         )
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
         processor.run_id = "run-resume-runtime-preflight-fails"
         artifacts = SimpleNamespace(
             source_id_map={"source": NodeID("source")},
@@ -724,7 +731,7 @@ class TestResumeFinalizesAsFailed:
 
     def test_resume_loop_uses_source_scoped_contract_for_each_replayed_row(self) -> None:
         """Replayed rows from different sources must keep their source-specific schema contract."""
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
         processor.has_scheduled_work.return_value = False
         processor.has_unresolved_scheduler_work.return_value = False
         processor.process_existing_row.return_value = []
@@ -812,7 +819,7 @@ class TestResumeFinalizesAsFailed:
             events.append(f"record:{kwargs['lifecycle_state']}")
 
         factory.run_lifecycle.record_run_source.side_effect = _record_run_source
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
 
         def _process_row(**kwargs):
             events.append("process")
@@ -855,6 +862,196 @@ class TestResumeFinalizesAsFailed:
         assert events == ["record:loading", "load", "process"]
         factory.run_lifecycle.record_run_source.assert_called_once()
 
+    def test_fresh_run_sweeps_row_union_timeouts_at_each_row_boundary(self) -> None:
+        """A continuously-ready source must not defer row_union timeouts to EOF."""
+        import threading
+
+        @contextmanager
+        def _source_operation(*args, **kwargs):
+            yield SimpleNamespace(operation=SimpleNamespace(operation_id="source-op-1"))
+
+        orch = _make_orchestrator(make_landscape_db())
+        source_contract = _observed_contract("value", int)
+        source = _specced_source(output_schema=MagicMock(spec=BaseModel))
+        source.name = "rows"
+        source.config = {}
+        source.on_success = "default"
+        source.output_schema.model_json_schema.return_value = {"type": "object"}
+        source.get_schema_contract.return_value = source_contract
+        source.get_field_resolution.return_value = None
+        config = PipelineConfig(
+            sources={"rows": source},
+            transforms=(),
+            sinks={"default": _specced_sink()},
+        )
+        factory = MagicMock(spec=RecorderFactory)
+        shutdown = threading.Event()
+        processor = _mock_processor()
+        row_union_executor = MagicMock()
+        row_union_executor.has_timeout_configured.return_value = False
+        row_union_executor.get_registered_names.return_value = ["variant_union"]
+        row_union_executor.check_timeouts.return_value = []
+        processor.row_union_executor = row_union_executor
+        processor.process_row.side_effect = lambda **kwargs: shutdown.set() or []
+        loop_ctx = LoopContext(
+            counters=ExecutionCounters(),
+            pending_tokens={"default": []},
+            processor=processor,
+            ctx=MagicMock(spec=PluginContext),
+            config=config,
+            agg_transform_lookup={},
+            coalesce_executor=None,
+            coalesce_node_map={},
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.source_iteration.track_operation", _source_operation),
+            patch.object(
+                orch._source_driver,
+                "load_source_with_events",
+                return_value=iter((make_source_row({"value": 1}, contract=source_contract),)),
+            ),
+        ):
+            orch._source_driver.run_main_processing_loop(
+                loop_ctx,
+                factory,
+                run_id="run-row-union-boundary",
+                source_id=NodeID("source-rows"),
+                edge_map={},
+                active_source_name="rows",
+                active_source=source,
+                shutdown_event=shutdown,
+            )
+
+        assert shutdown.is_set()
+        row_union_executor.check_timeouts.assert_called_once_with("variant_union")
+
+    def test_row_union_timeout_alone_enables_idle_source_sweeps(self) -> None:
+        """A row_union-only pipeline must sweep while blocked fetching its first row."""
+        import threading
+
+        @contextmanager
+        def _source_operation(*args, **kwargs):
+            yield SimpleNamespace(operation=SimpleNamespace(operation_id="source-op-1"))
+
+        orch = _make_orchestrator(make_landscape_db())
+        orch._source_driver._SOURCE_IDLE_POLL_INTERVAL_SECONDS = 0.01
+        source_contract = _observed_contract("value", int)
+        source = _specced_source(output_schema=MagicMock(spec=BaseModel))
+        source.name = "rows"
+        source.config = {}
+        source.on_success = "default"
+        source.output_schema.model_json_schema.return_value = {"type": "object"}
+        source.get_schema_contract.return_value = source_contract
+        source.get_field_resolution.return_value = None
+        config = PipelineConfig(
+            sources={"rows": source},
+            transforms=(),
+            sinks={"default": _specced_sink()},
+        )
+        factory = MagicMock(spec=RecorderFactory)
+        shutdown = threading.Event()
+        idle_sweep_seen = threading.Event()
+        processor = _mock_processor()
+        row_union_executor = MagicMock()
+        row_union_executor.has_timeout_configured.return_value = True
+        row_union_executor.get_registered_names.return_value = ["variant_union"]
+
+        def _check_timeouts(_name: str) -> list[object]:
+            idle_sweep_seen.set()
+            return []
+
+        row_union_executor.check_timeouts.side_effect = _check_timeouts
+        processor.row_union_executor = row_union_executor
+        processor.process_row.side_effect = lambda **kwargs: shutdown.set() or []
+        loop_ctx = LoopContext(
+            counters=ExecutionCounters(),
+            pending_tokens={"default": []},
+            processor=processor,
+            ctx=PluginContext(
+                run_id="run-row-union-idle",
+                config={},
+                node_id=NodeID("source-rows"),
+            ),
+            config=config,
+            agg_transform_lookup={},
+            coalesce_executor=None,
+            coalesce_node_map={},
+        )
+
+        def _blocked_first_row():
+            if not idle_sweep_seen.wait(0.5):
+                raise AssertionError("row_union timeout did not enable idle source polling")
+            yield make_source_row({"value": 1}, contract=source_contract)
+
+        with (
+            patch("elspeth.engine.orchestrator.source_iteration.track_operation", _source_operation),
+            patch.object(orch._source_driver, "load_source_with_events", return_value=_blocked_first_row()),
+        ):
+            orch._source_driver.run_main_processing_loop(
+                loop_ctx,
+                factory,
+                run_id="run-row-union-idle",
+                source_id=NodeID("source-rows"),
+                edge_map={},
+                active_source_name="rows",
+                active_source=source,
+                shutdown_event=shutdown,
+            )
+
+        assert idle_sweep_seen.is_set()
+
+    def test_resume_sweeps_row_union_timeouts_at_each_row_boundary(self) -> None:
+        """Resume replay must apply the same row_union timeout boundary as a fresh run."""
+        import threading
+
+        shutdown = threading.Event()
+        processor = _mock_processor()
+        processor.has_scheduled_work.return_value = False
+        processor.process_existing_row.side_effect = lambda **kwargs: shutdown.set() or []
+        row_union_executor = MagicMock()
+        row_union_executor.get_registered_names.return_value = ["variant_union"]
+        row_union_executor.check_timeouts.return_value = []
+        processor.row_union_executor = row_union_executor
+        config = PipelineConfig(
+            sources={"primary": _specced_source()},
+            transforms=(),
+            sinks={"default": _specced_sink()},
+        )
+        loop_ctx = LoopContext(
+            counters=ExecutionCounters(),
+            pending_tokens={"default": []},
+            processor=processor,
+            ctx=MagicMock(spec=PluginContext),
+            config=config,
+            agg_transform_lookup={},
+            coalesce_executor=None,
+            coalesce_node_map={},
+        )
+
+        interrupted = run_resume_processing_loop(
+            loop_ctx,
+            unprocessed_rows=(
+                ResumedRow(
+                    row_id="row-row-union-boundary",
+                    row_index=0,
+                    source_node_id=NodeID("source"),
+                    row_data={"value": 1},
+                ),
+            ),
+            incomplete_by_row={},
+            recovery_manager=MagicMock(spec=RecoveryManager),
+            payload_store=MockPayloadStore(),
+            run_id="run-row-union-resume-boundary",
+            resume_checkpoint_id="checkpoint-row-union-boundary",
+            schema_contracts_by_source={NodeID("source"): _observed_contract("value", int)},
+            source_on_success_by_source={NodeID("source"): "default"},
+            shutdown_event=shutdown,
+        )
+
+        assert interrupted is True
+        row_union_executor.check_timeouts.assert_called_once_with("variant_union")
+
     def test_source_exhaustion_is_recorded_before_eof_flush_failure(self) -> None:
         """A crash in EOF engine work must not look like an incomplete source load."""
 
@@ -891,7 +1088,7 @@ class TestResumeFinalizesAsFailed:
             events.append(f"record:{kwargs['lifecycle_state']}")
 
         factory.run_lifecycle.record_run_source.side_effect = _record_run_source
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
         processor.check_aggregation_timeout.return_value = (False, None)
         processor.process_row.side_effect = lambda **kwargs: events.append("process") or []
         # Slice 3 (ADR-030 §D): the EOF flush helper gates on journal
@@ -969,7 +1166,7 @@ class TestResumeFinalizesAsFailed:
         events: list[str] = []
         factory.run_lifecycle.update_run_source_contract.side_effect = lambda **kwargs: events.append("source_contract")
         factory.data_flow.update_node_output_contract.side_effect = lambda *args, **kwargs: events.append("node_contract")
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
 
         def _process_row(**kwargs):
             events.append("process")
@@ -1021,7 +1218,7 @@ class TestResumeFinalizesAsFailed:
             transforms=(),
             sinks={"sink": sink},
         )
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
         processor.run_id = "run-stuck-scheduler"
         processor.has_peer_active_leases.return_value = False
         processor.peer_lease_wait_budget_seconds.return_value = 0.0
@@ -1895,7 +2092,7 @@ class TestBuildProcessorCallsCleanupOnFailure:
             config_gate_id_map={},
             coalesce_id_map={},
         )
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
 
         with patch.object(orch._processor_factory, "build_processor", return_value=(processor, {}, None)):
             run_ctx = orch._context_factory.initialize_run_context(
@@ -2083,7 +2280,7 @@ class TestResumeLoopCoordinationLatch:
     @staticmethod
     def _make_loop_ctx(sink_name: str = "default") -> LoopContext:
         """Minimal LoopContext with a MagicMock processor that succeeds."""
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
         processor.has_scheduled_work.return_value = False
         processor.has_unresolved_scheduler_work.return_value = False
         # Return a single sink-bound row result for each process_existing_row call.
@@ -2226,7 +2423,7 @@ class TestResumeLoopCoordinationLatch:
         processing_order: list[str] = []
 
         # Capture when process_existing_row is called.
-        processor = MagicMock(spec=RowProcessor)
+        processor = _mock_processor()
         processor.has_scheduled_work.return_value = False
         processor.has_unresolved_scheduler_work.return_value = False
 

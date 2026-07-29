@@ -75,6 +75,7 @@ from elspeth.engine.orchestrator.leader_drain import run_end_of_input_barrier_fl
 from elspeth.engine.orchestrator.outcomes import (
     accumulate_row_outcomes,
     handle_coalesce_timeouts,
+    handle_row_union_timeouts,
 )
 from elspeth.engine.orchestrator.run_state import (
     GraphArtifacts,
@@ -234,6 +235,7 @@ def run_resume_processing_loop(
     coalesce_executor = loop_ctx.coalesce_executor
     coalesce_node_map = dict(loop_ctx.coalesce_node_map)
     agg_transform_lookup = dict(loop_ctx.agg_transform_lookup)
+    row_union_executor = processor.row_union_executor
 
     # A buffered-only resume can have zero unprocessed rows but still carry
     # restored aggregation/coalesce state. If shutdown is already requested,
@@ -371,6 +373,13 @@ def run_resume_processing_loop(
                 ctx=ctx,
                 counters=counters,
                 pending_tokens=pending_tokens,
+            )
+
+        if row_union_executor is not None:
+            handle_row_union_timeouts(
+                row_union_executor=row_union_executor,
+                processor=processor,
+                counters=counters,
             )
 
         # ─────────────────────────────────────────────────────────────

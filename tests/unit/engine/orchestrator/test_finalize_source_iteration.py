@@ -105,6 +105,10 @@ class _CoalesceExecutorSentinel:
     pass
 
 
+class _RowUnionExecutorSentinel:
+    pass
+
+
 class _AggregationSettingSentinel:
     pass
 
@@ -355,6 +359,41 @@ class TestFinalizeSourceIterationContext:
             )
 
         flush_coalesce.assert_called_once()
+
+    def test_row_union_flush_runs_at_true_end_of_input_without_other_barriers(self) -> None:
+        """A row_union-only pipeline must enter the EOF barrier flush."""
+        ctx = PluginContext(
+            run_id="test-run",
+            config={},
+            node_id="transform-residue",
+            operation_id=None,
+        )
+        orchestrator = _make_orchestrator()
+        loop_ctx = _make_loop_ctx(ctx)
+        row_union_executor = _RowUnionExecutorSentinel()
+        loop_ctx.processor.row_union_executor = row_union_executor
+
+        with patch("elspeth.engine.orchestrator.leader_drain.flush_row_union_pending") as flush_row_union:
+            orchestrator._source_driver.finalize_source_iteration(
+                loop_ctx,
+                factory=_RecorderFactoryDouble(),
+                run_id="test-run",
+                source_id=NodeID("source-refunds"),
+                active_source_name="refunds",
+                source_operation_id="op-source-load-refunds",
+                recorded_field_resolution=None,
+                schema_contract_recorded=True,
+                source_exhausted=True,
+                interrupted_by_shutdown=False,
+                flush_end_of_input=True,
+                active_source=_make_active_source(),
+            )
+
+        flush_row_union.assert_called_once_with(
+            row_union_executor=row_union_executor,
+            processor=loop_ctx.processor,
+            counters=loop_ctx.counters,
+        )
 
     def test_aggregation_flush_is_skipped_for_source_local_finalization(self) -> None:
         """Multi-source source completion must not flush shared aggregations."""

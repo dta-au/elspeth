@@ -175,6 +175,16 @@ class TestLateArrival:
 
 
 class TestTimeouts:
+    def test_reports_whether_any_registered_barrier_has_a_timeout(self) -> None:
+        without_timeout, _execution, _data_flow, _clock = _make_executor()
+        _register(without_timeout)
+        assert hasattr(without_timeout, "has_timeout_configured"), "RowUnionExecutor must expose timeout presence to source idle polling"
+        assert without_timeout.has_timeout_configured() is False
+
+        with_timeout, _execution, _data_flow, _clock = _make_executor()
+        _register(with_timeout, _make_settings(timeout_seconds=5.0))
+        assert with_timeout.has_timeout_configured() is True
+
     def test_timeout_fails_whole_group(self) -> None:
         clock = MockClock(start=100.0)
         executor, execution, data_flow, _ = _make_executor(clock=clock)

@@ -156,6 +156,10 @@ class RowUnionExecutor:
         """Names of all registered row_union barriers."""
         return list(self._settings.keys())
 
+    def has_timeout_configured(self) -> bool:
+        """Return whether any registered row_union needs wall-clock polling."""
+        return any(settings.timeout_seconds is not None for settings in self._settings.values())
+
     def node_id_for(self, row_union_name: str) -> NodeID:
         """Graph node id for a registered row_union barrier."""
         if row_union_name not in self._node_ids:

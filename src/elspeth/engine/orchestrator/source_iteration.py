@@ -60,6 +60,7 @@ from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
     PipelineConfig,
 )
+from elspeth.engine.row_union_executor import RowUnionExecutor
 from elspeth.engine.spans import SpanFactory
 
 if TYPE_CHECKING:
@@ -111,13 +112,19 @@ class SourceIterationDriver:
         ctx.node_id = source_id
         ctx.operation_id = source_operation_id
 
-    def _requires_idle_aggregation_polling(self, config: PipelineConfig) -> bool:
+    def _requires_idle_aggregation_polling(
+        self,
+        config: PipelineConfig,
+        *,
+        row_union_executor: RowUnionExecutor | None = None,
+    ) -> bool:
         """Return True when the pipeline has time-sensitive buffered work."""
         has_aggregation_timeout = any(
             settings.trigger.has_timeout or settings.trigger.has_condition for settings in config.aggregation_settings.values()
         )
         has_coalesce_timeout = any(settings.timeout_seconds is not None for settings in config.coalesce_settings)
-        return has_aggregation_timeout or has_coalesce_timeout
+        has_row_union_timeout = row_union_executor is not None and row_union_executor.has_timeout_configured() is True
+        return has_aggregation_timeout or has_coalesce_timeout or has_row_union_timeout
 
     def _idle_timeout_context(self, source_ctx: PluginContext) -> PluginContext:
         """Create an isolated context for idle timeout work.
@@ -507,6 +514,7 @@ class SourceIterationDriver:
         coalesce_executor = loop_ctx.coalesce_executor
         coalesce_node_map = dict(loop_ctx.coalesce_node_map)
         agg_transform_lookup = dict(loop_ctx.agg_transform_lookup)
+        row_union_executor = processor.row_union_executor
 
         start_time = time.perf_counter()
         last_progress_time = start_time
@@ -539,7 +547,10 @@ class SourceIterationDriver:
             )
 
             source_iterator = self.load_source_with_events(run_id, ctx, active_source=active_source)
-            use_idle_polling = self._requires_idle_aggregation_polling(config)
+            use_idle_polling = self._requires_idle_aggregation_polling(
+                config,
+                row_union_executor=row_union_executor,
+            )
             idle_pump: IdleTimeoutPump | None = None
             if use_idle_polling:
                 # ONE persistent idle-flush worker for the whole run; the two
@@ -713,6 +724,13 @@ class SourceIterationDriver:
                                 ctx=ctx,
                                 counters=counters,
                                 pending_tokens=pending_tokens,
+                            )
+
+                        if row_union_executor is not None:
+                            handle_row_union_timeouts(
+                                row_union_executor=row_union_executor,
+                                processor=processor,
+                                counters=counters,
                             )
 
                         last_progress_time = self.maybe_emit_progress(

@@ -707,6 +707,83 @@ def test_complete_barrier_emitted_ready_inserts_ready_rows_with_enqueue_events()
     assert claimed.token_id == "t-next"
 
 
+def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> None:
+    """Same-row row_union continuations must not fall through to token-hash order."""
+    engine, repo = _make_repo()
+    payload = _seed_run_grouped(
+        engine,
+        run_id=RUN_ID,
+        rows=[("r1", 0)],
+        tokens=[
+            ("r1", "held-a"),
+            ("r1", "held-b"),
+            ("r1", "token-a"),
+            ("r1", "token-b"),
+        ],
+        now=NOW,
+    )
+    _enqueue_and_block(
+        repo,
+        token_id="held-a",
+        row_id="r1",
+        ingest_sequence=0,
+        payload=payload,
+        now=NOW,
+        barrier_key="variant_union",
+    )
+    _enqueue_and_block(
+        repo,
+        token_id="held-b",
+        row_id="r1",
+        ingest_sequence=0,
+        payload=payload,
+        now=NOW,
+        barrier_key="variant_union",
+    )
+
+    repo.complete_barrier(
+        run_id=RUN_ID,
+        barrier_key="variant_union",
+        consumed_token_ids=["held-a", "held-b"],
+        emitted_pending_sink=[],
+        emitted_ready=[
+            BarrierEmission(
+                token_id="token-a",
+                row_id="r1",
+                row_payload_json=payload,
+                node_id="normalize",
+                step_index=2,
+                ingest_sequence=0,
+                branch_name="control",
+            ),
+            BarrierEmission(
+                token_id="token-b",
+                row_id="r1",
+                row_payload_json=payload,
+                node_id="normalize",
+                step_index=2,
+                ingest_sequence=0,
+                branch_name="treatment",
+            ),
+        ],
+        now=NOW,
+        scope_row_id="r1",
+        coordination_token=COORD_TOKEN,
+    )
+
+    first_row = _row_for_token(engine, "token-a")
+    second_row = _row_for_token(engine, "token-b")
+    assert first_row["work_item_id"] > second_row["work_item_id"], (
+        "test tokens must collide against declared order under the hash tiebreaker"
+    )
+
+    claimed = [
+        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30, now=NOW + timedelta(seconds=3)),
+        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30, now=NOW + timedelta(seconds=3)),
+    ]
+    assert [item.token_id if item is not None else None for item in claimed] == ["token-a", "token-b"]
+
+
 def test_complete_barrier_rejects_duplicate_consumed_token_ids() -> None:
     engine, repo = _make_repo()
     _seed_three_blocked(engine, repo)
