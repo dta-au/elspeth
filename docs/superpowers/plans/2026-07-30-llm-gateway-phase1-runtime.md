@@ -347,7 +347,7 @@ def parse_strict_json(raw: bytes, *, max_bytes: int) -> Any:
   - `class UpstreamClient: def __init__(self, config, token_manager, client: httpx.AsyncClient)`
   - `async def invoke(self, plan: InvokePlan) -> UpstreamResult`:
     1. URL = `f"{config.upstream_origin}/{plan.path}"`; assert resulting URL still starts with `upstream_origin + "/"`.
-    2. Headers = plan.headers + `Authorization: Bearer <token>` + `Content-Type: application/json`. (InvokePlan already forbids adapter Authorization; transport asserts again defensively.)
+    2. Headers = plan.headers + `Authorization: Bearer <token>` + `Content-Type: application/json`. **Transport MUST re-validate `plan.headers` at send time** — forbidden names (authorization/host/cookie/x-forwarded-for, case-insensitive) and the 1024-char value cap — because `InvokePlan` is frozen but its `headers` dict is mutable: an adapter can mutate it after construction, so construction-time validation alone is bypassable. Test: build a valid plan, mutate `plan.headers["authorization"] = "x"` post-construction, assert `invoke` raises `GatewayError(INTERNAL_ERROR)` without any HTTP call.
     3. `follow_redirects=False`; 3xx → `GatewayError(UPSTREAM_RESPONSE_INVALID)`.
     4. On 401: `token_manager.invalidate()`, fetch fresh token, replay ONCE; second 401 → `GatewayError(UPSTREAM_UNAUTHORIZED)`.
     5. `httpx.TimeoutException` → `UPSTREAM_TIMEOUT`; `httpx.TransportError` → `UPSTREAM_UNAVAILABLE`; 429 → `UPSTREAM_RATE_LIMITED`. NO retry/replay for any of these (respx call_count == 1). **CAUTION: `httpx.TimeoutException` IS a subclass of `httpx.TransportError` — catch it FIRST or every timeout becomes `upstream_unavailable`.**
