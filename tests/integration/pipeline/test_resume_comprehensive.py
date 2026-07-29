@@ -292,6 +292,7 @@ class _ResumeLoopContextFake:
 @dataclass(frozen=True, slots=True)
 class _ResumeLoopProcessorFake:
     run_id: str
+    row_union_executor = None
 
     def has_scheduled_work(self) -> bool:
         return False

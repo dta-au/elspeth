@@ -3402,13 +3402,29 @@ class RowProcessor:
     ) -> tuple[WorkItem, ...]:
         """Build READY continuations for a released group, in declared order.
 
-        Continuations start AT the row_union node with NO row_union fields —
-        the barrier is passed, so traversal steps straight through the
-        structural node to the on_success consumer instead of re-entering
-        the barrier (released tokens still carry branch_name).
+        Continuations start at the node AFTER the barrier, with no row_union
+        fields: the barrier is passed (the executor already completed each
+        member's node state there), so the group must not re-enter it —
+        released tokens still carry ``branch_name``.
+
+        The cursor must ADVANCE rather than sit on the union node. Unlike
+        coalesce — whose merged output is a fresh ``token_id`` — a row_union
+        releases the ORIGINAL tokens, so a continuation parked on the union
+        node would derive the same ``work_item_id``
+        (run_id, token_id, node_id, attempt) as the very BLOCKED row this
+        fire consumes. For an identity branch, whose blocked row already
+        sits on the union node, that collides inside the atomic completion
+        and the emission is rejected as a duplicate audit write.
         """
         union_node_id = self._row_union_node_ids[row_union_name]
-        return tuple(self._work_items.create(token=token, current_node_id=union_node_id) for token in released_tokens)
+        continuation_node_id = self._nav.resolve_next_node(union_node_id)
+        if continuation_node_id is None:
+            raise OrchestrationInvariantError(
+                f"row_union '{row_union_name}' has no downstream node to release into. "
+                "A row_union must continue on a processing connection; terminal "
+                "row_union -> sink release is rejected at build time."
+            )
+        return tuple(self._work_items.create(token=token, current_node_id=continuation_node_id) for token in released_tokens)
 
     def complete_coalesce_merge(
         self,
@@ -3683,10 +3699,17 @@ class RowProcessor:
         raise OrchestrationInvariantError(f"Cannot schedule unknown node cursor {node_id!r}")
 
     def _queue_key_for_blocked_item(self, item: WorkItem) -> str | None:
-        """Return a queue key for structural queue blocking, if applicable."""
+        """Return a queue key for structural queue blocking, if applicable.
+
+        Barrier-bound items are excluded by BOTH barrier kinds: an identity
+        fork branch is parked AT its barrier node (the gate->barrier COPY
+        edge carries no intermediate transform), so without the row_union
+        arm such an item blocks under a structural queue key with a NULL
+        barrier_key and its group is never adopted by the intake.
+        """
         if item.current_node_id is None:
             return None
-        if item.current_node_id in self._structural_node_ids and item.coalesce_name is None:
+        if item.current_node_id in self._structural_node_ids and item.coalesce_name is None and item.row_union_name is None:
             return str(item.current_node_id)
         return None
 
