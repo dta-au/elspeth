@@ -18,6 +18,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPlan,
     SinkEffectReconcileResult,
 )
+from elspeth.plugins.sinks.aws_s3_sink import S3ConditionalWriteRejectedError
 from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._aws_ecs_acceptance import s3
 from elspeth.web._aws_ecs_acceptance.contracts import FORBIDDEN_AWS_OVERRIDE_ENV, AcceptanceCheckError
@@ -104,6 +105,10 @@ class _EffectS3SinkBase:
 
     def prepare_effect(self, request: object, _ctx: object) -> SinkEffectPlan:
         self.events.append(f"sink-{self.index}-prepare")
+        if self.index == 3:
+            # The third drive is the genuine-collision probe (different
+            # content, same key): the real sink rejects it at prepare.
+            raise S3ConditionalWriteRejectedError from None
         effect_id = request.effect_id  # type: ignore[attr-defined]
         target = f"s3://acceptance-bucket/{_S3_PREFIX}/verify-s3.jsonl"
         digest = "b" * 64 if self.failure == "integrity" and self.index == 1 else _S3_HASH
@@ -199,7 +204,11 @@ def test_verify_s3_round_trips_with_bounded_default_chain_plugin_configs_and_cle
         "max_object_bytes": 4096,
         "max_record_chars": 256,
     }
-    assert sink_configs == [{**expected_common, "overwrite": False}, {**expected_common, "overwrite": False}]
+    assert sink_configs == [
+        {**expected_common, "overwrite": False},
+        {**expected_common, "overwrite": False},
+        {**expected_common, "overwrite": False},
+    ]
     assert source_configs == [{**expected_common, "on_validation_failure": "discard"}]
     assert receipt == {
         "object_count": 1,
@@ -217,8 +226,11 @@ def test_verify_s3_round_trips_with_bounded_default_chain_plugin_configs_and_cle
         "sink-2-inspect",
         "sink-2-prepare",
         "sink-2-reconcile",
+        "sink-3-inspect",
+        "sink-3-prepare",
         "source-close",
         "sink-2-close",
+        "sink-3-close",
         "sink-1-close",
         "cleanup-client:ap-southeast-2:None",
         "delete",
@@ -424,7 +436,7 @@ def test_verify_s3_cleanup_continues_after_resource_close_failure_and_fails_clos
             s3_client_factory=lambda _region, _endpoint: _S3CleanupClient(events),
         )
 
-    assert events.count("sink-close") == 2
+    assert events.count("sink-close") == 3
     assert "source-close" in events
     assert "delete" in events
     assert "head" in events
