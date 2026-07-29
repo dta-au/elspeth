@@ -307,7 +307,7 @@ git commit -m "feat(textract): define secure plugin configuration"
 - Create: `tests/unit/plugins/transforms/aws/test_textract_result.py`
 - Create: `tests/property/plugins/transforms/aws/test_textract_result_properties.py`
 
-- [ ] **Step 1: Write failing text/page/native-result tests**
+- [x] **Step 1: Write failing text/page/native-result tests**
 
 Create `tests/unit/plugins/transforms/aws/test_textract_result.py` with a two-page synthetic response. Use only provider-shaped dictionaries, including `PAGE` child relationships to `LINE` blocks and line child relationships to `WORD` blocks. Assert:
 
@@ -355,7 +355,7 @@ def test_duplicate_block_id_fails_closed() -> None:
 
 Add focused failing cases for page-count disagreement, missing required keys, non-list blocks, dangling relationships, invalid page/confidence/geometry values, too many blocks, and an oversized aggregate.
 
-- [ ] **Step 2: Run parser tests and verify import failure**
+- [x] **Step 2: Run parser tests and verify import failure**
 
 Run:
 
@@ -365,7 +365,7 @@ pytest tests/unit/plugins/transforms/aws/test_textract_result.py -q
 
 Expected: collection fails because `textract_result.py` does not exist.
 
-- [ ] **Step 3: Implement aggregation primitives and text/page projection**
+- [x] **Step 3: Implement aggregation primitives and text/page projection**
 
 Create `src/elspeth/plugins/transforms/aws/textract_result.py` with:
 
@@ -416,7 +416,7 @@ Implement strict helpers `_mapping`, `_sequence`, `_required_str`, `_optional_st
 
 Require every result page to be `SUCCEEDED`, require stable page count/model version, concatenate blocks in API order, reject duplicate IDs, then compare PAGE blocks with `DocumentMetadata.Pages`. Build page text from `LINE` blocks in provider arrival order and join pages with `"\n\f\n"`. Use `canonical_json(native_result).encode("utf-8")` for the final exact size check.
 
-- [ ] **Step 4: Run text/page parser tests**
+- [x] **Step 4: Run text/page parser tests**
 
 Run:
 
@@ -426,11 +426,11 @@ pytest tests/unit/plugins/transforms/aws/test_textract_result.py -q
 
 Expected: the text/page/native tests pass; facet tests added next are still absent.
 
-- [ ] **Step 5: Add failing table/form/query/signature/layout tests**
+- [x] **Step 5: Add failing table/form/query/signature/layout tests**
 
 Extend the fixture with `TABLE`, `CELL`, `KEY_VALUE_SET`, `QUERY`, `QUERY_RESULT`, `SIGNATURE`, and `LAYOUT_*` blocks. Assert exact normalized dictionaries from the approved specification, including sparse cell coordinates, an unanswered query with null answer fields, and a valid form key without a value. Add failures for duplicate cell coordinates, non-positive spans, query results linked from the wrong block type, and cyclic child relationships.
 
-- [ ] **Step 6: Implement all facet projections**
+- [x] **Step 6: Implement all facet projections**
 
 Add `_project_tables`, `_project_forms`, `_project_queries`, `_project_signatures`, and `_project_layout`, each returning `tuple[dict[str, Any], ...]`. Their exact algorithms are:
 
@@ -442,11 +442,11 @@ Add `_project_tables`, `_project_forms`, `_project_queries`, `_project_signature
 
 Every function validates each consumed member, retains provider order within a page, and orders page groups numerically. `_text_from_children` carries an active-ID recursion set so relationship cycles raise `MalformedTextractResponse` instead of recursing.
 
-- [ ] **Step 7: Add property tests for pagination cuts and mapping order**
+- [x] **Step 7: Add property tests for pagination cuts and mapping order**
 
 Create `tests/property/plugins/transforms/aws/test_textract_result_properties.py`. Generate a fixed semantic block sequence, split it at Hypothesis-generated cut points, independently shuffle dictionary insertion order, and assert `text`, all facet tuples, metadata, and native block order are identical. Do not shuffle the provider block sequence itself because provider arrival order is part of the public contract.
 
-- [ ] **Step 8: Run pure parser tests**
+- [x] **Step 8: Run pure parser tests**
 
 Run:
 
@@ -456,7 +456,7 @@ pytest tests/unit/plugins/transforms/aws/test_textract_result.py tests/property/
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit Task 2**
+- [x] **Step 9: Commit Task 2**
 
 ```bash
 git add src/elspeth/plugins/transforms/aws/textract_result.py tests/unit/plugins/transforms/aws/test_textract_result.py tests/property/plugins/transforms/aws/test_textract_result_properties.py
