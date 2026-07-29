@@ -5,9 +5,11 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 from elspeth.web._aws_ecs_acceptance import scenario_inventory, task_definition
@@ -862,7 +864,37 @@ def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permis
     assert "terraform state rm" not in readme
 
 
-def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs() -> None:
+@pytest.fixture(scope="module")
+def initialized_scenario_a() -> Path:
+    """Make ``terraform test`` runnable in any checkout, not just an initialised one.
+
+    ``terraform test`` requires the working directory to be initialised so the
+    local ``../modules/scenario`` reference resolves, and ``.terraform/`` is
+    untracked. A fresh ``git worktree`` or a clean CI checkout therefore has
+    none, and the command fails with "This module is not yet installed" — a
+    setup failure wearing the costume of a contract failure. Initialising here
+    keeps the assertion real instead of skipping past it.
+
+    ``-backend=false`` is deliberate: the scenario root declares a partial S3
+    backend, and a contract test must never reach for remote state or
+    credentials.
+    """
+    directory = PACKAGE / "scenario-a"
+    if shutil.which("terraform") is None:
+        pytest.skip("terraform is not installed, so the native mock-plan contract cannot be exercised")
+    if not (directory / ".terraform").is_dir():
+        result = subprocess.run(
+            ["terraform", f"-chdir={directory}", "init", "-backend=false", "-input=false", "-no-color"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode == 0, "terraform init failed:\n" + result.stdout + result.stderr
+    return directory
+
+
+def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs(initialized_scenario_a: Path) -> None:
     native_test = PACKAGE / "scenario-a" / "codeblind.tftest.hcl"
     assert native_test.is_file()
     content = native_test.read_text(encoding="utf-8")
@@ -882,7 +914,7 @@ def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs() -> No
         assert forbidden not in content
 
     result = subprocess.run(
-        ["terraform", f"-chdir={PACKAGE / 'scenario-a'}", "test", "-filter=codeblind.tftest.hcl", "-no-color"],
+        ["terraform", f"-chdir={initialized_scenario_a}", "test", "-filter=codeblind.tftest.hcl", "-no-color"],
         check=False,
         capture_output=True,
         text=True,
