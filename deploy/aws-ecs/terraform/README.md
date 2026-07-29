@@ -335,7 +335,7 @@ Only the baked, root-owned, 0444 image path above is trusted.
 OCI digest
 `sha256:c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700`
 predates this contract. It is an acceptance-attempt artifact and is not
-eligible for `0.7.2-RC-280726`.
+eligible for `0.7.2-RC-290726`.
 
 Before promoting a candidate, verify the baked bundle, the OCI CA labels, the
 live Aurora CA identifier, and the `readonlyRootFilesystem` split:

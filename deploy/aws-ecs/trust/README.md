@@ -26,6 +26,8 @@ SHA-256 (or certificate count) appears — all in the same commit:
 - the active implementation-plan document, if one is in flight
 
 `.github/workflows/build-push.yaml` reads the expected digest from the
-committed sidecar and needs no edit. Then build a new image digest and repeat
-the complete source-free AWS production qualification before moving a release
-tag.
+committed sidecar and needs no edit for that value, but its acceptance job
+hardcodes the certificate count (108) and the CA identifier
+(`rds-ca-rsa2048-g1`) in two places (build and push jobs) and both must be
+updated to match. Then build a new image digest and repeat the complete
+source-free AWS production qualification before moving a release tag.
