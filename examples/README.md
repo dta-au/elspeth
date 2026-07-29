@@ -26,7 +26,7 @@ These examples run locally with no credentials or external services.
 | [`error_routing`](error_routing/) | `on_error` diversion to quarantine sinks |
 | [`deep_routing`](deep_routing/) | 5 chained gates, 3 transforms, 7 sinks — complex decision tree |
 | [`fork_coalesce`](fork_coalesce/) | Fork/join DAG pattern — parallel paths merged with configurable policy (includes ARCH-15 per-branch transforms variant) |
-| [`row_union_ab_experiment`](row_union_ab_experiment/) | Fork-based A/B experiment — `row_union` releases both variant branches as one group in long format for cross-variant statistics |
+| [`row_union_ab_experiment`](row_union_ab_experiment/) | Fork-based A/B experiment — `row_union` releases both variant branches as one correlated group in long format; variants cover pooled and paired statistics, screening with reject routing, and list-form branches |
 | [`batch_aggregation`](batch_aggregation/) | Count-triggered aggregation with group-by statistics |
 | [`report_assemble`](report_assemble/) | Assemble text rows into paginated markdown reports with flush metadata |
 | [`statistical_batch_plugins`](statistical_batch_plugins/) | Statistical batch QA: distributions, experiments, classifier metrics, paired preferences, drift, outliers, data quality, top-k, thresholds, and effect sizes |

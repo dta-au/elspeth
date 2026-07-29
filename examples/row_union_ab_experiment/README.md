@@ -35,9 +35,76 @@ deterministic expressions here so the example runs offline with no external serv
 
 ## Running
 
+Run one settings file at a time:
+
 ```bash
 elspeth run --settings examples/row_union_ab_experiment/settings.yaml --execute
 ```
+
+## Variants
+
+Four configurations, each exercising a different part of the barrier's contract.
+
+### 1. `settings.yaml` — pooled comparison (start here)
+
+Dict-form branches with a per-variant transform chain, feeding
+`batch_experiment_compare`. 8 tickets → 16 long-format rows → one comparison row.
+
+### 2. `settings_paired_preference.yaml` — within-ticket comparison
+
+The same topology feeding `batch_paired_preference`, which joins on
+`pair_field: id` and compares the two variants *within* each ticket.
+
+```bash
+elspeth run --settings examples/row_union_ab_experiment/settings_paired_preference.yaml --execute
+```
+
+This is the sharpest test of what `row_union` guarantees: a ticket whose two
+variants were split across batch boundaries would silently contribute nothing to
+the tally. Uses `paired_input.csv`, whose explicit per-ticket `treatment_delta`
+makes the outcome mixed — 6 wins, 2 losses, `win_rate 0.75` — because a uniform
+sweep could not distinguish working pairing from broken pairing.
+
+### 3. `settings_screened.yaml` — success and reject routing
+
+A production-shaped topology where a `quality_screen` gate inside the control
+branch routes tickets below a quality floor to a `screened_out` sink.
+
+```bash
+elspeth run --settings examples/row_union_ab_experiment/settings_screened.yaml --execute
+```
+
+Those tickets' control tokens never reach the barrier, so their groups cannot
+complete. `row_union` is require-all and fails **closed**: the orphaned treatment
+sibling is failed with an audit record naming the loss, rather than being released
+alone to contribute a half-group observation. The run ends `PARTIAL`:
+
+```
+⚠ Run PARTIAL: 8 rows processed | ✓4 succeeded | ✗3 failed | →3 routed (screened_out:3)
+```
+
+3 of 8 tickets are screened out, so the comparison is computed over the 5
+surviving tickets (`batch_size: 10`) — the correct answer, not a silently biased
+one. The barrier's own adjudication is in the audit trail: 10 completed node
+states and 3 failed, each carrying `failure_reason: row_union_branch_lost`.
+
+### 4. `settings_identity_branches.yaml` — list-form branches
+
+The ergonomic list form, `branches: [replica_a, replica_b]`, where each branch
+runs straight from the fork gate to the barrier with no transform chain.
+
+```bash
+elspeth run --settings examples/row_union_ab_experiment/settings_identity_branches.yaml --execute
+```
+
+This isolates the cardinality contract: no merging, no field synthesis, no
+per-branch processing — 8 source rows become 16 released tokens, all written.
+Contrast with [`fork_coalesce`](../fork_coalesce/), where the same fork shape
+yields 8 rows because coalesce collapses each pair into one.
+
+Use the list form when both branches carry identical payloads (redundancy
+fan-out, or duplicating a row for two sinks); use the dict form when each branch
+needs its own transform chain.
 
 ## Output
 

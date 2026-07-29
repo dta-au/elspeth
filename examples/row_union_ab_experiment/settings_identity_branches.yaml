@@ -1,0 +1,79 @@
+# Row Union Variant — Identity Branches (list form)
+#
+# The ergonomic list form: `branches: [replica_a, replica_b]`, normalised to an
+# identity mapping. Each branch travels straight from the fork gate to the
+# barrier over a direct COPY edge, with no per-branch transform chain.
+#
+#   source ─> [duplicate_fork] ─┬─ replica_a ─┐
+#                                └─ replica_b ─┤
+#                                              ├─ [replica_union] ─> stamp_replica ─> output
+#
+# WHAT THIS DEMONSTRATES: the barrier's cardinality contract in isolation.
+# There is no merging, no field synthesis and no per-branch processing — 8
+# source rows become 8 correlated pairs, and all 16 tokens are released and
+# written. Compare with fork_coalesce, where the same fork shape yields 8 rows
+# because coalesce collapses each pair into one.
+#
+# Use the list form when both branches should carry identical payloads (fan-out
+# for redundancy, or duplicating a row for two different downstream sinks), and
+# the dict form in settings.yaml when each branch needs its own transform chain.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: routed
+    options:
+      path: examples/row_union_ab_experiment/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'ticket: str'
+        - 'baseline_quality: int'
+      on_validation_failure: discard
+
+gates:
+- name: duplicate_fork
+  input: routed
+  condition: "True"
+  routes:
+    'true': fork
+    'false': output
+  fork_to:
+    - replica_a
+    - replica_b
+
+row_unions:
+# List form: each branch name is its own input connection. Declared order is
+# release order, so replica_a precedes replica_b for every source row.
+- name: replica_union
+  branches: [replica_a, replica_b]
+  on_success: union_out
+
+transforms:
+# Runs once per RELEASED token — 16 executions for 8 source rows. Each token
+# keeps its own branch identity, which the barrier preserves rather than merges.
+- name: stamp_replica
+  plugin: value_transform
+  input: union_out
+  on_success: output
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: replica_of
+      expression: "row['id']"
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/row_union_ab_experiment/output/replicas.json
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/row_union_ab_experiment/runs/identity_branches.db

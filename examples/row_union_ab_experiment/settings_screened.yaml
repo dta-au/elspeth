@@ -1,0 +1,136 @@
+# Row Union Variant — Screening Gate With Success And Reject Routing
+#
+# A production-shaped topology: tickets below a quality floor are screened out
+# of the experiment rather than scored, so the run exercises BOTH the success
+# path and a reject path.
+#
+#   source ─> [variant_fork] ─┬─ control_branch ──> tag_control ─> [quality_screen] ─┬─(pass)─┐
+#                              │                                                      └─(fail)─> screened_out
+#                              └─ treatment_branch ─> tag_treatment ──────────────────────────┐
+#                                                                                    ├─ [variant_union]
+#                                          ─(experiment_in)─> [prompt_experiment] ─> output
+#
+# WHAT THIS DEMONSTRATES: what a row_union does when one arm of a correlated
+# group legitimately leaves the pipeline.
+#
+# `quality_screen` routes tickets whose baseline_quality is below 60 to the
+# `screened_out` sink. Those tickets' control tokens never reach the barrier,
+# so their groups can never be completed. row_union is require_all and fails
+# CLOSED: the orphaned treatment sibling is failed with an audit record naming
+# the branch loss, rather than being released alone and silently contributing a
+# half-group observation to the statistics.
+#
+# With this input, 3 of 8 tickets are screened out (quality 45, 53, 58), so:
+#   - 5 tickets release as complete pairs  -> 10 rows into batch_experiment_compare
+#   - 3 control tokens land in screened_out
+#   - 3 treatment tokens fail closed at the barrier (visible in the audit trail)
+#
+# The comparison is therefore computed over the 5 surviving tickets only —
+# which is the correct answer, not a silently biased one.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: routed
+    options:
+      path: examples/row_union_ab_experiment/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'ticket: str'
+        - 'baseline_quality: int'
+      on_validation_failure: discard
+
+gates:
+- name: variant_fork
+  input: routed
+  condition: "True"
+  routes:
+    'true': fork
+    'false': output
+  fork_to:
+    - control_branch
+    - treatment_branch
+
+# Screening lives INSIDE the control branch, between its transform and the
+# barrier — the branch chain may contain gates, not just transforms.
+- name: quality_screen
+  input: control_tagged
+  condition: "row['baseline_quality'] >= 60"
+  routes:
+    'true': control_scored
+    'false': screened_out
+
+transforms:
+- name: tag_control
+  plugin: value_transform
+  input: control_branch
+  on_success: control_tagged
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'control'"
+    - target: score
+      expression: "row['baseline_quality'] * 1.0"
+
+- name: tag_treatment
+  plugin: value_transform
+  input: treatment_branch
+  on_success: treatment_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'treatment'"
+    - target: score
+      expression: "row['baseline_quality'] * 1.25"
+
+row_unions:
+- name: variant_union
+  branches:
+    control_branch: control_scored
+    treatment_branch: treatment_scored
+  on_success: experiment_in
+
+aggregations:
+- name: prompt_experiment
+  plugin: batch_experiment_compare
+  input: experiment_in
+  on_success: output
+  on_error: discard
+  trigger: {}
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    variant_field: prompt_variant
+    score_field: score
+    baseline_variant: control
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/row_union_ab_experiment/output/screened_comparison.json
+      format: jsonl
+      schema:
+        mode: observed
+
+  screened_out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/row_union_ab_experiment/output/screened_out.json
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/row_union_ab_experiment/runs/screened.db
