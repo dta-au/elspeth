@@ -127,13 +127,31 @@ The original record here claimed "full engine wiring" shipped. It was written be
   that guard walks FORWARD from the row_union and this aggregation is UPSTREAM of it. The
   binding is field-carried, not map-derived (traversal reads `item.row_union_name` at
   `scheduler_drain.py:597`; `_maybe_row_union_token` bails when it is None at
-  `processor.py:2791`), so the flushed branch's continuations are neither held nor marked
-  BLOCKED — they walk through the barrier, the sibling branch is failed at EOF flush as
-  incomplete, and `batch_experiment_compare` receives a half-group and emits a wrong statistic
-  with no audit signal for the split. This is the only known row_union path that produces a
-  plausible-looking wrong answer rather than failing loudly. Fix by threading the row_union
-  binding through `_FlushContext` and both routers, or by rejecting the topology at build
-  time.
+  `processor.py:2791`).
+
+  **Runtime behaviour measured, not inferred — it fails closed.** Static tracing predicted a
+  silent half-group reaching `batch_experiment_compare`. Running the topology end to end
+  disproves that: the run raises `OrchestrationInvariantError("Aggregation continuation work
+  item missing current_node_id")` from `orchestrator/aggregation.py:94`, reached via
+  `run_end_of_input_barrier_flush` -> `flush_remaining_aggregation_buffers`
+  (`aggregation.py:250`) -> `_process_flush_results`. **No sink file is created at all** — no
+  partial group, no wrong statistic, nothing leaked. The `current_node_id is None` guard at
+  `:94` fires immediately before the line that would have passed coalesce-only fields
+  (`:95-101`), so the drop is caught rather than acted on.
+
+  What remains wrong is the DIAGNOSTIC, not the durability: an author who writes a buildable
+  YAML gets an internal invariant error naming neither the row_union, nor the aggregation, nor
+  the fact that a branch-internal aggregation feeding a row_union is unsupported. Preferred fix
+  is therefore a build-time rejection in the shape of the existing group-split guard — name the
+  aggregation, the row_union, the hazard and the supported alternative — rather than threading
+  the binding through six flush sites, which is production work for a surface the spike defers.
+  The six sites, for whoever does the production delivery: `_FlushContext`
+  (`processor.py:202-226`) and its `__post_init__` (`:237-244`), `_derive_coalesce_from_tokens`
+  (`:1002-1016`), the two `create_continuation` calls (`:1430-1437`, `:1610-1617`),
+  `_process_batch_aggregation_node` (`:2162-2163`), and `_process_flush_results`
+  (`orchestrator/aggregation.py:95-101`). Note `AggregationProcessorPort.process_token` is
+  typed `(*args: Any, **kwargs: Any)` (`ports.py:74`), so mypy cannot see a dropped kwarg on
+  that seam.
 - **No composer/web authoring surface.** `src/elspeth/composer_mcp/` contains no occurrence of `row_union` at all, and in `src/elspeth/web/` (including `web/frontend/`) it appears only in `preflight.py`'s runtime-graph threading and an acceptance-receipt label — nothing in composer state, importer, generator, MCP tools, guided authoring, or the frontend graph/wire surfaces. YAML is the only authoring path. (Tracked with the rest of the deferred surfaces on elspeth-a5b86149d4.)
 
 Notable verification finding: adding `row_unions` to `ElspethSettings` rotated `semantic_settings_sha256` for every recorded run (full-dump settings material). Resolved in the corpus semantic lens (`tests/fixtures/dag_scenario_corpus/harness.py::_semantic_run_settings` drops post-pin empty sections) so the Wave-owned manifest pins stay untouched; the corpus process owns any holistic re-baseline (elspeth-ef29ef6ba4).
