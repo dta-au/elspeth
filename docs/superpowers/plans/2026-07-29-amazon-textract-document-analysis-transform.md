@@ -651,10 +651,12 @@ git commit -m "feat(textract): audit asynchronous SDK calls"
 **Files:**
 
 - Modify: `src/elspeth/plugins/transforms/aws/textract_document_analysis.py`
+- Modify: `src/elspeth/contracts/errors.py`
+- Modify: `config/cicd/contracts-whitelist.yaml`
 - Modify: `tests/unit/plugins/transforms/aws/test_textract_document_analysis.py`
 - Create: `tests/unit/contracts/transform_contracts/test_aws_textract_document_analysis_contract.py`
 
-- [ ] **Step 1: Write failing transform metadata and idempotency tests**
+- [x] **Step 1: Write failing transform metadata and idempotency tests**
 
 Add tests asserting the final class metadata, declared fields, canonical feature request order, and deterministic token behavior:
 
@@ -691,7 +693,7 @@ def test_request_token_is_stable_and_request_sensitive() -> None:
 
 Add parameterized row-input failures for missing bucket/key/version, wrong types, invalid bucket regex/length, blank key/version, key containing `#`, and overlong key/version.
 
-- [ ] **Step 2: Write failing polling/pagination/projection tests**
+- [x] **Step 2: Write failing polling/pagination/projection tests**
 
 Use a fake audited client factory whose start returns `job-1` and whose get sequence is configurable. Cover:
 
@@ -707,7 +709,7 @@ Use a fake audited client factory whose start returns `job-1` and whose get sequ
 - `TextractIdempotencyInvariantError` mapped to `FrameworkBugError`; and
 - no output emitted before the full result parser succeeds.
 
-- [ ] **Step 3: Run transform tests and verify plugin-class failures**
+- [x] **Step 3: Run transform tests and verify plugin-class failures**
 
 Run:
 
@@ -717,7 +719,7 @@ pytest tests/unit/plugins/transforms/aws/test_textract_document_analysis.py -q
 
 Expected: failures because `AWSTextractDocumentAnalysis` is not defined.
 
-- [ ] **Step 4: Implement plugin metadata, construction, and schemas**
+- [x] **Step 4: Implement plugin metadata, construction, and schemas**
 
 Add imports from the client/result modules and define:
 
@@ -736,7 +738,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
 
 In `__init__`, parse the config once, initialize declared input fields, copy secrets into private attributes only, compute the sorted feature tuple and immutable query request tuple, derive all declared output fields, build input/output schemas, and initialize lifecycle/client/batch state. Set `_effective_batch_wait_timeout_seconds` to the maximum of the configured batch wait and `poll_timeout_seconds + 90.0`.
 
-- [ ] **Step 5: Implement lifecycle and idempotency**
+- [x] **Step 5: Implement lifecycle and idempotency**
 
 `on_start()` must require `ctx.landscape`, capture run/node identity and telemetry, obtain the plugin limiter, and lazily call `build_textract_sdk_client`. Do not build the SDK client in `__init__` or preflight mode.
 
@@ -744,7 +746,7 @@ Implement `_client_request_token()` by feeding a length-delimited list of UTF-8 
 
 Implement `close()` in the approved order: set shutdown, shut down the batch mixin, clear row wrappers, close the shared SDK once, then clear recorder/client references.
 
-- [ ] **Step 6: Implement row orchestration and projection**
+- [x] **Step 6: Implement row orchestration and projection**
 
 Implement `connect_output()`, `accept()`, the intentional `process()` error, `_process_row()`, `_process_single_with_state()`, `_poll_and_collect()`, input validation, backoff through `self._shutdown.wait(timeout=...)`, pagination token tracking, and error mapping.
 
@@ -758,15 +760,15 @@ output_contract = self._align_output_contract(output_contract)
 
 Return success reason `action="enriched"`, sorted `fields_added`, and bounded metadata containing job ID, page/block counts, model version, warning count, feature list, and `result_status="succeeded"`.
 
-- [ ] **Step 7: Implement the no-network invariant probe**
+- [x] **Step 7: Implement the no-network invariant probe**
 
 `probe_config()` uses default-chain mode, synthetic bucket/key fields, `FORMS`, one text output, and observed schema. `forward_invariant_probe_rows()` adds the synthetic locator fields. `execute_forward_invariant_probe()` injects a fake shared SDK whose start returns `job-probe` and whose get returns one valid PAGE/LINE response; it exercises `_process_single_with_state()` and restores all prior lifecycle state in `finally`.
 
-- [ ] **Step 8: Add the ADR-009 contract test**
+- [x] **Step 8: Add the ADR-009 contract test**
 
 Create `tests/unit/contracts/transform_contracts/test_aws_textract_document_analysis_contract.py` mirroring the Azure Document Intelligence contract test. Assert external-call determinism, pass-through, schema presence, enrichment, preservation of pre-existing fields, and `success_reason["action"] == "enriched"`.
 
-- [ ] **Step 9: Run transform and contract tests**
+- [x] **Step 9: Run transform and contract tests**
 
 Run:
 
@@ -776,7 +778,7 @@ pytest tests/unit/plugins/transforms/aws/test_textract_document_analysis.py test
 
 Expected: PASS.
 
-- [ ] **Step 10: Commit Task 4**
+- [x] **Step 10: Commit Task 4**
 
 ```bash
 git add src/elspeth/plugins/transforms/aws/textract_document_analysis.py tests/unit/plugins/transforms/aws/test_textract_document_analysis.py tests/unit/contracts/transform_contracts/test_aws_textract_document_analysis_contract.py

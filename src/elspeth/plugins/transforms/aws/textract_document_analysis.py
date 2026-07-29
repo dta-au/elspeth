@@ -2,12 +2,46 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
-from typing import ClassVar, Literal, Self
+import threading
+import time
+from collections.abc import Callable, Mapping, Sequence
+from types import MappingProxyType
+from typing import Any, ClassVar, Literal, Self
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from elspeth.contracts import Determinism
+from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.contexts import LifecycleContext, TransformContext
+from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.enums import AuditCharacteristic
+from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.canonical import canonical_json
+from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
+from elspeth.plugins.transforms.aws.textract_client import (
+    StartAnalysisReceipt,
+    TextractClient,
+    TextractIdempotencyInvariantError,
+    TextractResponseError,
+    TextractSDKClient,
+    TextractServiceError,
+    build_textract_sdk_client,
+)
+from elspeth.plugins.transforms.aws.textract_result import (
+    MalformedTextractResponse,
+    NormalizedTextractResult,
+    normalize_textract_result,
+)
 
 FeatureType = Literal["TABLES", "FORMS", "QUERIES", "SIGNATURES", "LAYOUT"]
 AuthMode = Literal["default_chain", "secret_refs"]
@@ -17,6 +51,11 @@ _REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _QUERY_TEXT_PATTERN = re.compile(r"^[a-zA-Z0-9\s!\"#$%'&()*+,\-./:;=?@[\\\]^_`{|}~><]+$")
 _QUERY_PAGE_PATTERN = re.compile(r"^[0-9*\-]+$")
 _FACET_NAMES = ("pages", "tables", "forms", "queries", "signatures", "layout")
+_BUCKET_PATTERN = re.compile(r"^[0-9A-Za-z.\-_]*$")
+_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
+
+logger = structlog.get_logger(__name__)
+_warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
 
 
 def _require_non_whitespace(value: str | None, *, field_name: str) -> str | None:
@@ -90,32 +129,69 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
         hide_input_in_errors=True,
     )
 
-    region: str = Field(min_length=1, max_length=64)
-    auth_mode: AuthMode = "default_chain"
-    aws_access_key_id: str | None = Field(default=None, min_length=1, max_length=256, repr=False)
-    aws_secret_access_key: str | None = Field(default=None, min_length=1, max_length=4096, repr=False)
-    aws_session_token: str | None = Field(default=None, min_length=1, max_length=16384, repr=False)
+    region: str = Field(min_length=1, max_length=64, description="AWS region containing the S3 object and Textract endpoint.")
+    auth_mode: AuthMode = Field(
+        default="default_chain",
+        description="Use boto3's default credential chain or credentials resolved from ELSPETH secret references.",
+    )
+    aws_access_key_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        repr=False,
+        description="Resolved AWS access-key identifier; accepted only with auth_mode secret_refs.",
+    )
+    aws_secret_access_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=4096,
+        repr=False,
+        description="Resolved AWS secret access key; accepted only with auth_mode secret_refs.",
+    )
+    aws_session_token: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=16384,
+        repr=False,
+        description="Optional resolved AWS session token for temporary secret_refs credentials.",
+    )
 
-    bucket_field: str = Field(min_length=1, max_length=256)
-    key_field: str = Field(min_length=1, max_length=256)
-    version_field: str | None = Field(default=None, min_length=1, max_length=256)
-    feature_types: list[FeatureType] = Field(min_length=1, max_length=5)
-    queries: list[TextractQueryConfig] = Field(default_factory=list, max_length=30)
+    bucket_field: str = Field(min_length=1, max_length=256, description="Input row field containing the S3 bucket name.")
+    key_field: str = Field(min_length=1, max_length=256, description="Input row field containing the S3 object key.")
+    version_field: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        description="Optional input row field containing an S3 object version.",
+    )
+    feature_types: list[FeatureType] = Field(
+        min_length=1,
+        max_length=5,
+        description="Unique Textract analysis features selected from TABLES, FORMS, QUERIES, SIGNATURES, and LAYOUT.",
+    )
+    queries: list[TextractQueryConfig] = Field(
+        default_factory=list,
+        max_length=30,
+        description="Textract query definitions; configured together with the QUERIES feature.",
+    )
 
-    text_field: str | None = None
-    page_count_field: str | None = None
-    metadata_field: str | None = None
-    extract: TextractExtractFields = Field(default_factory=TextractExtractFields)
-    result_field: str | None = None
+    text_field: str | None = Field(default=None, description="Optional output field for page-ordered LINE text.")
+    page_count_field: str | None = Field(default=None, description="Optional output field for the validated document page count.")
+    metadata_field: str | None = Field(default=None, description="Optional output field for bounded Textract job metadata.")
+    extract: TextractExtractFields = Field(
+        default_factory=TextractExtractFields,
+        description="Optional mappings from normalized document facets to output row fields.",
+    )
+    result_field: str | None = Field(default=None, description="Optional output field for the bounded provider-shaped aggregate.")
 
-    poll_interval_seconds: float = Field(default=1.0, gt=0)
-    poll_backoff_multiplier: float = Field(default=1.5, ge=1)
-    poll_max_interval_seconds: float = Field(default=10.0, gt=0)
-    poll_timeout_seconds: float = Field(default=3600.0, gt=0)
-    batch_wait_timeout_seconds: float = Field(default=3900.0, gt=0)
-    max_result_pages: int = Field(default=1000, gt=0)
-    max_blocks: int = Field(default=200_000, gt=0)
-    max_result_bytes: int = Field(default=50_000_000, gt=0)
+    poll_interval_seconds: float = Field(default=1.0, gt=0, description="Initial delay between non-terminal job-status polls.")
+    poll_backoff_multiplier: float = Field(default=1.5, ge=1, description="Multiplier applied to successive job-status poll delays.")
+    poll_max_interval_seconds: float = Field(default=10.0, gt=0, description="Maximum delay between job-status polls.")
+    poll_timeout_seconds: float = Field(default=3600.0, gt=0, description="Total submit-through-terminal-status deadline in seconds.")
+    batch_wait_timeout_seconds: float = Field(default=3900.0, gt=0, description="Maximum engine wait for one pipelined document row.")
+    max_result_pages: int = Field(default=1000, gt=0, description="Maximum GetDocumentAnalysis result pages retained for one document.")
+    max_blocks: int = Field(default=200_000, gt=0, description="Maximum combined Textract block count for one document.")
+    max_result_bytes: int = Field(default=50_000_000, gt=0, description="Maximum canonical JSON bytes retained for one document result.")
 
     @field_validator("region")
     @classmethod
@@ -191,3 +267,538 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
         if self.version_field is not None:
             fields.add(self.version_field)
         return super().declared_input_fields | frozenset(fields)
+
+
+class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
+    """Enrich S3 document references through asynchronous Amazon Textract analysis."""
+
+    name = "aws_textract_document_analysis"
+    determinism = Determinism.EXTERNAL_CALL
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:0000000000000000"
+    config_model = AWSTextractDocumentAnalysisConfig
+    passes_through_input = True
+    creates_tokens = False
+    audit_characteristics = frozenset({AuditCharacteristic.CREDENTIALS})
+    capability_tags = ("aws", "textract", "document", "ocr", "enrichment")
+
+    usage_when_to_use = (
+        "Use when each row names a document already stored in S3 and you need asynchronous Textract "
+        "text, forms, tables, queries, signatures, or layout enrichment with a complete audit trail."
+    )
+    usage_when_not_to_use = (
+        "Not for inline bytes or synchronous single-page analysis; use the separate synchronous Textract "
+        "plugin when that surface is available. This transform requires an S3 object locator per row."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: aws_textract_document_analysis\n"
+        "  options:\n"
+        "    region: ap-southeast-2\n"
+        "    auth_mode: secret_refs\n"
+        "    aws_access_key_id: {secret_ref: AWS_ACCESS_KEY_ID}\n"
+        "    aws_secret_access_key: {secret_ref: AWS_SECRET_ACCESS_KEY}\n"
+        "    bucket_field: document_bucket\n"
+        "    key_field: document_key\n"
+        "    feature_types: [TABLES, FORMS]\n"
+        "    text_field: textract_text\n"
+        "    schema: {mode: observed}"
+    )
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        return {
+            "region": "us-east-1",
+            "auth_mode": "default_chain",
+            "bucket_field": "document_bucket",
+            "key_field": "document_key",
+            "feature_types": ["FORMS"],
+            "text_field": "textract_text",
+            "schema": {"mode": "observed"},
+        }
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        cfg = AWSTextractDocumentAnalysisConfig.from_dict(config, plugin_name=self.name)
+        self._initialize_declared_input_fields(cfg)
+        self._cfg = cfg
+
+        self._region = cfg.region
+        self._aws_access_key_id = cfg.aws_access_key_id
+        self._aws_secret_access_key = cfg.aws_secret_access_key
+        self._aws_session_token = cfg.aws_session_token
+        self._bucket_field = cfg.bucket_field
+        self._key_field = cfg.key_field
+        self._version_field = cfg.version_field
+        self._feature_types = tuple(sorted(cfg.feature_types))
+        self._query_requests: tuple[Mapping[str, Any], ...] = tuple(
+            MappingProxyType(
+                {
+                    "text": query.text,
+                    "alias": query.alias,
+                    "pages": tuple(query.pages),
+                }
+            )
+            for query in cfg.queries
+        )
+        self._text_field = cfg.text_field
+        self._page_count_field = cfg.page_count_field
+        self._metadata_field = cfg.metadata_field
+        self._result_field = cfg.result_field
+        self._facet_fields = cfg.configured_output_fields()
+        self._poll_interval_seconds = cfg.poll_interval_seconds
+        self._poll_backoff_multiplier = cfg.poll_backoff_multiplier
+        self._poll_max_interval_seconds = cfg.poll_max_interval_seconds
+        self._poll_timeout_seconds = cfg.poll_timeout_seconds
+        self._max_result_pages = cfg.max_result_pages
+        self._max_blocks = cfg.max_blocks
+        self._max_result_bytes = cfg.max_result_bytes
+        self._effective_batch_wait_timeout_seconds = max(
+            float(cfg.batch_wait_timeout_seconds),
+            float(cfg.poll_timeout_seconds) + _SDK_TIMEOUT_HEADROOM_SECONDS,
+        )
+
+        self.declared_output_fields = frozenset(cfg.all_output_field_names())
+        self.input_schema, self.output_schema = self._create_schemas(
+            cfg.schema_config,
+            "AWSTextractDocumentAnalysis",
+            adds_fields=True,
+        )
+        self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
+
+        self._recorder: PluginAuditWriter | None = None
+        self._run_id = ""
+        self._node_id = ""
+        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._limiter: Any = None
+        self._sdk_client: TextractSDKClient | None = None
+        self._row_clients: dict[str, TextractClient] = {}
+        self._row_clients_lock = threading.Lock()
+        self._shutdown = threading.Event()
+        self._batch_initialized = False
+
+    def on_start(self, ctx: LifecycleContext) -> None:
+        super().on_start(ctx)
+        if ctx.landscape is None:
+            raise FrameworkBugError("Amazon Textract transform requires Landscape audit recording")
+        node_id = ctx.node_id if ctx.node_id is not None else self.node_id
+        if node_id is None:
+            raise FrameworkBugError("Amazon Textract transform requires a node_id before startup")
+        self._recorder = ctx.landscape
+        self._run_id = ctx.run_id
+        self._node_id = node_id
+        self._telemetry_emit = ctx.telemetry_emit
+        self._limiter = ctx.rate_limit_registry.get_limiter(self.name) if ctx.rate_limit_registry is not None else None
+        if ctx.shutdown_event is not None:
+            self._shutdown = ctx.shutdown_event
+        if self._sdk_client is None:
+            self._sdk_client = build_textract_sdk_client(
+                region=self._region,
+                aws_access_key_id=self._aws_access_key_id,
+                aws_secret_access_key=self._aws_secret_access_key,
+                aws_session_token=self._aws_session_token,
+            )
+
+    def connect_output(self, output: OutputPort, max_pending: int = 30) -> None:
+        if self._batch_initialized:
+            raise RuntimeError("connect_output() already called")
+        self.init_batch_processing(
+            max_pending=max_pending,
+            output=output,
+            name=self.name,
+            max_workers=max_pending,
+            batch_wait_timeout=self._effective_batch_wait_timeout_seconds,
+        )
+        self._batch_initialized = True
+
+    def accept(self, row: PipelineRow, ctx: TransformContext) -> None:
+        if not self._batch_initialized:
+            raise RuntimeError("connect_output() must be called before accept().")
+        self.accept_row(row, ctx, self._process_row)
+
+    def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
+        del row, ctx
+        raise NotImplementedError(f"{self.__class__.__name__} uses row-level pipelining. Use accept() instead of process().")
+
+    def close(self) -> None:
+        self._shutdown.set()
+        if self._batch_initialized:
+            self.shutdown_batch_processing()
+        with self._row_clients_lock:
+            self._row_clients.clear()
+        sdk_client = self._sdk_client
+        self._sdk_client = None
+        if sdk_client is not None:
+            sdk_client.close()
+        self._recorder = None
+        self._limiter = None
+
+    def _get_row_client(self, state_id: str, *, token_id: str | None) -> TextractClient:
+        with self._row_clients_lock:
+            existing = self._row_clients.get(state_id)
+            if existing is not None:
+                return existing
+            if self._recorder is None or self._sdk_client is None or not self._run_id:
+                raise FrameworkBugError("Amazon Textract transform used before on_start")
+            client = TextractClient(
+                execution=self._recorder,
+                state_id=state_id,
+                run_id=self._run_id,
+                telemetry_emit=self._telemetry_emit,
+                region=self._region,
+                sdk_client=self._sdk_client,
+                max_response_bytes=self._max_result_bytes,
+                limiter=self._limiter,
+                token_id=token_id,
+            )
+            self._row_clients[state_id] = client
+            return client
+
+    def _process_row(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
+        if ctx.state_id is None:
+            raise FrameworkBugError("Amazon Textract batch processing requires state_id")
+        if ctx.token is None:
+            raise FrameworkBugError("Amazon Textract batch processing requires token identity")
+        try:
+            return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id)
+        finally:
+            with self._row_clients_lock:
+                self._row_clients.pop(ctx.state_id, None)
+
+    def _read_document_location(self, row: PipelineRow) -> tuple[str, str, str | None] | TransformResult:
+        required_fields = (self._bucket_field, self._key_field)
+        for field_name in required_fields:
+            if field_name not in row:
+                return TransformResult.error({"reason": "missing_field", "field": field_name}, retryable=False)
+        if self._version_field is not None and self._version_field not in row:
+            return TransformResult.error({"reason": "missing_field", "field": self._version_field}, retryable=False)
+
+        bucket = row[self._bucket_field]
+        key = row[self._key_field]
+        version = row[self._version_field] if self._version_field is not None else None
+        for field_name, value in ((self._bucket_field, bucket), (self._key_field, key)):
+            if type(value) is not str:
+                return TransformResult.error(
+                    {"reason": "invalid_input", "field": field_name, "actual_type": type(value).__name__},
+                    retryable=False,
+                )
+        if self._version_field is not None and type(version) is not str:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._version_field, "actual_type": type(version).__name__},
+                retryable=False,
+            )
+        assert isinstance(bucket, str)
+        assert isinstance(key, str)
+        assert version is None or isinstance(version, str)
+        if not 3 <= len(bucket) <= 255 or _BUCKET_PATTERN.fullmatch(bucket) is None:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._bucket_field, "error_type": "invalid_s3_bucket"},
+                retryable=False,
+            )
+        if not 1 <= len(key) <= 1024 or not key.strip() or "#" in key:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._key_field, "error_type": "invalid_s3_key"},
+                retryable=False,
+            )
+        if version is not None and (not 1 <= len(version) <= 1024 or not version.strip()):
+            assert self._version_field is not None
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._version_field, "error_type": "invalid_s3_version"},
+                retryable=False,
+            )
+        return bucket, key, version
+
+    def _client_request_token(
+        self,
+        *,
+        run_id: str,
+        node_id: str,
+        token_id: str,
+        bucket: str,
+        key: str,
+        version: str | None,
+    ) -> str:
+        query_identity = canonical_json([dict(query) for query in self._query_requests])
+        fields = (
+            "elspeth:aws_textract_document_analysis:start",
+            self.plugin_version,
+            run_id,
+            node_id,
+            token_id,
+            self._region,
+            bucket,
+            key,
+            "0" if version is None else "1",
+            "" if version is None else version,
+            *self._feature_types,
+            query_identity,
+        )
+        digest = hashlib.sha256()
+        for field in fields:
+            encoded = field.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
+
+    def _process_single_with_state(self, row: PipelineRow, state_id: str, *, token_id: str | None) -> TransformResult:
+        if not self._run_id or not self._node_id or token_id is None:
+            raise FrameworkBugError("Amazon Textract processing requires run, node, and token identity")
+        if self._shutdown.is_set():
+            return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
+        location = self._read_document_location(row)
+        if isinstance(location, TransformResult):
+            return location
+        bucket, key, version = location
+        started_at = time.monotonic()
+        client = self._get_row_client(state_id, token_id=token_id)
+        request_token = self._client_request_token(
+            run_id=self._run_id,
+            node_id=self._node_id,
+            token_id=token_id,
+            bucket=bucket,
+            key=key,
+            version=version,
+        )
+        try:
+            receipt = client.start_document_analysis(
+                bucket=bucket,
+                key=key,
+                version=version,
+                feature_types=self._feature_types,
+                queries=self._query_requests,
+                client_request_token=request_token,
+            )
+        except TextractIdempotencyInvariantError as error:
+            raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
+        except TextractServiceError as error:
+            return TransformResult.error(
+                {"reason": "submit_failed", "error_type": "service_error", "code": error.code},
+                retryable=error.retryable,
+            )
+        except TextractResponseError as error:
+            submit_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
+            return TransformResult.error({"reason": submit_reason, "error_type": "submit_response"}, retryable=False)
+
+        collected = self._poll_and_collect(client, receipt, started_at=started_at)
+        if isinstance(collected, TransformResult):
+            return collected
+        result_pages = collected
+        try:
+            normalized = normalize_textract_result(
+                job_id=receipt.job_id,
+                result_pages=result_pages,
+                feature_types=self._feature_types,
+                s3_version=version,
+                max_blocks=self._max_blocks,
+                max_result_bytes=self._max_result_bytes,
+            )
+        except MalformedTextractResponse as error:
+            safe_message = str(error)
+            validation_reason: TransformErrorCategory
+            if "max_blocks" in safe_message:
+                validation_reason = "too_many_blocks"
+            elif "max_result_bytes" in safe_message:
+                validation_reason = "result_too_large"
+            else:
+                validation_reason = "malformed_response"
+            return TransformResult.error({"reason": validation_reason, "error_type": "result_validation"}, retryable=False)
+        return self._build_enriched_result(row, receipt, normalized)
+
+    def _poll_and_collect(
+        self,
+        client: TextractClient,
+        receipt: StartAnalysisReceipt,
+        *,
+        started_at: float,
+    ) -> tuple[Mapping[str, Any], ...] | TransformResult:
+        deadline = started_at + self._poll_timeout_seconds
+        interval = self._poll_interval_seconds
+        next_token: str | None = None
+        seen_tokens: set[str] = set()
+        pages: list[Mapping[str, Any]] = []
+        block_count = 0
+        while True:
+            if self._shutdown.is_set():
+                return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
+            try:
+                page = client.get_document_analysis(job_id=receipt.job_id, next_token=next_token)
+            except TextractIdempotencyInvariantError as error:
+                raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
+            except TextractServiceError as error:
+                return TransformResult.error(
+                    {"reason": "poll_failed", "error_type": "service_error", "code": error.code},
+                    retryable=error.retryable,
+                )
+            except TextractResponseError as error:
+                poll_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
+                return TransformResult.error({"reason": poll_reason, "error_type": "poll_response"}, retryable=False)
+
+            status = page.semantic_response.get("JobStatus")
+            if type(status) is not str:
+                return TransformResult.error({"reason": "malformed_response", "error_type": "job_status"}, retryable=False)
+            if status == "IN_PROGRESS":
+                if page.next_token is not None:
+                    return TransformResult.error({"reason": "malformed_response", "error_type": "premature_next_token"}, retryable=False)
+                now = time.monotonic()
+                if now >= deadline:
+                    return TransformResult.error({"reason": "poll_timeout"}, retryable=True)
+                sleep_seconds = min(interval, deadline - now)
+                if sleep_seconds > 0 and self._shutdown.wait(timeout=sleep_seconds):
+                    return TransformResult.error({"reason": "shutdown_requested"}, retryable=False)
+                interval = min(interval * self._poll_backoff_multiplier, self._poll_max_interval_seconds)
+                continue
+            if status == "FAILED":
+                return TransformResult.error({"reason": "analysis_failed"}, retryable=False)
+            if status == "PARTIAL_SUCCESS":
+                return TransformResult.error({"reason": "partial_success"}, retryable=False)
+            if status != "SUCCEEDED":
+                return TransformResult.error({"reason": "malformed_response", "error_type": "unknown_status"}, retryable=False)
+
+            pages.append(page.semantic_response)
+            raw_blocks = page.semantic_response.get("Blocks")
+            if isinstance(raw_blocks, Sequence) and not isinstance(raw_blocks, (str, bytes, bytearray)):
+                block_count += len(raw_blocks)
+                if block_count > self._max_blocks:
+                    return TransformResult.error({"reason": "too_many_blocks"}, retryable=False)
+            returned_token = page.next_token
+            if returned_token is None:
+                return tuple(pages)
+            if returned_token in seen_tokens:
+                return TransformResult.error({"reason": "pagination_cycle"}, retryable=False)
+            seen_tokens.add(returned_token)
+            if len(pages) >= self._max_result_pages:
+                return TransformResult.error({"reason": "pagination_limit_exceeded"}, retryable=False)
+            next_token = returned_token
+
+    def _build_enriched_result(
+        self,
+        row: PipelineRow,
+        receipt: StartAnalysisReceipt,
+        normalized: NormalizedTextractResult,
+    ) -> TransformResult:
+        output = row.to_dict()
+        if self._text_field is not None:
+            output[self._text_field] = normalized.text
+        if self._page_count_field is not None:
+            output[self._page_count_field] = normalized.page_count
+        if self._metadata_field is not None:
+            output[self._metadata_field] = deep_thaw(normalized.metadata)
+        if self._result_field is not None:
+            output[self._result_field] = deep_thaw(normalized.native_result)
+        facet_values = {
+            "pages": normalized.pages,
+            "tables": normalized.tables,
+            "forms": normalized.forms,
+            "queries": normalized.queries,
+            "signatures": normalized.signatures,
+            "layout": normalized.layout,
+        }
+        for facet_name, field_name in self._facet_fields.items():
+            output[field_name] = deep_thaw(facet_values[facet_name])
+
+        output_contract = narrow_contract_to_output(input_contract=row.contract, output_row=output)
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
+        output_contract = self._align_output_contract(output_contract)
+        metadata = normalized.metadata
+        warnings = metadata["warnings"]
+        warning_count = len(warnings) if isinstance(warnings, list | tuple) else 0
+        return TransformResult.success(
+            PipelineRow(output, output_contract),
+            success_reason={
+                "action": "enriched",
+                "fields_added": sorted(self.declared_output_fields),
+                "metadata": {
+                    "job_id": receipt.job_id,
+                    "page_count": normalized.page_count,
+                    "block_count": normalized.block_count,
+                    "model_version": metadata["model_version"],
+                    "warning_count": warning_count,
+                    "feature_types": list(self._feature_types),
+                    "result_status": "succeeded",
+                },
+            },
+        )
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        row = self._augment_invariant_probe_row(probe, field_name=self._bucket_field, value="probe-bucket")
+        row = self._augment_invariant_probe_row(row, field_name=self._key_field, value="probe-document.pdf")
+        return [row]
+
+    def execute_forward_invariant_probe(self, probe_rows: list[PipelineRow], ctx: Any) -> TransformResult:
+        if len(probe_rows) != 1:
+            raise FrameworkBugError(f"{self.__class__.__name__}.execute_forward_invariant_probe() requires exactly one row")
+        if ctx.landscape is None:
+            raise FrameworkBugError("Amazon Textract invariant probe requires Landscape audit recording")
+
+        class _ProbeSDK:
+            def start_document_analysis(self, **_kwargs: Any) -> Mapping[str, Any]:
+                return {"JobId": "job-probe", "ResponseMetadata": {"RetryAttempts": 0}}
+
+            def get_document_analysis(self, **_kwargs: Any) -> Mapping[str, Any]:
+                return {
+                    "JobStatus": "SUCCEEDED",
+                    "DocumentMetadata": {"Pages": 1},
+                    "AnalyzeDocumentModelVersion": "probe-model",
+                    "Blocks": [
+                        {"BlockType": "PAGE", "Id": "page-probe", "Page": 1},
+                        {
+                            "BlockType": "LINE",
+                            "Id": "line-probe",
+                            "Page": 1,
+                            "Text": "probe",
+                            "Confidence": 100.0,
+                        },
+                    ],
+                    "ResponseMetadata": {"RetryAttempts": 0},
+                }
+
+            def close(self) -> None:
+                return None
+
+        prior_recorder = self._recorder
+        prior_run_id = self._run_id
+        prior_node_id = self._node_id
+        prior_telemetry = self._telemetry_emit
+        prior_sdk = self._sdk_client
+        prior_limiter = self._limiter
+        prior_clients = self._row_clients
+        prior_shutdown = self._shutdown
+        try:
+            self._recorder = ctx.landscape
+            self._run_id = ctx.run_id
+            self._node_id = "textract-invariant-probe"
+            self._telemetry_emit = ctx.telemetry_emit
+            self._sdk_client = _ProbeSDK()
+            self._limiter = None
+            self._row_clients = {}
+            self._shutdown = threading.Event()
+            state_id = ctx.state_id or "textract-invariant-probe-state"
+            token_id = ctx.token.token_id if ctx.token is not None else "textract-invariant-probe-token"
+            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id)
+        finally:
+            self._recorder = prior_recorder
+            self._run_id = prior_run_id
+            self._node_id = prior_node_id
+            self._telemetry_emit = prior_telemetry
+            self._sdk_client = prior_sdk
+            self._limiter = prior_limiter
+            self._row_clients = prior_clients
+            self._shutdown = prior_shutdown
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is not None:
+            return None
+        return PluginAssistance(
+            plugin_name=cls.name,
+            issue_code=None,
+            summary=(
+                "Analyze S3-backed documents asynchronously with Amazon Textract and enrich each row only after "
+                "all result pages validate. Configure AWS identity through the default chain or ELSPETH secret refs."
+            ),
+            composer_hints=(
+                "Provide bucket_field and key_field, choose one or more Textract feature_types, and map at least one output.",
+                "QUERIES requires query definitions; inline document bytes belong in the separate synchronous plugin.",
+                "For explicit AWS credentials, use ELSPETH markers such as {secret_ref: AWS_ACCESS_KEY_ID}.",
+            ),
+        )
