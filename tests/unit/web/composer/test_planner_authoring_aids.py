@@ -188,6 +188,98 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
     return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
 
 
+def _guardrail_profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Control-required posture: LLM profile plus both Bedrock Guardrail profiles.
+
+    Mirrors the AWS scenario module, which authorizes the two Bedrock controls,
+    sets both control modes to ``required``, and binds each to an operator-owned
+    Guardrail behind an opaque alias.
+    """
+    from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
+    from elspeth.web.config import WebSettings
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        plugin_allowlist=("transform:aws_bedrock_prompt_shield", "transform:aws_bedrock_content_safety"),
+        plugin_preferences={
+            PluginCapability.PROMPT_SHIELD: ("transform:aws_bedrock_prompt_shield",),
+            PluginCapability.CONTENT_SAFETY: ("transform:aws_bedrock_content_safety",),
+        },
+        plugin_control_modes={
+            PluginCapability.PROMPT_SHIELD: ControlMode.REQUIRED,
+            PluginCapability.CONTENT_SAFETY: ControlMode.REQUIRED,
+        },
+        bedrock_guardrail_profiles=(
+            BedrockGuardrailProfileSettings(
+                alias="prompt-approved",
+                plugin="aws_bedrock_prompt_shield",
+                guardrail_identifier="operatorpromptguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+            BedrockGuardrailProfileSettings(
+                alias="content-approved",
+                plugin="aws_bedrock_content_safety",
+                guardrail_identifier="operatorcontentguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+        ),
+        bedrock_guardrail_default_profiles={
+            "aws_bedrock_prompt_shield": "prompt-approved",
+            "aws_bedrock_content_safety": "content-approved",
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    class _ServerKeyInventory:
+        def has_server_ref(self, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def server_generation(self, name: str) -> str | None:
+            return "gen-1" if name == "OPENROUTER_API_KEY" else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=create_catalog_service(),
+        profiles=profiles,
+        principal_scope="local:authoring-aids-guardrail",
+        secret_inventory=_ServerKeyInventory(),
+        generation_key=b"authoring-aids-key",
+    )
+    return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
+
+
 def _session_with_user_message(content: str) -> tuple[Any, str, str, str]:
     """Session + user chat message whose text contains ``content`` verbatim."""
     engine = create_session_engine(
@@ -404,6 +496,71 @@ class TestForkCoalesceExemplar:
         assert len({llm["options"]["prompt_template"] for llm in llms}) == 2
         assert len({llm["options"]["response_field"] for llm in llms}) == 2
         assert all("queries" not in llm["options"] for llm in llms)
+
+    def test_forked_exemplar_still_builds_with_controls_inserted(self, tmp_path: Path) -> None:
+        """Inserting the control nodes must not break the exemplar's topology.
+
+        Scope: this proves the bytes still construct a valid pipeline with two
+        extra nodes spliced into the stream chain. It does NOT prove control
+        coverage — ``build_set_pipeline_candidate`` does not run the plugin-policy
+        coverage check (an uncovered fork is accepted here and rejected later, at
+        completion validation). The dominance relationships that satisfy coverage
+        are asserted structurally in the next test.
+        """
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"control-required fork exemplar rejected: {rejection}"
+
+    def test_selected_controls_are_wired_into_the_forked_llm_exemplar(self, tmp_path: Path) -> None:
+        """A control-required deployment must not be taught two bare llm branches.
+
+        ``control_coverage_findings`` proves coverage per LLM node: the shield
+        must dominate the node's prompt inputs and content safety must dominate
+        every one of its output streams. An exemplar modelling an uncovered fork
+        would teach exactly the topology this deployment's validator rejects, so
+        the controls are wired — one shield upstream of the fork covering both
+        branches' prompt fields, one safety node downstream of the rejoin
+        covering both branches' response fields.
+        """
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        nodes = {node["id"]: node for node in args["nodes"]}
+        llms = [node for node in nodes.values() if node.get("plugin") == "llm"]
+        assert len(llms) == 2
+        gate = next(node for node in nodes.values() if node["node_type"] == "gate")
+        coalesce = next(node for node in nodes.values() if node["node_type"] == "coalesce")
+
+        shield = next(node for node in nodes.values() if node.get("plugin") == "aws_bedrock_prompt_shield")
+        safety = next(node for node in nodes.values() if node.get("plugin") == "aws_bedrock_content_safety")
+
+        # The shield dominates the fork, so one node covers both branches, and it
+        # covers exactly the row fields the branch prompts interpolate.
+        assert shield["input"] == args["source"]["on_success"]
+        assert gate["input"] == shield["on_success"]
+        prompt_fields = {"ticket_id", "body"}
+        assert prompt_fields <= set(shield["options"]["fields"])
+
+        # Safety dominates the rejoin, covering both branches' response fields.
+        assert safety["input"] == coalesce["id"]
+        assert {llm["options"]["response_field"] for llm in llms} <= set(safety["options"]["fields"])
+        cleanup = next(node for node in nodes.values() if node.get("plugin") == "field_mapper")
+        assert cleanup["input"] == safety["on_success"]
+
+        # Operator-owned bindings stay behind the alias — never modelled inline.
+        for control in (shield, safety):
+            assert control["options"]["profile"] in {"prompt-approved", "content-approved"}
+            assert "guardrail_identifier" not in control["options"]
+            assert "guardrail_version" not in control["options"]
 
     def test_topology_exemplar_renders_and_validates_without_a_usable_llm_profile(self, tmp_path: Path) -> None:
         """No usable llm profile -> the SAME topology with non-LLM branches.

@@ -511,6 +511,33 @@ def _usable_llm_profile_alias(catalog: PolicyCatalogView) -> str | None:
     return dict(snapshot.usable_profile_aliases)[llm_id][0]
 
 
+def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapability) -> tuple[str, str] | None:
+    """Return ``(plugin_name, profile_alias)`` for a selected operator-profiled control.
+
+    Returns ``None`` when the deployment selected no implementation for the
+    capability, or when the selected implementation is not operator-profiled
+    (so it would need endpoint/key options an exemplar must never invent).
+    """
+    snapshot = catalog.snapshot
+    plugin_id = dict(snapshot.selected).get(capability)
+    if plugin_id is None:
+        return None
+    alias = dict(snapshot.selected_profile_aliases).get(plugin_id)
+    if alias is None:
+        aliases = dict(snapshot.usable_profile_aliases).get(plugin_id, ())
+        if not aliases:
+            return None
+        alias = aliases[0]
+    return plugin_id.name, alias
+
+
+def _plugin_declares_field(summaries: Mapping[str, list[PluginSummary]], plugin_name: str, field_name: str) -> bool:
+    """Return True when the named transform declares that config field."""
+    return any(
+        field.name == field_name for plugin in summaries["transform"] if plugin.name == plugin_name for field in plugin.config_fields
+    )
+
+
 def _plugin_summaries(catalog: PolicyCatalogView) -> dict[str, list[PluginSummary]]:
     """One catalog sweep shared by every aid — the expensive step of a build."""
     return {
@@ -837,6 +864,64 @@ def fork_coalesce_exemplar_args(
             "description": "Fan rows out to one transform per branch, rejoin with a coalesce, tidy, and save.",
         }
 
+    # Required-control coverage is proved per LLM node: the shield must dominate
+    # the node's prompt inputs and content safety must dominate every one of its
+    # output streams. A forked exemplar that modelled two bare llm branches would
+    # therefore teach a topology this deployment's validator rejects, so the
+    # controls are wired here whenever the deployment selected one. Placement is
+    # chosen so ONE node covers both branches: the shield sits upstream of the
+    # fork, content safety downstream of the rejoin. Only the LLM-branch variant
+    # needs them — the non-LLM fallback has no LLM node to cover.
+    gate_input = "rows"
+    tidy_input = "merge_branches"
+    control_nodes_before: list[_ExemplarNode] = []
+    control_nodes_after: list[_ExemplarNode] = []
+    if profile_alias is not None:
+        shield_control = _selected_control_profile(catalog, PluginCapability.PROMPT_SHIELD)
+        if shield_control is not None:
+            shield_plugin, shield_alias = shield_control
+            gate_input = "shielded_rows"
+            control_nodes_before.append(
+                {
+                    "id": "shield_ticket_text",
+                    "node_type": "transform",
+                    "plugin": shield_plugin,
+                    "input": "rows",
+                    "on_success": "shielded_rows",
+                    "on_error": "discard",
+                    "options": {
+                        # The operator-owned Guardrail binding stays behind the
+                        # alias; fields are exactly the branches' prompt inputs.
+                        "profile": shield_alias,
+                        "fields": ["ticket_id", "body"],
+                        "schema": {"mode": "observed"},
+                    },
+                }
+            )
+        safety_control = _selected_control_profile(catalog, PluginCapability.CONTENT_SAFETY)
+        if safety_control is not None:
+            safety_plugin, safety_alias = safety_control
+            tidy_input = "screened_rows"
+            safety_options: dict[str, Any] = {
+                "profile": safety_alias,
+                # Both branches' response fields — one node, both output streams.
+                "fields": ["sentiment", "urgency"],
+                "schema": {"mode": "observed"},
+            }
+            if _plugin_declares_field(summaries, safety_plugin, "source"):
+                safety_options["source"] = "OUTPUT"
+            control_nodes_after.append(
+                {
+                    "id": "screen_assessments",
+                    "node_type": "transform",
+                    "plugin": safety_plugin,
+                    "input": "merge_branches",
+                    "on_success": "screened_rows",
+                    "on_error": "discard",
+                    "options": safety_options,
+                }
+            )
+
     exemplar: _SetPipelineExemplar = {
         "source": {
             "plugin": "csv",
@@ -857,10 +942,11 @@ def fork_coalesce_exemplar_args(
             },
         },
         "nodes": [
+            *control_nodes_before,
             {
                 "id": "fan_out",
                 "node_type": "gate",
-                "input": "rows",
+                "input": gate_input,
                 "condition": "True",
                 "routes": {"true": "fork", "false": "fork"},
                 "fork_to": ["branch_a", "branch_b"],
@@ -878,11 +964,12 @@ def fork_coalesce_exemplar_args(
                 "merge": "union",
                 "options": {"schema": {"mode": "observed"}},
             },
+            *control_nodes_after,
             {
                 "id": "tidy_columns",
                 "node_type": "transform",
                 "plugin": "field_mapper",
-                "input": "merge_branches",
+                "input": tidy_input,
                 "on_success": "main",
                 "on_error": "discard",
                 "options": {
