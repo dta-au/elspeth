@@ -169,6 +169,7 @@ class _PlannerAuthoringAids(TypedDict, total=False):
     llm_output_contract: _RulesAid
     review_registry: _ReviewRegistryAid
     prompt_shield: _RulesAid
+    content_safety: _RulesAid
     raw_html_cleanup: _RulesAid
     web_scrape_http_identity: _RulesAid
     discovery_digest: _DiscoveryDigestAid
@@ -294,6 +295,25 @@ def _prompt_shield_rules(*, shield_plugin: str | None, untrusted_producers: tupl
         "The review is advisory and never blocks the pipeline, but omitting it hides a "
         "prompt-injection exposure decision from the operator's review cards.",
         "Skip the row only when an authorized prompt-injection shield transform is already wired between the fetch step and the llm node.",
+    ]
+
+
+def _content_safety_rules(*, safety_plugin: str) -> list[str]:
+    """Wiring rules for the content-safety control this deployment selected.
+
+    Same regime as the shield's available branch, on the other side of the
+    model: the shield protects what goes IN, content safety screens what
+    comes OUT. Only the available branch exists today — there is no
+    registered ``pipeline_decision`` term for an absent content-safety
+    control, so a deployment without one gets no acknowledge card (unlike
+    the shield). That asymmetry is a known gap, not a decision.
+    """
+    return [
+        f"An authorized content-safety control is available in this deployment: {safety_plugin}. "
+        f"WIRE a {safety_plugin} transform on the llm node's output — its input is the llm node's "
+        "on_success connection, and its on_success carries the screened rows onward. This is "
+        "required, not advisory: model-generated content must be screened before it is written out.",
+        "Load its schema and assistance through the capability catalog before authoring it, and configure it from that schema alone.",
     ]
 
 
@@ -976,6 +996,11 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
                 untrusted_producers=visible_untrusted_producers,
             ),
         }
+    if (
+        "llm" in visible["transform"]
+        and (selected_safety := dict(catalog.snapshot.selected).get(PluginCapability.CONTENT_SAFETY)) is not None
+    ):
+        aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=selected_safety.name)}
     if visible_untrusted_producers and "field_mapper" in visible["transform"]:
         aids["raw_html_cleanup"] = {"rules": _raw_html_cleanup_rules(untrusted_producers=visible_untrusted_producers)}
     if "web_scrape" in visible["transform"]:
