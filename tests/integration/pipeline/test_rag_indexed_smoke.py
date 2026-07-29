@@ -85,6 +85,9 @@ sinks:
 
 landscape:
   url: sqlite:///{audit_db}
+payload_store:
+  backend: filesystem
+  base_path: {example_dst / "payloads"}
 """
     )
 
@@ -164,6 +167,9 @@ sinks:
 
 landscape:
   url: sqlite:///{audit_db}
+payload_store:
+  backend: filesystem
+  base_path: {example_dst / "payloads"}
 """
     )
 

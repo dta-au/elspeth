@@ -109,8 +109,13 @@ class TestValidateCommand:
             f"Expected 'Pipeline configuration valid' in output, got: {result.stdout}"
         )
 
-    def test_validate_allows_export_enabled_post_run_sink(self, tmp_path: Path) -> None:
+    def test_validate_allows_export_enabled_post_run_sink(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Export sink should be excluded from execution-graph validation."""
+        # The export spool/content-store roots are code-owned and CWD-relative
+        # by contract (absolute paths are rejected), so run from tmp_path to
+        # keep .elspeth/audit-export-* out of the checkout.
+        monkeypatch.chdir(tmp_path)
+
         input_csv = tmp_path / "input.csv"
         input_csv.write_text("id,name\n1,Alice\n")
 

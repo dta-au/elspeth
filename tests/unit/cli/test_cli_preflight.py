@@ -154,7 +154,13 @@ def _make_minimal_config_yaml(
 
 
 def _explicit_audit_export_settings(*, enabled: bool | str | int, sink: str = "audit") -> dict[str, object]:
-    """Return a fully bounded raw export policy for CLI preflight tests."""
+    """Return a fully bounded raw export policy for CLI preflight tests.
+
+    ``spool_root`` and ``content_store.root`` MUST stay CWD-relative under
+    ``.elspeth/``: ``LandscapeExportSettings`` rejects absolute paths so these
+    stay code-owned locations. Callers therefore chdir into ``tmp_path`` to keep
+    the roots out of the checkout.
+    """
     return {
         "enabled": enabled,
         "sink": sink,
@@ -190,10 +196,18 @@ def test_cli_run_rejects_raw_legacy_sink_before_key_vault_resolution(tmp_path: P
     load_secrets.assert_not_called()
 
 
-def test_cli_fresh_run_screens_pipeline_and_export_lanes_before_secret_loading(tmp_path: Path) -> None:
+def test_cli_fresh_run_screens_pipeline_and_export_lanes_before_secret_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import yaml
 
     from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError, SinkEffectExecutionPurpose
+
+    # The export spool/content-store roots are code-owned and CWD-relative by
+    # contract (absolute paths are rejected), so run from tmp_path to keep
+    # .elspeth/audit-export-* out of the checkout.
+    monkeypatch.chdir(tmp_path)
 
     settings_path = tmp_path / "dual-lane.yaml"
     settings_path.write_text(
@@ -254,12 +268,15 @@ def test_cli_fresh_run_screens_pipeline_and_export_lanes_before_secret_loading(t
 )
 def test_raw_export_lane_classification_matches_pydantic_bool_coercion(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     raw_enabled: bool | str | int,
     expected_enabled: bool,
 ) -> None:
     import yaml
 
     from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
+
+    monkeypatch.chdir(tmp_path)
 
     settings_path = tmp_path / "coerced-export.yaml"
     settings_path.write_text(

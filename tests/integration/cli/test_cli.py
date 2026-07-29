@@ -77,8 +77,9 @@ class TestCLIIntegration:
                     },
                 },
             },
-            # Use temp-path DB to avoid polluting CWD during tests
+            # Use temp-path DB and payload store to avoid polluting CWD during tests
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         config_file = tmp_path / "settings.yaml"
         config_file.write_text(yaml.dump(config))
@@ -205,6 +206,7 @@ class TestSourceQuarantineRouting:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         config_file = tmp_path / "settings.yaml"
         config_file.write_text(yaml.dump(config))
@@ -270,6 +272,7 @@ class TestSourceQuarantineRouting:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         config_file = tmp_path / "settings.yaml"
         config_file.write_text(yaml.dump(config))
@@ -338,6 +341,7 @@ class TestTransformErrorSinkRouting:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
 
         config_path = tmp_path / "settings.yaml"
