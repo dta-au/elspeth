@@ -284,12 +284,24 @@ field path without echoing the raw value.
 `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` names the profile alias the first-run
 tutorial's `llm` node must select.
 
+**The tutorial needs *a* profile, not its *own* profile.** Point this at an
+ordinary general-purpose profile you already define. A dedicated alias named
+something like `tutorial` is not required and is usually a mistake: the alias is
+visible to authors and lands in the audit trail, so every unrelated pipeline on
+the deployment ends up citing a tutorial-shaped name for its model binding.
+
 - It must name a key of `ELSPETH_WEB__LLM_PROFILES`; the service refuses to
-  start otherwise.
+  start otherwise. **This is the way to break a working tutorial by accident:**
+  renaming or removing a profile that this variable still points at turns a
+  healthy deployment into one that will not boot. Change both together, and
+  re-check `GET /api/system/status` afterwards.
 - When unset, the first-run tutorial is disabled — the launch path returns a
   typed HTTP 409 (`tutorial_profile_unavailable`) — without hiding ordinary
   CSV/JSON/text authoring.
-- The named alias is listed first in the `profile` enum that authors see.
+- The named alias is listed first in the `profile` enum that authors see, and it
+  is the alias the Composer's worked examples use. That makes it the de-facto
+  default for *all* authoring, not just the tutorial — another reason to point it
+  at a general-purpose tier rather than a niche or experimental one.
 
 The tutorial pipeline has a fixed shape: one `csv` or `json` source →
 `web_scrape`, `llm`, and `field_mapper` transforms → one `json` sink. The
@@ -345,11 +357,20 @@ protected plugin-policy variables (`ELSPETH_WEB__PLUGIN_ALLOWLIST`,
 two Bedrock Guardrail variables) plus `ELSPETH_WEB__COMPOSER_MODEL` and
 `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` into the web task definition. Its
 `variables.tf` requires both Composer models to be `bedrock/...` ids and
-requires them to differ. The scenario defines one keyless Bedrock profile
-aliased `tutorial` (reusing the Composer model id) and points
-`ELSPETH_WEB__TUTORIAL_LLM_PROFILE` at it; all Bedrock access flows through
-the ECS task role, and no `OPENROUTER_API_KEY` secret is wired when both
-Composer models are Bedrock. See the
+requires them to differ. The scenario defines two keyless Bedrock profiles named
+for the tier they provide — `standard` (the Composer model) and `fast` (the
+Composer advisor model) — and points `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` at
+`standard`, so the tutorial shares the ordinary general-purpose profile instead
+of owning a dedicated one.
+
+Both profiles deliberately reuse the two configured Composer model ids, because
+the module grants `bedrock:InvokeModel` for exactly those. A profile naming any
+other model passes startup validation and then fails at invoke time with
+`AccessDenied`, so adding a third model means extending the grant (and the
+permissions boundary) first.
+
+All Bedrock access flows through the ECS task role, and no `OPENROUTER_API_KEY`
+secret is wired when both Composer models are Bedrock. See the
 [AWS ECS deployment runbook](../runbooks/aws-ecs-deployment.md) ("Web plugin
 policy rollout") and the
 [Bedrock model-selection runbook](../runbooks/aws-ecs-bedrock-opus-sonnet.md).

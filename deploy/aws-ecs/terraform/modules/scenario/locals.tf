@@ -149,7 +149,7 @@ locals {
   # the alias outlives a model swap, where "flash" or "glm47" would start lying the
   # first time composer_advisor_model changes.
   llm_profiles = jsonencode({
-    tutorial = {
+    standard = {
       provider    = "bedrock"
       model       = local.bedrock_litellm_model
       region_name = var.aws_region
@@ -160,9 +160,15 @@ locals {
       region_name = var.aws_region
     }
   })
-  # Stays the tutorial's profile AND the resolver's preferred alias, so adding
-  # profiles never changes which one the planner teaches by default.
-  tutorial_llm_profile = "tutorial"
+  # The tutorial needs A profile, not its OWN profile — it points at the ordinary
+  # standard-tier one, the same way the systemd deployment points this at whichever
+  # general profile it defines. An alias called "tutorial" made every non-tutorial
+  # pipeline on the deployment cite a tutorial-shaped name in its audit trail.
+  #
+  # This alias is also the profile resolver's preferred_alias, so it sorts first and
+  # is what the planner's exemplars teach by default; keep it pointed at the
+  # general-purpose tier rather than a special-purpose one.
+  tutorial_llm_profile = "standard"
   guardrail_profiles = jsonencode([
     {
       alias                = "prompt-approved"

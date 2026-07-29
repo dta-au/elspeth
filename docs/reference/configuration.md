@@ -132,8 +132,8 @@ Bedrock profile for the tutorial:
 ELSPETH_WEB__PLUGIN_ALLOWLIST='["transform:aws_bedrock_prompt_shield","transform:aws_bedrock_content_safety"]'
 ELSPETH_WEB__PLUGIN_PREFERENCES='{"prompt_shield":["transform:aws_bedrock_prompt_shield"],"content_safety":["transform:aws_bedrock_content_safety"]}'
 ELSPETH_WEB__PLUGIN_CONTROL_MODES='{"prompt_shield":"required","content_safety":"required"}'
-ELSPETH_WEB__LLM_PROFILES='{"tutorial":{"provider":"bedrock","model":"bedrock/anthropic.claude-3-haiku-20240307-v1:0","region_name":"ap-southeast-2"}}'
-ELSPETH_WEB__TUTORIAL_LLM_PROFILE='tutorial'
+ELSPETH_WEB__LLM_PROFILES='{"standard":{"provider":"bedrock","model":"bedrock/anthropic.claude-3-haiku-20240307-v1:0","region_name":"ap-southeast-2"}}'
+ELSPETH_WEB__TUTORIAL_LLM_PROFILE='standard'
 ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES='[{"alias":"prompt-default","plugin":"aws_bedrock_prompt_shield","guardrail_identifier":"operatorpromptguardrail","guardrail_version":"7","region":"ap-southeast-2"},{"alias":"content-default","plugin":"aws_bedrock_content_safety","guardrail_identifier":"operatorcontentguardrail","guardrail_version":"4","region":"ap-southeast-2"}]'
 ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES='{"aws_bedrock_prompt_shield":"prompt-default","aws_bedrock_content_safety":"content-default"}'
 ```
@@ -159,7 +159,13 @@ store. Web-authored pipeline state stores the opaque profile alias, not the
 provider, model, endpoint, or credential binding.
 
 `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` must name a configured profile or the
-service refuses to start. Setting it enables the first-run tutorial, whose
+service refuses to start — so renaming or removing a profile this still points
+at will break a previously healthy deployment on its next restart; change both
+together. The tutorial needs *a* profile, not a dedicated one: point it at an
+ordinary general-purpose alias rather than inventing a `tutorial` alias, which
+would otherwise appear in every unrelated pipeline's audit trail. It is also the
+alias listed first for authors and used by the Composer's worked examples, so it
+should name a general-purpose tier. Setting it enables the first-run tutorial, whose
 launch contract needs more than the profile alone: the tutorial pipeline is
 exactly one `csv`/`json` source, the `web_scrape`, `llm`, and `field_mapper`
 transforms, and one `json` sink, and every one of those plugins must be
