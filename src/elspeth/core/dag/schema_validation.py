@@ -95,8 +95,10 @@ def validate_single_edge(
     to_info = graph.get_node_info(to_node_id)
 
     # Skip edge validation for coalesce nodes - they have special validation
-    # that checks all incoming branches together
-    if to_info.node_type == NodeType.COALESCE:
+    # that checks all incoming branches together. row_union nodes are
+    # pass-through barriers with an observed contract - branch payloads are
+    # released untouched, so single-edge schema derivation does not apply.
+    if to_info.node_type in (NodeType.COALESCE, NodeType.ROW_UNION):
         return
 
     # Rule 0: Gates must preserve schema (input == output)

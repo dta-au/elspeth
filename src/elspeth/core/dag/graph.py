@@ -34,6 +34,7 @@ from elspeth.contracts.types import (
     CoalesceName,
     GateName,
     NodeID,
+    RowUnionName,
     SinkName,
 )
 from elspeth.core.dag import coalesce_warnings, guarantees, schema_validation
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
         CoalesceSettings,
         GateSettings,
         QueueSettings,
+        RowUnionSettings,
         SourceSettings,
     )
     from elspeth.core.dag.wiring import WiredTransform
@@ -85,6 +87,8 @@ class ExecutionGraph:
         self._aggregation_id_map: dict[AggregationName, NodeID] = {}  # agg_name -> node_id
         self._coalesce_id_map: dict[CoalesceName, NodeID] = {}  # coalesce_name -> node_id
         self._branch_info: dict[BranchName, BranchInfo] = {}  # branch_name -> coalesce + gate info
+        self._row_union_id_map: dict[RowUnionName, NodeID] = {}  # row_union_name -> node_id
+        self._branch_to_row_union: dict[BranchName, RowUnionName] = {}  # fork branch -> row_union
         self._route_label_map: dict[tuple[NodeID, SinkName], str] = {}  # (gate_node, sink_name) -> route_label
         self._route_resolution_map: dict[tuple[NodeID, str], RouteDestination] = {}
         self._pipeline_nodes: list[NodeID] | None = None  # Ordered processing nodes (no source/sinks); None = not yet populated
@@ -288,12 +292,12 @@ class ExecutionGraph:
 
         for node_id_str, node_attrs in self._graph.nodes(data=True):
             node_info = cast(NodeInfo, node_attrs["info"])
-            # QUEUE and COALESCE are structural join primitives. SINK is a
-            # terminal write boundary: ADR-025 Decision 9 allows direct
-            # multi-source fan-in here, with ingest_sequence as the ordering
-            # authority. Ordinary processing nodes must still route through
-            # an explicit QUEUE.
-            if node_info.node_type in {NodeType.QUEUE, NodeType.SINK, NodeType.COALESCE}:
+            # QUEUE, COALESCE, and ROW_UNION are structural join primitives.
+            # SINK is a terminal write boundary: ADR-025 Decision 9 allows
+            # direct multi-source fan-in here, with ingest_sequence as the
+            # ordering authority. Ordinary processing nodes must still route
+            # through an explicit QUEUE.
+            if node_info.node_type in {NodeType.QUEUE, NodeType.SINK, NodeType.COALESCE, NodeType.ROW_UNION}:
                 continue
             incoming_move_predecessors = {
                 from_id
@@ -636,6 +640,25 @@ class ExecutionGraph:
             for u, v, _key, data in self._graph.in_edges(node_id, data=True, keys=True)
         ]
 
+    def get_outgoing_edges(self, node_id: str) -> list[EdgeInfo]:
+        """Get all edges leaving this node.
+
+        Args:
+            node_id: The source node ID
+
+        Returns:
+            List of EdgeInfo for edges where from_node == node_id
+        """
+        return [
+            EdgeInfo(
+                from_node=NodeID(u),
+                to_node=NodeID(v),
+                label=data["label"],
+                mode=data["mode"],
+            )
+            for u, v, _key, data in self._graph.out_edges(node_id, data=True, keys=True)
+        ]
+
     @classmethod
     def from_plugin_instances(
         cls,
@@ -648,6 +671,7 @@ class ExecutionGraph:
         gates: Sequence[GateSettings] = (),
         coalesce_settings: Sequence[CoalesceSettings] | None = None,
         queues: Mapping[str, QueueSettings] | None = None,
+        row_union_settings: Sequence[RowUnionSettings] | None = None,
     ) -> ExecutionGraph:
         """Build ExecutionGraph from plugin instances.
 
@@ -671,6 +695,7 @@ class ExecutionGraph:
             gates: Config-driven gate settings
             coalesce_settings: Coalesce configs for fork/join patterns
             queues: Declared pass-through scheduling queues
+            row_union_settings: row_union barrier configs (fork-branch UNION ALL)
 
         Returns:
             ExecutionGraph with schemas populated
@@ -692,6 +717,7 @@ class ExecutionGraph:
             gates=gates,
             coalesce_settings=coalesce_settings,
             queues=queues,
+            row_union_settings=row_union_settings,
         )
 
     # ===== PUBLIC SETTERS (construction-time) =====
@@ -725,6 +751,16 @@ class ExecutionGraph:
         """Set the coalesce_name -> node_id mapping."""
         self._assert_build_metadata_mutable()
         self._coalesce_id_map = dict(mapping)
+
+    def set_row_union_id_map(self, mapping: dict[RowUnionName, NodeID]) -> None:
+        """Set the row_union_name -> node_id mapping."""
+        self._assert_build_metadata_mutable()
+        self._row_union_id_map = dict(mapping)
+
+    def set_branch_to_row_union_map(self, mapping: dict[BranchName, RowUnionName]) -> None:
+        """Set the fork branch_name -> row_union_name mapping."""
+        self._assert_build_metadata_mutable()
+        self._branch_to_row_union = dict(mapping)
 
     def set_branch_info(self, mapping: dict[BranchName, BranchInfo]) -> None:
         """Set the branch_name -> BranchInfo mapping (coalesce + gate)."""
@@ -831,6 +867,18 @@ class ExecutionGraph:
             Branches not in this map route to the output sink.
         """
         return {name: info.coalesce_name for name, info in self._branch_info.items()}
+
+    def get_row_union_id_map(self) -> dict[RowUnionName, NodeID]:
+        """Get explicit row_union_name -> node_id mapping."""
+        return dict(self._row_union_id_map)
+
+    def get_branch_to_row_union_map(self) -> dict[BranchName, RowUnionName]:
+        """Get fork branch_name -> row_union_name mapping.
+
+        Branches in this map release through a row_union barrier; branches in
+        neither this map nor the coalesce branch map route to a sink.
+        """
+        return dict(self._branch_to_row_union)
 
     def get_branch_info_map(self) -> dict[BranchName, BranchInfo]:
         """Get immutable branch routing plans keyed by branch name."""

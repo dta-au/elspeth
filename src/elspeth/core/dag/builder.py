@@ -25,6 +25,7 @@ from elspeth.contracts.types import (
     CoalesceName,
     GateName,
     NodeID,
+    RowUnionName,
     SinkName,
 )
 from elspeth.core.canonical import canonical_json
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
         CoalesceSettings,
         GateSettings,
         QueueSettings,
+        RowUnionSettings,
         SourceSettings,
     )
     from elspeth.core.dag.graph import ExecutionGraph
@@ -97,6 +99,15 @@ class _CoalescePlan:
     name: CoalesceName
     node_id: NodeID
     branches: tuple[_CoalesceBranchSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RowUnionBranchSpec:
+    branch_name: BranchName
+    row_union_name: RowUnionName
+    row_union_node_id: NodeID
+    input_connection: str
+    uses_transform_chain: bool
 
 
 def _validate_output_schema_contract(transform: Any) -> None:
@@ -167,6 +178,7 @@ def build_execution_graph(
     gates: Sequence[GateSettings] = (),
     coalesce_settings: Sequence[CoalesceSettings] | None = None,
     queues: Mapping[str, QueueSettings] | None = None,
+    row_union_settings: Sequence[RowUnionSettings] | None = None,
 ) -> ExecutionGraph:
     """Build an ExecutionGraph from plugin instances.
 
@@ -543,11 +555,78 @@ def build_execution_graph(
 
         graph.set_coalesce_id_map(coalesce_ids)
 
+    # ===== ROW_UNION IMPLEMENTATION (BUILD NODES AND MAPPINGS FIRST) =====
+    # row_union is the fork-branch UNION ALL barrier (elspeth-a5b86149d4 v1):
+    # correlated on row_id, require_all only, pass-through payloads. Like
+    # queues, it promises no schema synthesis — its contract is observed.
+    row_union_ids: dict[RowUnionName, NodeID] = {}
+    row_union_branch_specs: dict[BranchName, _RowUnionBranchSpec] = {}
+    if row_union_settings:
+        observed_row_union_schema = SchemaConfig(mode="observed", fields=None)
+        for union_config in row_union_settings:
+            union_name = RowUnionName(union_config.name)
+            if SinkName(union_config.on_success) in sink_ids:
+                raise GraphValidationError(
+                    f"row_union '{union_config.name}' on_success '{union_config.on_success}' names a sink. "
+                    "A released group must continue on a processing connection; "
+                    "terminal row_union -> sink release is not supported in v1.",
+                    component_id=union_config.name,
+                    component_type="row_union",
+                )
+            union_node_config: NodeConfig = {
+                "branches": dict(union_config.branches),
+                "on_success": union_config.on_success,
+            }
+            if union_config.timeout_seconds is not None:
+                union_node_config["timeout_seconds"] = union_config.timeout_seconds
+
+            uid = node_id("row_union", union_config.name, union_node_config)
+            row_union_ids[union_name] = uid
+
+            for branch_name, input_connection in union_config.branches.items():
+                branch_key = BranchName(branch_name)
+                if branch_key in coalesce_branch_specs:
+                    raise GraphValidationError(
+                        f"Branch '{branch_name}' is already mapped to coalesce "
+                        f"'{coalesce_branch_specs[branch_key].coalesce_name}', but row_union "
+                        f"'{union_config.name}' also declares it.\n"
+                        f"Each fork branch can only join at one barrier.",
+                        component_id=union_config.name,
+                        component_type="row_union",
+                    )
+                if branch_key in row_union_branch_specs:
+                    raise GraphValidationError(
+                        f"Duplicate branch name '{branch_name}' found in row_union settings.\n"
+                        f"Branch '{branch_name}' is already mapped to row_union "
+                        f"'{row_union_branch_specs[branch_key].row_union_name}', but row_union "
+                        f"'{union_config.name}' also declares it.",
+                        component_id=union_config.name,
+                        component_type="row_union",
+                    )
+                row_union_branch_specs[branch_key] = _RowUnionBranchSpec(
+                    branch_name=branch_key,
+                    row_union_name=union_name,
+                    row_union_node_id=uid,
+                    input_connection=input_connection,
+                    uses_transform_chain=input_connection != branch_name,
+                )
+
+            graph.add_node(
+                uid,
+                node_type=NodeType.ROW_UNION,
+                plugin_name=f"row_union:{union_config.name}",
+                config=union_node_config,
+                output_schema_config=observed_row_union_schema,
+            )
+
+        graph.set_row_union_id_map(row_union_ids)
+
     # ===== CONNECT FORK GATES - EXPLICIT DESTINATIONS ONLY =====
     # CRITICAL: No fallback behavior. All fork branches must have explicit destinations.
     # This prevents silent configuration bugs (typos, missing destinations).
     fork_branch_owner: dict[BranchName, GateName] = {}
     coalesce_branch_plans: dict[BranchName, _CoalesceBranchPlan] = {}
+    row_union_branch_gates: dict[BranchName, tuple[GateName, NodeID]] = {}
     for gate_entry in gate_entries:
         if gate_entry.fork_to:
             branch_counts = Counter(gate_entry.fork_to)
@@ -584,6 +663,17 @@ def build_execution_graph(
                             label=branch_name,
                             mode=RoutingMode.COPY,
                         )
+                elif branch_key in row_union_branch_specs:
+                    ru_spec = row_union_branch_specs[branch_key]
+                    row_union_branch_gates[branch_key] = (GateName(gate_entry.name), gate_entry.node_id)
+                    if not ru_spec.uses_transform_chain:
+                        # Identity branch: direct COPY edge into the barrier
+                        graph.add_edge(
+                            gate_entry.node_id,
+                            ru_spec.row_union_node_id,
+                            label=branch_name,
+                            mode=RoutingMode.COPY,
+                        )
                 elif SinkName(branch_name) in sink_ids:
                     # Explicit sink destination (branch name matches sink name)
                     graph.add_edge(
@@ -598,9 +688,11 @@ def build_execution_graph(
                         f"Gate '{gate_entry.name}' has fork branch '{branch_name}' with no destination.\n"
                         f"Fork branches must either:\n"
                         f"  1. Be listed in a coalesce 'branches' dict/list, or\n"
-                        f"  2. Match a sink name exactly\n"
+                        f"  2. Be listed in a row_union 'branches' dict/list, or\n"
+                        f"  3. Match a sink name exactly\n"
                         f"\n"
                         f"Available coalesce branches: {sorted(coalesce_branch_specs.keys())}\n"
+                        f"Available row_union branches: {sorted(row_union_branch_specs.keys())}\n"
                         f"Available sinks: {sorted(sink_ids.keys())}",
                         component_id=gate_entry.name,
                         component_type="gate",
@@ -622,6 +714,21 @@ def build_execution_graph(
                     component_id=str(spec.coalesce_name),
                     component_type="coalesce",
                 )
+
+    # ===== VALIDATE ROW_UNION BRANCHES ARE PRODUCED BY GATES =====
+    if row_union_branch_specs:
+        for branch_name, ru_spec in row_union_branch_specs.items():
+            if branch_name not in row_union_branch_gates:
+                raise GraphValidationError(
+                    f"row_union '{ru_spec.row_union_name}' declares branch '{branch_name}', "
+                    f"but no gate produces this branch.\n"
+                    f"Branches must be listed in a gate's fork_to list to be valid.\n"
+                    f"\n"
+                    f"Branches produced by gates: {sorted(fork_branch_owner.keys()) if fork_branch_owner else '(none)'}",
+                    component_id=str(ru_spec.row_union_name),
+                    component_type="row_union",
+                )
+        graph.set_branch_to_row_union_map({branch: spec.row_union_name for branch, spec in row_union_branch_specs.items()})
 
     # ===== BUILD PRODUCER REGISTRY =====
     producers: dict[str, tuple[NodeID, str]] = {}
@@ -677,6 +784,15 @@ def build_execution_graph(
                     f"coalesce '{coalesce_config.name}'",
                 )
 
+    if row_union_settings:
+        for union_config in row_union_settings:
+            register_producer(
+                union_config.on_success,
+                row_union_ids[RowUnionName(union_config.name)],
+                "continue",
+                f"row_union '{union_config.name}'",
+            )
+
     for queue_name, queue_id in queue_ids.items():
         producers[queue_name] = (queue_id, "continue")
         producer_desc[queue_name] = f"queue '{queue_name}'"
@@ -691,6 +807,17 @@ def build_execution_graph(
             plan.gate_node_id,
             plan.branch_name,
             f"fork branch '{plan.branch_name}' from gate '{plan.gate_name}'",
+        )
+
+    for branch_key, (ru_gate_name, ru_gate_node_id) in row_union_branch_gates.items():
+        ru_spec = row_union_branch_specs[branch_key]
+        if not ru_spec.uses_transform_chain:
+            continue
+        register_producer(
+            ru_spec.branch_name,
+            ru_gate_node_id,
+            ru_spec.branch_name,
+            f"fork branch '{ru_spec.branch_name}' from gate '{ru_gate_name}'",
         )
 
     # ===== BUILD CONSUMER REGISTRY =====
@@ -734,6 +861,18 @@ def build_execution_graph(
             plan.input_connection,
             plan.coalesce_node_id,
             f"coalesce '{plan.coalesce_name}' branch '{plan.branch_name}'",
+        )
+
+    # Same shape for row_union transform branches: the barrier consumes the
+    # final transform's output connection; connection resolution creates the
+    # MOVE edges through the chain.
+    for ru_spec in row_union_branch_specs.values():
+        if not ru_spec.uses_transform_chain:
+            continue
+        register_consumer(
+            ru_spec.input_connection,
+            ru_spec.row_union_node_id,
+            f"row_union '{ru_spec.row_union_name}' branch '{ru_spec.branch_name}'",
         )
 
     for gate_id, route_label, target in gate_route_connections:
@@ -1127,6 +1266,45 @@ def build_execution_graph(
     # replaces NodeInfo payloads during multi-step schema propagation.
     # deep_freeze converts nested dicts/lists to MappingProxyType/tuple recursively.
     graph.finalize_node_configs()
+
+    # ===== ROW_UNION GROUP-INDIVISIBILITY GUARD (v1) =====
+    # A released union group is indivisible: downstream batch triggers may
+    # fire only BETWEEN complete groups, never between variants of one source
+    # row. v1 enforces this structurally — any aggregation reachable from a
+    # row_union may use only the implicit end_of_source trigger, which cannot
+    # split a group. Group-aware count/timeout/condition triggers are the
+    # production follow-up on elspeth-a5b86149d4.
+    if row_union_ids:
+        aggregation_settings_by_node: dict[NodeID, AggregationSettings] = {
+            aggregation_ids[AggregationName(agg_name)]: agg_settings for agg_name, (_transform, agg_settings) in aggregations.items()
+        }
+        for union_name, union_node_id in row_union_ids.items():
+            visited: set[NodeID] = set()
+            frontier: list[NodeID] = [union_node_id]
+            while frontier:
+                current = frontier.pop()
+                for out_edge in graph.get_outgoing_edges(current):
+                    downstream = out_edge.to_node
+                    if downstream in visited:
+                        continue
+                    visited.add(downstream)
+                    if graph.get_node_info(downstream).node_type == NodeType.SINK:
+                        continue
+                    downstream_agg = aggregation_settings_by_node.get(downstream)
+                    if downstream_agg is not None:
+                        trigger = downstream_agg.trigger
+                        if trigger.has_count or trigger.has_timeout or trigger.has_condition:
+                            raise GraphValidationError(
+                                f"Aggregation '{downstream_agg.name}' is downstream of row_union "
+                                f"'{union_name}' but declares a count/timeout/condition trigger. "
+                                f"Such triggers can fire between variants of one source row, "
+                                f"splitting an indivisible union group. Use the implicit "
+                                f"end_of_source trigger (omit 'trigger' or set 'trigger: {{}}'), "
+                                f"or move the aggregation upstream of the fork.",
+                                component_id=str(union_name),
+                                component_type="row_union",
+                            )
+                    frontier.append(downstream)
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)
