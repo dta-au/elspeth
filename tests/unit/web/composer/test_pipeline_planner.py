@@ -4350,6 +4350,34 @@ async def test_repair_exhaustion_records_last_rejection_codes(
 
 
 @pytest.mark.asyncio
+async def test_opted_in_rejection_diagnostics_never_log_authored_values(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    authored_canary = "AUTHORED_VALUE_MUST_NOT_ENTER_LOGS"
+    invalid = _pipeline(tmp_path)
+    invalid["outputs"][0]["sink_name"] = authored_canary
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": invalid})))
+    monkeypatch.setenv("ELSPETH_PLANNER_REJECTION_DETAIL_LOG", "1")
+
+    with capture_logs() as logs, pytest.raises(PipelinePlannerError):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            repair_budget=0,
+            model_overrides={"escape_hatch_model": None},
+        )
+
+    diagnostic = next(entry for entry in logs if entry["event"] == "composer.planner_rejection_detail")
+    assert authored_canary not in json.dumps(diagnostic)
+    assert all("message" not in entry for entry in diagnostic["entries"])
+
+
+@pytest.mark.asyncio
 async def test_planner_attempt_trail_names_reject_repair_accept(
     tmp_path: Path,
     tool_context: ToolContext,

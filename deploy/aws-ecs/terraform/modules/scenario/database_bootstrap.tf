@@ -102,7 +102,7 @@ locals {
 
   database_bootstrap_container = {
     name                   = "database-bootstrap"
-    image                  = var.candidate_image
+    image                  = terraform_data.candidate_image_provenance.output
     essential              = true
     readonlyRootFilesystem = true
     entryPoint             = ["python", "-c"]
@@ -148,6 +148,7 @@ resource "terraform_data" "database_bootstrap" {
   triggers_replace = [
     aws_rds_cluster_instance.database.id,
     aws_ecs_task_definition.database_bootstrap.arn,
+    aws_secretsmanager_secret_version.bootstrap.version_id,
   ]
 
   depends_on = [aws_secretsmanager_secret_version.bootstrap]

@@ -899,6 +899,53 @@ def test_sign_bundle_resume_migrates_legacy_pending_publication_journal(
     assert any({"source_file": "gadget.yaml", "old_key": stale_key, "new_key": live_key} in record["rotations"] for record in records)
 
 
+def test_sign_bundle_resume_does_not_roll_back_completed_legacy_rotation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(rotation_log)))) == 0
+    transaction = _recovery_path(capsys.readouterr().err)
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    manifest.pop("source_validation_state")
+    sign_bundle_transaction.save_manifest(transaction, manifest)
+    before_allowlist = _tree_bytes(allowlist_dir)
+    before_rotation = rotation_log.read_bytes()
+
+    _write_source(root, "plugins/gadget.py", "gadget", active=False)
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before_allowlist
+    assert rotation_log.read_bytes() == before_rotation
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+
+
 def test_publication_disposition_rejects_preexchange_writer_and_base_mimic(
     tmp_path: Path,
 ) -> None:
@@ -2224,6 +2271,57 @@ def test_sign_bundle_dry_run_writes_nothing(tmp_path: Path, capsys: pytest.Captu
     assert not (allowlist_dir.parent / ".sign-bundle-transactions").exists()
     out = capsys.readouterr().out
     assert "new_judgment" in out
+
+
+def test_sign_bundle_resume_dry_run_never_rolls_back_published_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _interrupt_after_publish(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _interrupt_after_publish)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(rotation_log)))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+
+    _write_source(root, "plugins/gadget.py", "gadget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--dry-run", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
 
 
 def test_sign_bundle_dry_run_reports_planned_override_count(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

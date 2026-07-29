@@ -222,8 +222,24 @@ def test_page_block_numbering_disagreement_fails_closed() -> None:
     second = _second_page()
     second["Blocks"][0]["Page"] = 3
 
-    with pytest.raises(MalformedTextractResponse, match="PAGE block"):
+    with pytest.raises(MalformedTextractResponse, match="Page"):
         _normalize(_first_page(), second)
+
+
+def test_non_page_block_outside_document_page_count_fails_closed() -> None:
+    first = _first_page()
+    first["Blocks"][2]["Page"] = 3
+
+    with pytest.raises(MalformedTextractResponse, match="Page"):
+        _normalize(first, _second_page())
+
+
+def test_every_block_requires_a_page_number() -> None:
+    first = _first_page()
+    del first["Blocks"][2]["Page"]
+
+    with pytest.raises(MalformedTextractResponse, match="Page"):
+        _normalize(first, _second_page())
 
 
 @pytest.mark.parametrize("missing", ["JobStatus", "DocumentMetadata", "AnalyzeDocumentModelVersion", "Blocks"])
@@ -271,6 +287,48 @@ def test_invalid_known_block_member_fails_closed(member: str, value: object, mes
 def test_too_many_blocks_fail_closed() -> None:
     with pytest.raises(MalformedTextractResponse, match="max_blocks"):
         _normalize(max_blocks=9)
+
+
+def test_table_coordinates_cannot_drive_unbounded_dense_allocation() -> None:
+    first = _facet_first_page()
+    table_cell = next(block for block in first["Blocks"] if block["BlockType"] == "CELL")
+    table_cell["RowIndex"] = 10_000
+
+    with pytest.raises(MalformedTextractResponse, match="RowIndex"):
+        _normalize(first, _second_page())
+
+
+def test_deep_acyclic_child_graph_is_normalized_without_python_recursion() -> None:
+    blocks: list[dict[str, Any]] = [
+        {"BlockType": "PAGE", "Id": "page-1", "Page": 1},
+        {
+            "BlockType": "LAYOUT_TITLE",
+            "Id": "layout-root",
+            "Page": 1,
+            "Confidence": 99.0,
+            "Relationships": [{"Type": "CHILD", "Ids": ["word-0"]}],
+        },
+    ]
+    for index in range(2_000):
+        block: dict[str, Any] = {
+            "BlockType": "WORD",
+            "Id": f"word-{index}",
+            "Page": 1,
+            "Text": "deep text" if index == 1_999 else "",
+        }
+        if index < 1_999:
+            block["Relationships"] = [{"Type": "CHILD", "Ids": [f"word-{index + 1}"]}]
+        blocks.append(block)
+    result_page = {
+        "JobStatus": "SUCCEEDED",
+        "DocumentMetadata": {"Pages": 1},
+        "AnalyzeDocumentModelVersion": "1.0",
+        "Blocks": blocks,
+    }
+
+    result = _normalize(result_page)
+
+    assert result.layout[0]["text"] == "deep text"
 
 
 def test_oversized_native_result_fails_closed() -> None:

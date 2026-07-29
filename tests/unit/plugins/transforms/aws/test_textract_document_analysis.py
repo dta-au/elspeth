@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -183,6 +184,21 @@ def test_poll_backoff_multiplier_must_be_at_least_one() -> None:
 def test_poll_max_interval_must_cover_initial_interval() -> None:
     with pytest.raises(PluginConfigError, match="poll_max_interval_seconds"):
         _load(poll_interval_seconds=2.0, poll_max_interval_seconds=1.0)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "poll_interval_seconds",
+        "poll_backoff_multiplier",
+        "poll_max_interval_seconds",
+        "poll_timeout_seconds",
+        "batch_wait_timeout_seconds",
+    ],
+)
+def test_non_finite_timing_configuration_fails(field: str) -> None:
+    with pytest.raises(PluginConfigError, match=field):
+        _load(**{field: float("inf")})
 
 
 def test_full_configuration_declares_inputs_and_ordered_outputs() -> None:
@@ -557,6 +573,58 @@ def test_poll_timeout_is_retryable() -> None:
     assert result.status == "error"
     assert result.reason["reason"] == "poll_timeout"
     assert result.retryable is True
+
+
+def test_successful_get_returning_after_total_deadline_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeTextractClient(pages=[_page(blocks=_basic_blocks())])
+    transform = _transform_for_client(client, poll_timeout_seconds=1.0)
+    clock = iter((0.0, 0.25, 1.25))
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.textract_document_analysis.time.monotonic",
+        lambda: next(clock),
+    )
+
+    result = _run(transform)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "poll_timeout"
+    assert result.retryable is True
+
+
+def test_shutdown_requested_during_successful_get_is_rejected() -> None:
+    client = FakeTextractClient(pages=[_page(blocks=_basic_blocks())])
+    transform = _transform_for_client(client)
+    shutdown = threading.Event()
+    transform._shutdown = shutdown
+    original_get = client.get_document_analysis
+
+    def get_and_cancel(**kwargs: object) -> AnalysisResultPage:
+        page = original_get(**kwargs)
+        shutdown.set()
+        return page
+
+    client.get_document_analysis = get_and_cancel  # type: ignore[method-assign]
+
+    result = _run(transform)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "shutdown_requested"
+
+
+def test_cumulative_result_bytes_stop_pagination_before_another_request() -> None:
+    client = FakeTextractClient(
+        pages=[
+            _page(blocks=_basic_blocks(page=1, text="a" * 600), next_token="page-2", page_count=2),
+            _page(blocks=_basic_blocks(page=2, text="b" * 600), next_token="page-3", page_count=2),
+            _page(blocks=[]),
+        ]
+    )
+
+    result = _run(_transform_for_client(client, max_result_bytes=1_000))
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "result_too_large"
+    assert len(client.get_calls) == 2
 
 
 def test_repeated_pagination_token_fails_closed() -> None:

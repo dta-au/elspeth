@@ -37,6 +37,7 @@ _IDEMPOTENCY_MISMATCH_CODE = "IdempotentParameterMismatchException"
 _MAX_ERROR_CODE_LENGTH = 128
 _MAX_JOB_ID_LENGTH = 64
 _MAX_NEXT_TOKEN_LENGTH = 1024
+_SDK_TOTAL_MAX_ATTEMPTS = 3
 
 
 class TextractResponseError(ValueError):
@@ -93,6 +94,10 @@ def _mapping(value: object) -> Mapping[str, Any]:
 def _bounded_string(value: object, *, maximum: int) -> str:
     if type(value) is not str or not 1 <= len(value) <= maximum:
         raise TextractResponseError
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise TextractResponseError from error
     return value
 
 
@@ -140,7 +145,7 @@ def _provider_error(error: Exception) -> tuple[str, bool, int, bool]:
     from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 
     if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
-        return "transport_error", True, 1, False
+        return "transport_error", True, _SDK_TOTAL_MAX_ATTEMPTS, False
     if not isinstance(error, ClientError):
         return "botocore_error", False, 1, False
 
@@ -181,7 +186,7 @@ def build_textract_sdk_client(
         "config": Config(
             connect_timeout=10,
             read_timeout=30,
-            retries={"mode": "standard", "total_max_attempts": 3},
+            retries={"mode": "standard", "total_max_attempts": _SDK_TOTAL_MAX_ATTEMPTS},
         ),
     }
     if aws_access_key_id is not None:
@@ -409,14 +414,14 @@ class TextractClient(AuditedClientBase):
             semantic_response = {key: value for key, value in response.items() if key not in {"ResponseMetadata", "NextToken"}}
             try:
                 semantic_size = len(canonical_json(semantic_response).encode("utf-8"))
-            except (TypeError, ValueError) as error:
+                frozen_semantic = cast("Mapping[str, Any]", deep_freeze(semantic_response))
+            except (TypeError, ValueError, RecursionError, UnicodeError) as error:
                 raise TextractResponseError from error
             if semantic_size > self._max_response_bytes:
                 raise TextractResponseError(
                     "Amazon Textract response exceeded the maximum response size",
                     category="response_too_large",
                 )
-            frozen_semantic = cast("Mapping[str, Any]", deep_freeze(semantic_response))
             result_page: AnalysisResultPage | None = AnalysisResultPage(
                 semantic_response=frozen_semantic,
                 next_token=returned_next_token,

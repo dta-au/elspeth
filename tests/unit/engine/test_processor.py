@@ -75,6 +75,7 @@ from elspeth.engine.processor import (
     _LiveBarrierHold,
 )
 from elspeth.engine.retry import RetryManager
+from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
 from elspeth.plugins.infrastructure.clients.llm import LLMClientError
@@ -313,6 +314,8 @@ def _make_processor(
     coalesce_executor: Any = None,
     coalesce_node_ids: dict[CoalesceName, NodeID] | None = None,
     branch_to_coalesce: dict[BranchName, CoalesceName] | None = None,
+    row_union_executor: Any = None,
+    branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
     branch_to_sink: dict[BranchName, str] | None = None,
     node_step_map: dict[NodeID, int] | None = None,
     coalesce_on_success_map: dict[CoalesceName, str] | None = None,
@@ -426,6 +429,8 @@ def _make_processor(
         retry_manager=retry_manager,
         coalesce_executor=coalesce_executor,
         branch_to_coalesce=branch_to_coalesce,
+        row_union_executor=row_union_executor,
+        branch_to_row_union=branch_to_row_union,
         branch_to_sink={BranchName(k): SinkName(v) for k, v in (branch_to_sink or {}).items()},
         coalesce_on_success_map=coalesce_on_success_map,
         barrier_restore=barrier_restore,
@@ -8256,6 +8261,56 @@ class TestTelemetryEmission:
         event = SimpleNamespace()
         processor._emit_telemetry(event)
         telemetry.handle_event.assert_called_once_with(event)
+
+
+class TestRowUnionBranchLossTelemetry:
+    def test_follower_stages_durable_loss_without_executor(self) -> None:
+        _, factory = _make_factory()
+        lost_token = make_token_info(row_id="row-1", token_id="lost-token", branch_name="control")
+        processor = _make_processor(
+            factory,
+            row_union_executor=None,
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+
+        assert processor._notify_row_union_of_lost_branch(lost_token, "error_routed") == []
+
+        loss = processor._take_claim_branch_loss("lost-token")
+        assert loss is not None
+        assert loss.coalesce_name == "variants"
+        assert loss.row_id == "row-1"
+        assert loss.branch_name == "control"
+        assert loss.reason == "error_routed"
+
+    def test_failed_siblings_emit_token_completed_after_audit(self) -> None:
+        _, factory = _make_factory()
+        held_sibling = make_token_info(row_id="row-1", token_id="held-token", branch_name="treatment")
+        lost_token = make_token_info(row_id="row-1", token_id="lost-token", branch_name="control")
+        row_union_executor = create_autospec(RowUnionExecutor, instance=True)
+        row_union_executor.notify_branch_lost.return_value = RowUnionOutcome(
+            held=False,
+            consumed_tokens=(held_sibling,),
+            failure_reason="row_union_branch_lost",
+            row_union_name="variants",
+            outcomes_recorded=True,
+        )
+        telemetry = create_autospec(TelemetryManagerProtocol, instance=True)
+        processor = _make_processor(
+            factory,
+            row_union_executor=row_union_executor,
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+            telemetry_manager=telemetry,
+        )
+
+        with patch.object(processor, "_complete_row_union_fire"):
+            results = processor._notify_row_union_of_lost_branch(lost_token, "error_routed")
+
+        assert [result.token.token_id for result in results] == ["held-token"]
+        telemetry.handle_event.assert_called_once()
+        event = telemetry.handle_event.call_args.args[0]
+        assert event.token_id == "held-token"
+        assert event.outcome is TerminalOutcome.FAILURE
+        assert event.path is TerminalPath.UNROUTED
 
 
 # =============================================================================

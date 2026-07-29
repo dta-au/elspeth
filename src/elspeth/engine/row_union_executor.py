@@ -21,6 +21,7 @@ recognizable siblings; the merge machinery is deliberately absent.
 """
 
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -100,6 +101,16 @@ class _PendingRowUnion:
     first_arrival: float  # Timeout anchor (oldest member's arrival)
 
 
+@dataclass(frozen=True, slots=True)
+class RowUnionRestoreEntry:
+    """One adopted durable row_union hold reconstructed for resume."""
+
+    token: TokenInfo
+    row_union_name: str
+    state_id: str | None
+    arrival_time: float
+
+
 class RowUnionExecutor:
     """Executes row_union barriers with audit recording.
 
@@ -150,6 +161,9 @@ class RowUnionExecutor:
         # Recorded branch losses for §E.5 replay dedup:
         # (row_union_name, row_id, branch_name)
         self._recorded_losses: set[tuple[str, str, str]] = set()
+        # Group-level index for correctness after the bounded completed-key
+        # cache evicts an early loss before any sibling arrives.
+        self._recorded_loss_groups: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------------
     # Registration
@@ -173,6 +187,127 @@ class RowUnionExecutor:
         if row_union_name not in self._node_ids:
             raise OrchestrationInvariantError(f"row_union '{row_union_name}' not registered")
         return self._node_ids[row_union_name]
+
+    def restore_from_journal(
+        self,
+        *,
+        entries: Sequence[RowUnionRestoreEntry],
+    ) -> tuple[RowUnionOutcome, ...]:
+        """Restore adopted pending groups from durable scheduler and audit rows.
+
+        Validation completes before executor memory is replaced. Fully
+        adopted groups are released immediately; the caller must commit the
+        returned outcomes through the scheduler barrier-completion seam.
+        """
+        if self._pending:
+            raise OrchestrationInvariantError("row_union restore requires an empty executor pending map")
+
+        restored: dict[tuple[str, str], _PendingRowUnion] = {}
+        for entry in entries:
+            if entry.row_union_name not in self._settings:
+                raise OrchestrationInvariantError(f"Cannot restore unknown row_union '{entry.row_union_name}'")
+            branch_name = entry.token.branch_name
+            if branch_name is None:
+                raise OrchestrationInvariantError(f"Cannot restore row_union token {entry.token.token_id}: branch_name is None")
+            settings = self._settings[entry.row_union_name]
+            if branch_name not in settings.branches:
+                raise OrchestrationInvariantError(
+                    f"Cannot restore branch '{branch_name}' into row_union '{entry.row_union_name}'; "
+                    f"expected one of {list(settings.branches)}"
+                )
+            key = (entry.row_union_name, entry.token.row_id)
+            pending = restored.setdefault(key, _PendingRowUnion(branches={}, first_arrival=entry.arrival_time))
+            if branch_name in pending.branches:
+                raise OrchestrationInvariantError(
+                    f"Duplicate restored branch '{branch_name}' for row_union '{entry.row_union_name}', row {entry.token.row_id}"
+                )
+            if entry.state_id is None:
+                raise OrchestrationInvariantError(f"Cannot restore row_union token {entry.token.token_id} without an OPEN node state")
+            pending.first_arrival = min(pending.first_arrival, entry.arrival_time)
+            pending.branches[branch_name] = _BranchEntry(
+                token=entry.token,
+                arrival_time=entry.arrival_time,
+                state_id=entry.state_id,
+            )
+
+        self._pending = restored
+        outcomes: list[RowUnionOutcome] = []
+        for key in tuple(self._pending):
+            if key in self._recorded_loss_groups:
+                outcomes.append(self._fail_pending(self._settings[key[0]], key, "row_union_branch_lost"))
+        for key in tuple(self._pending):
+            settings = self._settings[key[0]]
+            pending = self._pending[key]
+            if set(pending.branches) == set(settings.branches):
+                outcomes.append(self._execute_release(settings=settings, key=key, pending=pending))
+        return tuple(outcomes)
+
+    def restore_branch_losses(self, losses: Sequence[tuple[str, str, str]]) -> None:
+        """Restore the durable lost-branch index before pending groups reopen."""
+        for row_union_name, row_id, branch_name in losses:
+            if row_union_name not in self._settings:
+                raise OrchestrationInvariantError(f"Cannot restore loss for unknown row_union '{row_union_name}'")
+            if branch_name not in self._settings[row_union_name].branches:
+                raise OrchestrationInvariantError(f"Cannot restore loss for branch '{branch_name}' in row_union '{row_union_name}'")
+            self._recorded_losses.add((row_union_name, row_id, branch_name))
+            self._recorded_loss_groups.add((row_union_name, row_id))
+
+    def reconcile_released_group(
+        self,
+        *,
+        entries: Sequence[RowUnionRestoreEntry],
+    ) -> RowUnionOutcome:
+        """Finish a release whose node-state writes preceded scheduler commit.
+
+        A completed Landscape state proves that the group reached the release
+        arm. Entries still carrying an OPEN state are the prefix/suffix left by
+        a crash during state completion; already-completed entries carry
+        ``state_id=None`` and are not written twice.
+        """
+        if not entries:
+            raise OrchestrationInvariantError("Cannot reconcile an empty row_union release")
+        row_union_name = entries[0].row_union_name
+        row_id = entries[0].token.row_id
+        key = (row_union_name, row_id)
+        if row_union_name not in self._settings:
+            raise OrchestrationInvariantError(f"Cannot reconcile unknown row_union '{row_union_name}'")
+        if key in self._pending or key in self._completed_keys or key in self._recorded_loss_groups:
+            raise OrchestrationInvariantError(f"Cannot reconcile non-pristine row_union group {row_union_name}/{row_id}")
+
+        by_branch: dict[str, RowUnionRestoreEntry] = {}
+        for entry in entries:
+            if entry.row_union_name != row_union_name or entry.token.row_id != row_id:
+                raise OrchestrationInvariantError("Row_union release reconciliation mixed group identities")
+            branch_name = entry.token.branch_name
+            if branch_name is None or branch_name in by_branch:
+                raise OrchestrationInvariantError("Row_union release reconciliation has a missing or duplicate branch")
+            by_branch[branch_name] = entry
+
+        settings = self._settings[row_union_name]
+        if set(by_branch) != set(settings.branches):
+            raise OrchestrationInvariantError(
+                f"Row_union release reconciliation for {row_union_name}/{row_id} has branches "
+                f"{sorted(by_branch)}; expected {list(settings.branches)}"
+            )
+
+        now = self._clock.monotonic()
+        for entry in by_branch.values():
+            if entry.state_id is not None:
+                self._execution.complete_node_state(
+                    state_id=entry.state_id,
+                    status=NodeStateStatus.COMPLETED,
+                    output_data=entry.token.row_data.to_dict(),
+                    duration_ms=(now - entry.arrival_time) * 1000,
+                )
+
+        released = tuple(by_branch[branch_name].token for branch_name in settings.branches)
+        self._mark_completed(key, _CLOSED_BY_RELEASE)
+        return RowUnionOutcome(
+            held=False,
+            released_tokens=released,
+            consumed_tokens=released,
+            row_union_name=row_union_name,
+        )
 
     # ------------------------------------------------------------------
     # Accept
@@ -209,13 +344,14 @@ class RowUnionExecutor:
         key = (row_union_name, token.row_id)
         now = arrival_time if arrival_time is not None else self._clock.monotonic()
 
-        if key in self._completed_keys or self._check_landscape_for_completion(row_union_name, token.row_id):
+        closed_by_recorded_loss = key in self._recorded_loss_groups
+        if key in self._completed_keys or closed_by_recorded_loss or self._check_landscape_for_completion(row_union_name, token.row_id):
             return self._fail_late_arrival(
                 token,
                 settings,
                 node_id,
                 step,
-                closed_reason=self._completed_keys.get(key, _CLOSED_BY_RELEASE),
+                closed_reason=_CLOSED_BY_BRANCH_LOSS if closed_by_recorded_loss else self._completed_keys.get(key, _CLOSED_BY_RELEASE),
             )
 
         if key not in self._pending:
@@ -439,6 +575,7 @@ class RowUnionExecutor:
         self._recorded_losses.add((row_union_name, row_id, lost_branch))
 
         key = (row_union_name, row_id)
+        self._recorded_loss_groups.add(key)
         if key in self._completed_keys:
             return None
         if key not in self._pending:

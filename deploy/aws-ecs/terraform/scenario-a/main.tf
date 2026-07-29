@@ -17,6 +17,7 @@ module "scenario" {
   scenario_id                        = var.scenario_id
   candidate_sha                      = var.candidate_sha
   candidate_image                    = var.candidate_image
+  candidate_ecr_repository           = var.candidate_ecr_repository
   rollback_baseline_image            = var.candidate_image
   rollback_baseline_sha              = var.candidate_sha
   aws_account_id                     = var.aws_account_id
@@ -28,6 +29,7 @@ module "scenario" {
   purpose                            = var.purpose
   cleanup_deadline                   = var.cleanup_deadline
   cloudwatch_agent_image             = var.cloudwatch_agent_image
+  cloudwatch_agent_ecr_repository    = var.cloudwatch_agent_ecr_repository
   composer_model                     = var.composer_model
   composer_advisor_model             = var.composer_advisor_model
   bedrock_inference_profile_arns     = var.bedrock_inference_profile_arns

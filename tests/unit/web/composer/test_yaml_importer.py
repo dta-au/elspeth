@@ -127,6 +127,26 @@ def test_composition_state_from_runtime_yaml_rejects_empty_mapping() -> None:
         composition_state_from_runtime_yaml("{}\n")
 
 
+def test_composition_state_from_runtime_yaml_rejects_unsupported_row_unions() -> None:
+    pipeline_yaml = """
+transforms:
+- name: normalize
+  plugin: field_mapper
+  input: source
+  on_success: control
+  on_error: discard
+  options:
+    mapping: {}
+row_unions:
+- name: variants
+  branches: [control, treatment]
+  on_success: compared
+"""
+
+    with pytest.raises(RuntimeYamlImportError, match=r"row_unions.*not supported by Composer import"):
+        composition_state_from_runtime_yaml(pipeline_yaml)
+
+
 def test_composition_state_from_runtime_yaml_rejects_aliases() -> None:
     """Hardening: anchors/aliases are rejected outright (billion-laughs defense).
 

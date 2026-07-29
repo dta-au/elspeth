@@ -26,7 +26,7 @@ from elspeth.core.config import RowUnionSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine.clock import MockClock
-from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
+from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome, RowUnionRestoreEntry
 from elspeth.testing import make_field, make_row
 
 _state_counter = itertools.count(1)
@@ -68,6 +68,8 @@ def _make_settings(
 
 def _make_executor(
     clock: MockClock | None = None,
+    *,
+    max_completed_keys: int = 10000,
 ) -> tuple[RowUnionExecutor, MagicMock, MagicMock, MockClock]:
     execution = MagicMock(spec=ExecutionRepository)
     execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=_next_state_id())
@@ -83,6 +85,7 @@ def _make_executor(
         step_resolver=lambda node_id: 5,
         clock=clock,
         data_flow=data_flow,
+        max_completed_keys=max_completed_keys,
         barrier_restore_reads=SimpleNamespace(
             get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
             has_completed_row_for_node=execution.has_completed_row_for_node,
@@ -260,6 +263,98 @@ class TestBranchLoss:
         late = executor.accept(_make_token(token_id="tok_a", branch_name="branch_a"), "variant_union")
         assert late.held is False
         assert late.failure_reason is not None
+
+    def test_recorded_loss_survives_completed_key_cache_eviction(self) -> None:
+        executor, _execution, _data_flow, _clock = _make_executor(max_completed_keys=1)
+        _register(executor)
+        for row_id in ("row_1", "row_2"):
+            executor.notify_branch_lost(
+                row_union_name="variant_union",
+                row_id=row_id,
+                lost_branch="branch_b",
+                reason="diverted_to_error_sink",
+            )
+
+        late = executor.accept(
+            _make_token(row_id="row_1", token_id="tok_a", branch_name="branch_a"),
+            "variant_union",
+        )
+
+        assert late.held is False
+        assert late.failure_reason == "row_union_branch_lost"
+
+
+class TestRestoreFromJournal:
+    def test_restored_loss_fails_pending_sibling_instead_of_reopening_group(self) -> None:
+        executor, _execution, data_flow, _clock = _make_executor()
+        _register(executor)
+        restored = _make_token(token_id="tok_a", branch_name="branch_a")
+        executor.restore_branch_losses((("variant_union", "row_1", "branch_b"),))
+
+        outcomes = executor.restore_from_journal(entries=(RowUnionRestoreEntry(restored, "variant_union", "state-a", 90.0),))
+
+        assert len(outcomes) == 1
+        assert outcomes[0].failure_reason == "row_union_branch_lost"
+        assert outcomes[0].consumed_tokens == (restored,)
+        data_flow.record_token_outcome.assert_called_once()
+
+    def test_reconcile_released_group_completes_only_still_open_states(self) -> None:
+        executor, execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        tok_a = _make_token(token_id="tok_a", branch_name="branch_a")
+        tok_b = _make_token(token_id="tok_b", branch_name="branch_b")
+
+        outcome = executor.reconcile_released_group(
+            entries=(
+                RowUnionRestoreEntry(tok_b, "variant_union", "state-b", 91.0),
+                RowUnionRestoreEntry(tok_a, "variant_union", None, 90.0),
+            )
+        )
+
+        assert outcome.released_tokens == (tok_a, tok_b)
+        execution.complete_node_state.assert_called_once()
+        assert execution.complete_node_state.call_args.kwargs["state_id"] == "state-b"
+
+    def test_partial_group_resumes_and_releases_when_sibling_arrives(self) -> None:
+        executor, execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        restored = _make_token(token_id="tok_a", branch_name="branch_a")
+
+        outcomes = executor.restore_from_journal(
+            entries=(
+                RowUnionRestoreEntry(
+                    token=restored,
+                    row_union_name="variant_union",
+                    state_id="state-restored",
+                    arrival_time=90.0,
+                ),
+            )
+        )
+
+        assert outcomes == ()
+        sibling = _make_token(token_id="tok_b", branch_name="branch_b")
+        released = executor.accept(sibling, "variant_union")
+        assert released.released_tokens == (restored, sibling)
+        completed_state_ids = [call.kwargs["state_id"] for call in execution.complete_node_state.call_args_list]
+        assert completed_state_ids[0] == "state-restored"
+        assert len(completed_state_ids) == 2
+
+    def test_fully_adopted_group_returns_release_for_scheduler_completion(self) -> None:
+        executor, execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        tok_a = _make_token(token_id="tok_a", branch_name="branch_a")
+        tok_b = _make_token(token_id="tok_b", branch_name="branch_b")
+
+        outcomes = executor.restore_from_journal(
+            entries=(
+                RowUnionRestoreEntry(tok_a, "variant_union", "state-a", 90.0),
+                RowUnionRestoreEntry(tok_b, "variant_union", "state-b", 91.0),
+            )
+        )
+
+        assert len(outcomes) == 1
+        assert outcomes[0].released_tokens == (tok_a, tok_b)
+        assert [call.kwargs["state_id"] for call in execution.complete_node_state.call_args_list] == ["state-a", "state-b"]
 
 
 class TestOutcomeInvariants:

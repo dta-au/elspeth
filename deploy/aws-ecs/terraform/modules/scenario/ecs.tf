@@ -62,7 +62,7 @@ locals {
 
   cloudwatch_agent_container = {
     name              = "cloudwatch-agent"
-    image             = local.cloudwatch_agent_image
+    image             = terraform_data.cloudwatch_agent_image_provenance.output
     essential         = false
     memoryReservation = 192
     entryPoint        = ["/bin/sh", "-ceu"]
@@ -92,7 +92,7 @@ locals {
 
   candidate_web_container = {
     name       = local.web_container_name
-    image      = var.candidate_image
+    image      = terraform_data.candidate_image_provenance.output
     essential  = true
     entryPoint = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
     command    = ["web", "--host", "0.0.0.0", "--port", "8451"]
@@ -120,7 +120,7 @@ locals {
 
   schema_init_doctor_container = {
     name                   = local.doctor_name
-    image                  = var.candidate_image
+    image                  = terraform_data.candidate_image_provenance.output
     essential              = true
     readonlyRootFilesystem = true
     entryPoint             = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
@@ -133,7 +133,7 @@ locals {
 
   runtime_doctor_container = {
     name                   = local.doctor_name
-    image                  = var.candidate_image
+    image                  = terraform_data.candidate_image_provenance.output
     essential              = true
     readonlyRootFilesystem = true
     entryPoint             = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
@@ -146,7 +146,7 @@ locals {
 
   payload_container = {
     name                   = local.web_container_name
-    image                  = var.candidate_image
+    image                  = terraform_data.candidate_image_provenance.output
     essential              = true
     readonlyRootFilesystem = true
     user                   = "1654:1654"
@@ -160,7 +160,7 @@ locals {
 
   local_auth_container = {
     name                   = local.web_container_name
-    image                  = var.candidate_image
+    image                  = terraform_data.candidate_image_provenance.output
     essential              = true
     readonlyRootFilesystem = true
     user                   = "1654:1654"
@@ -179,7 +179,7 @@ locals {
   ]
 
   rollback_web_container = merge(local.candidate_web_container, {
-    image = var.rollback_baseline_image
+    image = terraform_data.rollback_image_provenance.output
     environment = concat(local.rollback_environment, [
       { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = "http://127.0.0.1:4317" },
       { name = "OTEL_EXPORTER_OTLP_PROTOCOL", value = "grpc" },
@@ -187,7 +187,7 @@ locals {
   })
 
   rollback_doctor_container = merge(local.runtime_doctor_container, {
-    image       = var.rollback_baseline_image
+    image       = terraform_data.rollback_image_provenance.output
     environment = local.rollback_environment
   })
 }

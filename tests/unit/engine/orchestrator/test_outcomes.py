@@ -22,10 +22,13 @@ from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.engine.orchestrator.outcomes import (
     accumulate_row_outcomes,
     flush_coalesce_pending,
+    flush_row_union_pending,
     handle_coalesce_timeouts,
+    handle_row_union_timeouts,
     reconcile_sink_write_diversions,
 )
 from elspeth.engine.orchestrator.types import ExecutionCounters
+from elspeth.engine.row_union_executor import RowUnionOutcome
 from elspeth.testing import make_row, make_token_info
 
 # =============================================================================
@@ -80,6 +83,22 @@ class _FakeCoalesceExecutor:
 
     def flush_pending(self) -> list[_FakeCoalesceOutcome]:
         self.flush_pending_call_count += 1
+        return list(self.flush_outcomes)
+
+
+@dataclass
+class _FakeRowUnionExecutor:
+    timed_out_outcomes: list[RowUnionOutcome] = field(default_factory=list)
+    flush_outcomes: list[RowUnionOutcome] = field(default_factory=list)
+
+    def get_registered_names(self) -> list[str]:
+        return ["variant_union"]
+
+    def check_timeouts(self, row_union_name: str) -> list[RowUnionOutcome]:
+        assert row_union_name == "variant_union"
+        return list(self.timed_out_outcomes)
+
+    def flush_pending(self) -> list[RowUnionOutcome]:
         return list(self.flush_outcomes)
 
 
@@ -1563,3 +1582,50 @@ class TestCoalesceOutcomeValidation:
                 counters=counters,
                 pending_tokens=pending,
             )
+
+
+class TestRowUnionFailureTelemetry:
+    @staticmethod
+    def _failed_outcome() -> RowUnionOutcome:
+        return RowUnionOutcome(
+            held=False,
+            consumed_tokens=(
+                make_token_info(row_id="row-1", token_id="token-1"),
+                make_token_info(row_id="row-1", token_id="token-2"),
+            ),
+            failure_reason="row_union_timeout",
+            row_union_name="variant_union",
+            outcomes_recorded=True,
+        )
+
+    def test_timeout_emits_token_completed_for_every_consumed_token(self) -> None:
+        executor = _FakeRowUnionExecutor(timed_out_outcomes=[self._failed_outcome()])
+        processor = _FakeProcessor(mark_blocked_barrier_terminal_result=2)
+        counters = _make_counters()
+        ctx = _FakeContext()
+
+        handle_row_union_timeouts(
+            row_union_executor=executor,
+            processor=processor,
+            ctx=ctx,
+            counters=counters,
+        )
+
+        assert [event.token_id for event in ctx.emitted_events] == ["token-1", "token-2"]
+        assert all(event.outcome is TerminalOutcome.FAILURE for event in ctx.emitted_events)
+        assert all(event.path is TerminalPath.UNROUTED for event in ctx.emitted_events)
+
+    def test_end_of_source_flush_emits_token_completed_for_every_consumed_token(self) -> None:
+        executor = _FakeRowUnionExecutor(flush_outcomes=[self._failed_outcome()])
+        processor = _FakeProcessor(mark_blocked_barrier_terminal_result=2)
+        counters = _make_counters()
+        ctx = _FakeContext()
+
+        flush_row_union_pending(
+            row_union_executor=executor,
+            processor=processor,
+            ctx=ctx,
+            counters=counters,
+        )
+
+        assert [event.token_id for event in ctx.emitted_events] == ["token-1", "token-2"]

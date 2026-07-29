@@ -197,6 +197,7 @@ def test_fixed_pipeline_yaml_rejects_noncanonical_session_id() -> None:
 
 
 _SESSION_ID = "8e826f53-5f13-420f-8678-5ec0caecd15f"
+_FIXED_OUTPUT_SINK_NODE_ID = "sink_output_d4f5d8b83aa5"
 
 _TUTORIAL_SESSION_ID = "f6a99a36-13f9-49c9-a3af-d9f6f7924a56"
 
@@ -280,7 +281,7 @@ class _AcceptanceApi:
                 artifacts = [
                     {
                         "artifact_id": _ARTIFACT_ID,
-                        "sink_node_id": "output",
+                        "sink_node_id": _FIXED_OUTPUT_SINK_NODE_ID,
                         "artifact_type": "file",
                         "content_hash": self.artifact_sha256,
                         "exists_now": True,
@@ -459,17 +460,14 @@ def test_capture_fails_closed_with_static_check_names(tmp_path: Path, failure: s
 
 def test_capture_accepts_generated_output_sink_node_id(tmp_path: Path) -> None:
     """Reproduces elspeth-a811cba074: the live outputs manifest reports the
-    engine's deterministic generated node id (``sink_<yaml-key>_<12-hex>``,
-    e.g. ``sink_output_ca54c90e06a7``) for the fixed pipeline's one sink, not
-    the literal YAML key ``"output"``. ``capture()`` must accept this shape
-    since it is the schema-guaranteed identity of this pipeline's output
-    sink (see ``node_id()`` in ``elspeth.core.dag.builder``), not a defect.
+    engine's deterministic generated node id for the fixed pipeline's one
+    sink. ``capture()`` must bind the exact config-derived identity.
     """
     api = _AcceptanceApi()
     api.artifacts = [
         {
             "artifact_id": _ARTIFACT_ID,
-            "sink_node_id": "sink_output_ca54c90e06a7",
+            "sink_node_id": _FIXED_OUTPUT_SINK_NODE_ID,
             "artifact_type": "file",
             "content_hash": api.artifact_sha256,
             "exists_now": True,
@@ -489,13 +487,36 @@ def test_capture_accepts_generated_output_sink_node_id(tmp_path: Path) -> None:
     assert state.artifact_sha256 == api.artifact_sha256
 
 
+def test_capture_rejects_generated_output_sink_id_from_a_different_config(tmp_path: Path) -> None:
+    api = _AcceptanceApi()
+    api.artifacts = [
+        {
+            "artifact_id": _ARTIFACT_ID,
+            "sink_node_id": "sink_output_000000000000",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        }
+    ]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="artifact_manifest"):
+        acceptance.capture(
+            _auth_env(),
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(api),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
+
+
 def test_capture_fails_closed_when_output_sink_id_is_ambiguous(tmp_path: Path) -> None:
     api = _AcceptanceApi()
     other_artifact_id = "9e15a237-4c5e-4b09-9d9d-3c9f8db6b6c1"
     api.artifacts = [
         {
             "artifact_id": _ARTIFACT_ID,
-            "sink_node_id": "output",
+            "sink_node_id": _FIXED_OUTPUT_SINK_NODE_ID,
             "artifact_type": "file",
             "content_hash": api.artifact_sha256,
             "exists_now": True,
@@ -503,7 +524,7 @@ def test_capture_fails_closed_when_output_sink_id_is_ambiguous(tmp_path: Path) -
         },
         {
             "artifact_id": other_artifact_id,
-            "sink_node_id": "sink_output_ca54c90e06a7",
+            "sink_node_id": _FIXED_OUTPUT_SINK_NODE_ID,
             "artifact_type": "file",
             "content_hash": api.artifact_sha256,
             "exists_now": True,
@@ -563,7 +584,7 @@ def test_capture_accepts_uuid4_hex_artifact_id(tmp_path: Path) -> None:
     api.artifacts = [
         {
             "artifact_id": generated_artifact_id,
-            "sink_node_id": "output",
+            "sink_node_id": _FIXED_OUTPUT_SINK_NODE_ID,
             "artifact_type": "file",
             "content_hash": api.artifact_sha256,
             "exists_now": True,
@@ -582,6 +603,30 @@ def test_capture_accepts_uuid4_hex_artifact_id(tmp_path: Path) -> None:
     assert state.artifact_id == generated_artifact_id
 
 
+@pytest.mark.parametrize("artifact_id", ["a", "a" * 31, "a" * 33, "a" * 63])
+def test_capture_rejects_impossible_artifact_id_lengths(tmp_path: Path, artifact_id: str) -> None:
+    api = _AcceptanceApi()
+    api.artifacts = [
+        {
+            "artifact_id": artifact_id,
+            "sink_node_id": _FIXED_OUTPUT_SINK_NODE_ID,
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        }
+    ]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="artifact_manifest"):
+        acceptance.capture(
+            _auth_env(),
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(api),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
+
+
 def test_capture_rejects_non_hex_artifact_id(tmp_path: Path) -> None:
     """artifact_id must never be treated as a canonical UUID (see
     ``_ARTIFACT_ID_PATTERN``): a dashed-UUID-shaped or otherwise non-hex
@@ -591,7 +636,7 @@ def test_capture_rejects_non_hex_artifact_id(tmp_path: Path) -> None:
     api.artifacts = [
         {
             "artifact_id": "8e82b504-5dcc-4dc9-9fe4-a1c62be47153",
-            "sink_node_id": "output",
+            "sink_node_id": _FIXED_OUTPUT_SINK_NODE_ID,
             "artifact_type": "file",
             "content_hash": api.artifact_sha256,
             "exists_now": True,

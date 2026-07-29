@@ -121,10 +121,10 @@
         "iam:PutRolePolicy"
       ],
       "Resource": [
-        "arn:aws:iam::${aws_account_id}:role/a-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/a-*-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
       ],
       "Condition": {
         "StringEquals": {
@@ -140,8 +140,8 @@
         "iam:DetachRolePolicy"
       ],
       "Resource": [
-        "arn:aws:iam::${aws_account_id}:role/a-*-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
       ],
       "Condition": {
         "StringEquals": {
@@ -159,15 +159,14 @@
         "iam:PassRole"
       ],
       "Resource": [
-        "arn:aws:iam::${aws_account_id}:role/a-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/a-*-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/b-*-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
       ],
       "Condition": {
         "StringEquals": {
-          "iam:PassedToService": "ecs-tasks.amazonaws.com",
-          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}"
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
         }
       }
     },

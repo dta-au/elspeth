@@ -600,23 +600,12 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_default_llm_profile_alias(self) -> WebSettings:
-        """A deployment that offers LLM authoring must designate its standard profile.
+        """Validate a designated default without turning its absence into boot failure.
 
-        The relationship runs one way: there is a standard profile, and the
-        first-run tutorial uses it — not a tutorial profile that other surfaces
-        borrow. That standard alias is also sorted first for authors and used by
-        the Composer's worked examples, so leaving it unset does not mean "no
-        default": it means the default is whichever alias happens to sort first,
-        chosen by nothing. Refuse to start rather than let an arbitrary profile
-        become the house default by accident.
-
-        Zero configured profiles remains valid — that is a deployment with no LLM
-        authoring at all, where there is no standard model to designate.
+        A missing default is a supported degraded-readiness state: ordinary
+        pipelines and explicit profile authoring remain available, while the
+        first-run tutorial reports that no standard profile is configured.
         """
-        if self.llm_profiles and self.default_llm_profile is None:
-            raise ValueError(
-                "default_llm_profile is required when llm_profiles is configured; it must name the deployment's standard profile"
-            )
         if self.default_llm_profile is not None:
             validate_profile_alias(self.default_llm_profile)
             if self.default_llm_profile not in self.llm_profiles:

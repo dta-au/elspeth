@@ -379,6 +379,7 @@ def run_resume_processing_loop(
             handle_row_union_timeouts(
                 row_union_executor=row_union_executor,
                 processor=processor,
+                ctx=ctx,
                 counters=counters,
             )
 

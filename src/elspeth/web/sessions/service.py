@@ -6787,18 +6787,6 @@ class SessionServiceImpl:
                 if live_state_row is None:  # pragma: no cover - state_row above proves same-session state exists
                     raise AuditIntegrityError(f"create_pending_interpretation_event: session {sid!r} has no current composition state")
                 live_state_record = self._row_to_state_record(live_state_row)
-                current_review_identity = _reviewed_content_identity(
-                    live_state_record,
-                    kind=kind,
-                    affected_node_id=affected_node_id,
-                    user_term=user_term,
-                    context="create_pending_interpretation_event",
-                )
-                session_row = conn.execute(
-                    select(sessions_table.c.interpretation_review_disabled).where(sessions_table.c.id == sid)
-                ).one_or_none()
-                review_disabled = session_row is not None and bool(session_row.interpretation_review_disabled)
-
                 # Content-identity dedup and supersession share this transaction
                 # and session lock with the eventual INSERT. The immutable
                 # composition_state_id on each pending row lets us reconstruct
@@ -6814,6 +6802,48 @@ class SessionServiceImpl:
                     .where(interpretation_events_table.c.interpretation_source == InterpretationSource.USER_APPROVED.value)
                     .order_by(interpretation_events_table.c.created_at, interpretation_events_table.c.id)
                 ).all()
+                try:
+                    current_review_identity = _reviewed_content_identity(
+                        live_state_record,
+                        kind=kind,
+                        affected_node_id=affected_node_id,
+                        user_term=user_term,
+                        context="create_pending_interpretation_event",
+                    )
+                except InterpretationResolveError:
+                    # A newer durable state can remove or structurally consume
+                    # this review site while an older surfacer waits for the
+                    # session lock. The stale call must not mint a card, but it
+                    # still owns reconciliation of any card for the historical
+                    # site. Return that terminal row so post-persist advisory
+                    # surfacers finish without converting a successful state
+                    # commit into an error response.
+                    stale_rows_to_abandon = [
+                        pending_row.id
+                        for pending_row in pending_site_rows
+                        if isinstance(pending_row.user_term, str) and pending_row.user_term.strip() == user_term.strip()
+                    ]
+                    if not stale_rows_to_abandon:
+                        raise
+                    conn.execute(
+                        update(interpretation_events_table)
+                        .where(interpretation_events_table.c.id.in_(stale_rows_to_abandon))
+                        .where(interpretation_events_table.c.session_id == sid)
+                        .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
+                        .values(
+                            choice=InterpretationChoice.ABANDONED.value,
+                            resolved_at=now,
+                        )
+                    )
+                    abandoned_row = conn.execute(
+                        select(interpretation_events_table).where(interpretation_events_table.c.id == stale_rows_to_abandon[0])
+                    ).one()
+                    return _interpretation_event_record_from_row(abandoned_row)
+                session_row = conn.execute(
+                    select(sessions_table.c.interpretation_review_disabled).where(sessions_table.c.id == sid)
+                ).one_or_none()
+                review_disabled = session_row is not None and bool(session_row.interpretation_review_disabled)
+
                 matching_pending_row = None
                 rows_to_abandon: list[str] = []
                 for pending_row in pending_site_rows:

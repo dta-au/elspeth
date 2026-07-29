@@ -30,7 +30,7 @@ from copy import deepcopy
 from threading import Lock
 from typing import Any, Final, NotRequired, Required, TypedDict
 
-from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSummary
 
@@ -39,6 +39,7 @@ from elspeth.web.catalog.schemas import PluginSummary
 # private set included — is deliberate, so the taught row can never drift.
 from elspeth.web.interpretation_state import (
     _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS,
+    PROMPT_SHIELD_AVAILABLE_DRAFT,
     PROMPT_SHIELD_USER_TERM,
     PROMPT_SHIELD_WARNING_DRAFT,
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
@@ -247,16 +248,19 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
 _FORK_EXEMPLAR_CONTENT: Final[str] = "ticket_id,body\nT-1001,Cannot log in since the update\nT-1002,Invoice totals look wrong\n"
 
 
-def _prompt_shield_rules(*, shield_plugin: str | None, untrusted_producers: tuple[str, ...]) -> list[str]:
+def _prompt_shield_rules(
+    *,
+    shield_plugin: str | None,
+    shield_required: bool = False,
+    untrusted_producers: tuple[str, ...],
+) -> list[str]:
     """Shield-staging rules quoting the registered review constants verbatim.
 
-    Two regimes, chosen by whether THIS deployment selected a shield plugin
-    (aws_bedrock_prompt_shield, azure_prompt_shield, …): where one exists it
-    is WIRED — mandatory, no card; where none exists the advisory review row
-    is staged so the operator must acknowledge the exposure. The review is
-    ADVISORY end-to-end (warnings only, excluded from the blocking contract),
-    so no rejection code ever teaches it on a repair turn — these aids are
-    the only lever. Tutorial finalizer
+    Required mode wires the selected implementation. Recommend mode stages the
+    advisory review row whether or not an implementation is selected, using
+    the deployment-available draft when it is. The review is ADVISORY end-to-end
+    (warnings only, excluded from the blocking contract), so no rejection code
+    ever teaches it on a repair turn — these aids are the only lever. Tutorial finalizer
     battery (dim_c under-flag): the replan planner non-deterministically
     omitted the row on the scrape→summarize llm node. Constants are imported
     from ``interpretation_state`` so the taught row can never drift from the
@@ -266,12 +270,7 @@ def _prompt_shield_rules(*, shield_plugin: str | None, untrusted_producers: tupl
     keyed by snapshot hash.
     """
     producers = " or ".join(sorted(untrusted_producers))
-    if shield_plugin is not None:
-        # A deployment that ships a shield gets the shield, not a leaflet about
-        # one. These aids previously taught the advisory card in BOTH cases and
-        # named wiring only as a reason to SKIP the card, so no planner ever
-        # wired an available shield (run 06c9ec49, 2026-07-29) — and on a
-        # control-required deployment that left coverage permanently unmet.
+    if shield_plugin is not None and shield_required:
         return [
             f"An authorized prompt-injection shield is available in this deployment: {shield_plugin}. "
             f"When an llm transform consumes externally-fetched content (any path from a {producers} "
@@ -284,8 +283,14 @@ def _prompt_shield_rules(*, shield_plugin: str | None, untrusted_producers: tupl
             f"With the shield wired, do NOT also stage the {PROMPT_SHIELD_USER_TERM} review row — the "
             "exposure it warns about no longer exists.",
         ]
-    draft = PROMPT_SHIELD_WARNING_DRAFT
+    draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_plugin is not None else PROMPT_SHIELD_WARNING_DRAFT
+    availability = (
+        f"The selected deployment implementation is {shield_plugin}. "
+        if shield_plugin is not None
+        else "No deployment implementation is selected. "
+    )
     return [
+        availability,
         f"When an llm transform consumes externally-fetched content (any path from a {producers} "
         "output reaches its input), stage the prompt-injection shield review ON THAT LLM NODE: "
         "add one pending pipeline_decision entry to its options.interpretation_requirements "
@@ -512,13 +517,15 @@ def _usable_llm_profile_alias(catalog: PolicyCatalogView) -> str | None:
 
 
 def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapability) -> tuple[str, str] | None:
-    """Return ``(plugin_name, profile_alias)`` for a selected operator-profiled control.
+    """Return a selected operator-profiled control only when policy requires it.
 
-    Returns ``None`` when the deployment selected no implementation for the
-    capability, or when the selected implementation is not operator-profiled
-    (so it would need endpoint/key options an exemplar must never invent).
+    Recommended controls must never mutate a worked topology merely because an
+    implementation is selected. Returns ``None`` for recommend mode, no
+    selection, or a selection that is not operator-profiled.
     """
     snapshot = catalog.snapshot
+    if dict(snapshot.control_modes).get(capability, ControlMode.RECOMMEND) is not ControlMode.REQUIRED:
+        return None
     plugin_id = dict(snapshot.selected).get(capability)
     if plugin_id is None:
         return None
@@ -1070,6 +1077,7 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         "rules": list(_REVIEW_REGISTRY_RULES),
     }
     visible_untrusted_producers = tuple(sorted(_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS & visible["transform"]))
+    control_modes = dict(catalog.snapshot.control_modes)
     if visible_untrusted_producers and "llm" in visible["transform"]:
         aids["prompt_shield"] = {
             "rules": _prompt_shield_rules(
@@ -1080,12 +1088,14 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
                     if (selected_shield := dict(catalog.snapshot.selected).get(PluginCapability.PROMPT_SHIELD))
                     else None
                 ),
+                shield_required=control_modes.get(PluginCapability.PROMPT_SHIELD, ControlMode.RECOMMEND) is ControlMode.REQUIRED,
                 untrusted_producers=visible_untrusted_producers,
             ),
         }
     if (
         "llm" in visible["transform"]
         and (selected_safety := dict(catalog.snapshot.selected).get(PluginCapability.CONTENT_SAFETY)) is not None
+        and control_modes.get(PluginCapability.CONTENT_SAFETY, ControlMode.RECOMMEND) is ControlMode.REQUIRED
     ):
         aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=selected_safety.name)}
     if visible_untrusted_producers and "field_mapper" in visible["transform"]:

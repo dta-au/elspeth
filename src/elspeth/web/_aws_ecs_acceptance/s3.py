@@ -185,6 +185,11 @@ def _drive_s3_acceptance_effect(
         # "predecessor_unchanged" NOT_APPLIED result instead of the no-op it is.
         if plan.expected_descriptor is None:
             raise AcceptanceCheckError("s3_collision" if require_existing else "s3_sink_write")
+        if not require_existing:
+            # The primary lane must prove this invocation published the
+            # object. A reaffirmed/pre-existing descriptor is not owned by
+            # the harness and must never enable cleanup.
+            raise _S3EffectFailure(cleanup_owned=False)
         return plan.expected_descriptor, True
     reconciliation = sink.reconcile_effect(plan, context)  # type: ignore[attr-defined]
 
@@ -194,6 +199,8 @@ def _drive_s3_acceptance_effect(
         descriptor = reconciliation.descriptor
         if descriptor is None:
             raise AcceptanceCheckError("s3_collision" if require_existing else "s3_sink_write")
+        if not require_existing:
+            raise _S3EffectFailure(cleanup_owned=False)
         return descriptor, True
     if require_existing:
         raise AcceptanceCheckError("s3_collision")
