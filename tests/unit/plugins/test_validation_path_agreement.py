@@ -29,6 +29,22 @@ def _make_observed_schema() -> dict[str, str]:
 # ── Invalid configs that both paths must reject ─────────────────────────
 
 _TRANSFORM_REJECTION_CASES = [
+    # ── aws_textract_document_analysis ──────────────────────────────────
+    pytest.param(
+        "aws_textract_document_analysis",
+        {
+            "schema": _make_observed_schema(),
+            "region": "ap-southeast-2",
+            "auth_mode": "default_chain",
+            "bucket_field": "document_bucket",
+            "key_field": "document_key",
+            "feature_types": ["FORMS"],
+            "text_field": "duplicate_output",
+            "extract": {"forms": "duplicate_output"},
+        },
+        "Duplicate output field names",
+        id="aws_textract_document_analysis-duplicate-output-fields",
+    ),
     # ── azure_document_intelligence ──────────────────────────────────────
     pytest.param(
         "azure_document_intelligence",

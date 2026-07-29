@@ -1,0 +1,231 @@
+{
+  "knob_schema": {
+    "fields": [
+      {
+        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "default": null,
+        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Required Input Fields",
+        "name": "required_input_fields",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "description": "AWS region containing the S3 object and Textract endpoint.",
+        "kind": "text",
+        "label": "Region",
+        "name": "region",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "default": "default_chain",
+        "description": "Use boto3's default credential chain or credentials resolved from ELSPETH secret references.",
+        "enum": [
+          "default_chain",
+          "secret_refs"
+        ],
+        "kind": "enum",
+        "label": "Auth Mode",
+        "name": "auth_mode",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Resolved AWS access-key identifier; accepted only with auth_mode secret_refs.",
+        "kind": "text",
+        "label": "Aws Access Key ID",
+        "name": "aws_access_key_id",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Resolved AWS secret access key; accepted only with auth_mode secret_refs.",
+        "kind": "text",
+        "label": "Aws Secret Access Key",
+        "name": "aws_secret_access_key",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS session token for temporary secret_refs credentials.",
+        "kind": "text",
+        "label": "Aws Session Token",
+        "name": "aws_session_token",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "description": "Input row field containing the S3 bucket name.",
+        "kind": "text",
+        "label": "Bucket Field",
+        "name": "bucket_field",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "description": "Input row field containing the S3 object key.",
+        "kind": "text",
+        "label": "Key Field",
+        "name": "key_field",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "default": null,
+        "description": "Optional input row field containing an S3 object version.",
+        "kind": "text",
+        "label": "Version Field",
+        "name": "version_field",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "description": "Unique Textract analysis features selected from TABLES, FORMS, QUERIES, SIGNATURES, and LAYOUT.",
+        "kind": "json-array",
+        "label": "Feature Types",
+        "name": "feature_types",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "description": "Textract query definitions; configured together with the QUERIES feature.",
+        "kind": "json-array",
+        "label": "Queries",
+        "name": "queries",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Optional output field for page-ordered LINE text.",
+        "kind": "text",
+        "label": "Text Field",
+        "name": "text_field",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Optional output field for the validated document page count.",
+        "kind": "text",
+        "label": "Page Count Field",
+        "name": "page_count_field",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Optional output field for bounded Textract job metadata.",
+        "kind": "text",
+        "label": "Metadata Field",
+        "name": "metadata_field",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "description": "Optional mappings from normalized document facets to output row fields.",
+        "kind": "json-object",
+        "label": "Extract",
+        "name": "extract",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Optional output field for the bounded provider-shaped aggregate.",
+        "kind": "text",
+        "label": "Result Field",
+        "name": "result_field",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": 1.0,
+        "description": "Initial delay between non-terminal job-status polls.",
+        "kind": "number-float",
+        "label": "Poll Interval Seconds",
+        "name": "poll_interval_seconds",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 1.5,
+        "description": "Multiplier applied to successive job-status poll delays.",
+        "kind": "number-float",
+        "label": "Poll Backoff Multiplier",
+        "name": "poll_backoff_multiplier",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 10.0,
+        "description": "Maximum delay between job-status polls.",
+        "kind": "number-float",
+        "label": "Poll Max Interval Seconds",
+        "name": "poll_max_interval_seconds",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 3600.0,
+        "description": "Total submit-through-terminal-status deadline in seconds.",
+        "kind": "number-float",
+        "label": "Poll Timeout Seconds",
+        "name": "poll_timeout_seconds",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 3900.0,
+        "description": "Maximum engine wait for one pipelined document row.",
+        "kind": "number-float",
+        "label": "Batch Wait Timeout Seconds",
+        "name": "batch_wait_timeout_seconds",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 1000,
+        "description": "Maximum GetDocumentAnalysis result pages retained for one document.",
+        "kind": "number-int",
+        "label": "Max Result Pages",
+        "name": "max_result_pages",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 200000,
+        "description": "Maximum combined Textract block count for one document.",
+        "kind": "number-int",
+        "label": "Max Blocks",
+        "name": "max_blocks",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": 50000000,
+        "description": "Maximum canonical JSON bytes retained for one document result.",
+        "kind": "number-int",
+        "label": "Max Result Bytes",
+        "name": "max_result_bytes",
+        "nullable": false,
+        "required": false
+      }
+    ]
+  },
+  "plugin_kind": "transform",
+  "plugin_name": "aws_textract_document_analysis"
+}

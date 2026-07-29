@@ -27,6 +27,7 @@ SECRET_FIELD_NAMES = frozenset(
     {
         "api_key",
         "api-key",
+        "aws_access_key_id",
         "authorization",
         "connection_string",
         "credential",

@@ -8,11 +8,28 @@ from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
 from elspeth.core.secrets import (
     SECRET_REF_VALIDATION_PLACEHOLDER,
     SecretResolutionError,
+    collect_credential_field_violations,
+    collect_disallowed_secret_ref_markers,
+    is_secret_field,
     redact_secret_refs_for_validation,
     resolve_secret_refs,
 )
 
 _VALID_FINGERPRINT = "a" * 64
+
+
+def test_aws_access_key_id_is_a_credential_field() -> None:
+    assert is_secret_field("aws_access_key_id") is True
+
+
+def test_literal_aws_access_key_id_is_rejected_as_credential() -> None:
+    options = {"aws_access_key_id": "literal-access-key-id"}
+    assert collect_credential_field_violations(options) == ["aws_access_key_id"]
+
+
+def test_secret_ref_is_allowed_in_aws_access_key_id() -> None:
+    options = {"aws_access_key_id": {"secret_ref": "AWS_ACCESS_KEY_ID"}}
+    assert collect_disallowed_secret_ref_markers(options) == []
 
 
 class FakeResolver:

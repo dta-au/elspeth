@@ -10,7 +10,8 @@ from elspeth.contracts.plugin_capabilities import (
     PluginCapability,
     WebConfigAuthority,
 )
-from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.infrastructure.manager import PluginManager, get_shared_plugin_manager
+from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
 from elspeth.web.catalog.service import CatalogServiceImpl
@@ -147,6 +148,30 @@ class TestListTransforms:
 
         assert prompt_shield.secret_requirements == expected
         assert catalog.get_schema("transform", "azure_prompt_shield").secret_requirements == expected
+
+    def test_textract_transform_is_discoverable_with_credentials_characteristic(
+        self,
+        catalog: CatalogServiceImpl,
+    ) -> None:
+        transforms = catalog.list_transforms()
+        textract = next(item for item in transforms if item.name == "aws_textract_document_analysis")
+
+        assert "credentials" in textract.audit_characteristics
+        schema = catalog.get_schema("transform", "aws_textract_document_analysis")
+        names = {field["name"] for field in schema.knob_schema["fields"]}
+        assert {"auth_mode", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"} <= names
+
+    def test_textract_shared_discovery_and_assistance_describe_secure_async_s3_usage(self) -> None:
+        transform_cls = get_shared_plugin_manager().get_transform_by_name("aws_textract_document_analysis")
+        assistance = transform_cls.get_agent_assistance()
+
+        assert transform_cls is AWSTextractDocumentAnalysis
+        assert assistance is not None
+        guidance = "\n".join((assistance.summary, *assistance.composer_hints))
+        assert "S3" in guidance
+        assert "asynchronous" in guidance
+        assert "{secret_ref:" in guidance
+        assert "inline" in guidance
 
 
 class TestListSinks:

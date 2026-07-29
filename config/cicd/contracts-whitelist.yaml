@@ -160,6 +160,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/azure/content_safety.py:AzureContentSafety.probe_config:return"
   - "src/elspeth/plugins/transforms/azure/document_intelligence.py:AzureDocumentIntelligence.probe_config:return"
   - "src/elspeth/plugins/transforms/azure/prompt_shield.py:AzurePromptShield.probe_config:return"
+  - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.probe_config:return"
   - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.probe_config:return"
   - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.probe_config:return"
 
@@ -194,6 +195,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/blob_fetch.py:BlobFetch.__init__:options"
   - "src/elspeth/plugins/transforms/blob_csv_expand.py:BlobCSVExpand.__init__:options"
   - "src/elspeth/plugins/transforms/azure/document_intelligence.py:AzureDocumentIntelligence.__init__:config"
+  - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.__init__:config"
   - "src/elspeth/plugins/sources/json_source.py:JSONSource.__init__:config"
   - "src/elspeth/plugins/sources/csv_source.py:CSVSource.__init__:config"
   - "src/elspeth/plugins/sources/null_source.py:NullSource.__init__:config"

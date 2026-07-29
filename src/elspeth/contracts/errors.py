@@ -527,6 +527,14 @@ TransformErrorCategory = Literal[
     "poll_timeout",  # async analyze operation did not reach a terminal status within budget
     "operation_location_missing",  # 202 response lacked the Operation-Location header
     "operation_location_untrusted",  # Operation-Location host != configured endpoint (security)
+    # Amazon Textract asynchronous document analysis
+    "submit_failed",
+    "poll_failed",
+    "partial_success",
+    "pagination_cycle",
+    "pagination_limit_exceeded",
+    "too_many_blocks",
+    "result_too_large",
 ]
 
 
@@ -635,6 +643,7 @@ class TransformErrorReason(TypedDict):
     field: NotRequired[str]
     error_type: NotRequired[str]
     message: NotRequired[str]
+    code: NotRequired[str]
     url: NotRequired[str]
     blob_ref: NotRequired[str]
     encoding: NotRequired[str]
