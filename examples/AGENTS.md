@@ -30,6 +30,7 @@ These run immediately with no setup:
 | `error_routing` | 17 | Error-triggered routing paths |
 | `explicit_routing` | 10 | Named route destinations |
 | `fork_coalesce` | 5 | Parallel path fork/join DAG pattern |
+| `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group into `batch_experiment_compare` |
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
 | `landscape_journal` | 2 | JSON source, audit journal |
 | `multi_flow` | 4 | Two independent named source flows in one run |
