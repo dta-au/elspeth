@@ -103,6 +103,7 @@ class TokenTraversalEngine:
         coalesce_name: CoalesceName | None,
         current_on_success_sink: str,
         attempt_offset: int = 0,
+        row_union_name: RowUnionName | None = None,
     ) -> _TransformOutcome:
         """Handle a single transform node: execute with retry, route errors, handle multi-row.
 
@@ -246,12 +247,20 @@ class TokenTraversalEngine:
             # Children born during a re-drive get fresh token_ids with no prior node_states,
             # so they use the default resume_attempt_offset=0 / resume_checkpoint_id=None.
             for child_token in child_tokens:
-                child_coalesce_name = coalesce_name if coalesce_name is not None and child_token.branch_name is not None else None
+                on_branch = child_token.branch_name is not None
+                child_coalesce_name = coalesce_name if coalesce_name is not None and on_branch else None
+                # The barrier binding must survive expansion, exactly as the
+                # coalesce binding does. Dropping it lets the children walk
+                # through the structural barrier node and split their group
+                # silently; carrying it makes an unsatisfiable expansion
+                # (N children sharing one row_id) fail closed at the barrier.
+                child_row_union_name = row_union_name if row_union_name is not None and on_branch else None
                 child_items.append(
                     self._processor._work_items.create_continuation(
                         token=child_token,
                         current_node_id=node_id,
                         coalesce_name=child_coalesce_name,
+                        row_union_name=child_row_union_name,
                         on_success_sink=updated_sink,
                     )
                 )
@@ -825,6 +834,7 @@ class TokenTraversalEngine:
                     coalesce_name,
                     last_on_success_sink,
                     attempt_offset,
+                    row_union_name=row_union_name,
                 )
                 if isinstance(transform_outcome, _TransformTerminal):
                     return transform_outcome.result, child_items
