@@ -10,6 +10,7 @@ import { resetStore } from "@/test/store-helpers";
 import type { GuidedSession } from "@/types/guided";
 
 vi.mock("@/api/client", () => ({
+  fetchPluginPolicy: vi.fn().mockResolvedValue({ data: { selections: [] }, snapshotFingerprint: "fp" }),
   deleteTutorialOrphans: vi.fn().mockResolvedValue({ deleted_count: 0 }),
   // Mount-time resume validation lists live sessions; default includes the
   // canonical resume session so the existing resume tests read as "alive".

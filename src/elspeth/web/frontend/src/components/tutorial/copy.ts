@@ -131,6 +131,22 @@ export const TUTORIAL_SHIELD_OVERRIDE_CAVEAT =
   "wire the shield.";
 
 /**
+ * The same teaching moment for a deployment that HAS an authorized prompt
+ * shield. The override caveat above states a fact about the pipeline — "we are
+ * proceeding without a prompt shield" — which became false once the planner
+ * started wiring an available shield rather than recommending it. Stating it
+ * over a shielded pipeline teaches the reader to distrust the interface, so
+ * this deployment gets the true version of the same lesson: the shield is the
+ * rule, and it is here because the content is fetched from outside.
+ */
+export const TUTORIAL_SHIELD_WIRED_NOTE =
+  "Your pipeline runs the fetched page content through a prompt shield before " +
+  "the model sees it. That is the rule, not an optional extra: anything " +
+  "fetched from outside is untrusted, and text on a page can be written to " +
+  "steer a model. This deployment requires the shield, so the composer wired " +
+  "one for you.";
+
+/**
  * Teaching moment (spec §"Teaching moments"): the source's on_validation_failure
  * routing. The worked example sets it to "discard" because the synthetic sample
  * pages are valid by construction — no row ever fails validation, so the route

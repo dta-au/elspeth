@@ -4,6 +4,7 @@ import * as api from "@/api/client";
 import {
   TUTORIAL_ASSUMPTION_CALLOUT,
   TUTORIAL_SHIELD_OVERRIDE_CAVEAT,
+  TUTORIAL_SHIELD_WIRED_NOTE,
 } from "./copy";
 import { TutorialTurn4Run } from "./TutorialTurn4Run";
 import { TutorialTurn5AuditStory } from "./TutorialTurn5AuditStory";
@@ -11,7 +12,30 @@ import { TutorialTurn5AuditStory } from "./TutorialTurn5AuditStory";
 vi.mock("@/api/client", () => ({
   runTutorialPipeline: vi.fn(),
   getRunAuditSummary: vi.fn(),
+  fetchPluginPolicy: vi.fn(),
 }));
+
+/** Policy snapshot whose prompt-shield capability is/is not selected. */
+function policyWithShield(selected: boolean) {
+  return {
+    data: {
+      selections: [
+        {
+          capability: "prompt_shield",
+          plugin_id: selected ? "transform:aws_bedrock_prompt_shield" : null,
+        },
+      ],
+    },
+    snapshotFingerprint: "fp-1",
+  } as unknown as Awaited<ReturnType<typeof api.fetchPluginPolicy>>;
+}
+
+function stubRun(): void {
+  vi.mocked(api.runTutorialPipeline).mockResolvedValue({
+    run_id: "run-1",
+    output: { rows: [], source_data_hash: "h", discarded_row_count: 0 },
+  } as unknown as Awaited<ReturnType<typeof api.runTutorialPipeline>>);
+}
 
 function noop(): void {}
 
@@ -75,20 +99,55 @@ describe("tutorial teaching moments — render at the right turn", () => {
     expect(backButton).not.toHaveAccessibleName(/edit prompt/i);
   });
 
-  it("Turn 4 (run) renders the shield-override caveat", () => {
-    vi.mocked(api.runTutorialPipeline).mockResolvedValue({
-      run_id: "run-1",
-      output: { rows: [], source_data_hash: "h", discarded_row_count: 0 },
-    } as unknown as Awaited<ReturnType<typeof api.runTutorialPipeline>>);
+  it("Turn 4 (run) renders the shield-override caveat with no shield selected", async () => {
+    stubRun();
+    vi.mocked(api.fetchPluginPolicy).mockResolvedValue(policyWithShield(false));
     render(
       <TutorialTurn4Run
-        sessionId="sess-1"
+        sessionId="sess-shield-absent"
         onCompleted={noop}
         onCancelled={noop}
       />,
     );
-    // The caveat is static pre-flight copy and must render synchronously,
-    // before the run resolves.
-    expect(screen.getByText(TUTORIAL_SHIELD_OVERRIDE_CAVEAT)).toBeInTheDocument();
+    expect(
+      await screen.findByText(TUTORIAL_SHIELD_OVERRIDE_CAVEAT),
+    ).toBeInTheDocument();
+  });
+
+  it("Turn 4 (run) never claims an unshielded run when a shield is selected", async () => {
+    // The caveat asserts a FACT about the running pipeline. Once the composer
+    // began wiring an available shield instead of recommending it, rendering
+    // this string over a shielded run told the user something demonstrably
+    // untrue about their own pipeline.
+    stubRun();
+    vi.mocked(api.fetchPluginPolicy).mockResolvedValue(policyWithShield(true));
+    render(
+      <TutorialTurn4Run
+        sessionId="sess-shield-present"
+        onCompleted={noop}
+        onCancelled={noop}
+      />,
+    );
+    expect(await screen.findByText(TUTORIAL_SHIELD_WIRED_NOTE)).toBeInTheDocument();
+    expect(screen.queryByText(TUTORIAL_SHIELD_OVERRIDE_CAVEAT)).toBeNull();
+  });
+
+  it("Turn 4 (run) states neither shield fact when the policy is unreadable", async () => {
+    // Showing nothing costs a teaching moment; guessing states a falsehood
+    // about the user's own pipeline. The run itself must still proceed.
+    stubRun();
+    vi.mocked(api.fetchPluginPolicy).mockRejectedValue(new Error("policy down"));
+    render(
+      <TutorialTurn4Run
+        sessionId="sess-policy-down"
+        onCompleted={noop}
+        onCancelled={noop}
+      />,
+    );
+    await waitFor(() => {
+      expect(api.runTutorialPipeline).toHaveBeenCalled();
+    });
+    expect(screen.queryByText(TUTORIAL_SHIELD_OVERRIDE_CAVEAT)).toBeNull();
+    expect(screen.queryByText(TUTORIAL_SHIELD_WIRED_NOTE)).toBeNull();
   });
 });

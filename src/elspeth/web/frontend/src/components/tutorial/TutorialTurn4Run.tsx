@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { cancelTutorialRun, runTutorialPipeline } from "@/api/client";
+import { cancelTutorialRun, fetchPluginPolicy, runTutorialPipeline } from "@/api/client";
 import { AlertBanner } from "@/components/ui";
 import type { TutorialRunResponse } from "@/types/api";
-import { TUTORIAL_RUN_PREAMBLE, TUTORIAL_SHIELD_OVERRIDE_CAVEAT, TURN_4_PRIMARY_BUTTON } from "./copy";
+import {
+  TUTORIAL_RUN_PREAMBLE,
+  TUTORIAL_SHIELD_OVERRIDE_CAVEAT,
+  TUTORIAL_SHIELD_WIRED_NOTE,
+  TURN_4_PRIMARY_BUTTON,
+} from "./copy";
 import type { RunResultRow, TutorialRunResult } from "./tutorialMachine";
 
 interface TutorialTurn4RunProps {
@@ -228,6 +233,42 @@ export function TutorialTurn4Run({
     setRetryNonce((n) => n + 1);
   };
 
+  /**
+   * Which prompt-shield teaching moment is true for THIS deployment.
+   *
+   * `null` until the policy answers, and on any failure. Both strings state a
+   * fact about the pipeline the user is watching run, so neither may be
+   * rendered on a guess — showing nothing costs a teaching moment, showing the
+   * wrong one teaches the reader that the interface lies. The signal is the
+   * deployment's prompt-shield *selection*: whenever one is selected the
+   * composer wires it (it stopped merely recommending it), so "proceeding
+   * without a prompt shield" is false exactly when a selection exists.
+   */
+  const [shieldSelected, setShieldSelected] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPluginPolicy()
+      .then((snapshot) => {
+        if (cancelled) {
+          return;
+        }
+        const selected = snapshot.data.selections.some(
+          (selection) =>
+            selection.capability === "prompt_shield" && selection.plugin_id !== null,
+        );
+        setShieldSelected(selected);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setShieldSelected(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const phaseText = describePhase(phase);
 
   return (
@@ -239,7 +280,11 @@ export function TutorialTurn4Run({
       <AlertBanner tone="info" className="tutorial-disclosure">
         {TUTORIAL_RUN_PREAMBLE}
       </AlertBanner>
-      <p className="tutorial-callout">{TUTORIAL_SHIELD_OVERRIDE_CAVEAT}</p>
+      {shieldSelected !== null && (
+        <p className="tutorial-callout">
+          {shieldSelected ? TUTORIAL_SHIELD_WIRED_NOTE : TUTORIAL_SHIELD_OVERRIDE_CAVEAT}
+        </p>
+      )}
       {result === null && error === null && (
         <>
           <div
