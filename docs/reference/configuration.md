@@ -128,6 +128,14 @@ Collection and mapping values use JSON. This example enables the AWS Bedrock
 prompt and output controls, requires both controls, and selects a keyless
 Bedrock profile for the tutorial:
 
+> **This is the plain-environment-file form** — systemd, Docker Compose, or any
+> deployment where you set these variables yourself. It is **not** the AWS ECS
+> form. There, the Terraform scenario module creates both Guardrails and renders
+> their identifiers for you, so the hand-written `guardrail_identifier` and
+> `guardrail_version` values below would name Guardrails nothing owns. Configure
+> that deployment through the module's variables instead — see
+> [Where each deployment sets these](environment-variables.md#where-each-deployment-sets-these).
+
 ```bash
 ELSPETH_WEB__PLUGIN_ALLOWLIST='["transform:aws_bedrock_prompt_shield","transform:aws_bedrock_content_safety"]'
 ELSPETH_WEB__PLUGIN_PREFERENCES='{"prompt_shield":["transform:aws_bedrock_prompt_shield"],"content_safety":["transform:aws_bedrock_content_safety"]}'

@@ -60,3 +60,8 @@ output "service_enable_command" {
 output "teardown" {
   value = module.scenario.teardown
 }
+
+output "effective_guardrail_policy" {
+  description = "Guardrail content policies created for this scenario (filter types and strengths, blocked messaging)."
+  value       = module.scenario.effective_guardrail_policy
+}

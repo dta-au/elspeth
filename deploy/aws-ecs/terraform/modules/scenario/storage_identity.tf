@@ -199,14 +199,18 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "acceptance" {
 resource "aws_bedrock_guardrail" "prompt" {
   name                      = "elspeth-${local.compact_run_id}-${local.scenario_id_lower}-prompt"
   description               = "Disposable ELSPETH ${var.scenario_id} prompt acceptance Guardrail"
-  blocked_input_messaging   = "Input blocked by acceptance policy."
-  blocked_outputs_messaging = "Output blocked by acceptance policy."
+  blocked_input_messaging   = local.effective_prompt_guardrail.blocked_input_messaging
+  blocked_outputs_messaging = local.effective_prompt_guardrail.blocked_outputs_messaging
 
   content_policy_config {
-    filters_config {
-      type            = "PROMPT_ATTACK"
-      input_strength  = "HIGH"
-      output_strength = "NONE"
+    dynamic "filters_config" {
+      for_each = local.effective_prompt_guardrail.filters
+
+      content {
+        type            = filters_config.value.type
+        input_strength  = filters_config.value.input_strength
+        output_strength = filters_config.value.output_strength
+      }
     }
   }
 
@@ -222,17 +226,17 @@ resource "aws_bedrock_guardrail_version" "prompt" {
 resource "aws_bedrock_guardrail" "content" {
   name                      = "elspeth-${local.compact_run_id}-${local.scenario_id_lower}-content"
   description               = "Disposable ELSPETH ${var.scenario_id} content acceptance Guardrail"
-  blocked_input_messaging   = "Input blocked by acceptance policy."
-  blocked_outputs_messaging = "Output blocked by acceptance policy."
+  blocked_input_messaging   = local.effective_content_guardrail.blocked_input_messaging
+  blocked_outputs_messaging = local.effective_content_guardrail.blocked_outputs_messaging
 
   content_policy_config {
     dynamic "filters_config" {
-      for_each = toset(["HATE", "INSULTS", "MISCONDUCT", "SEXUAL", "VIOLENCE"])
+      for_each = local.effective_content_guardrail.filters
 
       content {
-        type            = filters_config.value
-        input_strength  = "NONE"
-        output_strength = "HIGH"
+        type            = filters_config.value.type
+        input_strength  = filters_config.value.input_strength
+        output_strength = filters_config.value.output_strength
       }
     }
   }

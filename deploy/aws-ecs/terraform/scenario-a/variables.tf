@@ -218,3 +218,70 @@ variable "aurora_engine_version" {
     error_message = "this package is currently validated only for Aurora PostgreSQL 16.13."
   }
 }
+
+# ── Operator-configurable web plugin policy (forwarded to modules/scenario) ──
+#
+# Thin pass-throughs: every type, default, and validation rule lives in
+# modules/scenario/variables.tf so there is one source of truth. Leave any of
+# these unset (null) to keep the module's shipped default.
+
+variable "plugin_allowlist" {
+  type        = list(string)
+  default     = null
+  description = "Kind-qualified plugin ids authorized on top of the web core. Null keeps the module default."
+}
+
+variable "plugin_preferences" {
+  type        = map(list(string))
+  default     = null
+  description = "Ordered implementation choice per control capability. Null keeps the module default."
+}
+
+variable "plugin_control_modes" {
+  type        = map(string)
+  default     = null
+  description = "'required' or 'recommend' per control capability. Null keeps the module default (both required)."
+}
+
+variable "llm_profiles" {
+  type = map(object({
+    model       = string
+    region_name = optional(string)
+  }))
+  default     = null
+  description = "Operator LLM profiles offered to web authors, keyed by alias. Null derives standard/fast from the Composer models. The task role's Bedrock grant follows whatever is set here."
+}
+
+variable "default_llm_profile" {
+  type        = string
+  default     = null
+  description = "Alias offered first to authors and used by the first-run tutorial. Null selects the module default."
+}
+
+variable "prompt_guardrail" {
+  type = object({
+    filters = list(object({
+      type            = string
+      input_strength  = string
+      output_strength = string
+    }))
+    blocked_input_messaging   = optional(string, "Input blocked by acceptance policy.")
+    blocked_outputs_messaging = optional(string, "Output blocked by acceptance policy.")
+  })
+  default     = null
+  description = "Bedrock Guardrail content policy for the prompt shield (screens model input). Null keeps the module default."
+}
+
+variable "content_guardrail" {
+  type = object({
+    filters = list(object({
+      type            = string
+      input_strength  = string
+      output_strength = string
+    }))
+    blocked_input_messaging   = optional(string, "Input blocked by acceptance policy.")
+    blocked_outputs_messaging = optional(string, "Output blocked by acceptance policy.")
+  })
+  default     = null
+  description = "Bedrock Guardrail content policy for content safety (screens model output). Null keeps the module default."
+}

@@ -225,6 +225,32 @@ resource "aws_ecs_task_definition" "candidate_web" {
   }
 
   tags = local.tags
+
+  # The web service compiles the plugin policy at startup and fails closed on an
+  # inconsistent one, which means the operator learns about it only after the
+  # service is rolled. These preconditions move both failures to `terraform
+  # plan`, before an image is registered against a policy that cannot boot.
+  lifecycle {
+    precondition {
+      condition = alltrue([
+        for capability, mode in local.effective_plugin_control_modes :
+        length(lookup(local.effective_plugin_preferences, capability, [])) > 0
+        if mode == "required"
+      ])
+      error_message = "a control set to \"required\" in plugin_control_modes must name at least one implementation in plugin_preferences."
+    }
+
+    precondition {
+      condition = alltrue(flatten([
+        for capability, mode in local.effective_plugin_control_modes : [
+          for implementation in lookup(local.effective_plugin_preferences, capability, []) :
+          contains(local.effective_plugin_allowlist, implementation)
+        ]
+        if mode == "required"
+      ]))
+      error_message = "every implementation preferred for a \"required\" control must also appear in plugin_allowlist, or the web service cannot satisfy that control."
+    }
+  }
 }
 
 resource "aws_ecs_task_definition" "schema_init_doctor" {

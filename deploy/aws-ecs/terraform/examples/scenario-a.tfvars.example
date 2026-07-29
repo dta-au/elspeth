@@ -33,3 +33,60 @@ landscape_database_name     = "elspeth_landscape"
 aurora_engine_major_version = "16"
 aurora_engine_version       = "16.13"
 alarm_actions               = []
+
+# ── Web plugin policy (all optional) ─────────────────────────────────────
+#
+# Leave every setting below commented out to keep the module defaults: the
+# 15-plugin allowlist, both Bedrock controls set to "required", the
+# standard/fast profile pair bound to the two Composer models, and Guardrails
+# that screen PROMPT_ATTACK on input and the five harm categories on output.
+#
+# The module CREATES both Bedrock Guardrails and renders their identifiers, so
+# never hand-author a guardrail_identifier for an ECS deployment; set the
+# content policy here instead.
+
+# Which LLM profiles web authors may select, keyed by the opaque alias they see.
+# The task role's bedrock:InvokeModel grant is derived from these, so naming a
+# third model here is sufficient — no separate IAM change is needed.
+# llm_profiles = {
+#   standard = { model = "bedrock/REPLACE_PRIMARY_MODEL" }
+#   fast     = { model = "bedrock/REPLACE_ADVISOR_MODEL" }
+# }
+# default_llm_profile = "standard"
+
+# Enforcement per control. "required" rejects a web-authored pipeline whose LLM
+# nodes are not covered; "recommend" makes the control advisory and leaves the
+# decision to the author. Relaxing either is a deliberate posture change.
+# plugin_control_modes = {
+#   prompt_shield  = "required"
+#   content_safety = "required"
+# }
+
+# Optional plugins authorized on top of the always-authorized web core.
+# plugin_allowlist = [
+#   "source:aws_s3", "source:csv", "source:json", "source:text",
+#   "sink:aws_s3", "sink:csv", "sink:json", "sink:text",
+#   "transform:aws_bedrock_content_safety", "transform:aws_bedrock_prompt_shield",
+#   "transform:aws_textract_document_analysis", "transform:field_mapper",
+#   "transform:llm", "transform:passthrough", "transform:web_scrape",
+# ]
+# plugin_preferences = {
+#   prompt_shield  = ["transform:aws_bedrock_prompt_shield"]
+#   content_safety = ["transform:aws_bedrock_content_safety"]
+# }
+
+# Guardrail content policies. The prompt shield screens what goes INTO the
+# model, content safety screens what comes OUT — hence the asymmetric
+# strengths. Setting either replaces its whole filter list.
+# prompt_guardrail = {
+#   filters = [{ type = "PROMPT_ATTACK", input_strength = "HIGH", output_strength = "NONE" }]
+# }
+# content_guardrail = {
+#   filters = [
+#     { type = "HATE", input_strength = "NONE", output_strength = "HIGH" },
+#     { type = "INSULTS", input_strength = "NONE", output_strength = "HIGH" },
+#     { type = "MISCONDUCT", input_strength = "NONE", output_strength = "HIGH" },
+#     { type = "SEXUAL", input_strength = "NONE", output_strength = "HIGH" },
+#     { type = "VIOLENCE", input_strength = "NONE", output_strength = "HIGH" },
+#   ]
+# }

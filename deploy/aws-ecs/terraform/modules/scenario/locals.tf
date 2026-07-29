@@ -80,7 +80,10 @@ locals {
   s3_bucket_name                 = "elspeth-${local.namespace}-${substr(local.compact_run_id, 0, 12)}"
   s3_prefix                      = "${local.namespace}/${var.run_id}"
 
-  plugin_allowlist = jsonencode([
+  # Shipped defaults for the operator-configurable plugin policy. Each paired
+  # var.* defaults to null, so leaving a variable unset reproduces exactly the
+  # policy this module rendered when these values were hardcoded here.
+  default_plugin_allowlist = [
     "source:aws_s3",
     "source:csv",
     "source:json",
@@ -96,15 +99,26 @@ locals {
     "transform:llm",
     "transform:passthrough",
     "transform:web_scrape",
-  ])
-  plugin_preferences = jsonencode({
+  ]
+  default_plugin_preferences = {
     prompt_shield  = ["transform:aws_bedrock_prompt_shield"]
     content_safety = ["transform:aws_bedrock_content_safety"]
-  })
-  plugin_control_modes = jsonencode({
+  }
+  # Both controls default to "required": an uncovered LLM node is rejected
+  # rather than merely flagged. Weakening either to "recommend" is an explicit
+  # operator decision, never a side effect of setting something else.
+  default_plugin_control_modes = {
     prompt_shield  = "required"
     content_safety = "required"
-  })
+  }
+
+  effective_plugin_allowlist     = var.plugin_allowlist == null ? local.default_plugin_allowlist : var.plugin_allowlist
+  effective_plugin_preferences   = var.plugin_preferences == null ? local.default_plugin_preferences : var.plugin_preferences
+  effective_plugin_control_modes = var.plugin_control_modes == null ? local.default_plugin_control_modes : var.plugin_control_modes
+
+  plugin_allowlist     = jsonencode(local.effective_plugin_allowlist)
+  plugin_preferences   = jsonencode(local.effective_plugin_preferences)
+  plugin_control_modes = jsonencode(local.effective_plugin_control_modes)
   # A cross-region ("global."/"us."/"eu."/"apac.") inference profile is authorized by Bedrock
   # against the underlying foundation model in whichever region it actually routes to, and that
   # authorization check reports a region-less resource ARN. A single region-pinned
@@ -114,10 +128,18 @@ locals {
   # in var.bedrock_foundation_model_arns.
   bedrock_cross_region_prefixes = ["global.", "us.", "eu.", "apac."]
 
-  bedrock_configured_model_ids = distinct([
-    trimprefix(var.composer_model, "bedrock/"),
-    trimprefix(var.composer_advisor_model, "bedrock/"),
-  ])
+  # The grant follows the configuration instead of only the Composer pair.
+  # Deriving it from the Composer models alone meant a profile naming any third
+  # model passed startup validation and then died at invoke with AccessDenied —
+  # a trap the module comment and the reference docs both had to WARN about.
+  # Including the profile models makes that failure unreachable.
+  bedrock_configured_model_ids = distinct(concat(
+    [
+      trimprefix(var.composer_model, "bedrock/"),
+      trimprefix(var.composer_advisor_model, "bedrock/"),
+    ],
+    [for profile in values(local.effective_llm_profile_bindings) : trimprefix(profile.model, "bedrock/")],
+  ))
 
   # Map each configured model id to the cross-region prefix it starts with, or null if it is
   # region-pinned. try() turns the index-out-of-bounds error from an empty match list into null.
@@ -136,19 +158,19 @@ locals {
 
   bedrock_litellm_model      = var.composer_model
   bedrock_fast_litellm_model = var.composer_advisor_model
-  # Two profiles so a pipeline can pick a tier, and web authors keep selecting an
-  # opaque alias rather than a model id.
+  # Two default profiles so a pipeline can pick a tier, and web authors keep
+  # selecting an opaque alias rather than a model id.
   #
-  # Both models are taken from the configured Composer pair on purpose: IAM grants
-  # bedrock:InvokeModel for exactly `bedrock_configured_model_ids`, which is derived
-  # from composer_model and composer_advisor_model. A profile naming any other model
-  # would validate at startup and then fail at invoke time with AccessDenied, so
-  # adding a genuinely third model means extending that grant too.
+  # The default pair reuses the configured Composer models because those are the
+  # two models the deployment already knows it can invoke. Operators may replace
+  # the set entirely via var.llm_profiles; the IAM grant is derived from whatever
+  # ends up here (see bedrock_configured_model_ids), so a third model no longer
+  # needs the grant extended by hand.
   #
   # `fast` is named for the tier it provides, not the vendor's current model name —
   # the alias outlives a model swap, where "flash" or "glm47" would start lying the
   # first time composer_advisor_model changes.
-  llm_profiles = jsonencode({
+  default_llm_profile_bindings = {
     standard = {
       provider    = "bedrock"
       model       = local.bedrock_litellm_model
@@ -159,7 +181,15 @@ locals {
       model       = local.bedrock_fast_litellm_model
       region_name = var.aws_region
     }
-  })
+  }
+  effective_llm_profile_bindings = var.llm_profiles == null ? local.default_llm_profile_bindings : {
+    for alias, profile in var.llm_profiles : alias => {
+      provider    = "bedrock"
+      model       = profile.model
+      region_name = coalesce(profile.region_name, var.aws_region)
+    }
+  }
+  llm_profiles = jsonencode(local.effective_llm_profile_bindings)
   # The tutorial needs A profile, not its OWN profile — it points at the ordinary
   # standard-tier one, the same way the systemd deployment points this at whichever
   # general profile it defines. An alias called "tutorial" made every non-tutorial
@@ -168,7 +198,34 @@ locals {
   # This alias is also the profile resolver's preferred_alias, so it sorts first and
   # is what the planner's exemplars teach by default; keep it pointed at the
   # general-purpose tier rather than a special-purpose one.
-  default_llm_profile = "standard"
+  #
+  # A dangling alias here is a web STARTUP error, i.e. discovered after a service
+  # roll. The check_default_llm_profile_is_configured precondition below moves
+  # that failure to `terraform plan`.
+  default_llm_profile = var.default_llm_profile == null ? "standard" : var.default_llm_profile
+  # Default Guardrail content policies. The split is the point: the prompt
+  # shield screens what goes INTO the model (input strength set, output NONE),
+  # content safety screens what comes OUT (output strength set, input NONE).
+  # Overriding either variable replaces its filter list wholesale.
+  default_prompt_guardrail = {
+    filters = [
+      { type = "PROMPT_ATTACK", input_strength = "HIGH", output_strength = "NONE" },
+    ]
+    blocked_input_messaging   = "Input blocked by acceptance policy."
+    blocked_outputs_messaging = "Output blocked by acceptance policy."
+  }
+  default_content_guardrail = {
+    filters = [
+      for category in ["HATE", "INSULTS", "MISCONDUCT", "SEXUAL", "VIOLENCE"] :
+      { type = category, input_strength = "NONE", output_strength = "HIGH" }
+    ]
+    blocked_input_messaging   = "Input blocked by acceptance policy."
+    blocked_outputs_messaging = "Output blocked by acceptance policy."
+  }
+
+  effective_prompt_guardrail  = var.prompt_guardrail == null ? local.default_prompt_guardrail : var.prompt_guardrail
+  effective_content_guardrail = var.content_guardrail == null ? local.default_content_guardrail : var.content_guardrail
+
   guardrail_profiles = jsonencode([
     {
       alias                = "prompt-approved"

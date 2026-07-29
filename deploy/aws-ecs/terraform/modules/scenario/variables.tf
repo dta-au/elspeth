@@ -278,3 +278,169 @@ variable "aurora_engine_version" {
     error_message = "this package is currently validated only for Aurora PostgreSQL 16.13."
   }
 }
+
+# ── Operator-configurable web plugin policy ──────────────────────────────
+#
+# These seven settings are the web service's protected plugin-policy
+# assignment. They were hardcoded in locals.tf, which made the deployment's
+# safety posture, LLM offering, and plugin surface unchangeable without
+# editing the module. Each variable below is nullable and defaults to null;
+# locals.tf coalesces null to the shipped default, so the defaults live in
+# exactly one place and an unset variable reproduces the previous behaviour
+# byte for byte.
+
+variable "plugin_allowlist" {
+  type        = list(string)
+  default     = null
+  description = "Kind-qualified plugin ids authorized on top of the always-authorized web core. Null keeps the module default. An empty list authorizes only the core."
+
+  validation {
+    condition = var.plugin_allowlist == null || alltrue([
+      for id in var.plugin_allowlist : can(regex("^(source|transform|sink):[a-z0-9_]+$", id))
+    ])
+    error_message = "each plugin_allowlist entry must be kind-qualified, e.g. \"transform:llm\"."
+  }
+}
+
+variable "plugin_preferences" {
+  type        = map(list(string))
+  default     = null
+  description = "Ordered implementation choice per control capability, e.g. {prompt_shield = [\"transform:aws_bedrock_prompt_shield\"]}. Null keeps the module default."
+}
+
+variable "plugin_control_modes" {
+  type        = map(string)
+  default     = null
+  description = "Enforcement mode per control capability. 'required' rejects a web-authored pipeline whose LLM nodes are not covered; 'recommend' makes the control advisory. Null keeps the module default (both required)."
+
+  validation {
+    condition = var.plugin_control_modes == null || alltrue([
+      for mode in values(var.plugin_control_modes) : contains(["required", "recommend"], mode)
+    ])
+    error_message = "each plugin_control_modes value must be \"required\" or \"recommend\"."
+  }
+
+  # The web service compiles the policy at startup and fails closed on both of
+  # these, i.e. after the service is rolled. Checking here fails the plan.
+  # Each guard is skipped when the paired variable is null, because the shipped
+  # defaults in locals.tf are mutually consistent by construction; the resource
+  # preconditions on aws_ecs_task_definition.candidate_web re-check every
+  # combination, including the defaults.
+  validation {
+    condition = var.plugin_control_modes == null || var.plugin_preferences == null || alltrue([
+      for capability, mode in var.plugin_control_modes :
+      length(lookup(var.plugin_preferences, capability, [])) > 0
+      if mode == "required"
+    ])
+    error_message = "a control set to \"required\" must name at least one implementation in plugin_preferences."
+  }
+
+  validation {
+    condition = var.plugin_control_modes == null || var.plugin_preferences == null || var.plugin_allowlist == null || alltrue(flatten([
+      for capability, mode in var.plugin_control_modes : [
+        for implementation in lookup(var.plugin_preferences, capability, []) :
+        contains(var.plugin_allowlist, implementation)
+      ]
+      if mode == "required"
+    ]))
+    error_message = "every implementation preferred for a \"required\" control must also appear in plugin_allowlist."
+  }
+}
+
+variable "llm_profiles" {
+  type = map(object({
+    model       = string
+    region_name = optional(string)
+  }))
+  default     = null
+  description = "Operator LLM profiles offered to web authors, keyed by the opaque alias an author selects. Bedrock-only here, so profiles are keyless. Null derives the standard/fast pair from the Composer models. Every model named here is added to the task role's bedrock:InvokeModel grant. max_tokens is not exposed yet: emitting it would put an explicit null in the rendered policy for every profile that omits it."
+
+  validation {
+    condition = var.llm_profiles == null || alltrue([
+      for profile in values(var.llm_profiles) : startswith(profile.model, "bedrock/")
+    ])
+    error_message = "each llm_profiles model must be a bedrock/... provider id; this module grants Bedrock access only."
+  }
+
+  validation {
+    condition = var.llm_profiles == null || alltrue([
+      for alias in keys(var.llm_profiles) : can(regex("^[a-z0-9]+([_-][a-z0-9]+)*$", alias))
+    ])
+    error_message = "each llm_profiles alias must be a lowercase identifier, words joined with - or _."
+  }
+}
+
+variable "default_llm_profile" {
+  type        = string
+  default     = null
+  description = "Alias listed first for authors, cited by the Composer's worked examples, and used by the first-run tutorial. Must name a configured profile. Null selects the module default (\"standard\")."
+
+  # An alias that names no configured profile is a web STARTUP error, so without
+  # this it is discovered only after the service is rolled. Checking it here
+  # fails `terraform plan` instead.
+  validation {
+    condition = var.default_llm_profile == null || contains(
+      var.llm_profiles == null ? ["standard", "fast"] : keys(var.llm_profiles),
+      coalesce(var.default_llm_profile, ""),
+    )
+    error_message = "default_llm_profile must name a configured llm_profiles alias; the module default pair is \"standard\" and \"fast\"."
+  }
+}
+
+variable "prompt_guardrail" {
+  type = object({
+    filters = list(object({
+      type            = string
+      input_strength  = string
+      output_strength = string
+    }))
+    blocked_input_messaging   = optional(string, "Input blocked by acceptance policy.")
+    blocked_outputs_messaging = optional(string, "Output blocked by acceptance policy.")
+  })
+  default     = null
+  description = "Bedrock Guardrail content policy for the prompt shield, which screens what goes INTO the model. Null keeps the module default (one PROMPT_ATTACK filter at input HIGH). Only content filters are configurable here; denied-topic, PII, word, and contextual-grounding policies are not yet exposed."
+
+  validation {
+    condition = var.prompt_guardrail == null || alltrue(flatten([
+      for filter in var.prompt_guardrail.filters : [
+        contains(["NONE", "LOW", "MEDIUM", "HIGH"], filter.input_strength),
+        contains(["NONE", "LOW", "MEDIUM", "HIGH"], filter.output_strength),
+      ]
+    ]))
+    error_message = "prompt_guardrail filter strengths must each be NONE, LOW, MEDIUM, or HIGH."
+  }
+
+  validation {
+    condition     = var.prompt_guardrail == null || length(var.prompt_guardrail.filters) > 0
+    error_message = "prompt_guardrail.filters must not be empty; a Guardrail with no filter screens nothing."
+  }
+}
+
+variable "content_guardrail" {
+  type = object({
+    filters = list(object({
+      type            = string
+      input_strength  = string
+      output_strength = string
+    }))
+    blocked_input_messaging   = optional(string, "Input blocked by acceptance policy.")
+    blocked_outputs_messaging = optional(string, "Output blocked by acceptance policy.")
+  })
+  default     = null
+  description = "Bedrock Guardrail content policy for content safety, which screens what comes OUT of the model. Null keeps the module default (HATE, INSULTS, MISCONDUCT, SEXUAL, VIOLENCE at output HIGH). Same configurability limits as prompt_guardrail."
+
+  validation {
+    condition = var.content_guardrail == null || alltrue(flatten([
+      for filter in var.content_guardrail.filters : [
+        contains(["NONE", "LOW", "MEDIUM", "HIGH"], filter.input_strength),
+        contains(["NONE", "LOW", "MEDIUM", "HIGH"], filter.output_strength),
+      ]
+    ]))
+    error_message = "content_guardrail filter strengths must each be NONE, LOW, MEDIUM, or HIGH."
+  }
+
+  validation {
+    condition     = var.content_guardrail == null || length(var.content_guardrail.filters) > 0
+    error_message = "content_guardrail.filters must not be empty; a Guardrail with no filter screens nothing."
+  }
+}

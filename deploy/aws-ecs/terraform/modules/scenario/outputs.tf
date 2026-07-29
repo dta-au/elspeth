@@ -242,3 +242,11 @@ output "teardown" {
   description = "Code-blind teardown reminder."
   value       = "Select the same backend config and workspace, verify account/region, then run terraform destroy."
 }
+
+output "effective_guardrail_policy" {
+  description = "Guardrail content policies this scenario actually created. Surfaced so an operator can read the deployment's safety posture without decoding the module, and so the policy is assertable in tests."
+  value = {
+    prompt  = local.effective_prompt_guardrail
+    content = local.effective_content_guardrail
+  }
+}

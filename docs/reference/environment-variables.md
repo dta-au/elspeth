@@ -368,11 +368,24 @@ Composer advisor model) — and points `ELSPETH_WEB__DEFAULT_LLM_PROFILE` at
 `standard`, so the tutorial shares the ordinary general-purpose profile instead
 of owning a dedicated one.
 
-Both profiles deliberately reuse the two configured Composer model ids, because
-the module grants `bedrock:InvokeModel` for exactly those. A profile naming any
-other model passes startup validation and then fails at invoke time with
-`AccessDenied`, so adding a third model means extending the grant (and the
-permissions boundary) first.
+Those are defaults, not fixed values. Each of the seven is a module variable
+(`plugin_allowlist`, `plugin_preferences`, `plugin_control_modes`,
+`llm_profiles`, `default_llm_profile`, `prompt_guardrail`, `content_guardrail`),
+forwarded from both scenario roots and defaulting to null; an unset variable
+renders exactly the policy above. Set them in your `scenario-*.tfvars` — the
+example files carry a commented block for each.
+
+**The `bedrock:InvokeModel` grant follows `llm_profiles`.** It is derived from
+the Composer pair *and* every model named in the configured profiles, so naming
+a third model in a profile is sufficient on its own. Earlier versions derived
+the grant from the Composer pair alone, which meant a third model passed web
+startup validation and then failed at invoke time with `AccessDenied`; that trap
+no longer exists.
+
+Two failure modes that used to surface only after a service roll now fail at
+`terraform plan`: a `default_llm_profile` naming no configured alias, and a
+control set to `required` whose preferred implementation is missing from the
+allowlist (or absent entirely).
 
 All Bedrock access flows through the ECS task role, and no `OPENROUTER_API_KEY`
 secret is wired when both Composer models are Bedrock. See the
@@ -426,6 +439,34 @@ version, and region are operator-owned and lowered only for validation and
 execution, so an author can never read or forge them. Credentials come from the
 AWS default SDK chain; grant Bedrock permissions to the task role and never put
 access keys or custom endpoints in profile or pipeline configuration.
+
+**On AWS ECS the Terraform module creates both Guardrails; do not hand-author
+their identifiers.** `deploy/aws-ecs/terraform/modules/scenario` declares an
+`aws_bedrock_guardrail` per control, versions it, and renders the resulting
+identifier and version into `ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES` under the
+aliases `prompt-approved` and `content-approved`. An identifier written by hand
+into a tfvars file would name a Guardrail the module does not own. Configure the
+*content policy* instead, via the `prompt_guardrail` and `content_guardrail`
+variables:
+
+| Guardrail | Default filters | Strengths |
+|---|---|---|
+| prompt shield (screens model **input**) | `PROMPT_ATTACK` | `input_strength = HIGH`, `output_strength = NONE` |
+| content safety (screens model **output**) | `HATE`, `INSULTS`, `MISCONDUCT`, `SEXUAL`, `VIOLENCE` | `input_strength = NONE`, `output_strength = HIGH` |
+
+The asymmetry is the design: a prompt shield that screened output, or a content
+filter that screened input, would guard the wrong side of the model. Setting
+either variable replaces that Guardrail's whole filter list, and strengths are
+validated at `terraform plan` against `NONE`/`LOW`/`MEDIUM`/`HIGH`. Only content
+filters are configurable today — denied-topic, PII, word, and
+contextual-grounding policies each need their own block and are not yet exposed.
+
+The other five policy variables are configurable the same way
+(`plugin_allowlist`, `plugin_preferences`, `plugin_control_modes`,
+`llm_profiles`, `default_llm_profile`). Leaving any of them unset reproduces the
+module's shipped default exactly, and
+`deploy/aws-ecs/terraform/examples/scenario-a.tfvars.example` carries a
+commented block for each.
 
 See [configuration.md](configuration.md#environment-configuration) for a
 complete worked example, and the plugin's YAML options under

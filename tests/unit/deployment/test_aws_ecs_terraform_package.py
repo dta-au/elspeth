@@ -46,6 +46,7 @@ EXPECTED_FILES = {
     "scenario-a/.terraform.lock.hcl",
     "scenario-a/codeblind-compatibility.json",
     "scenario-a/codeblind.tftest.hcl",
+    "scenario-a/web_policy.tftest.hcl",
     "scenario-a/main.tf",
     "scenario-a/outputs.tf",
     "scenario-a/variables.tf",
@@ -139,13 +140,124 @@ def test_package_contains_only_the_supported_source_and_operator_inputs() -> Non
 def test_scenario_web_plugin_allowlist_exposes_textract_to_composer() -> None:
     locals_text = _text("modules/scenario/locals.tf")
     allowlist_match = re.search(
-        r"plugin_allowlist\s*=\s*jsonencode\(\[(?P<body>.*?)\]\)",
+        r"default_plugin_allowlist\s*=\s*\[(?P<body>.*?)\]",
         locals_text,
         re.DOTALL,
     )
 
     assert allowlist_match is not None
     assert '"transform:aws_textract_document_analysis"' in allowlist_match.group("body")
+
+
+def test_web_plugin_policy_is_operator_configurable() -> None:
+    """Every protected policy value must be reachable from a module variable.
+
+    These seven settings decide the deployment's safety posture, its LLM
+    offering, and which plugins exist at all. Hardcoding them in locals.tf made
+    the AWS deployment's posture unchangeable without editing the module, while
+    the reference docs described all seven as operator-owned settings.
+    """
+    variables = _text("modules/scenario/variables.tf")
+    locals_text = _text("modules/scenario/locals.tf")
+
+    for name in (
+        "plugin_allowlist",
+        "plugin_preferences",
+        "plugin_control_modes",
+        "llm_profiles",
+        "default_llm_profile",
+        "prompt_guardrail",
+        "content_guardrail",
+    ):
+        assert f'variable "{name}"' in variables, f"{name} must be a module variable"
+
+    # Each one defaults to null and is coalesced against a default_* local, so
+    # an unset variable reproduces the previously hardcoded policy.
+    for name in ("plugin_allowlist", "plugin_preferences", "plugin_control_modes"):
+        assert f"var.{name} == null ? local.default_{name}" in locals_text
+
+    assert "var.llm_profiles == null ? local.default_llm_profile_bindings" in locals_text
+    assert 'var.default_llm_profile == null ? "standard"' in locals_text
+    assert "var.prompt_guardrail == null ? local.default_prompt_guardrail" in locals_text
+    assert "var.content_guardrail == null ? local.default_content_guardrail" in locals_text
+
+
+def test_bedrock_invoke_grant_follows_the_configured_llm_profiles() -> None:
+    """The IAM grant must be derived from the profiles, not just the Composer pair.
+
+    Deriving it from composer_model/composer_advisor_model alone meant a profile
+    naming any third model passed web startup validation and then failed at
+    invoke time with AccessDenied. Including the profile models makes that
+    failure unreachable instead of merely documented.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+    grant = re.search(
+        r"bedrock_configured_model_ids\s*=\s*distinct\((?P<body>.*?)\n  \)",
+        locals_text,
+        re.DOTALL,
+    )
+
+    assert grant is not None, "bedrock_configured_model_ids must still be derived, not hardcoded"
+    body = grant.group("body")
+    assert "var.composer_model" in body
+    assert "var.composer_advisor_model" in body
+    assert "effective_llm_profile_bindings" in body, "the grant must include every configured profile's model"
+
+
+def test_guardrail_content_policies_are_rendered_from_variables() -> None:
+    """Both Guardrails must take their filter list from configuration.
+
+    The module creates these Guardrails; the operator never supplies an
+    identifier. That makes the module the only place their content policy can be
+    set, so the filters have to be variable-driven or the deployment's safety
+    posture is unchangeable.
+    """
+    storage = _text("modules/scenario/storage_identity.tf")
+
+    for guardrail in ("prompt", "content"):
+        block = re.search(
+            rf'resource "aws_bedrock_guardrail" "{guardrail}" \{{(?P<body>.*?)\n\}}',
+            storage,
+            re.DOTALL,
+        )
+        assert block is not None
+        body = block.group("body")
+        assert f"local.effective_{guardrail}_guardrail.filters" in body, f"{guardrail} filters must come from configuration"
+        assert f"local.effective_{guardrail}_guardrail.blocked_input_messaging" in body
+        assert 'dynamic "filters_config"' in body
+
+
+def test_inconsistent_web_policy_fails_at_plan_not_at_startup() -> None:
+    """A policy the web service rejects at boot must be rejected while planning.
+
+    `expect_failures` in a root tftest cannot name a module-level variable
+    validation or a module-internal resource precondition, so these rules are
+    pinned here instead. They fire in practice: an invalid control mode, a
+    dangling default_llm_profile, a non-Bedrock profile model, and an
+    out-of-range Guardrail strength all abort `terraform plan`.
+    """
+    variables = _text("modules/scenario/variables.tf")
+    ecs = _text("modules/scenario/ecs.tf")
+
+    assert 'contains(["required", "recommend"], mode)' in variables
+    assert 'startswith(profile.model, "bedrock/")' in variables
+    assert 'contains(["NONE", "LOW", "MEDIUM", "HIGH"], filter.input_strength)' in variables
+    # A dangling default profile alias is otherwise a web startup failure.
+    assert 'var.llm_profiles == null ? ["standard", "fast"] : keys(var.llm_profiles)' in variables
+
+    # Preconditions re-check every combination, including the shipped defaults,
+    # which the variable validations deliberately skip.
+    candidate = re.search(
+        r'resource "aws_ecs_task_definition" "candidate_web" \{(?P<body>.*?)\n\}',
+        ecs,
+        re.DOTALL,
+    )
+    assert candidate is not None
+    body = candidate.group("body")
+    assert "precondition" in body
+    assert "effective_plugin_control_modes" in body
+    assert "effective_plugin_preferences" in body
+    assert "contains(local.effective_plugin_allowlist, implementation)" in body
 
 
 def test_terraform_and_provider_versions_are_current_and_locked() -> None:

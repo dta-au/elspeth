@@ -34,6 +34,13 @@ module "scenario" {
   composer_advisor_model             = var.composer_advisor_model
   bedrock_inference_profile_arns     = var.bedrock_inference_profile_arns
   bedrock_foundation_model_arns      = var.bedrock_foundation_model_arns
+  plugin_allowlist                   = var.plugin_allowlist
+  plugin_preferences                 = var.plugin_preferences
+  plugin_control_modes               = var.plugin_control_modes
+  llm_profiles                       = var.llm_profiles
+  default_llm_profile                = var.default_llm_profile
+  prompt_guardrail                   = var.prompt_guardrail
+  content_guardrail                  = var.content_guardrail
   scenario_tf_dir                    = abspath(path.root)
   scenario_tf_vars                   = abspath("${path.root}/../examples/scenario-a.tfvars.example")
   scenario_tf_binding_sha            = local.codeblind_compatibility_sha256
