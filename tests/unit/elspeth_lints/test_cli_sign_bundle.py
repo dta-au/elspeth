@@ -286,6 +286,23 @@ def _argv(
     owner: str = "test-operator",
     extra: tuple[str, ...] = (),
 ) -> list[str]:
+    """Build a ``sign-bundle`` argv bound to this test's tmp_path.
+
+    ``--rotation-log`` defaults to the CWD-relative ``.elspeth/rotations.log``,
+    which ``create_transaction`` resolves against the *process* CWD -- under
+    pytest that is the checkout, so an unqualified invocation binds the
+    repository's own tracked rotation manifest: the transaction snapshots its
+    bytes into ``rotation-base.bin``, ``assert_rotation_log_unchanged`` gates on
+    them, and a rotation that reaches ``finalize_rotation_log`` appends a
+    tmp-dir record to a tracked file. Bind every invocation to the test's
+    tmp_path instead (``allowlist_dir.parent``: ``_build_allowlist_dir`` always
+    returns ``tmp_path / <name>``), which is the same ``tmp_path /
+    "rotations.log"`` the rotation tests already pass explicitly. Callers that
+    supply their own ``--rotation-log`` in ``extra`` keep it -- resume runs
+    authenticate ``rotation_log`` against the transaction manifest
+    (``assert_resume_identity``), so both legs must select the same path.
+    """
+    rotation_log = () if "--rotation-log" in extra else ("--rotation-log", str(allowlist_dir.parent / "rotations.log"))
     return [
         "sign-bundle",
         str(bundle_path),
@@ -295,6 +312,7 @@ def _argv(
         str(allowlist_dir),
         "--owner",
         owner,
+        *rotation_log,
         *extra,
     ]
 
@@ -352,6 +370,27 @@ def _recovery_path(stderr: str) -> Path:
 # =========================================================================== #
 # Task 2.1 -- subparser, dispatch, fail-closed key hoist, load + integrity
 # =========================================================================== #
+
+
+def test_argv_never_selects_the_repository_rotation_manifest(tmp_path: Path) -> None:
+    """No sign-bundle invocation may bind the checkout's tracked rotations.log.
+
+    Regression for the CWD-relative ``--rotation-log`` default: a leaked
+    binding lets a rotation append a tmp-dir record to a tracked file, which
+    dirties the tree and trips pre-commit dirty-checks. Asserted at ``_argv``
+    because that is the single chokepoint every test invocation passes through.
+    """
+    from elspeth_lints.core.cli import _build_parser
+
+    repo_manifest = (Path.cwd() / ".elspeth" / "rotations.log").resolve()
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    explicit = str(tmp_path / "explicit-rotations.log")
+    for extra in ((), ("--yes",), ("--yes", "--resume", str(tmp_path / "tx")), ("--yes", "--rotation-log", explicit)):
+        argv = _argv(tmp_path / "bundle.json", tmp_path / "src_root", allowlist_dir, extra=extra)
+        assert argv.count("--rotation-log") == 1, f"{extra!r} produced a duplicate/missing --rotation-log: {argv!r}"
+        selected = _build_parser().parse_args(argv).rotation_log.resolve()
+        assert selected != repo_manifest, f"{extra!r} selected the repository rotation manifest"
+        assert tmp_path.resolve() in selected.parents, f"{extra!r} selected {selected} outside tmp_path"
 
 
 def test_sign_bundle_fails_closed_without_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
