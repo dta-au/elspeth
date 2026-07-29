@@ -675,25 +675,30 @@ class TestPromptShieldRules:
     imported constants, so the aids can never drift from the contract.
     """
 
-    def test_trained_view_quotes_term_and_available_draft_verbatim(self) -> None:
-        from elspeth.web.interpretation_state import (
-            PROMPT_SHIELD_AVAILABLE_DRAFT,
-            PROMPT_SHIELD_USER_TERM,
-            PROMPT_SHIELD_WARNING_DRAFT,
-        )
+    def test_available_shield_is_wired_not_merely_recommended(self) -> None:
+        """A deployment that ships a shield gets the shield wired in.
+
+        The aids used to teach the advisory card in BOTH regimes and named
+        wiring only as a reason to SKIP the card, so no planner ever wired an
+        available shield (run 06c9ec49, 2026-07-29) — and where a deployment
+        marks the capability ``required``, coverage could never be met. With a
+        shield selected the rules now mandate wiring it BY ITS DEPLOYMENT NAME
+        (aws_bedrock_prompt_shield, azure_prompt_shield, …) and suppress the
+        card, whose exposure no longer exists.
+        """
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_WARNING_DRAFT
 
         view, snapshot = _trained_view()
-        # The trained snapshot SELECTS a prompt shield — the honest draft is
-        # the shield-available wording (mirrors the warning→available upgrade
-        # the server itself applies when the shield is selected).
-        from elspeth.contracts.plugin_capabilities import PluginCapability
+        selected = dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD)
+        assert selected is not None
 
-        assert dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD) is not None
-
-        aids = build_planner_authoring_aids(view)
-        rendered = "\n".join(aids["prompt_shield"]["rules"])
-        assert PROMPT_SHIELD_USER_TERM in rendered
-        assert PROMPT_SHIELD_AVAILABLE_DRAFT in rendered
+        rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
+        # The live selection names itself — never a hardcoded vendor.
+        assert selected.name in rendered
+        assert "WIRE" in rendered
+        assert "required, not advisory" in rendered
+        # The advisory regime's draft must not ride along and re-teach the card.
         assert PROMPT_SHIELD_WARNING_DRAFT not in rendered
 
     def test_shieldless_view_quotes_the_warning_draft_verbatim(self) -> None:
@@ -733,12 +738,26 @@ class TestPromptShieldRules:
         assert PROMPT_SHIELD_AVAILABLE_DRAFT not in rendered
 
     def test_rules_name_the_untrusted_producer_and_the_llm_attachment_point(self) -> None:
+        """Both regimes name the untrusted producer and the llm attachment point.
+
+        The shielded regime attaches a wired transform between them; the
+        shieldless regime attaches the review row to the llm node's
+        ``interpretation_requirements``.
+        """
         view, _snapshot = _trained_view()
 
         rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
         assert "web_scrape" in rendered
-        assert "interpretation_requirements" in rendered
         assert "llm" in rendered
+        # Shielded deployment: the attachment point is the wiring, not a card.
+        assert "between the fetch step and" in rendered
+
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        shieldless = "\n".join(_prompt_shield_rules(shield_plugin=None, untrusted_producers=("web_scrape",)))
+        assert "web_scrape" in shieldless
+        assert "llm" in shieldless
+        assert "interpretation_requirements" in shieldless
 
     def test_section_renders_under_the_live_profile_posture(self, tmp_path: Path) -> None:
         # The failing surface is the tutorial/guided walk under the operator-

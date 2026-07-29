@@ -39,7 +39,6 @@ from elspeth.web.catalog.schemas import PluginSummary
 # private set included — is deliberate, so the taught row can never drift.
 from elspeth.web.interpretation_state import (
     _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS,
-    PROMPT_SHIELD_AVAILABLE_DRAFT,
     PROMPT_SHIELD_USER_TERM,
     PROMPT_SHIELD_WARNING_DRAFT,
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
@@ -247,12 +246,16 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
 _FORK_EXEMPLAR_CONTENT: Final[str] = "ticket_id,body\nT-1001,Cannot log in since the update\nT-1002,Invoice totals look wrong\n"
 
 
-def _prompt_shield_rules(*, shield_available: bool, untrusted_producers: tuple[str, ...]) -> list[str]:
+def _prompt_shield_rules(*, shield_plugin: str | None, untrusted_producers: tuple[str, ...]) -> list[str]:
     """Shield-staging rules quoting the registered review constants verbatim.
 
-    The prompt-injection shield review is ADVISORY end-to-end (warnings only,
-    excluded from the blocking contract), so no rejection code ever teaches it
-    on a repair turn — these aids are the only lever. Tutorial finalizer
+    Two regimes, chosen by whether THIS deployment selected a shield plugin
+    (aws_bedrock_prompt_shield, azure_prompt_shield, …): where one exists it
+    is WIRED — mandatory, no card; where none exists the advisory review row
+    is staged so the operator must acknowledge the exposure. The review is
+    ADVISORY end-to-end (warnings only, excluded from the blocking contract),
+    so no rejection code ever teaches it on a repair turn — these aids are
+    the only lever. Tutorial finalizer
     battery (dim_c under-flag): the replan planner non-deterministically
     omitted the row on the scrape→summarize llm node. Constants are imported
     from ``interpretation_state`` so the taught row can never drift from the
@@ -261,8 +264,26 @@ def _prompt_shield_rules(*, shield_available: bool, untrusted_producers: tuple[s
     server itself applies, and memoizes correctly because the aids cache is
     keyed by snapshot hash.
     """
-    draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available else PROMPT_SHIELD_WARNING_DRAFT
     producers = " or ".join(sorted(untrusted_producers))
+    if shield_plugin is not None:
+        # A deployment that ships a shield gets the shield, not a leaflet about
+        # one. These aids previously taught the advisory card in BOTH cases and
+        # named wiring only as a reason to SKIP the card, so no planner ever
+        # wired an available shield (run 06c9ec49, 2026-07-29) — and on a
+        # control-required deployment that left coverage permanently unmet.
+        return [
+            f"An authorized prompt-injection shield is available in this deployment: {shield_plugin}. "
+            f"When an llm transform consumes externally-fetched content (any path from a {producers} "
+            f"output reaches its input), WIRE a {shield_plugin} transform between the fetch step and "
+            "that llm node — its input is the fetch step's on_success connection, and its on_success "
+            "is the llm node's input. This is required, not advisory: untrusted remote text must not "
+            "reach the model unshielded.",
+            "Load the shield's schema and assistance through the capability catalog before authoring "
+            "it, and configure it from that schema alone.",
+            f"With the shield wired, do NOT also stage the {PROMPT_SHIELD_USER_TERM} review row — the "
+            "exposure it warns about no longer exists.",
+        ]
+    draft = PROMPT_SHIELD_WARNING_DRAFT
     return [
         f"When an llm transform consumes externally-fetched content (any path from a {producers} "
         "output reaches its input), stage the prompt-injection shield review ON THAT LLM NODE: "
@@ -945,7 +966,13 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
     if visible_untrusted_producers and "llm" in visible["transform"]:
         aids["prompt_shield"] = {
             "rules": _prompt_shield_rules(
-                shield_available=dict(catalog.snapshot.selected).get(PluginCapability.PROMPT_SHIELD) is not None,
+                # Whichever shield THIS deployment selected (aws_bedrock_prompt_shield,
+                # azure_prompt_shield, …) — never a hardcoded vendor.
+                shield_plugin=(
+                    selected_shield.name
+                    if (selected_shield := dict(catalog.snapshot.selected).get(PluginCapability.PROMPT_SHIELD))
+                    else None
+                ),
                 untrusted_producers=visible_untrusted_producers,
             ),
         }
