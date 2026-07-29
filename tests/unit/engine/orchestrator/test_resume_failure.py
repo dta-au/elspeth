@@ -48,6 +48,7 @@ from elspeth.engine.orchestrator.resume import run_resume_processing_loop, setup
 from elspeth.engine.orchestrator.run_state import LoopContext, LoopResult, ResumeState, _RunFailedWithPartialResultError
 from elspeth.engine.orchestrator.types import ExecutionCounters
 from elspeth.engine.processor import RowProcessor
+from elspeth.engine.row_union_executor import RowUnionExecutor
 from elspeth.testing import make_row_result, make_source_row
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
@@ -887,7 +888,7 @@ class TestResumeFinalizesAsFailed:
         factory = MagicMock(spec=RecorderFactory)
         shutdown = threading.Event()
         processor = _mock_processor()
-        row_union_executor = MagicMock()
+        row_union_executor = MagicMock(spec=RowUnionExecutor)
         row_union_executor.has_timeout_configured.return_value = False
         row_union_executor.get_registered_names.return_value = ["variant_union"]
         row_union_executor.check_timeouts.return_value = []
@@ -953,7 +954,7 @@ class TestResumeFinalizesAsFailed:
         shutdown = threading.Event()
         idle_sweep_seen = threading.Event()
         processor = _mock_processor()
-        row_union_executor = MagicMock()
+        row_union_executor = MagicMock(spec=RowUnionExecutor)
         row_union_executor.has_timeout_configured.return_value = True
         row_union_executor.get_registered_names.return_value = ["variant_union"]
 
@@ -1009,7 +1010,7 @@ class TestResumeFinalizesAsFailed:
         processor = _mock_processor()
         processor.has_scheduled_work.return_value = False
         processor.process_existing_row.side_effect = lambda **kwargs: shutdown.set() or []
-        row_union_executor = MagicMock()
+        row_union_executor = MagicMock(spec=RowUnionExecutor)
         row_union_executor.get_registered_names.return_value = ["variant_union"]
         row_union_executor.check_timeouts.return_value = []
         processor.row_union_executor = row_union_executor

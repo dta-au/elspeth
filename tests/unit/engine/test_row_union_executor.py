@@ -176,9 +176,10 @@ class TestLateArrival:
 
 class TestTimeouts:
     def test_reports_whether_any_registered_barrier_has_a_timeout(self) -> None:
+        # Source idle polling reads this to decide whether the run needs a
+        # wall-clock sweep at all; calling it IS the surface assertion.
         without_timeout, _execution, _data_flow, _clock = _make_executor()
         _register(without_timeout)
-        assert hasattr(without_timeout, "has_timeout_configured"), "RowUnionExecutor must expose timeout presence to source idle polling"
         assert without_timeout.has_timeout_configured() is False
 
         with_timeout, _execution, _data_flow, _clock = _make_executor()
