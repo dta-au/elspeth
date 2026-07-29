@@ -11,9 +11,12 @@ ELSPETH_BIN="${ELSPETH_BLOB_TRANSFORMS_CLI_BIN:-$PROJECT_ROOT/.venv/bin/elspeth}
 cd "$PROJECT_ROOT"
 
 mkdir -p "$EXAMPLE_DIR/input" "$EXAMPLE_DIR/output" "$EXAMPLE_DIR/payloads/offline" "$EXAMPLE_DIR/runs"
-# The payload store refuses group/world-writable directories and only repairs
-# the mode on directories it creates itself; mkdir honours umask, so force a
-# private mode on the pre-created store directory.
+# FilesystemPayloadStore rejects group/world-writable roots (see
+# elspeth.core.payload_store._validate_store_directory). `mkdir -p` applies
+# the umask, which on hosts with a permissive umask (e.g. 0002) leaves this
+# directory group-writable and self-healing only fires when the store
+# creates the directory itself, not when it already exists. Pin the mode
+# explicitly so the launcher works regardless of the operator's umask.
 chmod 700 "$EXAMPLE_DIR/payloads/offline"
 rm -f \
   "$EXAMPLE_DIR/input/csv_blob_manifest.csv" \

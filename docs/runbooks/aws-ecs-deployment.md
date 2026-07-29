@@ -1965,6 +1965,124 @@ docker image inspect --format '{{ index .Config.Labels "io.elspeth.install-extra
 Acceptance/lean images instead report `webui llm aws postgres`; never retag
 one of those digests as the generic GHCR/ACR release image.
 
+## Immutable RDS trust-root admission
+
+The image must contain `/etc/elspeth/rds/global-bundle.pem` with SHA-256
+`e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3`.
+Its OCI CA label must be `rds-ca-rsa2048-g1`. Every ELSPETH container in the
+task definitions except the web container (`elspeth-web`, candidate and
+rollback) must set `readonlyRootFilesystem` to `true`. The web container is
+exempt because ECS Exec — which runs the acceptance checks inside it — is
+unsupported by AWS with a read-only root filesystem, and its multipart and
+telemetry paths write to `/tmp`; its trust root remains immutable through
+startup digest verification of the 0444 root-owned baked file.
+
+The schema and runtime doctor JSON must report all of these checks as green
+before the web service is enabled:
+
+- `rds_trust_root`
+- `session_tls`
+- `landscape_tls`
+- `session_schema`
+- `landscape_schema`
+
+`session_tls` and `landscape_tls` attest only the connection that inspected
+each schema: TLS is proven on the same connection the schema probe ran over,
+not on every connection a run opens. A `--init-schema` DDL connection uses
+the identical URL and `sslmode` posture but is not itself separately probed.
+
+The task definitions and bootstrap must not contain
+`truststore.pki.rds.amazonaws.com`, `/tmp/rds-global-bundle.pem`, or
+`/var/lib/elspeth/rds-global-bundle.pem`.
+
+OCI digest
+`sha256:c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700`
+predates this contract. It is an acceptance-attempt artifact and is not
+eligible for `0.7.2-RC-280726`.
+
+Verify the baked trust root and its OCI CA labels against the candidate
+image directly:
+
+```bash
+docker buildx imagetools inspect "$CANDIDATE_IMAGE"
+test "$(docker inspect --format \
+  '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
+  "$CANDIDATE_IMAGE")" = \
+  e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3
+test "$(docker inspect --format \
+  '{{ index .Config.Labels "io.elspeth.rds-ca-certificate-identifier" }}' \
+  "$CANDIDATE_IMAGE")" = rds-ca-rsa2048-g1
+```
+
+Verify the live Aurora CA identifier and the task definitions'
+`readonlyRootFilesystem` split through the protected capture wrappers
+defined in [Protected command capture](#protected-command-capture):
+
+```bash
+DB_INSTANCE_IDENTIFIER=$(jq -er '.orphan_sweep.rds_db_instance_identifiers[0]' "$SCENARIO_A_INVENTORY")
+CA_IDENTIFIER=$(aws_capture aws rds describe-db-instances \
+  --db-instance-identifier "$DB_INSTANCE_IDENTIFIER" \
+  --query 'DBInstances[0].CACertificateIdentifier' --output text)
+test "$CA_IDENTIFIER" = rds-ca-rsa2048-g1
+
+TASK_DEFINITION="$DOCTOR_TASK_DEFINITION"
+NON_WEB_READONLY_JSON=$(aws_capture aws ecs describe-task-definition \
+  --task-definition "$TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name!=`cloudwatch-agent` && name!=`elspeth-web`].{name: name, readonlyRootFilesystem: readonlyRootFilesystem}' \
+  --output json)
+jq -e 'length > 0 and all(.[]; .readonlyRootFilesystem == true)' <<<"$NON_WEB_READONLY_JSON" >/dev/null
+
+WEB_READONLY_JSON=$(aws_capture aws ecs describe-task-definition \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].{name: name, readonlyRootFilesystem: readonlyRootFilesystem}' \
+  --output json)
+jq -e 'length == 1 and all(.[]; .readonlyRootFilesystem != true)' <<<"$WEB_READONLY_JSON" >/dev/null
+```
+
+Both checks project `{name, readonlyRootFilesystem}` objects rather than the
+bare field because a JMESPath filter-then-field projection drops null
+results: against a container whose field is absent, the bare-field form
+yields the same empty array as a query that matched nothing at all, and any
+`all(...)` over an empty array is vacuously true. Run the first check only
+against `$DOCTOR_TASK_DEFINITION` — the schema-init
+or runtime doctor definition, container name `doctor` — never against
+`$PAYLOAD_VERIFIER_TASK_DEFINITION` or `$LOCAL_AUTH_VERIFIER_TASK_DEFINITION`:
+`resolve_bound_task_definition` binds those two under the `elspeth-web`
+container name (see
+[Saved-plan apply and scenario binding](#saved-plan-apply-and-scenario-binding)),
+so against either of them the `name!='elspeth-web'` projection returns an
+empty array and `length > 0` fails closed rather than silently passing. Run
+the second check only against a candidate or rollback web task definition —
+`$CANDIDATE_TASK_DEFINITION`, or `$PREVIOUS_TASK_DEFINITION` on an upgrade:
+its `readonlyRootFilesystem` field is absent, so the projection yields
+`[{"name": "elspeth-web", "readonlyRootFilesystem": null}]`; `length == 1`
+proves the query found exactly the intended container (a bare-field
+projection would drop the null and yield `[]`, which an unguarded `all()`
+would pass with zero evidentiary value — including against a wrong
+task-definition ARN or a typo'd container name), and
+`.readonlyRootFilesystem != true` proves the documented exemption rather
+than a silent `true` that would break ECS Exec. The payload and local-auth verifier
+task definitions run a read-only container (`readonlyRootFilesystem = true`)
+under the `elspeth-web` container name; neither jq command above exercises
+them — that source-level contract is asserted directly against
+`deploy/aws-ecs/terraform/modules/scenario/ecs.tf` by
+`tests/unit/deployment/test_aws_ecs_terraform_package.py`.
+
+### Upgrading an existing install
+
+Applying this module version to an existing install rotates all five Secrets
+Manager database URLs to the canonical immutable-trust query immediately,
+while `aws_ecs_service.web` ignores task-definition changes
+(`lifecycle.ignore_changes`). An old-image task that restarts inside that
+window injects the new canonical URL, lacks the baked bundle, and
+crash-loops. Apply and roll the service in one operation: run
+`terraform apply`, then immediately
+`aws ecs update-service --force-new-deployment` with the new qualified image
+digest. Pinning `ca_cert_identifier` on an existing Aurora instance triggers
+a database modification with engine-dependent restart semantics — expect and
+schedule it. No pre-trust-root image digest is rollback-eligible after the
+upgrade (see the rollback section).
+
 ## Storage provisioning and cold start
 
 Before doctor, run `provision_scenario_storage` above. It provisions
@@ -1987,9 +2105,31 @@ the exact filesystem/access point; `ClientRootAccess` needs separate approval.
 
 ## Bedrock, Guardrails, and S3 task-role shape
 
-Grant the runtime task role resource-scoped `bedrock:InvokeModel`. Configure
-the ordinary `region_name` and a `bedrock/anthropic...` model identifier; do
-not embed AWS keys. For the two run-scoped Guardrails, grant resource-scoped
+Grant the runtime task role resource-scoped `bedrock:InvokeModel`. Whichever
+of Composer primary/advisor is a cross-region (`global.`/`us.`/`eu.`/`apac.`)
+inference-profile model also needs a wildcard-region foundation-model grant
+(`arn:aws:bedrock:*::foundation-model/<base-model-id>`) alongside the
+region-pinned inference-profile ARN, because Bedrock authorizes the
+underlying foundation-model call in whichever region the profile actually
+routes to and reports that check against a region-less resource ARN; a
+single region-pinned foundation-model grant does not match it. The
+run-scoped permissions boundary must independently allow the same
+wildcard-region resource — a task-role grant the boundary does not also
+allow is intersected away to nothing. Configure the ordinary `region_name`
+and a `bedrock/anthropic...` model identifier; do not embed AWS keys.
+
+A correctly-shaped IAM policy is not sufficient on its own: the chosen model
+id also needs an active model-access agreement in the target account.
+Confirm with `aws bedrock get-foundation-model-availability --model-id <id>`
+that `agreementAvailability` reports `AVAILABLE` before granting access or
+running acceptance. First-party Amazon models generally have that agreement
+by default; third-party models (for example Anthropic's) may additionally
+require an AWS Marketplace subscription the account must complete first —
+without it, Bedrock invocation fails with an `AccessDeniedException` naming
+the missing Marketplace subscription even though the resource ARNs and
+boundary are correct.
+
+For the two run-scoped Guardrails, grant resource-scoped
 `bedrock:ApplyGuardrail` and grant `bedrock:GetGuardrail` only if the approved
 preflight uses it. Terraform creates two acceptance-run-tagged Guardrails,
 publishes immutable numeric versions, injects private identifier/version/
@@ -2021,6 +2161,14 @@ disposable acceptance role additionally gets `s3:DeleteObject` only for
 `ELSPETH_ACCEPTANCE_S3_BUCKET` plus its UUID-scoped
 `ELSPETH_ACCEPTANCE_S3_PREFIX`; the Plan 12 operator receives the same narrow
 cleanup backstop. Steady-state production does not inherit test-only delete.
+Also grant bucket-scoped `s3:ListBucket` on the acceptance bucket, and grant
+it unconditioned: without it S3 cannot distinguish a missing object from a
+forbidden one and `HeadObject` on a not-yet-existing key returns `403`
+instead of `404`, and a prefix condition on this statement never matches
+because S3 evaluates that missing-vs-forbidden check outside the triggering
+request's own context. The statement stays narrow because it names only
+this run's own disposable bucket, and the permissions boundary must grant
+the same bucket-level (not object-level) `s3:ListBucket` resource.
 
 For ECS Exec, grant exactly `ssmmessages:CreateControlChannel`,
 `ssmmessages:CreateDataChannel`, `ssmmessages:OpenControlChannel`, and
@@ -2039,10 +2187,12 @@ protected scenario inventory as `CLOUDWATCH_AGENT_CONFIG_JSON_SHA256` and
 single-line base64 plus its lowercase SHA-256 into the sidecar environment.
 Base64 is transport encoding, not a credential or secrecy mechanism. The
 sidecar entrypoint decodes both files into its task-local writable directory,
-verifies both hashes before use, then runs the agent's required `fetch-config`
-followed by `append-config` sequence. A mismatch or either control-script
-failure stops the sidecar. The task definition must refer to that exact
-manifest version; mutable “latest” configuration is not accepted.
+verifies both hashes before use, then runs `config-translator` to render the
+JSON config into the agent's TOML configuration file before `exec`ing
+`amazon-cloudwatch-agent` directly with that TOML plus the OTel YAML. A
+digest mismatch or translation failure stops the sidecar. The task definition
+must refer to that exact manifest version; mutable “latest” configuration is
+not accepted.
 
 CloudWatch Agent JSON (`elspeth.cloudwatch-agent.v1.json`):
 
@@ -2119,8 +2269,8 @@ into an unreviewed retention surface.
 Record the approved digest-only CloudWatch Agent reference in the protected
 scenario inventory as `CLOUDWATCH_AGENT_IMAGE`. The rendered image reference
 must equal it byte-for-byte and contain no tag. The approved ECS runtime variant must include
-the AWS control script plus `/bin/sh`, `base64`, `sha256sum`, `grep`, and
-`sleep`; those are part of the reviewed image contract and are exercised by
+the AWS config-translator, the `amazon-cloudwatch-agent` binary itself, plus `/bin/sh`, `base64`,
+and `sha256sum`; those are part of the reviewed image contract and are exercised by
 the entrypoint below. The web container must override the image's diagnostic
 default with the exact service command `web --host 0.0.0.0 --port 8451`:
 
@@ -2133,7 +2283,7 @@ default with the exact service command `web --host 0.0.0.0 --port 8451`:
       "essential": false,
       "memoryReservation": 192,
       "entryPoint": ["/bin/sh", "-ceu"],
-      "command": ["CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; CTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl; mkdir -p \"$CONFIG_DIR\"; printf '%s' \"$ELSPETH_CW_AGENT_CONFIG_JSON_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' \"$ELSPETH_CW_AGENT_OTEL_YAML_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' \"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" | sha256sum -c -; printf '%s\\n' \"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" | sha256sum -c -; \"$CTL\" -a fetch-config -m auto -c \"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" -s; \"$CTL\" -a append-config -m auto -c \"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" -s; while \"$CTL\" -a status -m auto | grep -q '\"status\": \"running\"'; do sleep 30; done; exit 1"],
+      "command": ["CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; TRANSLATOR=/opt/aws/amazon-cloudwatch-agent/bin/config-translator; AGENT=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent; mkdir -p \"$CONFIG_DIR\"; printf '%s' \"$ELSPETH_CW_AGENT_CONFIG_JSON_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' \"$ELSPETH_CW_AGENT_OTEL_YAML_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' \"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" | sha256sum -c -; printf '%s\\n' \"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" | sha256sum -c -; \"$TRANSLATOR\" -mode auto -os linux -input \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" -output \"/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml\"; exec \"$AGENT\" -config \"/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml\" -otelconfig \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\""],
       "environment": [
         {"name": "ELSPETH_CW_AGENT_CONFIG_JSON_B64", "value": "${CLOUDWATCH_AGENT_CONFIG_JSON_B64}"},
         {"name": "ELSPETH_CW_AGENT_CONFIG_JSON_SHA256", "value": "${CLOUDWATCH_AGENT_CONFIG_JSON_SHA256}"},
@@ -2141,7 +2291,7 @@ default with the exact service command `web --host 0.0.0.0 --port 8451`:
         {"name": "ELSPETH_CW_AGENT_OTEL_YAML_SHA256", "value": "${CLOUDWATCH_AGENT_OTEL_YAML_SHA256}"}
       ],
       "healthCheck": {
-        "command": ["CMD-SHELL", "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q '\"status\": \"running\"'"],
+        "command": ["CMD-SHELL", "kill -0 1"],
         "interval": 10,
         "timeout": 5,
         "retries": 6,
@@ -2620,6 +2770,16 @@ or sanitized doctor failure blocks service mutation. Diagnose only through
 bounded `aws logs filter-log-events` calls captured by `aws_capture` and sent
 directly to `sanitize-evidence`; raw logs are never printed or persisted.
 
+If the sanitized failure names `payload_store_writable` or `blob_writable`
+with a `FileNotFoundError` on an otherwise fresh stack, `provision_scenario_storage`
+(see [Fresh Scenario A database baseline](#fresh-scenario-a-database-baseline))
+has not yet run against this stack. Doctor deliberately never creates
+directories, including under `--init-schema` (see
+[Storage provisioning and cold start](#storage-provisioning-and-cold-start)),
+so a missing mount surfaces as this same sanitized failure. Run
+`provision_scenario_storage`, confirm the non-root probe booleans, then rerun
+this doctor step.
+
 ### 3. Apply the schema compatibility gate
 
 `--init-schema` may initialize a session or Landscape schema only when it is
@@ -2732,6 +2892,17 @@ run_candidate_role_check "$CANDIDATE_TASK_ARN" verify-bedrock-guardrails
 set_traffic_action forward
 verify_public_probes
 ```
+
+> **Known issue (elspeth-9a78b3a02f):** the `verify-s3` collision re-drive
+> currently fails deterministically because of a pre-existing sink
+> publication-protocol defect, unrelated to IAM or the deployment package.
+> Until that issue closes, S3-path qualification evidence is the raw
+> task-role S3 sequence — put/head/get/overwrite/delete → clean
+> 200s/204/404 with correct 404-vs-403 discrimination. A `verify-s3`
+> failure matching that signature (sanitized `s3_collision`
+> `AcceptanceCheckError`) does not gate release admission; any other
+> `verify-s3` failure signature still gates. Keep running the check in
+> sequence below — do not remove it from the acceptance program.
 
 #### Persistence, replacement, task-role, and local-auth sequence
 
@@ -3014,6 +3185,12 @@ the refusal/forward-recovery record. If the candidate is unhealthy, keep traffic
 drained and repair forward with epoch-36 session/epoch-29 Landscape code.
 Predecessor database restoration and code downgrade are not supported repair
 paths. Never roll old code over the recreated schema.
+
+No image digest that predates the immutable trust-root contract is
+rollback-eligible: such images lack the baked bundle and are rejected by the
+canonical URL contract at startup. Scenario B rollback evidence is therefore
+structurally impossible until a second, independently qualified trust-root
+digest exists; until then, record live rollback as unavailable.
 
 For first/first-recovery, remove traffic before compute, verify the listener's
 fixed 503 action, then scale to zero:

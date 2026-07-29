@@ -9,11 +9,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, create_autospec
+from unittest.mock import MagicMock, Mock, create_autospec
 
 import pytest
 from sqlalchemy import Connection, Engine, create_engine
 
+import elspeth.web.doctor as doctor
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
     ControlRole,
@@ -21,6 +22,7 @@ from elspeth.contracts.plugin_capabilities import (
 )
 from elspeth.core.config import TelemetrySettings
 from elspeth.core.landscape.database import SchemaCompatibilityError
+from elspeth.web.aws_rds_trust import AWS_RDS_GLOBAL_BUNDLE_PATH
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ContractCheck
 from elspeth.web.doctor import (
@@ -32,6 +34,7 @@ from elspeth.web.doctor import (
     collect_deployment_checks,
     database_target_check,
     plugin_and_dependency_checks,
+    postgres_tls_check,
     probe_directory_writable,
     sanitize_error,
     schema_check,
@@ -63,8 +66,8 @@ def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
         "operator_telemetry_task_definition_family": "elspeth-web-task",
         "operator_telemetry_task_definition_revision": "1",
         "host": "0.0.0.0",
-        "session_db_url": ("postgresql+psycopg://doctor:secret@db/session?sslmode=verify-full&sslrootcert=system"),
-        "landscape_url": ("postgresql+psycopg://doctor:secret@db/landscape?sslmode=verify-full&sslrootcert=system"),
+        "session_db_url": (f"postgresql+psycopg://doctor:secret@db/session?sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"),
+        "landscape_url": (f"postgresql+psycopg://doctor:secret@db/landscape?sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"),
         "data_dir": data_dir,
         "payload_store_path": payload_dir,
         "secret_key": "this-doctor-secret-is-long-enough",
@@ -80,6 +83,18 @@ def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
 
 def _by_name(checks: list[ContractCheck]) -> dict[str, ContractCheck]:
     return {check.name: check for check in checks}
+
+
+@pytest.fixture(autouse=True)
+def _verified_rds_trust_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "_aws_rds_trust_root_check",
+        lambda: ContractCheck("rds_trust_root", True, "immutable RDS trust root verified"),
+    )
+
+
+_REAL_TRUST_ROOT_CHECK = doctor._aws_rds_trust_root_check
 
 
 def test_sanitize_error_exposes_only_context_and_exception_class() -> None:
@@ -568,6 +583,70 @@ def test_collection_blocks_postgresql_tls_downgrade_before_database_probe(
     assert "/private/ca.pem" not in repr(checks)
 
 
+def test_failed_trust_root_blocks_every_database_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.doctor as doctor
+
+    events: list[str] = []
+    _patch_database_states(
+        monkeypatch,
+        SchemaState.CURRENT,
+        SchemaState.CURRENT,
+        events,
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_aws_rds_trust_root_check",
+        lambda: ContractCheck(
+            "rds_trust_root",
+            False,
+            "immutable RDS trust root verification failed (digest_mismatch)",
+        ),
+    )
+
+    all_checks = collect_checks(_settings(tmp_path))
+    checks = _by_name(all_checks)
+
+    assert checks["rds_trust_root"].ok is False
+    assert [check.name for check in all_checks][-4:] == [
+        "session_tls",
+        "landscape_tls",
+        "session_schema",
+        "landscape_schema",
+    ]
+    assert checks["session_tls"].ok is False
+    assert checks["landscape_tls"].ok is False
+    assert checks["session_schema"].ok is False
+    assert checks["landscape_schema"].ok is False
+    assert events == []
+
+
+def test_trust_root_check_formats_real_digest_mismatch_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        doctor.aws_rds_trust,
+        "verify_aws_rds_trust_bundle",
+        lambda: (_ for _ in ()).throw(
+            doctor.aws_rds_trust.AwsRdsTrustBundleError(
+                "digest_mismatch",
+                actual_sha256="f" * 64,
+            )
+        ),
+    )
+
+    check = _REAL_TRUST_ROOT_CHECK()
+
+    assert check.name == "rds_trust_root"
+    assert check.ok is False
+    assert "digest_mismatch" in check.detail
+    assert str(doctor.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH) in check.detail
+    assert doctor.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256 in check.detail
+    assert "f" * 64 in check.detail
+
+
 @pytest.mark.parametrize(
     "target",
     ["docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
@@ -715,6 +794,9 @@ def test_task1_check_names_are_exact_ordered_and_unique(tmp_path: Path) -> None:
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",
+        "rds_trust_root",
+        "session_tls",
+        "landscape_tls",
         "session_schema",
         "landscape_schema",
     ]
@@ -866,6 +948,36 @@ def test_schema_state_details_are_static(label: str, state: SchemaState, ok: boo
     assert schema_check(label, state) == ContractCheck(label, ok, detail)
 
 
+@pytest.mark.parametrize(
+    ("label", "row", "ok"),
+    [
+        ("session_schema", (True, "TLSv1.3", 256), True),
+        ("landscape_schema", (True, "TLSv1.2", 256), True),
+        ("session_schema", (False, None, None), False),
+        ("landscape_schema", None, False),
+        ("session_schema", (True, "TLSv1.3", 64), False),
+        ("landscape_schema", (True, "SSLv3", 256), False),
+    ],
+)
+def test_postgres_tls_check_is_named_redacted_and_fail_closed(
+    label: str,
+    row: tuple[object, ...] | None,
+    ok: bool,
+) -> None:
+    connection = MagicMock(spec_set=Connection)
+    connection.execute.return_value.one_or_none.return_value = row
+
+    check = postgres_tls_check(label, connection)
+
+    expected_name = "session_tls" if label == "session_schema" else "landscape_tls"
+    assert check.name == expected_name
+    assert check.ok is ok
+    assert "pg_stat_ssl" not in check.detail
+    assert str(connection.execute.call_args.args[0]) == (
+        "SELECT ssl, version, bits FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()"
+    )
+
+
 def _engine_with_connection() -> tuple[MagicMock, MagicMock]:
     engine = MagicMock(spec_set=Engine)
     connection = MagicMock(spec_set=Connection)
@@ -876,8 +988,10 @@ def _engine_with_connection() -> tuple[MagicMock, MagicMock]:
 
 
 @pytest.mark.parametrize("label", ["session_schema", "landscape_schema"])
+@pytest.mark.parametrize("require_authenticated_tls", [False, True])
 def test_inspect_database_forwards_pool_and_timeout_and_uses_one_connection(
     label: str,
+    require_authenticated_tls: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import elspeth.web.doctor as doctor
@@ -887,10 +1001,15 @@ def test_inspect_database_forwards_pool_and_timeout_and_uses_one_connection(
     landscape_factory = create_autospec(create_engine, return_value=engine)
     monkeypatch.setattr(doctor, "create_session_engine", session_factory)
     monkeypatch.setattr(doctor, "create_engine", landscape_factory)
+    if require_authenticated_tls:
+        connection.execute.return_value.one_or_none.return_value = (True, "TLSv1.3", 256)
     probe = create_autospec(probe_session_schema, return_value=SchemaState.CURRENT)
+    manager = Mock(spec_set=["execute", "probe"])
+    manager.attach_mock(connection.execute, "execute")
+    manager.attach_mock(probe, "probe")
     raw_url = "postgresql+psycopg://user:password@host/database"
 
-    state, check = _inspect_database(label, raw_url, probe)
+    state, check, tls_check = _inspect_database(label, raw_url, probe, require_authenticated_tls=require_authenticated_tls)
 
     assert state is SchemaState.CURRENT
     assert check == ContractCheck(label, True, "current")
@@ -904,18 +1023,38 @@ def test_inspect_database_forwards_pool_and_timeout_and_uses_one_connection(
     expected_factory.assert_called_once_with(raw_url, **expected_kwargs)
     (landscape_factory if label == "session_schema" else session_factory).assert_not_called()
     probe.assert_called_once_with(connection)
-    assert str(connection.execute.call_args.args[0]) == "SELECT 1"
     engine.dispose.assert_called_once_with()
+    expected_tls_name = "session_tls" if label == "session_schema" else "landscape_tls"
+    if require_authenticated_tls:
+        assert tls_check == ContractCheck(
+            expected_tls_name,
+            True,
+            "authenticated PostgreSQL TLS is active (TLSv1.3, 256 bits)",
+        )
+        assert str(connection.execute.call_args.args[0]) == (
+            "SELECT ssl, version, bits FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()"
+        )
+        # TLS is queried on the same connection, before the schema probe.
+        assert [entry[0] for entry in manager.mock_calls if entry[0] in ("execute", "probe")] == [
+            "execute",
+            "probe",
+        ]
+    else:
+        assert tls_check is None
+        assert str(connection.execute.call_args.args[0]) == "SELECT 1"
 
 
 @pytest.mark.parametrize("failure_site", ["connect", "probe"])
+@pytest.mark.parametrize("require_authenticated_tls", [False, True])
 def test_inspect_database_disposes_after_connection_and_probe_failures(
     failure_site: str,
+    require_authenticated_tls: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import elspeth.web.doctor as doctor
 
-    engine, _connection = _engine_with_connection()
+    engine, connection = _engine_with_connection()
+    connection.execute.return_value.one_or_none.return_value = (True, "TLSv1.3", 256)
     if failure_site == "connect":
         engine.connect.return_value.__enter__.side_effect = RuntimeError(
             "postgresql://user:secret@private/db"  # secret-scan: allow-this-line
@@ -932,16 +1071,83 @@ def test_inspect_database_disposes_after_connection_and_probe_failures(
     session_factory = create_autospec(create_session_engine, return_value=engine)
     monkeypatch.setattr(doctor, "create_session_engine", session_factory)
 
-    state, check = _inspect_database(
+    state, check, tls_check = _inspect_database(
         "session_schema",
         "postgresql+psycopg://user:password@host/database",
         probe,
+        require_authenticated_tls=require_authenticated_tls,
     )
 
     assert state is None
     assert check.ok is False
     assert "secret" not in check.detail
     assert "private" not in check.detail
+    engine.dispose.assert_called_once_with()
+
+    if not require_authenticated_tls:
+        assert tls_check is None
+        if failure_site == "probe":
+            assert str(connection.execute.call_args.args[0]) == "SELECT 1"
+    elif failure_site == "probe":
+        # The probe failed after TLS was already proven; that evidence is retained.
+        assert tls_check == ContractCheck(
+            "session_tls",
+            True,
+            "authenticated PostgreSQL TLS is active (TLSv1.3, 256 bits)",
+        )
+        assert str(connection.execute.call_args.args[0]) == (
+            "SELECT ssl, version, bits FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()"
+        )
+    else:
+        # The connection never opened, so no TLS evidence was ever collected.
+        assert tls_check == ContractCheck(
+            "session_tls",
+            False,
+            "authenticated PostgreSQL TLS is not active",
+        )
+        connection.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SessionSchemaError("secret compatibility cause"),
+        SchemaCompatibilityError("secret compatibility cause"),
+    ],
+)
+def test_inspect_database_stale_schema_after_proven_tls_does_not_read_as_transport_failure(
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale-schema failure discovered after TLS was proven must retain that
+    TLS evidence rather than read as a transport failure (doctor JSON is
+    release-admission evidence)."""
+    import elspeth.web.doctor as doctor
+
+    engine, connection = _engine_with_connection()
+    connection.execute.return_value.one_or_none.return_value = (True, "TLSv1.3", 256)
+    probe = create_autospec(probe_session_schema, side_effect=error)
+    session_factory = create_autospec(create_session_engine, return_value=engine)
+    monkeypatch.setattr(doctor, "create_session_engine", session_factory)
+
+    state, check, tls_check = _inspect_database(
+        "session_schema",
+        "postgresql+psycopg://user:password@host/database",
+        probe,
+        require_authenticated_tls=True,
+    )
+
+    assert state is SchemaState.STALE
+    assert check == ContractCheck(
+        "session_schema",
+        False,
+        "stale; drop and recreate the session database, then rerun doctor",
+    )
+    assert tls_check == ContractCheck(
+        "session_tls",
+        True,
+        "authenticated PostgreSQL TLS is active (TLSv1.3, 256 bits)",
+    )
     engine.dispose.assert_called_once_with()
 
 
@@ -1052,12 +1258,23 @@ def _patch_database_states(
 ) -> None:
     import elspeth.web.doctor as doctor
 
-    def inspect(label: str, _url: str, _probe: object) -> tuple[SchemaState | None, ContractCheck]:
+    def inspect(
+        label: str, _url: str, _probe: object, *, require_authenticated_tls: bool
+    ) -> tuple[SchemaState | None, ContractCheck, ContractCheck | None]:
         events.append(f"inspect:{label}")
         state = session if label == "session_schema" else landscape
+        tls_check = (
+            ContractCheck(
+                "session_tls" if label == "session_schema" else "landscape_tls",
+                True,
+                "authenticated PostgreSQL TLS is active (TLSv1.3, 256 bits)",
+            )
+            if require_authenticated_tls
+            else None
+        )
         if state is None:
-            return None, ContractCheck(label, False, f"{label} connection failed (RuntimeError)")
-        return state, schema_check(label, state)
+            return None, ContractCheck(label, False, f"{label} connection failed (RuntimeError)"), tls_check
+        return state, schema_check(label, state), tls_check
 
     monkeypatch.setattr(doctor, "_inspect_database", inspect)
 
@@ -1243,6 +1460,9 @@ def test_task2_order_remains_exact_and_unique_after_database_inspection(tmp_path
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",
+        "rds_trust_root",
+        "session_tls",
+        "landscape_tls",
         "session_schema",
         "landscape_schema",
     ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -30,6 +31,7 @@ from .contracts import (
     RUN_POLL_INTERVAL_SECONDS,
     AcceptanceCheckError,
     AcceptanceInputError,
+    _artifact_id_field,
     _canonical_uuid,
     _mapping,
     _sha256,
@@ -143,12 +145,35 @@ def _run_facts(payload: object, *, check: str) -> tuple[str, int, int]:
     return landscape_run_id, source_rows, failed_tokens
 
 
+# The outputs manifest (`RunOutputArtifact` / the `artifacts` table,
+# elspeth.core.landscape.schema) has no field carrying the sink's YAML key
+# directly -- only `sink_node_id`, the engine's *generated* node identity.
+# `node_id()` in `elspeth.core.dag.builder` assigns every sink node
+# `f"sink_{yaml_key}_{sha256(config).hexdigest()[:12]}"`, never the bare
+# YAML key. This fixed pipeline (`build_fixed_pipeline_yaml` above) hard-codes
+# exactly one sink under the YAML key "output", so its `sink_node_id` is
+# schema-guaranteed to be either the literal "output" (kept for forward/
+# backward compatibility with a manifest that ever reports the bare key) or
+# exactly `sink_output_<12 lowercase hex chars>`. The 12-hex-digit anchor is
+# required, not just a `startswith` prefix: a differently-named sink such as
+# "output_extra" would also generate an id starting "sink_output_" (e.g.
+# "sink_output_extra_<hash>") without matching this exact shape.
+_GENERATED_OUTPUT_SINK_NODE_ID = re.compile(r"^sink_output_[0-9a-f]{12}$")
+
+
+def _is_output_sink_artifact(artifact: Mapping[str, object]) -> bool:
+    sink_node_id = artifact.get("sink_node_id")
+    if sink_node_id == "output":
+        return True
+    return isinstance(sink_node_id, str) and _GENERATED_OUTPUT_SINK_NODE_ID.fullmatch(sink_node_id) is not None
+
+
 def _select_output_artifact(payload: object, *, check: str) -> tuple[str, str]:
     manifest = _mapping(payload, check=check)
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list):
         raise AcceptanceCheckError(check)
-    matches = [artifact for artifact in artifacts if isinstance(artifact, dict) and artifact.get("sink_node_id") == "output"]
+    matches = [artifact for artifact in artifacts if isinstance(artifact, dict) and _is_output_sink_artifact(artifact)]
     if len(matches) != 1:
         raise AcceptanceCheckError(check)
     artifact = matches[0]
@@ -156,7 +181,7 @@ def _select_output_artifact(payload: object, *, check: str) -> tuple[str, str]:
         raise AcceptanceCheckError(check)
     if artifact.get("exists_now") is not True or artifact.get("downloadable") is not True:
         raise AcceptanceCheckError(check)
-    return _uuid_field(artifact, "artifact_id", check=check), _sha256_field(artifact, "content_hash", check=check)
+    return _artifact_id_field(artifact, "artifact_id", check=check), _sha256_field(artifact, "content_hash", check=check)
 
 
 def capture(

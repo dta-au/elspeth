@@ -374,8 +374,10 @@ def test_cleanup_evidence_finalize_is_two_phase_refuses_pending_and_clears_only_
 
     version_directory = tmp_path / "version-2"
     # _validate_control_parent requires a private (no group/other bits)
-    # manifest parent; a bare mkdir() inherits umask-widened modes.
-    version_directory.mkdir(mode=0o700)
+    # manifest parent; a bare mkdir() inherits umask-widened modes, so pin
+    # the mode explicitly after creation.
+    version_directory.mkdir()
+    os.chmod(version_directory, 0o700)
     versioned_manifest_path = version_directory / "control.json"
     _init_control_manifest(
         versioned_manifest_path,

@@ -1,0 +1,130 @@
+{
+  "plan": "docs/superpowers/plans/2026-07-28-aws-rds-immutable-trust-root.md",
+  "issue": "elspeth-ca436b5f1b",
+  "review_date": "2026-07-28",
+  "verdict_before": "CHANGES_REQUESTED",
+  "reviewers": 4,
+  "findings": [
+    {
+      "id": "R1",
+      "severity": "blocker",
+      "title": "Checksum sidecar filename mismatch made the sha256sum -c gate self-failing in-image",
+      "resolution": "Repo assets renamed to deploy/aws-ecs/trust/global-bundle.pem(+.sha256) so one filename exists in repo and image; every occurrence updated (File Map, Task 1 retrieval/sidecar/tests/ignore rules, Task 3 COPY and assertions); in-repo sha256sum -c proof added to Task 1 Step 5. Terraform forbidden-path strings naming the old download artifacts kept verbatim."
+    },
+    {
+      "id": "R2",
+      "severity": "blocker",
+      "title": "Task 7 package-wide urllib.request ban contradicted the retained ECS metadata lookup in ecs_identity_wrapper",
+      "resolution": "Dropped the _all_text() urllib assertion; added a bootstrap-scoped assertion on modules/scenario/database_bootstrap.tf; noted in Task 7 and Deliberately-unchanged that the identity wrapper's urllib usage is the ECS task-metadata endpoint lookup and stays."
+    },
+    {
+      "id": "R3",
+      "severity": "blocker",
+      "title": "Task 8 in-process monkeypatch cannot reach the doctor CLI subprocesses spawned by the concurrency test",
+      "resolution": "New Task 8 Step 4: test-only sitecustomize.py shim written to a tmp dir and prepended to the Popen PYTHONPATH, driven by ELSPETH_TEST_RDS_TRUST_{PATH,SHA256,COUNT,UID,MODE}; rewrites the five module constants at interpreter startup. Plan states explicitly this adds zero production code paths. Steps renumbered."
+    },
+    {
+      "id": "R4",
+      "severity": "blocker",
+      "title": "readonlyRootFilesystem=true on the web container breaks ECS Exec acceptance checks and /tmp writers",
+      "resolution": "AWS docs verified 2026-07-28: ECS Exec remains unsupported with readonlyRootFilesystem (SSM agent must write to container fs; containers-roadmap #1359 still open). Web containers (candidate + rollback via merge) exempted with documented rationale; four non-web ecs.tf containers plus database bootstrap stay read-only; Task 7 counts/slices updated (== 4); Task 9 jq checks split into non-web all-true and web not-true; Task 11 Step 4 evidence lines updated; Task 10 gains a read-only rehearsal step (doctor under --read-only, web under --read-only --tmpfs /tmp with a >1MB multipart upload, no-EROFS assertions)."
+    },
+    {
+      "id": "R5",
+      "severity": "major",
+      "title": "Branch behind release/0.7.2 and dirty cold-install worktree owns uncommitted edits to Task 9's files",
+      "resolution": "Execution Contract clause plus Task 10 Step 0: git merge --no-ff release/0.7.2 before the release gate, rerun gates on the merged tree; merge-before-freeze rationale recorded (post-qualification tree change invalidates the digest). Blocking OPERATOR DECISION checkpoint added before Task 9 for runbook/README/contract-test landing order; no reading or copying from the dirty worktree."
+    },
+    {
+      "id": "R6",
+      "severity": "major",
+      "title": "Module upgrade rotates all five secret URLs while the web service ignores task_definition, crash-looping old-image tasks",
+      "resolution": "Task 9 adds a required 'Upgrading an existing install' note to runbook and terraform README: apply and force-new-deployment with the new digest in one operation; expect/schedule the ca_cert_identifier modification; old digests not rollback-eligible."
+    },
+    {
+      "id": "R7",
+      "severity": "major",
+      "title": "Task 6 exception-branch directive emitted a static failed TLS check even after TLS was proven on the connection",
+      "resolution": "Directive rewritten: exceptions raised after TLS capture (e.g. SessionSchemaError from probe_fn, doctor.py:325) retain the collected TLS result; a static failed TLS check is emitted only when the exception precedes TLS capture."
+    },
+    {
+      "id": "R8",
+      "severity": "major",
+      "title": "Task 5/6 doctor-test surgery under-scoped: unstubbed collect_checks callers and direct _inspect_database 2-tuple unpacks break",
+      "resolution": "Task 5 specifies a module-level autouse fixture patching _aws_rds_trust_root_check green, with failure tests re-patching in their bodies and a captured _REAL_TRUST_ROOT_CHECK for the real-formatting test; affected tests cited (:512-529/:523, :544). Task 6 Step 4 enumerates the :854 and :896 3-tuple updates and the :868/:934 SELECT-1 last-execute assertions."
+    },
+    {
+      "id": "R9",
+      "severity": "minor",
+      "title": "Top-level cryptography import executes on every deployment target via deployment_contract",
+      "resolution": "Task 2 moves the cryptography import inside _parse_ca_certificates (TYPE_CHECKING guard for annotations); constants stay dependency-free. Task 1 mirrors the cryptography pin into the hand-maintained all=[...] extras list (verified at pyproject.toml ~195-251)."
+    },
+    {
+      "id": "R10",
+      "severity": "minor",
+      "title": "_AWS_TLS_QUERY shape diverges per test module (leading '?' vs none vs hardcoded URLs)",
+      "resolution": "Task 4 Step 1 rewritten per-module: keep the leading '?' in test_deployment_contract.py:19, no '?' in test_aws_ecs_startup.py:24, direct URL edits at test_doctor.py:61-62."
+    },
+    {
+      "id": "R11",
+      "severity": "minor",
+      "title": "Task 5 Step 3 expected-failure text was wrong: red run errors whole modules, not individual tests",
+      "resolution": "Expected text now states test_aws_ecs_startup.py errors at fixture setup (AttributeError on startup.aws_rds_trust) and test_doctor.py errors at collection (module-level real-function capture)."
+    },
+    {
+      "id": "R12",
+      "severity": "minor",
+      "title": "Verifier test matrix missed 'unreadable' and had a FIFO hang risk for 'non_regular'",
+      "resolution": "Added unreadable test (chmod 0o000 with skipif euid==0) and specified non_regular uses a directory, with the FIFO O_RDONLY hang explicitly warned against."
+    },
+    {
+      "id": "R13",
+      "severity": "minor",
+      "title": "Task 11 Step 5 'no leakage' was unfalsifiable",
+      "resolution": "Replaced with a concrete zero-match grep sweep (postgresql+psycopg, run usernames/passwords, Aurora endpoint, BEGIN CERTIFICATE, AWS account ID, secretsmanager ARNs, tmp paths) modeled on _assert_private_database_values_absent (test_doctor_aws_ecs_postgres.py:141)."
+    },
+    {
+      "id": "R14",
+      "severity": "minor",
+      "title": "Task-definition inspection missed PGSSLROOTCERT/PGSSLMODE env bypass",
+      "resolution": "Both names added to Task 11 Step 4's forbidden-string inspection with a one-line precedence rationale."
+    },
+    {
+      "id": "R15",
+      "severity": "minor",
+      "title": "No test exercised the real _aws_rds_trust_root_check failure formatting",
+      "resolution": "Task 5 adds test_trust_root_check_formats_real_digest_mismatch_detail: patches verify_aws_rds_trust_bundle to raise digest_mismatch and asserts code, path, expected sha, and actual sha in the detail."
+    },
+    {
+      "id": "R16",
+      "severity": "minor",
+      "title": "TLS-check negatives missing bits<128 and non-TLSv version rows",
+      "resolution": "Task 6 parametrize matrix gains (True,'TLSv1.3',64)->False and (True,'SSLv3',256)->False rows."
+    },
+    {
+      "id": "R17",
+      "severity": "minor",
+      "title": "Intentional red windows (Tasks 4-7 URL contract, Tasks 5-8 testcontainer lane) were undocumented",
+      "resolution": "Execution Contract 'Intentional red windows' clause plus end-of-task notes at Tasks 4 and 5; executors directed not to improvise early fixes; reconciliation at Tasks 7/8 and proof at Task 10."
+    },
+    {
+      "id": "R18",
+      "severity": "minor",
+      "title": "Committing a 108-cert PEM may trip the whole-file secret-scan hook",
+      "resolution": "Task 1 Step 6 adds a staged pre-commit secret-scan dry-run before the commit, expected clean (public CERTIFICATE blocks only); if flagged, surface to the operator and extend the hook in a reviewed commit; --no-verify forbidden."
+    },
+    {
+      "id": "R19",
+      "severity": "minor",
+      "title": "Rollback eligibility gap after the trust-root contract was not stated structurally",
+      "resolution": "Task 9 runbook rollback section now states no pre-trust-root digest is rollback-eligible and Scenario B rollback evidence is impossible until a second qualified trust-root digest exists."
+    },
+    {
+      "id": "R20",
+      "severity": "minor",
+      "title": "SHA-256 hardcoded in the workflow twice; rotation sites not enumerated",
+      "resolution": "Adopted: both build-push jobs check out the repo, so the workflow steps read the expected digest from the committed sidecar (Task 3 test asserts the sidecar path instead of the raw sha). trust/README.md rotation section now enumerates every site the sha appears in."
+    }
+  ],
+  "verdict_after": "READY_FOR_RE-REVIEW"
+}

@@ -102,6 +102,7 @@ landscape.db
 .env
 .env.*
 *.pem
+!deploy/aws-ecs/trust/global-bundle.pem
 *.key
 secrets/
 

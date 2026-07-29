@@ -230,6 +230,7 @@ secrets/
 credentials.json
 *.pem
 *.key
+!deploy/aws-ecs/trust/global-bundle.pem
 
 # Jupyter
 .ipynb_checkpoints/

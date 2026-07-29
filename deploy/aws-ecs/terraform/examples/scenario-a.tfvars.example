@@ -1,0 +1,33 @@
+run_id                  = "REPLACE_WITH_LOWERCASE_UUID"
+scenario_id             = "A"
+candidate_sha           = "REPLACE_WITH_FULL_GIT_SHA"
+candidate_image         = "REPLACE_WITH_ELSPETH_IMAGE@sha256:REPLACE_WITH_64_HEX_DIGEST"
+aws_account_id          = "REPLACE_WITH_12_DIGIT_ACCOUNT_ID"
+aws_region              = "REPLACE_WITH_AWS_REGION"
+aws_profile             = "REPLACE_WITH_AWS_PROFILE"
+iam_lifecycle_aws_profile = "REPLACE_WITH_DISTINCT_IAM_LIFECYCLE_AWS_PROFILE"
+iam_permissions_boundary_arn = "arn:aws:iam::REPLACE_WITH_12_DIGIT_ACCOUNT_ID:policy/elspeth-REPLACE_WITH_LOWERCASE_UUID-ecs-boundary"
+target_platform         = "linux/amd64"
+owner                   = "REPLACE_WITH_OWNER"
+purpose                 = "ELSPETH disposable cold install"
+cleanup_deadline        = "2030-01-01T00:00:00Z"
+
+cloudwatch_agent_image = "REPLACE_WITH_AGENT_IMAGE@sha256:REPLACE_WITH_64_HEX_DIGEST"
+composer_model         = "bedrock/REPLACE_WITH_PRIMARY_INFERENCE_PROFILE_ID"
+composer_advisor_model = "bedrock/REPLACE_WITH_DISTINCT_ADVISOR_INFERENCE_PROFILE_ID"
+
+bedrock_inference_profile_arns = [
+  "arn:REPLACE_PARTITION:bedrock:REPLACE_REGION:REPLACE_ACCOUNT:inference-profile/REPLACE_PRIMARY_PROFILE",
+  "arn:REPLACE_PARTITION:bedrock:REPLACE_REGION:REPLACE_ACCOUNT:inference-profile/REPLACE_ADVISOR_PROFILE",
+]
+bedrock_foundation_model_arns = [
+  "arn:REPLACE_PARTITION:bedrock:REPLACE_REGION::foundation-model/REPLACE_PRIMARY_MODEL",
+  "arn:REPLACE_PARTITION:bedrock:REPLACE_REGION::foundation-model/REPLACE_ADVISOR_MODEL",
+]
+
+database_name               = "elspeth"
+session_database_name       = "elspeth_session"
+landscape_database_name     = "elspeth_landscape"
+aurora_engine_major_version = "16"
+aurora_engine_version       = "16.13"
+alarm_actions               = []

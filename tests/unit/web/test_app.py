@@ -33,6 +33,7 @@ from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
+from elspeth.web import aws_rds_trust as aws_rds_trust_module
 from elspeth.web.app import (
     _BodySizeLimitMiddleware,
     _BrowserDocumentHeadersMiddleware,
@@ -57,6 +58,29 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+
+
+@pytest.fixture(autouse=True)
+def _verified_aws_rds_trust_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the immutable RDS trust-root verification for app-factory tests.
+
+    The image-baked trust bundle at ``aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH``
+    only exists inside the built container, not in the unit-test environment.
+    These tests exercise startup validation ordering unrelated to that
+    verification, so stub a passing report the same way
+    ``tests/unit/web/test_aws_ecs_startup.py::_verified_trust_root`` does; no
+    test in this module asserts on the trust-root failure path itself.
+    """
+    monkeypatch.setattr(
+        aws_rds_trust_module,
+        "verify_aws_rds_trust_bundle",
+        lambda: aws_rds_trust_module.AwsRdsTrustBundleReport(
+            path=str(aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_PATH),
+            expected_sha256=aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            actual_sha256=aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            certificate_count=108,
+        ),
+    )
 
 
 def _settings(tmp_path: Path, **overrides) -> WebSettings:
@@ -84,13 +108,23 @@ def _external_settings(tmp_path: Path, deployment_target: str, **overrides: obje
     for directory in (data_dir, data_dir / "blobs", payload_dir):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
+    if deployment_target == "aws-ecs":
+        # aws-ecs uniquely requires authenticated TLS pinned to the immutable
+        # RDS trust root (deployment_contract._has_approved_aws_ecs_tls_query).
+        tls_query = f"sslmode=verify-full&sslrootcert={aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_PATH}"
+    else:
+        # Non-aws external targets still exercise authenticated TLS, but may
+        # trust the platform's certificate store.
+        tls_query = "sslmode=verify-full&sslrootcert=system"
+    session_db_url = f"postgresql+psycopg://runtime:session-secret@db/session?{tls_query}"
+    landscape_url = f"postgresql+psycopg://runtime:landscape-secret@db/landscape?{tls_query}"
     values: dict[str, object] = {
         "deployment_target": deployment_target,
         "deployment_state_mode": "external-postgresql",
         "host": "0.0.0.0" if deployment_target in {"docker-compose", "aws-ecs", "azure-container-apps", "kubernetes"} else "127.0.0.1",
         "payload_store_path": payload_dir,
-        "session_db_url": ("postgresql+psycopg://runtime:session-secret@db/session?sslmode=verify-full&sslrootcert=system"),
-        "landscape_url": ("postgresql+psycopg://runtime:landscape-secret@db/landscape?sslmode=verify-full&sslrootcert=system"),
+        "session_db_url": session_db_url,
+        "landscape_url": landscape_url,
         "secret_key": "this-app-external-startup-secret-is-long-enough",
         "shareable_link_signing_key": SecretBytes(bytes(range(32))),
     }

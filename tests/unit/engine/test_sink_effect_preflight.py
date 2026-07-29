@@ -1477,6 +1477,25 @@ def test_export_admission_precedes_pending_events_telemetry_and_signing_key_read
         def __getitem__(self, _key: str) -> str:
             pytest.fail("signing key must not be read before export admission")
 
+    class _EnvGuardOs:
+        """Stand-in for the ``os`` name as seen from inside
+        ``elspeth.engine.orchestrator.export``, scoped to that module only.
+
+        ``monkeypatch.setattr("...export.os.environ", ForbiddenEnvironment())``
+        resolves ``...export.os`` to the *real* ``os`` module (Python modules
+        are process-wide singletons; ``export.py`` merely imports the same
+        object everyone else does) and mutates its ``environ`` attribute
+        globally -- including for pytest's own terminal-width lookup
+        (``shutil.get_terminal_size`` reads ``os.environ["COLUMNS"]`` while
+        rendering the live progress percentage), which then calls
+        ``pytest.fail`` from inside a pytest hook and crashes the whole
+        session with an INTERNALERROR. Rebinding the ``os`` *name inside
+        export's own namespace* instead keeps the guard local to the code
+        path under test.
+        """
+
+        environ = ForbiddenEnvironment()
+
     sink = LegacyObservableSink()
     coordinator = object.__new__(RunLifecycleCoordinator)
     coordinator._db = object()
@@ -1496,7 +1515,7 @@ def test_export_admission_precedes_pending_events_telemetry_and_signing_key_read
             )
         ),
     )
-    monkeypatch.setattr("elspeth.engine.orchestrator.export.os.environ", ForbiddenEnvironment())
+    monkeypatch.setattr("elspeth.engine.orchestrator.export.os", _EnvGuardOs())
 
     with pytest.raises(SinkEffectCapabilityError, match="effect protocol"):
         coordinator.execute_export_phase(

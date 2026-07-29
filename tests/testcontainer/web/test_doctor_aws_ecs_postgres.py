@@ -23,7 +23,10 @@ from elspeth.cli import app
 from elspeth.web.schema_probe import SchemaState, probe_landscape_schema, probe_session_schema
 from elspeth.web.sessions.engine import create_session_engine
 
-pytestmark = pytest.mark.testcontainer
+pytestmark = [
+    pytest.mark.testcontainer,
+    pytest.mark.usefixtures("aws_rds_trust_test_override"),
+]
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 _PROCESS_TIMEOUT_SECONDS = 120.0
@@ -127,6 +130,15 @@ def _assert_all_green_report(stdout: str) -> list[dict[str, Any]]:
     return report
 
 
+def _assert_trust_and_transport_green(report: list[dict[str, Any]]) -> None:
+    checks = {item["name"]: item for item in report}
+    assert checks["rds_trust_root"]["ok"] is True
+    assert checks["session_tls"]["ok"] is True
+    assert checks["landscape_tls"]["ok"] is True
+    assert "TLSv" in checks["session_tls"]["detail"]
+    assert "TLSv" in checks["landscape_tls"]["detail"]
+
+
 def _assert_schemas_current(databases: _DatabasePair) -> None:
     session_engine = create_session_engine(databases.session_url)
     landscape_engine = create_engine(databases.landscape_url)
@@ -171,7 +183,8 @@ def test_doctor_init_schema_cli_succeeds_against_fresh_postgres(
     )
 
     assert result.exit_code == 0, result.output
-    _assert_all_green_report(result.stdout)
+    report = _assert_all_green_report(result.stdout)
+    _assert_trust_and_transport_green(report)
     _assert_private_database_values_absent(result.stdout + result.stderr, database_pair, environment)
     _assert_schemas_current(database_pair)
 
@@ -193,8 +206,14 @@ def _stop_processes(processes: list[subprocess.Popen[str]]) -> None:
 def test_concurrent_doctor_init_schema_cli_runs_are_safe(
     tmp_path: Path,
     database_pair: _DatabasePair,
+    aws_rds_trust_subprocess_env: dict[str, str],
 ) -> None:
     environment = _doctor_environment(tmp_path, database_pair)
+    overrides = dict(aws_rds_trust_subprocess_env)
+    existing_pythonpath = environment.get("PYTHONPATH")
+    if existing_pythonpath:
+        overrides["PYTHONPATH"] = overrides["PYTHONPATH"] + os.pathsep + existing_pythonpath
+    environment.update(overrides)
     command = [
         sys.executable,
         "-m",
@@ -223,7 +242,8 @@ def test_concurrent_doctor_init_schema_cli_runs_are_safe(
 
         for returncode, stdout, stderr in completed:
             assert returncode == 0, stderr or stdout
-            _assert_all_green_report(stdout)
+            report = _assert_all_green_report(stdout)
+            _assert_trust_and_transport_green(report)
             _assert_private_database_values_absent(stdout + stderr, database_pair, environment)
         _assert_schemas_current(database_pair)
     finally:

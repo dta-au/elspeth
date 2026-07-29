@@ -143,6 +143,32 @@ jobs:
               assert engine.dialect.driver == expected_driver
               engine.dispose()
           PY
+
+          # The reviewed AWS RDS trust root must be baked into this exact lean
+          # profile, root-owned and read-only, and readable under a read-only
+          # container filesystem. The expected digest is read from the
+          # committed sidecar so rotation touches only the sidecar, not this
+          # workflow.
+          image="$LEAN_IMAGE"
+          expected_rds_sha=$(cut -d' ' -f1 deploy/aws-ecs/trust/global-bundle.pem.sha256)
+          test "$(
+            docker inspect --format \
+              '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
+              "$image"
+          )" = "$expected_rds_sha"
+          test "$(
+            docker inspect --format \
+              '{{ index .Config.Labels "io.elspeth.rds-ca-certificate-identifier" }}' \
+              "$image"
+          )" = rds-ca-rsa2048-g1
+          docker run --rm --read-only --entrypoint python "$image" -c \
+            'from elspeth.web.aws_rds_trust import verify_aws_rds_trust_bundle; report = verify_aws_rds_trust_bundle(); assert report.certificate_count == 108'
+          docker run --rm --read-only --entrypoint /bin/sh "$image" -c \
+            'test "$(stat -c "%u:%g:%a" /etc/elspeth/rds/global-bundle.pem)" = "0:0:444" &&
+             test "$(stat -c "%u:%g:%a" /etc/elspeth/rds/global-bundle.pem.sha256)" = "0:0:444" &&
+             cd /etc/elspeth/rds &&
+             sha256sum -c global-bundle.pem.sha256'
+
           docker image rm "$LEAN_IMAGE"
 
       # -----------------------------------------------------------------------
@@ -368,6 +394,7 @@ jobs:
       - name: Verify generic image runtime contract
         run: |
           set -euo pipefail
+          expected_rds_sha=$(cut -d' ' -f1 deploy/aws-ecs/trust/global-bundle.pem.sha256)
           for image in "$GHCR_IMAGE" "$ACR_IMAGE"; do
             [[ -n "$image" ]] || continue
             docker pull "$image"
@@ -390,6 +417,29 @@ jobs:
               assert engine.dialect.driver == expected_driver
               engine.dispose()
           PY
+
+            # The reviewed AWS RDS trust root must be baked into every
+            # published image, root-owned and read-only, and readable under a
+            # read-only container filesystem. The expected digest is read
+            # from the committed sidecar so rotation touches only the
+            # sidecar, not this workflow.
+            test "$(
+              docker inspect --format \
+                '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
+                "$image"
+            )" = "$expected_rds_sha"
+            test "$(
+              docker inspect --format \
+                '{{ index .Config.Labels "io.elspeth.rds-ca-certificate-identifier" }}' \
+                "$image"
+            )" = rds-ca-rsa2048-g1
+            docker run --rm --read-only --entrypoint python "$image" -c \
+              'from elspeth.web.aws_rds_trust import verify_aws_rds_trust_bundle; report = verify_aws_rds_trust_bundle(); assert report.certificate_count == 108'
+            docker run --rm --read-only --entrypoint /bin/sh "$image" -c \
+              'test "$(stat -c "%u:%g:%a" /etc/elspeth/rds/global-bundle.pem)" = "0:0:444" &&
+               test "$(stat -c "%u:%g:%a" /etc/elspeth/rds/global-bundle.pem.sha256)" = "0:0:444" &&
+               cd /etc/elspeth/rds &&
+               sha256sum -c global-bundle.pem.sha256'
           done
 
       - name: Basic CLI tests

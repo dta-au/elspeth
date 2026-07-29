@@ -20,6 +20,7 @@ BEDROCK_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-bedrock-opus-sonnet
 RUNBOOK_INDEX = REPO_ROOT / "docs" / "runbooks" / "index.md"
 DOCKER_GUIDE = REPO_ROOT / "docs" / "guides" / "docker.md"
 OIDC_PLAYWRIGHT_CONFIG = REPO_ROOT / "src" / "elspeth" / "web" / "frontend" / "playwright.oidc.config.ts"
+TERRAFORM_README = REPO_ROOT / "deploy" / "aws-ecs" / "terraform" / "README.md"
 
 
 def _text() -> str:
@@ -134,29 +135,27 @@ def test_runbook_preserves_versioned_config_sidecar_startup() -> None:
     script = sidecar["command"][0]
     json_path = "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json"
     otel_path = "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml"
+    toml_path = "/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml"
     json_verify = f'"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  {json_path}" | sha256sum -c -'
     otel_verify = f'"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  {otel_path}" | sha256sum -c -'
-    fetch = f'-a fetch-config -m auto -c "file:{json_path}" -s'
-    append = f'-a append-config -m auto -c "file:{otel_path}" -s'
+    translate = f'-mode auto -os linux -input "{json_path}" -output "{toml_path}"'
+    exec_agent = f'exec "$AGENT" -config "{toml_path}" -otelconfig "{otel_path}"'
     assert f'base64 -d > "{json_path}"' in script
     assert f'base64 -d > "{otel_path}"' in script
     assert json_verify in script
     assert otel_verify in script
-    assert fetch in script
-    assert append in script
-    assert script.index(json_verify) < script.index(fetch)
-    assert script.index(otel_verify) < script.index(append)
-    assert script.index(fetch) < script.index(append)
+    assert translate in script
+    assert exec_agent in script
+    assert script.index(json_verify) < script.index(translate)
+    assert script.index(otel_verify) < script.index(exec_agent)
+    assert script.index(translate) < script.index(exec_agent)
 
 
 def test_runbook_preserves_supported_agent_health_mode() -> None:
     task = next(document for document in _json_documents() if isinstance(document, dict) and "containerDefinitions" in document)
     sidecar = next(container for container in task["containerDefinitions"] if container["name"] == "cloudwatch-agent")
 
-    assert sidecar["healthCheck"]["command"] == [
-        "CMD-SHELL",
-        '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q \'"status": "running"\'',
-    ]
+    assert sidecar["healthCheck"]["command"] == ["CMD-SHELL", "kill -0 1"]
     assert sidecar["healthCheck"] == task_definition._CLOUDWATCH_AGENT_HEALTH_CHECK
     assert "-m ecs" not in json.dumps(sidecar)
 
@@ -995,3 +994,27 @@ def test_bedrock_runbook_normalizes_and_asserts_composer_model_switch() -> None:
         assert f'.name != "{name}"' in verification
     assert ".ELSPETH_WEB__COMPOSER_MODEL == $composer_model" in verification
     assert ".ELSPETH_WEB__COMPOSER_ADVISOR_MODEL == $composer_advisor_model" in verification
+
+
+def test_runbook_requires_immutable_rds_trust_before_release_promotion() -> None:
+    text = _text()
+    assert "/etc/elspeth/rds/global-bundle.pem" in text
+    assert "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3" in text
+    assert "rds-ca-rsa2048-g1" in text
+    assert "readonlyRootFilesystem" in text
+    assert "session_tls" in text
+    assert "landscape_tls" in text
+    assert "c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700" in text
+    assert text.index("session_tls") < text.index("0.7.2-RC-280726")
+    assert text.index("landscape_tls") < text.index("0.7.2-RC-280726")
+
+
+def test_terraform_readme_requires_immutable_rds_trust_before_release_promotion() -> None:
+    text = TERRAFORM_README.read_text(encoding="utf-8")
+    assert "/etc/elspeth/rds/global-bundle.pem" in text
+    assert "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3" in text
+    assert "rds-ca-rsa2048-g1" in text
+    assert "readonlyRootFilesystem" in text
+    assert "session_tls" in text
+    assert "landscape_tls" in text
+    assert "c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700" in text

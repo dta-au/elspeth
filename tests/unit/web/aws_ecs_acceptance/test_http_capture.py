@@ -128,7 +128,7 @@ def _valid_state() -> acceptance.AcceptanceState:
             "blob_id": "cc742c5f-ae01-49f3-988b-7ecddf0445ef",
             "run_id": "401b6510-a37f-4375-acb8-695fe0098265",
             "landscape_run_id": "a31de342-a9f2-4b31-bb02-9043a047db72",
-            "artifact_id": "8e82b504-5dcc-4dc9-9fe4-a1c62be47153",
+            "artifact_id": _ARTIFACT_ID,
             "uploaded_sha256": "a" * 64,
             "blob_sha256": "a" * 64,
             "artifact_sha256": "b" * 64,
@@ -208,7 +208,11 @@ _RUN_ID = "401b6510-a37f-4375-acb8-695fe0098265"
 
 _LANDSCAPE_RUN_ID = "a31de342-a9f2-4b31-bb02-9043a047db72"
 
-_ARTIFACT_ID = "8e82b504-5dcc-4dc9-9fe4-a1c62be47153"
+# NOT a UUID: real artifact_id values are landscape `artifacts.artifact_id`
+# hex identities (32 or 64 lowercase hex chars from the sink-effect producer
+# path's labeled SHA-256 digest), never canonical dashed UUIDs -- see
+# `_ARTIFACT_ID_PATTERN` in contracts.py.
+_ARTIFACT_ID = "6d9653ae9f51e25579b040ab9ffb7d75e42b731666bbf7500a5c0e3546195d96"
 
 _ARTIFACT_BYTES = b"id,name\r\n1,alpha\r\n"
 
@@ -284,7 +288,13 @@ class _AcceptanceApi:
                     }
                 ]
             return httpx.Response(200, json={"run_id": _RUN_ID, "landscape_run_id": _LANDSCAPE_RUN_ID, "artifacts": artifacts})
-        if request.method == "GET" and path == f"/api/runs/{_RUN_ID}/outputs/{_ARTIFACT_ID}/content":
+        if request.method == "GET" and path.startswith(f"/api/runs/{_RUN_ID}/outputs/") and path.endswith("/content"):
+            # Matches whatever artifact_id _select_output_artifact() actually
+            # resolved -- not hardcoded to _ARTIFACT_ID -- so tests can swap
+            # in a differently-shaped valid artifact_id (see
+            # test_capture_accepts_uuid4_hex_artifact_id) and still exercise
+            # the full round trip; content-hash comparison downstream still
+            # catches a genuinely wrong artifact_id.
             return httpx.Response(200, content=self.artifact_bytes)
         if request.method == "GET" and path == f"/api/sessions/{_SESSION_ID}/blobs/{_BLOB_ID}":
             return httpx.Response(200, json={"id": _BLOB_ID, "session_id": _SESSION_ID, "content_hash": self.blob_sha256})
@@ -445,6 +455,158 @@ def test_capture_fails_closed_with_static_check_names(tmp_path: Path, failure: s
 
     assert "provider secret sentinel" not in str(raised.value)
     assert not (tmp_path / "state.json").exists()
+
+
+def test_capture_accepts_generated_output_sink_node_id(tmp_path: Path) -> None:
+    """Reproduces elspeth-a811cba074: the live outputs manifest reports the
+    engine's deterministic generated node id (``sink_<yaml-key>_<12-hex>``,
+    e.g. ``sink_output_ca54c90e06a7``) for the fixed pipeline's one sink, not
+    the literal YAML key ``"output"``. ``capture()`` must accept this shape
+    since it is the schema-guaranteed identity of this pipeline's output
+    sink (see ``node_id()`` in ``elspeth.core.dag.builder``), not a defect.
+    """
+    api = _AcceptanceApi()
+    api.artifacts = [
+        {
+            "artifact_id": _ARTIFACT_ID,
+            "sink_node_id": "sink_output_ca54c90e06a7",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        }
+    ]
+
+    state = acceptance.capture(
+        _auth_env(),
+        state_file=tmp_path / "state.json",
+        transport=httpx.MockTransport(api),
+        now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+        sleep=lambda _seconds: None,
+    )
+
+    assert state.artifact_id == _ARTIFACT_ID
+    assert state.artifact_sha256 == api.artifact_sha256
+
+
+def test_capture_fails_closed_when_output_sink_id_is_ambiguous(tmp_path: Path) -> None:
+    api = _AcceptanceApi()
+    other_artifact_id = "9e15a237-4c5e-4b09-9d9d-3c9f8db6b6c1"
+    api.artifacts = [
+        {
+            "artifact_id": _ARTIFACT_ID,
+            "sink_node_id": "output",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        },
+        {
+            "artifact_id": other_artifact_id,
+            "sink_node_id": "sink_output_ca54c90e06a7",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        },
+    ]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="artifact_manifest"):
+        acceptance.capture(
+            _auth_env(),
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(api),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
+
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_capture_rejects_differently_named_sink_that_shares_the_output_prefix(tmp_path: Path) -> None:
+    """A sink named e.g. ``output_extra`` would generate
+    ``sink_output_extra_<12-hex>`` — a bare ``startswith("sink_output_")``
+    heuristic would wrongly accept it. The selector must require the exact
+    ``sink_output_<12-hex>`` shape and reject this near-miss (zero matches).
+    """
+    api = _AcceptanceApi()
+    api.artifacts = [
+        {
+            "artifact_id": _ARTIFACT_ID,
+            "sink_node_id": "sink_output_extra_ca54c90e06a7",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        }
+    ]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="artifact_manifest"):
+        acceptance.capture(
+            _auth_env(),
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(api),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
+
+
+def test_capture_accepts_uuid4_hex_artifact_id(tmp_path: Path) -> None:
+    """The legacy (non-sink-effect) producer path defaults ``artifact_id``
+    to ``core.ids.generate_id()`` -- ``uuid.uuid4().hex`` (32 lowercase hex
+    chars, no dashes). This is the *other* real production shape besides
+    the 64-hex sha256 digest already covered by ``_ARTIFACT_ID``; both must
+    be accepted since neither is a canonical dashed UUID.
+    """
+    api = _AcceptanceApi()
+    generated_artifact_id = "8e82b5045dcc4dc99fe4a1c62be47153"
+    api.artifacts = [
+        {
+            "artifact_id": generated_artifact_id,
+            "sink_node_id": "output",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        }
+    ]
+
+    state = acceptance.capture(
+        _auth_env(),
+        state_file=tmp_path / "state.json",
+        transport=httpx.MockTransport(api),
+        now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+        sleep=lambda _seconds: None,
+    )
+
+    assert state.artifact_id == generated_artifact_id
+
+
+def test_capture_rejects_non_hex_artifact_id(tmp_path: Path) -> None:
+    """artifact_id must never be treated as a canonical UUID (see
+    ``_ARTIFACT_ID_PATTERN``): a dashed-UUID-shaped or otherwise non-hex
+    value is not a real landscape artifact identity and must fail closed.
+    """
+    api = _AcceptanceApi()
+    api.artifacts = [
+        {
+            "artifact_id": "8e82b504-5dcc-4dc9-9fe4-a1c62be47153",
+            "sink_node_id": "output",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        }
+    ]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="artifact_manifest"):
+        acceptance.capture(
+            _auth_env(),
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(api),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
 
 
 def test_capture_times_out_on_nonterminal_run_without_persisting_state(tmp_path: Path) -> None:
