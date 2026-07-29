@@ -97,6 +97,7 @@ class TestDeaggregationPipeline:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'audit.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         config_file = tmp_path / "settings.yaml"
         config_file.write_text(yaml.dump(config))
@@ -404,6 +405,7 @@ class TestSourceSchemaValidation:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'audit.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
 
         config_file = tmp_path / "settings.yaml"
