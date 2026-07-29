@@ -48,7 +48,7 @@ Dynamic plugin discovery already scans `src/elspeth/plugins/transforms/aws`; no 
 - Create: `tests/unit/plugins/transforms/aws/test_textract_document_analysis.py`
 - Modify: `tests/unit/core/test_resolve_secret_refs.py`
 
-- [ ] **Step 1: Write failing central secret-policy tests**
+- [x] **Step 1: Write failing central secret-policy tests**
 
 Add imports for `collect_credential_field_violations`, `collect_disallowed_secret_ref_markers`, and `is_secret_field` to `tests/unit/core/test_resolve_secret_refs.py`, then add:
 
@@ -67,7 +67,7 @@ def test_secret_ref_is_allowed_in_aws_access_key_id() -> None:
     assert collect_disallowed_secret_ref_markers(options) == []
 ```
 
-- [ ] **Step 2: Run the central tests and verify the new exact-name case fails**
+- [x] **Step 2: Run the central tests and verify the new exact-name case fails**
 
 Run:
 
@@ -77,7 +77,7 @@ pytest tests/unit/core/test_resolve_secret_refs.py -q
 
 Expected: the existing tests pass and `test_aws_access_key_id_is_a_credential_field` fails because the exact name is not yet in `SECRET_FIELD_NAMES`.
 
-- [ ] **Step 3: Add the exact credential field to the central policy**
+- [x] **Step 3: Add the exact credential field to the central policy**
 
 Add this member to `SECRET_FIELD_NAMES` in `src/elspeth/core/secrets.py`:
 
@@ -87,7 +87,7 @@ Add this member to `SECRET_FIELD_NAMES` in `src/elspeth/core/secrets.py`:
 
 Keep `aws_secret_access_key` and `aws_session_token` out of the exact set because the existing `_key` and `_token` suffixes already classify them.
 
-- [ ] **Step 4: Run the central secret-policy tests**
+- [x] **Step 4: Run the central secret-policy tests**
 
 Run:
 
@@ -97,7 +97,7 @@ pytest tests/unit/core/test_resolve_secret_refs.py -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Write failing configuration-model tests**
+- [x] **Step 5: Write failing configuration-model tests**
 
 Create `tests/unit/plugins/transforms/aws/test_textract_document_analysis.py` with a reusable minimal config and these assertions:
 
@@ -168,7 +168,7 @@ def test_duplicate_output_names_fail() -> None:
 
 Add parameterized cases covering all invalid feature names, duplicate features, empty outputs, more than 30 queries, invalid query page selectors, invalid region/bucket/key/version field names, non-positive bounds, `poll_max_interval_seconds < poll_interval_seconds`, and session token without the credential pair. Add a positive full configuration that maps all six `extract` members and checks `declared_input_fields` plus output ordering.
 
-- [ ] **Step 6: Run the configuration tests and verify import failure**
+- [x] **Step 6: Run the configuration tests and verify import failure**
 
 Run:
 
@@ -178,7 +178,7 @@ pytest tests/unit/plugins/transforms/aws/test_textract_document_analysis.py -q
 
 Expected: collection fails because `textract_document_analysis.py` does not exist.
 
-- [ ] **Step 7: Implement the frozen config models**
+- [x] **Step 7: Implement the frozen config models**
 
 Create `src/elspeth/plugins/transforms/aws/textract_document_analysis.py` with lazy runtime imports and these public models/constants:
 
@@ -280,7 +280,7 @@ Implement `configured_output_fields()`, `all_output_field_names()`, and:
 
 Do not define the plugin class yet; dynamic discovery will ignore a module that contains only config models.
 
-- [ ] **Step 8: Run configuration and secret-policy tests**
+- [x] **Step 8: Run configuration and secret-policy tests**
 
 Run:
 
@@ -290,7 +290,7 @@ pytest tests/unit/core/test_resolve_secret_refs.py tests/unit/plugins/transforms
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit Task 1**
+- [x] **Step 9: Commit Task 1**
 
 ```bash
 git add src/elspeth/core/secrets.py src/elspeth/plugins/transforms/aws/textract_document_analysis.py tests/unit/core/test_resolve_secret_refs.py tests/unit/plugins/transforms/aws/test_textract_document_analysis.py
