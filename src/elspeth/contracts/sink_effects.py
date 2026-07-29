@@ -1246,10 +1246,10 @@ class SinkEffectPlan:
         frozen_evidence = _freeze_bounded_evidence(self.safe_evidence, "safe_evidence")
         if self.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION:
             if "publication_kind" not in frozen_evidence:
-                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited or virtual")
+                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited, virtual, or reaffirmed")
             publication_kind = frozen_evidence["publication_kind"]
-            if publication_kind not in {"inherited", "virtual"}:
-                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited or virtual")
+            if publication_kind not in {"inherited", "virtual", "reaffirmed"}:
+                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited, virtual, or reaffirmed")
         object.__setattr__(self, "safe_evidence", deep_freeze(frozen_evidence))
 
 

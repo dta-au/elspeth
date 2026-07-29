@@ -41,7 +41,12 @@ from elspeth.engine.executors.sink_effects import SinkEffectExecutionSeam, SinkE
 from elspeth.engine.spans import SpanFactory
 from tests.fixtures.base_classes import create_observed_contract
 from tests.fixtures.landscape import make_factory, register_test_node
-from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget, PartitioningObservableSink
+from tests.fixtures.sink_effects import (
+    DuplicateObservableSink,
+    DuplicateObservableTarget,
+    PartitioningObservableSink,
+    ReaffirmingObservableSink,
+)
 
 
 @pytest.mark.parametrize(
@@ -868,6 +873,57 @@ def test_all_diverted_primary_finalizes_virtual_no_publication_before_discard(tm
         assert outcome is not None
         assert outcome.outcome is TerminalOutcome.FAILURE
         assert outcome.path is TerminalPath.SINK_DISCARDED
+    finally:
+        db.close()
+
+
+def test_reaffirmed_effect_finalizes_no_publication_without_lease_commit_or_reconcile(tmp_path: Path) -> None:
+    """A content-identity idempotent no-op (elspeth-9a78b3a02f) must ride the
+    same NO_PUBLICATION short-circuit as virtual/inherited: no lease, no
+    commit_effect, no reconcile_effect, and it is audited as inherited."""
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'reaffirmed.db'}")
+    try:
+        factory = make_factory(db)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
+        sink_id = register_test_node(factory.data_flow, run.run_id, "primary", node_type=NodeType.SINK, plugin_name="reaffirming")
+        token = _effect_tokens(
+            factory,
+            run_id=run.run_id,
+            source_id=source_id,
+            rows=[{"value": 1}],
+        )[0]
+        target = DuplicateObservableTarget()
+        sink = ReaffirmingObservableSink(target)
+        sink.node_id = sink_id
+        ctx = PluginContext(run_id=run.run_id, config={}, landscape=factory.plugin_audit_writer(), node_id=sink_id)
+
+        artifact, counts = SinkExecutor(
+            factory.execution,
+            factory.data_flow,
+            SpanFactory(),
+            run.run_id,
+            factory=factory,
+            worker_id="worker-a",
+        ).write(
+            sink,  # type: ignore[arg-type]
+            [token],
+            ctx,
+            1,
+            sink_name="output",
+            pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
+            effect_mode="write",
+        )
+
+        assert artifact is not None
+        assert artifact.publication_performed is False
+        assert artifact.publication_evidence_kind == "inherited"
+        assert sink.commit_calls == 0
+        assert sink.reconcile_calls == 0
+        assert counts.discard_mode == 0
+        outcome = factory.data_flow.get_token_outcome(token.token_id)
+        assert outcome is not None
+        assert outcome.outcome is TerminalOutcome.SUCCESS
     finally:
         db.close()
 

@@ -20,6 +20,7 @@ from azure.storage.blob import BlobProperties
 from botocore.exceptions import ClientError, ConnectionClosedError
 
 from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
     SinkEffectDescriptorMode,
@@ -669,6 +670,7 @@ def test_remote_effect_evidence_rejects_missing_or_invalid_diversion_attribution
         "predecessor_etag",
         "provider",
         "publication_kind",
+        "replace_authority",
         "schema",
         "staged_hash",
         "staged_size",
@@ -940,6 +942,347 @@ def test_restage_fails_closed_on_divergent_partition(tmp_path: Any, monkeypatch:
     with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="partition diverges"):
         sink.restage_effect(plan, SinkEffectPipelineMembersInput(members=(oversize,), target_snapshot_members=(oversize,)), _CTX)
     assert not stage.exists()
+
+
+# ---------------------------------------------------------------------------
+# Content-identity idempotence (elspeth-9a78b3a02f): reaffirmed no-op vs.
+# genuine collision, decided at prepare from the full verified-identity set.
+# ---------------------------------------------------------------------------
+
+
+def _raw_prepare(
+    *,
+    effect_id: str,
+    provider: str,
+    body: bytes,
+    checksum_algorithm: str,
+    observation: remote_effects.RemoteObjectObservation,
+    predecessor_descriptor: ArtifactDescriptor | None = None,
+    allow_replace: bool = False,
+) -> Any:
+    inspection = remote_effects.inspect_remote_object(
+        provider=provider,
+        target="s3://bucket/key" if provider == "aws_s3" else "azure://container/blob",
+        request=SinkEffectInspectionRequest(
+            effect_id=effect_id,
+            target="{}",
+            predecessor_descriptor=predecessor_descriptor,
+        ),
+        observation=observation,
+    )
+    return remote_effects.prepare_remote_object(
+        effect_id=effect_id,
+        provider=provider,
+        inspection=inspection,
+        body_chunks=(body,),
+        format_name="json",
+        max_bytes=4096,
+        accepted_ordinals=(0,),
+        diverted_ordinals=(),
+        predecessor_descriptor=predecessor_descriptor,
+        checksum_algorithm=checksum_algorithm,
+        allow_replace=allow_replace,
+    )
+
+
+def _genesis_identity(*, effect_id: str, provider: str, body: bytes, checksum_algorithm: str) -> tuple[str, int, str]:
+    """Prepare against an absent target to learn the exact staged identity."""
+    plan = _raw_prepare(
+        effect_id=effect_id,
+        provider=provider,
+        body=body,
+        checksum_algorithm=checksum_algorithm,
+        observation=remote_effects.RemoteObjectObservation(False, None, None, None),
+    )
+    checksum_b64 = plan.safe_evidence["checksum_b64"]
+    assert isinstance(checksum_b64, str)
+    return plan.payload_hash, len(body), checksum_b64
+
+
+@pytest.mark.parametrize(
+    ("provider", "checksum_algorithm"),
+    [("aws_s3", "sha256"), ("azure_blob", "md5")],
+)
+def test_reaffirmed_noop_recognizes_independently_reprepared_identical_content(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, provider: str, checksum_algorithm: str
+) -> None:
+    """A second, independent effect for identical content must no-op, not collide."""
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":1}'
+    staged_hash, staged_size, checksum_b64 = _genesis_identity(
+        effect_id="a" * 64, provider=provider, body=body, checksum_algorithm=checksum_algorithm
+    )
+
+    present = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"existing-etag"',
+        content_hash=staged_hash,
+        size_bytes=staged_size,
+        effect_id=None,
+        plan_hash=None,
+        protocol_version="sink-effect-v1",
+        checksum_algorithm=checksum_algorithm,
+        checksum_b64=checksum_b64,
+    )
+    plan = _raw_prepare(
+        effect_id="b" * 64,
+        provider=provider,
+        body=body,
+        checksum_algorithm=checksum_algorithm,
+        observation=present,
+        allow_replace=False,
+    )
+
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert plan.safe_evidence["publication_kind"] == "reaffirmed"
+    assert plan.safe_evidence["replace_authority"] == "none"
+    assert plan.safe_evidence["precondition"] == "if_none_match"
+    assert plan.safe_evidence["predecessor_etag"] is None
+    assert plan.expected_descriptor is not None
+    assert plan.expected_descriptor.content_hash == staged_hash
+    assert plan.expected_descriptor.size_bytes == staged_size
+    assert not Path(str(plan.safe_evidence["staging_path"])).exists()
+
+
+@pytest.mark.parametrize(
+    "divergence",
+    ["content_hash", "size_bytes", "protocol_version", "checksum_algorithm", "checksum_b64"],
+)
+def test_reaffirm_requires_the_full_verified_identity_set_not_partial_match(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, divergence: str
+) -> None:
+    """Metadata-only or partial equality must never be credited as identity proof."""
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":1}'
+    staged_hash, staged_size, checksum_b64 = _genesis_identity(
+        effect_id="c" * 64, provider="aws_s3", body=body, checksum_algorithm="sha256"
+    )
+    fields: dict[str, object] = {
+        "content_hash": staged_hash,
+        "size_bytes": staged_size,
+        "protocol_version": "sink-effect-v1",
+        "checksum_algorithm": "sha256",
+        "checksum_b64": checksum_b64,
+    }
+    if divergence == "content_hash":
+        fields["content_hash"] = "f" * 64
+    elif divergence == "size_bytes":
+        fields["size_bytes"] = staged_size + 1
+    elif divergence == "protocol_version":
+        fields["protocol_version"] = None
+    elif divergence == "checksum_algorithm":
+        fields["checksum_algorithm"] = None
+        fields["checksum_b64"] = None
+    else:
+        fields["checksum_b64"] = base64.b64encode(b"\x00" * 32).decode("ascii")
+    present = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"existing-etag"',
+        content_hash=cast_str_or_none(fields["content_hash"]),
+        size_bytes=cast_int_or_none(fields["size_bytes"]),
+        effect_id=None,
+        plan_hash=None,
+        protocol_version=cast_str_or_none(fields["protocol_version"]),
+        checksum_algorithm=cast_str_or_none(fields["checksum_algorithm"]),
+        checksum_b64=cast_str_or_none(fields["checksum_b64"]),
+    )
+
+    with pytest.raises(remote_effects.RemoteObjectCollisionError):
+        _raw_prepare(
+            effect_id="d" * 64,
+            provider="aws_s3",
+            body=body,
+            checksum_algorithm="sha256",
+            observation=present,
+            allow_replace=False,
+        )
+
+    assert not remote_effects._stage_path("d" * 64, "aws_s3").exists()
+
+
+def cast_str_or_none(value: object) -> str | None:
+    assert value is None or isinstance(value, str)
+    return value
+
+
+def cast_int_or_none(value: object) -> int | None:
+    assert value is None or isinstance(value, int)
+    return value
+
+
+def test_prepare_rejects_foreign_object_without_elspeth_identity_evidence(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pre-existing object with no elspeth metadata is never reaffirmable."""
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":1}'
+    foreign = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"foreign-etag"',
+        content_hash=None,
+        size_bytes=len(body),
+        effect_id=None,
+        plan_hash=None,
+        protocol_version=None,
+        checksum_algorithm=None,
+        checksum_b64=None,
+    )
+
+    with pytest.raises(remote_effects.RemoteObjectCollisionError):
+        _raw_prepare(
+            effect_id="e" * 64,
+            provider="aws_s3",
+            body=body,
+            checksum_algorithm="sha256",
+            observation=foreign,
+            allow_replace=False,
+        )
+
+
+def test_prepare_replaces_under_overwrite_config_authority_when_content_differs(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """overwrite=True authorizes an unconditional replace; no comparison is required."""
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":2}'
+    existing = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"existing-etag"',
+        content_hash="0" * 64,
+        size_bytes=999,
+        effect_id=None,
+        plan_hash=None,
+        protocol_version="sink-effect-v1",
+        checksum_algorithm="sha256",
+        checksum_b64=base64.b64encode(b"\x00" * 32).decode("ascii"),
+    )
+
+    plan = _raw_prepare(
+        effect_id="f" * 64,
+        provider="aws_s3",
+        body=body,
+        checksum_algorithm="sha256",
+        observation=existing,
+        allow_replace=True,
+    )
+
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.PRECOMPUTED
+    assert plan.safe_evidence["publication_kind"] == "conditional_replace"
+    assert plan.safe_evidence["replace_authority"] == "overwrite_config"
+    assert plan.safe_evidence["precondition"] == "if_match"
+    assert plan.safe_evidence["predecessor_etag"] == '"existing-etag"'
+
+
+def test_plan_evidence_round_trips_reaffirmed_replace_authority() -> None:
+    evidence = remote_effects.RemoteObjectPlanEvidence(
+        provider="aws_s3",
+        target="s3://bucket/key",
+        staging_path="/tmp/stage",
+        precondition="if_none_match",
+        predecessor_etag=None,
+        staged_hash="a" * 64,
+        staged_size=3,
+        checksum_algorithm="sha256",
+        checksum_b64=base64.b64encode(b"\x01" * 32).decode("ascii"),
+        format_name="json",
+        accepted_ordinals=(0,),
+        diverted_ordinals=(),
+        diversion_attribution=(),
+        publication_kind="reaffirmed",
+        replace_authority="none",
+    )
+    round_tripped = remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence.as_mapping())
+    assert round_tripped == evidence
+
+
+@pytest.mark.parametrize("bad_authority", ["overwrite", "predecessor", "None"])
+def test_plan_evidence_rejects_replace_authority_outside_closed_vocab(bad_authority: str) -> None:
+    evidence = dict(
+        remote_effects.RemoteObjectPlanEvidence(
+            provider="aws_s3",
+            target="s3://bucket/key",
+            staging_path="/tmp/stage",
+            precondition="if_none_match",
+            predecessor_etag=None,
+            staged_hash="a" * 64,
+            staged_size=3,
+            checksum_algorithm="sha256",
+            checksum_b64=base64.b64encode(b"\x01" * 32).decode("ascii"),
+            format_name="json",
+            accepted_ordinals=(0,),
+            diverted_ordinals=(),
+            diversion_attribution=(),
+            publication_kind="virtual",
+            replace_authority="none",
+        ).as_mapping()
+    )
+    evidence["replace_authority"] = bad_authority
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="replace authority is not closed"):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
+
+
+def test_plan_evidence_rejects_conditional_replace_without_authority() -> None:
+    evidence = dict(
+        remote_effects.RemoteObjectPlanEvidence(
+            provider="aws_s3",
+            target="s3://bucket/key",
+            staging_path="/tmp/stage",
+            precondition="if_match",
+            predecessor_etag='"etag"',
+            staged_hash="a" * 64,
+            staged_size=3,
+            checksum_algorithm="sha256",
+            checksum_b64=base64.b64encode(b"\x01" * 32).decode("ascii"),
+            format_name="json",
+            accepted_ordinals=(0,),
+            diverted_ordinals=(),
+            diversion_attribution=(),
+            publication_kind="conditional_replace",
+            replace_authority="overwrite_config",
+        ).as_mapping()
+    )
+    evidence["replace_authority"] = "none"
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="conditional_replace requires"):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
+
+
+def test_plan_evidence_rejects_reaffirmed_with_replace_authority_or_if_match() -> None:
+    base_kwargs = {
+        "provider": "aws_s3",
+        "target": "s3://bucket/key",
+        "staging_path": "/tmp/stage",
+        "staged_hash": "a" * 64,
+        "staged_size": 3,
+        "checksum_algorithm": "sha256",
+        "checksum_b64": base64.b64encode(b"\x01" * 32).decode("ascii"),
+        "format_name": "json",
+        "accepted_ordinals": (0,),
+        "diverted_ordinals": (),
+        "diversion_attribution": (),
+        "publication_kind": "reaffirmed",
+    }
+    tampered_authority = dict(
+        remote_effects.RemoteObjectPlanEvidence(
+            precondition="if_none_match",
+            predecessor_etag=None,
+            replace_authority="none",
+            **base_kwargs,  # type: ignore[arg-type]
+        ).as_mapping()
+    )
+    tampered_authority["replace_authority"] = "overwrite_config"
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="reaffirmed evidence must carry"):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(tampered_authority)
+
+    tampered_precondition = dict(
+        remote_effects.RemoteObjectPlanEvidence(
+            precondition="if_match",
+            predecessor_etag='"etag"',
+            replace_authority="predecessor_lineage",
+            **base_kwargs,  # type: ignore[arg-type]
+        ).as_mapping()
+    )
+    tampered_precondition["publication_kind"] = "reaffirmed"
+    tampered_precondition["replace_authority"] = "none"
+    # predecessor_etag stays set (a valid if_match pairing) so only the
+    # reaffirmed-specific precondition check is exercised here.
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="reaffirmed evidence must carry"):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(tampered_precondition)
 
 
 @pytest.mark.parametrize("factory", [_s3, _azure])

@@ -134,6 +134,72 @@ class DuplicateObservableSink:
         return SinkEffectReconcileResult.unknown(evidence={"target": "divergent"})
 
 
+class ReaffirmingObservableSink(DuplicateObservableSink):
+    """Effect double whose prepare always reaffirms an already-published target.
+
+    Models the content-identity idempotence outcome (elspeth-9a78b3a02f):
+    a NO_PUBLICATION plan with ``publication_kind: "reaffirmed"`` that the
+    orchestrator must finalize via the NO_PUBLICATION short-circuit,
+    never reaching lease/commit/reconcile.
+    """
+
+    effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
+    supported_effect_modes = frozenset({"write"})
+    supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
+
+    def __init__(self, target: DuplicateObservableTarget, *, name: str = "reaffirming") -> None:
+        super().__init__(target)
+        self.name = name
+        self.config = {"path": f"{name}.jsonl"}
+        self.commit_calls = 0
+        self.reconcile_calls = 0
+
+    def prepare_effect(
+        self,
+        request: SinkEffectPrepareRequest,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectPlan:
+        del ctx
+        rows = [deep_thaw(member.row) for member in request.effect_input.members]  # type: ignore[union-attr]
+        payload_hash = stable_hash(rows)
+        descriptor = ArtifactDescriptor(
+            artifact_type="file",
+            path_or_uri=f"file:///tmp/{self.name}.jsonl",
+            content_hash=payload_hash,
+            size_bytes=len(rows),
+        )
+        safe_evidence = {"publication_kind": "reaffirmed", "replace_authority": "none"}
+        return SinkEffectPlan(
+            effect_id=request.effect_id,
+            protocol_version=SINK_EFFECT_PROTOCOL_VERSION,
+            input_kind=request.input_kind,
+            descriptor_mode=SinkEffectDescriptorMode.NO_PUBLICATION,
+            inspection_mode=request.inspection.mode,
+            target=descriptor.path_or_uri,
+            plan_hash=stable_hash(
+                {
+                    "descriptor": descriptor.content_hash,
+                    "effect_id": request.effect_id,
+                    "evidence": safe_evidence,
+                    "schema": "reaffirming-observable-plan-v1",
+                }
+            ),
+            payload_hash=payload_hash,
+            expected_descriptor=descriptor,
+            safe_evidence=safe_evidence,
+        )
+
+    def commit_effect(self, plan: SinkEffectPlan, ctx: RestrictedSinkEffectContext) -> SinkEffectCommitResult:
+        del plan, ctx
+        self.commit_calls += 1
+        raise AssertionError("a reaffirmed NO_PUBLICATION plan must never reach commit_effect")
+
+    def reconcile_effect(self, plan: SinkEffectPlan, ctx: RestrictedSinkEffectContext) -> SinkEffectReconcileResult:
+        del plan, ctx
+        self.reconcile_calls += 1
+        raise AssertionError("a reaffirmed NO_PUBLICATION plan must never reach reconcile_effect")
+
+
 class PartitioningObservableSink(DuplicateObservableSink):
     """Effect double that diverts rows carrying ``divert=True`` during prepare."""
 
@@ -245,4 +311,9 @@ class PartitioningObservableSink(DuplicateObservableSink):
         )
 
 
-__all__ = ["DuplicateObservableSink", "DuplicateObservableTarget", "PartitioningObservableSink"]
+__all__ = [
+    "DuplicateObservableSink",
+    "DuplicateObservableTarget",
+    "PartitioningObservableSink",
+    "ReaffirmingObservableSink",
+]

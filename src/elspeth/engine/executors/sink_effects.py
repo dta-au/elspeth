@@ -1332,12 +1332,16 @@ class SinkEffectCoordinator:
             publication_kind = plan.safe_evidence["publication_kind"]
         except KeyError as exc:
             raise LandscapeRecordError("no-publication effect is missing publication evidence") from exc
-        if publication_kind == "inherited":
+        if publication_kind in {"inherited", "reaffirmed"}:
+            # A reaffirmed effect never touched the remote target either (it
+            # proved the existing object's content already matches), so it
+            # is audited and walked back through predecessor chains exactly
+            # like an inherited no-op.
             evidence_kind: Literal["inherited", "virtual"] = "inherited"
         elif publication_kind == "virtual":
             evidence_kind = "virtual"
         else:
-            raise LandscapeRecordError("no-publication effect requires inherited or virtual publication evidence")
+            raise LandscapeRecordError("no-publication effect requires inherited, virtual, or reaffirmed publication evidence")
         accepted, diverted = self._prepared_partition(effect.effect_id, request)
         by_ordinal = {member.ordinal: member for member in request.finalization_members}
         return self._effects.finalize(

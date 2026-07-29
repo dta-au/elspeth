@@ -28,9 +28,11 @@ from elspeth.contracts.sink_effects import (
 )
 from elspeth.plugins.sinks._diversion_attribution import DiversionAttribution, parse_diversion_attribution
 
-_EVIDENCE_SCHEMA: Final = "remote-object-effect-plan-v1"
+_EVIDENCE_SCHEMA: Final = "remote-object-effect-plan-v2"
 _INSPECTION_SCHEMA: Final = "remote-object-effect-inspection-v1"
 _COPY_BYTES: Final = 64 * 1024
+_PUBLICATION_KINDS: Final = frozenset({"conditional_create", "conditional_replace", "inherited", "virtual", "reaffirmed"})
+_REPLACE_AUTHORITIES: Final = frozenset({"none", "overwrite_config", "predecessor_lineage"})
 
 
 class RemoteObjectEffectError(RuntimeError):
@@ -43,6 +45,16 @@ class RemoteObjectEffectLimitError(RemoteObjectEffectError):
 
 class RemoteObjectPreconditionError(RemoteObjectEffectError):
     """Raised when durable evidence no longer describes the selected object."""
+
+
+class RemoteObjectCollisionError(RemoteObjectEffectError):
+    """Raised when an existing object cannot be proven identical or replaced.
+
+    Fires only when the target already exists, no predecessor lineage is
+    declared, no overwrite authority is configured, and the existing
+    object's identity does not fully verify against the staged content
+    (or is unverifiable, e.g. a foreign object without elspeth metadata).
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +86,7 @@ class RemoteObjectPlanEvidence:
     diverted_ordinals: tuple[int, ...]
     diversion_attribution: tuple[DiversionAttribution, ...]
     publication_kind: str
+    replace_authority: str
 
     def as_mapping(self) -> dict[str, object]:
         return {
@@ -87,6 +100,7 @@ class RemoteObjectPlanEvidence:
             "predecessor_etag": self.predecessor_etag,
             "provider": self.provider,
             "publication_kind": self.publication_kind,
+            "replace_authority": self.replace_authority,
             "schema": _EVIDENCE_SCHEMA,
             "staged_hash": self.staged_hash,
             "staged_size": self.staged_size,
@@ -116,8 +130,15 @@ class RemoteObjectPlanEvidence:
         if (precondition == "if_match") != (predecessor_etag is not None):
             raise RemoteObjectPreconditionError("remote object precondition and predecessor ETag diverge")
         publication_kind = _string(value["publication_kind"], "publication_kind")
-        if publication_kind not in {"conditional_create", "conditional_replace", "inherited", "virtual"}:
+        if publication_kind not in _PUBLICATION_KINDS:
             raise RemoteObjectPreconditionError("remote object publication kind is not closed")
+        replace_authority = _string(value["replace_authority"], "replace_authority")
+        if replace_authority not in _REPLACE_AUTHORITIES:
+            raise RemoteObjectPreconditionError("remote object replace authority is not closed")
+        if publication_kind == "conditional_replace" and replace_authority == "none":
+            raise RemoteObjectPreconditionError("conditional_replace requires a granted replace authority")
+        if publication_kind == "reaffirmed" and (replace_authority != "none" or precondition != "if_none_match"):
+            raise RemoteObjectPreconditionError("reaffirmed evidence must carry no replace authority and if_none_match")
         checksum_algorithm = _checksum_algorithm(value["checksum_algorithm"])
         return cls(
             provider=_string(value["provider"], "provider"),
@@ -134,6 +155,7 @@ class RemoteObjectPlanEvidence:
             diverted_ordinals=diverted,
             diversion_attribution=diversion_attribution,
             publication_kind=publication_kind,
+            replace_authority=replace_authority,
         )
 
 
@@ -153,6 +175,12 @@ def _integer(value: object, field_name: str) -> int:
     if type(value) is not int or value < 0:
         raise RemoteObjectPreconditionError(f"{field_name} must be a non-negative exact integer")
     return value
+
+
+def _optional_integer(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _integer(value, field_name)
 
 
 def _lower_hex(value: object, field_name: str) -> str:
@@ -249,12 +277,25 @@ def inspect_remote_object(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _InspectionValues:
+    target: str
+    exists: bool
+    etag: str | None
+    predecessor_declared: bool
+    observed_content_hash: str | None
+    observed_size: int | None
+    observed_protocol_version: str | None
+    observed_checksum_algorithm: str | None
+    observed_checksum_b64: str | None
+
+
 def _inspection_values(
     inspection: SinkEffectInspection,
     *,
     effect_id: str,
     provider: str,
-) -> tuple[str, bool, str | None, bool]:
+) -> _InspectionValues:
     evidence = inspection.evidence
     if evidence["schema"] != _INSPECTION_SCHEMA or evidence["effect_id"] != effect_id:
         raise RemoteObjectPreconditionError("remote inspection is missing or bound to another effect")
@@ -267,7 +308,17 @@ def _inspection_values(
     etag = _optional_string(evidence["observed_etag"], "observed_etag")
     if exists != (etag is not None):
         raise RemoteObjectPreconditionError("remote inspection existence and ETag diverge")
-    return _string(evidence["target"], "target"), exists, etag, predecessor_declared
+    return _InspectionValues(
+        target=_string(evidence["target"], "target"),
+        exists=exists,
+        etag=etag,
+        predecessor_declared=predecessor_declared,
+        observed_content_hash=_optional_string(evidence["observed_content_hash"], "observed_content_hash"),
+        observed_size=_optional_integer(evidence["observed_size"], "observed_size"),
+        observed_protocol_version=_optional_string(evidence["observed_protocol_version"], "observed_protocol_version"),
+        observed_checksum_algorithm=_optional_string(evidence["observed_checksum_algorithm"], "observed_checksum_algorithm"),
+        observed_checksum_b64=_optional_string(evidence["observed_checksum_b64"], "observed_checksum_b64"),
+    )
 
 
 def _spool_root() -> Path:
@@ -410,12 +461,14 @@ def prepare_remote_object(
     diverted_ordinals: Sequence[int],
     predecessor_descriptor: ArtifactDescriptor | None,
     checksum_algorithm: str,
+    allow_replace: bool = False,
     diversion_attribution: Sequence[DiversionAttribution] = (),
 ) -> SinkEffectPlan:
     """Persist an effect-addressed body and return a fresh-process-safe plan."""
     _lower_hex(effect_id, "effect_id")
-    target, exists, etag, predecessor_declared = _inspection_values(inspection, effect_id=effect_id, provider=provider)
-    if predecessor_declared != (predecessor_descriptor is not None):
+    values = _inspection_values(inspection, effect_id=effect_id, provider=provider)
+    target, exists, etag = values.target, values.exists, values.etag
+    if values.predecessor_declared != (predecessor_descriptor is not None):
         raise RemoteObjectPreconditionError("prepare predecessor diverges from inspection")
     path = _stage_path(effect_id, provider)
     algorithm = _checksum_algorithm(checksum_algorithm)
@@ -445,16 +498,61 @@ def prepare_remote_object(
         size_bytes=staged_size,
     )
     inherited = predecessor_descriptor == descriptor
+    precondition = "if_match" if exists else "if_none_match"
+    predecessor_etag = etag
     if virtual_no_publication:
+        # Nothing is ever published under this plan, so no replace is ever
+        # authorized or needed — true regardless of overwrite config.
         publication_kind = "virtual"
         descriptor_mode = SinkEffectDescriptorMode.NO_PUBLICATION
+        replace_authority = "none"
     elif inherited:
+        # `inherited` implies a declared predecessor (a bare descriptor can
+        # never equal None), so the resume/predecessor lineage is the
+        # authority — even though this plan never writes either.
         publication_kind = "inherited"
         descriptor_mode = SinkEffectDescriptorMode.NO_PUBLICATION
+        replace_authority = "predecessor_lineage"
         path.unlink(missing_ok=True)
     else:
-        publication_kind = "conditional_replace" if exists else "conditional_create"
-        descriptor_mode = SinkEffectDescriptorMode.PRECOMPUTED
+        # Content-identity idempotence: the existing object's full verified
+        # identity (hash, size, protocol, checksum algorithm, checksum
+        # bytes) equals what this effect would stage. Never credit a
+        # metadata-only or partial match — an unverifiable foreign object
+        # falls through to the reject/replace branch below.
+        content_verified = (
+            exists
+            and values.observed_content_hash == staged_hash
+            and values.observed_size == staged_size
+            and values.observed_protocol_version == SINK_EFFECT_PROTOCOL_VERSION
+            and values.observed_checksum_algorithm == algorithm
+            and values.observed_checksum_b64 == checksum_b64
+        )
+        if predecessor_descriptor is None and content_verified:
+            # A reaffirmation is definitionally not a replace: it never
+            # attempts provider I/O, so it carries no replace authority and
+            # no if_match precondition, regardless of overwrite config.
+            publication_kind = "reaffirmed"
+            descriptor_mode = SinkEffectDescriptorMode.NO_PUBLICATION
+            replace_authority = "none"
+            precondition = "if_none_match"
+            predecessor_etag = None
+            path.unlink(missing_ok=True)
+        else:
+            if predecessor_descriptor is not None:
+                replace_authority = "predecessor_lineage"
+            elif exists and allow_replace:
+                replace_authority = "overwrite_config"
+            else:
+                replace_authority = "none"
+            if exists and replace_authority == "none":
+                # Existing object, no predecessor lineage, no overwrite
+                # authority, and not provably identical: fail closed rather
+                # than silently clobbering or crediting unproven equality.
+                path.unlink(missing_ok=True)
+                raise RemoteObjectCollisionError("remote object already exists and cannot be verified as identical or replaced")
+            publication_kind = "conditional_replace" if exists else "conditional_create"
+            descriptor_mode = SinkEffectDescriptorMode.PRECOMPUTED
     try:
         attribution = parse_diversion_attribution(
             diversion_attribution,
@@ -467,8 +565,8 @@ def prepare_remote_object(
         provider=provider,
         target=target,
         staging_path=str(path),
-        precondition="if_match" if exists else "if_none_match",
-        predecessor_etag=etag,
+        precondition=precondition,
+        predecessor_etag=predecessor_etag,
         staged_hash=staged_hash,
         staged_size=staged_size,
         checksum_algorithm=algorithm,
@@ -478,6 +576,7 @@ def prepare_remote_object(
         diverted_ordinals=diverted,
         diversion_attribution=attribution,
         publication_kind=publication_kind,
+        replace_authority=replace_authority,
     )
     evidence = value.as_mapping()
     return SinkEffectPlan(
@@ -548,6 +647,27 @@ def remote_stage_missing(plan: SinkEffectPlan, *, provider: str) -> bool:
     """Report whether the plan's effect-addressed staged body is absent."""
     _evidence, stage = validate_remote_plan(plan, provider=provider, require_stage=False)
     return not stage.is_file()
+
+
+def require_commit_authority(evidence: RemoteObjectPlanEvidence, *, overwrite: bool) -> None:
+    """Re-check replace authority immediately before provider I/O.
+
+    A durable plan is data, not a live decision: the sink's `_overwrite`
+    configuration can differ at commit time from what it was at prepare
+    time (a stale or replayed plan, a different sink instance now
+    configured overwrite=False). `inspect_effect`'s guard was the sole
+    enforcement of `overwrite=False`; this closes the gap it left in
+    `commit_effect`, which otherwise IfMatch-overwrites any existing
+    object a plan tells it to. A no-op (`if_none_match`) precondition
+    never replaces anything and needs no authority check.
+    """
+    if evidence.precondition != "if_match":
+        return
+    if evidence.replace_authority == "predecessor_lineage":
+        return
+    if evidence.replace_authority == "overwrite_config" and overwrite:
+        return
+    raise RemoteObjectPreconditionError("remote object commit authority no longer covers this conditional replace")
 
 
 def restage_remote_object(
@@ -652,6 +772,7 @@ def iter_file_chunks(path: Path) -> Iterable[bytes]:
 
 
 __all__ = [
+    "RemoteObjectCollisionError",
     "RemoteObjectEffectError",
     "RemoteObjectEffectLimitError",
     "RemoteObjectObservation",
@@ -664,6 +785,7 @@ __all__ = [
     "reconcile_remote_observation",
     "remote_commit_result",
     "remote_stage_missing",
+    "require_commit_authority",
     "restage_remote_object",
     "validate_remote_plan",
 ]

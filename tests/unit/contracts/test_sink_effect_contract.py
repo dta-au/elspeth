@@ -574,6 +574,15 @@ def test_plan_protocol_descriptor_and_inspection_modes_validate_exactly() -> Non
         ).expected_descriptor
         == EXACT_DESCRIPTOR
     )
+    assert (
+        _plan(
+            descriptor_mode=SinkEffectDescriptorMode.NO_PUBLICATION,
+            inspection_mode=SinkEffectInspectionMode.NO_INSPECTION_REQUIRED,
+            expected_descriptor=EXACT_DESCRIPTOR,
+            safe_evidence={"publication_kind": "reaffirmed"},
+        ).expected_descriptor
+        == EXACT_DESCRIPTOR
+    )
 
     with pytest.raises(ValueError, match="protocol_version"):
         _plan().__class__(
