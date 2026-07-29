@@ -940,6 +940,13 @@ class CoalesceSettings(BaseModel):
     timeout_seconds: float | None = Field(
         default=None,
         gt=0,
+        # allow_inf_nan=False closes the `inf` hole that `gt=0` leaves open:
+        # CoalesceExecutor.check_timeouts compares `elapsed > timeout_seconds`,
+        # so an infinite timeout silently disables the sweep instead of
+        # bounding the wait — and best_effort/quorum, which require a timeout to
+        # resolve, are left without a working one. NaN is already rejected by
+        # gt=0 (nan > 0 is False).
+        allow_inf_nan=False,
         description="Max wait time (required for best_effort, optional for quorum)",
     )
     quorum_count: int | None = Field(
@@ -985,6 +992,12 @@ class CoalesceSettings(BaseModel):
             val = input_connection.strip()
             _validate_connection_or_sink_name(key, field_label="Coalesce branch name")
             _validate_connection_or_sink_name(val, field_label=f"Coalesce branch '{key}' input connection")
+            # min_length=2 is enforced on the raw mapping, so trimming must not
+            # be allowed to collapse two declared branches into one — branch
+            # count is the join contract (require_all/quorum arity), not a
+            # cosmetic detail.
+            if key in validated:
+                raise ValueError(f"Coalesce branch names collide after trimming whitespace: '{key}' is declared twice")
             validated[key] = val
         return validated
 
