@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from hypothesis import Phase, Verbosity, settings
@@ -150,6 +151,90 @@ def _sink_effect_spool_outside_repo(tmp_path_factory: pytest.TempPathFactory) ->
     patch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path_factory.mktemp("sink-effect-spool")))
     yield
     patch.undo()
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_ELSPETH = _REPO_ROOT / ".elspeth"
+
+
+def _in_repo_elspeth(candidate: str) -> Path | None:
+    """Return the resolved path when it targets ``<repo>/.elspeth``, else None."""
+    resolved = Path(candidate).expanduser().resolve()
+    if resolved == _REPO_ELSPETH or _REPO_ELSPETH in resolved.parents:
+        return resolved
+    return None
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _refuse_in_repo_elspeth_writes() -> Iterator[None]:
+    """Fail closed when the suite writes into the checkout's ``.elspeth/``.
+
+    Several settings default to CWD-relative ``.elspeth/`` paths and pytest
+    runs with the checkout as CWD, so a test that drives a real run without
+    redirecting them silently accumulates state in the developer's tree. It is
+    gitignored, so ``git status`` never surfaces it. Two defaults have already
+    done this: ``payload_store.base_path`` (~800K per full run) and the
+    sign-bundle rotation log.
+
+    Two layers, because no single one covers every write:
+
+    * ``os.mkdir`` is the choke point for ``Path.mkdir`` and ``os.makedirs``,
+      so refusing there names the offending test and, by raising before the
+      call, keeps the directory from being created at all.
+    * The fd-relative walk in ``core.audit_export_content_store`` passes bare
+      component names against a parent descriptor, so a path-based hook cannot
+      see it. The session-end sweep catches that, plus any plain file written
+      into ``.elspeth/`` without a ``mkdir``.
+
+    Fix a firing guard at the test, never by relaxing this fixture:
+
+    * ``payload_store.base_path`` is user-configurable — declare it under
+      ``tmp_path`` in the test's settings.
+    * ``landscape.export`` ``spool_root`` / ``content_store.root`` are
+      code-owned and reject absolute paths, so CWD is the only lever —
+      use ``monkeypatch.chdir(tmp_path)``.
+    """
+    before = frozenset(entry.name for entry in _REPO_ELSPETH.iterdir()) if _REPO_ELSPETH.is_dir() else frozenset()
+
+    original_mkdir = os.mkdir
+
+    def guarded_mkdir(path: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        # dir_fd calls carry a bare component name that cannot be resolved to
+        # an absolute path here; the session-end sweep below covers them.
+        if dir_fd is None:
+            candidate = os.fspath(path) if not isinstance(path, int) else None  # type: ignore[arg-type]
+            if isinstance(candidate, bytes):
+                candidate = candidate.decode(errors="replace")
+            # Cheap pre-filter: almost no mkdir in the suite mentions .elspeth,
+            # and resolve() is a syscall we should not pay on every call.
+            if candidate is not None and ".elspeth" in candidate:
+                resolved = _in_repo_elspeth(candidate)
+                if resolved is not None:
+                    # BaseException-derived (pytest.fail), so the `except OSError`
+                    # and `suppress(FileExistsError)` guards around production
+                    # mkdir calls cannot swallow it.
+                    pytest.fail(
+                        f"Test wrote into the repository checkout: {resolved}\n"
+                        f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
+                        f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
+                        pytrace=True,
+                    )
+        return original_mkdir(path, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(os, "mkdir", guarded_mkdir)
+    yield
+    patch.undo()
+
+    after = frozenset(entry.name for entry in _REPO_ELSPETH.iterdir()) if _REPO_ELSPETH.is_dir() else frozenset()
+    created = sorted(after - before)
+    if created:
+        pytest.fail(
+            f"Suite created {', '.join(created)} under {_REPO_ELSPETH}\n"
+            f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
+            f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
+            pytrace=False,
+        )
 
 
 @pytest.fixture(autouse=True)
