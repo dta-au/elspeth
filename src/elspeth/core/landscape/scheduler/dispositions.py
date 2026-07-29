@@ -719,6 +719,7 @@ class SchedulerDispositionRepository:
             expand_group_id=emission.expand_group_id,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
+            row_union_name=emission.row_union_name,
         )
         inserted = insert_work_item_idempotent(
             conn,

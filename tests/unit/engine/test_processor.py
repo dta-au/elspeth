@@ -53,7 +53,7 @@ from elspeth.contracts.results import FailureInfo, GateResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
-from elspeth.contracts.types import BranchName, CoalesceName, GateName, NodeID, SinkName
+from elspeth.contracts.types import BranchName, CoalesceName, GateName, NodeID, RowUnionName, SinkName
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
 from elspeth.core.config import AggregationSettings, GateSettings
 from elspeth.core.landscape import LandscapeDB
@@ -9339,6 +9339,11 @@ class TestReadyEmissionEnqueueParity:
             # node structural (in node_to_next, no plugin) so queue_key derives
             # the node id.
             "structural_queue",
+            # row_union-cursor item: the third barrier kind. Without a flavor
+            # that sets row_union_name non-None, both derivations project the
+            # column as NULL and the parity assertion passes while a drop site
+            # ships (elspeth-a5b86149d4 remediation).
+            "row_union_cursor",
         ],
     )
     def test_ready_emission_mirrors_enqueue_work_item_fields(self, flavor: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -9375,6 +9380,23 @@ class TestReadyEmissionEnqueueParity:
                 current_node_id=continue_node,
                 coalesce_node_id=coalesce_node,
                 coalesce_name=CoalesceName("merge"),
+                on_success_sink="merged_sink",
+            )
+        elif flavor == "row_union_cursor":
+            token = TokenInfo(
+                row_id="row-1",
+                token_id="token-merged-1",
+                row_data=make_pipeline_row({"value": 42}),
+                branch_name="path_a",
+                fork_group_id="fork-1",
+                expand_group_id="expand-1",
+            )
+            _persist_token_for_scheduler(factory, token)
+            item = WorkItem(
+                token=token,
+                current_node_id=continue_node,
+                row_union_node_id=NodeID("row_union::variants"),
+                row_union_name=RowUnionName("variants"),
                 on_success_sink="merged_sink",
             )
         else:
@@ -9455,11 +9477,23 @@ class TestReadyEmissionEnqueueParity:
             assert values_from_emission["coalesce_name"] == "merge"
             assert values_from_emission["branch_name"] == "path_a"
             assert values_from_emission["fork_group_id"] == "fork-1"
+            assert values_from_emission["row_union_name"] is None
+        elif flavor == "row_union_cursor":
+            # A barrier-bound item never derives a structural queue key, and
+            # the row_union name IS the durable barrier key.
+            assert values_from_emission["queue_key"] is None
+            assert values_from_emission["barrier_key"] == "variants"
+            assert values_from_emission["row_union_name"] == "variants"
+            assert values_from_emission["coalesce_node_id"] is None
+            assert values_from_emission["coalesce_name"] is None
+            assert values_from_emission["branch_name"] == "path_a"
+            assert values_from_emission["fork_group_id"] == "fork-1"
         else:
             assert values_from_emission["queue_key"] == str(continue_node)
             assert values_from_emission["barrier_key"] is None
             assert values_from_emission["coalesce_node_id"] is None
             assert values_from_emission["coalesce_name"] is None
+            assert values_from_emission["row_union_name"] is None
             assert values_from_emission["join_group_id"] == "join-1"
         assert values_from_emission["expand_group_id"] == "expand-1"
         assert values_from_emission["step_index"] == 2
