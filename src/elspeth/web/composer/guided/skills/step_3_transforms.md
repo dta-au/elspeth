@@ -36,3 +36,12 @@ When a selected plugin consumes a value-shape-sensitive field, use only the
 server's redacted sample shape markers to identify a likely mismatch. Do not
 repeat, infer, or expose sample values. Propose a schema-authorized normalization
 step when a reviewed shape is incompatible.
+
+## LLM node field declarations
+
+An `llm` node's field contract is explicit and two-way: every `row.*` field its
+`prompt_template` interpolates MUST also appear in
+`options.required_input_fields`, and every declared field must be interpolated
+(declare `required_input_fields: []` only as a deliberate opt-out). Emitting an
+llm node whose template reads `{{ row.content }}` without
+`required_input_fields: ["content"]` is rejected at proposal time.

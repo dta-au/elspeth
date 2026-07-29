@@ -536,8 +536,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"plugin_options_invalid",
-        "One or more of the component's options failed its plugin schema (missing required option, wrong shape, flexible schema without fields, or — for llm — a missing/invalid operator profile alias).",
-        "Call get_plugin_schema(<plugin_type>, <plugin_name>) for the exact option shapes and allowed values (the llm transform's 'profile' enum lists the operator-approved aliases), fix only the offending options, and re-emit. For schema options: use {mode: observed} to infer types, or provide explicit fields with mode fixed/flexible.",
+        "One of the component's options failed its plugin schema. This code alone does not identify WHICH option: the rejection's 'detail' field carries the validator's own message naming the exact option and requirement — read it before hypothesising a cause.",
+        "Apply exactly what 'detail' names (it usually includes a ready repair, e.g. a patch_node_options call). Only if detail is absent: call get_plugin_schema(<plugin_type>, <plugin_name>) for the exact option shapes and allowed values, fix only the offending options, and re-emit. Common traps, all equally likely: an llm node must declare options.required_input_fields matching its prompt_template's row.* references (or [] to opt out); schema options use {mode: observed} to infer types or explicit fields with mode fixed/flexible; the llm 'profile' must be one of the enum aliases from get_plugin_schema.",
     ),
     (
         r"transform_on_success_dangling|aggregation_on_success_dangling|source_on_success_dangling|is neither a sink nor a known connection",

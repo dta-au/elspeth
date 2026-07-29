@@ -2573,6 +2573,52 @@ def test_allowlisted_candidate_feedback_enriches_node_shape_codes() -> None:
     assert feedback["guidance"] == ("To expand any code, call explain_validation_error with the exact code string.")
 
 
+def test_allowlisted_candidate_feedback_carries_plugin_options_detail() -> None:
+    """``plugin_options_invalid`` carries the validator message as ``detail``.
+
+    The options-validator message quotes only the rejected candidate's own
+    authored options — already verbatim in the planner's context — and it
+    names the exact failing option with its repair. Withholding it made the
+    rejection unrepairable: run 06c9ec49 (2026-07-29) burned every repair
+    turn on the static enrichment's profile-alias hypothesis while the
+    validator's missing-``required_input_fields`` message (and its one-line
+    patch) never reached the model. Other codes keep the message withheld.
+    """
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="node:summarize",
+                message=(
+                    "Node 'summarize': Invalid options for transform 'llm': "
+                    "LLM prompt_template references row fields ['content'] "
+                    "but options.required_input_fields is not declared."
+                ),
+                severity="error",
+                error_code="plugin_options_invalid",
+            ),
+            ValidationEntry(
+                component="node:other",
+                message="WITHHELD_MESSAGE_CANARY",
+                severity="error",
+                error_code="unknown_node_type",
+            ),
+        ),
+    )
+
+    feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary)))
+
+    entries = feedback["validation"]["errors"]
+    options_entry = next(e for e in entries if e["error_code"] == "plugin_options_invalid")
+    assert "required_input_fields is not declared" in options_entry["detail"]
+    # The static enrichment still rides along and now defers to detail.
+    assert "detail" in options_entry["explanation"]
+    # Every other code keeps its raw message withheld.
+    other_entry = next(e for e in entries if e["error_code"] == "unknown_node_type")
+    assert "detail" not in other_entry
+    assert "WITHHELD_MESSAGE_CANARY" not in json.dumps(feedback)
+
+
 @pytest.mark.parametrize(
     "feedback",
     (

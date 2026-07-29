@@ -761,6 +761,18 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
     registered pipeline-decision kinds. The enrichment text is a public
     constant, never per-request data, so it does not re-open the message
     boundary this allowlist protects. Codes with no catalogue entry stay bare.
+
+    ``plugin_options_invalid`` additionally carries the validator's own
+    message as ``detail``. That message quotes only the OPTIONS OF THE
+    REJECTED CANDIDATE — content the planner itself authored in the very
+    tool call being answered, already present verbatim in its context and
+    in the session's tool audit — so echoing it back to the same planner
+    crosses no custody boundary. Withholding it made an exactly-repairable
+    rejection unrepairable: on run 06c9ec49 (2026-07-29) the validator
+    named the missing ``required_input_fields`` declaration and its
+    one-line patch, the planner never saw either, burned every repair on
+    the static enrichment's profile-alias hypothesis, and declined with a
+    confabulated cause — twice, in two sessions.
     """
     validation = result.validation
     errors: list[dict[str, Any]] = []
@@ -776,6 +788,8 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
         guidance = explain_validation_code(code)
         if guidance is not None:
             projected["explanation"], projected["suggested_fix"] = guidance
+        if code == "plugin_options_invalid":
+            projected["detail"] = entry.message
         if code == "coalesce_branch_unreachable":
             # Instance wiring facts derived from the REJECTED state the result
             # carries — same redaction class as the contract facts below (node
