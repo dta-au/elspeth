@@ -79,10 +79,13 @@ def test_verifier_returns_only_redacted_metadata_for_valid_bundle(tmp_path: Path
 @pytest.mark.parametrize(
     ("content", "code"),
     [
-        (b"", "empty"),
-        (b"-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n", "malformed_pem"),
-        (_self_signed_certificate(ca=True) + b"not-whitespace", "trailing_data"),
-        (_self_signed_certificate(ca=False), "non_ca_certificate"),
+        # Explicit ids keep collection deterministic: the generated certificates
+        # differ per process, and xdist rejects workers whose auto-derived ids
+        # (built from the parameter bytes) disagree.
+        pytest.param(b"", "empty", id="empty"),
+        pytest.param(b"-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n", "malformed_pem", id="malformed_pem"),
+        pytest.param(_self_signed_certificate(ca=True) + b"not-whitespace", "trailing_data", id="trailing_data"),
+        pytest.param(_self_signed_certificate(ca=False), "non_ca_certificate", id="non_ca_certificate"),
     ],
 )
 def test_verifier_rejects_invalid_certificate_content(
