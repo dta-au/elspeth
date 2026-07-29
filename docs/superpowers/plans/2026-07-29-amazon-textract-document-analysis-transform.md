@@ -472,7 +472,7 @@ git commit -m "feat(textract): normalize document analysis blocks"
 - Create: `src/elspeth/plugins/transforms/aws/textract_client.py`
 - Create: `tests/unit/plugins/transforms/aws/test_textract_client.py`
 
-- [ ] **Step 1: Write failing audited-client tests**
+- [x] **Step 1: Write failing audited-client tests**
 
 Create fakes for a call recorder, telemetry callback, limiter, and SDK protocol. The recorder must implement `allocate_call_index()` and `record_call()` and append `"audit"` to an order list; telemetry appends `"telemetry"`.
 
@@ -519,7 +519,7 @@ def test_get_replaces_raw_next_token_with_fingerprint_in_audit() -> None:
 
 Add tests for no-version/no-query request omission, `QueriesConfig` shape, limiter acquisition, attempt extraction, malformed response, oversized semantic response, all retryable and non-retryable botocore codes, raw-message redaction, idempotency mismatch's distinct exception, and telemetry not firing when audit persistence fails.
 
-- [ ] **Step 2: Run client tests and verify import failure**
+- [x] **Step 2: Run client tests and verify import failure**
 
 Run:
 
@@ -529,7 +529,7 @@ pytest tests/unit/plugins/transforms/aws/test_textract_client.py -q
 
 Expected: collection fails because `textract_client.py` does not exist.
 
-- [ ] **Step 3: Implement SDK protocol, receipts, and sanitized errors**
+- [x] **Step 3: Implement SDK protocol, receipts, and sanitized errors**
 
 Create `src/elspeth/plugins/transforms/aws/textract_client.py` with:
 
@@ -592,7 +592,7 @@ class TextractSDKClient(Protocol):
 
 Define `_RETRYABLE_CODES` as exactly `InternalServerError`, `ThrottlingException`, `ProvisionedThroughputExceededException`, and `LimitExceededException`. Treat botocore connection/endpoint/read-timeout exceptions as retryable with code `transport_error`. Bound every AWS code to 128 characters and never retain `Error.Message`.
 
-- [ ] **Step 4: Implement the client builder and audited operations**
+- [x] **Step 4: Implement the client builder and audited operations**
 
 Implement:
 
@@ -627,7 +627,7 @@ Implement `TextractClient(AuditedClientBase)` with constructor fields for region
 
 Both methods allocate the call index before SDK invocation, acquire the limiter once, record exactly one success/error call, then emit telemetry. Use `canonical_json(semantic_response)` to enforce the per-call byte cap before constructing `RawCallPayload`.
 
-- [ ] **Step 5: Run client tests**
+- [x] **Step 5: Run client tests**
 
 Run:
 
@@ -637,7 +637,7 @@ pytest tests/unit/plugins/transforms/aws/test_textract_client.py -q
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```bash
 git add src/elspeth/plugins/transforms/aws/textract_client.py tests/unit/plugins/transforms/aws/test_textract_client.py
