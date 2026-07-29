@@ -35,6 +35,7 @@ gateway/
     sdk/__init__.py        # re-exports: types, protocol, Capability
     sdk/types.py           # canonical frozen request/response models
     sdk/protocol.py        # AdapterDescriptor, InvokePlan, UpstreamFailure, AdapterProtocol
+    core/__init__.py       # empty — regular package, not implicit namespace
     core/errors.py         # GatewayErrorCode, GatewayError, envelope
     core/parsing.py        # strict JSON (dup keys, UTF-8, non-finite, size)
     core/contract.py       # inbound ChatRequest subset + response builder
