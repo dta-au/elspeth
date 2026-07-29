@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json
 
 
@@ -533,7 +533,7 @@ def normalize_textract_result(
     if sorted(page_block_numbers) != list(range(1, page_count + 1)):
         _malformed("Blocks", "PAGE block numbering does not match DocumentMetadata.Pages")
 
-    copied_blocks = [deepcopy(dict(block)) for block in blocks]
+    copied_blocks = [deep_thaw(block) for block in blocks]
     native_result: dict[str, Any] = {
         "JobStatus": "SUCCEEDED",
         "DocumentMetadata": {"Pages": page_count},

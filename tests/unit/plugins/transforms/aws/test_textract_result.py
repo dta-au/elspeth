@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.freeze import deep_freeze
 from elspeth.plugins.transforms.aws.textract_result import (
     MalformedTextractResponse,
     normalize_textract_result,
@@ -183,6 +184,22 @@ def test_normalize_text_pages_metadata_and_native_result() -> None:
     assert "ResponseMetadata" not in result.native_result
     assert "NextToken" not in result.native_result
     assert "UnknownTopLevel" not in result.native_result
+
+
+def test_normalize_accepts_deeply_frozen_audited_client_pages() -> None:
+    frozen_pages = deep_freeze([_first_page(), _second_page()])
+
+    result = normalize_textract_result(
+        job_id="job-1",
+        result_pages=frozen_pages,
+        feature_types=("FORMS", "TABLES"),
+        s3_version="version-1",
+        max_blocks=200_000,
+        max_result_bytes=50_000_000,
+    )
+
+    assert result.text == "Invoice\nTotal $42\n\f\nThank you"
+    assert result.native_result["Blocks"][0]["Relationships"] == [{"Type": "CHILD", "Ids": ["line-1", "line-2"]}]
 
 
 def test_duplicate_block_id_fails_closed() -> None:
