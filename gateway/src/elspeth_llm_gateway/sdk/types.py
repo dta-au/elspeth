@@ -73,7 +73,7 @@ class ResponseFormatSpec(BaseModel):
 
     kind: Literal["json_object", "json_schema"]
     schema_name: str | None = None
-    schema: dict | None = None
+    json_schema: dict | None = None
 
 
 class CanonicalRequest(BaseModel):

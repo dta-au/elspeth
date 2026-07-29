@@ -119,13 +119,13 @@ def test_response_format_spec_happy_path():
     spec = ResponseFormatSpec(kind="json_object")
     assert spec.kind == "json_object"
     assert spec.schema_name is None
-    assert spec.schema is None
+    assert spec.json_schema is None
 
 
 def test_response_format_spec_json_schema_happy_path():
-    spec = ResponseFormatSpec(kind="json_schema", schema_name="Foo", schema={"type": "object"})
+    spec = ResponseFormatSpec(kind="json_schema", schema_name="Foo", json_schema={"type": "object"})
     assert spec.schema_name == "Foo"
-    assert spec.schema == {"type": "object"}
+    assert spec.json_schema == {"type": "object"}
 
 
 def test_response_format_spec_is_frozen():
@@ -270,6 +270,16 @@ def test_canonical_response_happy_path_with_usage():
     usage = CanonicalUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
     resp = CanonicalResponse(text="hi", finish_reason=FinishReason.STOP, usage=usage)
     assert resp.usage == usage
+
+
+def test_canonical_response_empty_text_counts_as_text_present():
+    # Empty string is the adapter-mapping convention for a "successful" finish
+    # (e.g. content_filter or length truncation) that salvaged no text: it is
+    # never represented as None. text="" satisfies the has_text side of the
+    # XOR validator.
+    resp = CanonicalResponse(text="", finish_reason=FinishReason.CONTENT_FILTER)
+    assert resp.text == ""
+    assert resp.tool_calls == ()
 
 
 def test_canonical_response_is_frozen():
