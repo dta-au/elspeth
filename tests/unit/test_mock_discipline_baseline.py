@@ -19,6 +19,9 @@ SCAN_ROOT = REPO_ROOT
 PRUNE_DIRS = frozenset(
     {
         ".cache",
+        # Agent worktrees live under .claude/worktrees/<name>; each carries its
+        # own copy of this gate, so the main-tree scan must not govern them.
+        ".claude",
         ".git",
         ".mypy_cache",
         ".pytest_cache",
