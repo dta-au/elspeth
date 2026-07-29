@@ -29,6 +29,7 @@ from elspeth.web.composer.guided.stage_transitions import (
     finish_component_review,
     remove_reviewed_component,
     reorder_reviewed_components,
+    source_plugin_accepts_blob_inspection,
     transition_sink_field_review,
     transition_sink_plugin_selection,
     transition_sink_schema_form,
@@ -2511,22 +2512,30 @@ async def post_guided_respond(
         inspection_facts: SourceInspectionFacts | None = None
         if observed_guided.step is GuidedStep.STEP_1_SOURCE:
             if current_turn["type"] == TurnType.SINGLE_SELECT.value:
-                try:
-                    inspection_facts = await inspect_selected_ready_session_blob(
-                        request.app.state.blob_service,
-                        session_id,
-                        selected_blob_id=body.source_blob_id,
+                selected_source_plugin = body.chosen[0] if body.chosen is not None and len(body.chosen) == 1 else None
+                accepts_blob_inspection = source_plugin_accepts_blob_inspection(selected_source_plugin)
+                if body.source_blob_id is not None and not accepts_blob_inspection:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="source_blob_id is not valid for the selected source plugin.",
                     )
-                except SourceInspectionBlobLifecycleError as exc:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Selected source blob is no longer a ready upload for this session.",
-                    ) from exc
-                except ValueError as exc:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Selected source blob is not a ready upload for this session.",
-                    ) from exc
+                if accepts_blob_inspection:
+                    try:
+                        inspection_facts = await inspect_selected_ready_session_blob(
+                            request.app.state.blob_service,
+                            session_id,
+                            selected_blob_id=body.source_blob_id,
+                        )
+                    except SourceInspectionBlobLifecycleError as exc:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Selected source blob is no longer a ready upload for this session.",
+                        ) from exc
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Selected source blob is not a ready upload for this session.",
+                        ) from exc
             elif current_turn["type"] == TurnType.SCHEMA_FORM.value:
                 inspection_facts = await _schema8_active_source_edit_inspection(
                     request.app.state.blob_service,
@@ -2715,7 +2724,10 @@ async def post_guided_respond(
                         current_fence: GuidedOperationFence,
                         tool_recorder: BufferingRecorder,
                         llm_recorder: BufferingRecorder,
+                        current_turn: Turn,
+                        prepared_current: PreparedGuidedJsonPayload,
                         pending_payloads: tuple[PreparedGuidedJsonPayload, ...],
+                        tool_invocation_count: int | None = None,
                     ) -> GuidedRespondResponse:
                         """Persist an escape-hatch decline as an ordinary chat turn.
 
@@ -2728,11 +2740,12 @@ async def post_guided_respond(
                         ``chatHistory={guidedSession.chat_history}`` regardless
                         of endpoint — and the operation completes via the
                         generic state settlement (legal for kind="guided_respond"
-                        per ``_guided_completion_values``) with no new turn. The
-                        step/proposal this attempt was trying to advance is left
-                        untouched (``base_guided`` is the caller's pre-attempt,
-                        unmutated GuidedSession), so the operator retries with a
-                        fresh operation_id and their pending turn intact.
+                        per ``_guided_completion_values``) without emitting a
+                        successor turn. The step/proposal this attempt was trying
+                        to advance is left untouched (``base_guided`` is the
+                        caller's pre-attempt, unmutated GuidedSession), so the
+                        response re-presents the exact current unanswered turn and
+                        the operator can retry with a fresh operation_id.
 
                         The per-attempt values that would otherwise be closed
                         over from the enclosing retry loop (B023: a closure
@@ -2760,6 +2773,14 @@ async def post_guided_respond(
                         decline_is_valid, decline_validation_errors = _guided_persisted_validity(declined_state, catalog=catalog)
                         decline_meta = dict(current_meta)
                         decline_meta["guided_session"] = declined_guided.to_dict()
+                        decline_payloads = (
+                            pending_payloads
+                            if any(payload.payload_id == prepared_current.payload_id for payload in pending_payloads)
+                            else (*pending_payloads, prepared_current)
+                        )
+                        decline_tool_invocations = tool_recorder.invocations
+                        if tool_invocation_count is not None:
+                            decline_tool_invocations = decline_tool_invocations[:tool_invocation_count]
                         decline_settlement = await service.settle_guided_state_operation(
                             GuidedStateOperationCommand(
                                 fence=current_fence,
@@ -2783,12 +2804,16 @@ async def post_guided_respond(
                                 actor="composer_route",
                                 response=GuidedResponseDescriptor(
                                     kind="guided_respond",
-                                    next_turn=None,
+                                    next_turn=GuidedReplayTurn(
+                                        turn_type=TurnType(current_turn["type"]),
+                                        step_index=current_turn["step_index"],
+                                        payload_id=prepared_current.payload_id,
+                                    ),
                                     assistant_turn_seq=None,
                                 ),
-                                payloads=pending_payloads,
+                                payloads=decline_payloads,
                                 audit_evidence=GuidedAuditEvidence(
-                                    invocations=(*llm_recorder.invocations, *tool_recorder.invocations),
+                                    invocations=(*llm_recorder.invocations, *decline_tool_invocations),
                                     llm_calls=llm_recorder.llm_calls,
                                     chat_turns=llm_recorder.chat_turns,
                                 ),
@@ -3119,6 +3144,8 @@ async def post_guided_respond(
                                     current_fence=fence,
                                     tool_recorder=recorder,
                                     llm_recorder=planner_recorder,
+                                    current_turn=current_turn,
+                                    prepared_current=_planned_current,
                                     pending_payloads=tuple(prepared_payloads),
                                 )
                             plan, catalog_ids = outcome
@@ -3494,6 +3521,8 @@ async def post_guided_respond(
                                     current_fence=fence,
                                     tool_recorder=recorder,
                                     llm_recorder=planner_recorder,
+                                    current_turn=current_turn,
+                                    prepared_current=_planned_current,
                                     pending_payloads=tuple(prepared_payloads),
                                 )
                             plan, catalog_ids = outcome
@@ -3901,6 +3930,10 @@ async def post_guided_respond(
                                 composition_version=state.version,
                                 actor=user.user_id,
                             )
+                        # Candidate answer/advance evidence is durable only if
+                        # planning succeeds. A decline may retain this prefix,
+                        # including the real prospective turn emission above.
+                        decline_tool_invocation_count = len(recorder.invocations)
                         emit_turn_answered(
                             recorder,
                             step=prior_step,
@@ -4037,10 +4070,12 @@ async def post_guided_respond(
                                 # Today's failure path already persists nothing
                                 # and leaves the session at STEP_2_SINK; keeping
                                 # that means the decline is a completed operation
-                                # with the advisor's words visible, and nothing
-                                # else changes.
+                                # with the advisor's words visible and no
+                                # state-machine advance. ``prospective`` differs
+                                # from ``guided`` only when this request must
+                                # materialize the current unanswered occurrence.
                                 return await _settle_guided_planner_decline(
-                                    base_guided=guided,
+                                    base_guided=prospective,
                                     decline_text=outcome.decline_text.strip() or _empty_decline_fallback,
                                     current_state=state,
                                     current_state_record=state_record,
@@ -4048,7 +4083,10 @@ async def post_guided_respond(
                                     current_fence=fence,
                                     tool_recorder=recorder,
                                     llm_recorder=planner_recorder,
+                                    current_turn=current_turn,
+                                    prepared_current=planned_current,
                                     pending_payloads=tuple(prepared_payloads),
+                                    tool_invocation_count=decline_tool_invocation_count,
                                 )
                             plan, catalog_ids = outcome
                             projection = build_guided_proposal_projection(

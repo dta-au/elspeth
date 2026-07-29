@@ -86,7 +86,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError, SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
@@ -2117,6 +2117,67 @@ async def test_request_interpretation_review_without_persisted_state_returns_arg
     assert invocation.error_class == "ToolArgumentError"
     assert "composition_state_id" in (invocation.error_message or "")
 
+    events = await sessions_service.list_interpretation_events(session_id, status="all")
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_stale_interpretation_review_conflict_returns_arg_error(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A review invalidated under the service lock is LLM-correctable.
+
+    Direct service tests pin the race itself: the persisted composition head
+    can advance after the compose loop validates its in-memory snapshot.  This
+    full-loop regression pins the public dispatch boundary: the service's
+    typed stale-review conflict must become an audited ARG_ERROR instead of a
+    plugin crash that fails the compose request.
+    """
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_llm_node()
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+
+    async def _raise_stale_review_conflict(**_kwargs: Any) -> Any:
+        raise InterpretationPlaceholderConsumedError(
+            "create_pending_interpretation_event: reviewed content no longer matches the current composition state"
+        )
+
+    monkeypatch.setattr(
+        sessions_service,
+        "create_pending_interpretation_event",
+        _raise_stale_review_conflict,
+    )
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_stale_review",
+                tool_name="request_interpretation_review",
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "Visually appealing and well-organized.",
+                },
+            ),
+            _fake_text_response("I will rebuild the review from the latest pipeline state."),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        initial_state=state,
+    )
+
+    assert len(result.tool_invocations) == 1
+    invocation = result.tool_invocations[0]
+    assert invocation.tool_name == "request_interpretation_review"
+    assert invocation.status.value == "arg_error"
+    assert invocation.error_class == "ToolArgumentError"
+    assert "composition_state_id" in (invocation.error_message or "")
     events = await sessions_service.list_interpretation_events(session_id, status="all")
     assert events == []
 

@@ -569,6 +569,7 @@ describe("ChatPanel mode discriminator", () => {
         { id: "api", label: "API", hint: null },
       ],
       allow_custom: false,
+      source_blob_compatible_option_ids: ["csv"],
     };
     return { type: "single_select", step_index: 0, turn_token: turnToken, payload };
   }
@@ -646,13 +647,13 @@ describe("ChatPanel mode discriminator", () => {
       name: "Source file",
     });
     expect(rotatedSourceChooser).toHaveValue("");
-    expect(screen.getByRole("button", { name: "API" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
     fireEvent.change(rotatedSourceChooser, { target: { value: newerId } });
     await act(async () => {
-      screen.getByRole("button", { name: "API" }).click();
+      screen.getByRole("button", { name: "CSV" }).click();
     });
     expect(respondGuidedSpy.mock.calls[1][0]).toEqual(
-      expect.objectContaining({ chosen: ["api"], source_blob_id: newerId }),
+      expect.objectContaining({ chosen: ["csv"], source_blob_id: newerId }),
     );
     expect(respondGuidedSpy.mock.calls[0][0].source_blob_id).toBe(earlierId);
   });
@@ -698,6 +699,45 @@ describe("ChatPanel mode discriminator", () => {
     });
     expect(respondGuidedSpy).toHaveBeenCalledWith(
       expect.objectContaining({ chosen: ["csv"], source_blob_id: earlierId }),
+    );
+  });
+
+  it("does not bind recovered blobs to a non-file source option after a remount", async () => {
+    const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    const earlierId = "00000000-0000-4000-8000-000000001101";
+    const newerId = "00000000-0000-4000-8000-000000001102";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn("a".repeat(64)),
+      respondGuided: respondGuidedSpy,
+    });
+    useBlobStore.setState((state) => ({
+      blobs: [
+        ...state.blobs,
+        uploadedSource(earlierId, "earlier.csv"),
+        uploadedSource(newerId, "newer.csv"),
+      ],
+    }));
+
+    render(<ChatPanel />);
+
+    expect(
+      screen.getByRole("combobox", { name: "Source file" }),
+    ).toHaveValue("");
+    const apiOption = screen.getByRole("button", { name: "API" });
+    expect(apiOption).toBeEnabled();
+    await act(async () => {
+      apiOption.click();
+    });
+
+    expect(respondGuidedSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ chosen: ["api"] }),
+    );
+    expect(respondGuidedSpy.mock.calls[0][0]).not.toHaveProperty(
+      "source_blob_id",
     );
   });
 
@@ -851,10 +891,10 @@ describe("ChatPanel mode discriminator", () => {
       }));
     });
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "API" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "CSV" })).toBeDisabled();
     });
     await act(async () => {
-      screen.getByRole("button", { name: "API" }).click();
+      screen.getByRole("button", { name: "CSV" }).click();
     });
     expect(respondGuidedSpy).toHaveBeenCalledTimes(1);
   });

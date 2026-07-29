@@ -42,6 +42,42 @@ function wireResponse(payloadOverrides: Record<string, unknown> = {}): Record<st
   };
 }
 
+function singleSelectWireResponse(): Record<string, unknown> {
+  return {
+    guided_session: {
+      step: "step_1_source",
+      history: [{
+        step: "step_1_source",
+        turn_type: "single_select",
+        payload_hash: "a".repeat(64),
+        response_hash: null,
+        summary: null,
+        emitter: "server",
+      }],
+      terminal: null,
+      chat_history: [],
+      chat_turn_seq: 0,
+      profile: null,
+    },
+    next_turn: {
+      type: "single_select",
+      step_index: 0,
+      turn_token: "b".repeat(64),
+      payload: {
+        question: "Which data source would you like to use?",
+        options: [
+          { id: "csv", label: "CSV", hint: null },
+          { id: "api", label: "API", hint: null },
+        ],
+        allow_custom: false,
+        source_blob_compatible_option_ids: ["csv"],
+      },
+    },
+    terminal: null,
+    composition_state: null,
+  };
+}
+
 function aggregationNode(
   behaviorOverrides: Record<string, unknown> = {},
   cardinalityOverrides: Record<string, unknown> = {},
@@ -73,6 +109,17 @@ function aggregationNode(
 }
 
 describe("guided schema-10 wire decoder", () => {
+  it("decodes the server-owned source-blob-compatible option set", () => {
+    const decoded = decodeGetGuidedResponse(singleSelectWireResponse());
+
+    expect(decoded.next_turn?.type).toBe("single_select");
+    if (decoded.next_turn?.type === "single_select") {
+      expect(
+        decoded.next_turn.payload.source_blob_compatible_option_ids,
+      ).toEqual(["csv"]);
+    }
+  });
+
   it("decodes a wire turn bound to its pending proposal", () => {
     const decoded = decodeGetGuidedResponse(wireResponse());
 

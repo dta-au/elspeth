@@ -349,9 +349,14 @@ class TestSerialization:
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
 
-    def test_csv_missing_declared_field_is_a_contract_failure(self) -> None:
-        with pytest.raises(KeyError, match="name"):
-            _serialize([{"id": 1}], format="csv", fieldnames=["id", "name"])
+    def test_csv_sparse_rows_serialize_missing_optional_field_as_empty_cell(self) -> None:
+        serialized = _serialize(
+            [{"id": 1}, {"id": 2, "name": "present"}],
+            format="csv",
+            fieldnames=["id", "name"],
+        )
+        assert serialized.body.read() == b"id,name\r\n1,\r\n2,present\r\n"
+        serialized.close()
 
     def test_stateful_csv_encoding_uses_one_incremental_encoder_and_one_bom(self) -> None:
         serialized = _serialize(

@@ -44,6 +44,7 @@ from elspeth_lints.core.source_excerpt import (
     SourceExcerptPathOutsideRootError,
     resolve_safe_excerpt_path,
 )
+from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
 VerificationMode = Literal["shape-only", "authoritative"]
 
@@ -60,6 +61,7 @@ _SIGNABLE_DIAGNOSIS_STATUSES = frozenset(
         "AST_PATH_BINDING_DRIFT",
         "SCOPE_BINDING_DRIFT",
         "BINDING_DRIFT",
+        "IDENTITY_PREFIX_REPLACEMENT",
     }
 )
 _DIAGNOSIS_ENV_FILE_KEYS = frozenset(
@@ -128,8 +130,49 @@ def diagnose_judge_signatures(*, root: Path, allowlist_dir: Path) -> JudgeSignat
         verification_mode=mode,
         allowlist_dir=allowlist_dir,
         root=resolved_root,
-        items=tuple(items),
+        items=_downgrade_multiply_owned_identity_replacements(items),
     )
+
+
+def _downgrade_multiply_owned_identity_replacements(
+    items: list[JudgeSignatureDiagnosis],
+) -> tuple[JudgeSignatureDiagnosis, ...]:
+    """Keep same-prefix replacement pairing strictly one old row to one live row.
+
+    Diagnosis happens one YAML entry at a time, so each stale row can appear to
+    have a unique live replacement even when another allowlist row owns the
+    same identity. Such groups must use the conservative two-cycle path:
+    delete the stale rows first, then let a later scan expose the now-uncovered
+    live finding for a fresh judgment.
+    """
+    items_by_prefix: dict[str, list[JudgeSignatureDiagnosis]] = {}
+    for item in items:
+        try:
+            prefix = identity_prefix(item.key)
+        except ValueError:
+            continue
+        items_by_prefix.setdefault(prefix, []).append(item)
+
+    resolved: list[JudgeSignatureDiagnosis] = []
+    for item in items:
+        if item.status != "IDENTITY_PREFIX_REPLACEMENT":
+            resolved.append(item)
+            continue
+        prefix = identity_prefix(item.key)
+        owners = items_by_prefix[prefix]
+        if len(owners) == 1:
+            resolved.append(item)
+            continue
+        resolved.append(
+            JudgeSignatureDiagnosis(
+                status="NO_MATCHING_FINDING",
+                key=item.key,
+                source_file=item.source_file,
+                note="multiple allowlist rows own this identity; delete stale authority before judging the live finding",
+                detail=f"identity_owner_keys={sorted(owner.key for owner in owners)!r}",
+            )
+        )
+    return tuple(resolved)
 
 
 def load_diagnosis_env_file(env_file: Path | None) -> None:
@@ -537,6 +580,25 @@ def _diagnose_v2_entry(
         if len(fallback_matches) == 1:
             finding = fallback_matches[0]
         else:
+            identity_matches = [
+                candidate for candidate in findings if identity_prefix(_canonical_key_for_finding(candidate)) == identity_prefix(entry.key)
+            ]
+            if len(identity_matches) == 1:
+                replacement = identity_matches[0]
+                replacement_key = _canonical_key_for_finding(replacement)
+                return JudgeSignatureDiagnosis(
+                    status="IDENTITY_PREFIX_REPLACEMENT",
+                    key=entry.key,
+                    source_file=source_file,
+                    note="re-justify required; the sole live finding at this identity has a new semantic binding",
+                    repair_command=_justify_command(
+                        entry=entry,
+                        root=root,
+                        allowlist_dir=allowlist_dir,
+                        repair_key=replacement_key,
+                    ),
+                    repair_key=replacement_key,
+                )
             return JudgeSignatureDiagnosis(
                 status="NO_MATCHING_FINDING",
                 key=entry.key,

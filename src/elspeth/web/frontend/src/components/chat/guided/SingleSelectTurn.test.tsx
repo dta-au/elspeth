@@ -31,12 +31,14 @@ const PAYLOAD_NO_CUSTOM: SingleSelectPayload = {
     { id: "api", label: "REST API", hint: "Fetches data from an HTTP endpoint" },
   ],
   allow_custom: false,
+  source_blob_compatible_option_ids: ["csv"],
 };
 
 const PAYLOAD_WITH_CUSTOM: SingleSelectPayload = {
   question: "Which transform should we use?",
   options: [{ id: "llm_classify", label: "LLM Classifier", hint: null }],
   allow_custom: true,
+  source_blob_compatible_option_ids: ["llm_classify"],
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -132,6 +134,62 @@ describe("SingleSelectTurn — option click", () => {
     expect(screen.getByRole("combobox", { name: "Source file" })).toHaveValue("");
     expect(screen.getByRole("button", { name: "CSV File" })).toBeDisabled();
   });
+
+  it.each([
+    [
+      "omitted",
+      {
+        question: PAYLOAD_NO_CUSTOM.question,
+        options: PAYLOAD_NO_CUSTOM.options,
+        allow_custom: PAYLOAD_NO_CUSTOM.allow_custom,
+      } satisfies SingleSelectPayload,
+    ],
+    [
+      "empty",
+      {
+        ...PAYLOAD_NO_CUSTOM,
+        source_blob_compatible_option_ids: [],
+      } satisfies SingleSelectPayload,
+    ],
+  ])(
+    "ignores recovered source-file state when compatible metadata is %s",
+    async (_metadataState, payload) => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn();
+      const sourceBlobCandidates = [
+        {
+          id: "00000000-0000-4000-8000-000000000841",
+          filename: "first.csv",
+          sizeBytes: 16,
+        },
+        {
+          id: "00000000-0000-4000-8000-000000000842",
+          filename: "second.csv",
+          sizeBytes: 24,
+        },
+      ];
+      render(
+        <SingleSelectTurn
+          payload={payload}
+          onSubmit={onSubmit}
+          sourceBlobCandidates={sourceBlobCandidates}
+          sourceBlobChoiceRequired
+          sourceUploadPending
+        />,
+      );
+
+      expect(
+        screen.queryByRole("combobox", { name: "Source file" }),
+      ).not.toBeInTheDocument();
+      const csvOption = screen.getByRole("button", { name: "CSV File" });
+      expect(csvOption).toBeEnabled();
+      expect(screen.getByRole("button", { name: "REST API" })).toBeEnabled();
+
+      await user.click(csvOption);
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+      expect(onSubmit.mock.calls[0][0]).not.toHaveProperty("source_blob_id");
+    },
+  );
 });
 
 describe("SingleSelectTurn — allow_custom=false", () => {

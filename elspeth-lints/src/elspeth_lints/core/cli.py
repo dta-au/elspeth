@@ -3908,7 +3908,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
 
     from elspeth_lints.core.allowlist import _judge_metadata_hmac_key
     from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
-    from elspeth_lints.core.review_bundle import read_bundle
+    from elspeth_lints.core.review_bundle import load_bundle
     from elspeth_lints.core.sign_bundle_transaction import (
         SignBundleTransactionError,
         assert_active_unchanged,
@@ -3916,6 +3916,8 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
         create_transaction,
         load_manifest,
         publication_disposition,
+        rollback_pending_publish,
+        source_validation_pending,
         transaction_lock,
     )
 
@@ -3936,12 +3938,15 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        bundle = read_bundle(args.bundle)
+        bundle_bytes = args.bundle.read_bytes()
+        bundle = load_bundle(bundle_bytes.decode("utf-8"))
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"sign-bundle: cannot read bundle {args.bundle}: {exc}\n")
         return 2
+    verified_bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
 
     resume_manifest: dict[str, Any] | None = None
+    resume_disposition: str | None = None
     signing_policy = _sign_bundle_signing_policy(args)
     verification_allowlist_dir = args.allowlist_dir
     if args.resume is not None:
@@ -3955,7 +3960,8 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
                 rotation_log=args.rotation_log,
                 signing_policy=signing_policy,
             )
-            if publication_disposition(resume_manifest).startswith("published"):
+            resume_disposition = publication_disposition(resume_manifest)
+            if resume_disposition.startswith("published"):
                 # After the atomic swap the transaction's candidate path holds
                 # the original active tree. Re-derive bundle claims there while
                 # separately verifying journaled signatures in the live tree.
@@ -3972,9 +3978,37 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
             allowlist_dir=verification_allowlist_dir,
         )
     except ValueError as exc:
+        if (
+            args.resume is not None
+            and resume_manifest is not None
+            and resume_disposition is not None
+            and resume_disposition.startswith("published")
+            and source_validation_pending(resume_manifest)
+        ):
+            try:
+                with transaction_lock(args.allowlist_dir, create=False):
+                    pending_manifest = load_manifest(args.resume)
+                    rollback_pending_publish(args.resume, pending_manifest)
+            except SignBundleTransactionError as rollback_exc:
+                sys.stderr.write(f"sign-bundle: transaction error while rolling back source-unverifiable publish: {rollback_exc}\n")
+                return 2
         sys.stderr.write(f"sign-bundle: verify error: {exc}\n")
         return 2
     if not verification.ok:
+        if (
+            args.resume is not None
+            and resume_manifest is not None
+            and resume_disposition is not None
+            and resume_disposition.startswith("published")
+            and source_validation_pending(resume_manifest)
+        ):
+            try:
+                with transaction_lock(args.allowlist_dir, create=False):
+                    pending_manifest = load_manifest(args.resume)
+                    rollback_pending_publish(args.resume, pending_manifest)
+            except SignBundleTransactionError as exc:
+                sys.stderr.write(f"sign-bundle: transaction error while rolling back source-invalid publish: {exc}\n")
+                return 2
         sys.stderr.write("sign-bundle: staged claims no longer match the source tree; refusing to sign (re-run stage_scan):\n")
         for mismatch in verification.mismatches:
             sys.stderr.write(f"  mismatch: {mismatch}\n")
@@ -3998,6 +4032,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
             if args.resume is None:
                 tx_path, manifest = create_transaction(
                     bundle_path=args.bundle,
+                    verified_bundle_sha256=verified_bundle_sha256,
                     bundle_id=bundle.bundle_id,
                     root=args.root,
                     allowlist_dir=args.allowlist_dir,

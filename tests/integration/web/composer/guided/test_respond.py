@@ -194,6 +194,58 @@ def _full_guided_session(body: dict) -> dict:
     return body["composition_state"]["composer_meta"]["guided_session"]
 
 
+def _remove_durable_current_turn(client: TestClient, session_id: str) -> None:
+    """Persist the same guided head without its unanswered turn occurrence."""
+
+    service = client.app.state.session_service
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    state = state_from_record(record)
+    guided = state.guided_session
+    assert guided is not None
+    assert guided.history and guided.history[-1].response_hash is None
+    prospective_guided = replace(guided, history=guided.history[:-1])
+    prospective_state = replace(state, guided_session=prospective_guided)
+    state_dict = prospective_state.to_dict()
+    composer_meta = dict(record.composer_meta or {})
+    composer_meta["guided_session"] = prospective_guided.to_dict()
+    asyncio.run(
+        service.save_composition_state(
+            UUID(session_id),
+            CompositionStateData(
+                sources=state_dict["sources"],
+                nodes=state_dict["nodes"],
+                edges=state_dict["edges"],
+                outputs=state_dict["outputs"],
+                metadata_=state_dict["metadata"],
+                is_valid=record.is_valid,
+                validation_errors=record.validation_errors,
+                composer_meta=composer_meta,
+            ),
+            provenance="convergence_persist",
+        )
+    )
+
+
+def _guided_audit_invocations(client: TestClient, session_id: str) -> list[tuple[str, dict[str, Any]]]:
+    service = client.app.state.session_service
+    messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))
+    guided_names = {
+        "guided_turn_emitted",
+        "guided_turn_answered",
+        "guided_step_advanced",
+        "guided_dropped_to_freeform",
+    }
+    invocations: list[tuple[str, dict[str, Any]]] = []
+    for message in messages:
+        for envelope in message.tool_calls:
+            invocation = envelope.get("invocation", {})
+            tool_name = invocation.get("tool_name")
+            if tool_name in guided_names:
+                invocations.append((tool_name, json.loads(invocation["arguments_canonical"])))
+    return invocations
+
+
 @pytest.mark.parametrize(
     "stable_id",
     [
@@ -2380,6 +2432,8 @@ class TestStep2IntraStep:
             chosen=["text"],
             custom_inputs=[],
         )
+        preserved_turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert preserved_turn is not None
         declined = _post_current_response(
             composer_test_client,
             session_id,
@@ -2388,7 +2442,8 @@ class TestStep2IntraStep:
 
         assert declined.status_code == 200, declined.json()
         body = declined.json()
-        assert body["next_turn"] is None
+        assert body["next_turn"] == preserved_turn
+        assert _get_guided(composer_test_client, session_id)["next_turn"] == preserved_turn
         assert body["guided_session"]["step"] == "step_2_sink"
         chat_history = _full_guided_session(body)["chat_history"]
         assert [turn["content"] for turn in chat_history if turn["role"] == "assistant"] == [decline_text]
@@ -2407,6 +2462,63 @@ class TestStep2IntraStep:
         last_operation = operation_rows[-1]
         assert last_operation["failure_code"] is None
         assert last_operation["result_kind"] == "composition_state"
+
+    def test_escape_hatch_decline_materializes_a_prospective_current_turn(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "prospective-decline.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+        _remove_durable_current_turn(composer_test_client, session_id)
+        preserved_turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert preserved_turn is not None
+        audit_before = _guided_audit_invocations(composer_test_client, session_id)
+
+        async def decline_planner(**_kwargs):
+            return GuidedPlannerDecline(decline_text="The prospective turn cannot be planned yet.")
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        declined = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert declined.status_code == 200, declined.json()
+        assert declined.json()["next_turn"] == preserved_turn
+        assert _get_guided(composer_test_client, session_id)["next_turn"] == preserved_turn
+        audit_delta = _guided_audit_invocations(composer_test_client, session_id)[len(audit_before) :]
+        assert [name for name, _arguments in audit_delta] == ["guided_turn_emitted"]
+        payload_hash = _full_guided_session(declined.json())["history"][-1]["payload_hash"]
+        assert audit_delta[0][1] == {
+            "step_index": "step_2_sink",
+            "turn_type": "review_components",
+            "payload_hash": payload_hash,
+            "payload_payload_id": payload_hash,
+            "emitter": "server",
+        }
 
     @pytest.mark.parametrize(
         "composer_test_client",

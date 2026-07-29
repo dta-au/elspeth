@@ -169,7 +169,10 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #   36 -> ``blob_deletion_cleanups`` retains the exact staged filesystem delete
 #        across post-commit unlink/fsync failures. Epoch 35 cannot make those
 #        purges retryable after the ``blobs`` row is gone and is rejected.
-SESSION_SCHEMA_EPOCH = 36
+#   37 -> ``guided_operations`` completed-plan result CHECKs gain the
+#        ``declined`` result kind and its state-only locator. Epoch 36 cannot
+#        represent an ordinary guided planner decline and is rejected outright.
+SESSION_SCHEMA_EPOCH = 37
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

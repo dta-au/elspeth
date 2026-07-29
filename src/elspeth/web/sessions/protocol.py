@@ -2204,6 +2204,34 @@ class StaleComposeStateError(RuntimeError):
     """
 
 
+class InterpretationResolveError(ValueError):
+    """Base class for expected interpretation-resolution failures."""
+
+
+class InterpretationEventNotFoundError(InterpretationResolveError):
+    """No event exists for the requested ``(session_id, event_id)`` pair."""
+
+
+class InterpretationEventAlreadyResolvedError(InterpretationResolveError):
+    """The event exists but is no longer pending."""
+
+
+class InterpretationNodeMissingError(InterpretationResolveError):
+    """The affected node disappeared from the live composition state."""
+
+
+class InterpretationNodePluginMutatedError(InterpretationResolveError):
+    """The affected node still exists but is no longer an LLM transform."""
+
+
+class InterpretationPlaceholderConsumedError(InterpretationResolveError):
+    """The affected LLM node no longer carries the expected placeholder."""
+
+
+class InterpretationUnsupportedChoiceError(InterpretationResolveError):
+    """The requested choice is valid generally but unsupported for this kind."""
+
+
 class AuditAccessLogWriteError(RuntimeError):
     """Audit-grade transcript access could not be recorded.
 

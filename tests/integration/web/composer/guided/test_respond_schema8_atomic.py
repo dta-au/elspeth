@@ -22,6 +22,7 @@ from elspeth.contracts.blobs import BlobNotFoundError, BlobStateError
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import (
     GuidedStep,
@@ -42,6 +43,8 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.pipeline_proposal import AbsentBase
 from elspeth.web.composer.source_inspection import SourceInspectionFacts
+from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_replay import guided_turn_token, load_guided_json_payload
 from elspeth.web.sessions.models import guided_operations_table
@@ -144,6 +147,27 @@ def _respond_operation_count(client: TestClient, session_id: str) -> int:
 
 def _payload_file_count(client: TestClient) -> int:
     return sum(path.is_file() for path in client.app.state.payload_store.base_path.rglob("*"))
+
+
+def _enable_aws_s3_source(client: TestClient) -> None:
+    settings = client.app.state.settings.model_copy(
+        update={
+            "plugin_allowlist": (
+                *client.app.state.settings.plugin_allowlist,
+                "source:aws_s3",
+            )
+        }
+    )
+    runtime_policy = RuntimeWebPluginConfig.from_settings(settings)
+    client.app.state.settings = settings
+    client.app.state.web_plugin_policy = compile_web_plugin_policy(
+        registry=get_shared_plugin_manager(),
+        settings=runtime_policy,
+    )
+    client.app.state.operator_profile_registry = OperatorProfileRegistry(
+        policy=client.app.state.web_plugin_policy,
+        settings=runtime_policy,
+    )
 
 
 class _ReadRaceBlobService:
@@ -526,6 +550,57 @@ def test_source_selection_without_blob_identity_does_not_fall_back_to_latest_upl
     assert response.json()["next_turn"]["payload"]["prefilled"] == {"schema": {"mode": "observed"}}
     intents = response.json()["composition_state"]["composer_meta"]["guided_session"]["pending_source_intents"]
     assert next(iter(intents.values()))["inspection_facts"] is None
+
+
+def test_non_file_source_without_blob_identity_ignores_one_unrelated_ready_blob(
+    composer_test_client: TestClient,
+) -> None:
+    _enable_aws_s3_source(composer_test_client)
+    session_id = _create_session(composer_test_client)
+    uploaded = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={"filename": "unrelated.csv", "content": "id\n1\n", "mime_type": "text/csv"},
+    )
+    assert uploaded.status_code == 201, uploaded.json()
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    assert "aws_s3" in {option["id"] for option in turn["payload"]["options"]}
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(turn, chosen=["aws_s3"]),
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["next_turn"]["payload"]["plugin"] == "aws_s3"
+    intents = response.json()["composition_state"]["composer_meta"]["guided_session"]["pending_source_intents"]
+    assert next(iter(intents.values()))["inspection_facts"] is None
+
+
+def test_non_file_source_rejects_explicit_incompatible_blob_before_reservation(
+    composer_test_client: TestClient,
+) -> None:
+    _enable_aws_s3_source(composer_test_client)
+    session_id = _create_session(composer_test_client)
+    uploaded = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={"filename": "unrelated.csv", "content": "id\n1\n", "mime_type": "text/csv"},
+    )
+    assert uploaded.status_code == 201, uploaded.json()
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    assert "aws_s3" in {option["id"] for option in turn["payload"]["options"]}
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            turn,
+            chosen=["aws_s3"],
+            source_blob_id=uploaded.json()["id"],
+        ),
+    )
+
+    assert response.status_code == 400, response.json()
+    assert response.json()["detail"] == "source_blob_id is not valid for the selected source plugin."
+    assert _respond_operation_count(composer_test_client, session_id) == 0
 
 
 def test_source_selection_rejects_blob_identity_outside_ready_session_set_before_reservation(

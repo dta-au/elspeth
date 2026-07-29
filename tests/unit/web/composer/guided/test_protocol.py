@@ -456,9 +456,28 @@ class TestPayloadValidation:
 
         ok = validate_payload(
             TurnType.SINGLE_SELECT,
-            {"question": "Q?", "options": [], "allow_custom": False},
+            {
+                "question": "Q?",
+                "options": [{"id": "csv", "label": "CSV", "hint": None}],
+                "allow_custom": False,
+                "source_blob_compatible_option_ids": ["csv"],
+            },
         )
         assert ok is None
+
+    def test_validate_single_select_rejects_undeclared_blob_compatible_option(self) -> None:
+        from elspeth.web.composer.guided.protocol import validate_payload
+
+        err = validate_payload(
+            TurnType.SINGLE_SELECT,
+            {
+                "question": "Q?",
+                "options": [{"id": "csv", "label": "CSV", "hint": None}],
+                "allow_custom": False,
+                "source_blob_compatible_option_ids": ["api"],
+            },
+        )
+        assert err == "payload.source_blob_compatible_option_ids must reference declared option ids"
 
     def test_validate_single_select_missing_field(self) -> None:
         from elspeth.web.composer.guided.protocol import validate_payload

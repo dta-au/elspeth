@@ -975,6 +975,14 @@ def test_existing_service_redeploy_requires_immutable_scan_clean_identity() -> N
     assert "direct ECS Exec inherits the task definition's static environment" in normalized
 
 
+def test_existing_service_redeploy_disables_automatic_rollback() -> None:
+    text = REDEPLOY_RUNBOOK.read_text(encoding="utf-8")
+    deploy = text[text.index("## 6. Deploy with zero overlap") : text.index("## 7. Prove public behavior")]
+
+    assert '"deploymentCircuitBreaker":{"enable":true,"rollback":false}' in deploy
+    assert '"rollback":true' not in deploy
+
+
 def test_bedrock_runbook_removes_openrouter_secret_for_all_bedrock_composer() -> None:
     text = _bedrock_text()
     candidate = text[text.index("Create a registrable task-definition document") : text.index("Before registration")]

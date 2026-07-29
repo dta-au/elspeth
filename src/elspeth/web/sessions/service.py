@@ -186,6 +186,12 @@ from elspeth.web.sessions.protocol import (
     GuidedStateOperationCommand,
     GuidedStateOperationSettlement,
     IllegalRunTransitionError,
+    InterpretationEventAlreadyResolvedError,
+    InterpretationEventNotFoundError,
+    InterpretationNodeMissingError,
+    InterpretationNodePluginMutatedError,
+    InterpretationPlaceholderConsumedError,
+    InterpretationUnsupportedChoiceError,
     PipelineDispatchRecovery,
     PipelineProposalPublicMetadata,
     PipelineProposalRejectionReason,
@@ -207,6 +213,9 @@ from elspeth.web.sessions.protocol import (
     ToolCallIDMismatchError,
     TransitionAssistantDraft,
     TransitionResponseSettlement,
+)
+from elspeth.web.sessions.protocol import (
+    InterpretationResolveError as InterpretationResolveError,
 )
 from elspeth.web.sessions.telemetry import _SessionsTelemetry
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE, _validate_accepted_value_content
@@ -2186,34 +2195,6 @@ def _interpretation_event_record_from_row(row: Any) -> InterpretationEventRecord
 # constraint violation (which would emit a spurious security telemetry
 # signal upstream).
 _INTERPRETATION_IMMUTABLE_TRIGGER_MSG: str = "interpretation_events: resolved rows are immutable"
-
-
-class InterpretationResolveError(ValueError):
-    """Base class for expected interpretation-resolution failures."""
-
-
-class InterpretationEventNotFoundError(InterpretationResolveError):
-    """No event exists for the requested ``(session_id, event_id)`` pair."""
-
-
-class InterpretationEventAlreadyResolvedError(InterpretationResolveError):
-    """The event exists but is no longer pending."""
-
-
-class InterpretationNodeMissingError(InterpretationResolveError):
-    """The affected node disappeared from the live composition state."""
-
-
-class InterpretationNodePluginMutatedError(InterpretationResolveError):
-    """The affected node still exists but is no longer an LLM transform."""
-
-
-class InterpretationPlaceholderConsumedError(InterpretationResolveError):
-    """The affected LLM node no longer carries the expected placeholder."""
-
-
-class InterpretationUnsupportedChoiceError(InterpretationResolveError):
-    """The requested choice is valid generally but unsupported for this kind."""
 
 
 class QuarantineCleanupError(AuditIntegrityError):
@@ -6787,8 +6768,27 @@ class SessionServiceImpl:
                                 f"must contain exactly one pending {kind.value!r} requirement for {user_term!r}"
                             ) from exc
 
-                current_review_identity = _reviewed_content_identity(
+                surfacing_review_identity = _reviewed_content_identity(
                     state_record,
+                    kind=kind,
+                    affected_node_id=affected_node_id,
+                    user_term=user_term,
+                    context="create_pending_interpretation_event",
+                )
+                # The caller-selected state remains the immutable audit anchor,
+                # but the locked session head owns supersession authority. A
+                # delayed worker must not make its historical projection current.
+                live_state_row = conn.execute(
+                    select(composition_states_table)
+                    .where(composition_states_table.c.session_id == sid)
+                    .order_by(desc(composition_states_table.c.version))
+                    .limit(1)
+                ).one_or_none()
+                if live_state_row is None:  # pragma: no cover - state_row above proves same-session state exists
+                    raise AuditIntegrityError(f"create_pending_interpretation_event: session {sid!r} has no current composition state")
+                live_state_record = self._row_to_state_record(live_state_row)
+                current_review_identity = _reviewed_content_identity(
+                    live_state_record,
                     kind=kind,
                     affected_node_id=affected_node_id,
                     user_term=user_term,
@@ -6838,6 +6838,13 @@ class SessionServiceImpl:
                         matching_pending_row = pending_row
                     else:
                         rows_to_abandon.append(pending_row.id)
+                # A matching live card is safe to reuse. Without one, a stale
+                # surfacing projection must not abandon rows or mint a card that
+                # the live-state resolution gate can never settle.
+                if matching_pending_row is None and surfacing_review_identity != current_review_identity:
+                    raise InterpretationPlaceholderConsumedError(
+                        "create_pending_interpretation_event: reviewed content no longer matches the current composition state"
+                    )
                 if rows_to_abandon:
                     conn.execute(
                         update(interpretation_events_table)
@@ -6904,15 +6911,6 @@ class SessionServiceImpl:
                         composer_skill_hash=composer_skill_hash,
                         context="create_pending_interpretation_event",
                     )
-                    live_state_row = conn.execute(
-                        select(composition_states_table)
-                        .where(composition_states_table.c.session_id == sid)
-                        .order_by(desc(composition_states_table.c.version))
-                        .limit(1)
-                    ).one_or_none()
-                    if live_state_row is None:
-                        raise AuditIntegrityError(f"create_pending_interpretation_event: session {sid!r} has no composition state to patch")
-                    live_state_record = self._row_to_state_record(live_state_row)
                     final_sources: Mapping[str, Mapping[str, Any]] | None
                     final_nodes: list[Mapping[str, Any]]
                     resolved_prompt_template_hash: str | None

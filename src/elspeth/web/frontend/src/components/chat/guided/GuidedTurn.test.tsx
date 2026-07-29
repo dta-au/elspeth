@@ -45,6 +45,7 @@ const SINGLE_SELECT_PAYLOAD: SingleSelectPayload = {
   question: "Which data source should we use?",
   options: [{ id: "csv", label: "CSV File", hint: null }],
   allow_custom: false,
+  source_blob_compatible_option_ids: ["csv"],
 };
 
 const INSPECT_AND_CONFIRM_PAYLOAD: InspectAndConfirmPayload = {

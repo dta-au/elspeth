@@ -419,6 +419,8 @@ export interface SingleSelectPayload {
   question: string;
   options: Option[];
   allow_custom: boolean;
+  /** Server-owned subset of option IDs that may bind a ready session blob. */
+  source_blob_compatible_option_ids?: string[];
 }
 
 /** Wire: MultiSelectWithCustomPayload (protocol.py:46-50). */

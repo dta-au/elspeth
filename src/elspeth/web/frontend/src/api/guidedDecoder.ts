@@ -731,11 +731,32 @@ function decodeInspectPayload(value: unknown, path: string): InspectAndConfirmPa
 }
 
 function decodeSingleSelectPayload(value: unknown, path: string): SingleSelectPayload {
-  const payload = exactRecord(value, path, ["question", "options", "allow_custom"]);
+  const payload = exactRecord(
+    value,
+    path,
+    ["question", "options", "allow_custom"],
+    ["source_blob_compatible_option_ids"],
+  );
+  const options = decodeOptions(payload.options, `${path}.options`);
+  const compatiblePath = `${path}.source_blob_compatible_option_ids`;
+  const compatibleOptionIds = payload.source_blob_compatible_option_ids === undefined
+    ? undefined
+    : stringArray(payload.source_blob_compatible_option_ids, compatiblePath);
+  const validatedCompatibleOptionIds = compatibleOptionIds ?? [];
+  if (new Set(validatedCompatibleOptionIds).size !== validatedCompatibleOptionIds.length) {
+    invalid(compatiblePath, "duplicate option id");
+  }
+  const declaredOptionIds = new Set(options.map((option) => option.id));
+  if (validatedCompatibleOptionIds.some((optionId) => !declaredOptionIds.has(optionId))) {
+    invalid(compatiblePath, "must reference a declared option id");
+  }
   return {
     question: stringValue(payload.question, `${path}.question`),
-    options: decodeOptions(payload.options, `${path}.options`),
+    options,
     allow_custom: booleanValue(payload.allow_custom, `${path}.allow_custom`),
+    ...(compatibleOptionIds === undefined
+      ? {}
+      : { source_blob_compatible_option_ids: compatibleOptionIds }),
   };
 }
 

@@ -35,6 +35,16 @@ TRANSACTION_DIRNAME = ".sign-bundle-transactions"
 MANIFEST_NAME = "transaction.json"
 _MANIFEST_HMAC_FIELD = "manifest_hmac"
 _MANIFEST_HMAC_LABEL = b"elspeth-sign-bundle-transaction-manifest-v1"
+_SOURCE_VALIDATION_NOT_STARTED = "not_started"
+_SOURCE_VALIDATION_PENDING = "pending"
+_SOURCE_VALIDATION_VALIDATED = "validated"
+_SOURCE_VALIDATION_STATES = frozenset(
+    {
+        _SOURCE_VALIDATION_NOT_STARTED,
+        _SOURCE_VALIDATION_PENDING,
+        _SOURCE_VALIDATION_VALIDATED,
+    }
+)
 _RENAME_EXCHANGE = 2
 _AT_FDCWD = -100
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -111,6 +121,7 @@ def transaction_lock(allowlist_dir: Path, *, create: bool) -> Iterator[None]:
 def create_transaction(
     *,
     bundle_path: Path,
+    verified_bundle_sha256: str,
     bundle_id: str,
     root: Path,
     allowlist_dir: Path,
@@ -122,6 +133,8 @@ def create_transaction(
     source_root = root.resolve()
     bundle_resolved = bundle_path.resolve()
     rotation_resolved = rotation_log.resolve()
+    if file_sha256(bundle_resolved) != verified_bundle_sha256:
+        raise SignBundleTransactionError("bundle bytes changed after verification; refusing transaction creation")
 
     tx_root = transaction_root(active)
     tx_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -150,7 +163,7 @@ def create_transaction(
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "bundle_path": str(bundle_resolved),
-        "bundle_sha256": file_sha256(bundle_resolved),
+        "bundle_sha256": verified_bundle_sha256,
         "root": str(source_root),
         "allowlist_dir": str(active),
         "candidate_dir": str(candidate),
@@ -164,6 +177,7 @@ def create_transaction(
         "rotation_staged_sha256": file_sha256(rotation_staged),
         "checkpoint_snapshot": None,
         "publish_started_at": None,
+        "source_validation_state": _SOURCE_VALIDATION_NOT_STARTED,
         "completed_actions": [],
         "running_action": None,
     }
@@ -187,6 +201,26 @@ def _manifest_hmac(manifest: dict[str, Any]) -> str:
     unsigned = {key: value for key, value in manifest.items() if key != _MANIFEST_HMAC_FIELD}
     canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hmac.new(_transaction_manifest_key(), canonical, hashlib.sha256).hexdigest()
+
+
+def _source_validation_state(manifest: dict[str, Any]) -> str:
+    """Return the authenticated publication-validation state, including legacy journals."""
+    if "source_validation_state" in manifest:
+        value = manifest["source_validation_state"]
+    else:
+        # Schema-v1 journals created before the explicit state field still
+        # authenticated publish_started_at. A timestamp means publication was
+        # attempted but never durably recorded as source-validated, regardless
+        # of whether recovery observes the pre- or post-exchange orientation.
+        value = _SOURCE_VALIDATION_PENDING if manifest.get("publish_started_at") is not None else _SOURCE_VALIDATION_NOT_STARTED
+    if not isinstance(value, str) or value not in _SOURCE_VALIDATION_STATES:
+        raise SignBundleTransactionError("transaction manifest source_validation_state is invalid")
+    return value
+
+
+def source_validation_pending(manifest: dict[str, Any]) -> bool:
+    """Whether an exchanged candidate still needs source-binding finalization."""
+    return _source_validation_state(manifest) == _SOURCE_VALIDATION_PENDING
 
 
 def load_manifest(tx_path: Path) -> dict[str, Any]:
@@ -225,6 +259,7 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
         raise SignBundleTransactionError("transaction manifest checkpoint_snapshot must be a mapping or null")
     if raw.get("publish_started_at") is not None and not _is_timezone_aware_iso8601(raw.get("publish_started_at")):
         raise SignBundleTransactionError("transaction manifest publish_started_at must be a timezone-aware timestamp or null")
+    _source_validation_state(raw)
     candidate = Path(raw["candidate_dir"]).resolve()
     if candidate.parent.parent != resolved:
         raise SignBundleTransactionError("transaction candidate path escapes its transaction directory")
@@ -233,9 +268,7 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
         raise SignBundleTransactionError("transaction rotation-base authentication failed")
     checkpoint_snapshot = raw.get("checkpoint_snapshot")
     checkpoint = resolved / "checkpoint"
-    if checkpoint_snapshot is not None and (
-        not checkpoint.is_dir() or tree_snapshot(checkpoint) != checkpoint_snapshot
-    ):
+    if checkpoint_snapshot is not None and (not checkpoint.is_dir() or tree_snapshot(checkpoint) != checkpoint_snapshot):
         raise SignBundleTransactionError("transaction checkpoint authentication failed")
     # An orphan checkpoint is the safe side of the two-phase protocol: the
     # authenticated manifest says no action depends on it, so a crash before
@@ -291,15 +324,15 @@ def publication_disposition(manifest: dict[str, Any]) -> str:
     active_identity = directory_identity(active)
     candidate_identity = directory_identity(candidate)
     original_orientation = (
-        active_identity == manifest["base_directory_identity"]
-        and candidate_identity == manifest["candidate_directory_identity"]
+        active_identity == manifest["base_directory_identity"] and candidate_identity == manifest["candidate_directory_identity"]
     )
     swapped_orientation = (
-        active_identity == manifest["candidate_directory_identity"]
-        and candidate_identity == manifest["base_directory_identity"]
+        active_identity == manifest["candidate_directory_identity"] and candidate_identity == manifest["base_directory_identity"]
     )
-    if original_orientation and active_snapshot == manifest["base_snapshot"] and (
-        candidate_snapshot == manifest["candidate_snapshot"] or manifest.get("running_action") is not None
+    if (
+        original_orientation
+        and active_snapshot == manifest["base_snapshot"]
+        and (candidate_snapshot == manifest["candidate_snapshot"] or manifest.get("running_action") is not None)
     ):
         return "not_published"
     if swapped_orientation and active_snapshot == manifest["candidate_snapshot"] and candidate_snapshot == manifest["base_snapshot"]:
@@ -427,6 +460,70 @@ def publish_candidate(tx_path: Path, manifest: dict[str, Any]) -> None:
             raise SignBundleTransactionError("atomic exchange completed with unexpected directory content")
 
 
+def rollback_pending_publish(tx_path: Path, manifest: dict[str, Any]) -> None:
+    """Restore the authenticated base when an exchanged publish fails source validation."""
+    if not source_validation_pending(manifest):
+        raise SignBundleTransactionError("refusing source-validation rollback for a transaction that is not pending")
+    active = Path(manifest["allowlist_dir"])
+    candidate = Path(manifest["candidate_dir"])
+    with allowlist_mutation_lock(active):
+        disposition = publication_disposition(manifest)
+        if disposition == "published":
+            _rename_exchange(active, candidate)
+            for parent in {active.parent, candidate.parent}:
+                _fsync_directory(parent)
+        elif disposition != "not_published":
+            raise SignBundleTransactionError(
+                "cannot roll back source-invalid publish after the active allowlist received later coordinated changes"
+            )
+        if (
+            directory_identity(active) != manifest["base_directory_identity"]
+            or directory_identity(candidate) != manifest["candidate_directory_identity"]
+            or tree_snapshot(active) != manifest["base_snapshot"]
+            or tree_snapshot(candidate) != manifest["candidate_snapshot"]
+        ):
+            raise SignBundleTransactionError("source-validation rollback did not restore the authenticated directory state")
+        manifest["source_validation_state"] = _SOURCE_VALIDATION_NOT_STARTED
+        manifest["publish_started_at"] = None
+        save_manifest(tx_path, manifest)
+
+
+def _validate_pending_source_publish(
+    *,
+    bundle: Any,
+    args: argparse.Namespace,
+    tx_path: Path,
+    manifest: dict[str, Any],
+) -> None:
+    """Re-derive source bindings after exchange, rolling back before reporting drift."""
+    state = _source_validation_state(manifest)
+    if state == _SOURCE_VALIDATION_VALIDATED:
+        return
+    if state != _SOURCE_VALIDATION_PENDING:
+        raise SignBundleTransactionError("published transaction has no pending source-validation record")
+    from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
+
+    try:
+        verification = verify_bundle_against_tree(
+            bundle,
+            root=args.root,
+            # RENAME_EXCHANGE moved the exact pre-publish allowlist here. Re-run
+            # the bundle claims against that base while the signed candidate is
+            # active, so source drift cannot hide behind its own new entries.
+            allowlist_dir=Path(manifest["candidate_dir"]),
+        )
+    except ValueError:
+        rollback_pending_publish(tx_path, manifest)
+        raise SignBundleTransactionError(
+            "source tree or bundle bindings changed during coherent publish; rolled back active allowlist"
+        ) from None
+    if not verification.ok:
+        rollback_pending_publish(tx_path, manifest)
+        raise SignBundleTransactionError("source tree or bundle bindings changed during coherent publish; rolled back active allowlist")
+    manifest["source_validation_state"] = _SOURCE_VALIDATION_VALIDATED
+    save_manifest(tx_path, manifest)
+
+
 def finalize_rotation_log(tx_path: Path, manifest: dict[str, Any]) -> None:
     """Append only transaction-produced rotation records after allowlist publish."""
     rotation_log = Path(manifest["rotation_log"])
@@ -514,6 +611,12 @@ def run_sign_bundle_transaction(
     if disposition.startswith("published"):
         if completed != set(range(len(bundle.actions))):
             raise SignBundleTransactionError("published transaction journal does not contain every bundle action")
+        _validate_pending_source_publish(
+            bundle=bundle,
+            args=args,
+            tx_path=tx_path,
+            manifest=manifest,
+        )
         if disposition == "published":
             _verify_completed_actions(
                 bundle,
@@ -725,9 +828,16 @@ def run_sign_bundle_transaction(
     # A prior failed attempt or pre-exchange process death must not make the
     # eventual active mutation appear older than it is.
     manifest["publish_started_at"] = datetime.now(UTC).isoformat()
+    manifest["source_validation_state"] = _SOURCE_VALIDATION_PENDING
     save_manifest(tx_path, manifest)
     with allowlist_mutation_lock(Path(manifest["allowlist_dir"])):
         publish_candidate(tx_path, manifest)
+        _validate_pending_source_publish(
+            bundle=bundle,
+            args=args,
+            tx_path=tx_path,
+            manifest=manifest,
+        )
         finalize_rotation_log(tx_path, manifest)
     return SignBundleRunResult(0, len(completed))
 
@@ -927,9 +1037,7 @@ def _assert_judge_event_transition(
             expected_key=expected_key,
         )
         if record != expected_record:
-            raise SignBundleTransactionError(
-                f"{action.kind} {action.key!r} decision event contradicts its authoritative signed entry"
-            )
+            raise SignBundleTransactionError(f"{action.kind} {action.key!r} decision event contradicts its authoritative signed entry")
 
 
 def _assert_rotation_staged_transition(
@@ -1170,11 +1278,7 @@ def _signed_judge_event_payload(
     stored_model_verdict = entry.get("judge_model_verdict")
     if not operator_override and effective_verdict == "ACCEPTED" and stored_model_verdict is None:
         model_verdict = "ACCEPTED"
-    elif (
-        operator_override
-        and effective_verdict == "OVERRIDDEN_BY_OPERATOR"
-        and stored_model_verdict in {"ACCEPTED", "BLOCKED"}
-    ):
+    elif operator_override and effective_verdict == "OVERRIDDEN_BY_OPERATOR" and stored_model_verdict in {"ACCEPTED", "BLOCKED"}:
         model_verdict = stored_model_verdict
     else:
         raise SignBundleTransactionError(

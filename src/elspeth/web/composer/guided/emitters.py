@@ -53,6 +53,7 @@ from elspeth.web.composer.guided.protocol import (
     _WireSourceReview,
     _WireStructuredOutputField,
 )
+from elspeth.web.composer.guided.stage_transitions import source_plugin_accepts_blob_inspection
 from elspeth.web.composer.tools._common import _semantic_contracts_payload
 
 if TYPE_CHECKING:
@@ -255,6 +256,7 @@ def build_step_2_single_select_turn(
         "question": "What format should the output be in?",
         "options": options,
         "allow_custom": False,
+        "source_blob_compatible_option_ids": [],
     }
     return Turn(
         type=TurnType.SINGLE_SELECT.value,
@@ -745,6 +747,7 @@ def _build_step_1_single_select_turn(
         "question": "Which data source would you like to use?",
         "options": options,
         "allow_custom": False,
+        "source_blob_compatible_option_ids": [option["id"] for option in options if source_plugin_accepts_blob_inspection(option["id"])],
     }
     return Turn(
         type=TurnType.SINGLE_SELECT.value,

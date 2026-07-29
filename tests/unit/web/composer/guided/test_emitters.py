@@ -530,6 +530,7 @@ class TestStep1SourcePicker:
         option_ids = [opt["id"] for opt in turn["payload"]["options"]]
         assert "null" not in option_ids
         assert option_ids == ["csv", "json"]
+        assert turn["payload"]["source_blob_compatible_option_ids"] == ["csv", "json"]
 
 
 class _SinkCatalog:
@@ -572,6 +573,7 @@ class TestPluginDisplayLabels:
         # Humanised fallback: underscores to spaces, acronyms upper-cased.
         assert options["json_explode"]["label"] == "JSON Explode"
         assert options["csv"]["label"] == "CSV"
+        assert turn["payload"]["source_blob_compatible_option_ids"] == []
 
     def test_plugin_display_label_helper_directly(self) -> None:
         from elspeth.web.composer.guided._display import plugin_display_label

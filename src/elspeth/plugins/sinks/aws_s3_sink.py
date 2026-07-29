@@ -548,7 +548,7 @@ def _serialize_rows_to_spool(
             for row in rows:
                 if set(row) - set(fieldnames):
                     raise S3RecordSerializationError
-                values = [_csv_scalar_text(row[field]) for field in fieldnames]
+                values = [_csv_scalar_text(row.get(field)) for field in fieldnames]
                 if _csv_record_chars(values, csv_options.delimiter) > max_record_chars:
                     raise S3RecordSizeLimitError
                 csv_writer.writerow(values)
@@ -714,7 +714,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a92df38a58c1b855"
+    source_file_hash: str | None = "sha256:316cf5a81607145a"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP

@@ -23,7 +23,7 @@ def test_readme_advertises_current_release_surface() -> None:
     assert "## What Changed In 0.7.2" in text
     assert "Current 0.7.2 behaviour:" in text
     assert "Current 0.7.1 behaviour:" not in text
-    assert "session store moves\nfrom epoch 35 to 36" in text
+    assert "session store moves\nfrom epoch 35 to 37" in text
     assert "guided schema remains at 10" in text
     assert "Landscape remains at epoch 29" in text
 

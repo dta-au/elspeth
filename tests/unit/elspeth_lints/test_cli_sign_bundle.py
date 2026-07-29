@@ -28,6 +28,7 @@ Fixtures are replicated locally (rather than imported from
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -789,6 +790,76 @@ def test_sign_bundle_resume_finalizes_rotation_audit_after_published_interruptio
     assert _SPARE_PRE_JUDGE_KEY in (allowlist_dir / "later.yaml").read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("published_before_interrupt", [False, True])
+def test_sign_bundle_resume_migrates_legacy_pending_publication_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    published_before_interrupt: bool,
+) -> None:
+    """Schema-v1 journals without the new field recover in either orientation."""
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _interrupt_publish(transaction: Path, manifest: dict[str, Any]) -> None:
+        if published_before_interrupt:
+            real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _interrupt_publish)
+    assert (
+        main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--rotation-log", str(rotation_log)),
+            )
+        )
+        == 130
+    )
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    # Simulate an authenticated pre-upgrade schema-v1 journal. The historic
+    # manifest had publish_started_at but no explicit source-validation field.
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    manifest.pop("source_validation_state")
+    sign_bundle_transaction.save_manifest(transaction, manifest)
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 0
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+    records = [json.loads(line) for line in rotation_log.read_text(encoding="utf-8").splitlines()]
+    assert any({"source_file": "gadget.yaml", "old_key": stale_key, "new_key": live_key} in record["rotations"] for record in records)
+
+
 def test_publication_disposition_rejects_preexchange_writer_and_base_mimic(
     tmp_path: Path,
 ) -> None:
@@ -854,6 +925,7 @@ def test_create_transaction_fsyncs_each_new_parent_directory_entry(
     monkeypatch.setattr(sign_bundle_transaction, "_fsync_directory", _record_fsync)
     _tx_path, manifest = sign_bundle_transaction.create_transaction(
         bundle_path=bundle_path,
+        verified_bundle_sha256=sign_bundle_transaction.file_sha256(bundle_path),
         bundle_id="fsync-order",
         root=root,
         allowlist_dir=allowlist_dir,
@@ -867,6 +939,93 @@ def test_create_transaction_fsyncs_each_new_parent_directory_entry(
     assert fsynced.index(active_parent) < fsynced.index(tx_root) < fsynced.index(candidate_parent)
 
 
+def test_sign_bundle_rejects_bundle_replaced_after_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The recovery transaction must bind the exact bundle the operator confirmed."""
+    import io
+
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    gadget_finding = _live_finding(root, "plugins/gadget.py")
+    gadget_stale = _stale_rotation_key(gadget_finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=gadget_stale)
+
+    _write_source(root, "plugins/sprocket.py", "sprocket")
+    sprocket_finding = _live_finding(root, "plugins/sprocket.py")
+    sprocket_live = _canonical_key(sprocket_finding)
+    sprocket_stale = _stale_rotation_key(sprocket_finding, fp="cafebabecafebabe")
+    _write_pre_judge_entry(allowlist_dir, "sprocket.yaml", key=sprocket_stale)
+
+    approved = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="rotation", key=gadget_stale, source_file="gadget.yaml"),),
+    )
+    replacement = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="rotation", key=sprocket_stale, source_file="sprocket.yaml"),),
+    )
+    bundle_path = _write_bundle_file(tmp_path, approved)
+    approved_bytes = bundle_path.read_bytes()
+    rotation_log = tmp_path / "rotations.log"
+
+    class _ReplaceAtConfirmation(io.StringIO):
+        def readline(self, *args: Any, **kwargs: Any) -> str:
+            _write_bundle_file(tmp_path, replacement)
+            return super().readline(*args, **kwargs)
+
+    real_run_transaction = sign_bundle_transaction.run_sign_bundle_transaction
+    monkeypatch.setattr("sys.stdin", _ReplaceAtConfirmation("yes\n"))
+    monkeypatch.setattr(
+        sign_bundle_transaction,
+        "run_sign_bundle_transaction",
+        lambda **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    first_rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--rotation-log", str(rotation_log)),
+        )
+    )
+    first_stderr = capsys.readouterr().err
+
+    if first_rc != 2:
+        transaction = _recovery_path(first_stderr)
+        manifest = json.loads((transaction / "transaction.json").read_text(encoding="utf-8"))
+        replacement_bytes = bundle_path.read_bytes()
+        bound_replacement = manifest["bundle_sha256"] == hashlib.sha256(replacement_bytes).hexdigest()
+        monkeypatch.setattr(sign_bundle_transaction, "run_sign_bundle_transaction", real_run_transaction)
+        resume_rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+            )
+        )
+        replacement_executed = sprocket_live in (allowlist_dir / "sprocket.yaml").read_text(encoding="utf-8")
+        pytest.fail(
+            "bundle replacement crossed the confirmation boundary: "
+            f"first_rc={first_rc}, manifest_bound_replacement={bound_replacement}, "
+            f"resume_rc={resume_rc}, replacement_executed={replacement_executed}"
+        )
+
+    assert "bundle bytes changed after verification" in first_stderr
+    assert bundle_path.read_bytes() != approved_bytes
+    assert gadget_stale in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+    assert sprocket_stale in (allowlist_dir / "sprocket.yaml").read_text(encoding="utf-8")
+
+
 def test_manifest_rejects_authenticated_non_integer_directory_identity(
     tmp_path: Path,
 ) -> None:
@@ -878,6 +1037,7 @@ def test_manifest_rejects_authenticated_non_integer_directory_identity(
     bundle_path.write_text("{}\n", encoding="utf-8")
     tx_path, manifest = sign_bundle_transaction.create_transaction(
         bundle_path=bundle_path,
+        verified_bundle_sha256=sign_bundle_transaction.file_sha256(bundle_path),
         bundle_id="identity-type",
         root=root,
         allowlist_dir=allowlist_dir,
@@ -1804,6 +1964,136 @@ def test_sign_bundle_resume_rejects_stale_source_before_publish(tmp_path: Path, 
     assert rc == 2
     assert _tree_bytes(allowlist_dir) == before
     assert "staged claims no longer match" in capsys.readouterr().err
+
+
+def test_sign_bundle_rolls_back_if_source_changes_at_directory_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source_path = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_exchange = sign_bundle_transaction._rename_exchange
+
+    def _change_source_at_exchange(source: Path, destination: Path) -> None:
+        if source.resolve() == allowlist_dir.resolve():
+            source_path.write_text(_src("widget"), encoding="utf-8")
+        real_exchange(source, destination)
+
+    monkeypatch.setattr(sign_bundle_transaction, "_rename_exchange", _change_source_at_exchange)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert orphan_key in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert "source tree or bundle bindings changed during coherent publish" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("legacy_manifest", [False, True])
+def test_sign_bundle_resume_rolls_back_pending_publish_if_source_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    legacy_manifest: bool,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source_path = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _publish_then_interrupt(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _publish_then_interrupt)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    if legacy_manifest:
+        manifest = sign_bundle_transaction.load_manifest(transaction)
+        manifest.pop("source_validation_state")
+        sign_bundle_transaction.save_manifest(transaction, manifest)
+    source_path.write_text(_src("widget"), encoding="utf-8")
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert orphan_key in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert "staged claims no longer match" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_rolls_back_pending_publish_if_source_root_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _publish_then_interrupt(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _publish_then_interrupt)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    shutil.rmtree(root)
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert orphan_key in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert "verify error" in capsys.readouterr().err
 
 
 def test_sign_bundle_resume_rejects_tampered_transaction_signature(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

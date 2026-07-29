@@ -9,7 +9,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
 from elspeth.web.catalog.knob_schema import SchemaFormPayload as SchemaFormPayload
@@ -57,6 +57,7 @@ class SingleSelectPayload(TypedDict):
     question: str
     options: Sequence[_Option]
     allow_custom: bool
+    source_blob_compatible_option_ids: NotRequired[Sequence[str]]
 
 
 class MultiSelectWithCustomPayload(TypedDict):
@@ -639,7 +640,7 @@ _REQUIRED_KEYS: Mapping[TurnType, frozenset[str]] = {
 
 _ALLOWED_KEYS: Mapping[TurnType, frozenset[str]] = {
     TurnType.INSPECT_AND_CONFIRM: frozenset({"observed"}),
-    TurnType.SINGLE_SELECT: frozenset({"question", "options", "allow_custom"}),
+    TurnType.SINGLE_SELECT: frozenset({"question", "options", "allow_custom", "source_blob_compatible_option_ids"}),
     TurnType.MULTI_SELECT_WITH_CUSTOM: frozenset({"question", "options", "default_chosen", "escape_label"}),
     TurnType.SCHEMA_FORM: frozenset({"mode", "knobs", "prefilled", "plugin"}),
     TurnType.REVIEW_COMPONENTS: _REQUIRED_KEYS[TurnType.REVIEW_COMPONENTS],
@@ -900,10 +901,21 @@ def _validate_inspect_payload(payload: Mapping[str, Any]) -> str | None:
 def _validate_single_select_payload(payload: Mapping[str, Any]) -> str | None:
     if (error := _current_text_error(payload["question"], "payload.question", nonempty=True)) is not None:
         return error
-    if (error := _validate_options(payload["options"], "payload.options")[1]) is not None:
+    option_ids, error = _validate_options(payload["options"], "payload.options")
+    if error is not None:
         return error
     if type(payload["allow_custom"]) is not bool:
         return "payload.allow_custom must be a bool"
+    compatible_ids, error = _current_string_sequence(
+        payload.get("source_blob_compatible_option_ids", ()),
+        "payload.source_blob_compatible_option_ids",
+        unique=True,
+    )
+    if error is not None:
+        return error
+    assert option_ids is not None and compatible_ids is not None
+    if not set(compatible_ids).issubset(option_ids):
+        return "payload.source_blob_compatible_option_ids must reference declared option ids"
     return None
 
 

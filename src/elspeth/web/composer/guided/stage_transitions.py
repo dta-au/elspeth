@@ -36,6 +36,7 @@ from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 _PATH_OPTION_NAMES: Final = frozenset({"path", "file"})
 _SOURCE_KIND_PLUGIN: Final = {"csv": "csv", "json": "json", "jsonl": "json", "text": "text"}
+_SOURCE_BLOB_COMPATIBLE_PLUGINS: Final = frozenset(_SOURCE_KIND_PLUGIN.values())
 _KNOB_KINDS: Final = frozenset(
     {
         "text",
@@ -56,6 +57,11 @@ def _require_nonempty_exact_str(value: object, field_name: str) -> str:
     if type(value) is not str or value == "":
         raise TypeError(f"{field_name} must be a non-empty exact str")
     return value
+
+
+def source_plugin_accepts_blob_inspection(plugin: object) -> bool:
+    """Return whether a source choice can bind inspected session-blob bytes."""
+    return type(plugin) is str and plugin in _SOURCE_BLOB_COMPATIBLE_PLUGINS
 
 
 def _canonical_uuid(value: object, field_name: str) -> str:

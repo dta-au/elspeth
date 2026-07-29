@@ -842,6 +842,47 @@ def test_accept_proposal_executes_tool_and_commits_state(tmp_path, monkeypatch) 
     assert provenance == "tool_call"
 
 
+def test_accept_schema_stale_proposal_returns_422_and_rejects(tmp_path) -> None:
+    app, service = _make_app(tmp_path)
+    client = TestClient(app, raise_server_exceptions=False)
+    session = client.post("/api/sessions", json={"title": "Stale proposal"}).json()
+    session_id = uuid.UUID(session["id"])
+    arguments: dict[str, Any] = {}
+    proposal = asyncio.run(
+        service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_stale_set_metadata",
+            tool_name="set_metadata",
+            summary="Update pipeline metadata.",
+            rationale="Persisted before the current tool schema was deployed.",
+            affects=("metadata",),
+            arguments_json=arguments,
+            arguments_redacted_json=arguments,
+            base_state_id=None,
+            actor="composer-web:user:alice",
+            composer_model_identifier="test-model",
+            composer_model_version="test-model-v1",
+            composer_provider="test",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash=stable_hash(arguments),
+        )
+    )
+
+    response = client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept")
+
+    persisted = asyncio.run(
+        service.get_authoritative_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal.id,
+            reviewed_facts=None,
+        )
+    ).row
+    assert (response.status_code, persisted.status) == (422, "rejected"), response.text
+    assert response.json()["detail"]["error_type"] == "proposal_validation_failed"
+    assert response.json()["detail"]["tool_name"] == "set_metadata"
+    assert asyncio.run(service.get_current_state(session_id)) is None
+
+
 async def _create_canonical_pipeline_route_proposal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

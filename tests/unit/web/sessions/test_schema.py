@@ -290,9 +290,58 @@ def test_initialize_session_schema_rejects_epoch_35_database() -> None:
     assert probe_current_schema(eng) is False
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=36.*Delete the session DB file and restart",
+        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=37.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
+
+
+def test_epoch_36_database_without_declined_result_contract_fails_at_sentinel(tmp_path) -> None:
+    """The pre-decline epoch-36 CHECKs are rejected as an older schema."""
+    db_path = tmp_path / "epoch-36-without-declined-result.db"
+    engine = create_session_engine(f"sqlite:///{db_path}")
+    initialize_session_schema(engine)
+    with engine.begin() as connection:
+        guided_operations_sql = connection.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
+        ).scalar_one()
+        declined_result_kind = "'composition_state', 'pipeline_proposal', 'session', 'declined'"
+        prior_result_kind = "'composition_state', 'pipeline_proposal', 'session'"
+        declined_result_locator = (
+            "(kind = 'guided_plan' AND result_kind = 'declined' "
+            "AND result_state_id IS NOT NULL AND result_session_id IS NULL AND proposal_id IS NULL) OR "
+        )
+        epoch_36_sql = guided_operations_sql.replace(declined_result_kind, prior_result_kind).replace(
+            declined_result_locator,
+            "",
+        )
+        assert epoch_36_sql != guided_operations_sql
+        assert "'declined'" not in epoch_36_sql
+        connection.execute(text("PRAGMA writable_schema = ON"))
+        connection.execute(
+            text("UPDATE sqlite_master SET sql = :sql WHERE type = 'table' AND name = 'guided_operations'"),
+            {"sql": epoch_36_sql},
+        )
+        connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 36 WHERE store_kind = 'session'"))
+        connection.execute(text("PRAGMA user_version = 36"))
+        schema_version = connection.execute(text("PRAGMA schema_version")).scalar_one()
+        connection.execute(text(f"PRAGMA schema_version = {schema_version + 1}"))
+        connection.execute(text("PRAGMA writable_schema = OFF"))
+    engine.dispose()
+
+    stale_engine = create_session_engine(f"sqlite:///{db_path}")
+    with stale_engine.connect() as connection:
+        assert connection.execute(text("PRAGMA user_version")).scalar_one() == 36
+        stored_sql = connection.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
+        ).scalar_one()
+        assert "'declined'" not in stored_sql
+
+    with pytest.raises(
+        SessionSchemaError,
+        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=37.*"
+        r"Delete the session DB file and restart",
+    ):
+        initialize_session_schema(stale_engine)
 
 
 def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with_recreate_guidance(tmp_path) -> None:
@@ -330,7 +379,7 @@ def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=36.*"
+        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=37.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)

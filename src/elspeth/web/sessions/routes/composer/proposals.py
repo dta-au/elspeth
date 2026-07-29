@@ -229,6 +229,8 @@ async def accept_composition_proposal(
                 composer_provider=proposal.composer_provider,
                 composer_skill_hash=proposal.composer_skill_hash,
                 tool_arguments_hash=proposal.tool_arguments_hash,
+                validate_arguments=True,
+                require_data_dir_for_paths=True,
             )
         )
         cancellation_deferred = cancellation_deferred or was_cancelled

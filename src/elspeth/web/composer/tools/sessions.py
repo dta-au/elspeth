@@ -131,6 +131,7 @@ from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
     web_aws_s3_source_policy_error,
 )
+from elspeth.web.sessions.protocol import InterpretationPlaceholderConsumedError
 from elspeth.web.validation import (
     _reject_credential_shaped_content,
     _validate_accepted_value_content,
@@ -2415,19 +2416,31 @@ async def _handle_request_interpretation_review(
     # under the session write lock (defence in depth — the compose-state could
     # in principle race with another writer; the service is the authoritative
     # consistency gate).
-    event = await create_pending_interpretation_event(
-        session_id=session_id,
-        composition_state_id=composition_state_id,
-        affected_node_id=parsed.affected_node_id,
-        tool_call_id=tool_call_id,
-        user_term=parsed.user_term,
-        kind=parsed.kind,
-        llm_draft=parsed.llm_draft,
-        model_identifier=model_identifier,
-        model_version=model_version,
-        provider=provider,
-        composer_skill_hash=composer_skill_hash,
-    )
+    try:
+        event = await create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=composition_state_id,
+            affected_node_id=parsed.affected_node_id,
+            tool_call_id=tool_call_id,
+            user_term=parsed.user_term,
+            kind=parsed.kind,
+            llm_draft=parsed.llm_draft,
+            model_identifier=model_identifier,
+            model_version=model_version,
+            provider=provider,
+            composer_skill_hash=composer_skill_hash,
+        )
+    except InterpretationPlaceholderConsumedError as exc:
+        # The compose snapshot passed the Tier-3 component check above, but
+        # the service re-checks the persisted head under the session write
+        # lock.  A mismatch there is an expected stale-argument race: tell the
+        # model to rebuild from the latest state instead of letting the typed
+        # service conflict fall into the dispatcher's plugin-crash path.
+        raise ToolArgumentError(
+            argument="composition_state_id",
+            expected="the current composition state with matching reviewed content; reload the latest state and retry",
+            actual_type="stale composition state or reviewed content",
+        ) from exc
     if event.interpretation_source is InterpretationSource.AUTO_INTERPRETED_OPT_OUT:
         return ToolResult(
             success=True,
