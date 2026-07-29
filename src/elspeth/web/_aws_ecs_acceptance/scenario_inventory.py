@@ -712,7 +712,7 @@ def _validate_scenario_inventory(
         ):
             raise AcceptanceCheckError("scenario_inventory_schema")
     for name in PLUGIN_POLICY_ASSIGNMENT_NAMES:
-        if name == "ELSPETH_WEB__TUTORIAL_LLM_PROFILE":
+        if name == "ELSPETH_WEB__DEFAULT_LLM_PROFILE":
             continue
         try:
             json.loads(cast(str, values[name]))

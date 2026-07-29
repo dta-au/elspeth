@@ -737,6 +737,7 @@ class TestExecutionFlow:
                     "region_name": private_region,
                 }
             },
+            default_llm_profile="tutorial",
         )
         runtime_policy = RuntimeWebPluginConfig.from_settings(web_settings)
         policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_policy)

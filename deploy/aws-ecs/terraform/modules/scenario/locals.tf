@@ -168,7 +168,7 @@ locals {
   # This alias is also the profile resolver's preferred_alias, so it sorts first and
   # is what the planner's exemplars teach by default; keep it pointed at the
   # general-purpose tier rather than a special-purpose one.
-  tutorial_llm_profile = "standard"
+  default_llm_profile = "standard"
   guardrail_profiles = jsonencode([
     {
       alias                = "prompt-approved"
@@ -195,7 +195,7 @@ locals {
     ELSPETH_WEB__PLUGIN_PREFERENCES                 = local.plugin_preferences
     ELSPETH_WEB__PLUGIN_CONTROL_MODES               = local.plugin_control_modes
     ELSPETH_WEB__LLM_PROFILES                       = local.llm_profiles
-    ELSPETH_WEB__TUTORIAL_LLM_PROFILE               = local.tutorial_llm_profile
+    ELSPETH_WEB__DEFAULT_LLM_PROFILE               = local.default_llm_profile
     ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES         = local.guardrail_profiles
     ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES = local.guardrail_defaults
   }

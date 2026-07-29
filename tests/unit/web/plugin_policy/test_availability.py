@@ -103,7 +103,7 @@ def test_configured_tutorial_profile_is_the_selected_usable_alias() -> None:
                     "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
                 },
             },
-            tutorial_llm_profile="tutorial",
+            default_llm_profile="tutorial",
         )
     )
 

@@ -1119,7 +1119,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
                 "region_name": "ap-northeast-1",
             }
         },
-        tutorial_llm_profile="tutorial",
+        default_llm_profile="tutorial",
     )
     runtime_config = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_config)

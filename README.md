@@ -316,7 +316,7 @@ Then open `http://localhost:5173`.
   the two defaults need `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in the
   environment), and the operator LLM profiles that web-authored `llm`
   transform nodes select by alias (`ELSPETH_WEB__LLM_PROFILES`, with
-  `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` naming the profile the first-run
+  `ELSPETH_WEB__DEFAULT_LLM_PROFILE` naming the profile the first-run
   tutorial uses). See
   [Web LLM Configuration](docs/reference/environment-variables.md#web-llm-configuration).
 - Session state is stored in `data/sessions.db`; local auth users are stored in

@@ -2218,6 +2218,7 @@ def _operator_profile_view(tmp_path: Path) -> ToolContext:
                 "credential_ref": "OPENROUTER_API_KEY",
             }
         },
+        default_llm_profile="sonnet",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)

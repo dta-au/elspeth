@@ -620,7 +620,7 @@ class TestSystemStatusEndpoint:
                         "region_name": "ap-southeast-2",
                     }
                 },
-                tutorial_llm_profile="tutorial-default",
+                default_llm_profile="tutorial-default",
             )
         )
         response = TestClient(app).get("/api/system/status")
@@ -1795,7 +1795,7 @@ class TestSettingsFromEnv:
             "ELSPETH_WEB__LLM_PROFILES",
             '{"tutorial": {"provider": "bedrock", "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0"}}',
         )
-        monkeypatch.setenv("ELSPETH_WEB__TUTORIAL_LLM_PROFILE", "tutorial")
+        monkeypatch.setenv("ELSPETH_WEB__DEFAULT_LLM_PROFILE", "tutorial")
 
         settings = settings_from_env()
 

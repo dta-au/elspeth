@@ -156,6 +156,7 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
                 "credential_ref": "OPENROUTER_API_KEY",
             }
         },
+        default_llm_profile="sonnet",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -219,6 +220,7 @@ def _guardrail_profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAv
                 "credential_ref": "OPENROUTER_API_KEY",
             }
         },
+        default_llm_profile="sonnet",
         plugin_allowlist=("transform:aws_bedrock_prompt_shield", "transform:aws_bedrock_content_safety"),
         plugin_preferences={
             PluginCapability.PROMPT_SHIELD: ("transform:aws_bedrock_prompt_shield",),

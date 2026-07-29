@@ -136,7 +136,7 @@ class RuntimeWebPluginConfig:
     plugin_preferences: tuple[tuple[PluginCapability, tuple[str, ...]], ...]
     plugin_control_modes: tuple[tuple[PluginCapability, ControlMode], ...]
     llm_profiles: tuple[tuple[str, RuntimeWebLLMProfile], ...] = field(repr=False)
-    tutorial_llm_profile: str | None
+    default_llm_profile: str | None
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = field(repr=False)
     bedrock_guardrail_default_profiles: tuple[tuple[str, str], ...]
 
@@ -157,7 +157,7 @@ class RuntimeWebPluginConfig:
             llm_profiles=tuple(
                 (alias, RuntimeWebLLMProfile.from_settings(alias, profile)) for alias, profile in sorted(settings.llm_profiles.items())
             ),
-            tutorial_llm_profile=settings.tutorial_llm_profile,
+            default_llm_profile=settings.default_llm_profile,
             bedrock_guardrail_profiles=tuple(sorted(settings.bedrock_guardrail_profiles, key=lambda profile: profile.alias)),
             bedrock_guardrail_default_profiles=tuple(sorted(settings.bedrock_guardrail_default_profiles.items())),
         )
@@ -598,7 +598,7 @@ class OperatorProfileRegistry:
         self._resolvers: dict[PluginId, OperatorProfileResolver] = {
             PluginId("transform", "llm"): _LLMProfileResolver(
                 settings.llm_profiles,
-                preferred_alias=settings.tutorial_llm_profile,
+                preferred_alias=settings.default_llm_profile,
             )
         }
         defaults = dict(settings.bedrock_guardrail_default_profiles)

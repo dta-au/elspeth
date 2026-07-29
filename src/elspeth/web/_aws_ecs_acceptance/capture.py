@@ -198,7 +198,7 @@ def capture(
     register_value = env.get("ELSPETH_ACCEPTANCE_REGISTER")
     if register_value not in {None, "0", "1"}:
         raise AcceptanceInputError("ELSPETH_ACCEPTANCE_REGISTER must be 0 or 1")
-    tutorial_profile = env.get("ELSPETH_WEB__TUTORIAL_LLM_PROFILE")
+    tutorial_profile = env.get("ELSPETH_WEB__DEFAULT_LLM_PROFILE")
     if type(tutorial_profile) is not str or not tutorial_profile.strip() or tutorial_profile != tutorial_profile.strip():
         raise AcceptanceInputError("tutorial profile alias is invalid")
     captured_at = _utc_timestamp(now())

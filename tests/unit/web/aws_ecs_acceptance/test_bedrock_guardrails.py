@@ -244,7 +244,7 @@ def _guardrail_env(**updates: str) -> dict[str, str]:
             },
             separators=(",", ":"),
         ),
-        "ELSPETH_WEB__TUTORIAL_LLM_PROFILE": "tutorial",
+        "ELSPETH_WEB__DEFAULT_LLM_PROFILE": "tutorial",
         "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES": json.dumps(
             [
                 {
@@ -510,7 +510,7 @@ def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_sa
                 "region_name": "ap-southeast-2",
             }
         },
-        tutorial_llm_profile="tutorial",
+        default_llm_profile="tutorial",
         bedrock_guardrail_profiles=[
             {
                 "alias": "prompt-approved",

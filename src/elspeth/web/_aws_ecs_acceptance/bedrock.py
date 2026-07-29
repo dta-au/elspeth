@@ -331,13 +331,13 @@ def build_plugin_policy_acceptance(
             secret_inventory=_AcceptanceSecretInventory(),
             generation_key=secret_key.encode("utf-8"),
         )
-        tutorial_state_profile = runtime.tutorial_llm_profile
+        tutorial_state_profile = runtime.default_llm_profile
         if tutorial_state_profile is None:
             tutorial_state_profile = ""
         readiness = build_plugin_policy_readiness(
             policy=policy,
             snapshot=snapshot,
-            tutorial_profile=runtime.tutorial_llm_profile,
+            tutorial_profile=runtime.default_llm_profile,
             tutorial_state=_canonical_tutorial_policy_state(profile_alias=tutorial_state_profile),
             profile_registry=profiles,
             catalog=catalog,
@@ -348,7 +348,7 @@ def build_plugin_policy_acceptance(
     selected = dict(snapshot.selected)
     aliases = dict(snapshot.selected_profile_aliases)
     modes = dict(snapshot.control_modes)
-    tutorial_alias = runtime.tutorial_llm_profile
+    tutorial_alias = runtime.default_llm_profile
     llm_profiles = dict(runtime.llm_profiles)
     tutorial_profile = None
     if tutorial_alias is not None:

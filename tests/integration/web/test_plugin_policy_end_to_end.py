@@ -255,7 +255,7 @@ def _profiles(policy: WebPluginPolicy) -> OperatorProfileRegistry:
                 "region_name": "ap-southeast-2",
             }
         },
-        tutorial_llm_profile="tutorial",
+        default_llm_profile="tutorial",
         bedrock_guardrail_profiles=[
             {
                 "alias": "prompt-matrix",

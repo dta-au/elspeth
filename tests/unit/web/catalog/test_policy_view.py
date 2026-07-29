@@ -45,6 +45,7 @@ def _build_view(*, principal_scope: str = "local:alice") -> PolicyCatalogView:
                 "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
             }
         },
+        default_llm_profile="task-role",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)

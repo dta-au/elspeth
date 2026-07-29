@@ -327,7 +327,7 @@ jq -e --arg container "$WEB_CONTAINER_NAME" '
   | select(.name == $container)
   | ((.secrets // []) | map(.name) | all(
       . != "ELSPETH_WEB__LLM_PROFILES"
-      and . != "ELSPETH_WEB__TUTORIAL_LLM_PROFILE"
+      and . != "ELSPETH_WEB__DEFAULT_LLM_PROFILE"
       and . != "ELSPETH_WEB__COMPOSER_MODEL"
       and . != "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL"
       and . != "ELSPETH_BEDROCK_LIVE_TEST_MODEL"
@@ -348,7 +348,7 @@ existing `OPENROUTER_API_KEY` binding from the web container.
 jq \
   --arg container "$WEB_CONTAINER_NAME" \
   --arg profiles "$LLM_PROFILES" \
-  --arg tutorial_profile "bedrock-sonnet" \
+  --arg default_profile "bedrock-sonnet" \
   --arg live_model "bedrock/$SONNET_INFERENCE_PROFILE" \
   --arg composer_model "bedrock/$SONNET_INFERENCE_PROFILE" \
   --arg composer_advisor_model "bedrock/$OPUS_INFERENCE_PROFILE" \
@@ -373,7 +373,7 @@ jq \
       if .name == $container then
         .secrets = ((.secrets // []) | map(select(.name != "OPENROUTER_API_KEY")))
         | setenv("ELSPETH_WEB__LLM_PROFILES"; $profiles)
-        | setenv("ELSPETH_WEB__TUTORIAL_LLM_PROFILE"; $tutorial_profile)
+        | setenv("ELSPETH_WEB__DEFAULT_LLM_PROFILE"; $default_profile)
         | setenv("ELSPETH_WEB__COMPOSER_MODEL"; $composer_model)
         | setenv("ELSPETH_WEB__COMPOSER_ADVISOR_MODEL"; $composer_advisor_model)
         | setenv("ELSPETH_BEDROCK_LIVE_TEST_MODEL"; $live_model)
@@ -411,7 +411,7 @@ normalize_bedrock_candidate() {
         if .name == $container then
           .environment = ((.environment // []) | map(
             select(.name != "ELSPETH_WEB__LLM_PROFILES"
-              and .name != "ELSPETH_WEB__TUTORIAL_LLM_PROFILE"
+              and .name != "ELSPETH_WEB__DEFAULT_LLM_PROFILE"
               and .name != "ELSPETH_WEB__COMPOSER_MODEL"
               and .name != "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL"
               and .name != "ELSPETH_BEDROCK_LIVE_TEST_MODEL"
@@ -441,7 +441,7 @@ jq -e \
   (.containerDefinitions[] | select(.name == $container)) as $web
   | (reduce ($web.environment // [])[] as $item ({}; .[$item.name] = $item.value)) as $env
   | $env.ELSPETH_WEB__LLM_PROFILES == $profiles
-    and $env.ELSPETH_WEB__TUTORIAL_LLM_PROFILE == "bedrock-sonnet"
+    and $env.ELSPETH_WEB__DEFAULT_LLM_PROFILE == "bedrock-sonnet"
     and $env.ELSPETH_WEB__COMPOSER_MODEL == $composer_model
     and $env.ELSPETH_WEB__COMPOSER_ADVISOR_MODEL == $composer_advisor_model
     and $env.ELSPETH_BEDROCK_LIVE_TEST_MODEL == $live_model
@@ -660,7 +660,7 @@ not required to restore the previous application task definition.
 | Bedrock returns `AccessDeniedException` | Agreement not active, FTU missing, task-role policy incomplete, or an SCP denies a routed Region/model | Recheck all four availability fields, profile model ARNs, task role, and SCPs |
 | Sonnet works but Opus does not | Opus agreement or one Opus ARN is missing from IAM | Compare the Opus availability and `get-inference-profile` output with the policy resources |
 | `ValidationException` identifies the model/profile | Stale or malformed model identifier | Repeat live model and inference-profile discovery; keep the `bedrock/` prefix only in ELSPETH config |
-| Tutorial uses the wrong model | `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` names the wrong alias or an old task is serving | Set it to `bedrock-sonnet`, register a new revision, and replace the task |
+| Tutorial uses the wrong model | `ELSPETH_WEB__DEFAULT_LLM_PROFILE` names the wrong alias or an old task is serving | Set it to `bedrock-sonnet`, register a new revision, and replace the task |
 | Bedrock profile validation fails on timeout | `timeout_seconds` was supplied | Remove it; current Bedrock web profiles do not accept an operator timeout field |
 | Model works in the engineer's shell but not ECS | Shell credentials have broader access than the task role | Diagnose from inside the running task and fix `taskRoleArn`; never copy shell credentials into ECS |
 | Cross-Region invocation fails despite correct IAM | SCP or data-residency controls block a destination Region | Allow every destination used by the profile, or select a permitted geographic/in-Region profile |
@@ -678,7 +678,7 @@ not required to restore the previous application task definition.
 - [ ] No static AWS credentials, credential-profile variables, role overrides,
       or endpoint overrides are present in the task definition.
 - [ ] `ELSPETH_WEB__LLM_PROFILES` contains both opaque aliases.
-- [ ] `ELSPETH_WEB__TUTORIAL_LLM_PROFILE=bedrock-sonnet`.
+- [ ] `ELSPETH_WEB__DEFAULT_LLM_PROFILE=bedrock-sonnet`.
 - [ ] Composer primary/advisor are the protected Bedrock model values; no
       OpenRouter secret is present unless one selected model uses OpenRouter.
 - [ ] Candidate doctor passed before service update.

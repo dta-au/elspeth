@@ -504,7 +504,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
         operator_profile_registry=app.state.operator_profile_registry,
         catalog=app.state.catalog_service,
-        tutorial_profile=settings.tutorial_llm_profile,
+        tutorial_profile=settings.default_llm_profile,
     )
 
     # ShareableReviewService — Phase 6A completion gestures.

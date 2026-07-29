@@ -133,7 +133,7 @@ ELSPETH_WEB__PLUGIN_ALLOWLIST='["transform:aws_bedrock_prompt_shield","transform
 ELSPETH_WEB__PLUGIN_PREFERENCES='{"prompt_shield":["transform:aws_bedrock_prompt_shield"],"content_safety":["transform:aws_bedrock_content_safety"]}'
 ELSPETH_WEB__PLUGIN_CONTROL_MODES='{"prompt_shield":"required","content_safety":"required"}'
 ELSPETH_WEB__LLM_PROFILES='{"standard":{"provider":"bedrock","model":"bedrock/anthropic.claude-3-haiku-20240307-v1:0","region_name":"ap-southeast-2"}}'
-ELSPETH_WEB__TUTORIAL_LLM_PROFILE='standard'
+ELSPETH_WEB__DEFAULT_LLM_PROFILE='standard'
 ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES='[{"alias":"prompt-default","plugin":"aws_bedrock_prompt_shield","guardrail_identifier":"operatorpromptguardrail","guardrail_version":"7","region":"ap-southeast-2"},{"alias":"content-default","plugin":"aws_bedrock_content_safety","guardrail_identifier":"operatorcontentguardrail","guardrail_version":"4","region":"ap-southeast-2"}]'
 ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES='{"aws_bedrock_prompt_shield":"prompt-default","aws_bedrock_content_safety":"content-default"}'
 ```
@@ -158,7 +158,7 @@ the server store; a user-scoped profile resolves only through that principal's
 store. Web-authored pipeline state stores the opaque profile alias, not the
 provider, model, endpoint, or credential binding.
 
-`ELSPETH_WEB__TUTORIAL_LLM_PROFILE` must name a configured profile or the
+`ELSPETH_WEB__DEFAULT_LLM_PROFILE` must name a configured profile or the
 service refuses to start — so renaming or removing a profile this still points
 at will break a previously healthy deployment on its next restart; change both
 together. The tutorial needs *a* profile, not a dedicated one: point it at an

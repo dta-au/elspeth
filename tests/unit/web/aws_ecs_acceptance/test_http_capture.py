@@ -37,7 +37,7 @@ def _auth_env(**updates: str) -> Mapping[str, str]:
     values = {
         "ELSPETH_ACCEPTANCE_BASE_URL": "https://staging.example",
         "ELSPETH_ACCEPTANCE_BEARER_TOKEN": "bearer-secret",
-        "ELSPETH_WEB__TUTORIAL_LLM_PROFILE": "tutorial",
+        "ELSPETH_WEB__DEFAULT_LLM_PROFILE": "tutorial",
     }
     values.update(updates)
     return values

@@ -281,7 +281,7 @@ class WebSettings(BaseModel):
         }
     )
     llm_profiles: Mapping[str, WebLLMProfileSettings] = Field(default_factory=dict)
-    tutorial_llm_profile: str | None = None
+    default_llm_profile: str | None = None
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = ()
     bedrock_guardrail_default_profiles: Mapping[str, str] = Field(default_factory=dict)
     orphan_run_max_age_seconds: int = Field(default=3600, ge=60)
@@ -599,11 +599,28 @@ class WebSettings(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_tutorial_profile_alias(self) -> WebSettings:
-        if self.tutorial_llm_profile is not None:
-            validate_profile_alias(self.tutorial_llm_profile)
-            if self.tutorial_llm_profile not in self.llm_profiles:
-                raise ValueError("tutorial_llm_profile must name a configured LLM profile")
+    def _validate_default_llm_profile_alias(self) -> WebSettings:
+        """A deployment that offers LLM authoring must designate its standard profile.
+
+        The relationship runs one way: there is a standard profile, and the
+        first-run tutorial uses it — not a tutorial profile that other surfaces
+        borrow. That standard alias is also sorted first for authors and used by
+        the Composer's worked examples, so leaving it unset does not mean "no
+        default": it means the default is whichever alias happens to sort first,
+        chosen by nothing. Refuse to start rather than let an arbitrary profile
+        become the house default by accident.
+
+        Zero configured profiles remains valid — that is a deployment with no LLM
+        authoring at all, where there is no standard model to designate.
+        """
+        if self.llm_profiles and self.default_llm_profile is None:
+            raise ValueError(
+                "default_llm_profile is required when llm_profiles is configured; it must name the deployment's standard profile"
+            )
+        if self.default_llm_profile is not None:
+            validate_profile_alias(self.default_llm_profile)
+            if self.default_llm_profile not in self.llm_profiles:
+                raise ValueError("default_llm_profile must name a configured LLM profile")
         return self
 
     @model_validator(mode="after")
@@ -990,7 +1007,7 @@ def settings_from_env() -> WebSettings:
             "plugin_preferences",
             "plugin_control_modes",
             "llm_profiles",
-            "tutorial_llm_profile",
+            "default_llm_profile",
             "bedrock_guardrail_profiles",
             "bedrock_guardrail_default_profiles",
         }

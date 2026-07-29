@@ -57,7 +57,7 @@ locals {
     ELSPETH_WEB__PLUGIN_PREFERENCES                 = local.plugin_preferences
     ELSPETH_WEB__PLUGIN_CONTROL_MODES               = local.plugin_control_modes
     ELSPETH_WEB__LLM_PROFILES                       = local.llm_profiles
-    ELSPETH_WEB__TUTORIAL_LLM_PROFILE               = local.tutorial_llm_profile
+    ELSPETH_WEB__DEFAULT_LLM_PROFILE               = local.default_llm_profile
     ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES         = local.guardrail_profiles
     ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES = local.guardrail_defaults
     ELSPETH_WEB__COMPOSER_MODEL                     = var.composer_model

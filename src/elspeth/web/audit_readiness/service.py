@@ -300,7 +300,7 @@ def build_boot_plugin_policy_readiness(
     """
     llm_id = PluginId("transform", "llm")
     configured_aliases = tuple(alias for alias, _profile in settings.llm_profiles)
-    tutorial_profile = settings.tutorial_llm_profile
+    tutorial_profile = settings.default_llm_profile
     selected_by_capability = dict(policy.preferences)
     implementations: dict[PluginCapability, list[PluginId]] = {capability: [] for capability in PluginCapability}
     plugin_classes = _plugin_catalog_snapshot()

@@ -226,7 +226,7 @@ async def _require_tutorial_launch_readiness(
         state=state,
         policy=request.app.state.web_plugin_policy,
         snapshot=snapshot,
-        tutorial_profile=settings.tutorial_llm_profile,
+        tutorial_profile=settings.default_llm_profile,
         profile_registry=request.app.state.operator_profile_registry,
         catalog=request.app.state.catalog_service,
     )

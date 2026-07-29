@@ -78,7 +78,7 @@ def test_bedrock_profile_is_keyless_and_uses_canonical_provider_registry() -> No
                 "region_name": "ap-southeast-2",
             }
         },
-        tutorial_llm_profile="tutorial",
+        default_llm_profile="tutorial",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
 
@@ -98,7 +98,7 @@ def test_llm_public_profile_schema_accepts_observed_schema_without_fields() -> N
                 "region_name": "ap-southeast-1",
             }
         },
-        tutorial_llm_profile="tutorial",
+        default_llm_profile="tutorial",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -140,7 +140,7 @@ def test_runtime_conversion_is_frozen_and_canonical() -> None:
     assert runtime.llm_profiles[0][0] == "tutorial"
     assert "TOP_SECRET_MARKER" not in repr(runtime)
     with pytest.raises(FrozenInstanceError):
-        runtime.tutorial_llm_profile = "changed"  # type: ignore[misc]
+        runtime.default_llm_profile = "changed"  # type: ignore[misc]
 
 
 def test_profile_reprs_hide_provider_and_provider_specific_settings() -> None:
@@ -192,13 +192,54 @@ def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
         "plugin_preferences",
         "plugin_control_modes",
         "llm_profiles",
-        "tutorial_llm_profile",
+        "default_llm_profile",
         "bedrock_guardrail_profiles",
         "bedrock_guardrail_default_profiles",
     }
     runtime_fields = set(RuntimeWebPluginConfig.__dataclass_fields__)
 
     assert settings_fields == runtime_fields
+
+
+def test_llm_profiles_require_a_designated_standard_profile() -> None:
+    """Offering LLM authoring without naming the standard profile is refused.
+
+    Leaving it unset does not mean "no default" — the resolver would fall back to
+    whichever alias happens to sort first, making an arbitrary profile the alias
+    authors see first and the one the Composer's worked examples cite. Fail
+    closed instead of letting that be decided by alphabetical accident.
+    """
+    profiles = {
+        "standard": {
+            "provider": "bedrock",
+            "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            "region_name": "ap-southeast-2",
+        },
+        "fast": {
+            "provider": "bedrock",
+            "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            "region_name": "ap-southeast-2",
+        },
+    }
+
+    with pytest.raises(ValidationError):
+        _settings(llm_profiles=profiles)
+
+    settings = _settings(llm_profiles=profiles, default_llm_profile="standard")
+    assert settings.default_llm_profile == "standard"
+
+
+def test_no_llm_profiles_needs_no_standard_profile() -> None:
+    """A deployment with no LLM authoring has no standard model to designate.
+
+    The gate above must not turn "this deployment offers no llm nodes" into a
+    boot failure — that posture is supported, and the first-run tutorial is
+    simply disabled.
+    """
+    settings = _settings()
+
+    assert settings.llm_profiles == {}
+    assert settings.default_llm_profile is None
 
 
 def test_bedrock_profiles_require_explicit_default_when_plugin_has_multiple_profiles() -> None:

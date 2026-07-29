@@ -29,6 +29,7 @@ def test_profiled_llm_policy_schema_matches_golden() -> None:
                 "credential_ref": "OPENROUTER_API_KEY",
             }
         },
+        default_llm_profile="tutorial",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)

@@ -172,7 +172,7 @@ once at startup: restart the web service after changing any of them.
 | Composer primary model | The Composer chat/tool loop that authors pipelines | `ELSPETH_WEB__COMPOSER_MODEL` |
 | Composer advisor model | The mandatory independent reviewer inside the compose loop | `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` |
 | Operator LLM profiles | The `llm` transform inside web-authored pipelines | `ELSPETH_WEB__LLM_PROFILES` |
-| Tutorial profile | Which profile the first-run tutorial's `llm` node uses | `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` |
+| Default LLM profile | The deployment's standard profile: offered first to authors, used by the Composer's worked examples, and the one the first-run tutorial runs on | `ELSPETH_WEB__DEFAULT_LLM_PROFILE` |
 
 ### Composer models
 
@@ -272,29 +272,34 @@ ELSPETH_WEB__LLM_PROFILES='{
   "bedrock-haiku": {"provider": "bedrock", "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "region_name": "ap-southeast-2"},
   "sonnet": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "credential_scope": "server", "credential_ref": "OPENROUTER_API_KEY"}
 }'
-ELSPETH_WEB__TUTORIAL_LLM_PROFILE=sonnet
+ELSPETH_WEB__DEFAULT_LLM_PROFILE=sonnet
 ```
 
 Malformed values fail startup with sanitized errors: JSON fields report
 "must be valid JSON object/array", and profile validation names the failing
 field path without echoing the raw value.
 
-### Tutorial profile and the launch contract
+### Default LLM profile and the tutorial launch contract
 
-`ELSPETH_WEB__TUTORIAL_LLM_PROFILE` names the profile alias the first-run
-tutorial's `llm` node must select.
+`ELSPETH_WEB__DEFAULT_LLM_PROFILE` names the deployment's **standard** profile
+alias. That profile is the general-purpose one: it is listed first in the
+`profile` enum authors see, it is the alias the Composer's worked examples use,
+and the first-run tutorial's `llm` node runs on it.
 
-**The tutorial needs *a* profile, not its *own* profile.** Point this at an
-ordinary general-purpose profile you already define. A dedicated alias named
-something like `tutorial` is not required and is usually a mistake: the alias is
-visible to authors and lands in the audit trail, so every unrelated pipeline on
-the deployment ends up citing a tutorial-shaped name for its model binding.
+**The relationship runs one way.** A deployment offering LLM authoring needs a
+standard profile, and the tutorial uses that standard profile. The tutorial does
+not need — and should not have — a profile of its own. A dedicated alias called
+something like `tutorial` is a mistake: the alias is visible to authors and lands
+in the audit trail, so every unrelated pipeline ends up citing a tutorial-shaped
+name for its model binding. Name profiles for the tier they provide
+(`standard`, `fast`), and point this variable at the standard one.
 
 - It must name a key of `ELSPETH_WEB__LLM_PROFILES`; the service refuses to
   start otherwise. **This is the way to break a working tutorial by accident:**
   renaming or removing a profile that this variable still points at turns a
-  healthy deployment into one that will not boot. Change both together, and
-  re-check `GET /api/system/status` afterwards.
+  healthy deployment into one that will not boot — and the failure appears at the
+  next restart, not at the moment of the edit. Change both together, and re-check
+  `GET /api/system/status` afterwards.
 - When unset, the first-run tutorial is disabled — the launch path returns a
   typed HTTP 409 (`tutorial_profile_unavailable`) — without hiding ordinary
   CSV/JSON/text authoring.
@@ -353,13 +358,13 @@ Consequences:
 `deploy/aws-ecs/terraform/modules/scenario/locals.tf` renders the seven
 protected plugin-policy variables (`ELSPETH_WEB__PLUGIN_ALLOWLIST`,
 `ELSPETH_WEB__PLUGIN_PREFERENCES`, `ELSPETH_WEB__PLUGIN_CONTROL_MODES`,
-`ELSPETH_WEB__LLM_PROFILES`, `ELSPETH_WEB__TUTORIAL_LLM_PROFILE`, and the
+`ELSPETH_WEB__LLM_PROFILES`, `ELSPETH_WEB__DEFAULT_LLM_PROFILE`, and the
 two Bedrock Guardrail variables) plus `ELSPETH_WEB__COMPOSER_MODEL` and
 `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` into the web task definition. Its
 `variables.tf` requires both Composer models to be `bedrock/...` ids and
 requires them to differ. The scenario defines two keyless Bedrock profiles named
 for the tier they provide — `standard` (the Composer model) and `fast` (the
-Composer advisor model) — and points `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` at
+Composer advisor model) — and points `ELSPETH_WEB__DEFAULT_LLM_PROFILE` at
 `standard`, so the tutorial shares the ordinary general-purpose profile instead
 of owning a dedicated one.
 
@@ -384,7 +389,7 @@ commented block — uncomment and set them. A typical OpenRouter-backed deployme
 sets `ELSPETH_WEB__COMPOSER_MODEL` and `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`
 (`openrouter/...` ids), `OPENROUTER_API_KEY`, `ELSPETH_WEB__LLM_PROFILES`
 (a server-scoped OpenRouter profile referencing `OPENROUTER_API_KEY`), and
-`ELSPETH_WEB__TUTORIAL_LLM_PROFILE` together, alongside
+`ELSPETH_WEB__DEFAULT_LLM_PROFILE` together, alongside
 `ELSPETH_FINGERPRINT_KEY` so server-scoped credentials resolve. See the
 [Ansible Ubuntu deployment runbook](../runbooks/ansible-ubuntu-deployment.md).
 
