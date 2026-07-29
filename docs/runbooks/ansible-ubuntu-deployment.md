@@ -156,7 +156,9 @@ For Azure production, make these URLs point to Azure Database for PostgreSQL.
 The example file ships the web LLM configuration commented out. Uncomment and
 set `ELSPETH_WEB__COMPOSER_MODEL`, `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`,
 `ELSPETH_WEB__LLM_PROFILES`, and `ELSPETH_WEB__TUTORIAL_LLM_PROFILE`, and
-supply the provider API key each choice requires. Left unset, the service
+supply the provider API key each choice requires, plus
+`ELSPETH_FINGERPRINT_KEY`, which server-scoped profile credentials need to
+resolve. Left unset, the service
 boots with development-default Composer models whose OpenAI and Anthropic
 keys this file does not provide — the Composer stays unavailable — and with
 zero LLM profiles, so the web surface offers no `llm` nodes and no user gets
