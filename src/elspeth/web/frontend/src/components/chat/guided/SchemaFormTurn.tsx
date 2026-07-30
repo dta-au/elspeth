@@ -608,6 +608,7 @@ function KnobFieldRenderer({
             id={id}
             className={`guided-schema-textarea${hasError ? " guided-schema-textarea--error" : ""}`}
             value={jsonText(value, field.kind)}
+            placeholder={field.placeholder}
             required={required}
             aria-required={required || undefined}
             aria-invalid={hasError || undefined}

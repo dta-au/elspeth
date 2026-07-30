@@ -1332,6 +1332,73 @@ class TestAwsS3SourceComposerPolicy:
         assert result.success is True
         assert result.updated_state.sources["source"].plugin == "aws_s3"
 
+    def test_prohibited_source_selection_explains_the_policy_not_a_repairable_setting(self) -> None:
+        """A snapshot-declared prohibition must name the policy, not a code.
+
+        Once ``build_plugin_snapshot`` declines ``source:aws_s3`` with
+        ``WEB_SURFACE_PROHIBITED``, the plugin-visibility gate is the FIRST one
+        an authoring call meets (it precedes the aws_s3-specific gate below in
+        both ``set_source`` and ``set_pipeline``). Its message therefore has to
+        carry the policy cause; otherwise the honest decline degrades to a bare
+        code and the author is told a plugin is "unavailable" with nothing to
+        act on.
+        """
+        from elspeth.web.composer.tools._common import _validate_plugin_name
+
+        catalog = _mock_catalog()
+        view, snapshot = _restricted_policy_pair(
+            catalog,
+            PluginId("source", "aws_s3"),
+            PluginUnavailableReason.WEB_SURFACE_PROHIBITED,
+        )
+
+        violation = _validate_plugin_name(ToolContext(catalog=view, plugin_snapshot=snapshot), "source", "aws_s3")
+
+        assert violation is not None
+        assert violation.error_code is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+        assert AWS_S3_SOURCE_POLICY_ERROR in violation.message
+
+        result = execute_tool(
+            "set_source",
+            {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": _VALID_AWS_S3_OPTIONS,
+                "on_validation_failure": "discard",
+            },
+            _empty_state(),
+            view,
+            plugin_snapshot=snapshot,
+        )
+
+        assert result.success is False
+        assert result.data["error_code"] == "plugin_not_allowed_on_web"
+        assert AWS_S3_SOURCE_POLICY_ERROR in result.data["error"]
+
+    def test_prohibited_sink_selection_is_unaffected(self) -> None:
+        """Only the SOURCE is prohibited; S3 writes stay authorable."""
+        catalog = _mock_catalog()
+        view, snapshot = _restricted_policy_pair(
+            catalog,
+            PluginId("source", "aws_s3"),
+            PluginUnavailableReason.WEB_SURFACE_PROHIBITED,
+        )
+
+        result = execute_tool(
+            "set_output",
+            {
+                "sink_name": "archive",
+                "plugin": "aws_s3",
+                "options": {"bucket": "test-bucket", "key": "out.jsonl", "schema": {"mode": "observed"}},
+            },
+            _empty_state(),
+            view,
+            plugin_snapshot=snapshot,
+        )
+
+        assert result.success is True, result.data
+        assert [(output.name, output.plugin) for output in result.updated_state.outputs] == [("archive", "aws_s3")]
+
 
 class TestSetSource:
     def test_sets_source(self) -> None:

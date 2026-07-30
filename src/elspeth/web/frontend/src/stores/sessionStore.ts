@@ -438,6 +438,24 @@ function formatLlmAuthError(apiErr: ApiError): string {
 }
 
 /**
+ * F-4b: the fail-closed audit-integrity 500 refuses to REPLY — it does not
+ * mean the message was lost. Every send_message path inserts the user row
+ * before any audit-guard raise site, so "your message was saved" is honest
+ * for this error_type; claiming anything about pipeline state is not.
+ */
+function formatAuditIntegrityError(apiErr: ApiError): string {
+  const reference =
+    apiErr.request_id === undefined
+      ? " If this repeats, contact your administrator."
+      : ` If this repeats, contact your administrator and reference request ID ${apiErr.request_id}.`;
+  return (
+    "ELSPETH stopped before replying because it could not verify this session's audit trail. " +
+    "Your message was saved. Reload the session to see exactly what was stored." +
+    reference
+  );
+}
+
+/**
  * Pull any interpretation events a compose action created into the
  * interpretationEventsStore.
  *
@@ -1571,7 +1589,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const seen = new Set(s.messages.map((m) => m.id));
         const repaired = s.messages.map((existing) =>
           existing.id === optimisticMessage.id
-            ? { ...existing, local_status: undefined, local_error: undefined }
+            ? {
+                ...existing,
+                local_status: undefined,
+                local_error: undefined,
+                local_failure_code: undefined,
+              }
             : existing,
         );
         const finalMessages = seen.has(message.id)
@@ -1628,12 +1651,29 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           apiErr.error_type === "llm_auth_error"
         ) {
           errorMessage = formatLlmAuthError(apiErr);
+        } else if (apiErr.error_type === "audit_integrity_error") {
+          errorMessage = formatAuditIntegrityError(apiErr);
         } else {
           errorMessage =
             apiErr.detail ?? "Failed to send message. Please try again.";
         }
       }
       const apiErr = err as ApiError;
+      // F-4b: on an audit-integrity refusal the user row IS committed (the
+      // insert precedes every audit-guard raise site) — marking it failed is
+      // the lie the user acts on (re-sending a duplicate). Clear the pending
+      // bit instead: saved, no reply.
+      const auditIntegrityRefusal =
+        !isComposeAbort(err) && apiErr.error_type === "audit_integrity_error";
+      // S1: thread the closed failure code onto the failed row so retry
+      // affordances can suppress themselves for permanent failures
+      // ("policy_blocked" — see the F13-D guided precedent below: a
+      // deployment policy refused the pipeline; retrying cannot succeed).
+      // Only set when the structured error actually carried one.
+      const localFailureCode =
+        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+          ? apiErr.failure_code
+          : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
@@ -1648,7 +1688,19 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         error: errorMessage,
         messages: state.messages.map((existing) =>
           existing.id === optimisticMessage.id
-            ? { ...existing, local_status: "failed", local_error: errorMessage }
+            ? auditIntegrityRefusal
+              ? {
+                  ...existing,
+                  local_status: undefined,
+                  local_error: undefined,
+                  local_failure_code: undefined,
+                }
+              : {
+                  ...existing,
+                  local_status: "failed",
+                  local_error: errorMessage,
+                  local_failure_code: localFailureCode,
+                }
             : existing,
         ),
         ...recoveryPatch,
@@ -2028,7 +2080,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const seen = new Set(s.messages.map((m) => m.id));
         const repaired = s.messages.map((existing) =>
           existing.id === messageId
-            ? { ...existing, local_status: undefined, local_error: undefined }
+            ? {
+                ...existing,
+                local_status: undefined,
+                local_error: undefined,
+                local_failure_code: undefined,
+              }
             : existing,
         );
         const finalMessages = seen.has(assistantMessage.id)
@@ -2069,6 +2126,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
                 : apiErr.detail ?? "Failed to send message. Please try again.";
       }
       const apiErr = err as ApiError;
+      // S1: mirror the sendMessage catch handler — a retry that itself fails
+      // with a permanent code ("policy_blocked") must not re-render the
+      // Retry invitation it just disproved.
+      const localFailureCode =
+        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+          ? apiErr.failure_code
+          : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
@@ -2084,7 +2148,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         error: errorMessage,
         messages: state.messages.map((existing) =>
           existing.id === messageId
-            ? { ...existing, local_status: "failed", local_error: errorMessage }
+            ? {
+                ...existing,
+                local_status: "failed",
+                local_error: errorMessage,
+                local_failure_code: localFailureCode,
+              }
             : existing,
         ),
         ...recoveryPatch,
@@ -2950,6 +3019,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         })
         .filter((line) => line !== "");
       const retainsRetryCustody = isAmbiguousFailure;
+      // F13-D: ``policy_blocked`` is permanent by construction — a deployment
+      // policy refused this pipeline, and its copy directs the user to CHANGE
+      // the highlighted component. Never render a retry invitation for it,
+      // and never lock the propose_pipeline controls behind a non-retryable
+      // error state (that would contradict the copy's own instruction): the
+      // review returns to active so the revise affordances stay live.
+      const policyBlocked =
+        !retainsRetryCustody && apiErr.failure_code === "policy_blocked";
       const proposalErrorReview: GuidedProposalReviewState | null =
         proposalBinding === null
           ? null
@@ -2963,15 +3040,20 @@ export const useSessionStore = create<SessionState>((set, get) => ({
                 retryable: true,
                 retry_action: proposalRetryAction,
               }
-            : {
-                status: "error",
-                ...proposalBinding,
-                message:
-                  apiErr.detail ??
-                  "The proposal response failed. Refresh the session before taking another action.",
-                retryable: false,
-                retry_action: null,
-              };
+            : policyBlocked
+              ? {
+                  status: "active",
+                  ...proposalBinding,
+                }
+              : {
+                  status: "error",
+                  ...proposalBinding,
+                  message:
+                    apiErr.detail ??
+                    "The proposal response failed. Refresh the session before taking another action.",
+                  retryable: false,
+                  retry_action: null,
+                };
       const responseErrorMessage =
         apiErr.detail ?? "Failed to submit guided response. Please try again.";
       releaseSubmitOwnership();

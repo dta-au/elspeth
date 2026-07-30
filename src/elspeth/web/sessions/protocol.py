@@ -59,7 +59,15 @@ PipelineProposalRejectionReason = Literal[
     "base_conflict",
     "request_cancelled",
     "superseded",
+    "guided_exit",
 ]
+# The subset a guided state mutation may record when it atomically rejects
+# the pending proposal it is clearing: "superseded" for a real supersession
+# (a newer draft or a rewind displaces the pending one), "guided_exit" when
+# exit-to-freeform abandons custody — nothing displaced the proposal, so
+# recording "superseded" there would fabricate a successor that never existed.
+GuidedProposalInvalidationReason = Literal["superseded", "guided_exit"]
+_GUIDED_PROPOSAL_INVALIDATION_REASONS = frozenset({"superseded", "guided_exit"})
 PipelineProposalSurface = Literal["freeform", "guided_full", "guided_staged", "tutorial_profile"]
 ProposalEventType = Literal[
     "proposal.created",
@@ -77,10 +85,30 @@ GuidedOperationKind = Literal[
     "state_revert",
     "session_fork",
 ]
+# Closed enum mirroring the ``ck_guided_operations_failure_code`` CHECK
+# constraint in ``web/sessions/models.py``; the order here mirrors the CHECK
+# declaration for visual diff clarity. Same paired-contract posture as
+# ``ChatMessageWriterPrincipal`` below: extending one side only lets the Python
+# writer pass while the DB rejects the row (or vice versa), so both edits ship
+# together with a ``SESSION_SCHEMA_EPOCH`` bump.
+#
+# The vocabulary also carries a PERMANENT-vs-TRANSIENT split the client reads to
+# decide whether a retry can succeed. ``provider_unavailable`` /
+# ``provider_timeout`` / ``invalid_provider_response`` / ``stale_conflict`` are
+# transient (retry or reload can win); ``policy_blocked`` is permanent by
+# construction — a deployment policy refused the pipeline, so the identical
+# request will be refused identically no matter how many operation ids the
+# client mints.
 GuidedOperationFailureCode = Literal[
     "provider_unavailable",
     "provider_timeout",
     "invalid_provider_response",
+    # Permanent refusal from a deployment security policy (e.g. a source plugin
+    # prohibited on the web authoring surface). Distinct from
+    # ``invalid_provider_response`` precisely because there is nothing to retry:
+    # collapsing the two blamed the provider for a policy decision and told the
+    # user to retry an operation that cannot ever succeed.
+    "policy_blocked",
     "stale_conflict",
     "integrity_error",
     "custody_error",
@@ -1400,11 +1428,19 @@ class PreparedGuidedInterpretationDraft:
 @final
 @dataclass(frozen=True, slots=True)
 class GuidedPendingProposalInvalidation:
-    """Exact pending proposal authority invalidated by a guided state mutation."""
+    """Exact pending proposal authority invalidated by a guided state mutation.
+
+    ``reason`` is the truthful rejection cause recorded on the terminal
+    ``proposal.rejected`` event (closed
+    :data:`GuidedProposalInvalidationReason` vocabulary) — the settlement
+    verifies the clear and terminalizes the row, but only the call site knows
+    WHY custody is being cleared.
+    """
 
     proposal_id: UUID
     draft_hash: str
     reviewed_facts: Mapping[str, Any]
+    reason: GuidedProposalInvalidationReason
 
     def __post_init__(self) -> None:
         if type(self.proposal_id) is not UUID:
@@ -1412,6 +1448,8 @@ class GuidedPendingProposalInvalidation:
         _require_guided_sha256(self.draft_hash, "Guided pending proposal invalidation draft_hash")
         if type(self.reviewed_facts) not in {dict, MappingProxyType}:
             raise AuditIntegrityError("Guided pending proposal invalidation reviewed_facts must be a mapping")
+        if self.reason not in _GUIDED_PROPOSAL_INVALIDATION_REASONS:
+            raise AuditIntegrityError("Guided pending proposal invalidation reason is outside the closed vocabulary")
         freeze_fields(self, "reviewed_facts")
 
 
@@ -1457,7 +1495,15 @@ class GuidedStateOperationCommand:
         ):
             raise AuditIntegrityError("GuidedStateOperationCommand.invalidated_pending_proposal must be exact or None")
         if self.invalidated_pending_proposal is not None and self.deferred_intent_action is None:
-            raise AuditIntegrityError("Pending proposal invalidation requires an exact deferred intent action")
+            # Closed producer set for clearing pending proposal authority:
+            # deferred-intent management (rewind) or a terminal checkpoint
+            # (exit-to-freeform, the binding-exempt universal escape). The
+            # settlement re-verifies the exact transition either way.
+            composer_meta = self.state.composer_meta
+            guided_meta = composer_meta.get("guided_session") if isinstance(composer_meta, Mapping) else None
+            terminal = guided_meta.get("terminal") if isinstance(guided_meta, Mapping) else None
+            if terminal is None:
+                raise AuditIntegrityError("Pending proposal invalidation requires a deferred intent action or a terminal exit checkpoint")
 
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
@@ -2798,6 +2844,34 @@ class SessionServiceProtocol(Protocol):
         limit: int | None = 100,
         offset: int = 0,
     ) -> list[ChatMessageRecord]: ...
+
+    async def add_message_with_transcript(
+        self,
+        session_id: UUID,
+        role: ChatMessageRole,
+        content: str,
+        *,
+        writer_principal: ChatMessageWriterPrincipal,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+        composition_state_id: UUID | None = None,
+        raw_content: str | None = None,
+        tool_call_id: str | None = None,
+        parent_assistant_id: UUID | None = None,
+    ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
+        """Insert one message and return ``(record, full transcript)``.
+
+        The insert and the transcript read MUST happen inside one
+        write-locked transaction on one connection, so the returned
+        transcript ends at the inserted row by construction. Callers that
+        need "the transcript this write belongs to" (the freeform
+        send_message snapshot guard) MUST use this method instead of an
+        ``add_message`` + ``get_messages`` pair — the split pair reads on
+        a different pooled connection and a stale reader turns the Tier-1
+        snapshot guard into a false 500. Implementations MUST also apply
+        the same fail-closed guided-failure cohort verification as
+        ``get_messages`` over the same rows.
+        """
+        ...
 
     async def get_verified_guided_root_intent(
         self,

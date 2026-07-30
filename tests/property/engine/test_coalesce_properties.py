@@ -35,11 +35,12 @@ from hypothesis import strategies as st
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import NodeID
+from elspeth.contracts.union_merge import merge_union_contracts
 from elspeth.core.config import CoalesceSettings
 from elspeth.engine.clock import MockClock
-from elspeth.engine.coalesce_executor import CoalesceExecutor
+from elspeth.engine.coalesce_executor import CoalesceExecutor, _merge_with_original_names
 from elspeth.engine.spans import SpanFactory
 from tests.strategies.json import row_data
 
@@ -1031,3 +1032,169 @@ class TestSchemaMergeInvariantProperties:
             field = merged_contract.get_field(branch)
             assert field is not None, f"Missing field for branch '{branch}'"
             assert field.required is True, f"Branch '{branch}' field should be required"
+
+
+# =============================================================================
+# Union Contract Merge Bijection Property Tests (P9 regression)
+# =============================================================================
+
+
+def make_renamed_token(
+    token_id: str,
+    row_id: str,
+    branch_name: str,
+    fields: dict[str, tuple[str, Any]],
+) -> TokenInfo:
+    """Create a token whose contract carries renames (original != normalized).
+
+    fields maps normalized_name -> (original_name, value).
+    """
+    from elspeth.contracts import PipelineRow
+
+    contract = SchemaContract(
+        mode="OBSERVED",
+        fields=tuple(
+            FieldContract(
+                normalized_name=normalized,
+                original_name=original,
+                python_type=object,
+                required=False,
+                source="inferred",
+            )
+            for normalized, (original, _) in fields.items()
+        ),
+        locked=True,
+    )
+    row = PipelineRow({normalized: value for normalized, (_, value) in fields.items()}, contract)
+    return TokenInfo(token_id=token_id, row_id=row_id, row_data=row, branch_name=branch_name)
+
+
+# Small alphabet forces frequent cross-branch original_name collisions —
+# the P9 shape (two branches renaming one upstream field differently).
+_rename_names = st.text(alphabet="abcde", min_size=1, max_size=4)
+
+
+@st.composite
+def renamed_branch_contracts(draw: st.DrawFn) -> dict[str, SchemaContract]:
+    """Branch contracts whose fields may rename shared upstream names.
+
+    Each branch contract stays individually bijective (dict keys are unique
+    normalized names; entries repeating an original within the branch are
+    dropped) — only CROSS-branch original_name collisions survive, which is
+    exactly what the merge must resolve.
+    """
+    n_branches = draw(st.integers(min_value=2, max_value=4))
+    contracts: dict[str, SchemaContract] = {}
+    for i in range(n_branches):
+        mapping = draw(st.dictionaries(_rename_names, _rename_names, min_size=0, max_size=5))
+        seen_originals: set[str] = set()
+        branch_fields: list[FieldContract] = []
+        for normalized, original in mapping.items():
+            if original in seen_originals:
+                continue
+            seen_originals.add(original)
+            branch_fields.append(
+                FieldContract(
+                    normalized_name=normalized,
+                    original_name=original,
+                    python_type=object,
+                    required=False,
+                    source="inferred",
+                )
+            )
+        contracts[f"branch_{i}"] = SchemaContract(mode="OBSERVED", fields=tuple(branch_fields), locked=True)
+    return contracts
+
+
+class TestUnionContractMergeBijectionProperties:
+    """Union contract merges never raise bare ValueError (P9 regression).
+
+    SchemaContract.__post_init__ enforces an original_name -> normalized_name
+    bijection with a bare ValueError. Cross-branch renames of one upstream
+    field must be resolved by the merge (identity original_name on colliding
+    fields), never surfaced as a first-row crash after green validation.
+    """
+
+    @given(branch_contracts=renamed_branch_contracts(), require_all=st.booleans())
+    @settings(max_examples=200)
+    def test_merge_union_contracts_never_raises_value_error(
+        self,
+        branch_contracts: dict[str, SchemaContract],
+        require_all: bool,
+    ) -> None:
+        merged = merge_union_contracts(
+            branch_contracts,
+            require_all=require_all,
+            branch_order=tuple(branch_contracts),
+        )
+        expected = {fc.normalized_name for contract in branch_contracts.values() for fc in contract.fields}
+        assert {fc.normalized_name for fc in merged.fields} == expected
+        originals = [fc.original_name for fc in merged.fields]
+        assert len(set(originals)) == len(originals), "merged contract must keep the original_name bijection"
+
+    @given(branch_contracts=renamed_branch_contracts(), data=st.data())
+    @settings(max_examples=200)
+    def test_merge_with_original_names_never_raises_value_error(
+        self,
+        branch_contracts: dict[str, SchemaContract],
+        data: st.DataObject,
+    ) -> None:
+        """The precomputed-schema (typed union) path shares the same hazard."""
+        all_names = sorted({fc.normalized_name for contract in branch_contracts.values() for fc in contract.fields})
+        precomputed = SchemaContract(
+            mode="FIXED",
+            fields=tuple(
+                FieldContract(
+                    normalized_name=name,
+                    original_name=name,
+                    python_type=object,
+                    required=False,
+                    source="declared",
+                )
+                for name in all_names
+            ),
+            locked=True,
+        )
+        field_origins = {
+            name: data.draw(
+                st.sampled_from([branch for branch, contract in branch_contracts.items() if contract.find_field(name) is not None]),
+                label=name,
+            )
+            for name in all_names
+        }
+        merged = _merge_with_original_names(precomputed, branch_contracts, field_origins)
+        originals = [fc.original_name for fc in merged.fields]
+        assert len(set(originals)) == len(originals), "merged contract must keep the original_name bijection"
+
+
+class TestUnionRenameCollisionExecutor:
+    """P9 repro shape through the executor: two branches rename one field."""
+
+    def test_cross_branch_rename_merges_and_metadata_keeps_real_origins(self) -> None:
+        executor = make_mock_executor()
+        coalesce_settings = CoalesceSettings(
+            name="merge_currencies",
+            branches=["branch_a", "branch_b"],
+            policy="require_all",
+            merge="union",
+        )
+        executor.register_coalesce(coalesce_settings, node_id=NodeID("node-001"))
+
+        token_a = make_renamed_token("t-a", "row-001", "branch_a", {"id": ("id", 1), "amount_aud": ("amount", 100)})
+        token_b = make_renamed_token("t-b", "row-001", "branch_b", {"id": ("id", 1), "amount_usd": ("amount", 150)})
+
+        executor.accept(token_a, "merge_currencies")
+        outcome = executor.accept(token_b, "merge_currencies")
+
+        assert outcome.merged_token is not None
+        contract = outcome.merged_token.row_data.contract
+        assert contract.get_field("amount_aud").original_name == "amount_aud"
+        assert contract.get_field("amount_usd").original_name == "amount_usd"
+        assert contract.get_field("id").original_name == "id"
+
+        # The contract drops the ambiguous lineage; the audit metadata keeps it.
+        assert outcome.coalesce_metadata is not None
+        origins = outcome.coalesce_metadata.union_field_origins
+        assert origins is not None
+        assert origins["amount_aud"] == "branch_a"
+        assert origins["amount_usd"] == "branch_b"

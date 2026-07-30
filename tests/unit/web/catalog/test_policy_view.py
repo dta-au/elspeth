@@ -11,6 +11,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 
 
@@ -32,13 +33,18 @@ class _Inventory:
         return None
 
 
-def _build_view(*, principal_scope: str = "local:alice") -> PolicyCatalogView:
+def _build_view(
+    *,
+    principal_scope: str = "local:alice",
+    plugin_allowlist: tuple[str, ...] = (),
+) -> PolicyCatalogView:
     settings = WebSettings(
         composer_max_composition_turns=4,
         composer_max_discovery_turns=4,
         composer_timeout_seconds=60,
         composer_rate_limit_per_minute=20,
         shareable_link_signing_key=SecretBytes(b"0123456789abcdef0123456789abcdef"),
+        plugin_allowlist=plugin_allowlist,
         llm_profiles={
             "task-role": {
                 "provider": "bedrock",
@@ -83,6 +89,40 @@ def test_hidden_schema_uses_sanitized_closed_error(view: PolicyCatalogView) -> N
         view.get_schema("transform", "azure_prompt_shield")
 
     assert str(exc_info.value) == "plugin_not_enabled"
+
+
+def test_web_prohibited_source_is_coherent_across_every_reader() -> None:
+    """All three readers of one prohibition must agree.
+
+    ``PolicyCatalogView`` answers "what exists" (``list_*``), "why not"
+    (``unavailable_reason``) and "configure it" (``get_schema``) from the same
+    snapshot, and a PARTIAL fix is the dangerous outcome: a source missing from
+    the listing but still schema-readable, or hidden with no reason attached,
+    leaves the composer able to name the plugin and be told nothing it can act
+    on. Kind-qualified identity is what keeps the aws_s3 SINK fully usable
+    while the SOURCE is refused.
+    """
+    view = _build_view(plugin_allowlist=("source:aws_s3", "sink:aws_s3"))
+    source_id = PluginId("source", "aws_s3")
+
+    assert "aws_s3" not in {item.name for item in view.list_sources()}
+    assert "aws_s3" in {item.name for item in view.list_sinks()}
+    assert view.unavailable_reason(source_id) is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+    assert view.unavailable_reason(PluginId("sink", "aws_s3")) is None
+    with pytest.raises(ValueError, match="plugin_not_enabled"):
+        view.get_schema("source", "aws_s3")
+    assert view.get_schema("sink", "aws_s3").name == "aws_s3"
+
+
+def test_trained_operator_view_still_offers_the_web_prohibited_source() -> None:
+    """The local MCP projection keeps the plugin the web surface refuses."""
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    view = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+
+    assert "aws_s3" in {item.name for item in view.list_sources()}
+    assert view.unavailable_reason(PluginId("source", "aws_s3")) is None
+    assert view.get_schema("source", "aws_s3").name == "aws_s3"
 
 
 def test_web_username_matching_trained_operator_marker_cannot_create_unrestricted_view() -> None:

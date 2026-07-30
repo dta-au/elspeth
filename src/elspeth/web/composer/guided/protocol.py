@@ -211,9 +211,18 @@ class _TransformBehavior(TypedDict):
     kind: Literal["transform"]
 
 
+class _GateRouteBinding(TypedDict):
+    """One ordinal route alias bound to its author-visible route key."""
+
+    alias: str
+    key: str
+
+
 class _GateBehavior(TypedDict):
     kind: Literal["gate"]
+    condition: str
     route_aliases: Sequence[str]
+    routes: Sequence[_GateRouteBinding]
     fork_branches: Sequence[Mapping[str, Any]]
 
 
@@ -469,8 +478,11 @@ class ChatTurn:
     persisted discriminator. User turns require both fields to be ``None``.
     Assistant turns require a kind; real replies require a ``None`` reason,
     while synthetic failures require one closed reason: quality rejection,
-    provider unavailability, or a safe response that was deliberately not
-    applied. There is no nested compatibility reader for omitted fields.
+    provider unavailability, a safe response that was deliberately not
+    applied, or a model-output defect (the provider answered but the reply
+    violated a tool's argument contract — retrying the same message is the
+    designed remedy, unlike the deterministic ``not_applied`` causes).
+    There is no nested compatibility reader for omitted fields.
     """
 
     role: ChatRole
@@ -479,7 +491,7 @@ class ChatTurn:
     step: GuidedStep
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None = None
-    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied"] | None = None
+    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None = None
 
     def __post_init__(self) -> None:
         if type(self.role) is not ChatRole:
@@ -496,9 +508,10 @@ class ChatTurn:
             "quality_guard",
             "unavailable",
             "not_applied",
+            "model_defect",
         ):
             raise ValueError(
-                "synthetic_failure_reason must be 'quality_guard', 'unavailable', 'not_applied', or None; "
+                "synthetic_failure_reason must be 'quality_guard', 'unavailable', 'not_applied', 'model_defect', or None; "
                 f"got {self.synthetic_failure_reason!r}"
             )
         if self.synthetic_failure_reason is not None and self.assistant_message_kind != "synthetic_failure":
@@ -991,7 +1004,7 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
     seen_names: set[str] = set()
     visibility_gated: set[str] = set()
     required = frozenset({"name", "label", "kind", "required", "nullable"})
-    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when"})
+    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder"})
     for index, item in enumerate(fields):
         field_path = f"{path}.fields[{index}]"
         if not isinstance(item, Mapping):
@@ -1014,6 +1027,8 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
         if type(item["required"]) is not bool or type(item["nullable"]) is not bool:
             return f"{field_path}.required and nullable must be bools"
         if "description" in item and (error := _current_text_error(item["description"], f"{field_path}.description")) is not None:
+            return error
+        if "placeholder" in item and (error := _current_text_error(item["placeholder"], f"{field_path}.placeholder")) is not None:
             return error
         if "tier" in item and (type(item["tier"]) is not str or item["tier"] not in _FIELD_TIERS):
             return f"{field_path}.tier is outside the closed tier vocabulary"
@@ -1338,14 +1353,39 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
     if node_type in ("transform", "queue"):
         return _exact_nested_keys(behavior, frozenset({"kind"}), behavior_path)
     if node_type == "gate":
-        expected = frozenset({"kind", "route_aliases", "fork_branches"})
+        expected = frozenset({"kind", "condition", "route_aliases", "routes", "fork_branches"})
         if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
+            return error
+        # The authored predicate is bounded non-empty text and NOTHING MORE:
+        # no re-parsing or classification here — expression validity and
+        # route/condition parity are validated upstream at candidate
+        # validation (state.py), and a third ExpressionParser site would
+        # drift (elspeth-224fab9702).
+        if (error := _current_text_error(behavior["condition"], f"{behavior_path}.condition", nonempty=True)) is not None:
             return error
         route_aliases, error = _validate_alias_sequence(
             behavior["route_aliases"], kind="route", path=f"{behavior_path}.route_aliases", minimum=1
         )
         if error is not None:
             return error
+        assert route_aliases is not None
+        # ``routes`` binds each ordinal alias to its author-visible route key,
+        # bijective with ``route_aliases`` in the same order (fork gates
+        # included — both lists derive from the same ordered route walk).
+        route_bindings, error = _sequence_of_mappings(behavior["routes"], f"{behavior_path}.routes")
+        if error is not None:
+            return error
+        assert route_bindings is not None
+        if len(route_bindings) != len(route_aliases):
+            return f"{behavior_path}.routes must bind route_aliases one-to-one in the same order"
+        for index, binding in enumerate(route_bindings):
+            binding_path = f"{behavior_path}.routes[{index}]"
+            if (error := _exact_nested_keys(binding, frozenset({"alias", "key"}), binding_path)) is not None:
+                return error
+            if binding["alias"] != route_aliases[index]:
+                return f"{behavior_path}.routes must bind route_aliases one-to-one in the same order"
+            if (error := _current_text_error(binding["key"], f"{binding_path}.key", nonempty=True)) is not None:
+                return error
         fork_branches, error = _sequence_of_mappings(behavior["fork_branches"], f"{behavior_path}.fork_branches")
         if error is not None:
             return error

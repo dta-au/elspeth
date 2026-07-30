@@ -95,6 +95,27 @@ describe("MessageBubble", () => {
       );
       expect(screen.getByText("Failed to send message. Please try again.")).toBeInTheDocument();
     });
+
+    it("suppresses the Retry button but keeps the failed text for policy_blocked (S1)", () => {
+      // policy_blocked is permanent by construction — a deployment policy
+      // refused the pipeline — so the failed row must not invite a retry.
+      const onRetry = vi.fn();
+      render(
+        <MessageBubble
+          message={makeMessage({
+            local_status: "failed",
+            local_error: "This pipeline is not permitted by deployment policy.",
+            local_failure_code: "policy_blocked",
+          })}
+          isComposing={false}
+          onRetry={onRetry}
+        />,
+      );
+      expect(
+        screen.getByText("This pipeline is not permitted by deployment policy."),
+      ).toBeInTheDocument();
+      expect(screen.queryByText("Retry")).not.toBeInTheDocument();
+    });
   });
 
   describe("copy button", () => {

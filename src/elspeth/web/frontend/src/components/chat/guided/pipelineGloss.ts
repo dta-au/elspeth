@@ -69,7 +69,12 @@ function sourcePhrase(source: SourceSpec): string {
 
 function transformPhrase(node: NodeSpec): string {
   // Structural node types read off the shape, not the plugin.
-  if (node.node_type === "gate") return "filter the rows";
+  // A gate's gloss carries the authored predicate verbatim (F11): "filter
+  // the rows" alone hides which condition routes which way.
+  if (node.node_type === "gate") {
+    const condition = node.condition?.trim();
+    return condition ? `filter the rows (when ${condition})` : "filter the rows";
+  }
   if (node.node_type === "aggregation") return "summarise the rows";
   if (node.node_type === "coalesce") return "merge the branches";
   // A queue is uncorrelated fan-in: many producers publish one connection name

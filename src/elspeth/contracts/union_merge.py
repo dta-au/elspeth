@@ -32,7 +32,9 @@ one that arrives).
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Hashable, Mapping, Sequence
+from dataclasses import replace
 from typing import Literal, cast
 
 from elspeth.contracts.errors import ContractMergeError
@@ -171,6 +173,31 @@ def merge_union_field_flags(
     return seen_types
 
 
+def resolve_original_name_collisions(fields: Sequence[FieldContract]) -> tuple[FieldContract, ...]:
+    """Break cross-branch original_name collisions deterministically.
+
+    Sibling branches may rename one upstream field to different normalized
+    names, so a union merge can produce two fields carrying the same
+    original_name — violating SchemaContract's original->normalized bijection.
+    The ambiguous lineage is dropped from the contract by setting
+    original_name = normalized_name (identity) on every colliding field;
+    cross-branch provenance stays in the union audit metadata
+    (union_field_origins / collision_values), not the contract.
+
+    Iterates to a fixed point because an identity reassignment can itself
+    collide with another field's original_name. Terminates: normalized names
+    are unique, so each colliding group has at most one identity member and
+    every pass strictly shrinks the set of non-identity original_names.
+    """
+    resolved = tuple(fields)
+    while True:
+        counts = Counter(fc.original_name for fc in resolved)
+        colliding = {name for name, count in counts.items() if count > 1}
+        if not colliding:
+            return resolved
+        resolved = tuple(replace(fc, original_name=fc.normalized_name) if fc.original_name in colliding else fc for fc in resolved)
+
+
 def merge_union_contracts(
     branch_contracts: Mapping[str, SchemaContract],
     *,
@@ -194,7 +221,8 @@ def merge_union_contracts(
     - locked: True if any branch is locked
     - source: 'declared' if any branch with the field declares it
     - original_name: from the first contributing branch (in branch_order)
-      that carries the field
+      that carries the field; fields whose original_name would collide
+      across branches fall back to identity (resolve_original_name_collisions)
 
     Args:
         branch_contracts: Map of branch name to that branch's SchemaContract
@@ -275,6 +303,6 @@ def merge_union_contracts(
 
     return SchemaContract(
         mode=merged_mode,
-        fields=tuple(merged_fields),
+        fields=resolve_original_name_collisions(merged_fields),
         locked=merged_locked,
     )

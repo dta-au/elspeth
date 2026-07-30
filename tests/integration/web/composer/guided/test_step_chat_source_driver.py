@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
 from elspeth.web.composer.guided.chat_solver import (
     GuidedChatEmptyOutcome,
     GuidedChatProseOutcome,
@@ -15,6 +16,7 @@ from elspeth.web.composer.guided.chat_solver import (
     maybe_resolve_step_1_source_chat,
 )
 from elspeth.web.composer.guided.resolved import SourceResolved
+from elspeth.web.sessions._guided_step_chat import GuidedStepChatOnlyResult, resolve_step_1_source_chat_with_auto_drop
 
 
 def _fake_resolve_source_response(args: dict) -> SimpleNamespace:
@@ -372,6 +374,59 @@ async def test_source_driver_declines_prose_beside_hallucinated_tool_call() -> N
             timeout_seconds=30.0,
         )
     assert type(outcome) is GuidedChatEmptyOutcome
+
+
+@pytest.mark.asyncio
+async def test_source_wrapper_classifies_empty_content_as_model_defect_not_unavailable() -> None:
+    """The source-side mirror of the resolve_sink shape classification.
+
+    An uploaded-file bind request cannot be resolved by a model — it would have
+    to invent the file's bytes — so ``resolve_source`` comes back with empty
+    ``content`` and the parser rejects it. That is a MODEL-output defect: the
+    provider answered. The wrapper must classify it as
+    ``GuidedToolArgumentShapeError`` / ``INVARIANT_VIOLATED`` and must NOT fold
+    it into the transient "unavailable" set. The wire-level
+    ``synthetic_failure_reason`` for this error class is ``model_defect``
+    (pinned route-level in test_step_chat.py's
+    ``test_model_shape_defect_turn_persists_model_defect_reason``).
+    """
+    empty_content_args = {
+        "resolution": "source",
+        "plugin": "csv",
+        "filename": "inventory.csv",
+        "mime_type": "text/csv",
+        "content": "",
+        "options": {"schema": {"mode": "observed"}},
+        "observed_columns": ["sku"],
+        "sample_rows": [],
+        "assistant_message": "Bound the uploaded file.",
+    }
+
+    async def _return_empty_content(**_kwargs: object) -> SimpleNamespace:
+        return _fake_resolve_source_response(empty_content_args)
+
+    with patch(
+        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        new=_return_empty_content,
+    ):
+        result = await resolve_step_1_source_chat_with_auto_drop(
+            site="test",
+            session_id="s1",
+            user_id="u1",
+            model="anthropic/claude-sonnet-4.6",
+            user_message='I\'ve uploaded "inventory.csv"; please use it as the pipeline input.',
+            plugin_hint="csv",
+            current_source=None,
+            available_source_plugins=("csv",),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+
+    assert type(result) is GuidedStepChatOnlyResult
+    assert result.chat.error_class == "GuidedToolArgumentShapeError"
+    assert result.chat.status is ComposerChatTurnStatus.INVARIANT_VIOLATED
+    assert result.chat.status is not ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
 
 
 @pytest.mark.asyncio

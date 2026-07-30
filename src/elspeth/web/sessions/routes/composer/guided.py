@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json  # noqa: F401  # Preserve signed module statement positions.
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.validation import get_sink_config_model, get_source_config_model
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -24,6 +25,7 @@ from elspeth.web.composer.guided.stage_transitions import (
     PluginSelectionResponse,
     SchemaFormAuthority,
     SchemaFormResponse,
+    WebSurfacePolicyRejectedError,
     add_component_intent,
     begin_component_edit,
     finish_component_review,
@@ -68,6 +70,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationConflictError,
     GuidedOperationFailed,
     GuidedOriginatingUserMessageDraft,
+    GuidedPendingProposalInvalidation,
     GuidedReplayTurn,
     GuidedResponseDescriptor,
     GuidedStateOperationCommand,
@@ -97,7 +100,6 @@ from .._helpers import (
     BlobServiceProtocol,
     BufferingRecorder,
     ChatTurnResponse,
-    ComposerChatTurnStatus,
     CompositionState,
     CompositionStateData,
     CompositionStateRecord,
@@ -173,6 +175,11 @@ if TYPE_CHECKING:
 
 _COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY = "guided_completed_terminal_before_user_exit"
 _MISSING_COMPLETED_TERMINAL_MARKER = object()
+# Bound on the scrubbed ``str(exc)`` logged when a guided /respond body is
+# rejected by the turn contract. Log-only — the closed 400 detail is
+# unchanged. Scrub first, then truncate: truncation is a bound, never a
+# redaction mechanism (mirrors execution.service's operator diagnostic).
+_CONTRACT_REJECTION_EXC_MESSAGE_CHARS = 500
 
 
 def _resolve_shield_available(snapshot: PluginAvailabilitySnapshot) -> bool:
@@ -182,35 +189,6 @@ def _resolve_shield_available(snapshot: PluginAvailabilitySnapshot) -> bool:
     selection is the fail-safe State C result.
     """
     return dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD) is not None
-
-
-def _guided_chat_wire_kind(status: ComposerChatTurnStatus) -> Literal["assistant", "synthetic_failure"]:
-    """Map a ``StepChatResult``'s status to the wire discriminator (fp-review C-2)."""
-    return "assistant" if status is ComposerChatTurnStatus.SUCCESS else "synthetic_failure"
-
-
-def _chat_turn_synthetic_failure_reason(
-    status: ComposerChatTurnStatus,
-    error_class: str | None,
-) -> Literal["quality_guard", "unavailable"] | None:
-    """Classify a persisted ``ChatTurn``'s synthetic-failure cause (fp-review C-2).
-
-    ``None`` on success. Otherwise ``"quality_guard"`` when a scaffold-leak
-    guard rejected the reply, or ``"unavailable"`` for transient provider /
-    solver failures. STEP_1/STEP_2 commit-seam rejection branches
-    (``error_class="StepHandlerRejected"``) deliberately return ``None``:
-    they are neither quality-guard nor availability events, and the audit row
-    carries the redaction-safe classifier. ``error_class`` is compared by the
-    literal class name string (``_guided_step_chat.py`` sets it via
-    ``type(exc).__name__``); ``"AssistantScaffoldLeakError"`` is the ONLY
-    class the dedicated scaffold-leak branches ever record. Persisted-only:
-    the live ``GuidedChatResponse`` deliberately carries kind alone.
-    """
-    if status is ComposerChatTurnStatus.SUCCESS:
-        return None
-    if error_class == "StepHandlerRejected":
-        return None
-    return "quality_guard" if error_class == "AssistantScaffoldLeakError" else "unavailable"
 
 
 def _turn_payload_response(
@@ -368,6 +346,7 @@ def _build_get_guided_turn(
     guided: Any,
     *,
     catalog: Any,
+    fallback_blob_inspection: SourceInspectionFacts | None = None,
 ) -> Any | None:
     """Deterministically rebuild a GET/reentry turn from schema-8 custody.
 
@@ -376,6 +355,14 @@ def _build_get_guided_turn(
     renders the corresponding reviewed component. Proposal payloads are held
     by the proposal service rather than in ``GuidedSession``, so STEP_3 has no
     synchronous checkpoint-only reconstruction here.
+
+    ``fallback_blob_inspection`` carries a compatible ready upload resolved by
+    an async caller (this function is synchronous and holds no blob service).
+    It prefills a Step-1 ``plugin_options`` form whose intent captured no
+    inspection facts — the form's ``path`` knob has no other practically legal
+    web value than the ``blob:<id>`` sentinel, so an unprefilled form is a
+    dead end. Custody is unchanged: the facts are display prefill only, never
+    staged onto the intent.
     """
     step = guided.step
     if step is GuidedStep.STEP_1_SOURCE:
@@ -400,10 +387,15 @@ def _build_get_guided_turn(
         if pending.phase == "plugin_options":
             if pending.plugin is None:  # pragma: no cover - guarded by SourceIntent
                 raise InvariantError("STEP_1 plugin_options intent requires a plugin")
+            inspection_facts = pending.inspection_facts
+            if inspection_facts is None and fallback_blob_inspection is not None:
+                inspection_facts = (
+                    fallback_blob_inspection if _inspection_matches_source_plugin(pending.plugin, fallback_blob_inspection) else None
+                )
             return build_step_1_schema_form_turn(
                 pending.plugin,
                 catalog,
-                inspection_facts=pending.inspection_facts,
+                inspection_facts=inspection_facts,
             )
         if pending.phase == "inspection_review":
             return build_step_1_inspect_and_confirm_turn_from_intent(pending)
@@ -473,22 +465,99 @@ def _step_1_plugin_hint(guided: GuidedSession) -> str | None:
 
 
 def _step_1_uploaded_input_filename(message: str) -> str | None:
-    """Return the filename from the upload helper's Step-1 bind request."""
-    stripped = message.strip()
+    """Return the filename from the upload helper's Step-1 bind request.
+
+    The frontend upload helper APPENDS its bind sentence to whatever the user
+    already typed, separated by a newline (``ChatInput``'s upload-completion
+    handler), so the sentinel is the message's TRAILING LINE rather than a
+    whole-message prefix. Matching the prefix of the whole message made any
+    typed prose defeat the deterministic upload route and hand an
+    unresolvable request to the provider instead.
+    """
+    lines = message.strip().splitlines()
+    if not lines:
+        return None
+    sentinel = lines[-1].strip()
     prefix = "I've uploaded \""
     suffix = '"; please use it as the pipeline input.'
-    if not stripped.startswith(prefix) or not stripped.endswith(suffix):
+    if not sentinel.startswith(prefix) or not sentinel.endswith(suffix):
         return None
-    filename = stripped[len(prefix) : -len(suffix)]
-    if not filename or '"' in filename or "\n" in filename or "\r" in filename:
+    filename = sentinel[len(prefix) : -len(suffix)]
+    if not filename or '"' in filename:
         return None
     return filename
+
+
+def _step_1_plugin_for_uploaded_inspection(
+    inspection_facts: SourceInspectionFacts,
+    *,
+    selectable_plugins: tuple[str, ...],
+) -> str | None:
+    """Derive the source plugin an inspected upload binds, or ``None``.
+
+    The upload helper's bind request names no plugin, so a Step-1 plugin
+    SELECTION turn has no server-held plugin to bind against. Invert the
+    prefill compatibility predicate over the turn's own permitted option ids:
+    exactly one match is a deterministic derivation (csv content binds ``csv``,
+    json/jsonl bind ``json``, text binds ``text``), while an unknown source
+    kind or an ambiguous permitted set abstains so the request falls back to
+    the ordinary provider route rather than guessing.
+    """
+    matches = tuple(dict.fromkeys(plugin for plugin in selectable_plugins if _inspection_matches_source_plugin(plugin, inspection_facts)))
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+async def _step_1_unambiguous_compatible_blob_inspection(
+    blob_service: BlobServiceProtocol,
+    session_id: UUID,
+    *,
+    plugin: str,
+) -> SourceInspectionFacts | None:
+    """Inspect the session's ONE ready upload that can prefill ``plugin``.
+
+    Deliberately NOT recency-based. Several compatible ready uploads stay
+    ambiguous — their order is temporal session state, not source intent
+    (``resolve_source_inspection_blob_id``), and a selection naming no blob
+    must never silently bind "the latest one"
+    (``test_source_selection_without_blob_identity_does_not_fall_back_to_latest_upload``
+    locks that in). This closes only the strictly unambiguous gap: the session
+    holds exactly one upload that could prefill the selected plugin, while some
+    OTHER ready blob of an unrelated kind made the raw ready set plural and so
+    made ``inspect_selected_ready_session_blob`` abstain. The emitted form would
+    otherwise carry an empty ``path`` whose only practically legal web value is
+    a ``blob:<id>`` sentinel the user cannot type.
+
+    Blob bytes are Tier 3 and ``inspect_blob_content`` is the source-boundary
+    validation point; listing is session-scoped, so another session's upload can
+    never be reached from here.
+    """
+    match: SourceInspectionFacts | None = None
+    for record in await blob_service.list_blobs(session_id, limit=None):
+        if record.status != "ready":
+            continue
+        content = await blob_service.read_blob_content(record.id)
+        facts = inspect_blob_content(
+            content=content,
+            filename=record.filename,
+            mime_type=record.mime_type,
+            blob_id=record.id,
+            content_hash=record.content_hash,
+        )
+        if not _inspection_matches_source_plugin(plugin, facts):
+            continue
+        if match is not None:
+            return None
+        match = facts
+    return match
 
 
 async def _source_from_latest_uploaded_blob_for_step_1_chat(
     *,
     message: str,
     plugin_hint: str | None,
+    selectable_plugins: tuple[str, ...] = (),
     blob_service: BlobServiceProtocol,
     session_id: UUID,
 ) -> tuple[SourceResolved | None, SourceInspectionFacts] | None:
@@ -497,10 +566,16 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
     The frontend upload helper currently appends text like "I've uploaded
     <file>; please use it as the pipeline input." to the chat box. That text
     carries no blob id, so letting the LLM resolve it invites invented schema.
-    When the session is already on a Step-1 schema form with a concrete plugin,
-    bind the newest ready session blob through the same inspection prefill used
+    Bind the named ready session blob through the same inspection prefill used
     by the visible form. The proposal custody boundary later resolves the
     masked ``blob:<id>`` sentinel authoritatively.
+
+    ``plugin_hint`` is the server-held Step-1 plugin when one exists (a schema
+    form). A plugin SELECTION turn holds none, so the plugin is derived from
+    the inspected content kind restricted to ``selectable_plugins`` — the
+    permitted option ids the same turn advertised. The default empty set means
+    "no derivation is available here", which is the pre-derivation contract:
+    without a plugin hint there is then nothing to bind.
 
     ``None`` means there is no applicable ready upload. A tuple with a source
     means the inspected blob matches the selected plugin; a tuple whose source
@@ -508,7 +583,7 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
     type-mismatch response.
     """
     uploaded_filename = _step_1_uploaded_input_filename(message)
-    if plugin_hint is None or uploaded_filename is None:
+    if uploaded_filename is None:
         return None
     inspection_facts = await _inspect_latest_ready_session_blob(
         blob_service,
@@ -517,9 +592,16 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
     )
     if inspection_facts is None:
         return None
-    prefilled = build_step_1_source_prefill(plugin_hint, inspection_facts=inspection_facts)
+    plugin = (
+        plugin_hint
+        if plugin_hint is not None
+        else _step_1_plugin_for_uploaded_inspection(inspection_facts, selectable_plugins=selectable_plugins)
+    )
+    if plugin is None:
+        return None
+    prefilled = build_step_1_source_prefill(plugin, inspection_facts=inspection_facts)
     if "path" not in prefilled:
-        if _inspection_matches_source_plugin(plugin_hint, inspection_facts):
+        if _inspection_matches_source_plugin(plugin, inspection_facts):
             raise InvariantError("matching source prefill is missing required path")
         # A ready upload with incompatible inspected content is not the same
         # thing as no upload. Preserve the facts so the chat boundary can
@@ -553,7 +635,7 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
     return (
         SourceResolved(
             name="source",
-            plugin=plugin_hint,
+            plugin=plugin,
             options=options,
             observed_columns=observed_columns,
             sample_rows=(),
@@ -785,7 +867,10 @@ async def get_guided(
                         )
                         raise HTTPException(
                             status_code=500,
-                            detail="Server invariant violated. See application audit log for diagnostic detail.",
+                            detail={
+                                "error_type": "server_invariant_violated",
+                                "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                            },
                         ) from exc
                     if turn is not None:
                         turn = _finalize_guided_turn(
@@ -1203,7 +1288,10 @@ async def post_guided_reenter(
                 )
                 raise HTTPException(
                     status_code=500,
-                    detail="Server invariant violated. See application audit log for diagnostic detail.",
+                    detail={
+                        "error_type": "server_invariant_violated",
+                        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                    },
                 ) from exc
 
             existing_meta.pop(_COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY)
@@ -2170,6 +2258,7 @@ def _schema8_answer_and_project_next(
     new_stable_id: UUID,
     source_inspection_facts: SourceInspectionFacts | None = None,
     sink_prefill_options: Mapping[str, Any] | None = None,
+    fallback_blob_inspection: SourceInspectionFacts | None = None,
 ) -> tuple[CompositionState, PreparedGuidedJsonPayload, Turn | None, PreparedGuidedJsonPayload | None]:
     if body.control_signal == ControlSignal.EXIT_TO_FREEFORM.value:
         _schema8_only_response_fields(body, "control_signal")
@@ -2181,6 +2270,13 @@ def _schema8_answer_and_project_next(
                 reason=TerminalReason.USER_PRESSED_EXIT,
                 pipeline_yaml=None,
             ),
+            # Exit is the binding-exempt universal escape: it fires from any
+            # step, including Step 3/4 with an active proposal, so it must
+            # clear proposal custody itself or GuidedSession's frozen
+            # revalidation ("terminal state must clear active_proposal and
+            # active_edit_target") turns the escape into a 500.
+            active_proposal=None,
+            active_edit_target=None,
             transition_consumed=True,
         )
     else:
@@ -2202,7 +2298,12 @@ def _schema8_answer_and_project_next(
     next_turn = (
         None
         if transitioned.terminal is not None
-        else _build_get_guided_turn(_replace(state, guided_session=transitioned), transitioned, catalog=catalog)
+        else _build_get_guided_turn(
+            _replace(state, guided_session=transitioned),
+            transitioned,
+            catalog=catalog,
+            fallback_blob_inspection=fallback_blob_inspection,
+        )
     )
     prepared_next: PreparedGuidedJsonPayload | None = None
     if next_turn is not None:
@@ -2364,7 +2465,7 @@ async def post_guided_respond(
                 raise HTTPException(status_code=409, detail="edit_target does not identify a current wire component")
             raise AuditIntegrityError("guided wire correction target changed after reservation")
 
-    async def _preflight_attempt(attempt_stable_id: UUID) -> tuple[SourceInspectionFacts | None, bool]:
+    async def _preflight_attempt(attempt_stable_id: UUID) -> tuple[SourceInspectionFacts | None, SourceInspectionFacts | None, bool]:
         observed = await service.get_current_state(session_id)
         observed_state = _state_from_record(observed) if observed is not None else _initial_composition_state_with_guided_session()
         observed_guided = observed_state.guided_session
@@ -2384,7 +2485,7 @@ async def post_guided_respond(
                 and body.control_signal == ControlSignal.EXIT_TO_FREEFORM.value
             ):
                 raise HTTPException(status_code=409, detail="Guided session is already terminal.")
-            return None, False
+            return None, None, False
         _verify_schema8_proposal_binding(observed_guided, body)
         is_active_exit = body.control_signal == ControlSignal.EXIT_TO_FREEFORM.value
         if not is_active_exit and observed_guided.step is GuidedStep.STEP_3_TRANSFORMS:
@@ -2445,7 +2546,7 @@ async def post_guided_respond(
                         detail="Guided proposal revision instruction must be a non-empty string of at most 8192 characters.",
                     )
             requires_planner = is_prose_revise or (is_revise and body.edit_target is not None and body.edit_target.kind in {"node", "edge"})
-            return None, requires_planner
+            return None, None, requires_planner
         if not is_active_exit and observed_guided.step is GuidedStep.STEP_4_WIRE:
             if observed_guided.correction_messages:
                 correction_ids = {str(reference.message_id) for reference in observed_guided.correction_messages}
@@ -2492,7 +2593,7 @@ async def post_guided_respond(
                 raise HTTPException(status_code=400, detail="Guided wire action has an invalid closed shape.")
             if is_correction:
                 _require_bound_wire_target(current_turn, public_error=True)
-            return None, is_correction
+            return None, None, is_correction
         if not is_active_exit and observed_guided.step not in {GuidedStep.STEP_1_SOURCE, GuidedStep.STEP_2_SINK}:
             raise _schema8_unsupported_stage(observed_guided.step)
         prospective, current_turn, _prepared_current = _schema8_prospective_occurrence(
@@ -2510,6 +2611,7 @@ async def post_guided_respond(
                 detail="source_blob_id is only valid for a Step 1 source selection.",
             )
         inspection_facts: SourceInspectionFacts | None = None
+        fallback_blob_inspection: SourceInspectionFacts | None = None
         if observed_guided.step is GuidedStep.STEP_1_SOURCE:
             if current_turn["type"] == TurnType.SINGLE_SELECT.value:
                 selected_source_plugin = body.chosen[0] if body.chosen is not None and len(body.chosen) == 1 else None
@@ -2536,6 +2638,20 @@ async def post_guided_respond(
                             status_code=400,
                             detail="Selected source blob is not a ready upload for this session.",
                         ) from exc
+                    if inspection_facts is None and selected_source_plugin is not None:
+                        # A plural raw ready set resolves no blob identity, so
+                        # the intent captures no inspection custody and the
+                        # projected schema form would render an empty ``path``
+                        # whose only practically legal web value is a
+                        # ``blob:<id>`` sentinel the user cannot type. Prefill
+                        # the form only when exactly ONE ready upload could
+                        # prefill the selected plugin: staying recency-blind
+                        # keeps the no-silent-latest-blob rule intact.
+                        fallback_blob_inspection = await _step_1_unambiguous_compatible_blob_inspection(
+                            request.app.state.blob_service,
+                            session_id,
+                            plugin=selected_source_plugin,
+                        )
             elif current_turn["type"] == TurnType.SCHEMA_FORM.value:
                 inspection_facts = await _schema8_active_source_edit_inspection(
                     request.app.state.blob_service,
@@ -2560,6 +2676,7 @@ async def post_guided_respond(
                 shield_available=shield_available,
                 new_stable_id=attempt_stable_id,
                 source_inspection_facts=inspection_facts,
+                fallback_blob_inspection=fallback_blob_inspection,
             )
         except (PluginConfigError, TypeError, ValueError) as exc:
             # The client sees the closed generic detail, but the operator must
@@ -2567,16 +2684,39 @@ async def post_guided_respond(
             # a silent 400 here wedged the first-run tutorial undiagnosably
             # (elspeth-a88c07cd47: server-held prefill failed its own plugin
             # config model on every echo).
+            #
+            # The generic branch logs the CLASS only: generic contract
+            # messages echo raw client-supplied values (pinned by
+            # test_unsupported_guided_selection_never_reaches_operator_logs),
+            # and the audit scrubber redacts secret-shaped text, not
+            # arbitrary client text. A deployment-policy refusal is the
+            # exception: its message is server-composed end to end, so that
+            # branch logs the policy explanation under its own closed
+            # rejection code — without it the operator sees only
+            # "invalid_guided_response ValueError" and never learns that
+            # policy, not the author, refused the selection.
             with contextlib.suppress(Exception):
-                slog.warning(
-                    "guided.respond_turn_contract_rejected",
-                    session_id=str(session_id),
-                    user_id=user.user_id,
-                    step=observed_guided.step.value,
-                    turn_type=current_turn["type"],
-                    rejection_code="invalid_guided_response",
-                    exc_class=type(exc).__name__,
-                )
+                if isinstance(exc, WebSurfacePolicyRejectedError):
+                    slog.warning(
+                        "guided.respond_turn_contract_rejected",
+                        session_id=str(session_id),
+                        user_id=user.user_id,
+                        step=observed_guided.step.value,
+                        turn_type=current_turn["type"],
+                        rejection_code=WebSurfacePolicyRejectedError.rejection_code,
+                        exc_class=type(exc).__name__,
+                        exc_message=scrub_text_for_audit(str(exc))[:_CONTRACT_REJECTION_EXC_MESSAGE_CHARS],
+                    )
+                else:
+                    slog.warning(
+                        "guided.respond_turn_contract_rejected",
+                        session_id=str(session_id),
+                        user_id=user.user_id,
+                        step=observed_guided.step.value,
+                        turn_type=current_turn["type"],
+                        rejection_code="invalid_guided_response",
+                        exc_class=type(exc).__name__,
+                    )
             raise HTTPException(
                 status_code=400,
                 detail="Guided response does not satisfy the current turn contract.",
@@ -2588,9 +2728,9 @@ async def post_guided_respond(
             and projected_guided.step is GuidedStep.STEP_3_TRANSFORMS
             and projected_guided.terminal is None
         )
-        return inspection_facts, requires_planner
+        return inspection_facts, fallback_blob_inspection, requires_planner
 
-    async def _preflight_or_sanitize(attempt_stable_id: UUID) -> tuple[SourceInspectionFacts | None, bool]:
+    async def _preflight_or_sanitize(attempt_stable_id: UUID) -> tuple[SourceInspectionFacts | None, SourceInspectionFacts | None, bool]:
         try:
             return await _preflight_attempt(attempt_stable_id)
         except (AuditIntegrityError, *SOURCE_INSPECTION_INTEGRITY_ERRORS, InvariantError) as exc:
@@ -2605,7 +2745,10 @@ async def post_guided_respond(
                 )
             raise HTTPException(
                 status_code=500,
-                detail="Server invariant violated. See application audit log for diagnostic detail.",
+                detail={
+                    "error_type": "server_invariant_violated",
+                    "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                },
             ) from exc
 
     pending = await reserve_or_replay_guided_operation(
@@ -2630,6 +2773,7 @@ async def post_guided_respond(
         rejoin_after_lock = False
         attempt_stable_id = uuid4()
         attempt_inspection_facts: SourceInspectionFacts | None = None
+        attempt_fallback_blob_inspection: SourceInspectionFacts | None = None
         attempt_requires_planner = False
         attempt_planner_admitted = False
         bypass_admission = isinstance(pending, GuidedOperationExpired)
@@ -2638,7 +2782,11 @@ async def post_guided_respond(
             # but cannot queue behind the stale local worker it is fencing out.
             # This is a read plus a discarded pure transition. The fenced
             # settlement rechecks the exact head under compose before writing.
-            attempt_inspection_facts, attempt_requires_planner = await _preflight_or_sanitize(attempt_stable_id)
+            (
+                attempt_inspection_facts,
+                attempt_fallback_blob_inspection,
+                attempt_requires_planner,
+            ) = await _preflight_or_sanitize(attempt_stable_id)
             if attempt_requires_planner:
                 await rate_limiter.check(user.user_id)
                 attempt_planner_admitted = True
@@ -2687,7 +2835,11 @@ async def post_guided_respond(
                 # preflight and settlement, so stale competing ids never mint
                 # a loser operation row.
                 async with compose_lock:
-                    attempt_inspection_facts, attempt_requires_planner = await _preflight_or_sanitize(attempt_stable_id)
+                    (
+                        attempt_inspection_facts,
+                        attempt_fallback_blob_inspection,
+                        attempt_requires_planner,
+                    ) = await _preflight_or_sanitize(attempt_stable_id)
 
             if attempt_requires_planner and not bypass_admission:
                 await rate_limiter.check(user.user_id)
@@ -2837,6 +2989,11 @@ async def post_guided_respond(
                         )
                         return _response_from_record(decline_settlement.result_state)
 
+                    # Mirror the preflight dispatch: an active exit bypasses
+                    # the Step 3/4 proposal-action branches (exit is the
+                    # binding-exempt universal escape) and settles through
+                    # the generic answer-and-project path below.
+                    is_active_exit = body.control_signal == ControlSignal.EXIT_TO_FREEFORM.value
                     if guided.terminal is not None:
                         if not (
                             guided.terminal.kind is TerminalKind.COMPLETED
@@ -2864,7 +3021,7 @@ async def post_guided_respond(
                             "composition_hash": composition_content_hash(state),
                         }
                         new_state = _replace(state, guided_session=guided)
-                    elif guided.step is GuidedStep.STEP_3_TRANSFORMS:
+                    elif not is_active_exit and guided.step is GuidedStep.STEP_3_TRANSFORMS:
                         if state_record is None or guided.active_proposal is None:
                             raise AuditIntegrityError("guided proposal action requires a persisted active proposal")
                         prospective, current_turn, _planned_current = _schema8_prospective_occurrence(
@@ -3408,7 +3565,7 @@ async def post_guided_respond(
                             payload_store=payload_store,
                         )
                         return _response_from_record(settlement.result_state)
-                    elif guided.step is GuidedStep.STEP_4_WIRE:
+                    elif not is_active_exit and guided.step is GuidedStep.STEP_4_WIRE:
                         if state_record is None or guided.active_proposal is None:
                             raise AuditIntegrityError("guided wire action requires a persisted active proposal")
                         prospective, current_turn, _planned_current = _schema8_prospective_occurrence(
@@ -3920,6 +4077,7 @@ async def post_guided_respond(
                                 shield_available=shield_available,
                                 new_stable_id=attempt_stable_id,
                                 source_inspection_facts=attempt_inspection_facts,
+                                fallback_blob_inspection=attempt_fallback_blob_inspection,
                             )
                         except (PluginConfigError, TypeError, ValueError) as exc:
                             raise AuditIntegrityError("Guided RESPOND contract changed after reservation") from exc
@@ -4208,6 +4366,22 @@ async def post_guided_respond(
                     settlement_guided = new_state.guided_session
                     if settlement_guided is None:  # pragma: no cover
                         raise AuditIntegrityError("Guided RESPOND settlement has no checkpoint")
+                    invalidated_pending_proposal = None
+                    if guided.active_proposal is not None and settlement_guided.active_proposal is None:
+                        # Exit-to-freeform is the only generic transition that
+                        # clears proposal custody: surface the exact pending
+                        # authority so the settlement verifies the clear and
+                        # terminalizes the now-unreferenced proposal row
+                        # atomically instead of stranding it pending. The
+                        # rejection reason is "guided_exit", not "superseded":
+                        # nothing displaced this proposal — the author left
+                        # guided mode.
+                        invalidated_pending_proposal = GuidedPendingProposalInvalidation(
+                            proposal_id=guided.active_proposal.proposal_id,
+                            draft_hash=guided.active_proposal.draft_hash,
+                            reviewed_facts=guided_private_reviewed_facts(guided),
+                            reason="guided_exit",
+                        )
                     existing_meta["guided_session"] = settlement_guided.to_dict()
                     state_dict = new_state.to_dict()
                     is_valid, validation_errors = _guided_persisted_validity(new_state, catalog=catalog)
@@ -4246,6 +4420,7 @@ async def post_guided_respond(
                         ),
                         payloads=tuple(prepared_payloads),
                         audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
+                        invalidated_pending_proposal=invalidated_pending_proposal,
                     )
                     # CHAT and other current writers do not all carry an
                     # expected-head CAS yet, so settlement remains mutually
