@@ -283,7 +283,14 @@ def test_static_policy_bans_attribute_presence_proxies_without_revalidating_fixe
     ):
         assert forbidden in policy
     assert "At a genuinely unknown-type boundary" in policy
-    assert "declared concrete type or runtime-checkable protocol" in policy
+    # ADR-032: the runtime-checkable-Protocol option was withdrawn — it is
+    # structural typing (an impostor passes) and since Python 3.12 it resolves
+    # through ``inspect.getattr_static`` (honest dynamic-attribute objects are
+    # rejected). Internal discrimination is nominal only.
+    assert "declared concrete type that ELSPETH defines" in policy
+    assert "Do NOT use a ``runtime_checkable`` ``Protocol`` for that discrimination" in policy
+    assert "never a security control" in policy
+    assert "Parse, don't validate" in policy
     assert "Under a fixed contract, access the declared attribute directly and let breakage raise" in policy
     assert "Do not use ``isinstance`` to revalidate Tier 1 or another fixed contract" in policy
 
