@@ -24,7 +24,7 @@ import asyncio
 import base64
 import time
 from collections.abc import Callable
-from urllib.parse import urlsplit
+from urllib.parse import quote_plus, urlsplit
 
 import httpx
 
@@ -125,7 +125,18 @@ class TokenManager:
 
         headers: dict[str, str] = {}
         if self._config.oauth_auth_method == "client_secret_basic":
-            credentials = f"{self._config.oauth_client_id.get_secret_value()}:{self._config.oauth_client_secret.get_secret_value()}"
+            # RFC 6749 §2.3.1 / Appendix B: the client id and secret are each
+            # encoded using the "application/x-www-form-urlencoded" algorithm
+            # (HTML 4.01 §17.13.4) *before* being joined with ":" and
+            # base64'd — not raw string concatenation. That algorithm encodes
+            # a space as "+", which is what distinguishes it from plain
+            # percent-encoding (`urllib.parse.quote`, which would emit
+            # "%20"); `quote_plus` implements the same "+"-for-space rule.
+            # Without this, a colon or "%" inside either value produces a
+            # Basic header a spec-compliant server decodes incorrectly.
+            username = quote_plus(self._config.oauth_client_id.get_secret_value(), safe="")
+            password = quote_plus(self._config.oauth_client_secret.get_secret_value(), safe="")
+            credentials = f"{username}:{password}"
             headers["Authorization"] = "Basic " + base64.b64encode(credentials.encode("utf-8")).decode("ascii")
         else:
             data["client_id"] = self._config.oauth_client_id.get_secret_value()

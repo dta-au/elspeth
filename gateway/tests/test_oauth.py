@@ -1,6 +1,6 @@
 import asyncio
 import base64
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote_plus
 
 import httpx
 import pytest
@@ -135,6 +135,55 @@ async def test_client_secret_basic_sends_basic_header_and_no_secret_in_form(clie
     assert "client_secret" not in form
     assert "scope" not in form
     assert form["grant_type"] == "client_credentials"
+
+
+@respx.mock
+async def test_client_secret_basic_form_urlencodes_id_and_secret_before_joining(client):
+    """RFC 6749 §2.3.1 / Appendix B: client_id and client_secret are each
+    application/x-www-form-urlencoded *before* being joined with ':' and
+    base64'd. A raw ':' or '%' inside either value must not corrupt the
+    username:password split a compliant server performs after decoding."""
+    route = respx.post(TOKEN_URL).mock(return_value=_ok_response(access_token="tok-encoded"))
+    raw_client_id = "id:with:colons"
+    raw_client_secret = "secret%with%percent"
+    config = _config(
+        ELSPETH_LLM_GATEWAY_OAUTH_AUTH_METHOD="client_secret_basic",
+        ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_ID=raw_client_id,
+        ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_SECRET=raw_client_secret,
+    )
+    manager = TokenManager(config, client)
+
+    token = await manager.get_token()
+
+    assert token == "tok-encoded"
+    sent = route.calls[0].request
+    auth_header = sent.headers["Authorization"]
+    assert auth_header.startswith("Basic ")
+    decoded = base64.b64decode(auth_header.removeprefix("Basic ")).decode("utf-8")
+    expected_username = quote_plus(raw_client_id, safe="")
+    expected_password = quote_plus(raw_client_secret, safe="")
+    assert decoded == f"{expected_username}:{expected_password}"
+    # The encoded username/password must each still split unambiguously on
+    # the join separator -- the whole point of encoding before joining.
+    username, _, password = decoded.partition(":")
+    assert username == expected_username
+    assert password == expected_password
+
+
+@respx.mock
+async def test_client_secret_basic_plain_ascii_credentials_unchanged(client):
+    """quote_plus is a no-op on unreserved characters, so the plain-ASCII
+    BASE_ENV credentials must still produce exactly the same header as
+    a raw (unencoded) colon-join would."""
+    route = respx.post(TOKEN_URL).mock(return_value=_ok_response())
+    config = _config()
+    manager = TokenManager(config, client)
+
+    await manager.get_token()
+
+    sent = route.calls[0].request
+    expected_basic = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+    assert sent.headers["Authorization"] == f"Basic {expected_basic}"
 
 
 @respx.mock
