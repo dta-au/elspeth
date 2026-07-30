@@ -11,6 +11,32 @@ This package (`gateway/`) has no dependency on the rest of ELSPETH: it
 ships and runs standalone, with its own `pyproject.toml`, test suite, and
 container image.
 
+## A plain OpenAI-compatible endpoint
+
+This gateway is a plain OpenAI-compatible endpoint. Any OpenAI client —
+the OpenAI SDK, LiteLLM, ELSPETH's own OpenRouter-style provider, or
+anything else that speaks the `POST /v1/chat/completions` shape — can point
+its `base_url` at `<base>/v1` and use the gateway's static inbound bearer
+token as its API key. No gateway-specific header, SDK, or client library is
+required.
+
+```bash
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer <the configured inbound bearer>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "mock-model", "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+Note what this curl example does *not* send: `X-ELSPETH-LLM-Gateway-Contract`.
+That header is optional — present only to let a client that wants version
+negotiation assert which contract major version it expects (`"1"`, matching
+`CONTRACT_MAJOR`). Sending it with the right value is accepted exactly as
+before; sending it with any other value (`"2"`, an empty string, garbage)
+is still rejected with `contract_mismatch` (400); omitting it entirely is
+now accepted too. The static bearer is not optional — every `/v1/*` request
+still requires a valid `Authorization: Bearer <token>` regardless of what
+contract header, if any, it sends.
+
 ## Quick-start: the local mock stack
 
 `gateway/mock/stack.py` runs three uvicorn servers side by side, wired

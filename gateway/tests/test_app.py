@@ -103,26 +103,47 @@ async def test_wrong_bearer_returns_401_envelope_with_headers():
 
 
 @respx.mock
-async def test_missing_contract_header_returns_400_contract_mismatch():
-    """Also sends an inbound X-Request-ID and asserts it's echoed back, proving
-    RequestIDMiddleware (outermost) still ran and stamped its header even
-    though ContractHeaderMiddleware (nested inside it) short-circuited the
-    request before it ever reached auth or the route."""
+async def test_missing_contract_header_with_valid_bearer_returns_200():
+    """Phase 3 relaxation: a plain OpenAI-compatible client that never sends
+    the gateway-specific contract header must still be served -- the header
+    is now optional, used only for version negotiation by clients that
+    choose to send it. Also proves RequestIDMiddleware still stamps its
+    header and the outbound contract header is unaffected by the inbound
+    header's absence."""
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "hello"}, "halt": "complete"}))
+
     async with _client_for(_config()) as client:
         headers = _headers(**{REQUEST_ID_HEADER: "req-missing-contract"})
         del headers[CONTRACT_HEADER]
         response = await client.post("/v1/chat/completions", json=CHAT_BODY, headers=headers)
 
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "contract_mismatch"
+    assert response.status_code == 200
     assert response.headers[REQUEST_ID_HEADER] == "req-missing-contract"
     assert response.headers[CONTRACT_HEADER] == "1"
 
 
 @respx.mock
-async def test_wrong_contract_header_value_returns_400_contract_mismatch():
+async def test_matching_contract_header_returns_200():
+    """Unchanged: a client that does send the header and gets it right is
+    still served."""
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "hello"}, "halt": "complete"}))
+
     async with _client_for(_config()) as client:
-        response = await client.post("/v1/chat/completions", json=CHAT_BODY, headers=_headers(**{CONTRACT_HEADER: "2"}))
+        response = await client.post("/v1/chat/completions", json=CHAT_BODY, headers=_headers(**{CONTRACT_HEADER: "1"}))
+
+    assert response.status_code == 200
+    assert response.headers[CONTRACT_HEADER] == "1"
+
+
+@pytest.mark.parametrize("bad_value", ["2", "abc", ""])
+@respx.mock
+async def test_present_but_wrong_contract_header_value_returns_400_contract_mismatch(bad_value):
+    """Proves the relaxation did not over-relax: a header that IS present but
+    wrong is still rejected, exactly as before the header became optional."""
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", json=CHAT_BODY, headers=_headers(**{CONTRACT_HEADER: bad_value}))
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "contract_mismatch"
@@ -138,6 +159,20 @@ async def test_contract_check_runs_before_auth():
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "contract_mismatch"
+
+
+@respx.mock
+async def test_no_bearer_and_no_contract_header_returns_401_not_bypassed():
+    """Security-critical: the contract-header relaxation must not become an
+    auth bypass. With neither header sent at all, auth still fires
+    independently and the request is still rejected -- 401, never 200."""
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", json=CHAT_BODY, headers={"Content-Type": "application/json"})
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "inbound_authentication_failed"
+    assert response.headers[REQUEST_ID_HEADER]
+    assert response.headers[CONTRACT_HEADER] == "1"
 
 
 # --- body parsing ----------------------------------------------------------------
@@ -489,7 +524,7 @@ def test_unknown_adapter_name_raises_config_error():
 
 
 @respx.mock
-async def test_root_path_prefixed_request_without_bearer_returns_401_not_bypassed():
+async def test_root_path_prefixed_request_without_bearer_or_contract_header_returns_401_not_bypassed():
     """The CRITICAL regression: both middlewares used to gate on
     ``request.url.path`` (== ``scope["path"]``, which still includes
     ``root_path``), while the router matches routes on
@@ -497,16 +532,18 @@ async def test_root_path_prefixed_request_without_bearer_returns_401_not_bypasse
     ``root_path="/gw"``, ``"/gw/v1/chat/completions"`` does not start with
     ``"/v1/"``, so both middlewares used to skip their check entirely while
     the router still resolved and served the route underneath -- a full
-    auth+contract bypass. No respx routes are registered here: if the
-    request ever reached CompletionService (and so the OAuth token
-    endpoint), respx would raise instead of this test's assertions ever
-    running.
+    auth+contract bypass. Neither the bearer nor the (now-optional) contract
+    header is sent here: this proves auth still fires independently of the
+    contract-header relaxation, even under a non-empty root_path. No respx
+    routes are registered here: if the request ever reached
+    CompletionService (and so the OAuth token endpoint), respx would raise
+    instead of this test's assertions ever running.
     """
     async with _client_for(_config(), root_path="/gw") as client:
         response = await client.post(
             "/gw/v1/chat/completions",
             json=CHAT_BODY,
-            headers={CONTRACT_HEADER: "1", "Content-Type": "application/json"},  # no Authorization at all
+            headers={"Content-Type": "application/json"},  # no Authorization, no contract header
         )
 
     assert response.status_code == 401
@@ -514,10 +551,26 @@ async def test_root_path_prefixed_request_without_bearer_returns_401_not_bypasse
 
 
 @respx.mock
-async def test_root_path_prefixed_request_without_contract_header_returns_400_not_bypassed():
+async def test_root_path_prefixed_request_missing_contract_header_with_valid_bearer_returns_200():
+    """The relaxation applies under a non-empty root_path too: a valid
+    bearer with no contract header at all still reaches the route."""
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "hello"}, "halt": "complete"}))
+
     async with _client_for(_config(), root_path="/gw") as client:
         headers = _headers()
         del headers[CONTRACT_HEADER]
+        response = await client.post("/gw/v1/chat/completions", json=CHAT_BODY, headers=headers)
+
+    assert response.status_code == 200
+
+
+@respx.mock
+async def test_root_path_prefixed_request_with_wrong_contract_header_returns_400_not_bypassed():
+    """A present-but-wrong contract header is still rejected under a
+    non-empty root_path -- the relaxation only widens "absent", not "wrong"."""
+    async with _client_for(_config(), root_path="/gw") as client:
+        headers = _headers(**{CONTRACT_HEADER: "2"})
         response = await client.post("/gw/v1/chat/completions", json=CHAT_BODY, headers=headers)
 
     assert response.status_code == 400

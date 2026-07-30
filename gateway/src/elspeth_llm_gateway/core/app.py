@@ -124,10 +124,24 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
 
 class ContractHeaderMiddleware(BaseHTTPMiddleware):
-    """Middle layer: on ``/v1/*``, the inbound contract header must be ``"1"``."""
+    """Middle layer: on ``/v1/*``, a *present* contract header must match ``"1"``.
+
+    Phase 1 made this header mandatory -- absent was rejected the same as
+    mismatched. That is a deliberate, operator-approved relaxation as of
+    Phase 3: the gateway is an *affordance* over a trusted, operator-chosen
+    upstream, not a required protocol, so any plain OpenAI-compatible client
+    (the OpenAI SDK, LiteLLM, ELSPETH's own OpenRouter-style provider) must be
+    able to speak to it with only a bearer token and no gateway-specific
+    header. Three-way behaviour, do not "fix" this back to two-way:
+    absent -> proceed; present and equal to ``CONTRACT_MAJOR`` -> proceed;
+    present and anything else -> reject ``contract_mismatch`` (400), exactly
+    as before. Auth (``AuthMiddleware``, nested inside this one) is enforced
+    independently and is unaffected by this relaxation.
+    """
 
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable]):
-        if _gated_path(request).startswith("/v1/") and request.headers.get(CONTRACT_HEADER) != str(CONTRACT_MAJOR):
+        received = request.headers.get(CONTRACT_HEADER)
+        if _gated_path(request).startswith("/v1/") and received is not None and received != str(CONTRACT_MAJOR):
             error = GatewayError(GatewayErrorCode.CONTRACT_MISMATCH)
             return JSONResponse(status_code=error.status, content=error_envelope(error, _request_id_from_state(request)))
         return await call_next(request)
