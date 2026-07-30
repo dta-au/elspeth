@@ -38,9 +38,11 @@ from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginC
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.value_source import register_value_source_plugin
+from elspeth.core.security.secret_loader import EnvSecretLoader, SecretNotFoundError
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.clients.llm import ContextLengthError, LLMClientError
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.pooling import PooledExecutor, RowContext
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
@@ -67,7 +69,7 @@ from elspeth.plugins.transforms.llm.provider import (
 )
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig, _configure_azure_monitor
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
-from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, GatewayLLMProvider
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterConfig, OpenRouterLLMProvider
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig, parse_tracing_config
@@ -248,20 +250,15 @@ def _finish_reason_error(
 
 # NOTE: type[LLMProvider] won't work here — mypy doesn't support type[Protocol]
 # for structural subtyping. The concrete classes (AzureLLMProvider,
-# OpenRouterLLMProvider, BedrockLLMProvider) are verified against LLMProvider by mypy at their
-# definition sites. The provider class is stored here for documentation only —
-# actual construction uses isinstance narrowing in _create_provider().
-#
-# "gateway" is registered for config-and-schema purposes only (Phase 2 Task 2
-# of the LLM gateway integration plan): GatewayLLMProvider does not exist yet
-# (Task 3), so `object` is a deliberate placeholder — never instantiated, and
-# never read except as this dict's value type. `_create_provider()` raises
-# NotImplementedError before it would ever need a real provider class here.
+# OpenRouterLLMProvider, BedrockLLMProvider, GatewayLLMProvider) are verified
+# against LLMProvider by mypy at their definition sites. The provider class is
+# stored here for documentation only — actual construction uses isinstance
+# narrowing in _create_provider().
 _PROVIDERS: dict[str, tuple[type[LLMConfig], type]] = {
     "azure": (AzureOpenAIConfig, AzureLLMProvider),
     "openrouter": (OpenRouterConfig, OpenRouterLLMProvider),
     "bedrock": (BedrockConfig, BedrockLLMProvider),
-    "gateway": (GatewayConfig, object),
+    "gateway": (GatewayConfig, GatewayLLMProvider),
 }
 
 
@@ -1148,8 +1145,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         "azure"      → AzureOpenAIConfig + AzureLLMProvider
         "openrouter" → OpenRouterConfig  + OpenRouterLLMProvider
         "bedrock"    → BedrockConfig     + BedrockLLMProvider
-        "gateway"    → GatewayConfig     + GatewayLLMProvider (Phase 2 Task 3;
-                       config-only for now — construction raises NotImplementedError)
+        "gateway"    → GatewayConfig     + GatewayLLMProvider
 
     Strategy selection:
         queries is not None → MultiQueryStrategy
@@ -1657,14 +1653,32 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 resolved_prompt_template_hash=self._resolved_prompt_template_hash,
             )
         elif isinstance(self._config, GatewayConfig):
-            # GatewayConfig is registered (Phase 2 Task 2) for config parsing
-            # and schema publication only. GatewayLLMProvider does not exist
-            # yet — Phase 2 Task 3 adds it. Fail closed and loudly rather than
-            # falling through to another provider's isinstance branch below.
-            raise NotImplementedError(
-                "GatewayLLMProvider is not implemented yet (Phase 2 Task 3). "
-                "GatewayConfig is currently registered for configuration and "
-                "schema purposes only; it cannot be used to run an LLM transform."
+            # credential_ref names a server-scoped secret (an env-var-shaped
+            # identifier, e.g. "ELSPETH_LLM_GATEWAY_BEARER_TOKEN") — it is
+            # NEVER the literal bearer value. v1 supports only
+            # credential_scope="server", so resolution is a direct env
+            # lookup here; the provider itself never reads ambient process
+            # state (it receives the already-resolved token), which also
+            # keeps provider unit tests free of environment-variable setup.
+            try:
+                api_key, _secret_ref = EnvSecretLoader().get_secret(self._config.credential_ref)
+            except SecretNotFoundError as exc:
+                raise PluginConfigError(
+                    f"Gateway credential_ref {self._config.credential_ref!r} could not be resolved: {exc}",
+                    plugin_name=self.name,
+                    plugin_class="GatewayConfig",
+                ) from exc
+            return GatewayLLMProvider(
+                endpoint=self._config.endpoint,
+                api_key=api_key,
+                contract_major=self._config.contract_major,
+                required_capabilities=self._config.required_capabilities,
+                timeout_seconds=self._config.timeout_seconds,
+                recorder=self._recorder,
+                run_id=self._run_id,
+                telemetry_emit=self._telemetry_emit,
+                limiter=self._limiter,
+                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
             )
         else:
             raise RuntimeError(f"Unknown config type: {type(self._config).__name__}")

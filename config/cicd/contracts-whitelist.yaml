@@ -384,6 +384,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/llm/provider.py:LLMProvider.execute_query:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/azure.py:AzureLLMProvider.execute_query:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider.execute_query:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider.execute_query:response_format"
 
   # LLM tracing — extra_metadata is provider-specific (deployment, model, query keys vary per caller)
   - "src/elspeth/plugins/transforms/llm/langfuse.py:LangfuseTracer.record_success:extra_metadata"
@@ -461,6 +462,13 @@ allowed_dict_patterns:
   # LLMCallResponse are the typed audit contracts around these mappings.
   - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider._build_llm_request_payload:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider._record_logical_llm_success:raw_response"
+
+  # ELSPETH LLM Gateway provider — same OpenAI-compatible wire shapes as
+  # OpenRouter above (request_body IS the JSON POST body sent verbatim;
+  # raw_response is the gateway's parsed chat-completion JSON kept for audit).
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._post_chat_completion:request_body"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._build_llm_request_payload:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._record_logical_llm_success:raw_response"
   - "src/elspeth/plugins/infrastructure/clients/replayer.py:ReplayMissError.__init__:request_data"
   - "src/elspeth/plugins/infrastructure/clients/replayer.py:CallReplayer.replay:request_data"
   - "src/elspeth/plugins/infrastructure/clients/verifier.py:CallVerifier.verify:request_data"

@@ -28,7 +28,8 @@ from unittest.mock import Mock
 import pytest
 from pydantic import ValidationError
 
-from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, GatewayLLMProvider
 from elspeth.plugins.transforms.llm.transform import _PROVIDERS, LLMTransform
 from elspeth.web.plugin_policy.profiles import _LLM_PRIVATE_OPTIONS
 
@@ -59,6 +60,9 @@ class TestGatewayEndpointValidation:
             "https://gateway.example.com/v1",
             "https://gateway.internal.corp/v1",
             "http://127.0.0.1:8787/v1",
+            # Sub-path mount behind a reverse proxy — a legitimate shape that
+            # the tightened path-segment check (below) must NOT reject.
+            "https://gateway.example.com/gateway/v1",
         ],
     )
     def test_accepts_valid_endpoints(self, endpoint: str) -> None:
@@ -86,10 +90,25 @@ class TestGatewayEndpointValidation:
             "https://gateway.example.com/v1/extra",
             # Trailing slash past the versioned base still isn't the base itself.
             "https://gateway.example.com/v1/",
+            # Doubled slash — endswith('/v1') alone would accept this.
+            "https://gateway.example.com//v1",
+            # Dot-segment path trick — endswith('/v1') alone would accept this.
+            "https://gateway.example.com/v1/../v1",
         ],
     )
     def test_rejects_invalid_endpoints(self, endpoint: str) -> None:
         with pytest.raises(ValidationError):
+            _make_gateway_config(endpoint=endpoint)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "http://127.0.0.1:99999/v1",  # out-of-range port
+            "http://127.0.0.1:notaport/v1",  # non-numeric port
+        ],
+    )
+    def test_rejects_malformed_port(self, endpoint: str) -> None:
+        with pytest.raises(ValidationError, match="port"):
             _make_gateway_config(endpoint=endpoint)
 
 
@@ -235,7 +254,8 @@ def _make_ctx() -> SimpleNamespace:
 
 
 class TestGatewayLimiterDispatch:
-    def test_gateway_provider_gets_gateway_limiter_not_openrouters(self) -> None:
+    def test_gateway_provider_gets_gateway_limiter_not_openrouters(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GATEWAY_API_KEY", "test-bearer-token")
         transform = LLMTransform(_make_gateway_transform_config())
 
         mock_registry = Mock()
@@ -244,15 +264,16 @@ class TestGatewayLimiterDispatch:
         ctx = _make_ctx()
         ctx.rate_limit_registry = mock_registry
 
-        # _create_provider() is unimplemented for gateway (Task 3); the
-        # limiter is selected and requested BEFORE that raise, so this test
-        # exercises exactly the fallthrough bug in isolation.
-        with pytest.raises(NotImplementedError):
-            transform.on_start(ctx)
+        transform.on_start(ctx)
 
         mock_registry.get_limiter.assert_called_once_with("gateway")
+        assert isinstance(transform._provider, GatewayLLMProvider)
 
-    def test_create_provider_fails_closed_with_clear_message(self) -> None:
+    def test_create_provider_fails_closed_when_credential_ref_unresolved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """credential_ref names an env var; an unset one is an "absent server
+        secret" config failure (per the design's fail-closed list), not a
+        deferred connect-time surprise."""
+        monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
         transform = LLMTransform(_make_gateway_transform_config())
 
         mock_registry = Mock()
@@ -260,7 +281,7 @@ class TestGatewayLimiterDispatch:
         ctx = _make_ctx()
         ctx.rate_limit_registry = mock_registry
 
-        with pytest.raises(NotImplementedError, match="GatewayLLMProvider"):
+        with pytest.raises(PluginConfigError, match="GATEWAY_API_KEY"):
             transform.on_start(ctx)
 
 
