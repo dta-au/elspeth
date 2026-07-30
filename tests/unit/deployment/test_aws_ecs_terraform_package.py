@@ -62,12 +62,34 @@ EXPECTED_FILES = {
 }
 
 
-def _source_files() -> list[Path]:
+def _source_files(root: Path = PACKAGE) -> list[Path]:
+    """Enumerate the package as git would ship it.
+
+    Deliberately NOT a filesystem walk. The package README instructs an
+    operator to create their real `examples/*.tfvars` and `*.tfbackend`
+    inputs inside this directory, and the package's own `.gitignore`
+    excludes them. A walk counts those local files as package source, so
+    every operator who follows the README turns this suite red — and the
+    account-data assertion below fires on their own legitimately-ignored
+    credentials rather than on a genuine leak. Asking git for tracked plus
+    untracked-but-not-ignored files tests exactly the set that would be
+    committed: a new package file an author forgot to `git add` is still
+    caught, while operator inputs are correctly out of scope.
+    """
+    listing = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "."],
+        cwd=root,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
     return [
         path
-        for path in PACKAGE.rglob("*")
+        for name in listing.stdout.split("\0")
+        if name
+        for path in (root / name,)
         if path.is_file()
-        and ".terraform" not in path.relative_to(PACKAGE).parts
+        and ".terraform" not in path.relative_to(root).parts
         and not path.name.endswith((".tfstate", ".tfplan"))
         and ".tfstate." not in path.name
     ]
@@ -1431,3 +1453,33 @@ def test_examples_and_policy_are_parseable_and_contain_no_local_or_account_data(
         "baseline-copy",
     ):
         assert forbidden not in all_text.lower()
+
+
+def test_source_enumeration_sees_uncommitted_files_but_not_operator_inputs(tmp_path: Path) -> None:
+    """The package census must track what git would ship, not the working tree.
+
+    Operator inputs the README tells you to create here are gitignored and
+    must NOT count as package source (they made every real cold install turn
+    this suite red, and leaked the operator's own account id into the
+    no-account-data assertion). A new package file that is merely uncommitted
+    must still be counted, so a forgotten `git add` cannot slip a file past
+    the census.
+
+    Exercised against a throwaway repo carrying the real package's ignore
+    rules: mutating the live package directory would race the other tests
+    enumerating it in parallel.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text((PACKAGE / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "examples").mkdir()
+    (tmp_path / "examples" / "scenario-a.tfvars").write_text('aws_account_id = "000000000000"\n', encoding="utf-8")
+    (tmp_path / "examples" / "scenario-a.s3.tfbackend").write_text('bucket = "operator-state"\n', encoding="utf-8")
+    (tmp_path / "examples" / "scenario-a.tfvars.example").write_text('aws_account_id = "REPLACE"\n', encoding="utf-8")
+    (tmp_path / "uncommitted.tf").write_text("# never git added\n", encoding="utf-8")
+
+    listed = {path.relative_to(tmp_path).as_posix() for path in _source_files(tmp_path)}
+
+    assert "uncommitted.tf" in listed
+    assert "examples/scenario-a.tfvars.example" in listed
+    assert "examples/scenario-a.tfvars" not in listed
+    assert "examples/scenario-a.s3.tfbackend" not in listed

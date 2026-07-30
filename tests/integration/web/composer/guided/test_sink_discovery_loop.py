@@ -457,3 +457,98 @@ async def test_sink_loop_single_shot_when_no_catalog() -> None:
     # Terminal guided actions remain available, but no discovery tools are offered.
     offered_names = {t["function"]["name"] for t in captured[0]}
     assert offered_names == {"resolve_sink", "retain_deferred_intent", "manage_deferred_intent"}
+
+
+_INVALID_CONFIG_RESOLVE_SINK_ARGS = {
+    "resolution": "sink",
+    "output": {
+        "name": "results",
+        "plugin": "json",
+        # flexible without fields fails JSONSinkConfig validation — the exact
+        # shape that wedged the first-run tutorial (elspeth-a88c07cd47): the
+        # options passed shape checks, were staged as server-held prefill,
+        # and every subsequent /guided/respond echo died in from_dict.
+        "options": {"path": "out.json", "schema": {"mode": "flexible"}},
+        "required_fields": [],
+        "schema_mode": "flexible",
+        "on_write_failure": "discard",
+    },
+    "assistant_message": "Saved the results as a JSON file.",
+}
+
+
+@pytest.mark.asyncio
+async def test_sink_resolve_invalid_plugin_config_feeds_back_and_repairs() -> None:
+    """A resolve_sink whose options fail the plugin config model is NOT terminal.
+
+    The solver validates resolved options through the real sink config model,
+    threads the config error back as the tool result, and the model's
+    corrected second resolve_sink resolves normally.
+    """
+    responses = [
+        _response(tool_calls=[_tool_call("c1", "resolve_sink", _INVALID_CONFIG_RESOLVE_SINK_ARGS)]),
+        _response(tool_calls=[_tool_call("c2", "resolve_sink", _RESOLVE_SINK_ARGS)]),
+    ]
+    recorder = BufferingRecorder()
+    captured_messages: list[list[dict[str, Any]]] = []
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        captured_messages.append(kwargs["messages"])
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save the results as a json file",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            recorder=recorder,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+        )
+
+    assert result.sink is not None
+    assert result.sink.outputs[0].options["schema"] == {"mode": "observed"}
+
+    # The second round must carry the validation feedback keyed to c1.
+    second_call_messages = captured_messages[1]
+    feedback = [m for m in second_call_messages if m.get("role") == "tool" and m.get("tool_call_id") == "c1"]
+    assert len(feedback) == 1
+    assert "fields" in feedback[0]["content"]
+    # ... preceded by the assistant tool-call request it answers.
+    assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in second_call_messages)
+    # One recorded LLM call per provider round.
+    assert len(recorder.llm_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_sink_resolve_invalid_plugin_config_at_cap_returns_empty() -> None:
+    """Config-invalid resolves never wedge: at the iteration cap the loop
+    degrades to the advisory fallback instead of staging toxic prefill."""
+    responses = [
+        _response(tool_calls=[_tool_call("c1", "resolve_sink", _INVALID_CONFIG_RESOLVE_SINK_ARGS)]),
+    ]
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save the results as a json file",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+            max_discovery_iters=1,
+        )
+
+    assert type(result) is GuidedChatEmptyOutcome

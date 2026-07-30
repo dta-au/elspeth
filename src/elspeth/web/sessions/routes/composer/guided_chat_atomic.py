@@ -16,7 +16,11 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.web.composer.guided.audit import emit_intent_cancelled
-from elspeth.web.composer.guided.chat_solver import DeferredIntentManagementChatRequest, Step1SourceChatResolution
+from elspeth.web.composer.guided.chat_solver import (
+    DeferredIntentManagementChatRequest,
+    Step1SourceChatResolution,
+    resolved_sink_config_error,
+)
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, Turn, TurnType
@@ -814,9 +818,38 @@ async def post_guided_chat_schema8(
                         and prospective.step is GuidedStep.STEP_2_SINK
                         and TurnType(current_turn["type"]) is TurnType.SINGLE_SELECT
                     ):
+                        # Staged prefill becomes server-held authority that every
+                        # /guided/respond echo re-validates through the plugin
+                        # config model, so options that fail it must never be
+                        # staged — the session would wedge with an unrepairable
+                        # 400 turn-contract rejection (elspeth-a88c07cd47). The
+                        # solver validates resolutions before returning them;
+                        # this guard covers every other producer of a
+                        # sink resolution.
                         (resolved_output,) = sink_resolution.outputs
-                        sink_prefill_options = dict(deep_thaw(resolved_output.options))
-                        sink_prefill_options["on_write_failure"] = resolved_output.on_write_failure
+                        prefill_config_error = resolved_sink_config_error(sink_resolution)
+                        if prefill_config_error is not None:
+                            slog.warning(
+                                "guided.step_2_sink_prefill_config_rejected",
+                                session_id=str(session_id),
+                                user_id=user.user_id,
+                                plugin=resolved_output.plugin,
+                                error_detail=prefill_config_error[:500],
+                            )
+                            chat_result = StepChatResult(
+                                assistant_message=(
+                                    "I couldn't apply that output configuration because it fails the "
+                                    f"'{resolved_output.plugin}' plugin's validation, so I didn't change "
+                                    "your pipeline. Describe the output again and I'll rebuild it."
+                                ),
+                                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                latency_ms=chat_result.latency_ms,
+                                error_class="SinkPrefillConfigRejected",
+                            )
+                            sink_resolution = None
+                        else:
+                            sink_prefill_options = dict(deep_thaw(resolved_output.options))
+                            sink_prefill_options["on_write_failure"] = resolved_output.on_write_failure
                     transition_body = _transition_request(
                         body=body,
                         guided=prospective,

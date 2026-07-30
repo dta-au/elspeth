@@ -6,9 +6,11 @@ telemetry. This runbook permits planned downtime: it deliberately uses a
 zero-overlap, single-task deployment.
 
 > **Scope:** This is the exhaustive, release-specific, two-scenario acceptance
-> and teardown program. Its Terraform package and owning remote state are not
-> tracked in this repository, so a clean source checkout cannot execute it from
-> top to bottom. For an ordinary rebuild and rollout to an existing ECS
+> and teardown program. Its supported Terraform source IS tracked in this
+> repository at [`deploy/aws-ecs/terraform/`](../../deploy/aws-ecs/terraform/README.md)
+> — start a cold install from that package's README. Only the owning remote
+> state (the per-run S3 state bucket and its contents) lives outside the
+> repository. For an ordinary rebuild and rollout to an existing ECS
 > service, use
 > [AWS ECS existing-service redeploy](aws-ecs-existing-service-redeploy.md).
 > Reconcile every schema epoch, task-definition input, and external Terraform

@@ -83,6 +83,20 @@ explicit operator action, not a side effect of merging a release branch.
 Resolve whichever tag you install from to its immutable digest and put the
 digest reference in the tfvars.
 
+Some registry tags predate this contract and were published without the
+leading `v` (for example `0.7.2-RC-290726`); they did not come from the
+tag-triggered workflow path above and are not install candidates.
+
+**Minimum image revision.** This Terraform package renders the web settings
+contract of the source tree it ships with; the candidate image's settings
+loader rejects unknown `ELSPETH_WEB__` keys, so an image older than the
+package's settings contract fails every task at settings load (observed as
+`{"check": "storage_settings", ...}` from `provision-storage` on a cold
+install). The supported pairing is a package and image cut from the same
+commit. Concretely for 0.7.2: the image must include commit `a04021af6`
+(`ELSPETH_WEB__DEFAULT_LLM_PROFILE`); every image published before
+`v0.7.2-RC-300726` predates it and cannot boot under this package.
+
 ### Installer policy and task-role boundary
 
 The package deliberately splits IAM authority across two principals:

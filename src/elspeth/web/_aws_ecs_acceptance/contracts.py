@@ -256,10 +256,56 @@ class AcceptanceStateError(RuntimeError):
 class AcceptanceCheckError(RuntimeError):
     """A static named acceptance check failure safe for operator output."""
 
-    def __init__(self, check: str, *, missing: tuple[str, ...] | None = None) -> None:
+    def __init__(
+        self,
+        check: str,
+        *,
+        missing: tuple[str, ...] | None = None,
+        cause_class: str | None = None,
+        cause_fields: tuple[str, ...] | None = None,
+    ) -> None:
         super().__init__(f"acceptance check failed: {check}")
         self.check = check
         self.missing = missing
+        self.cause_class = cause_class
+        self.cause_fields = cause_fields
+
+
+_CAUSE_FIELD_TOKEN = re.compile(r"\bELSPETH_[A-Z0-9_]*[A-Z0-9]\b")
+
+
+def check_error_with_cause(check: str, exc: BaseException) -> AcceptanceCheckError:
+    """Build a named check failure carrying only static cause identity.
+
+    A bare ``AcceptanceCheckError("storage_settings")`` proved undiagnosable
+    in the field (elspeth-dfd09564d5): the operator could not tell a missing
+    setting from a type error from an unknown key without extracting the
+    module from the image. This projection keeps the envelope fail-closed —
+    it emits the underlying exception CLASS name plus static identifiers
+    only: pydantic field locations when the exception exposes ``errors()``,
+    otherwise ``ELSPETH_*`` environment-variable tokens found in the message.
+    Message text and values are never emitted.
+    """
+    fields: tuple[str, ...] = ()
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        with contextlib.suppress(Exception):
+            fields = tuple(
+                dict.fromkeys(
+                    location
+                    for error in errors()
+                    if isinstance(error, Mapping)
+                    for location in (".".join(str(part) for part in error.get("loc", ())),)
+                    if location
+                )
+            )
+    if not fields:
+        fields = tuple(dict.fromkeys(_CAUSE_FIELD_TOKEN.findall(str(exc))))
+    return AcceptanceCheckError(
+        check,
+        cause_class=type(exc).__name__,
+        cause_fields=fields or None,
+    )
 
 
 class OperatorTelemetryAcceptanceError(RuntimeError):
@@ -287,6 +333,10 @@ def acceptance_error_envelope(exc: BaseException) -> dict[str, object]:
         envelope["check"] = exc.check
         if exc.missing:
             envelope["missing"] = sorted(exc.missing)
+        if exc.cause_class is not None:
+            envelope["cause_class"] = exc.cause_class
+        if exc.cause_fields:
+            envelope["cause_fields"] = sorted(exc.cause_fields)
         return envelope
     error_code = getattr(exc, "error_code", None)
     envelope["error_code"] = error_code if isinstance(error_code, str) and error_code in ACCEPTANCE_ERROR_CODES else "acceptance_internal"

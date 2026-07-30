@@ -305,3 +305,54 @@ def test_main_resets_stale_steps_between_invocations(
     monkeypatch.setattr(acceptance, "provision_storage", plain_failure)
     assert acceptance.main(["provision-storage"]) == 1
     assert json.loads(capsys.readouterr().err)["step"] is None
+
+
+def test_check_error_with_cause_projects_static_env_tokens_only() -> None:
+    """The cause taxonomy carries the exception class and ELSPETH_* tokens —
+    never message text or values (elspeth-dfd09564d5: storage_settings was
+    undiagnosable because the underlying cause was swallowed entirely)."""
+    exc = RuntimeError("Unknown ELSPETH_WEB__ setting: ELSPETH_WEB__DEFAULT_LLM_PROFILE (password=hunter2)")  # secret-scan: allow-this-line
+    error = contracts.check_error_with_cause("storage_settings", exc)
+    envelope = contracts.acceptance_error_envelope(error)
+    assert envelope["check"] == "storage_settings"
+    assert envelope["cause_class"] == "RuntimeError"
+    assert envelope["cause_fields"] == ["ELSPETH_WEB__DEFAULT_LLM_PROFILE"]
+    flattened = json.dumps(envelope)
+    assert "hunter2" not in flattened
+    assert "password" not in flattened
+
+
+def test_check_error_with_cause_projects_pydantic_field_locations() -> None:
+    import pydantic
+
+    class _Probe(pydantic.BaseModel):
+        composer_max_discovery_turns: int
+
+    try:
+        _Probe.model_validate({})
+    except pydantic.ValidationError as exc:
+        error = contracts.check_error_with_cause("storage_settings", exc)
+    envelope = contracts.acceptance_error_envelope(error)
+    assert envelope["cause_class"] == "ValidationError"
+    assert envelope["cause_fields"] == ["composer_max_discovery_turns"]
+
+
+def test_check_error_without_cause_keeps_prior_envelope_shape() -> None:
+    envelope = contracts.acceptance_error_envelope(contracts.AcceptanceCheckError("storage_identity"))
+    assert "cause_class" not in envelope
+    assert "cause_fields" not in envelope
+
+
+def test_provision_storage_settings_failure_names_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web._aws_ecs_acceptance import capture
+
+    def _boom() -> None:
+        raise RuntimeError("Unknown ELSPETH_WEB__ setting: ELSPETH_WEB__DEFAULT_LLM_PROFILE")
+
+    monkeypatch.setattr(capture, "settings_from_env", _boom)
+    with pytest.raises(contracts.AcceptanceCheckError) as excinfo:
+        capture.provision_storage()
+    envelope = contracts.acceptance_error_envelope(excinfo.value)
+    assert envelope["check"] == "storage_settings"
+    assert envelope["cause_class"] == "RuntimeError"
+    assert envelope["cause_fields"] == ["ELSPETH_WEB__DEFAULT_LLM_PROFILE"]

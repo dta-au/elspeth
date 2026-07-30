@@ -40,6 +40,7 @@ from .contracts import (
     _utc_timestamp,
     _uuid_field,
     acceptance_step,
+    check_error_with_cause,
 )
 from .http_client import AcceptanceHttpClient
 from .state import AcceptanceState, read_acceptance_state, write_acceptance_state
@@ -531,8 +532,8 @@ def provision_storage() -> dict[str, object]:
         payload_root = settings.get_payload_store_path()
     except AcceptanceCheckError:
         raise
-    except Exception:
-        raise AcceptanceCheckError("storage_settings") from None
+    except Exception as exc:
+        raise check_error_with_cause("storage_settings", exc) from None
     if os.geteuid() != _CONTAINER_RUNTIME_UID or os.getegid() != _CONTAINER_RUNTIME_GID:
         raise AcceptanceCheckError("storage_identity")
     if not isinstance(data_dir, Path) or not isinstance(payload_root, Path):
@@ -618,8 +619,8 @@ def verify_payloads(landscape_run_id: str) -> dict[str, object]:
         landscape_url = settings.get_landscape_url()
         passphrase = settings.landscape_passphrase
         payload_root = settings.get_payload_store_path()
-    except Exception:
-        raise AcceptanceCheckError("settings_load") from None
+    except Exception as exc:
+        raise check_error_with_cause("settings_load", exc) from None
 
     try:
         with LandscapeDB.from_url(
@@ -630,21 +631,21 @@ def verify_payloads(landscape_run_id: str) -> dict[str, object]:
         ) as database:
             rows = RecorderFactory.read_only(database).query.get_rows(canonical_run_id)
             refs = [row.source_data_ref for row in rows if row.source_data_ref is not None]
-    except Exception:
-        raise AcceptanceCheckError("landscape_payload_query") from None
+    except Exception as exc:
+        raise check_error_with_cause("landscape_payload_query", exc) from None
     if not refs:
         raise AcceptanceCheckError("payload_refs")
     if payload_root.is_symlink() or not payload_root.is_dir():
         raise AcceptanceCheckError("payload_root")
     try:
         store = FilesystemPayloadStore(payload_root)
-    except Exception:
-        raise AcceptanceCheckError("payload_store") from None
+    except Exception as exc:
+        raise check_error_with_cause("payload_store", exc) from None
     try:
         for ref in refs:
             store.retrieve(ref)
-    except Exception:
-        raise AcceptanceCheckError("payload_retrieval") from None
+    except Exception as exc:
+        raise check_error_with_cause("payload_retrieval", exc) from None
     return {
         "check": "verify-payloads",
         "ok": True,
