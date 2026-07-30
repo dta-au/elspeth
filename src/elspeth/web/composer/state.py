@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from math import isfinite
 from pathlib import PurePosixPath
 from typing import Any, Literal, NotRequired, Self, TypedDict
 
@@ -43,6 +44,7 @@ from elspeth.core.config import (
     _RESERVED_EDGE_LABELS,
     _VALID_NODE_NAME_RE,
     TriggerConfig,
+    _validate_connection_or_sink_name,
     _validate_max_length,
     _validate_node_name_chars,
 )
@@ -50,11 +52,11 @@ from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
 
-NodeType = Literal["transform", "gate", "aggregation", "coalesce", "queue"]
+NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", "queue"]
 EdgeType = Literal["on_success", "on_error", "route_true", "route_false", "fork"]
 CoalesceBranches = tuple[str, ...] | Mapping[str, str]
 
-COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "gate", "queue", "transform"))
+COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "gate", "queue", "row_union", "transform"))
 
 _DECLARED_INPUT_FIELDS_OPTION = "required_input_fields"
 _MISSING_DECLARED_INPUT_FIELDS = object()
@@ -151,12 +153,12 @@ class SourceSpec:
 
 @dataclass(frozen=True, slots=True)
 class NodeSpec:
-    """Transform, gate, aggregation, or coalesce node.
+    """Transform, gate, aggregation, coalesce, row_union, or queue node.
 
     Attributes:
         id: Unique node identifier within the pipeline.
-        node_type: One of "transform", "gate", "aggregation", "coalesce".
-        plugin: Plugin name. None for gates and coalesces.
+        node_type: One of the composer-supported node discriminators.
+        plugin: Plugin name. None for structural nodes.
         input: Named connection point this node reads from.
         on_success: Named connection point for successful output. None for gates.
         on_error: Named connection point for error output. None if not diverted.
@@ -164,12 +166,13 @@ class NodeSpec:
         condition: Gate expression. None for non-gates.
         routes: Gate route mapping. None for non-gates.
         fork_to: Fork destinations for fork gates. None for non-fork nodes.
-        branches: Branch inputs for coalesce nodes. None for non-coalesce nodes.
+        branches: Branch inputs for coalesce/row_union nodes. None otherwise.
         policy: Coalesce policy. None for non-coalesce nodes.
         merge: Coalesce merge strategy. None for non-coalesce nodes.
         trigger: Aggregation batch trigger config. None for non-aggregation nodes.
         output_mode: Aggregation output mode ("passthrough" or "transform"). None for non-aggregation nodes.
         expected_output_count: Aggregation expected output count. None for non-aggregation nodes.
+        timeout_seconds: Row-union group timeout. None for other node types.
     """
 
     id: str
@@ -188,8 +191,15 @@ class NodeSpec:
     trigger: Mapping[str, Any] | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
+    timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
+        if self.node_type == "row_union" and self.branches is not None and not isinstance(self.branches, Mapping):
+            branch_tuple = tuple(self.branches)
+            normalized_branches: CoalesceBranches = (
+                branch_tuple if len(branch_tuple) != len(set(branch_tuple)) else {branch: branch for branch in branch_tuple}
+            )
+            object.__setattr__(self, "branches", normalized_branches)
         # Mapping fields must be deep-frozen. Scalar, enum, and tuple fields
         # are already immutable and need no guard.
         freeze_fields(self, "options")
@@ -205,13 +215,24 @@ class NodeSpec:
         """Reconstruct from a plain dict (inverse of to_dict serialisation).
 
         Optional fields (condition, routes, fork_to, branches, policy, merge,
-        trigger, output_mode, expected_output_count) default to None when
+        trigger, output_mode, expected_output_count, timeout_seconds) default to None when
         absent from the dict. fork_to is converted from list to tuple since
-        to_dict() serialises tuples as lists. branches preserves mapping form
-        for transformed coalesce branches and converts list form to tuple.
+        to_dict() serialises tuples as lists. Coalesce branches preserve their
+        list-vs-mapping semantics; row_union list branches normalize to the
+        runtime's ordered identity mapping.
         """
         fork_to = d["fork_to"] if "fork_to" in d else None
         branches = d["branches"] if "branches" in d else None
+        if d["node_type"] == "row_union" and branches is not None and not isinstance(branches, Mapping):
+            branch_tuple = tuple(branches)
+            # Preserve an invalid duplicate list long enough for validate() to
+            # reject it; a dict comprehension would silently erase the authoring
+            # error. Valid lists normalize to the runtime's identity mapping.
+            normalized_branches: CoalesceBranches | None = (
+                branch_tuple if len(branch_tuple) != len(set(branch_tuple)) else {branch: branch for branch in branch_tuple}
+            )
+        else:
+            normalized_branches = dict(branches) if isinstance(branches, Mapping) else tuple(branches) if branches is not None else None
         return cls(
             id=d["id"],
             node_type=d["node_type"],
@@ -223,12 +244,13 @@ class NodeSpec:
             condition=d["condition"] if "condition" in d else None,
             routes=d["routes"] if "routes" in d else None,
             fork_to=tuple(fork_to) if fork_to is not None else None,
-            branches=dict(branches) if isinstance(branches, Mapping) else tuple(branches) if branches is not None else None,
+            branches=normalized_branches,
             policy=d["policy"] if "policy" in d else None,
             merge=d["merge"] if "merge" in d else None,
             trigger=d["trigger"] if "trigger" in d else None,
             output_mode=d["output_mode"] if "output_mode" in d else None,
             expected_output_count=d["expected_output_count"] if "expected_output_count" in d else None,
+            timeout_seconds=d["timeout_seconds"] if "timeout_seconds" in d else None,
         )
 
 
@@ -275,6 +297,11 @@ def _serialize_branches(branches: CoalesceBranches) -> list[str] | dict[str, str
     return list(branches)
 
 
+def _timeout_seconds_is_invalid(value: object) -> bool:
+    """Return whether a structural barrier timeout violates runtime bounds."""
+    return isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0
+
+
 def queue_node_contract_error(node: NodeSpec) -> str | None:
     """Return the intrinsic (topology-free) contract violation for a queue node.
 
@@ -304,6 +331,7 @@ def queue_node_contract_error(node: NodeSpec) -> str | None:
         "trigger": node.trigger,
         "output_mode": node.output_mode,
         "expected_output_count": node.expected_output_count,
+        "timeout_seconds": node.timeout_seconds,
     }
     present = sorted(name for name, value in forbidden.items() if value is not None)
     if present:
@@ -801,9 +829,14 @@ def _runtime_connection_targets(
 
 def _runtime_consumer_connections(nodes: tuple[NodeSpec, ...]) -> set[str]:
     """Return connection names runtime can resolve to processing nodes."""
-    consumers = {node.input for node in nodes if node.node_type != "coalesce"}
+    consumers = {node.input for node in nodes if node.node_type not in ("coalesce", "row_union")}
     for node in nodes:
         if node.node_type == "coalesce" and node.branches is not None:
+            consumers.update(_coalesce_branch_connections(node.branches))
+        elif node.node_type == "row_union" and node.branches is not None:
+            # NodeSpec.input is only the serialized adapter placeholder for a
+            # row_union. Every declared branch value is a real consuming
+            # binding, including identity branches.
             consumers.update(_coalesce_branch_connections(node.branches))
     return consumers
 
@@ -948,7 +981,7 @@ def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinati
 
     for node in state.nodes:
         component = f"node:{node.id}"
-        if node.node_type in ("transform", "aggregation"):
+        if node.node_type in ("transform", "aggregation", "row_union"):
             if node.on_success is not None and node.on_success not in output_names and node.on_success not in consumer_connections:
                 _merge(
                     component,
@@ -1018,29 +1051,27 @@ def _validate_runtime_route_destinations(
             )
 
     # Mirror the engine's fork-branch destination rule: every gate fork_to
-    # name must be a key in some coalesce 'branches' mapping (arrival is
-    # tracked by FORK BRANCH NAME, not by the connection that reaches the
-    # coalesce) or match a sink name exactly. The engine rejects this at
-    # pre-run; without the mirror a committed fork/coalesce pipeline is
-    # valid-but-not-runnable.
-    coalesce_branch_names = {
+    # name must be a key in a correlated barrier's branches mapping (arrival
+    # is tracked by FORK BRANCH NAME, not by the connection that reaches the
+    # barrier) or match a sink name exactly.
+    barrier_branch_names = {
         str(branch_name)
         for candidate in nodes
-        if candidate.node_type == "coalesce" and candidate.branches is not None
+        if candidate.node_type in ("coalesce", "row_union") and candidate.branches is not None
         for branch_name in (candidate.branches.keys() if isinstance(candidate.branches, Mapping) else candidate.branches)
     }
     for node in nodes:
         if node.node_type == "gate" and node.fork_to:
             for branch in node.fork_to:
-                if branch not in coalesce_branch_names and branch not in output_names:
+                if branch not in barrier_branch_names and branch not in output_names:
                     errors.append(
                         _err(
                             f"node:{node.id}",
                             f"Gate '{node.id}' fork branch '{branch}' has no destination: it must be a key "
-                            "in some coalesce 'branches' mapping or match a sink name exactly. "
-                            f"Coalesce branch keys: {sorted(coalesce_branch_names)}; sinks: {sorted(output_names)}. "
-                            "Key coalesce branches by FORK BRANCH NAME, with each value naming the connection "
-                            "that arrives at the coalesce after any per-branch transforms.",
+                            "in some coalesce/row_union 'branches' mapping or match a sink name exactly. "
+                            f"Barrier branch keys: {sorted(barrier_branch_names)}; sinks: {sorted(output_names)}. "
+                            "Key barrier branches by FORK BRANCH NAME, with each value naming the connection "
+                            "that arrives at the barrier after any per-branch transforms.",
                             "high",
                             "fork_branch_no_destination",
                         )
@@ -1100,6 +1131,28 @@ def _validate_runtime_route_destinations(
                         f"Coalesce '{node.id}' on_success references unknown sink '{node.on_success}'.",
                         "high",
                         "coalesce_on_success_unknown_sink",
+                    )
+                )
+            continue
+
+        if node.node_type == "row_union":
+            if node.on_success in output_names:
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        f"row_union '{node.id}' on_success '{node.on_success}' names a sink. "
+                        "A released group must continue on a processing connection.",
+                        "high",
+                        "row_union_on_success_must_be_connection",
+                    )
+                )
+            elif node.on_success is not None and node.on_success not in consumer_connections:
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        f"row_union '{node.id}' on_success '{node.on_success}' is not a known processing connection.",
+                        "high",
+                        "row_union_on_success_dangling",
                     )
                 )
 
@@ -1388,10 +1441,10 @@ def _check_schema_contracts(
     contract_probe_failed_producers: set[str] = set()
     sink_names = {output.name for output in outputs}
     sink_names_frozen = frozenset(sink_names)
-    coalesce_branch_names = {
+    barrier_branch_names = {
         branch_name
         for node in nodes
-        if node.node_type == "coalesce" and node.branches is not None
+        if node.node_type in ("coalesce", "row_union") and node.branches is not None
         for branch_name in _coalesce_branch_names(node.branches)
     }
     internal_connection_names: set[str] = set()
@@ -1532,22 +1585,24 @@ def _check_schema_contracts(
             )
         )
 
-    # A queue reads its fan-in predecessors but republishes under the same id,
-    # so counting it as a consumer of its own connection would make the legal
-    # queue-then-consumer pattern read as a duplicate consumer
-    # (elspeth-a5b86149d4). Coalesce identity branches are direct COPY edges;
-    # mapped branches claim their input connection in the runtime registry and
-    # must do the same here (elspeth-3f4e63900f).
+    # Queue and row_union NodeSpec.input fields are structural placeholders,
+    # not consuming bindings. Coalesce identity branches are direct COPY edges;
+    # mapped branches claim their input connection. A row_union consumes every
+    # branch value, including identity branches.
     consumer_claims: list[tuple[str, str, str]] = [
-        (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue")
+        (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue", "row_union")
     ]
     for node in nodes:
-        if node.node_type != "coalesce":
-            continue
-        consumer_claims.extend(
-            (connection_name, node.id, f"coalesce '{node.id}' mapped branch")
-            for connection_name in _coalesce_mapped_branch_connections(node.branches)
-        )
+        if node.node_type == "coalesce":
+            consumer_claims.extend(
+                (connection_name, node.id, f"coalesce '{node.id}' mapped branch")
+                for connection_name in _coalesce_mapped_branch_connections(node.branches)
+            )
+        elif node.node_type == "row_union":
+            consumer_claims.extend(
+                (connection_name, node.id, f"row_union '{node.id}' branch")
+                for connection_name in _coalesce_branch_connections(node.branches)
+            )
     consumer_counts = Counter(connection_name for connection_name, _node_id, _desc in consumer_claims)
     duplicate_consumers = sorted(name for name, count in consumer_counts.items() if count > 1)
     for connection_name in duplicate_consumers:
@@ -1569,7 +1624,7 @@ def _check_schema_contracts(
     # Runtime fork routing resolves coalesce branch names before sink names.
     # A branch identity that also names a sink would make composer preview treat
     # the branch as direct-to-sink while execution sends it to coalesce.
-    internal_connection_names.update(coalesce_branch_names)
+    internal_connection_names.update(barrier_branch_names)
     overlap = sorted(internal_connection_names & sink_names)
     if overlap:
         errors.append(
@@ -1593,10 +1648,10 @@ def _check_schema_contracts(
         """Schema-specific walk-back with coalesce/fork warning emission.
 
         Differs from ``ProducerResolver.walk_to_real_producer`` in two
-        ways: it traverses fork gates and coalesce nodes only to emit
-        skip-with-warning entries (the resolver returns None silently),
-        and it stops at coalesce nodes because schema-contract
-        propagation through coalesce branches is out of scope here.
+        ways: it traverses structural producers to emit skip-with-warning
+        entries (the resolver returns or abstains silently), and it stops at
+        coalesce/row_union boundaries because branch-aware schema-contract
+        propagation is out of scope here.
         """
         visited_connections: set[str] = set()
         current_producer = producer
@@ -1626,6 +1681,16 @@ def _check_schema_contracts(
                     _warn(
                         f"node:{producer_node.id}",
                         f"Contract check skipped because connection '{connection_name}' is produced by queue node '{producer_node.id}' with observed schema.",
+                        "medium",
+                    )
+                )
+                return None
+            if producer_node.node_type == "row_union":
+                warnings.append(
+                    _warn(
+                        f"node:{producer_node.id}",
+                        f"Contract check skipped because connection '{connection_name}' is produced by "
+                        f"row_union node '{producer_node.id}' with observed schema.",
                         "medium",
                     )
                 )
@@ -1936,6 +2001,9 @@ def _check_schema_contracts(
         if producer_node.node_type == "queue":
             # Runtime assigns every structural queue an observed output schema.
             return "observed"
+        if producer_node.node_type == "row_union":
+            # Runtime assigns every row_union an observed output schema.
+            return "observed"
         if producer_node.node_type == "coalesce":
             # A nested coalesce's strategy-specific output schema is not
             # reconstructed by Composer preview. Preserve the existing
@@ -2008,6 +2076,12 @@ def _check_schema_contracts(
             # required_input_fields must not be resolved against one of them
             # (elspeth-a5b86149d4). Abstaining here keeps explicit required
             # fields on a valid consumer from being falsely rejected.
+            return False, frozenset()
+
+        if producer_node.node_type == "row_union":
+            # Row union releases payloads without merging fields and publishes
+            # an observed schema. It must not invent guarantees from one or all
+            # branch predecessors.
             return False, frozenset()
 
         if producer_node.node_type == "coalesce":
@@ -2597,7 +2671,8 @@ class CompositionState:
 
     Attributes:
         sources: Named source roots keyed by stable composer/audit-visible name.
-        nodes: Ordered tuple of transform, gate, aggregation, coalesce nodes.
+        nodes: Ordered tuple of transform, gate, aggregation, coalesce,
+            row_union, and queue nodes.
         edges: Connections between nodes.
         outputs: Sink configurations.
         metadata: Pipeline name and description.
@@ -2795,6 +2870,8 @@ class CompositionState:
                 node_dict["output_mode"] = node.output_mode
             if node.expected_output_count is not None:
                 node_dict["expected_output_count"] = node.expected_output_count
+            if node.timeout_seconds is not None:
+                node_dict["timeout_seconds"] = node.timeout_seconds
             result["nodes"].append(node_dict)
 
         for edge in self.edges:
@@ -3095,6 +3172,129 @@ class CompositionState:
                             "coalesce_merge_invalid",
                         )
                     )
+                if node.timeout_seconds is not None and _timeout_seconds_is_invalid(node.timeout_seconds):
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' timeout_seconds must be a finite positive number or None.",
+                            "high",
+                            "coalesce_timeout_invalid",
+                        )
+                    )
+            elif node.node_type == "row_union":
+                forbidden = {
+                    "plugin": node.plugin,
+                    "on_error": node.on_error,
+                    "condition": node.condition,
+                    "routes": node.routes,
+                    "fork_to": node.fork_to,
+                    "policy": node.policy,
+                    "merge": node.merge,
+                    "trigger": node.trigger,
+                    "output_mode": node.output_mode,
+                    "expected_output_count": node.expected_output_count,
+                }
+                present = sorted(name for name, value in forbidden.items() if value is not None)
+                if node.options:
+                    present.append("options")
+                if present:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' does not accept field(s): {sorted(present)}.",
+                            "high",
+                            "row_union_config_invalid",
+                        )
+                    )
+
+                branch_names = _coalesce_branch_names(node.branches)
+                branch_connections = _coalesce_branch_connections(node.branches)
+                if len(branch_names) < 2:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' requires at least two ordered branches.",
+                            "high",
+                            "row_union_branches_invalid",
+                        )
+                    )
+                elif len(set(branch_names)) != len(branch_names):
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' branch aliases must be unique.",
+                            "high",
+                            "row_union_branches_invalid",
+                        )
+                    )
+
+                for branch_name, connection_name in zip(branch_names, branch_connections, strict=True):
+                    for value, field_label in (
+                        (branch_name, "branch name"),
+                        (connection_name, f"branch '{branch_name}' input connection"),
+                    ):
+                        try:
+                            if type(value) is not str or not value.strip():
+                                raise ValueError(f"row_union {field_label} must be a non-empty string")
+                            _validate_connection_or_sink_name(
+                                value,
+                                field_label=f"row_union {field_label}",
+                            )
+                        except ValueError as exc:
+                            errors.append(
+                                _err(
+                                    f"node:{node.id}",
+                                    str(exc),
+                                    "high",
+                                    "row_union_branch_invalid",
+                                )
+                            )
+
+                if branch_connections and node.input != branch_connections[0]:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' input must equal its first branch connection "
+                            f"'{branch_connections[0]}'; input is only a serialization placeholder.",
+                            "high",
+                            "row_union_input_mismatch",
+                        )
+                    )
+
+                if type(node.on_success) is not str or not node.on_success.strip():
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' requires a non-empty on_success processing connection.",
+                            "high",
+                            "row_union_on_success_invalid",
+                        )
+                    )
+                else:
+                    try:
+                        _validate_connection_or_sink_name(
+                            node.on_success,
+                            field_label="row_union on_success connection name",
+                        )
+                    except ValueError as exc:
+                        errors.append(
+                            _err(
+                                f"node:{node.id}",
+                                str(exc),
+                                "high",
+                                "row_union_on_success_invalid",
+                            )
+                        )
+
+                if node.timeout_seconds is not None and _timeout_seconds_is_invalid(node.timeout_seconds):
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' timeout_seconds must be a finite positive number or None.",
+                            "high",
+                            "row_union_timeout_invalid",
+                        )
+                    )
             elif node.node_type == "aggregation":
                 if not node.plugin:
                     errors.append(
@@ -3146,6 +3346,12 @@ class CompositionState:
 
         # 8. Connection completeness
         runtime_connections = _runtime_connection_targets(self.sources, self.nodes)
+        gate_fork_branches = {
+            branch
+            for candidate in self.nodes
+            if candidate.node_type == "gate" and candidate.fork_to is not None
+            for branch in candidate.fork_to
+        }
         for node in self.nodes:
             if node.node_type == "coalesce":
                 missing_branches = sorted(
@@ -3158,6 +3364,30 @@ class CompositionState:
                             f"Coalesce '{node.id}' branches {missing_branches} are not reachable from any runtime connection.",
                             "high",
                             "coalesce_branch_unreachable",
+                        )
+                    )
+                continue
+            if node.node_type == "row_union":
+                missing_aliases = sorted(branch for branch in _coalesce_branch_names(node.branches) if branch not in gate_fork_branches)
+                if missing_aliases:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' branch aliases {missing_aliases} are not produced by any gate fork_to.",
+                            "high",
+                            "row_union_branch_alias_unreachable",
+                        )
+                    )
+                missing_branches = sorted(
+                    branch for branch in _coalesce_branch_connections(node.branches) if branch not in runtime_connections
+                )
+                if missing_branches:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' branch connections {missing_branches} are not reachable from any runtime connection.",
+                            "high",
+                            "row_union_branch_unreachable",
                         )
                     )
                 continue
@@ -3186,9 +3416,14 @@ class CompositionState:
         for node in self.nodes:
             if node.node_type != "queue":
                 continue
-            downstream_consumers = [n.id for n in self.nodes if n.node_type not in ("coalesce", "queue") and n.input == node.id]
+            downstream_consumers = [
+                n.id for n in self.nodes if n.node_type not in ("coalesce", "queue", "row_union") and n.input == node.id
+            ]
             downstream_consumers.extend(
                 n.id for n in self.nodes if n.node_type == "coalesce" and node.id in _coalesce_mapped_branch_connections(n.branches)
+            )
+            downstream_consumers.extend(
+                n.id for n in self.nodes if n.node_type == "row_union" and node.id in _coalesce_branch_connections(n.branches)
             )
             if not downstream_consumers:
                 errors.append(
@@ -3276,7 +3511,7 @@ class CompositionState:
                 )
 
         # W2: Source on_success target doesn't match any node input or output name
-        node_inputs = {n.input for n in self.nodes if n.input is not None}
+        node_inputs = _runtime_consumer_connections(self.nodes)
         for source_name, source in self.sources.items():
             source_on_success = source.on_success
             if source_on_success not in node_inputs and source_on_success not in output_names:
