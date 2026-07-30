@@ -1020,6 +1020,102 @@ class TestStage1Validation:
 
         assert any(error.error_code == "coalesce_timeout_invalid" for error in result.errors)
 
+    @pytest.mark.parametrize(
+        ("node", "error_code"),
+        [
+            pytest.param(
+                NodeSpec(
+                    id="transform_1",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="transform_1",
+                    on_success="main",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="transform",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="gate_1",
+                    node_type="gate",
+                    plugin=None,
+                    input="gate_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "main", "false": "main"},
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="gate",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="aggregation_1",
+                    node_type="aggregation",
+                    plugin="batch_counter",
+                    input="aggregation_1",
+                    on_success="main",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    trigger={"count": 100, "timeout_seconds": 5.0},
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="aggregation",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="queue_1",
+                    node_type="queue",
+                    plugin=None,
+                    input="queue_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "queue_config_invalid",
+                id="queue",
+            ),
+        ],
+    )
+    def test_only_barrier_nodes_accept_top_level_timeout(self, node: NodeSpec, error_code: str) -> None:
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success=node.input))
+        state = state.with_node(node)
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert any(error.error_code == error_code and "timeout_seconds" in error.message for error in result.errors), result.errors
+
     def test_multiple_fork_gates_do_not_collide_on_fork_route_keyword(self) -> None:
         """Two gates routing to the reserved 'fork' keyword are not duplicate producers.
 
@@ -2252,8 +2348,8 @@ class TestStage1Validation:
         assert not result.is_valid
         assert any("output_mode" in e.message and "agg1" in e.message for e in result.errors)
 
-    def test_validate_aggregation_with_trigger_passes(self) -> None:
-        """Aggregation with all required fields passes validation."""
+    def test_validate_aggregation_with_trigger_timeout_passes(self) -> None:
+        """Aggregation keeps its nested trigger timeout when top-level timeout is forbidden."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="agg1"))
         node = NodeSpec(
@@ -2270,7 +2366,7 @@ class TestStage1Validation:
             branches=None,
             policy=None,
             merge=None,
-            trigger={"count": 100},
+            trigger={"count": 100, "timeout_seconds": 5.0},
         )
         state = state.with_node(node)
         state = state.with_output(self._make_output("main"))
@@ -6633,6 +6729,37 @@ class TestCompositionStateRowUnion:
 
     def test_valid_row_union_topology(self) -> None:
         result = self._state().validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_output_feeds_ordinary_node_without_placeholder_consumer(self) -> None:
+        state = self._state()
+
+        result = state.validate()
+
+        assert any(node.id == "after_union" and node.input == "union_out" for node in state.nodes)
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_queue_output_feeds_row_union_branch_without_placeholder_consumer(self) -> None:
+        queue = NodeSpec(
+            id="control_done",
+            node_type="queue",
+            plugin=None,
+            input="control_done",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(extra_nodes=(queue,))
+
+        result = state.validate()
 
         assert result.is_valid, result.errors
         assert not any(error.error_code == "duplicate_connection_consumer" for error in result.errors)

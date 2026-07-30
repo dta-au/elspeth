@@ -172,7 +172,7 @@ class NodeSpec:
         trigger: Aggregation batch trigger config. None for non-aggregation nodes.
         output_mode: Aggregation output mode ("passthrough" or "transform"). None for non-aggregation nodes.
         expected_output_count: Aggregation expected output count. None for non-aggregation nodes.
-        timeout_seconds: Row-union group timeout. None for other node types.
+        timeout_seconds: Structural barrier timeout. None for other node types.
     """
 
     id: str
@@ -3052,6 +3052,20 @@ class CompositionState:
             if abuse_contact_error is not None:
                 errors.append(abuse_contact_error)
             errors.extend(_validate_web_scrape_http_identity_not_placeholder(node))
+
+            # ``timeout_seconds`` is a top-level structural-barrier field.
+            # Queue rejects it through queue_node_contract_error below so every
+            # queue consumer shares the same canonical-shape guard.
+            if node.timeout_seconds is not None and node.node_type not in ("coalesce", "row_union", "queue"):
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        f"Node '{node.id}' of type '{node.node_type}' does not accept top-level timeout_seconds; "
+                        "only coalesce and row_union nodes accept that field.",
+                        "high",
+                        "node_timeout_unsupported",
+                    )
+                )
 
             if node.node_type == "gate":
                 if node.condition is None:
