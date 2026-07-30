@@ -1,3 +1,4 @@
+import json
 import logging
 
 import httpx
@@ -322,3 +323,33 @@ async def test_classify_error_exception_raises_internal_error(client):
         await service.complete(_chat_request(), "req-classify-exc")
 
     assert exc_info.value.code == GatewayErrorCode.INTERNAL_ERROR
+
+
+# --- response_hash stability (I2 fix) -------------------------------------------
+
+
+@respx.mock
+async def test_response_hash_is_stable_across_different_request_ids_and_created(client, caplog):
+    """``response_hash`` must hash the canonical response, not the rendered
+    envelope: the envelope embeds ``id`` (gwcmpl-<request_id>) and
+    ``created`` (int(time.time())), both unique per call, so hashing it
+    would make two otherwise-identical completions never hash equal --
+    defeating canonical_hash's whole equality-comparison purpose."""
+    caplog.set_level(logging.INFO, logger="test.service")
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    adapter = FakeAdapter(parse_success_result=CanonicalResponse(text="identical content", finish_reason=FinishReason.STOP))
+    config = _config()
+    service = _service(config, adapter, client)
+
+    first = await service.complete(_chat_request(), "req-first")
+    second = await service.complete(_chat_request(), "req-second")
+
+    # The two rendered envelopes differ (different id, at least) -- proving
+    # this isn't a vacuous check of two identical responses.
+    assert first["id"] != second["id"]
+
+    records = [json.loads(record.getMessage()) for record in caplog.records if record.getMessage().startswith("{")]
+    hashes = [record["response_hash"] for record in records if record.get("status") == "success"]
+    assert len(hashes) == 2
+    assert hashes[0] == hashes[1]

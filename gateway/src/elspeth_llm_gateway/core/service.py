@@ -179,7 +179,13 @@ class CompletionService:
             request_hash,
             start,
             status="success",
-            response_hash=canonical_hash(response),
+            # Hash the *canonical* response, not the rendered envelope: the
+            # envelope embeds response_id ("gwcmpl-" + request_id) and
+            # created (int(time.time())), both unique per call, so hashing
+            # it would make two otherwise-identical completions never hash
+            # equal -- defeating canonical_hash's own equality-comparison
+            # purpose. request_hash above is stable for the same reason.
+            response_hash=canonical_hash(canonical_response.model_dump(mode="json")),
             response_bytes=len(json.dumps(response).encode("utf-8")),
         )
         return response

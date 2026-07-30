@@ -54,9 +54,9 @@ def _headers(**overrides) -> dict:
     return base
 
 
-def _client_for(config, **create_app_kwargs) -> httpx.AsyncClient:
+def _client_for(config, *, root_path: str = "", **create_app_kwargs) -> httpx.AsyncClient:
     app = create_app(config, **create_app_kwargs)
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx.ASGITransport(app=app, root_path=root_path)
     return httpx.AsyncClient(transport=transport, base_url="http://testserver")
 
 
@@ -104,14 +104,18 @@ async def test_wrong_bearer_returns_401_envelope_with_headers():
 
 @respx.mock
 async def test_missing_contract_header_returns_400_contract_mismatch():
+    """Also sends an inbound X-Request-ID and asserts it's echoed back, proving
+    RequestIDMiddleware (outermost) still ran and stamped its header even
+    though ContractHeaderMiddleware (nested inside it) short-circuited the
+    request before it ever reached auth or the route."""
     async with _client_for(_config()) as client:
-        headers = _headers()
+        headers = _headers(**{REQUEST_ID_HEADER: "req-missing-contract"})
         del headers[CONTRACT_HEADER]
         response = await client.post("/v1/chat/completions", json=CHAT_BODY, headers=headers)
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "contract_mismatch"
-    assert response.headers[REQUEST_ID_HEADER]
+    assert response.headers[REQUEST_ID_HEADER] == "req-missing-contract"
     assert response.headers[CONTRACT_HEADER] == "1"
 
 
@@ -175,6 +179,53 @@ async def test_oversized_body_returns_400_invalid_request():
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+# --- capability check ------------------------------------------------------------
+
+
+class _TextOnlyAdapter:
+    """Declares only ``Capability.TEXT`` -- the default reference adapter
+    supports every capability, so this is needed to exercise
+    ``capability_unsupported`` at the app level at all."""
+
+    def descriptor(self) -> AdapterDescriptor:
+        return AdapterDescriptor(name="text_only_adapter", version="0.0.1", adapter_api_major=1, capabilities=frozenset({Capability.TEXT}))
+
+    def validate_configuration(self, options: dict) -> None:
+        return None
+
+    def build_invoke(self, request):
+        raise NotImplementedError
+
+    def parse_success(self, body):
+        raise NotImplementedError
+
+    def classify_error(self, failure):
+        raise NotImplementedError
+
+
+@respx.mock
+async def test_capability_unsupported_returns_422_with_both_headers():
+    """No respx routes are registered: if the capability check ever let the
+    request reach the upstream call (or even the OAuth token endpoint),
+    respx would raise instead of this test's assertions ever running."""
+    body = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+    }
+    async with _client_for(_config(), adapter=_TextOnlyAdapter()) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=body,
+            headers=_headers(**{REQUEST_ID_HEADER: "req-capability"}),
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "capability_unsupported"
+    assert response.headers[REQUEST_ID_HEADER] == "req-capability"
+    assert response.headers[CONTRACT_HEADER] == "1"
 
 
 # --- happy path ------------------------------------------------------------------
@@ -394,6 +445,69 @@ async def test_unhandled_exception_returns_500_internal_error_with_headers():
 def test_unknown_adapter_name_raises_config_error():
     with pytest.raises(ConfigError):
         create_app(_config(ELSPETH_LLM_GATEWAY_ADAPTER="no_such_adapter_anywhere"))
+
+
+# --- root_path auth+contract bypass (CRITICAL regression) ------------------------------
+
+
+@respx.mock
+async def test_root_path_prefixed_request_without_bearer_returns_401_not_bypassed():
+    """The CRITICAL regression: both middlewares used to gate on
+    ``request.url.path`` (== ``scope["path"]``, which still includes
+    ``root_path``), while the router matches routes on
+    ``get_route_path(scope)`` (``root_path`` stripped). Under
+    ``root_path="/gw"``, ``"/gw/v1/chat/completions"`` does not start with
+    ``"/v1/"``, so both middlewares used to skip their check entirely while
+    the router still resolved and served the route underneath -- a full
+    auth+contract bypass. No respx routes are registered here: if the
+    request ever reached CompletionService (and so the OAuth token
+    endpoint), respx would raise instead of this test's assertions ever
+    running.
+    """
+    async with _client_for(_config(), root_path="/gw") as client:
+        response = await client.post(
+            "/gw/v1/chat/completions",
+            json=CHAT_BODY,
+            headers={CONTRACT_HEADER: "1", "Content-Type": "application/json"},  # no Authorization at all
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "inbound_authentication_failed"
+
+
+@respx.mock
+async def test_root_path_prefixed_request_without_contract_header_returns_400_not_bypassed():
+    async with _client_for(_config(), root_path="/gw") as client:
+        headers = _headers()
+        del headers[CONTRACT_HEADER]
+        response = await client.post("/gw/v1/chat/completions", json=CHAT_BODY, headers=headers)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "contract_mismatch"
+
+
+@respx.mock
+async def test_root_path_prefixed_request_with_valid_credentials_still_works():
+    """The fix must not break the legitimate case: valid bearer + contract
+    header under a non-empty root_path still reaches the route and
+    completes normally."""
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "hello"}, "halt": "complete"}))
+
+    async with _client_for(_config(), root_path="/gw") as client:
+        response = await client.post("/gw/v1/chat/completions", json=CHAT_BODY, headers=_headers())
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "hello"
+
+
+# --- route surface (I1: no /docs, /redoc, /openapi.json) -------------------------------
+
+
+def test_exact_route_set_excludes_docs_redoc_openapi():
+    app = create_app(_config())
+    paths = {route.path for route in app.routes if hasattr(route, "path")}
+    assert paths == {"/healthz", "/readyz", "/v1/chat/completions"}
 
 
 # --- caplog sweep: no leaked secrets or content ------------------------------------

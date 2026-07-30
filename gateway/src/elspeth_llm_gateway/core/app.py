@@ -23,6 +23,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from starlette._utils import get_route_path
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from elspeth_llm_gateway import ADAPTER_API_MAJOR, CONTRACT_MAJOR
@@ -30,6 +31,7 @@ from elspeth_llm_gateway.core.auth import check_bearer
 from elspeth_llm_gateway.core.config import ConfigError, GatewayConfig
 from elspeth_llm_gateway.core.contract import ChatRequest
 from elspeth_llm_gateway.core.errors import GatewayError, GatewayErrorCode, error_envelope
+from elspeth_llm_gateway.core.events import log_event
 from elspeth_llm_gateway.core.oauth import TokenManager
 from elspeth_llm_gateway.core.parsing import StrictJsonError, parse_strict_json
 from elspeth_llm_gateway.core.service import CompletionService
@@ -48,6 +50,23 @@ logger = logging.getLogger("elspeth_llm_gateway")
 
 def _new_request_id() -> str:
     return uuid.uuid4().hex
+
+
+def _gated_path(request: Request) -> str:
+    """The path the router actually matches routes against.
+
+    ``request.url.path`` is ``scope["path"]``, which still includes
+    ``root_path`` when the app is mounted behind a reverse proxy that sets
+    it (e.g. ASGI ``root_path="/gw"``). The router itself matches on
+    ``get_route_path(scope)``, which strips that prefix. Gating the
+    contract/auth middleware on ``request.url.path`` instead of this would
+    mean neither middleware recognises "/gw/v1/..." as under "/v1/" and
+    both skip their check, while the router still resolves and serves the
+    route underneath -- a full auth+contract bypass under any non-empty
+    ``root_path``. Both middlewares must gate on the same path the router
+    uses.
+    """
+    return get_route_path(request.scope)
 
 
 def _request_id_from_state(request: Request) -> str:
@@ -84,7 +103,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable]):
         raw_id = request.headers.get(REQUEST_ID_HEADER)
-        request_id = raw_id if raw_id is not None and _REQUEST_ID_RE.match(raw_id) else _new_request_id()
+        request_id = raw_id if raw_id is not None and _REQUEST_ID_RE.fullmatch(raw_id) else _new_request_id()
         request.state.request_id = request_id
 
         try:
@@ -107,7 +126,7 @@ class ContractHeaderMiddleware(BaseHTTPMiddleware):
     """Middle layer: on ``/v1/*``, the inbound contract header must be ``"1"``."""
 
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable]):
-        if request.url.path.startswith("/v1/") and request.headers.get(CONTRACT_HEADER) != str(CONTRACT_MAJOR):
+        if _gated_path(request).startswith("/v1/") and request.headers.get(CONTRACT_HEADER) != str(CONTRACT_MAJOR):
             error = GatewayError(GatewayErrorCode.CONTRACT_MISMATCH)
             return JSONResponse(status_code=error.status, content=error_envelope(error, _request_id_from_state(request)))
         return await call_next(request)
@@ -121,7 +140,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         self._expected = config.inbound_bearer.get_secret_value()
 
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable]):
-        if request.url.path.startswith("/v1/") and not check_bearer(request.headers.get("authorization"), self._expected):
+        if _gated_path(request).startswith("/v1/") and not check_bearer(request.headers.get("authorization"), self._expected):
             error = GatewayError(GatewayErrorCode.INBOUND_AUTHENTICATION_FAILED)
             return JSONResponse(status_code=error.status, content=error_envelope(error, _request_id_from_state(request)))
         return await call_next(request)
@@ -209,7 +228,10 @@ def create_app(
             if owns_http_client:
                 await http_client.aclose()
 
-    app = FastAPI(lifespan=_lifespan)
+    # No /docs, /redoc, or /openapi.json: this is a closed API boundary with
+    # a fixed, hand-specified route set, not a browsable API -- /docs in
+    # particular would pull third-party CDN scripts onto this origin.
+    app = FastAPI(lifespan=_lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> JSONResponse:
@@ -283,7 +305,15 @@ def create_app(
     # the outermost layer instead.
     @app.exception_handler(GatewayError)
     async def _gateway_error_handler(request: Request, exc: GatewayError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status, content=error_envelope(exc, _request_id_from_state(request)))
+        request_id = _request_id_from_state(request)
+        # Route-level rejections (oversized body, malformed JSON, an
+        # unknown field) never reach CompletionService, so this is the only
+        # place they get logged at all; a GatewayError raised inside
+        # service.complete() is also logged there (event "completion") --
+        # logging again here, safe-fields-only, is deliberate belt-and-braces
+        # rather than an attempt to be the single source of truth.
+        log_event(logger, "request_error", request_id=request_id, error_code=exc.code.value, status="error")
+        return JSONResponse(status_code=exc.status, content=error_envelope(exc, request_id))
 
     # Starlette's add_middleware makes the LAST-added middleware OUTERMOST.
     # Execution order must be request-ID -> contract -> auth, so middleware
