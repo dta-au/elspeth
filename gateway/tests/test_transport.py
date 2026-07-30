@@ -93,6 +93,24 @@ class _BoundedRaisingStream(httpx.AsyncByteStream):
         return None
 
 
+class _RaisingMidBodyStream(httpx.AsyncByteStream):
+    """Yields one chunk, then raises -- simulating a body that stalls or drops
+    *after* headers arrive. Because the transport reads the body via
+    ``stream=True`` + ``aiter_bytes``, a mid-body failure surfaces from that
+    later read, not from ``client.send(...)``; this proves the same
+    TimeoutException-first mapping applies there too."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aiter__(self):
+        yield b"partial"
+        raise self._exc
+
+    async def aclose(self) -> None:
+        return None
+
+
 # --- origin-pinned URL join / send-time header re-validation -------------------
 
 
@@ -190,6 +208,34 @@ async def test_401_then_401_raises_upstream_unauthorized_exactly_two_calls(clien
     assert upstream_route.call_count == 2
 
 
+@respx.mock
+async def test_header_mutation_between_first_send_and_replay_is_caught_before_replay(client):
+    """The pre-invoke mutation tests only prove the *first* revalidation call
+    (before the loop even starts sending). This proves the per-attempt check
+    inside the loop is independently effective: the plan's headers are still
+    clean when attempt 1 is validated and sent, but get mutated as a side
+    effect of that first response arriving (simulating a concurrent mutation
+    of the shared, mutable plan between attempts) -- so only the second
+    attempt's revalidation catches it, before a second request is ever sent."""
+    token_route = _mock_tokens("tok-1", "tok-2")
+    plan = _plan()
+
+    def _respond_then_mutate(request: httpx.Request) -> httpx.Response:
+        plan.headers["authorization"] = "smuggled-after-first-send"
+        return httpx.Response(401)
+
+    upstream_route = respx.post(UPSTREAM_URL).mock(side_effect=_respond_then_mutate)
+    config = _config()
+    transport = _transport(config, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await transport.invoke(plan)
+
+    assert exc_info.value.code == GatewayErrorCode.INTERNAL_ERROR
+    assert upstream_route.call_count == 1
+    assert token_route.call_count == 1
+
+
 # --- statuses the transport owns outright (no adapter, no replay) ---------------
 
 
@@ -247,6 +293,40 @@ async def test_connect_error_raises_upstream_unavailable_single_call_no_replay(c
     swallowing every other transport error into the timeout bucket."""
     _mock_tokens("tok-1")
     upstream_route = respx.post(UPSTREAM_URL).mock(side_effect=httpx.ConnectError("connection refused"))
+    config = _config()
+    transport = _transport(config, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await transport.invoke(_plan())
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_UNAVAILABLE
+    assert upstream_route.call_count == 1
+
+
+@respx.mock
+async def test_mid_body_timeout_raises_upstream_timeout_single_call_no_replay(client):
+    """Headers can arrive fine while the body then stalls: with stream=True,
+    that failure surfaces from the later ``aiter_bytes`` read, not from
+    ``client.send``. Must still map to upstream_timeout, not leak as a raw
+    httpx exception."""
+    _mock_tokens("tok-1")
+    stream = _RaisingMidBodyStream(httpx.ReadTimeout("stalled mid-body"))
+    upstream_route = respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, stream=stream))
+    config = _config()
+    transport = _transport(config, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await transport.invoke(_plan())
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_TIMEOUT
+    assert upstream_route.call_count == 1
+
+
+@respx.mock
+async def test_mid_body_transport_error_raises_upstream_unavailable_single_call_no_replay(client):
+    _mock_tokens("tok-1")
+    stream = _RaisingMidBodyStream(httpx.ReadError("connection dropped mid-body"))
+    upstream_route = respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, stream=stream))
     config = _config()
     transport = _transport(config, client)
 

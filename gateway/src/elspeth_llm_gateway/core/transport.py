@@ -33,13 +33,20 @@ untrusted:
 - ``httpx.TimeoutException`` is checked *before* ``httpx.TransportError``:
   the former is a subclass of the latter, so checking them in the wrong
   order would silently reclassify every timeout as
-  ``upstream_unavailable``.
+  ``upstream_unavailable``. Both the initial ``send`` (headers/connect) and
+  the later streamed read (body) can raise either class -- a stalled body
+  mid-stream is just as much a timeout as a stalled connect -- so both call
+  sites map the same way.
 - Response bodies are read via a bounded streaming loop -- never
   ``.content`` / ``.aread()`` on an unbounded body -- so an oversized
   response is rejected once at most ``max_response_bytes + 1`` bytes have
   been pulled from the wire, not after the whole body has been buffered.
+- Closing the response (``aclose``) is best-effort: a transport error while
+  discarding an already-classified response must never replace the
+  ``GatewayError`` (or successful ``UpstreamResult``) already in flight.
 """
 
+import contextlib
 from dataclasses import dataclass
 
 import httpx
@@ -188,11 +195,25 @@ class UpstreamClient:
                 if status == 429:
                     raise GatewayError(GatewayErrorCode.UPSTREAM_RATE_LIMITED)
 
-                raw = await _read_capped(response, self._config.max_response_bytes)
+                try:
+                    raw = await _read_capped(response, self._config.max_response_bytes)
+                except httpx.TimeoutException:
+                    # A stalled body mid-stream is still a timeout -- same
+                    # ordering requirement as the send() above, since this is
+                    # exactly where a slow/stuck upstream body would surface
+                    # once stream=True defers the read past the initial send.
+                    raise GatewayError(GatewayErrorCode.UPSTREAM_TIMEOUT) from None
+                except httpx.TransportError:
+                    raise GatewayError(GatewayErrorCode.UPSTREAM_UNAVAILABLE) from None
+
                 if 200 <= status < 300:
                     body = _parse_success_body(raw, self._config.max_response_bytes)
                 else:
                     body = _parse_failure_body(raw, self._config.max_response_bytes)
                 return UpstreamResult(status=status, body=body)
             finally:
-                await response.aclose()
+                # Best-effort: a transport error while discarding an
+                # already-classified response must not replace the
+                # GatewayError (or successful result) already propagating.
+                with contextlib.suppress(httpx.HTTPError):
+                    await response.aclose()
