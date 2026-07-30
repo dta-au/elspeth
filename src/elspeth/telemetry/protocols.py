@@ -24,9 +24,21 @@ class ExporterDeliveryMetrics(TypedDict):
     lifecycle_failures: int
 
 
-@runtime_checkable
 class DeliveryMetricsExporterProtocol(Protocol):
-    """Optional capability for exporters with native delivery accounting."""
+    """Optional capability for exporters with native delivery accounting.
+
+    Deliberately NOT ``@runtime_checkable``. This is a documentation and
+    static-typing contract for exporter authors, not an admission gate:
+    ``isinstance()`` against it must raise ``TypeError`` rather than quietly
+    become a duck-type check (ADR-032 rule 3). Exporters arrive from
+    third-party pluggy plugins, and a runtime-checkable Protocol resolves
+    members through ``inspect.getattr_static`` since Python 3.12 — it admits
+    an impostor that merely declares the attribute names and rejects an
+    honest exporter that forwards ``delivery_metrics`` through
+    ``__getattr__``. ``TelemetryManager._exporter_delivery_metrics`` probes
+    the capability with a sentinel-defaulted ``getattr`` and validates the
+    returned VALUES instead.
+    """
 
     @property
     def delivery_metrics(self) -> ExporterDeliveryMetrics:

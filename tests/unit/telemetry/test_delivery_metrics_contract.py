@@ -7,7 +7,7 @@ from typing import cast
 import pytest
 
 from elspeth.telemetry.manager import _exporter_delivery_metrics, _metric_delta
-from elspeth.telemetry.protocols import ExporterProtocol
+from elspeth.telemetry.protocols import DeliveryMetricsExporterProtocol, ExporterProtocol
 from tests.fixtures.telemetry import TelemetryTestExporter
 
 
@@ -34,9 +34,60 @@ class _DeliveryMetricsExporter(TelemetryTestExporter):
         return self._delivery_metrics
 
 
+class _DynamicDeliveryMetricsExporter(TelemetryTestExporter):
+    """Exporter that resolves ``delivery_metrics`` through ``__getattr__``.
+
+    A wrapper/decorator exporter forwarding to a wrapped implementation is a
+    plausible third-party shape, and third-party exporters reach
+    ``_exporter_delivery_metrics`` through the ``elspeth_get_exporters``
+    pluggy hook with no type gate in front of them. Such an object fails a
+    ``runtime_checkable`` Protocol ``isinstance()`` — since Python 3.12 those
+    resolve members via ``inspect.getattr_static``, which bypasses
+    ``__getattr__`` — so delivery accounting used to vanish silently
+    (ADR-032). Only ``delivery_metrics`` is forwarded; every other name still
+    raises ``AttributeError`` so the real methods on the base class are used.
+    """
+
+    def __init__(self, metrics: object) -> None:
+        super().__init__()
+        object.__setattr__(self, "_dynamic_metrics", metrics)
+
+    def __getattr__(self, name: str) -> object:
+        if name == "delivery_metrics":
+            return object.__getattribute__(self, "_dynamic_metrics")
+        raise AttributeError(name)
+
+
 def _read_metrics(metrics: object) -> dict[str, int | None] | None:
     exporter = cast(ExporterProtocol, _DeliveryMetricsExporter(metrics))
     return _exporter_delivery_metrics(exporter)
+
+
+def _read_dynamic_metrics(metrics: object) -> dict[str, int | None] | None:
+    exporter = cast(ExporterProtocol, _DynamicDeliveryMetricsExporter(metrics))
+    return _exporter_delivery_metrics(exporter)
+
+
+def test_delivery_metrics_resolved_through_getattr_is_accepted() -> None:
+    metrics = _valid_metrics()
+
+    assert _read_dynamic_metrics(metrics) == metrics
+
+
+def test_delivery_metrics_resolved_through_getattr_still_validates_values() -> None:
+    metrics = _valid_metrics()
+    metrics["delivered"] = -1
+
+    with pytest.raises(ValueError, match=r"delivered.*non-negative"):
+        _read_dynamic_metrics(metrics)
+
+
+def test_delivery_metrics_protocol_is_not_an_isinstance_gate() -> None:
+    """ADR-032 rule 3: the capability Protocol must not be usable as a guard."""
+    exporter = _DynamicDeliveryMetricsExporter(_valid_metrics())
+
+    with pytest.raises(TypeError):
+        isinstance(exporter, DeliveryMetricsExporterProtocol)  # type: ignore[misc]
 
 
 def test_exporter_without_delivery_metrics_capability_returns_none() -> None:
