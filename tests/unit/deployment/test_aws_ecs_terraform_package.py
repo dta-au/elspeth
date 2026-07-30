@@ -147,13 +147,115 @@ def test_scenario_a_https_ingress_is_explicit_and_never_world_open() -> None:
     )
 
     assert 'variable "alb_https_ingress_cidrs"' in module_variables
-    assert '!endswith(cidr, "/0")' in module_variables
+    assert 'cidrnetmask(cidr) != "0.0.0.0"' in module_variables
     assert alb_ingress is not None
     assert re.search(r"for_each\s*=\s*toset\(var\.alb_https_ingress_cidrs\)", alb_ingress.group("body"))
     assert re.search(r"cidr_ipv4\s*=\s*each\.value", alb_ingress.group("body"))
     assert '"0.0.0.0/0"' not in alb_ingress.group("body")
     assert re.search(r"alb_https_ingress_cidrs\s*=\s*var\.alb_https_ingress_cidrs", scenario_a)
     assert 'alb_https_ingress_cidrs = ["REPLACE_WITH_OPERATOR_CIDR"]' in example
+
+
+_ALB_INGRESS_ROOTS = (
+    "modules/scenario/variables.tf",
+    "scenario-a/variables.tf",
+    "scenario-b/variables.tf",
+)
+
+# (candidate value, must terraform accept it)
+_ALB_INGRESS_CASES: tuple[tuple[str, bool], ...] = (
+    ('["203.0.113.5/32"]', True),
+    ('["203.0.113.0/24", "198.51.100.0/24"]', True),
+    ("[]", False),
+    ('["nonsense"]', False),
+    ('["203.0.113.5/32", "203.0.113.5/32"]', False),
+    # Semantically identical networks written differently: both render the same
+    # EC2 rule, so the second is a duplicate `distinct()` on raw strings misses.
+    ('["10.0.0.5/8", "10.0.0.6/8"]', False),
+    ('["0.0.0.0/0"]', False),
+    # Leading zeros in the prefix. `cidrnetmask` parses these as /0 and EC2
+    # canonicalises them back to 0.0.0.0/0, so a raw-suffix check on "/0" lets
+    # them through and the fail-closed allowlist opens HTTPS to the internet.
+    ('["0.0.0.0/00"]', False),
+    ('["0.0.0.0/000"]', False),
+    ('["10.0.0.0/0"]', False),
+    ('["10.0.0.0/00"]', False),
+    # IPv4-only is the enforced contract: `cidrnetmask` errors on IPv6, so
+    # every IPv6 CIDR is rejected. Fail-closed, and the message says so.
+    ('["::/0"]', False),
+    ('["2001:db8::/32"]', False),
+)
+
+
+def test_alb_ingress_guard_rejects_every_spelling_of_a_world_open_cidr(tmp_path: Path) -> None:
+    """The `/0` guard must test the PARSED prefix, not the raw string suffix.
+
+    `!endswith(cidr, "/0")` accepted `0.0.0.0/00` and `0.0.0.0/000`:
+    `cidrnetmask` parses the leading zeros and EC2 canonicalises the rule back
+    to `0.0.0.0/0`, so the explicit operator allowlist silently became a
+    world-open HTTPS ingress rule. Uniqueness had the same shape of hole —
+    `distinct()` over raw strings let `10.0.0.5/8` and `10.0.0.6/8` both
+    through, though they build one and the same network.
+
+    The condition is duplicated across the module and both scenario roots
+    (each root validates the operator's own tfvars before the module sees
+    them), so this asserts the three blocks are byte-identical and then
+    exercises the one shared block for real: re-encoding the rule in three
+    places is exactly how the drift starts.
+    """
+    blocks = {}
+    for relative in _ALB_INGRESS_ROOTS:
+        match = re.search(
+            r'variable "alb_https_ingress_cidrs" \{.*?\n\}\n',
+            _text(relative),
+            re.DOTALL,
+        )
+        assert match is not None, f"{relative} no longer declares alb_https_ingress_cidrs"
+        blocks[relative] = match.group(0)
+    assert len(set(blocks.values())) == 1, (
+        "the alb_https_ingress_cidrs guard has drifted between "
+        + ", ".join(_ALB_INGRESS_ROOTS)
+        + "; every root must reject exactly what the module rejects"
+    )
+
+    if shutil.which("terraform") is None:
+        pytest.skip("terraform is not installed, so the ingress guard cannot be exercised")
+
+    (tmp_path / "main.tf").write_text(next(iter(blocks.values())), encoding="utf-8")
+    init = subprocess.run(
+        ["terraform", f"-chdir={tmp_path}", "init", "-backend=false", "-input=false", "-no-color"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert init.returncode == 0, "terraform init failed:\n" + init.stdout + init.stderr
+
+    for value, should_accept in _ALB_INGRESS_CASES:
+        result = subprocess.run(
+            [
+                "terraform",
+                f"-chdir={tmp_path}",
+                "plan",
+                "-input=false",
+                "-no-color",
+                f"-var=alb_https_ingress_cidrs={value}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        accepted = result.returncode == 0
+        assert accepted == should_accept, (
+            f"alb_https_ingress_cidrs={value} was "
+            + ("accepted" if accepted else "rejected")
+            + "; expected it to be "
+            + ("accepted" if should_accept else "rejected")
+            + "\n"
+            + result.stdout
+            + result.stderr
+        )
 
 
 def test_service_enable_command_pins_the_validated_task_revision() -> None:
