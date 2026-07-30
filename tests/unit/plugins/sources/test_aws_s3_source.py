@@ -966,6 +966,41 @@ class TestAWSS3SourceAuditAndLifecycle:
         assert set(ctx.calls[0]["error"]) <= {"type", "bytes_read", "max_object_bytes", "cleanup_error_type"}
         assert "SENTINEL" not in repr(ctx.calls)
 
+    def test_transport_failure_remains_primary_when_unexpected_body_cleanup_fails(self) -> None:
+        from elspeth.plugins.sources.aws_s3_source import S3SourceReadError
+
+        read_sentinel = "credential endpoint body READ SENTINEL"
+        cleanup_sentinel = "credential endpoint body CLEANUP SENTINEL"
+        body = _Body(
+            [],
+            read_error=ConnectionError(read_sentinel),
+            close_error=ValueError(cleanup_sentinel),
+        )
+        source, _, ctx = _source_for(b"x")
+        source._s3_client = _Client(
+            {"ContentLength": 1, "ETag": '"etag"'},
+            {"ContentLength": 1, "Body": body},
+        )
+
+        with pytest.raises(S3SourceReadError) as exc_info:
+            list(source.load(ctx))
+
+        exc = exc_info.value
+        assert exc.provider_error_type == "ConnectionError"
+        assert exc.cleanup_error_type == "ValueError"
+        assert exc.__cause__ is None
+        assert exc.__context__ is None
+        assert body.closed
+        assert len(ctx.calls) == 1
+        assert ctx.calls[0]["error"] == {
+            "type": "ConnectionError",
+            "bytes_read": 0,
+            "max_object_bytes": 256 * 1024 * 1024,
+            "cleanup_error_type": "ValueError",
+        }
+        assert read_sentinel not in f"{exc!s} {exc!r} {ctx.calls!r}"
+        assert cleanup_sentinel not in f"{exc!s} {exc!r} {ctx.calls!r}"
+
     def test_client_construction_provider_failure_is_static_unchained_and_audited(
         self,
         monkeypatch: pytest.MonkeyPatch,

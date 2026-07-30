@@ -146,6 +146,7 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
     actions = [
       "s3:DeleteObject",
       "s3:GetObject",
+      "s3:GetObjectVersion",
       "s3:PutObject",
     ]
     resources = ["arn:aws:s3:::elspeth-*/*"]
@@ -163,7 +164,7 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
     sid     = "InvokeBedrockModels"
     actions = ["bedrock:InvokeModel"]
     resources = [
-      "arn:aws:bedrock:${var.aws_region}:${var.aws_account_id}:inference-profile/*",
+      "arn:aws:bedrock:*:${var.aws_account_id}:inference-profile/*",
       # Cross-region inference profiles invoke destination foundation models.
       # The resource type has no account component, so only its region varies.
       "arn:aws:bedrock:*::foundation-model/*",

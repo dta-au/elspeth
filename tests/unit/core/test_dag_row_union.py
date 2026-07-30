@@ -235,6 +235,86 @@ row_unions:
         with pytest.raises(GraphValidationError, match="sink"):
             _build_graph(_yaml(tmp_path, row_unions=sink_union, tail=""))
 
+    def test_nested_fork_inside_row_union_branch_is_rejected(self, tmp_path: Path) -> None:
+        """A nested fork replaces the enclosing branch identity before its union."""
+        nested_fork = """
+  - name: nested_fork
+    input: control_staged
+    condition: "True"
+    routes:
+      'true': fork
+      'false': control_ready
+    fork_to: [inner_left, inner_right]
+"""
+        branch_transforms = """
+transforms:
+  - name: stage_control
+    plugin: passthrough
+    input: control_branch
+    on_success: control_staged
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: stage_treatment
+    plugin: passthrough
+    input: treatment_branch
+    on_success: treatment_ready
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: after_union
+    plugin: passthrough
+    input: union_out
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+"""
+        row_union = """
+row_unions:
+  - name: variant_union
+    branches:
+      control_branch: control_ready
+      treatment_branch: treatment_ready
+    on_success: union_out
+"""
+        inner_sinks = f"""
+  inner_left:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "inner-left.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  inner_right:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "inner-right.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+        with pytest.raises(GraphValidationError) as exc_info:
+            _build_graph(
+                _yaml(
+                    tmp_path,
+                    row_unions=row_union,
+                    branch_transforms=branch_transforms,
+                    tail="",
+                    extra_gates=nested_fork,
+                    extra_sinks=inner_sinks,
+                )
+            )
+        message = str(exc_info.value)
+        assert "nested_fork" in message
+        assert "variant_union" in message
+        assert "nested fork" in message.lower()
+
     def test_coalesce_downstream_of_row_union_rejected(self, tmp_path: Path) -> None:
         # row_union -> transform -> gate(fork_to) -> coalesce used to BUILD and
         # RUN, silently discarding half of every union group: the coalesce
@@ -616,6 +696,109 @@ def test_transform_mode_branch_aggregation_feeding_row_union_is_rejected(tmp_pat
     assert "variant_union" in message
     assert "row_id" in message
     assert "passthrough" in message
+
+
+def test_unrelated_row_union_fork_does_not_hide_branch_aggregation(tmp_path: Path) -> None:
+    """A later fork for another union must not stop this union's branch walk."""
+    input_path = tmp_path / "nested_union_agg_input.jsonl"
+    input_path.write_text('{"id": 1, "copies": 1}\n')
+    yaml_text = f"""
+sources:
+  rows:
+    plugin: json
+    on_success: routed
+    options:
+      path: {input_path}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+gates:
+  - name: outer_fork
+    input: routed
+    condition: "True"
+    routes:
+      'true': fork
+      'false': a_output
+    fork_to: [a_control, a_treatment]
+  - name: later_fork
+    input: batch_out
+    condition: "False"
+    routes:
+      'true': fork
+      'false': a_control_ready
+    fork_to: [b_left, b_right]
+transforms:
+  - name: stage_treatment
+    plugin: passthrough
+    input: a_treatment
+    on_success: a_treatment_ready
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: after_a
+    plugin: passthrough
+    input: a_union_out
+    on_success: a_output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: after_b
+    plugin: passthrough
+    input: b_union_out
+    on_success: b_output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+aggregations:
+  - name: control_batch
+    plugin: batch_replicate
+    input: a_control
+    on_success: batch_out
+    on_error: discard
+    trigger: {{}}
+    output_mode: transform
+    options:
+      schema:
+        mode: observed
+      copies_field: copies
+      default_copies: 1
+      include_copy_index: false
+row_unions:
+  - name: union_a
+    branches:
+      a_control: a_control_ready
+      a_treatment: a_treatment_ready
+    on_success: a_union_out
+  - name: union_b
+    branches: [b_left, b_right]
+    on_success: b_union_out
+sinks:
+  a_output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "union-a.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  b_output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "union-b.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+    with pytest.raises(GraphValidationError) as exc_info:
+        _build_graph(yaml_text)
+    message = str(exc_info.value)
+    assert "control_batch" in message
+    assert "union_a" in message
 
 
 def test_passthrough_mode_branch_aggregation_feeding_row_union_builds(tmp_path: Path) -> None:

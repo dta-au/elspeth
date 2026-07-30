@@ -1548,7 +1548,15 @@ class ExecutionServiceImpl:
             telemetry_config = RuntimeTelemetryConfig.from_settings(settings.telemetry)
 
             rate_limit_registry = RateLimitRegistry(rate_limit_config)
-            telemetry_manager = create_telemetry_manager(telemetry_config)
+            if self._settings.deployment_target == "aws-ecs":
+                from elspeth.web.operator_telemetry import record_operator_pipeline_event
+
+                telemetry_manager = create_telemetry_manager(
+                    telemetry_config,
+                    event_observers=(record_operator_pipeline_event,),
+                )
+            else:
+                telemetry_manager = create_telemetry_manager(telemetry_config)
             checkpoint_manager = CheckpointManager(landscape_db) if checkpoint_config.enabled else None
 
             orchestrator = Orchestrator(

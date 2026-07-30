@@ -27,6 +27,7 @@ Thread Safety:
 import queue
 import threading
 from collections import defaultdict
+from collections.abc import Callable, Sequence
 from typing import Literal, TypedDict
 
 import structlog
@@ -106,6 +107,8 @@ class TelemetryManager:
         self,
         config: RuntimeTelemetryProtocol,
         exporters: list[ExporterProtocol],
+        *,
+        event_observers: Sequence[Callable[[TelemetryEvent], None]] = (),
     ) -> None:
         """Initialize the TelemetryManager.
 
@@ -114,9 +117,12 @@ class TelemetryManager:
                 backpressure_mode, and fail_on_total_exporter_failure settings
             exporters: List of configured exporter instances. May be empty
                 (telemetry will be a no-op).
+            event_observers: Best-effort projections that receive already-audited
+                events before exporter granularity filtering.
         """
         self._config = config
         self._exporters = exporters
+        self._event_observers = tuple(event_observers)
         self._consecutive_total_failures = 0
         self._max_consecutive_failures = config.max_consecutive_failures
 
@@ -376,6 +382,13 @@ class TelemetryManager:
         # Thread-safe shutdown check
         if self._shutdown_event.is_set():
             return
+
+        # Operator metrics project bounded facts from already-audited events.
+        # This intentionally precedes exporter granularity filtering: the AWS
+        # lifecycle policy must not enable content-bearing FULL spans merely to
+        # retain aggregate external-call metrics.
+        for observer in self._event_observers:
+            observer(event)
 
         # Skip if telemetry was disabled due to repeated failures
         if self._disabled:

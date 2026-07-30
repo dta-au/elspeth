@@ -479,8 +479,14 @@ def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_
             digest.update(chunk)
             total = observed
 
-        cleanup_error_type = _close_body(body)
-        body_closed = True
+        try:
+            cleanup_error_type = _close_body(body)
+        except Exception as exc:
+            if primary_error is None:
+                raise
+            cleanup_error_type = _normalize_error_type(exc)
+        finally:
+            body_closed = True
         if primary_error is None and total != head_length:
             primary_error = _read_error("S3ContentLengthMismatch", max_object_bytes=max_object_bytes, bytes_read=total)
         if primary_error is None and cleanup_error_type is not None:
@@ -824,7 +830,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3dcc8fce87fa229e"
+    source_file_hash: str | None = "sha256:9ff5f20a6a942aab"
     config_model = AWSS3SourceConfig
 
     @classmethod

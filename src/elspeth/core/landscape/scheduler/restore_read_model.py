@@ -16,7 +16,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape.model_loaders import TokenOutcomeLoader
-from elspeth.core.landscape.schema import node_states_table, token_outcomes_table, tokens_table
+from elspeth.core.landscape.schema import coalesce_branch_losses_table, node_states_table, token_outcomes_table, tokens_table
 
 _TOKEN_ID_CHUNK_SIZE = 500
 
@@ -203,6 +203,19 @@ class BarrierRestoreReadModel:
                 tokens_table.c.row_id == row_id,
                 node_states_table.c.completed_at.isnot(None),
                 node_states_table.c.status == NodeStateStatus.COMPLETED.value,
+            )
+            .limit(1)
+        )
+        return self._ops.execute_fetchone(query) is not None
+
+    def has_branch_loss_for_group(self, *, run_id: str, barrier_name: str, row_id: str) -> bool:
+        """Return whether the durable ledger records any loss for one barrier group."""
+        query = (
+            select(coalesce_branch_losses_table.c.loss_id)
+            .where(
+                coalesce_branch_losses_table.c.run_id == run_id,
+                coalesce_branch_losses_table.c.coalesce_name == barrier_name,
+                coalesce_branch_losses_table.c.row_id == row_id,
             )
             .limit(1)
         )

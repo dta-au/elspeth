@@ -80,26 +80,31 @@ digest to `ghcr.io/<owner>/elspeth:<git-tag>`, where `<git-tag>` is the literal
 tag name including the leading `v` and any `-RC-...` suffix. No
 release-candidate image exists until that git tag is pushed: publication is an
 explicit operator action, not a side effect of merging a release branch.
-Resolve whichever tag you install from to its immutable digest and put the
-digest reference in the tfvars.
+The scenario roots deliberately do not accept a GHCR reference: after bootstrap
+creates the private application ECR repository, promote the immutable published
+index into that exact repository using the authenticated handoff in Section 1.
+Only the resulting ECR digest reference belongs in the scenario tfvars.
 
 ### Installer policy and task-role boundary
 
 The package deliberately splits IAM authority across two principals:
 
-- `iam/installer-policy.json.tftpl` is for the normal installer. It separates
-  discovery reads from mutations, limits named resources, manages only the
-  known inline and managed role-policy bindings, and permits `iam:PassRole`
-  only to `ecs-tasks.amazonaws.com`. It cannot create or delete the generated
-  roles, change their trust or boundary, or manage the boundary policy.
+- The three customer-managed policies for the normal installer are:
+  `iam/installer-control-plane-policy.json.tftpl`,
+  `iam/installer-regional-resources-policy.json.tftpl`, and
+  `iam/installer-relationships-policy.json.tftpl`. Together they separate
+  discovery reads from mutations, limit named resources, manage only the known
+  inline and managed role-policy bindings, and permit `iam:PassRole` only to
+  `ecs-tasks.amazonaws.com`. They cannot create or delete the generated roles,
+  change their trust or boundary, or manage the boundary policy.
 - `iam/lifecycle-policy.json.tftpl` is for a separate IAM lifecycle principal.
   It can create, tag, and delete only the four bounded scenario-role patterns
   and can create, version, and delete only the exact run boundary. Explicit
   denies prevent it from adding role permissions, passing or assuming a role,
   or starting an ECS task.
 
-Render both policies for one account, region, and run before attaching them to
-their respective principals:
+Render all three installer policies plus the lifecycle policy for one account,
+region, and run before attaching them to their respective principals:
 
 ```sh
 export aws_account_id=REPLACE_WITH_12_DIGIT_ACCOUNT
@@ -116,22 +121,33 @@ export scenario_a_bucket="elspeth-${scenario_a_namespace}-$(printf '%.12s' "$com
 export scenario_b_bucket="elspeth-${scenario_b_namespace}-$(printf '%.12s' "$compact_run_id")"
 mkdir -p bootstrap/.terraform
 envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
-  < iam/installer-policy.json.tftpl \
-  > bootstrap/.terraform/installer-policy.json
+  < iam/installer-control-plane-policy.json.tftpl \
+  > bootstrap/.terraform/installer-control-plane-policy.json
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
+  < iam/installer-regional-resources-policy.json.tftpl \
+  > bootstrap/.terraform/installer-regional-resources-policy.json
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
+  < iam/installer-relationships-policy.json.tftpl \
+  > bootstrap/.terraform/installer-relationships-policy.json
 envsubst '${aws_account_id} ${run_id} ${iam_permissions_boundary_arn}' \
   < iam/lifecycle-policy.json.tftpl \
   > bootstrap/.terraform/iam-lifecycle-policy.json
 ```
 
-Inspect the rendered JSON and attach each policy using the account's normal IAM
-administration path. Keep the two profiles backed by distinct principals for
-the supported least-privilege installation. A purpose-built root acceptance
-profile may set both provider variables to `elspeth-acceptance` for a smoke
-exercise, but that deliberately gives up the privilege separation and is not
-the supported least-privilege posture. If an account-specific prerequisite is
-missing, use a trusted administrator only to install or amend these policies in
-the dedicated disposable account; do not run Terraform with an
-account-administrator wildcard policy.
+Inspect the rendered JSON and attach all three installer documents as separate
+customer-managed policies to the normal installer principal. Attach the
+lifecycle policy only to the lifecycle principal. Each rendered installer
+document must remain within IAM's 6,144-character customer-managed-policy
+limit; the package contract test enforces that bound. Do not combine them as
+role inline policies: their aggregate rendered size exceeds IAM's inline-policy
+limit. Keep the two profiles backed by distinct principals for the supported
+least-privilege installation. A purpose-built root acceptance profile may set
+both provider variables to `elspeth-acceptance` for a smoke exercise, but that
+deliberately gives up the privilege separation and is not the supported
+least-privilege posture. If an account-specific prerequisite is missing, use a
+trusted administrator only to install or amend these policies in the dedicated
+disposable account; do not run Terraform with an account-administrator
+wildcard policy.
 
 The bucket derivation above is the same deterministic formula used by the
 scenario module. The rendered policy consequently limits S3 bucket/object
@@ -193,6 +209,73 @@ then pulls every credential-bearing image and verifies its baked
 `org.opencontainers.image.revision` label before Terraform may register any
 task definition. The resolved inventory also binds the digest and SHA-256
 hashes of both tracked telemetry configuration files.
+
+### Promote the published candidate into bootstrap ECR
+
+Run this only after the bootstrap apply above has created the application ECR
+repository. The GHCR credential needs package-read access; the named AWS
+installer profile needs the exact ECR push actions rendered by this package.
+The copy starts from the immutable GHCR digest, transfers the complete OCI
+index without rebuilding it, and requires the destination index digest to
+remain identical. A mismatch means the provenance-preserving handoff failed:
+stop rather than substituting a locally rebuilt image.
+
+```sh
+export GITHUB_USERNAME=REPLACE_WITH_GITHUB_USERNAME
+export GITHUB_TOKEN=REPLACE_WITH_GHCR_READ_TOKEN
+export GHCR_REPOSITORY=ghcr.io/REPLACE_WITH_OWNER/elspeth
+export GHCR_TAG=REPLACE_WITH_LITERAL_GIT_TAG
+export ECR_TRANSFER_TAG="candidate-${GHCR_TAG}"
+
+ECR_REPOSITORY_URL=$(terraform -chdir=bootstrap output -raw ecr_repository_url)
+ECR_REPOSITORY=$(terraform -chdir=bootstrap output -raw ecr_repository)
+ECR_REGISTRY=${ECR_REPOSITORY_URL%%/*}
+
+transfer_work=$(mktemp -d -p /tmp elspeth-ghcr-to-ecr.XXXXXX)
+chmod 700 "$transfer_work"
+mkdir -m 700 "$transfer_work/docker-config"
+(
+  export DOCKER_CONFIG="$transfer_work/docker-config"
+  trap 'docker logout ghcr.io >/dev/null 2>&1 || true; docker logout "$ECR_REGISTRY" >/dev/null 2>&1 || true; rm -rf -- "$transfer_work"' EXIT
+
+  printf '%s' "$GITHUB_TOKEN" \
+    | docker login ghcr.io --username "$GITHUB_USERNAME" --password-stdin
+  aws ecr get-login-password \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    >"$transfer_work/ecr-password"
+  docker login \
+    --username AWS \
+    --password-stdin "$ECR_REGISTRY" \
+    <"$transfer_work/ecr-password"
+
+  GHCR_IMAGE_DIGEST=$(docker buildx imagetools inspect \
+    --format '{{.Manifest.Digest}}' \
+    "$GHCR_REPOSITORY:$GHCR_TAG")
+  printf '%s\n' "$GHCR_IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+  GHCR_IMAGE="$GHCR_REPOSITORY@$GHCR_IMAGE_DIGEST"
+
+  docker buildx imagetools create \
+    --tag "$ECR_REPOSITORY_URL:$ECR_TRANSFER_TAG" \
+    "$GHCR_IMAGE"
+  ECR_IMAGE_DIGEST=$(aws ecr describe-images \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    --repository-name "$ECR_REPOSITORY" \
+    --image-ids "imageTag=$ECR_TRANSFER_TAG" \
+    --query 'imageDetails[0].imageDigest' \
+    --output text)
+  test "$ECR_IMAGE_DIGEST" = "$GHCR_IMAGE_DIGEST"
+
+  CANDIDATE_IMAGE="$ECR_REPOSITORY_URL@$ECR_IMAGE_DIGEST"
+  printf 'candidate_image = "%s"\n' "$CANDIDATE_IMAGE"
+)
+unset GITHUB_TOKEN
+```
+
+Copy the printed `candidate_image` assignment into the selected scenario
+tfvars. Do not substitute the GHCR reference: both scenario roots intentionally
+reject any candidate outside the bootstrap-created ECR repository.
 
 ## 2. Generate partial backend inputs
 

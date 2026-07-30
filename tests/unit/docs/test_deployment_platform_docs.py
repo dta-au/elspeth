@@ -146,10 +146,11 @@ def test_kubernetes_is_an_explicit_byo_zero_overlap_contract() -> None:
     assert "deploy/kubernetes" not in text
 
 
-def test_native_linux_documents_sqlite_or_postgresql_and_postgres_extra() -> None:
+def test_native_linux_documents_sqlite_or_postgresql_and_runtime_extras() -> None:
     text = _read(UBUNTU_RUNBOOK)
+    runtime_sync = "uv sync --frozen --extra webui --extra azure --extra llm --extra aws --extra postgres"
 
-    assert "uv sync --frozen --extra webui --extra azure --extra llm --extra postgres" in text
+    assert text.count(runtime_sync) == 3
     assert "SQLite" in text
     assert "single host" in text
     assert "external PostgreSQL" in text
@@ -203,7 +204,7 @@ def test_native_linux_trust_gate_runs_after_checkout_with_dev_dependency_then_sy
         "uv run --frozen --extra dev elspeth-lints check --rules trust_tier.tier_model "
         "--root src/elspeth --allowlist-dir config/cicd/enforce_tier_model"
     )
-    lean_sync = "uv sync --frozen --extra webui --extra azure --extra llm --extra postgres"
+    lean_sync = "uv sync --frozen --extra webui --extra azure --extra llm --extra aws --extra postgres"
 
     assert text.index('git -C /opt/elspeth checkout --detach "$ELSPETH_RELEASE_REF"') < text.index(gate)
     assert text.index(gate) < text.index(lean_sync)

@@ -155,7 +155,12 @@ def test_runbook_preserves_supported_agent_health_mode() -> None:
     task = next(document for document in _json_documents() if isinstance(document, dict) and "containerDefinitions" in document)
     sidecar = next(container for container in task["containerDefinitions"] if container["name"] == "cloudwatch-agent")
 
-    assert sidecar["healthCheck"]["command"] == ["CMD-SHELL", "kill -0 1"]
+    assert sidecar["healthCheck"]["command"] == [
+        "CMD",
+        "python",
+        "-c",
+        "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()",
+    ]
     assert sidecar["healthCheck"] == task_definition._CLOUDWATCH_AGENT_HEALTH_CHECK
     assert "-m ecs" not in json.dumps(sidecar)
 

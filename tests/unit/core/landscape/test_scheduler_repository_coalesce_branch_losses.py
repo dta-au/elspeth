@@ -124,12 +124,20 @@ def _loss_rows(db: LandscapeDB) -> list[dict[str, object]]:
         ]
 
 
-def _record(db: LandscapeDB, *, branch: str = "left", token_id: str = "tok-left", reason: str = "failed", now: datetime = NOW) -> bool:
+def _record(
+    db: LandscapeDB,
+    *,
+    coalesce_name: str = "merge",
+    branch: str = "left",
+    token_id: str = "tok-left",
+    reason: str = "failed",
+    now: datetime = NOW,
+) -> bool:
     with begin_write(db.engine) as conn:
         return record_coalesce_branch_loss(
             conn,
             run_id=RUN_ID,
-            coalesce_name="merge",
+            coalesce_name=coalesce_name,
             row_id="row-1",
             branch_name=branch,
             token_id=token_id,
@@ -204,6 +212,24 @@ class TestReplayAndAdoption:
         # §E.4 restore read returns EVERYTHING, adopted or not.
         full = repo.list_coalesce_branch_losses(run_id=RUN_ID)
         assert [(loss.branch_name, loss.adopted_epoch) for loss in full] == [("left", token.leader_epoch), ("right", None)]
+
+    def test_takeover_read_can_scope_history_to_configured_coalesces(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        repo = TokenSchedulerRepository(db.engine)
+        assert _record(db, coalesce_name="merge", branch="left", token_id="tok-merge") is True
+        assert _record(
+            db,
+            coalesce_name="variant_union",
+            branch="treatment",
+            token_id="tok-union",
+            now=NOW + timedelta(seconds=1),
+        )
+
+        scoped = repo.list_coalesce_branch_losses(
+            run_id=RUN_ID,
+            coalesce_names=frozenset({"merge"}),
+        )
+
+        assert [(loss.coalesce_name, loss.branch_name) for loss in scoped] == [("merge", "left")]
 
     def test_adopt_is_idempotent_second_mark_is_zero(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)

@@ -1236,8 +1236,11 @@ class BarrierRecoveryCoordinator:
         # reason disagreement — the first durable record may already have
         # fired a must-fail policy).
         durable_branch_losses = (
-            self._scheduler.list_coalesce_branch_losses(run_id=self._run_id)
-            if self._coalesce_executor is not None or self._row_union_executor is not None
+            self._scheduler.list_coalesce_branch_losses(
+                run_id=self._run_id,
+                coalesce_names=frozenset(coalesce_keys),
+            )
+            if self._coalesce_executor is not None
             else []
         )
         effective_coalesce_scalars: dict[tuple[str, str], CoalescePendingScalars] = dict(scalars.coalesce)
@@ -1322,48 +1325,6 @@ class BarrierRecoveryCoordinator:
                         f"Row_union restore reset {reset_count} adopted holdless rows; expected {len(row_union_holdless_items)}."
                     )
 
-            row_union_durable_losses = [loss for loss in durable_branch_losses if loss.coalesce_name in row_union_keys]
-            if row_union_durable_losses:
-                # A durable branch-loss row must never replay over a group
-                # whose union node states prove RELEASE (status COMPLETED):
-                # it would poison _recorded_loss_groups, and the
-                # reconcile_released_group pristine-group guard would wedge
-                # every leader takeover. Mirror the coalesce-scalar precedent
-                # above: drop-with-log, the durable release evidence wins. The
-                # read spans ALL row-union node ids — not just the current
-                # released-group classification — so fully-terminalized
-                # prior-epoch released groups are also protected (a straggler
-                # for such a group must fail as late_arrival_after_release,
-                # not row_union_branch_lost). The ledger row itself is left
-                # untouched; only the in-memory replay is filtered.
-                node_id_to_row_union_name = {str(node_id): str(name) for name, node_id in self._row_union_node_ids.items()}
-                released_pairs = self._barrier_restore_reads.get_released_row_ids_for_nodes(
-                    self._run_id,
-                    frozenset(node_id_to_row_union_name),
-                )
-                released_loss_keys = {
-                    (node_id_to_row_union_name[node_id], row_id)
-                    for node_id, row_id in released_pairs
-                    if node_id in node_id_to_row_union_name
-                }
-                replayable_losses = []
-                for loss in row_union_durable_losses:
-                    if (loss.coalesce_name, loss.row_id) in released_loss_keys:
-                        logger.warning(
-                            "row_union restore: durable branch-loss ledger row for %s/%s/%s (%r) contradicts "
-                            "durable release evidence (union node states prove RELEASE); release wins — "
-                            "the loss is not replayed",
-                            loss.coalesce_name,
-                            loss.row_id,
-                            loss.branch_name,
-                            loss.reason,
-                        )
-                        continue
-                    replayable_losses.append(loss)
-                row_union_durable_losses = replayable_losses
-            self._row_union_executor.restore_branch_losses(
-                tuple((loss.coalesce_name, loss.row_id, loss.branch_name) for loss in row_union_durable_losses)
-            )
             now_monotonic = self._clock.monotonic()
             for group in row_union_released_groups:
                 group_entries: list[RowUnionRestoreEntry] = []

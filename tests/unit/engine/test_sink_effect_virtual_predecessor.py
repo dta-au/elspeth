@@ -11,11 +11,19 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from elspeth.contracts import NodeType
-from elspeth.contracts.sink_effects import SinkEffectMember, SinkEffectMemberCandidate
+from elspeth.contracts.sink_effects import (
+    RestrictedSinkEffectContext,
+    SinkEffectInspectionRequest,
+    SinkEffectMember,
+    SinkEffectMemberCandidate,
+    SinkEffectPipelineMembersInput,
+    SinkEffectPrepareRequest,
+)
 from elspeth.core.landscape.execution.sink_effect_identity import resolve_sink_effect_members
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator
@@ -24,7 +32,7 @@ from tests.fixtures.landscape import make_factory, make_landscape_db, register_t
 from tests.fixtures.stores import MockPayloadStore
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members
 from tests.unit.engine.test_sink_effect_executor import _execution_request
-from tests.unit.plugins.sinks.test_remote_object_sink_effects import _Object, _s3, _S3Store
+from tests.unit.plugins.sinks.test_remote_object_sink_effects import _azure, _AzureStore, _Object, _s3, _S3Store
 
 _EMPTY_HASH = sha256(b"").hexdigest()
 
@@ -229,6 +237,83 @@ def test_real_publication_survives_inherited_no_publication_gap() -> None:
         assert len(put_requests) == 2
         # The successor's replace is fenced on the real publication's ETag.
         assert put_requests[1]["IfMatch"] == real_etag
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("sink_factory", [_s3, _azure])
+def test_reaffirmed_genesis_preserves_predecessor_authority_for_changed_successor(
+    sink_factory: Any,
+) -> None:
+    db = make_landscape_db()
+    try:
+        payload_store = MockPayloadStore()
+        factory = make_factory(db, payload_store=payload_store)
+        run_id, sink_id, members = _pipeline_members(factory, 2)
+        run = factory.run_lifecycle.get_run(run_id)
+        assert run is not None
+        store = _S3Store() if sink_factory is _s3 else _AzureStore()
+        seed_sink = sink_factory(store, overwrite=False)
+        seed_ctx = RestrictedSinkEffectContext(
+            run_id=run_id,
+            run_started_at=run.started_at,
+            operation_id="external-seed-operation",
+            sink_node_id=sink_id,
+        )
+        seed_effect_id = "a" * 64
+        seed_inspection = seed_sink.inspect_effect(
+            SinkEffectInspectionRequest(
+                effect_id=seed_effect_id,
+                target="{}",
+                predecessor_descriptor=None,
+            ),
+            seed_ctx,
+        )
+        seed_input = SinkEffectPipelineMembersInput(
+            members=members[:1],
+            target_snapshot_members=members[:1],
+        )
+        seed_plan = seed_sink.prepare_effect(
+            SinkEffectPrepareRequest(
+                effect_id=seed_effect_id,
+                effect_input=seed_input,
+                inspection=seed_inspection,
+            ),
+            seed_ctx,
+        )
+        seed_sink.commit_effect(seed_plan, seed_ctx)
+        assert store.value is not None
+        seed_etag = store.value.etag
+        write_operation = "put" if sink_factory is _s3 else "upload"
+
+        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a")
+        first = coordinator.execute(
+            _execution_request(run_id, sink_id, members[:1]),
+            sink_factory(store, overwrite=False),
+        )
+
+        assert first.effect.publication_performed is False
+        assert first.artifact.publication_performed is False
+        assert first.effect.plan_json is not None
+        assert json.loads(first.effect.plan_json)["safe_evidence"]["publication_kind"] == "reaffirmed"
+        assert len([request for request in store.requests if request["operation"] == write_operation]) == 1
+
+        second = coordinator.execute(
+            _execution_request(run_id, sink_id, members[1:]),
+            sink_factory(store, overwrite=False),
+        )
+
+        assert second.effect.publication_performed is True
+        assert store.value is not None
+        assert json.loads(store.value.body) == [{"ordinal": 0}, {"ordinal": 1}]
+        write_requests = [request for request in store.requests if request["operation"] == write_operation]
+        assert len(write_requests) == 2
+        if sink_factory is _s3:
+            assert write_requests[-1]["IfMatch"] == seed_etag
+        else:
+            assert write_requests[-1]["etag"] == seed_etag
+            assert write_requests[-1]["overwrite"] is True
+            assert "match_condition" in write_requests[-1]
     finally:
         db.close()
 

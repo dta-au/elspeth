@@ -187,25 +187,30 @@ class CoalesceBranchLossRepository:
             )
         return [_loss_from_mapping(row) for row in rows]
 
-    def list_coalesce_branch_losses(self, *, run_id: str) -> list[CoalesceBranchLoss]:
+    def list_coalesce_branch_losses(
+        self,
+        *,
+        run_id: str,
+        coalesce_names: frozenset[str] | None = None,
+    ) -> list[CoalesceBranchLoss]:
         """ALL branch-loss rows, adopted or not (§E.4 takeover restore read).
 
         The new leader rebuilds ``lost_branches`` for still-pending coalesce
         groups from the full table (the D3 checkpoint scalar is retained as a
         cross-check only) and seeds executor memory directly; unadopted rows
         are then re-marked under its own epoch. Append-only ledger: rows are
-        never deleted or consumed destructively. Read-only; no event.
+        never deleted or consumed destructively. ``coalesce_names`` scopes a
+        mixed-topology restore so unrelated row-union history is not
+        materialized. Read-only; no event.
         """
+        if coalesce_names == frozenset():
+            return []
+        query = select(coalesce_branch_losses_table).where(coalesce_branch_losses_table.c.run_id == run_id)
+        if coalesce_names is not None:
+            query = query.where(coalesce_branch_losses_table.c.coalesce_name.in_(coalesce_names))
+        query = query.order_by(coalesce_branch_losses_table.c.recorded_at, coalesce_branch_losses_table.c.loss_id)
         with self._engine.connect() as conn:
-            rows = (
-                conn.execute(
-                    select(coalesce_branch_losses_table)
-                    .where(coalesce_branch_losses_table.c.run_id == run_id)
-                    .order_by(coalesce_branch_losses_table.c.recorded_at, coalesce_branch_losses_table.c.loss_id)
-                )
-                .mappings()
-                .all()
-            )
+            rows = conn.execute(query).mappings().all()
         return [_loss_from_mapping(row) for row in rows]
 
     def adopt_coalesce_branch_losses(

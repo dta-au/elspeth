@@ -472,7 +472,7 @@ def _parse_verified_records(
                 spool.stream.close()
 
 
-def _open_owned_output(directory_fd: int, name: str) -> int:
+def _open_owned_output(directory_fd: int, name: str, owned_names: list[str]) -> int:
     _validate_relative_name(name)
     descriptor = os.open(
         name,
@@ -480,6 +480,7 @@ def _open_owned_output(directory_fd: int, name: str) -> int:
         0o600,
         dir_fd=directory_fd,
     )
+    owned_names.append(name)
     completed = False
     try:
         os.fchmod(descriptor, 0o600)
@@ -515,8 +516,13 @@ def _hash_regular_file_at(directory_fd: int, name: str, expected_identity: os.st
         os.close(descriptor)
 
 
-def _write_csv_file_at(directory_fd: int, name: str, spool: _RecordSpool) -> BundleFileEntry:
-    descriptor = _open_owned_output(directory_fd, name)
+def _write_csv_file_at(
+    directory_fd: int,
+    name: str,
+    spool: _RecordSpool,
+    owned_names: list[str],
+) -> BundleFileEntry:
+    descriptor = _open_owned_output(directory_fd, name, owned_names)
     identity = os.fstat(descriptor)
     with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as text:
         writer = csv.DictWriter(text, fieldnames=sorted(spool.fieldnames), lineterminator="\r\n")
@@ -533,8 +539,13 @@ def _write_csv_file_at(directory_fd: int, name: str, spool: _RecordSpool) -> Bun
     return BundleFileEntry(name, content_hash, size_bytes)
 
 
-def _write_exact_file_at(directory_fd: int, name: str, content: bytes) -> BundleFileEntry:
-    descriptor = _open_owned_output(directory_fd, name)
+def _write_exact_file_at(
+    directory_fd: int,
+    name: str,
+    content: bytes,
+    owned_names: list[str],
+) -> BundleFileEntry:
+    descriptor = _open_owned_output(directory_fd, name, owned_names)
     identity = os.fstat(descriptor)
     with os.fdopen(descriptor, "wb") as stream:
         written = stream.write(content)
@@ -814,10 +825,13 @@ def prepare_audit_export_bundle(
         spools, manifest_bytes = _parse_verified_records(effect_input)
         entries: list[BundleFileEntry] = []
         for relative_path in sorted(spools):
-            entries.append(_write_csv_file_at(building_descriptor, relative_path, spools[relative_path]))
-            written_names.append(relative_path)
-        manifest_entry = _write_exact_file_at(building_descriptor, AUDIT_MANIFEST_NAME, manifest_bytes)
-        written_names.append(AUDIT_MANIFEST_NAME)
+            entries.append(_write_csv_file_at(building_descriptor, relative_path, spools[relative_path], written_names))
+        manifest_entry = _write_exact_file_at(
+            building_descriptor,
+            AUDIT_MANIFEST_NAME,
+            manifest_bytes,
+            written_names,
+        )
         if (
             manifest_entry.content_hash != effect_input.signed_manifest.content_hash
             or manifest_entry.size_bytes != effect_input.signed_manifest.size_bytes
