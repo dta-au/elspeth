@@ -631,25 +631,29 @@ sinks:
 
 ### Add a Transform
 
-Add a field before routing:
+Add a computed field before routing. Computing a value is `value_transform`'s
+job: an ordered list of `operations`, each with a `target` field and an
+`expression` in the restricted expression language. (`field_mapper` is the
+rename/select transform — it cannot compute new values.)
 
 ```yaml
 source:
   plugin: csv
-  on_success: mapper_in
+  on_success: tier_in
   options: ...
 
 transforms:
   - name: add_tier
-    plugin: field_mapper
-    input: mapper_in
+    plugin: value_transform
+    input: tier_in
     on_success: tier_gate_in
     on_error: discard
     options:
       schema:
         mode: observed
-      computed:
-        tier: "row['amount'] > 2500 and 'premium' or (row['amount'] > 1000 and 'high' or 'normal')"
+      operations:
+        - target: tier
+          expression: "row['amount'] > 2500 and 'premium' or (row['amount'] > 1000 and 'high' or 'normal')"
 
 gates:
   - name: tier_router
