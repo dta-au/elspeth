@@ -6765,10 +6765,13 @@ class TestCompositionStateRowUnion:
 
         result = state.validate()
 
-        origin_error = next(error for error in result.errors if error.error_code == "row_union_branch_invalid")
+        origin_error = next(error for error in result.errors if error.error_code == "row_union_branch_origin_invalid")
         assert "one common gate fork_to" in origin_error.message
         assert "fork_rows" in origin_error.message
         assert "fork_treatment" in origin_error.message
+        # A step-8 topology finding, not the intrinsic node-shape code the
+        # mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
 
     def test_row_union_rejects_branch_connection_from_a_different_alias(self) -> None:
         row_union = self._row_union(
@@ -6781,10 +6784,13 @@ class TestCompositionStateRowUnion:
 
         result = self._state(row_union=row_union).validate()
 
-        mapping_error = next(error for error in result.errors if error.error_code == "row_union_branch_invalid")
+        mapping_error = next(error for error in result.errors if error.error_code == "row_union_branch_not_downstream")
         assert "control_branch" in mapping_error.message
         assert "treatment_done" in mapping_error.message
         assert "not downstream" in mapping_error.message
+        # A step-8 topology finding, not the intrinsic node-shape code the
+        # mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
 
     def test_row_union_output_feeds_ordinary_node_without_placeholder_consumer(self) -> None:
         state = self._state()

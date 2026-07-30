@@ -3436,6 +3436,13 @@ class CompositionState:
                             "row_union_branch_unreachable",
                         )
                     )
+                # Correlation-origin and downstream-lineage checks. These are
+                # topology findings like their unreachable siblings above, so
+                # they carry their own codes: sharing the intrinsic
+                # ``row_union_branch_invalid`` code put them in the tool
+                # layer's mutation-blocking preflight, where completing the
+                # topology from an unrelated node rolled that node's mutation
+                # back with an error naming the mis-wired row_union.
                 if not missing_aliases and not missing_branches:
                     common_gate_ids = sorted(
                         gate_id
@@ -3454,7 +3461,7 @@ class CompositionState:
                                 f"so they share one correlation origin; observed {alias_origins}. "
                                 "Choose every alias from a single gate or create a separate row_union per fork.",
                                 "high",
-                                "row_union_branch_invalid",
+                                "row_union_branch_origin_invalid",
                             )
                         )
                     else:
@@ -3468,7 +3475,7 @@ class CompositionState:
                                     f"'{branch_connection}', which is not downstream of that alias's fork edge. "
                                     "Wire each branches[alias] value through processing that starts at the same gate fork branch.",
                                     "high",
-                                    "row_union_branch_invalid",
+                                    "row_union_branch_not_downstream",
                                 )
                             )
                 continue

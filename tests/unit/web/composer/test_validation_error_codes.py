@@ -313,6 +313,8 @@ class TestClosedCodeCatalogueInvariants:
             "row_union_timeout_invalid",
             "row_union_branch_alias_unreachable",
             "row_union_branch_unreachable",
+            "row_union_branch_origin_invalid",
+            "row_union_branch_not_downstream",
             "row_union_on_success_must_be_connection",
             "row_union_on_success_dangling",
         ):
@@ -321,6 +323,28 @@ class TestClosedCodeCatalogueInvariants:
             assert guidance is not None, f"{code} does not resolve to catalogue guidance"
             explanation, fix = guidance
             assert explanation and fix
+
+    def test_row_union_topology_codes_resolve_to_topology_guidance(self) -> None:
+        """The new codes must not fall through to the intrinsic entry.
+
+        ``explain_validation_code`` returns the first matching pattern, so a
+        mis-ordered catalogue entry would silently route a topology code to
+        the node-shape guidance ("give every branch a non-empty unique
+        alias") — the exact mis-advice the code split removes.
+        """
+        intrinsic = explain_validation_code("row_union_branch_invalid")
+        assert intrinsic is not None
+
+        origin = explain_validation_code("row_union_branch_origin_invalid")
+        assert origin is not None
+        assert origin != intrinsic
+        assert "gate" in origin[0] or "gate" in origin[1]
+
+        downstream = explain_validation_code("row_union_branch_not_downstream")
+        assert downstream is not None
+        assert downstream != intrinsic
+        assert downstream != origin
+        assert "downstream" in downstream[0] or "downstream" in downstream[1]
 
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.

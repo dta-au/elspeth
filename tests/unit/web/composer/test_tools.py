@@ -15512,6 +15512,168 @@ class TestUpsertNodeRowUnion:
         assert result.updated_state.version == state.version
 
 
+class TestRowUnionTopologyCodesDoNotBlockUnrelatedMutations:
+    """row_union step-8 topology findings are telemetry, not mutation gates.
+
+    ``_post_mutation_invariant_error`` selects only intrinsic node-shape and
+    namespace invariants. While the two step-8 topology checks shared the
+    intrinsic ``row_union_branch_invalid`` code, completing the topology from
+    an *unrelated* node made that node's own mutation roll back with an error
+    naming the mis-wired row_union.
+    """
+
+    @staticmethod
+    def _transform(node_id: str, input_connection: str, on_success: str) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _mis_wired_state(self) -> CompositionState:
+        """A swapped-branch row_union whose topology is not yet complete.
+
+        ``treatment`` is deliberately absent, so ``treatment_done`` has no
+        producer and only the non-blocking reachability code fires.
+        """
+        return (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="fork_in",
+                    options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="fork_rows",
+                    node_type="gate",
+                    plugin=None,
+                    input="fork_in",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("control_branch", "treatment_branch"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(self._transform("control", "control_branch", "control_done"))
+            .with_node(
+                NodeSpec(
+                    id="variant_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="treatment_done",
+                    on_success="union_out",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    # Swapped: each alias claims the other branch's connection.
+                    branches={
+                        "control_branch": "treatment_done",
+                        "treatment_branch": "control_done",
+                    },
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(self._transform("after_union", "union_out", "main"))
+            .with_output(
+                OutputSpec(
+                    name="main",
+                    plugin="json",
+                    options={"path": "outputs/main.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+    def test_topology_codes_are_not_mutation_blocking_invariants(self) -> None:
+        from elspeth.web.composer.tools._common import (
+            _MUTATION_BLOCKING_INVARIANT_CODES,
+            _ROW_UNION_INTRINSIC_ERROR_CODES,
+        )
+
+        topology_codes = {"row_union_branch_origin_invalid", "row_union_branch_not_downstream"}
+        assert not topology_codes & _MUTATION_BLOCKING_INVARIANT_CODES
+        assert not topology_codes & _ROW_UNION_INTRINSIC_ERROR_CODES
+        # The intrinsic node-shape family must still gate mutations.
+        assert {
+            "row_union_config_invalid",
+            "row_union_branches_invalid",
+            "row_union_branch_invalid",
+            "row_union_input_mismatch",
+            "row_union_on_success_invalid",
+            "row_union_timeout_invalid",
+        } <= _MUTATION_BLOCKING_INVARIANT_CODES
+
+    def test_completing_topology_from_an_unrelated_node_is_not_rejected(self) -> None:
+        state = self._mis_wired_state()
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        assert "row_union_branch_unreachable" in {entry["error_code"] for entry in preview.data["errors"]}
+
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "treatment",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "treatment_branch",
+                "on_success": "treatment_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+                "condition": None,
+                "routes": None,
+                "fork_to": None,
+                "branches": None,
+                "policy": None,
+                "merge": None,
+                "trigger": None,
+                "output_mode": None,
+                "expected_output_count": None,
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is True, result.to_dict()
+        assert any(node.id == "treatment" for node in result.updated_state.nodes)
+        assert not any(entry.component == "rejected_mutation" for entry in result.validation.errors)
+
+        # The mis-wiring now surfaces as non-blocking validation telemetry
+        # against the row_union itself, under a topology-specific code.
+        codes = {entry.error_code for entry in result.validation.errors}
+        assert "row_union_branch_not_downstream" in codes
+        assert "row_union_branch_invalid" not in codes
+
+    def test_mis_wired_row_union_still_persists_while_topology_is_incomplete(self) -> None:
+        state = self._mis_wired_state()
+
+        result = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+
+        assert result.success is True
+        assert any(node.id == "variant_union" for node in result.updated_state.nodes)
+
+
 class TestStructuralBarrierTimeoutBoundary:
     @staticmethod
     def _coalesce_arguments(timeout_seconds: object) -> dict[str, Any]:
