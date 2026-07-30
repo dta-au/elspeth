@@ -1725,13 +1725,22 @@ class TestComposerEndpointAffordance:
 
         assert settings.composer_endpoint_base_url == "http://127.0.0.1:8787/v1"
 
-    def test_endpoint_allows_http_localhost(self) -> None:
-        settings = _settings(
-            composer_endpoint_base_url="http://localhost/v1",
-            composer_endpoint_api_key="loopback-bearer-token",
-        )
+    def test_endpoint_rejects_name_based_localhost(self) -> None:
+        """``localhost`` is resolver-dependent (/etc/hosts, NSS, container
+        DNS) and is not proof of on-box egress for a credential-bearing URL —
+        unlike the numeric 127.0.0.1/[::1] forms, which remain accepted."""
+        with pytest.raises(ValidationError, match="numeric loopback address"):
+            _settings(
+                composer_endpoint_base_url="http://localhost/v1",
+                composer_endpoint_api_key="loopback-bearer-token",
+            )
 
-        assert settings.composer_endpoint_base_url == "http://localhost/v1"
+    def test_advisor_endpoint_rejects_name_based_localhost(self) -> None:
+        with pytest.raises(ValidationError, match="numeric loopback address"):
+            _settings(
+                composer_advisor_endpoint_base_url="http://localhost/v1",
+                composer_advisor_endpoint_api_key="loopback-bearer-token",
+            )
 
     def test_endpoint_rejects_non_loopback_http(self) -> None:
         with pytest.raises(ValidationError):

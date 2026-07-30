@@ -26,7 +26,7 @@ from uuid import UUID
 from litellm.exceptions import APIError as LiteLLMAPIError
 from opentelemetry import metrics
 
-from elspeth.web.composer.service import _litellm_acompletion
+from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -124,10 +124,7 @@ async def maybe_auto_title_session(
         kwargs["temperature"] = temperature
     if seed is not None:
         kwargs["seed"] = seed
-    if api_base is not None:
-        kwargs["api_base"] = api_base
-    if api_key is not None:
-        kwargs["api_key"] = api_key
+    _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
     try:
         response = await _litellm_acompletion(**kwargs)
         content = response.choices[0].message.content

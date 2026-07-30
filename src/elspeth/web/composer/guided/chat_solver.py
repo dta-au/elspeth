@@ -67,7 +67,7 @@ from elspeth.web.composer.llm_response_parsing import (
     supports_anthropic_prompt_cache_markers,
 )
 from elspeth.web.composer.progress import emit_progress, model_call_progress_event, tool_batch_progress_event
-from elspeth.web.composer.service import _litellm_acompletion
+from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._dispatch import get_discovery_tool_definitions
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
@@ -1209,10 +1209,7 @@ async def maybe_manage_deferred_intent_chat(
         kwargs["temperature"] = request.temperature
     if request.seed is not None:
         kwargs["seed"] = request.seed
-    if request.api_base is not None:
-        kwargs["api_base"] = request.api_base
-    if request.api_key is not None:
-        kwargs["api_key"] = request.api_key
+    _apply_endpoint_kwargs(kwargs, base_url=request.api_base, api_key=request.api_key)
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()
     status: ComposerLLMCallStatus | None = None
@@ -1594,10 +1591,7 @@ async def maybe_resolve_step_1_source_chat(
             kwargs["temperature"] = temperature
         if seed is not None:
             kwargs["seed"] = seed
-        if api_base is not None:
-            kwargs["api_base"] = api_base
-        if api_key is not None:
-            kwargs["api_key"] = api_key
+        _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -2082,10 +2076,7 @@ async def maybe_resolve_step_2_sink_chat(
             kwargs["temperature"] = temperature
         if seed is not None:
             kwargs["seed"] = seed
-        if api_base is not None:
-            kwargs["api_base"] = api_base
-        if api_key is not None:
-            kwargs["api_key"] = api_key
+        _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -2328,10 +2319,7 @@ async def solve_step_chat(
         kwargs["temperature"] = temperature
     if seed is not None:
         kwargs["seed"] = seed
-    if api_base is not None:
-        kwargs["api_base"] = api_base
-    if api_key is not None:
-        kwargs["api_key"] = api_key
+    _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()
     status: ComposerLLMCallStatus | None = None

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import httpx
 
-from elspeth.web.composer.service import _litellm_acompletion
+from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 
 
 class ComposerBootConfigError(RuntimeError):
@@ -58,10 +58,7 @@ async def probe_composer_config(
         kwargs["temperature"] = temperature
     if seed is not None:
         kwargs["seed"] = seed
-    if api_base is not None:
-        kwargs["api_base"] = api_base
-    if api_key is not None:
-        kwargs["api_key"] = api_key
+    _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
 
     try:
         await _litellm_acompletion(**kwargs)

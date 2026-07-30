@@ -112,11 +112,27 @@ def _validate_composer_endpoint_base_url(value: str, *, field_name: str) -> str:
     query/fragment rejection — a path IS allowed (``/v1`` is the normal
     OpenAI-compatible mount point), unlike ``public_base_url`` which must be
     a bare origin.
+
+    Field-scoped tightening on top of the shared helper: the shared
+    ``_is_loopback_host`` treats the literal name ``localhost`` as loopback,
+    which is fine for the other (non-credential, or lower-stakes) callers of
+    that helper but not for this one. ``localhost`` is resolver-dependent —
+    ``/etc/hosts``, NSS, container DNS can all point it somewhere other than
+    the local box — so a name-based loopback URL is not proof of on-box
+    egress the way a literal ``127.0.0.0/8`` or ``::1`` address is. This
+    field carries an operator bearer credential over that connection, so we
+    reject the name form here and require the numeric loopback address.
     """
     safe_url = validate_credential_safe_https_url(value, field_name=field_name, allow_http_loopback=True)
     parsed = urlparse(safe_url)
     if parsed.query or parsed.fragment:
         raise ValueError(f"{field_name} must not include a query string or fragment")
+    if parsed.scheme == "http" and parsed.hostname is not None and parsed.hostname.casefold() == "localhost":
+        raise ValueError(
+            f"{field_name} must use a numeric loopback address (127.0.0.1 or [::1]), not the name 'localhost': "
+            "name resolution is resolver-dependent (/etc/hosts, NSS, container DNS) and is not proof of on-box "
+            "egress for this credential-bearing URL"
+        )
     return safe_url
 
 
