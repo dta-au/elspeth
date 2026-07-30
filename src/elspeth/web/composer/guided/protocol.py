@@ -1713,6 +1713,17 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     branch_origin_gates: dict[str, list[str]] = {}
     branch_adjacency: dict[str, dict[str, set[str]]] = {}
     branch_uses: list[tuple[str, str, str, str]] = []
+    # Only two edges in a fork arm ever carry a branch alias: the authoritative
+    # ``gate_fork`` edge that opens the arm, and the final edge into the
+    # correlated barrier (planning.py stamps that one per barrier-bound
+    # destination). Every processing hop in between is untagged, so a branch's
+    # provenance walk must traverse untagged routing as well — otherwise any arm
+    # with more than one node is falsely rejected as "not downstream of its
+    # authoritative gate_fork origin". This mirrors the composer's own
+    # ``_runtime_connection_is_downstream`` (state.py), which decides the same
+    # question by expanding generic on_success / on_error / routes / fork_to
+    # routing rather than branch-tagged routing.
+    unbranched_adjacency: dict[str, set[str]] = {}
 
     for index, edge in enumerate(edges):
         path = f"payload.graph.edges[{index}]"
@@ -1790,6 +1801,27 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             branch_graph.setdefault(from_stable_id, set()).add(to_stable_id)
             branch_graph.setdefault(to_stable_id, set())
             branch_uses.append((branch, from_stable_id, flow_kind, path))
+        else:
+            unbranched_adjacency.setdefault(from_stable_id, set()).add(to_stable_id)
+
+    def branch_downstream_ids(branch: str) -> set[str]:
+        """Components reachable from ``branch``'s authoritative gate_fork origin.
+
+        Walks the branch's own tagged edges plus every untagged routing edge, so
+        an arm of any length resolves. Another branch's tagged edges are never
+        traversed, so a producer wired in from a sibling arm stays unreachable.
+        """
+
+        branch_graph = branch_adjacency.get(branch, {})
+        frontier = list(branch_origins.get(branch, ()))
+        visited = set(frontier)
+        while frontier:
+            current = frontier.pop()
+            routed = branch_graph.get(current, frozenset()) | unbranched_adjacency.get(current, frozenset())
+            for target_id in routed - visited:
+                visited.add(target_id)
+                frontier.append(target_id)
+        return visited
 
     for node in nodes:
         behavior = node["behavior"]
@@ -1889,15 +1921,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.flow branch alias has no unique authoritative gate_fork origin"
         if flow_kind == "gate_fork":
             continue
-        branch_graph = branch_adjacency[branch]
-        frontier = list(origins)
-        visited = set(frontier)
-        while frontier:
-            current = frontier.pop()
-            for target_id in branch_graph.get(current, set()) - visited:
-                visited.add(target_id)
-                frontier.append(target_id)
-        if from_stable_id not in visited:
+        if from_stable_id not in branch_downstream_ids(branch):
             return f"{path}.flow branch alias is not downstream of its authoritative gate_fork origin"
 
     for node in nodes:
@@ -1909,15 +1933,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             origins = branch_origins.get(branch)
             if origins is None:
                 return "payload correlated barrier branch alias has no authoritative gate_fork origin"
-            branch_graph = branch_adjacency[branch]
-            frontier = list(origins)
-            visited = set(frontier)
-            while frontier:
-                current = frontier.pop()
-                for target_id in branch_graph.get(current, set()) - visited:
-                    visited.add(target_id)
-                    frontier.append(target_id)
-            if node["stable_id"] not in visited:
+            if node["stable_id"] not in branch_downstream_ids(branch):
                 return "payload correlated barrier branch is not connected to its gate_fork origin"
 
     indegree = dict.fromkeys(component_kind_by_id, 0)

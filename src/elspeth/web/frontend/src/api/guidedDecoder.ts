@@ -523,6 +523,11 @@ function validateProposalPayload(value: unknown, path: string): void {
   const branchOrigins = new Map<string, string[]>();
   const branchOriginGates = new Map<string, string[]>();
   const branchAdjacency = new Map<string, Map<string, Set<string>>>();
+  // Only the authoritative gate_fork edge and the final edge into a correlated
+  // barrier carry a branch alias; every processing hop between them is untagged.
+  // A branch's provenance walk therefore traverses untagged routing too, or any
+  // arm longer than one node is falsely rejected. Mirrors protocol.py.
+  const unbranchedAdjacency = new Map<string, Set<string>>();
   const branchUses: Array<{ branch: string; from: string; flowKind: string; path: string }> = [];
   const legalNodeFlows: Record<string, ReadonlySet<string>> = {
     transform: new Set(["node_success", "node_error"]),
@@ -584,8 +589,25 @@ function validateProposalPayload(value: unknown, path: string): void {
       if (!branchGraph.has(toId)) branchGraph.set(toId, new Set());
       branchAdjacency.set(edge.flow.branch, branchGraph);
       branchUses.push({ branch: edge.flow.branch, from: fromId, flowKind: edge.flow.kind, path: edge.path });
+    } else {
+      unbranchedAdjacency.set(fromId, new Set([...(unbranchedAdjacency.get(fromId) ?? []), toId]));
     }
   }
+
+  const branchDownstreamIds = (branch: string): Set<string> => {
+    const branchGraph = branchAdjacency.get(branch);
+    const origins = branchOrigins.get(branch) ?? [];
+    const seen = new Set(origins);
+    const frontier = [...origins];
+    while (frontier.length > 0) {
+      const current = frontier.pop()!;
+      const routed = [...(branchGraph?.get(current) ?? []), ...(unbranchedAdjacency.get(current) ?? [])];
+      for (const target of routed) {
+        if (!seen.has(target)) { seen.add(target); frontier.push(target); }
+      }
+    }
+    return seen;
+  };
 
   for (const node of nodes) {
     const flows = outgoingFlows.get(node.stableId) ?? [];
@@ -692,16 +714,7 @@ function validateProposalPayload(value: unknown, path: string): void {
     const origins = branchOrigins.get(use.branch);
     if (origins === undefined || origins.length !== 1) invalid(`${use.path}.flow`, "branch has no unique gate_fork origin");
     if (use.flowKind === "gate_fork") continue;
-    const branchGraph = branchAdjacency.get(use.branch)!;
-    const seen = new Set(origins);
-    const branchFrontier = [...origins];
-    while (branchFrontier.length > 0) {
-      const current = branchFrontier.pop()!;
-      for (const target of branchGraph.get(current) ?? []) {
-        if (!seen.has(target)) { seen.add(target); branchFrontier.push(target); }
-      }
-    }
-    if (!seen.has(use.from)) invalid(`${use.path}.flow`, "branch use is not downstream of gate_fork origin");
+    if (!branchDownstreamIds(use.branch).has(use.from)) invalid(`${use.path}.flow`, "branch use is not downstream of gate_fork origin");
   }
   for (const node of nodes.filter(
     (item) => item.nodeType === "coalesce" || item.nodeType === "row_union",
@@ -711,16 +724,7 @@ function validateProposalPayload(value: unknown, path: string): void {
       if (origins === undefined) {
         invalid(path, "correlated barrier branch has no fork origin");
       }
-      const branchGraph = branchAdjacency.get(branch)!;
-      const seen = new Set(origins);
-      const frontier = [...origins];
-      while (frontier.length > 0) {
-        const current = frontier.pop()!;
-        for (const target of branchGraph.get(current) ?? []) {
-          if (!seen.has(target)) { seen.add(target); frontier.push(target); }
-        }
-      }
-      if (!seen.has(node.stableId)) {
+      if (!branchDownstreamIds(branch).has(node.stableId)) {
         invalid(path, "correlated barrier branch disconnected from fork origin");
       }
     }

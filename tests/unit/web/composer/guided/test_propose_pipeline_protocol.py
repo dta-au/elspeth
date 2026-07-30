@@ -1199,6 +1199,92 @@ def test_propose_pipeline_rejects_row_union_success_targeting_downstream_barrier
     assert error == "payload row_union success must target one ordinary processing or queue node"
 
 
+def _lengthen_barrier_arms(payload: dict[str, Any], *, barrier_index: int) -> None:
+    """Insert one more processing stage into every arm feeding a barrier.
+
+    The inserted node is fed by an UNTAGGED ``node_success`` flow: only the
+    authoritative ``gate_fork`` edge and the final edge into the barrier ever
+    carry a branch alias, exactly as ``planning.py`` projects a real arm.
+    """
+    barrier_id = payload["nodes"][barrier_index]["stable_id"]
+    arm_edges = [
+        edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == barrier_id and edge["flow"].get("branch")
+    ]
+    added_edges: list[dict[str, Any]] = []
+    edge_base = 950 + len(payload["graph"]["edges"])
+    for edge in arm_edges:
+        stage_id = f"00000000-0000-4000-8000-{900 + len(payload['nodes']):012d}"
+        payload["nodes"].append(
+            {
+                "stable_id": stage_id,
+                "label": proposal_component_label("node", 0),
+                "node_type": "transform",
+                "plugin": {"kind": "transform", "id": "passthrough"},
+                "behavior": {"kind": "transform"},
+            }
+        )
+        branch = edge["flow"]["branch"]
+        edge["to_endpoint"] = {"kind": "node", "stable_id": stage_id}
+        # A gate_fork edge defines the branch's authoritative origin, so it keeps
+        # its alias; any other producer hop inside the arm is untagged.
+        if edge["flow"]["kind"] != "gate_fork":
+            edge["flow"]["branch"] = None
+        added_edges.append(
+            {
+                "stable_id": f"00000000-0000-4000-8000-{edge_base + len(added_edges):012d}",
+                "from_endpoint": {"kind": "node", "stable_id": stage_id},
+                "to_endpoint": {"kind": "node", "stable_id": barrier_id},
+                "flow": {"kind": "node_success", "branch": branch},
+            }
+        )
+        added_edges.append(
+            {
+                "stable_id": f"00000000-0000-4000-8000-{edge_base + len(added_edges):012d}",
+                "from_endpoint": {"kind": "node", "stable_id": stage_id},
+                "to_endpoint": {"kind": "discard"},
+                "flow": {"kind": "node_error"},
+            }
+        )
+    payload["graph"]["edges"].extend(added_edges)
+    for index, node in enumerate(payload["nodes"]):
+        node["label"] = proposal_component_label("node", index)
+    payload["component_counts"]["nodes"] = len(payload["nodes"])
+    payload["component_counts"]["edges"] = len(payload["graph"]["edges"])
+
+
+def test_propose_pipeline_accepts_multi_stage_row_union_arms() -> None:
+    payload = _fork_row_union_payload()
+    _lengthen_barrier_arms(payload, barrier_index=3)
+
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
+def test_propose_pipeline_accepts_multi_stage_coalesce_arms() -> None:
+    payload = _fork_coalesce_payload()
+    _lengthen_barrier_arms(payload, barrier_index=1)
+    _lengthen_barrier_arms(payload, barrier_index=1)
+
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
+def test_propose_pipeline_rejects_barrier_branch_produced_outside_its_own_fork_arm() -> None:
+    payload = _fork_row_union_payload()
+    _lengthen_barrier_arms(payload, barrier_index=3)
+    fork_edges = [edge for edge in payload["graph"]["edges"] if edge["flow"]["kind"] == "gate_fork"]
+    # Cross the two fork targets: each branch alias now enters the row_union from
+    # a producer that lives in the OTHER arm, so neither is downstream of its own
+    # authoritative fork edge.
+    fork_edges[0]["to_endpoint"], fork_edges[1]["to_endpoint"] = (
+        fork_edges[1]["to_endpoint"],
+        fork_edges[0]["to_endpoint"],
+    )
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+
+    assert error is not None
+    assert "downstream" in error or "not connected" in error
+
+
 def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces() -> None:
     payload = _payload()
     gate_a_id = NODE_ID

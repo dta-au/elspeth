@@ -681,6 +681,48 @@ describe("guided schema-10 wire decoder", () => {
     );
   });
 
+  it("decodes multi-stage branch arms whose interior hop carries no branch alias", () => {
+    const response = rowUnionProposalWireResponse();
+    const payload = (response.next_turn as { payload: Record<string, unknown> })
+      .payload;
+    const nodes = payload.nodes as Array<Record<string, unknown>>;
+    const edges = (payload.graph as { edges: Array<Record<string, unknown>> })
+      .edges;
+    const counts = payload.component_counts as Record<string, number>;
+    const unionId = (nodes[3] as { stable_id: string }).stable_id;
+    [4, 5].forEach((edgeIndex, offset) => {
+      const stageId = `00000000-0000-4000-8000-${String(409 + offset).padStart(12, "0")}`;
+      const branch = (edges[edgeIndex].flow as { branch: string }).branch;
+      nodes.push({
+        stable_id: stageId,
+        label: `node-${nodes.length + 1}`,
+        node_type: "transform",
+        plugin: { kind: "transform", id: "passthrough" },
+        behavior: { kind: "transform" },
+      });
+      edges[edgeIndex].to_endpoint = { kind: "node", stable_id: stageId };
+      (edges[edgeIndex].flow as { branch: string | null }).branch = null;
+      edges.push({
+        stable_id: `00000000-0000-4000-8000-${String(520 + offset * 2).padStart(12, "0")}`,
+        from_endpoint: { kind: "node", stable_id: stageId },
+        to_endpoint: { kind: "node", stable_id: unionId },
+        flow: { kind: "node_success", branch },
+      });
+      edges.push({
+        stable_id: `00000000-0000-4000-8000-${String(521 + offset * 2).padStart(12, "0")}`,
+        from_endpoint: { kind: "node", stable_id: stageId },
+        to_endpoint: { kind: "discard" },
+        flow: { kind: "node_error" },
+      });
+    });
+    counts.nodes = nodes.length;
+    counts.edges = edges.length;
+
+    const decoded = decodeGetGuidedResponse(response);
+
+    expect(decoded.next_turn?.type).toBe("propose_pipeline");
+  });
+
   it("decodes row_union N-to-N wire cardinality", () => {
     const decoded = decodeGetGuidedResponse(
       wireResponse({

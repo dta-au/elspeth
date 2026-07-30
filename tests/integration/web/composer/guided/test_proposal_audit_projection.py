@@ -16,6 +16,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.guided.planning import (
     build_guided_proposal_projection,
+    guided_candidate_state,
     guided_private_reviewed_facts,
     guided_redacted_current_state_context,
     guided_redacted_planner_context,
@@ -947,6 +948,80 @@ def test_fork_row_union_projection_preserves_declared_branch_order_when_producer
     assert row_union["behavior"]["branch_aliases"] == ["branch-1", "branch-2"]
     incoming = [edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == row_union["stable_id"]]
     assert [edge["flow"]["branch"] for edge in incoming] == ["branch-1", "branch-2"]
+
+
+def _multi_stage_row_union_proposal(guided: GuidedSession) -> PipelineProposal:
+    """The same A/B fork -> row_union, with TWO transforms in each arm.
+
+    Only the gate's fork edge and the final edge into the row_union carry a
+    branch alias; the hop between the two transforms in an arm is untagged.
+    """
+    pipeline = deep_thaw(_ab_row_union_proposal(guided).pipeline)
+    nodes = pipeline["nodes"]
+    for arm in ("control", "treatment"):
+        stage_one = next(node for node in nodes if node["id"] == f"tag_{arm}")
+        stage_one["on_success"] = f"{arm}_mid"
+        nodes.insert(
+            nodes.index(stage_one) + 1,
+            {
+                "id": f"score_{arm}",
+                "node_type": "transform",
+                "plugin": "value_transform",
+                "input": f"{arm}_mid",
+                "on_success": f"{arm}_scored",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}, "operations": []},
+            },
+        )
+    return PipelineProposal.create(
+        pipeline=pipeline,
+        base=PresentBase(state_id=CHECKPOINT_ID, composition_content_hash="a" * 64),
+        reviewed_facts=guided_private_reviewed_facts(guided),
+        surface=PlannerSurface.GUIDED_STAGED,
+        repair_count=0,
+        skill_hash=stable_hash("guided planner skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+
+
+def test_fork_row_union_projection_accepts_multi_transform_branch_arms() -> None:
+    guided = _ab_coalesce_guided()
+    proposal = _multi_stage_row_union_proposal(guided)
+    catalog = {
+        "source": frozenset({"csv"}),
+        "transform": frozenset({"value_transform", "batch_experiment_compare"}),
+        "sink": frozenset({"json"}),
+    }
+    assert not guided_candidate_state(proposal).validate().errors
+
+    payload = build_guided_proposal_projection(
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+
+    verify_guided_proposal_projection(
+        payload=payload,
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+    row_union = next(node for node in payload["nodes"] if node["node_type"] == "row_union")
+    assert row_union["behavior"]["branch_aliases"] == ["branch-1", "branch-2"]
+    incoming = [edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == row_union["stable_id"]]
+    assert [edge["flow"]["branch"] for edge in incoming] == ["branch-1", "branch-2"]
+    # The arms' second stages are the producers, and their inbound hop is untagged.
+    second_stage_ids = {edge["from_endpoint"]["stable_id"] for edge in incoming}
+    interior = [
+        edge
+        for edge in payload["graph"]["edges"]
+        if edge["to_endpoint"].get("stable_id") in second_stage_ids and edge["flow"]["kind"] == "node_success"
+    ]
+    assert len(interior) == 2
+    assert all(edge["flow"]["branch"] is None for edge in interior)
 
 
 def _ab_coalesce_proposal_ordered(
