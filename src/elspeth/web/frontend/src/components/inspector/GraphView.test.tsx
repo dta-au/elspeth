@@ -9,8 +9,10 @@ import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
 // Mock @xyflow/react — jsdom cannot do DOM measurements required by React Flow.
-// Render nodes and edges as simple divs so we can assert on their presence.
+// Render ordinary elements directly and invoke custom node/edge renderers with
+// deterministic coordinates so geometry and handle placement stay testable.
 vi.mock("@xyflow/react", () => ({
+  MarkerType: { ArrowClosed: "arrowclosed" },
   // Provider shares the flow store so Controls/MiniMap can render OUTSIDE
   // <ReactFlow> (they are siblings of the role="img" diagram scope —
   // elspeth-37f6f13132). The mock just passes children through.
@@ -20,6 +22,8 @@ vi.mock("@xyflow/react", () => ({
   ReactFlow: ({
     nodes,
     edges,
+    edgeTypes,
+    nodeTypes,
     children,
     colorMode,
     fitView,
@@ -38,29 +42,88 @@ vi.mock("@xyflow/react", () => ({
       data-has-on-init={String(typeof onInit === "function")}
       data-fit-view-options={fitViewOptions ? JSON.stringify(fitViewOptions) : ""}
     >
-      {nodes?.map((n: any) => (
-        <div
-          key={n.id}
-          data-testid={`node-${n.id}`}
-          style={n.style}
-          onClick={(event) => onNodeClick?.(event, n)}
-        >
-          {typeof n.data?.label === "string" ? n.data.label : n.data?.label}
-        </div>
-      ))}
-      {edges?.map((e: any) => (
-        <div
-          key={e.id}
-          data-testid={`edge-${e.id}`}
-          data-edge-source={e.source}
-          data-edge-target={e.target}
-        >
-          {e.label}
-        </div>
-      ))}
+      {nodes?.map((n: any) => {
+        const NodeRenderer = nodeTypes?.[n.type];
+        return (
+          <div
+            key={n.id}
+            data-testid={`node-${n.id}`}
+            style={n.style}
+            onClick={(event) => onNodeClick?.(event, n)}
+          >
+            {NodeRenderer
+              ? <NodeRenderer id={n.id} data={n.data} />
+              : typeof n.data?.label === "string"
+                ? n.data.label
+                : n.data?.label}
+          </div>
+        );
+      })}
+      {edges?.map((e: any) => {
+        const EdgeRenderer = edgeTypes?.[e.type];
+        if (EdgeRenderer) {
+          return (
+            <svg
+              key={e.id}
+              data-testid={`edge-${e.id}`}
+              data-edge-source={e.source}
+              data-edge-target={e.target}
+              data-source-handle={e.sourceHandle}
+              data-target-handle={e.targetHandle}
+            >
+              <EdgeRenderer
+                {...e}
+                sourceX={100 + (e.data?.laneOffset ?? 0)}
+                sourceY={80}
+                targetX={100 + (e.data?.laneOffset ?? 0)}
+                targetY={260}
+                sourcePosition="bottom"
+                targetPosition="top"
+                markerEnd={`url(#marker-${e.id})`}
+              />
+            </svg>
+          );
+        }
+        return (
+          <div
+            key={e.id}
+            data-testid={`edge-${e.id}`}
+            data-edge-source={e.source}
+            data-edge-target={e.target}
+          >
+            {e.label}
+          </div>
+        );
+      })}
       {children}
     </div>
   ),
+  BaseEdge: ({
+    id,
+    path,
+    label,
+    labelX,
+    labelY,
+    markerEnd,
+  }: any) => (
+    <g>
+      <path
+        data-edge-path-id={id}
+        d={path}
+        markerEnd={markerEnd}
+      />
+      <text x={labelX} y={labelY}>{label}</text>
+    </g>
+  ),
+  Handle: ({ id, type, position, style }: any) => (
+    <span
+      data-handle-id={id}
+      data-handle-type={type}
+      data-handle-position={position}
+      style={style}
+    />
+  ),
+  Position: { Top: "top", Bottom: "bottom" },
   Background: ({ color, gap, size }: any) => (
     <div
       data-testid="react-flow-background"
@@ -934,6 +997,87 @@ describe("GraphView", () => {
         "control",
         "treatment",
       ]);
+    });
+
+    it("routes parallel identity-fork aliases through distinct visible edge geometry", () => {
+      const state = rowUnionState();
+      state.nodes = state.nodes.filter(
+        (node) => !["control_score", "treatment_score"].includes(node.id),
+      );
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.input = "control_raw";
+      union!.branches = {
+        control: "control_raw",
+        treatment: "treatment_raw",
+      };
+      useSessionStore.setState({ compositionState: state });
+
+      const { container } = render(<GraphView />);
+
+      const paths = Array.from(
+        container.querySelectorAll(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"] path[data-edge-path-id]',
+        ),
+      );
+      expect(paths).toHaveLength(2);
+      expect(paths[0]?.getAttribute("d")).not.toBe(paths[1]?.getAttribute("d"));
+
+      const visualEdges = Array.from(
+        container.querySelectorAll(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+        ),
+      );
+      const sourceHandleIds = visualEdges.map(
+        (edge) => edge.getAttribute("data-source-handle"),
+      );
+      const targetHandleIds = visualEdges.map(
+        (edge) => edge.getAttribute("data-target-handle"),
+      );
+      expect(new Set(sourceHandleIds).size).toBe(2);
+      expect(new Set(targetHandleIds).size).toBe(2);
+      const sourceHandleOffsets: string[] = [];
+      for (const handleId of sourceHandleIds) {
+        const handle = screen.getByTestId("node-experiment_gate").querySelector(
+          `[data-handle-type="source"][data-handle-id="${handleId}"]`,
+        );
+        expect(handle).not.toBeNull();
+        sourceHandleOffsets.push((handle as HTMLElement).style.left);
+      }
+      const targetHandleOffsets: string[] = [];
+      for (const handleId of targetHandleIds) {
+        const handle = screen.getByTestId("node-variant_union").querySelector(
+          `[data-handle-type="target"][data-handle-id="${handleId}"]`,
+        );
+        expect(handle).not.toBeNull();
+        targetHandleOffsets.push((handle as HTMLElement).style.left);
+      }
+      expect(new Set(sourceHandleOffsets).size).toBe(2);
+      expect(new Set(targetHandleOffsets).size).toBe(2);
+      for (const offset of [...sourceHandleOffsets, ...targetHandleOffsets]) {
+        expect(Number.parseFloat(offset)).toBeGreaterThan(0);
+        expect(Number.parseFloat(offset)).toBeLessThan(100);
+      }
+
+      const pathEndpoints = paths.map((path) => {
+        const coordinates = path.getAttribute("d")?.match(
+          /M ([\d.-]+) ([\d.-]+).* ([\d.-]+) ([\d.-]+)$/,
+        );
+        expect(coordinates).not.toBeNull();
+        return coordinates?.slice(1);
+      });
+      expect(new Set(pathEndpoints.map((point) => point?.join(","))).size).toBe(2);
+      expect(paths.every((path) => path.getAttribute("marker-end"))).toBe(true);
+
+      const connectionList = screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      });
+      expect(within(connectionList).getByText(
+        "experiment_gate to variant_union: control",
+      )).toBeInTheDocument();
+      expect(within(connectionList).getByText(
+        "experiment_gate to variant_union: treatment",
+      )).toBeInTheDocument();
     });
 
     it.each([

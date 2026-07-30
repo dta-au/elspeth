@@ -12,12 +12,20 @@
 // Empty state when no nodes.
 // ============================================================================
 
-import { useMemo, useCallback, useEffect, useRef } from "react";
+import { useMemo, useCallback, useEffect, useRef, type ReactNode } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
+  BaseEdge,
+  Handle,
+  MarkerType,
+  Position,
   type Node,
   type Edge,
+  type EdgeProps,
+  type EdgeTypes,
+  type NodeProps,
+  type NodeTypes,
   type NodeMouseHandler,
   type OnInit,
   Background,
@@ -45,6 +53,10 @@ const MINIMAP_NODE_STROKE_COLOR_VAR = "--color-border-strong";
 // Interim UX threshold: avoid MiniMap noise on small graphs until we can
 // promote this to a viewport-overflow heuristic or an explicit user toggle.
 const MINIMAP_NODE_COUNT_THRESHOLD = 8;
+const PIPELINE_NODE_TYPE = "pipeline-component";
+const PARALLEL_EDGE_TYPE = "parallel-lane";
+const PARALLEL_EDGE_LANE_GAP = 22;
+const PARALLEL_HANDLE_INSET = 16;
 
 const EDGE_LABEL_MAP: Record<string, string> = {
   on_success: "success",
@@ -68,6 +80,241 @@ function inferredEdgeId(kind: string, ...parts: string[]): string {
     ? parts.map((part) => `${part.length}:${part}`).join("|")
     : parts.join("-");
   return `inferred-${kind}-${payload}`;
+}
+
+interface ParallelLaneEdgeData extends Record<string, unknown> {
+  laneOffset: number;
+}
+
+interface ParallelHandle {
+  id: string;
+  offsetPercent: number;
+}
+
+interface PipelineGraphNodeData extends Record<string, unknown> {
+  label: ReactNode;
+  parallelSourceHandles?: ParallelHandle[];
+  parallelTargetHandles?: ParallelHandle[];
+}
+
+type PipelineGraphNodeModel = Node<
+  PipelineGraphNodeData,
+  typeof PIPELINE_NODE_TYPE
+>;
+
+type ParallelLaneEdgeModel = Edge<
+  ParallelLaneEdgeData,
+  typeof PARALLEL_EDGE_TYPE
+>;
+
+function parallelLanePath(
+  sourceX: number,
+  sourceY: number,
+  targetX: number,
+  targetY: number,
+  laneOffset: number,
+): { path: string; labelX: number; labelY: number } {
+  const horizontal = Math.abs(targetX - sourceX) > Math.abs(targetY - sourceY);
+  if (horizontal) {
+    const bend = Math.max(40, Math.abs(targetX - sourceX) * 0.4);
+    const direction = targetX >= sourceX ? 1 : -1;
+    return {
+      path:
+        `M ${sourceX} ${sourceY} `
+        + `C ${sourceX + direction * bend} ${sourceY + laneOffset}, `
+        + `${targetX - direction * bend} ${targetY + laneOffset}, `
+        + `${targetX} ${targetY}`,
+      labelX: (sourceX + targetX) / 2,
+      labelY: (sourceY + targetY) / 2 + laneOffset,
+    };
+  }
+
+  const bend = Math.max(40, Math.abs(targetY - sourceY) * 0.4);
+  const direction = targetY >= sourceY ? 1 : -1;
+  return {
+    path:
+      `M ${sourceX} ${sourceY} `
+      + `C ${sourceX + laneOffset} ${sourceY + direction * bend}, `
+      + `${targetX + laneOffset} ${targetY - direction * bend}, `
+      + `${targetX} ${targetY}`,
+    labelX: (sourceX + targetX) / 2 + laneOffset,
+    labelY: (sourceY + targetY) / 2,
+  };
+}
+
+function PipelineGraphNode({
+  data,
+}: NodeProps<PipelineGraphNodeModel>): JSX.Element {
+  return (
+    <>
+      <Handle
+        type="target"
+        position={Position.Top}
+        isConnectable={false}
+        style={{ opacity: 0, pointerEvents: "none" }}
+      />
+      {data.parallelTargetHandles?.map((handle) => (
+        <Handle
+          key={handle.id}
+          id={handle.id}
+          type="target"
+          position={Position.Top}
+          isConnectable={false}
+          style={{
+            left: `${handle.offsetPercent}%`,
+            opacity: 0,
+            pointerEvents: "none",
+          }}
+        />
+      ))}
+      {data.label}
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        isConnectable={false}
+        style={{ opacity: 0, pointerEvents: "none" }}
+      />
+      {data.parallelSourceHandles?.map((handle) => (
+        <Handle
+          key={handle.id}
+          id={handle.id}
+          type="source"
+          position={Position.Bottom}
+          isConnectable={false}
+          style={{
+            left: `${handle.offsetPercent}%`,
+            opacity: 0,
+            pointerEvents: "none",
+          }}
+        />
+      ))}
+    </>
+  );
+}
+
+function ParallelLaneEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  data,
+  label,
+  labelStyle,
+  markerEnd,
+  style,
+}: EdgeProps<ParallelLaneEdgeModel>): JSX.Element {
+  const { path, labelX, labelY } = parallelLanePath(
+    sourceX,
+    sourceY,
+    targetX,
+    targetY,
+    data?.laneOffset ?? 0,
+  );
+  return (
+    <BaseEdge
+      id={id}
+      path={path}
+      label={label}
+      labelX={labelX}
+      labelY={labelY}
+      labelStyle={labelStyle}
+      markerEnd={markerEnd}
+      style={style}
+    />
+  );
+}
+
+const EDGE_TYPES: EdgeTypes = {
+  [PARALLEL_EDGE_TYPE]: ParallelLaneEdge,
+};
+
+const NODE_TYPES: NodeTypes = {
+  [PIPELINE_NODE_TYPE]: PipelineGraphNode,
+};
+
+function assignParallelEdgeLanes(
+  nodes: PipelineGraphNodeModel[],
+  edges: Edge[],
+): { nodes: PipelineGraphNodeModel[]; edges: Edge[] } {
+  const indexesByEndpoints = new Map<string, number[]>();
+  for (const [index, edge] of edges.entries()) {
+    const key =
+      `${edge.source.length}:${edge.source}|${edge.target.length}:${edge.target}`;
+    const indexes = indexesByEndpoints.get(key) ?? [];
+    indexes.push(index);
+    indexesByEndpoints.set(key, indexes);
+  }
+
+  const laneOffsetByIndex = new Map<number, number>();
+  const sourceHandlesByNode = new Map<string, ParallelHandle[]>();
+  const targetHandlesByNode = new Map<string, ParallelHandle[]>();
+  for (const indexes of indexesByEndpoints.values()) {
+    if (indexes.length < 2) continue;
+    const sortedIndexes = [...indexes].sort((left, right) =>
+      edges[left]!.id.localeCompare(edges[right]!.id),
+    );
+    const laneGap = Math.min(
+      PARALLEL_EDGE_LANE_GAP,
+      (NODE_WIDTH - PARALLEL_HANDLE_INSET * 2) / (sortedIndexes.length - 1),
+    );
+    sortedIndexes.forEach((edgeIndex, laneIndex) => {
+      const edge = edges[edgeIndex]!;
+      const laneOffset =
+        (laneIndex - (sortedIndexes.length - 1) / 2) * laneGap;
+      laneOffsetByIndex.set(edgeIndex, laneOffset);
+      const offsetPercent = 50 + (laneOffset / NODE_WIDTH) * 100;
+      const sourceHandle = {
+        id: `parallel-source-${edge.id}`,
+        offsetPercent,
+      };
+      const targetHandle = {
+        id: `parallel-target-${edge.id}`,
+        offsetPercent,
+      };
+      sourceHandlesByNode.set(edge.source, [
+        ...(sourceHandlesByNode.get(edge.source) ?? []),
+        sourceHandle,
+      ]);
+      targetHandlesByNode.set(edge.target, [
+        ...(targetHandlesByNode.get(edge.target) ?? []),
+        targetHandle,
+      ]);
+    });
+  }
+
+  const parallelEdges = edges.map((edge, index) => {
+    const laneOffset = laneOffsetByIndex.get(index);
+    if (laneOffset === undefined) return edge;
+    return {
+      ...edge,
+      type: PARALLEL_EDGE_TYPE,
+      sourceHandle: `parallel-source-${edge.id}`,
+      targetHandle: `parallel-target-${edge.id}`,
+      data: {
+        ...edge.data,
+        laneOffset,
+      },
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color:
+          typeof edge.style?.stroke === "string"
+            ? edge.style.stroke
+            : undefined,
+        width: 12,
+        height: 12,
+      },
+    };
+  });
+  const nodesWithHandles = nodes.map((node) => ({
+    ...node,
+    data: {
+      ...node.data,
+      parallelSourceHandles: sourceHandlesByNode.get(node.id),
+      parallelTargetHandles: targetHandlesByNode.get(node.id),
+    },
+  }));
+  return { nodes: nodesWithHandles, edges: parallelEdges };
 }
 
 type MiniMapNodeKind = keyof typeof BADGE_COLORS;
@@ -536,7 +783,7 @@ export function GraphView() {
       validationStatus?: ValidationStatus,
       validationTooltip?: string,
       isSelected?: boolean,
-    ): Node {
+    ): PipelineGraphNodeModel {
       const validationMarker = validationStatus
         ? VALIDATION_STATUS_MARKERS[validationStatus]
         : null;
@@ -553,6 +800,7 @@ export function GraphView() {
 
       return {
         id,
+        type: PIPELINE_NODE_TYPE,
         data: {
           label: (
             <div
@@ -615,7 +863,7 @@ export function GraphView() {
       };
     }
 
-    const rfNodes: Node[] = [];
+    const rfNodes: PipelineGraphNodeModel[] = [];
 
     // Source nodes (synthetic — source names are producer roots in edges)
     for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
@@ -1030,7 +1278,8 @@ export function GraphView() {
       }
     }
 
-    return layoutGraph(rfNodes, rfEdges);
+    const parallelGeometry = assignParallelEdgeLanes(rfNodes, rfEdges);
+    return layoutGraph(parallelGeometry.nodes, parallelGeometry.edges);
   }, [compositionState, nodeValidationMap, nodeMessageMap, selectedNodeId]);
 
   // Accessible, keyboard-operable equivalent of the visual DAG. The React Flow
@@ -1183,6 +1432,8 @@ export function GraphView() {
             <ReactFlow
               nodes={nodes}
               edges={edges}
+              edgeTypes={EDGE_TYPES}
+              nodeTypes={NODE_TYPES}
               nodesDraggable={false}
               nodesConnectable={false}
               // Visual nodes are display-only; keyboard node selection is
