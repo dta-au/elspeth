@@ -385,9 +385,10 @@ async def test_source_wrapper_classifies_empty_content_as_model_defect_not_unava
     ``content`` and the parser rejects it. That is a MODEL-output defect: the
     provider answered. The wrapper must classify it as
     ``GuidedToolArgumentShapeError`` / ``INVARIANT_VIOLATED`` and must NOT fold
-    it into the transient "unavailable" set. Asserts the classification as it
-    stands today; the wire-level ``synthetic_failure_reason`` vocabulary is a
-    separate change.
+    it into the transient "unavailable" set. The wire-level
+    ``synthetic_failure_reason`` for this error class is ``model_defect``
+    (pinned route-level in test_step_chat.py's
+    ``test_model_shape_defect_turn_persists_model_defect_reason``).
     """
     empty_content_args = {
         "resolution": "source",

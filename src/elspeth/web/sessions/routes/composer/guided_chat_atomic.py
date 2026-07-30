@@ -1296,9 +1296,22 @@ async def post_guided_chat_schema8(
                                 "DeferredIntentUnknown",
                                 "DeferredIntentBindingMismatch",
                                 "DeferredIntentAmbiguous",
+                                # The model's sink config failed plugin
+                                # validation and was deliberately not staged —
+                                # a rejected application, not provider weather
+                                # (inv-f1 incidental 2).
+                                "SinkPrefillConfigRejected",
                             }
                             else "quality_guard"
                             if chat_result.error_class == "AssistantScaffoldLeakError"
+                            # The provider ANSWERED; the reply violated the
+                            # tool's argument contract. Calling that
+                            # "unavailable" mislabels a model-output defect as
+                            # provider weather and contradicts the turn's own
+                            # copy ("Press Retry to have me redo this step") —
+                            # inv-f1 D4.
+                            else "model_defect"
+                            if chat_result.error_class == "GuidedToolArgumentShapeError"
                             else "unavailable"
                         ),
                     )

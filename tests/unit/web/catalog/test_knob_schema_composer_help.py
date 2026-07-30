@@ -150,17 +150,16 @@ def test_schema_help_placeholder_is_accepted_by_the_parser() -> None:
     assert [(field.name, field.required) for field in parsed.fields] == [("doc_id", True), ("note", False)]
 
 
-def test_schema_placeholder_is_not_yet_attached_to_the_schema_knob() -> None:
-    """Guard the deliberate hold on F5-5b (see the batch-3 handoff).
+def test_schema_placeholder_is_attached_to_the_schema_knob() -> None:
+    """F5-5b landed atomically: the schema knob now carries the placeholder.
 
-    ``placeholder`` is outside the closed knob-field vocabularies in
-    ``web/composer/guided/protocol.py`` and the frontend guided decoder, so
-    emitting it on ``schema`` — a field on 46 of 47 data plugins — would reject
-    every guided schema_form turn. The constant is ready; attaching it must land
-    atomically with those two vocabulary widenings. Delete this test in the same
-    change.
+    ``placeholder`` is inside the closed knob-field vocabularies in
+    ``web/composer/guided/protocol.py`` (``_validate_knob_schema``) and the
+    frontend guided decoder, so emitting it on ``schema`` — a field on 46 of 47
+    data plugins — is safe for every guided schema_form turn (construction,
+    durable load, and replay).
     """
     extra = DataPluginConfig.model_fields["schema_config"].json_schema_extra
     assert isinstance(extra, dict)
-    assert "composer_placeholder" not in extra
-    assert "placeholder" not in _lower(DataPluginConfig)["schema"]
+    assert extra["composer_placeholder"] == COMPOSER_SCHEMA_PLACEHOLDER
+    assert _lower(DataPluginConfig)["schema"]["placeholder"] == COMPOSER_SCHEMA_PLACEHOLDER

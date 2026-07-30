@@ -1651,6 +1651,49 @@ class TestChatHistoryDiscriminatorPersistence:
         assert chat_history[1]["assistant_message_kind"] == "synthetic_failure"
         assert chat_history[1]["synthetic_failure_reason"] == "quality_guard"
 
+    def test_model_shape_defect_turn_persists_model_defect_reason(self, composer_test_client: TestClient) -> None:
+        """inv-f1 D4: a model reply that violates resolve_source's argument
+        contract is a MODEL-output defect — the provider answered. The wire
+        reason must say so (``model_defect``), never fold it into the
+        transient ``unavailable`` set: the turn's own copy invites Retry
+        ("Press Retry to have me redo this step") and the frontend keeps the
+        Retry affordance live for this reason.
+        """
+        session_id = _create_session(composer_test_client)
+        _seed_guided_session(composer_test_client, session_id)
+
+        empty_content_reply = _fake_source_resolution_tool_call(
+            {
+                "resolution": "source",
+                "plugin": "csv",
+                "filename": "inventory.csv",
+                "mime_type": "text/csv",
+                "content": "",
+                "options": {"schema": {"mode": "observed"}},
+                "observed_columns": ["sku"],
+                "sample_rows": [],
+                "assistant_message": "Bound the uploaded file.",
+            }
+        )
+        with patch(
+            _CHAT_SOLVER_ACOMPLETION,
+            new=_ReturningLiteLLMCompletion(empty_content_reply),
+        ):
+            status, body = _post_chat(
+                composer_test_client,
+                session_id,
+                message="Create a CSV source from my inventory data.",
+            )
+
+        assert status == 200, body
+        assert body["assistant_message_kind"] == "synthetic_failure"
+
+        get_resp = composer_test_client.get(f"/api/sessions/{session_id}/guided")
+        assert get_resp.status_code == 200, get_resp.json()
+        chat_history = get_resp.json()["guided_session"]["chat_history"]
+        assert chat_history[-1]["assistant_message_kind"] == "synthetic_failure"
+        assert chat_history[-1]["synthetic_failure_reason"] == "model_defect"
+
     def test_real_reply_turn_persists_kind_across_get(self, composer_test_client: TestClient) -> None:
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)

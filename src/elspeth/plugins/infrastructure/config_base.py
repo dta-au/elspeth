@@ -377,7 +377,10 @@ class DataPluginConfig(PluginConfig):
             "Use 'schema: {mode: observed}' to infer types from data, or "
             "provide explicit field definitions with mode (fixed/flexible)."
         ),
-        json_schema_extra={"composer_description": COMPOSER_SCHEMA_DESCRIPTION},
+        json_schema_extra={
+            "composer_description": COMPOSER_SCHEMA_DESCRIPTION,
+            "composer_placeholder": COMPOSER_SCHEMA_PLACEHOLDER,
+        },
     )
 
 

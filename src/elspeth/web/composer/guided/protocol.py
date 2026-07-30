@@ -478,8 +478,11 @@ class ChatTurn:
     persisted discriminator. User turns require both fields to be ``None``.
     Assistant turns require a kind; real replies require a ``None`` reason,
     while synthetic failures require one closed reason: quality rejection,
-    provider unavailability, or a safe response that was deliberately not
-    applied. There is no nested compatibility reader for omitted fields.
+    provider unavailability, a safe response that was deliberately not
+    applied, or a model-output defect (the provider answered but the reply
+    violated a tool's argument contract — retrying the same message is the
+    designed remedy, unlike the deterministic ``not_applied`` causes).
+    There is no nested compatibility reader for omitted fields.
     """
 
     role: ChatRole
@@ -488,7 +491,7 @@ class ChatTurn:
     step: GuidedStep
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None = None
-    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied"] | None = None
+    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None = None
 
     def __post_init__(self) -> None:
         if type(self.role) is not ChatRole:
@@ -505,9 +508,10 @@ class ChatTurn:
             "quality_guard",
             "unavailable",
             "not_applied",
+            "model_defect",
         ):
             raise ValueError(
-                "synthetic_failure_reason must be 'quality_guard', 'unavailable', 'not_applied', or None; "
+                "synthetic_failure_reason must be 'quality_guard', 'unavailable', 'not_applied', 'model_defect', or None; "
                 f"got {self.synthetic_failure_reason!r}"
             )
         if self.synthetic_failure_reason is not None and self.assistant_message_kind != "synthetic_failure":
@@ -1000,7 +1004,7 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
     seen_names: set[str] = set()
     visibility_gated: set[str] = set()
     required = frozenset({"name", "label", "kind", "required", "nullable"})
-    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when"})
+    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder"})
     for index, item in enumerate(fields):
         field_path = f"{path}.fields[{index}]"
         if not isinstance(item, Mapping):
@@ -1023,6 +1027,8 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
         if type(item["required"]) is not bool or type(item["nullable"]) is not bool:
             return f"{field_path}.required and nullable must be bools"
         if "description" in item and (error := _current_text_error(item["description"], f"{field_path}.description")) is not None:
+            return error
+        if "placeholder" in item and (error := _current_text_error(item["placeholder"], f"{field_path}.placeholder")) is not None:
             return error
         if "tier" in item and (type(item["tier"]) is not str or item["tier"] not in _FIELD_TIERS):
             return f"{field_path}.tier is outside the closed tier vocabulary"

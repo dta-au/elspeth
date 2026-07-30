@@ -961,6 +961,13 @@ export interface ApiError {
   status: number;
   detail: string;
   error_type?: string;
+  /** Server correlation id (RequestIdMiddleware). Present on fail-closed
+   *  audit-integrity 500s so the banner can name a support reference. */
+  request_id?: string;
+  /** Closed guided-operation failure code (guided_operation_terminal_failure
+   *  envelopes). "policy_blocked" is permanent by construction — retry
+   *  affordances must not invite a retry for it. */
+  failure_code?: string;
   component_id?: string;
   plugin_id?: string;
   partial_state?: CompositionState | null;

@@ -1355,6 +1355,11 @@ def test_invalid_sink_prefill_never_reaches_operator_logs(
     assert "plugin" not in rejection
     assert "error_detail" not in rejection
     assert canary not in repr(logs)
+    # inv-f1 D4 / incidental 2: the rejected prefill was deliberately NOT
+    # applied — the wire reason must say so, not blame provider availability.
+    body = response.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
 
 
 def test_inline_source_defers_to_existing_ready_uploaded_blob(
