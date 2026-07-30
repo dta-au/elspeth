@@ -1184,8 +1184,8 @@ stream.
   connection. So no transform, including a control, can be interposed on an
   error path.
 - Any sink target on that path fails the coverage check with
-  `output_not_post_dominated`, because the row reaches a sink without passing
-  the control.
+  `output_error_route_not_post_dominated`, because the row reaches a sink
+  without passing the control.
 
 `discard` is therefore the only conforming value, and it is what the check
 accepts:

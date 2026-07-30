@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json  # noqa: F401  # Preserve signed module statement positions.
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.validation import get_sink_config_model, get_source_config_model
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -24,6 +25,7 @@ from elspeth.web.composer.guided.stage_transitions import (
     PluginSelectionResponse,
     SchemaFormAuthority,
     SchemaFormResponse,
+    WebSurfacePolicyRejectedError,
     add_component_intent,
     begin_component_edit,
     finish_component_review,
@@ -98,7 +100,6 @@ from .._helpers import (
     BlobServiceProtocol,
     BufferingRecorder,
     ChatTurnResponse,
-    ComposerChatTurnStatus,
     CompositionState,
     CompositionStateData,
     CompositionStateRecord,
@@ -174,6 +175,11 @@ if TYPE_CHECKING:
 
 _COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY = "guided_completed_terminal_before_user_exit"
 _MISSING_COMPLETED_TERMINAL_MARKER = object()
+# Bound on the scrubbed ``str(exc)`` logged when a guided /respond body is
+# rejected by the turn contract. Log-only — the closed 400 detail is
+# unchanged. Scrub first, then truncate: truncation is a bound, never a
+# redaction mechanism (mirrors execution.service's operator diagnostic).
+_CONTRACT_REJECTION_EXC_MESSAGE_CHARS = 500
 
 
 def _resolve_shield_available(snapshot: PluginAvailabilitySnapshot) -> bool:
@@ -183,35 +189,6 @@ def _resolve_shield_available(snapshot: PluginAvailabilitySnapshot) -> bool:
     selection is the fail-safe State C result.
     """
     return dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD) is not None
-
-
-def _guided_chat_wire_kind(status: ComposerChatTurnStatus) -> Literal["assistant", "synthetic_failure"]:
-    """Map a ``StepChatResult``'s status to the wire discriminator (fp-review C-2)."""
-    return "assistant" if status is ComposerChatTurnStatus.SUCCESS else "synthetic_failure"
-
-
-def _chat_turn_synthetic_failure_reason(
-    status: ComposerChatTurnStatus,
-    error_class: str | None,
-) -> Literal["quality_guard", "unavailable"] | None:
-    """Classify a persisted ``ChatTurn``'s synthetic-failure cause (fp-review C-2).
-
-    ``None`` on success. Otherwise ``"quality_guard"`` when a scaffold-leak
-    guard rejected the reply, or ``"unavailable"`` for transient provider /
-    solver failures. STEP_1/STEP_2 commit-seam rejection branches
-    (``error_class="StepHandlerRejected"``) deliberately return ``None``:
-    they are neither quality-guard nor availability events, and the audit row
-    carries the redaction-safe classifier. ``error_class`` is compared by the
-    literal class name string (``_guided_step_chat.py`` sets it via
-    ``type(exc).__name__``); ``"AssistantScaffoldLeakError"`` is the ONLY
-    class the dedicated scaffold-leak branches ever record. Persisted-only:
-    the live ``GuidedChatResponse`` deliberately carries kind alone.
-    """
-    if status is ComposerChatTurnStatus.SUCCESS:
-        return None
-    if error_class == "StepHandlerRejected":
-        return None
-    return "quality_guard" if error_class == "AssistantScaffoldLeakError" else "unavailable"
 
 
 def _turn_payload_response(
@@ -2707,16 +2684,39 @@ async def post_guided_respond(
             # a silent 400 here wedged the first-run tutorial undiagnosably
             # (elspeth-a88c07cd47: server-held prefill failed its own plugin
             # config model on every echo).
+            #
+            # The generic branch logs the CLASS only: generic contract
+            # messages echo raw client-supplied values (pinned by
+            # test_unsupported_guided_selection_never_reaches_operator_logs),
+            # and the audit scrubber redacts secret-shaped text, not
+            # arbitrary client text. A deployment-policy refusal is the
+            # exception: its message is server-composed end to end, so that
+            # branch logs the policy explanation under its own closed
+            # rejection code — without it the operator sees only
+            # "invalid_guided_response ValueError" and never learns that
+            # policy, not the author, refused the selection.
             with contextlib.suppress(Exception):
-                slog.warning(
-                    "guided.respond_turn_contract_rejected",
-                    session_id=str(session_id),
-                    user_id=user.user_id,
-                    step=observed_guided.step.value,
-                    turn_type=current_turn["type"],
-                    rejection_code="invalid_guided_response",
-                    exc_class=type(exc).__name__,
-                )
+                if isinstance(exc, WebSurfacePolicyRejectedError):
+                    slog.warning(
+                        "guided.respond_turn_contract_rejected",
+                        session_id=str(session_id),
+                        user_id=user.user_id,
+                        step=observed_guided.step.value,
+                        turn_type=current_turn["type"],
+                        rejection_code=WebSurfacePolicyRejectedError.rejection_code,
+                        exc_class=type(exc).__name__,
+                        exc_message=scrub_text_for_audit(str(exc))[:_CONTRACT_REJECTION_EXC_MESSAGE_CHARS],
+                    )
+                else:
+                    slog.warning(
+                        "guided.respond_turn_contract_rejected",
+                        session_id=str(session_id),
+                        user_id=user.user_id,
+                        step=observed_guided.step.value,
+                        turn_type=current_turn["type"],
+                        rejection_code="invalid_guided_response",
+                        exc_class=type(exc).__name__,
+                    )
             raise HTTPException(
                 status_code=400,
                 detail="Guided response does not satisfy the current turn contract.",
@@ -4372,11 +4372,15 @@ async def post_guided_respond(
                         # clears proposal custody: surface the exact pending
                         # authority so the settlement verifies the clear and
                         # terminalizes the now-unreferenced proposal row
-                        # atomically instead of stranding it pending.
+                        # atomically instead of stranding it pending. The
+                        # rejection reason is "guided_exit", not "superseded":
+                        # nothing displaced this proposal — the author left
+                        # guided mode.
                         invalidated_pending_proposal = GuidedPendingProposalInvalidation(
                             proposal_id=guided.active_proposal.proposal_id,
                             draft_hash=guided.active_proposal.draft_hash,
                             reviewed_facts=guided_private_reviewed_facts(guided),
+                            reason="guided_exit",
                         )
                     existing_meta["guided_session"] = settlement_guided.to_dict()
                     state_dict = new_state.to_dict()

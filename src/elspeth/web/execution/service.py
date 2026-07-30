@@ -293,11 +293,42 @@ def _scrubbed_exception_message(exc: BaseException) -> str:
     message carrying a token becomes the redaction marker rather than a
     truncated token. Truncation is applied after scrubbing — it is a bound,
     never a redaction mechanism.
+
+    Operator-diagnostic callers must go through :func:`_operator_exc_message`
+    instead: scrubbing alone does NOT make a ``pydantic.ValidationError``
+    safe, because its ``str()`` interleaves raw ``input_value=...`` fragments
+    that only *sometimes* match a candidate-secret pattern.
     """
-    scrubbed = scrub_text_for_audit(str(exc)).strip()
+    return _bounded_scrubbed_text(str(exc))
+
+
+def _bounded_scrubbed_text(text: str) -> str:
+    scrubbed = scrub_text_for_audit(text).strip()
     if len(scrubbed) > _MAX_OPERATOR_EXC_MESSAGE_CHARS:
         return scrubbed[: _MAX_OPERATOR_EXC_MESSAGE_CHARS - 1].rstrip() + "…"
     return scrubbed
+
+
+def _operator_exc_message(exc: BaseException) -> str:
+    """Return the exception-message component of the operator diagnostic.
+
+    ``pydantic.ValidationError`` is special-cased: its ``str()`` embeds an
+    ``input_value=...`` fragment for every error — the raw config/row payload
+    the audit trail keeps out of ``runs.error`` — and ``scrub_text_for_audit``
+    only replaces candidate-secret *patterns*, so an arbitrary payload sails
+    through the scrubber intact. The field-name diagnostics from
+    :func:`_schema_contract_violation_errors` (dotted ``loc`` plus the
+    pydantic error ``type``, never the input) carry the actionable part with
+    no input echo. ``isinstance`` — not the exact-type check the
+    schema-contract slog uses for its closed taxonomy — so a ValidationError
+    subclass cannot reintroduce the leak. Every other exception keeps the
+    scrubbed, bounded ``str(exc)``.
+    """
+    if isinstance(exc, PydanticValidationError):
+        violations = "; ".join(f"{error['loc']} ({error['type']})" for error in _schema_contract_violation_errors(exc))
+        rendered = f"{exc.error_count()} schema contract violation(s)" + (f": {violations}" if violations else "")
+        return _bounded_scrubbed_text(rendered)
+    return _scrubbed_exception_message(exc)
 
 
 def _operator_failure_diagnostic(
@@ -327,7 +358,17 @@ def _operator_failure_diagnostic(
     LLM boundary rather than starving the operator UI).
 
     Every component is bounded and secret-scrubbed by its producer, and none
-    of them echoes a row payload. The live SSE ``detail`` stays sanitized.
+    of them echoes a row payload — including ``exc_message``, which callers
+    obtain from :func:`_operator_exc_message` so that a
+    ``pydantic.ValidationError``'s ``input_value=...`` fragments are replaced
+    by field-name diagnostics before the text reaches this column. The live
+    SSE ``detail`` stays sanitized.
+
+    The node line is hedged ("Most recent recorded node failure"), not
+    asserted as THE failing node: ``_lookup_failed_node_id`` returns the
+    newest FAILED ``node_states`` row for the run, which is the fault site in
+    the common single-failure case but is an attribution heuristic when
+    several nodes failed before the run unwound.
     """
     lines = [f"Pipeline execution failed ({class_chain[0]})"]
     if len(class_chain) > 1:
@@ -335,9 +376,9 @@ def _operator_failure_diagnostic(
     if exc_message:
         lines.append(f"Message: {exc_message}")
     if node_id is not None:
-        lines.append(f"Failing node: {node_id}")
+        lines.append(f"Most recent recorded node failure: {node_id}")
     else:
-        lines.append("Failing node: not recorded (failure occurred before any node reached a FAILED state)")
+        lines.append("Most recent recorded node failure: none recorded (failure occurred before any node reached a FAILED state)")
     if frames:
         lines.append("Structural traceback (most recent call last):")
         lines.extend(f"  • {frame}" for frame in frames)
@@ -2020,7 +2061,7 @@ class ExecutionServiceImpl:
             exc_is_signal = isinstance(exc, (KeyboardInterrupt, SystemExit))
             failed_node_id: str | None = None
             if not exc_is_signal:
-                failed_node_id = self._lookup_failed_node_id(landscape_db, run_id=run_id)
+                failed_node_id = self._lookup_failed_node_id(landscape_db, run_id=run_id).node_id
                 # Unconditional (both terminality branches below): this is the
                 # only channel carrying the scrubbed message, the failing node,
                 # and the frame list.  It is NOT a duplicate of
@@ -2032,7 +2073,7 @@ class ExecutionServiceImpl:
                     run_id=run_id,
                     exc_class=type(exc).__name__,
                     exc_class_chain=_exception_class_chain(exc),
-                    exc_message=_scrubbed_exception_message(exc),
+                    exc_message=_operator_exc_message(exc),
                     failed_node_id=failed_node_id,
                     traceback_frames=_structural_traceback_frames(exc),
                 )
@@ -2123,7 +2164,7 @@ class ExecutionServiceImpl:
                             run_uuid,
                             error=_operator_failure_diagnostic(
                                 class_chain=_exception_class_chain(exc),
-                                exc_message=_scrubbed_exception_message(exc),
+                                exc_message=_operator_exc_message(exc),
                                 node_id=failed_node_id,
                                 frames=_structural_traceback_frames(exc),
                             ),
@@ -2289,7 +2330,7 @@ class ExecutionServiceImpl:
             )
             return _FailureSampleEnrichmentOutcome(samples_text="", failed=True)
 
-    def _lookup_failed_node_id(self, landscape_db: LandscapeDB | None, *, run_id: str) -> str | None:
+    def _lookup_failed_node_id(self, landscape_db: LandscapeDB | None, *, run_id: str) -> _FailedNodeLookupOutcome:
         """Return the node_id of the run's most recent FAILED node state.
 
         The engine already records failures against the node that died — the
@@ -2302,16 +2343,23 @@ class ExecutionServiceImpl:
         with ``run_id=run_id``, and ``update_run_status`` records the same
         value as ``landscape_run_id``), so no second identifier is threaded.
 
-        Returns ``None`` — never raises — when the answer is unavailable:
-        the run failed before Landscape was opened, no node reached a FAILED
-        state (a setup or pre-ingest failure), or the audit DB is degraded.
-        This runs inside ``_run_pipeline``'s exception recovery, where anything
-        escaping would replace the original pipeline exception; the narrow
-        ``(SQLAlchemyError, OSError)`` catch mirrors ``_enrich_failure_samples``
-        and ``_probe_run_already_terminal`` on the same recovery path.
+        Returns ``node_id=None`` — never raises — when the answer is
+        unavailable: the run failed before Landscape was opened, no node
+        reached a FAILED state (a setup or pre-ingest failure), or the audit DB
+        is degraded. This runs inside ``_run_pipeline``'s exception recovery,
+        where anything escaping would replace the original pipeline exception;
+        the narrow ``(SQLAlchemyError, OSError)`` catch mirrors
+        ``_enrich_failure_samples`` and ``_probe_run_already_terminal`` on the
+        same recovery path.
+
+        The explicit ``_FailedNodeLookupOutcome`` result is what keeps that
+        recovery handler honest: "no FAILED node recorded" and "the audit read
+        itself broke" are different facts, and a bare ``None`` return would
+        collapse them into one silent default (the same reason the two sibling
+        helpers return outcome records rather than plain values).
         """
         if landscape_db is None:
-            return None
+            return _FailedNodeLookupOutcome(node_id=None)
         stmt = (
             select(node_states_table.c.node_id)
             .where(
@@ -2319,6 +2367,11 @@ class ExecutionServiceImpl:
                 node_states_table.c.status == NodeStateStatus.FAILED,
             )
             .order_by(
+                # ``completed_at`` newest-first is the temporal signal; the
+                # ``state_id`` tiebreak is NOT temporal (ids are not ordered
+                # by time) — it only makes the pick deterministic when two
+                # FAILED rows share a timestamp. The diagnostic label hedges
+                # accordingly ("Most recent recorded node failure").
                 node_states_table.c.completed_at.desc(),
                 node_states_table.c.state_id.desc(),
             )
@@ -2328,10 +2381,10 @@ class ExecutionServiceImpl:
             with landscape_db.read_only_connection() as conn:
                 # Row iteration over a LIMIT-1 select, mirroring
                 # ``load_top_failure_samples``: an empty result simply yields
-                # nothing and falls through to the ``None`` return, so
+                # nothing and falls through to the node-less return, so
                 # "no FAILED node" needs no separate branch.
                 for (node_id,) in conn.execute(stmt):
-                    return str(node_id)
+                    return _FailedNodeLookupOutcome(node_id=str(node_id))
         except (SQLAlchemyError, OSError):
             # Audit-system degradation — the slog exemption applies (see
             # ``_enrich_failure_samples``). The diagnostic degrades to a
@@ -2341,7 +2394,8 @@ class ExecutionServiceImpl:
                 run_id=run_id,
                 exc_info=True,
             )
-        return None
+            return _FailedNodeLookupOutcome(node_id=None, failed=True)
+        return _FailedNodeLookupOutcome(node_id=None)
 
     def _probe_run_already_terminal(
         self,
@@ -2564,6 +2618,12 @@ class _OutputBlobFinalizationOutcome:
 @dataclass(frozen=True, slots=True)
 class _FailureSampleEnrichmentOutcome:
     samples_text: str
+    failed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _FailedNodeLookupOutcome:
+    node_id: str | None
     failed: bool = False
 
 

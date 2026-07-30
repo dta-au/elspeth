@@ -74,7 +74,7 @@ from elspeth.web.execution.schemas import (
     ValidationReadinessBlocker,
     ValidationResult,
 )
-from elspeth.web.execution.service import ExecutionServiceImpl
+from elspeth.web.execution.service import _MAX_FRAME_PATH_PARTS, ExecutionServiceImpl
 from elspeth.web.execution.validation import validate_pipeline as _real_validate_pipeline
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
 from elspeth.web.plugin_policy.models import (
@@ -3114,7 +3114,7 @@ class TestFailedNodeIdLookup:
         db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
         try:
             _seed_run_with_node_state(db, run_id="web-run-1", node_id="extract")
-            assert service._lookup_failed_node_id(db, run_id="web-run-1") == "extract"
+            assert service._lookup_failed_node_id(db, run_id="web-run-1").node_id == "extract"
         finally:
             db.close()
 
@@ -3142,7 +3142,7 @@ class TestFailedNodeIdLookup:
                 conn.execute(text("UPDATE node_states SET completed_at = '2026-01-01 00:00:00' WHERE state_id = 'state-early'"))
                 conn.execute(text("UPDATE node_states SET completed_at = '2026-01-02 00:00:00' WHERE state_id = 'state-late'"))
 
-            assert service._lookup_failed_node_id(db, run_id="web-run-1") == "late"
+            assert service._lookup_failed_node_id(db, run_id="web-run-1").node_id == "late"
         finally:
             db.close()
 
@@ -3151,7 +3151,12 @@ class TestFailedNodeIdLookup:
         db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
         try:
             _seed_run_with_node_state(db, run_id="web-run-1", status=NodeStateStatus.COMPLETED)
-            assert service._lookup_failed_node_id(db, run_id="web-run-1") is None
+            outcome = service._lookup_failed_node_id(db, run_id="web-run-1")
+            assert outcome.node_id is None
+            # A healthy read that simply found no FAILED node is NOT a
+            # degraded audit read — the counterpart to the
+            # ``failed is True`` assertion below.
+            assert outcome.failed is False
         finally:
             db.close()
 
@@ -3160,21 +3165,26 @@ class TestFailedNodeIdLookup:
         db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
         try:
             _seed_run_with_node_state(db, run_id="web-run-1", node_id="extract")
-            assert service._lookup_failed_node_id(db, run_id="web-run-2") is None
+            assert service._lookup_failed_node_id(db, run_id="web-run-2").node_id is None
         finally:
             db.close()
 
     def test_returns_none_without_landscape_db(self, service: ExecutionServiceImpl) -> None:
         """Pre-init failures (raise before ``open_landscape_db``) degrade cleanly."""
-        assert service._lookup_failed_node_id(None, run_id="web-run-1") is None
+        assert service._lookup_failed_node_id(None, run_id="web-run-1").node_id is None
 
     def test_degrades_to_none_when_audit_db_unavailable(self, service: ExecutionServiceImpl) -> None:
         """Audit-system degradation must not replace the original pipeline exception."""
-        broken_db = MagicMock()
+        broken_db = MagicMock(spec=LandscapeDB)
         broken_db.read_only_connection.side_effect = SQLAlchemyError("audit db gone")
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            assert service._lookup_failed_node_id(broken_db, run_id="web-run-1") is None
+            outcome = service._lookup_failed_node_id(broken_db, run_id="web-run-1")
+
+        assert outcome.node_id is None
+        # The explicit ``failed`` flag is what distinguishes audit-read failure
+        # from "no FAILED node recorded" — a bare None would conflate them.
+        assert outcome.failed is True
 
         warnings = [call for call in mock_slog.warning.call_args_list if call.args and call.args[0] == "failed_node_id_lookup_failed"]
         assert len(warnings) == 1
@@ -3288,7 +3298,7 @@ class TestOperatorFailureDiagnostic:
         assert ".venv" not in runs_error
         for frame in frame_lines:
             assert not frame.startswith("/"), frame
-            assert frame.count("/") < 4, frame
+            assert frame.count("/") < _MAX_FRAME_PATH_PARTS, frame
 
         # The client surface is unchanged by all of the above.
         assert failed_events[-1]["data"]["detail"] == "Pipeline execution failed (ValueError)"
@@ -3333,7 +3343,7 @@ class TestOperatorFailureDiagnostic:
 
         assert failed_events, "a non-terminal failure must broadcast a failed event"
         assert failed_events[-1]["data"]["node_id"] == "extract"
-        assert "Failing node: extract" in runs_error
+        assert "Most recent recorded node failure: extract" in runs_error
 
         failure_logs = [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"]
         assert len(failure_logs) == 1
@@ -3378,7 +3388,7 @@ class TestOperatorFailureDiagnostic:
             db.close()
 
         assert failed_events[-1]["data"]["node_id"] is None
-        assert "Failing node: not recorded" in runs_error
+        assert "Most recent recorded node failure: none recorded" in runs_error
 
         failure_logs = [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"]
         assert len(failure_logs) == 1
@@ -3406,7 +3416,7 @@ class TestOperatorFailureDiagnostic:
         The whole message is replaced rather than partially masked — partial
         redaction leaks structure, and truncation is not redaction.
         """
-        _run_id, runs_error, failed_events, mock_slog = self._run_failing_pipeline(
+        _run_id, runs_error, _failed_events, mock_slog = self._run_failing_pipeline(
             service,
             mock_session_service,
             mock_load=mock_load,
@@ -3427,6 +3437,80 @@ class TestOperatorFailureDiagnostic:
         assert failure_logs[0].kwargs["exc_message"] == "<redacted-secret>"
         for value in failure_logs[0].kwargs.values():
             assert _SECRET_SHAPED_TOKEN not in str(value)
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_pydantic_input_values_never_reach_runs_error(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Test (d): a Pydantic ``input_value`` payload never reaches ``runs.error``.
+
+        ``str(ValidationError)`` interleaves ``input_value=...`` into every
+        error line, and the sentinel below is deliberately NOT secret-shaped,
+        so scrubbing alone would wave it straight through into the audit row.
+        The persisted diagnostic must carry the field name and error type
+        instead of the input echo.
+        """
+        from pydantic import BaseModel
+        from pydantic import ValidationError as PydanticValidationError
+
+        sentinel = "ROW-PAYLOAD-SENTINEL-9c4e1"
+
+        class _ContractProbe(BaseModel):
+            rows: int
+
+        try:
+            _ContractProbe(rows=sentinel)  # type: ignore[arg-type]
+        except PydanticValidationError as exc:
+            pydantic_exc = exc
+        else:
+            raise AssertionError("expected _ContractProbe to raise")
+        # Precondition for the guard to be non-vacuous: the raw str() DOES
+        # embed the sentinel, and the scrubber does NOT redact it.
+        assert sentinel in str(pydantic_exc)
+        from elspeth.web.execution.service import _scrubbed_exception_message
+
+        assert sentinel in _scrubbed_exception_message(pydantic_exc)
+
+        _run_id, runs_error, failed_events, mock_slog = self._run_failing_pipeline(
+            service,
+            mock_session_service,
+            mock_load=mock_load,
+            mock_instantiate=mock_instantiate,
+            mock_graph_cls=mock_graph_cls,
+            mock_orch_cls=mock_orch_cls,
+            mock_landscape=mock_landscape,
+            exc=pydantic_exc,
+        )
+
+        assert sentinel not in runs_error
+        assert runs_error.startswith("Pipeline execution failed (ValidationError)")
+        # Field-name diagnostics survive: the offending loc and error type.
+        assert "rows" in runs_error
+        assert "int_parsing" in runs_error
+        assert "schema contract violation" in runs_error
+
+        # The operator log channel carries the same input-free message.
+        failure_logs = [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"]
+        assert len(failure_logs) == 1
+        for value in failure_logs[0].kwargs.values():
+            assert sentinel not in str(value)
+
+        # The client surface stays sanitized as ever.
+        assert failed_events[-1]["data"]["detail"] == "Pipeline execution failed (ValidationError)"
+        assert sentinel not in failed_events[-1]["data"]["detail"]
         for payload in failed_events:
             assert _SECRET_SHAPED_TOKEN not in str(payload)
 

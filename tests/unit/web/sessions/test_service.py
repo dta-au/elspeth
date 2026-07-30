@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 import structlog
-from sqlalchemy import func, insert, select
+from sqlalchemy import event, func, insert, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -1861,6 +1861,84 @@ class TestAddMessageWithTranscript:
             finally:
                 stale_reader.rollback()
                 stale_reader.close()
+        finally:
+            engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_insert_and_transcript_select_share_one_connection_and_transaction(self, tmp_path) -> None:
+        """Pin the MECHANISM, not just the outcome: one connection, one txn.
+
+        The sibling tests prove the returned transcript contains the insert;
+        this one proves HOW — the ``INSERT INTO chat_messages`` and the
+        transcript ``SELECT`` execute on the same DBAPI connection with no
+        commit between them. A regression that reintroduced a second pooled
+        connection (or committed the insert before reading) could still pass
+        the outcome tests on dialects without a stale reader; this listener
+        pin goes red on the split itself.
+        """
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'one-conn-sessions.db'}")
+        initialize_session_schema(engine)
+        try:
+            service = SessionServiceImpl(
+                engine,
+                telemetry=build_sessions_telemetry(),
+                log=structlog.get_logger("test.one-conn"),
+            )
+            session = await service.create_session("alice", "OneConn", "local")
+            await service.add_message(session.id, "user", "seed", writer_principal="route_user_message")
+
+            # One ordered event log: cursor executions tagged with their
+            # DBAPI connection id, interleaved with commit markers.
+            events: list[tuple[str, int, str]] = []
+
+            def record_statement(conn, cursor, statement, parameters, context, executemany) -> None:
+                events.append(("execute", id(conn.connection.dbapi_connection), statement))
+
+            def record_commit(conn) -> None:
+                events.append(("commit", id(conn.connection.dbapi_connection), "COMMIT"))
+
+            event.listen(engine, "before_cursor_execute", record_statement)
+            event.listen(engine, "commit", record_commit)
+            try:
+                record, transcript = await service.add_message_with_transcript(
+                    session.id,
+                    "user",
+                    "hello",
+                    writer_principal="route_user_message",
+                )
+            finally:
+                event.remove(engine, "before_cursor_execute", record_statement)
+                event.remove(engine, "commit", record_commit)
+
+            assert transcript[-1].id == record.id  # sanity: the outcome still holds
+
+            insert_indices = [
+                index
+                for index, (kind, _conn_id, statement) in enumerate(events)
+                if kind == "execute" and statement.lstrip().upper().startswith("INSERT INTO CHAT_MESSAGES")
+            ]
+            assert len(insert_indices) == 1, [entry[2] for entry in events]
+            insert_index = insert_indices[0]
+            transcript_select_indices = [
+                index
+                for index, (kind, _conn_id, statement) in enumerate(events)
+                if kind == "execute"
+                and statement.lstrip().upper().startswith("SELECT")
+                and "chat_messages" in statement
+                and "ORDER BY chat_messages.sequence_no" in statement
+            ]
+            assert len(transcript_select_indices) == 1, [entry[2] for entry in events]
+            select_index = transcript_select_indices[0]
+
+            # The read follows the write...
+            assert insert_index < select_index
+            # ...on the SAME DBAPI connection...
+            assert events[insert_index][1] == events[select_index][1]
+            # ...with no commit in between: the SELECT ran inside the
+            # insert's own transaction, which is the read-your-own-write
+            # guarantee the docstring claims.
+            between = events[insert_index + 1 : select_index]
+            assert all(kind != "commit" for kind, _conn_id, _statement in between), [entry[:2] for entry in between]
         finally:
             engine.dispose()
 

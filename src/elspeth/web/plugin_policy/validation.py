@@ -35,6 +35,11 @@ class PluginPolicyFinding:
     component_type: str | None
     error_code: str
     message: str
+    # Per-finding remediation, set when the producer can diagnose the repair
+    # more precisely than the stage-level default (currently only
+    # ``_control_coverage_finding``, keyed on the coverage reason). ``None``
+    # falls back to the consumer's stage default suggestion.
+    suggestion: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +136,38 @@ def validate_plugin_policy(
     return PluginPolicyValidationResult(executable_state=executable_state, findings=tuple(findings))
 
 
+# Per-diagnosis remediation for coverage findings, keyed on the finding's
+# ``reason`` — never on the stage. The three diagnoses have three different
+# repairs, and a stage-level string cannot be right for all of them: telling
+# an input-domination (prompt_shield) author to "set on_error to 'discard'"
+# names a repair that cannot address the finding, while the error-route
+# conflict has exactly that one authorable repair. Total over
+# ``ControlCoverageFinding.reason`` (pinned by test); a KeyError here means a
+# new reason was added without deciding its remediation.
+_CONTROL_COVERAGE_SUGGESTIONS: dict[str, str] = {
+    "input_not_dominated": (
+        "Interpose the required control transform upstream of the named node so every "
+        "path carrying data into it passes the control first: route the producer (or "
+        "source) through the control, then connect the control's output to this node. "
+        "Then validate again. If that layout is not possible, ask the operator to relax "
+        "the control mode to 'recommend' — it is not an authoring change."
+    ),
+    "output_not_post_dominated": (
+        "Wire the required control transform so it sits on every path that carries the "
+        "named node's output before any sink, then validate again. If a conforming "
+        "layout is not possible, ask the operator to relax the control mode to "
+        "'recommend' — it is not an authoring change."
+    ),
+    "output_error_route_not_post_dominated": (
+        "Set the named node's on_error to 'discard' — an on_error route is a separate "
+        "write path and no control can sit on it (on_error may only name a sink or "
+        "'discard'). Then validate again. If failed rows must be kept in a quarantine "
+        "sink, ask the operator to relax the control mode to 'recommend' — it is not an "
+        "authoring change."
+    ),
+}
+
+
 def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyFinding:
     """Name the on_error conflict and its one authorable repair.
 
@@ -181,6 +218,7 @@ def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyF
         component_type="transform",
         error_code="required_control_coverage",
         message=message,
+        suggestion=_CONTROL_COVERAGE_SUGGESTIONS[coverage.reason],
     )
 
 

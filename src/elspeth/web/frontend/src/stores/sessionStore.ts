@@ -1589,7 +1589,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const seen = new Set(s.messages.map((m) => m.id));
         const repaired = s.messages.map((existing) =>
           existing.id === optimisticMessage.id
-            ? { ...existing, local_status: undefined, local_error: undefined }
+            ? {
+                ...existing,
+                local_status: undefined,
+                local_error: undefined,
+                local_failure_code: undefined,
+              }
             : existing,
         );
         const finalMessages = seen.has(message.id)
@@ -1660,6 +1665,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // bit instead: saved, no reply.
       const auditIntegrityRefusal =
         !isComposeAbort(err) && apiErr.error_type === "audit_integrity_error";
+      // S1: thread the closed failure code onto the failed row so retry
+      // affordances can suppress themselves for permanent failures
+      // ("policy_blocked" — see the F13-D guided precedent below: a
+      // deployment policy refused the pipeline; retrying cannot succeed).
+      // Only set when the structured error actually carried one.
+      const localFailureCode =
+        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+          ? apiErr.failure_code
+          : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
@@ -1675,8 +1689,18 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         messages: state.messages.map((existing) =>
           existing.id === optimisticMessage.id
             ? auditIntegrityRefusal
-              ? { ...existing, local_status: undefined, local_error: undefined }
-              : { ...existing, local_status: "failed", local_error: errorMessage }
+              ? {
+                  ...existing,
+                  local_status: undefined,
+                  local_error: undefined,
+                  local_failure_code: undefined,
+                }
+              : {
+                  ...existing,
+                  local_status: "failed",
+                  local_error: errorMessage,
+                  local_failure_code: localFailureCode,
+                }
             : existing,
         ),
         ...recoveryPatch,
@@ -2056,7 +2080,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const seen = new Set(s.messages.map((m) => m.id));
         const repaired = s.messages.map((existing) =>
           existing.id === messageId
-            ? { ...existing, local_status: undefined, local_error: undefined }
+            ? {
+                ...existing,
+                local_status: undefined,
+                local_error: undefined,
+                local_failure_code: undefined,
+              }
             : existing,
         );
         const finalMessages = seen.has(assistantMessage.id)
@@ -2097,6 +2126,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
                 : apiErr.detail ?? "Failed to send message. Please try again.";
       }
       const apiErr = err as ApiError;
+      // S1: mirror the sendMessage catch handler — a retry that itself fails
+      // with a permanent code ("policy_blocked") must not re-render the
+      // Retry invitation it just disproved.
+      const localFailureCode =
+        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+          ? apiErr.failure_code
+          : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
@@ -2112,7 +2148,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         error: errorMessage,
         messages: state.messages.map((existing) =>
           existing.id === messageId
-            ? { ...existing, local_status: "failed", local_error: errorMessage }
+            ? {
+                ...existing,
+                local_status: "failed",
+                local_error: errorMessage,
+                local_failure_code: localFailureCode,
+              }
             : existing,
         ),
         ...recoveryPatch,

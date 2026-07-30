@@ -1112,7 +1112,54 @@ def test_unsupported_guided_selection_never_reaches_operator_logs(
     assert rejection["rejection_code"] == "invalid_guided_response"
     assert rejection["exc_class"] == "ValueError"
     assert "error_detail" not in rejection
+    # The generic branch must log the class ONLY — its messages echo raw
+    # client-supplied values, and the audit scrubber redacts secret-shaped
+    # text, not arbitrary client text.
+    assert "exc_message" not in rejection
     assert canary not in repr(logs)
+
+
+def test_web_surface_policy_rejection_reaches_operator_logs_with_distinct_code(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S7: a deployment-policy refusal must be diagnosable from the log alone.
+
+    The generic contract-rejection branch logs the exception class only (see
+    the canary test above), which left a policy refusal indistinguishable
+    from any authoring mistake — "invalid_guided_response ValueError" — with
+    the policy explanation dropped on the floor. The policy error's message
+    is server-composed end to end, so its branch logs the explanation under
+    its own closed rejection code. The client response body stays the closed
+    generic 400 either way.
+    """
+    from structlog.testing import capture_logs
+
+    from elspeth.web.composer.guided.stage_transitions import WebSurfacePolicyRejectedError
+    from elspeth.web.sessions.routes.composer import guided as guided_route
+
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    explanation = "source plugin 'aws_s3' is prohibited on the web authoring surface: policy-explanation-sentinel"
+
+    def reject(*_args: object, **_kwargs: object) -> None:
+        raise WebSurfacePolicyRejectedError(explanation)
+
+    monkeypatch.setattr(guided_route, "_schema8_answer_and_project_next", reject)
+
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=_live_body(turn, chosen=["csv"]),
+        )
+
+    assert response.status_code == 400, response.json()
+    assert response.json()["detail"] == "Guided response does not satisfy the current turn contract."
+    assert "policy-explanation-sentinel" not in response.text
+    rejection = next(entry for entry in logs if entry["event"] == "guided.respond_turn_contract_rejected")
+    assert rejection["rejection_code"] == "web_surface_policy_rejected"
+    assert rejection["exc_class"] == "WebSurfacePolicyRejectedError"
+    assert "policy-explanation-sentinel" in rejection["exc_message"]
 
 
 def test_expired_operation_is_not_taken_over_before_live_preflight(

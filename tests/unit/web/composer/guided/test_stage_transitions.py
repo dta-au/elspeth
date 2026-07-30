@@ -384,9 +384,14 @@ def test_source_selection_rejects_a_web_prohibited_plugin_the_persisted_turn_sti
     guaranteed dead end" failure (F14, 2026-07-31). The rejection must fire at
     selection time even when the permitted set names the plugin.
     """
+    from elspeth.web.composer.guided.stage_transitions import WebSurfacePolicyRejectedError
+
     session, turn = _with_unanswered_turn(GuidedSession.initial(), TurnType.SINGLE_SELECT)
 
-    with pytest.raises(ValueError, match="prohibited on the web authoring surface") as caught:
+    # Pin the TYPED policy error, not a bare ValueError: the guided 400
+    # handler keys its operator-log branch (distinct rejection_code + the
+    # policy explanation) on this class.
+    with pytest.raises(WebSurfacePolicyRejectedError, match="prohibited on the web authoring surface") as caught:
         transition_source_plugin_selection(
             session,
             turn=turn,
@@ -409,9 +414,11 @@ def test_source_plugin_reselection_rejects_a_web_prohibited_plugin_from_a_stale_
     the wizard schema-form path drives it from the persisted turn. Both must
     refuse before the pending intent is rewritten.
     """
+    from elspeth.web.composer.guided.stage_transitions import WebSurfacePolicyRejectedError
+
     session, turn = _source_options_session(facts=None)
 
-    with pytest.raises(ValueError, match="prohibited on the web authoring surface"):
+    with pytest.raises(WebSurfacePolicyRejectedError, match="prohibited on the web authoring surface"):
         transition_source_plugin_reselection(
             session,
             target_id=SOURCE_A,

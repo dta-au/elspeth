@@ -543,7 +543,7 @@ hard-cut sentinel before creating any session:
 sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 39 (== SESSION_SCHEMA_EPOCH)
 ```
 
-An epoch-35, epoch-36, or epoch-37 result is not repairable in place: keep the service drained,
+An epoch-35, epoch-36, epoch-37, or epoch-38 result is not repairable in place: keep the service drained,
 recreate the session database with the current release, and rerun the probe.
 Then create a new session through the API or UI and confirm no
 `SessionSchemaError` appears in the service journal.

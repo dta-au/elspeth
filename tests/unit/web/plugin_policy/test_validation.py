@@ -102,3 +102,74 @@ def test_error_route_coverage_message_routes_retention_to_the_operator() -> None
     assert "operator decision" in message
     assert "'recommend'" in message
     assert "content hash" in message
+
+
+# ── required_control_coverage suggestions (keyed on reason, not stage) ───────
+
+
+def _coverage_suggestion(reason: str, *, uncovered_stream: str | None = None, input_role: bool = False) -> str:
+    from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+    from elspeth.web.plugin_policy.coverage import ControlCoverageFinding
+    from elspeth.web.plugin_policy.validation import _control_coverage_finding
+
+    finding = _control_coverage_finding(
+        ControlCoverageFinding(
+            component_id="judge",
+            capability=PluginCapability.PROMPT_SHIELD if input_role else PluginCapability.CONTENT_SAFETY,
+            role=ControlRole.INPUT if input_role else ControlRole.OUTPUT,
+            reason=reason,  # type: ignore[arg-type]
+            uncovered_stream=uncovered_stream,
+        )
+    )
+    assert finding.suggestion is not None
+    return finding.suggestion
+
+
+def test_error_route_coverage_suggestion_names_the_on_error_repair() -> None:
+    """The output-role error-route diagnosis has exactly one authorable repair."""
+    suggestion = _coverage_suggestion("output_error_route_not_post_dominated", uncovered_stream="quarantine")
+
+    assert "on_error" in suggestion
+    assert "'discard'" in suggestion
+    assert "'recommend'" in suggestion
+    # The error-route advice must never send the author upstream — that is
+    # the input-domination repair, and the graph rejects a control on an
+    # error branch.
+    assert "upstream" not in suggestion
+
+
+def test_input_domination_coverage_suggestion_interposes_the_shield_upstream() -> None:
+    """M2: an input-role (prompt_shield) finding must NOT get on_error advice.
+
+    The pre-fix stage-keyed suggestion told every coverage failure to set
+    on_error to 'discard' — a repair that cannot address input domination.
+    The truthful repair is interposing the shield between the producers and
+    the node.
+    """
+    suggestion = _coverage_suggestion("input_not_dominated", input_role=True)
+
+    assert "upstream" in suggestion
+    assert "Interpose" in suggestion
+    assert "'recommend'" in suggestion
+    assert "on_error" not in suggestion
+    assert "'discard'" not in suggestion
+
+
+def test_generic_output_coverage_suggestion_wires_the_control_before_sinks() -> None:
+    suggestion = _coverage_suggestion("output_not_post_dominated")
+
+    assert "every path" in suggestion
+    assert "before any sink" in suggestion
+    assert "'recommend'" in suggestion
+    assert "on_error" not in suggestion
+
+
+def test_coverage_suggestions_are_total_over_reasons() -> None:
+    """A new ControlCoverageFinding.reason must decide its remediation too."""
+    from typing import get_args, get_type_hints
+
+    from elspeth.web.plugin_policy.coverage import ControlCoverageFinding
+    from elspeth.web.plugin_policy.validation import _CONTROL_COVERAGE_SUGGESTIONS
+
+    reasons = get_args(get_type_hints(ControlCoverageFinding)["reason"])
+    assert set(_CONTROL_COVERAGE_SUGGESTIONS) == set(reasons)

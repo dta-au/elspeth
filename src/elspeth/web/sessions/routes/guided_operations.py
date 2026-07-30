@@ -90,7 +90,9 @@ _SAFE_FAILURES: dict[str, tuple[int, str]] = {
     # PERMANENT by construction — a deployment policy refused this pipeline, so
     # the copy must not offer a retry and must not blame the provider. Kept in
     # lockstep with the freeform mirror
-    # (``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP``).
+    # (``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP``) up to one word:
+    # "highlighted" is guided-only, because only the guided review UI pins the
+    # blocked component; freeform has no component highlight.
     "policy_blocked": (
         422,
         "This pipeline is blocked by a deployment policy and cannot be built as configured. "

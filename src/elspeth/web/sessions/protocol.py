@@ -59,7 +59,15 @@ PipelineProposalRejectionReason = Literal[
     "base_conflict",
     "request_cancelled",
     "superseded",
+    "guided_exit",
 ]
+# The subset a guided state mutation may record when it atomically rejects
+# the pending proposal it is clearing: "superseded" for a real supersession
+# (a newer draft or a rewind displaces the pending one), "guided_exit" when
+# exit-to-freeform abandons custody — nothing displaced the proposal, so
+# recording "superseded" there would fabricate a successor that never existed.
+GuidedProposalInvalidationReason = Literal["superseded", "guided_exit"]
+_GUIDED_PROPOSAL_INVALIDATION_REASONS = frozenset({"superseded", "guided_exit"})
 PipelineProposalSurface = Literal["freeform", "guided_full", "guided_staged", "tutorial_profile"]
 ProposalEventType = Literal[
     "proposal.created",
@@ -1420,11 +1428,19 @@ class PreparedGuidedInterpretationDraft:
 @final
 @dataclass(frozen=True, slots=True)
 class GuidedPendingProposalInvalidation:
-    """Exact pending proposal authority invalidated by a guided state mutation."""
+    """Exact pending proposal authority invalidated by a guided state mutation.
+
+    ``reason`` is the truthful rejection cause recorded on the terminal
+    ``proposal.rejected`` event (closed
+    :data:`GuidedProposalInvalidationReason` vocabulary) — the settlement
+    verifies the clear and terminalizes the row, but only the call site knows
+    WHY custody is being cleared.
+    """
 
     proposal_id: UUID
     draft_hash: str
     reviewed_facts: Mapping[str, Any]
+    reason: GuidedProposalInvalidationReason
 
     def __post_init__(self) -> None:
         if type(self.proposal_id) is not UUID:
@@ -1432,6 +1448,8 @@ class GuidedPendingProposalInvalidation:
         _require_guided_sha256(self.draft_hash, "Guided pending proposal invalidation draft_hash")
         if type(self.reviewed_facts) not in {dict, MappingProxyType}:
             raise AuditIntegrityError("Guided pending proposal invalidation reviewed_facts must be a mapping")
+        if self.reason not in _GUIDED_PROPOSAL_INVALIDATION_REASONS:
+            raise AuditIntegrityError("Guided pending proposal invalidation reason is outside the closed vocabulary")
         freeze_fields(self, "reviewed_facts")
 
 

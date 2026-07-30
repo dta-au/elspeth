@@ -89,6 +89,11 @@ export interface ChatMessage {
   created_at: string;
   local_status?: "pending" | "failed";
   local_error?: string;
+  /** Closed failure code from the ApiError that failed this local send
+   *  (e.g. "policy_blocked", which is permanent by construction — retry
+   *  affordances must not invite a retry for it). Set only when the error
+   *  carried one; cleared wherever local_status is cleared. */
+  local_failure_code?: string;
   composition_state_id?: string | null;
   tool_call_id?: string | null;
   parent_assistant_id?: string | null;

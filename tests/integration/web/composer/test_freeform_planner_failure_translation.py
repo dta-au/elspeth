@@ -684,6 +684,9 @@ def test_freeform_policy_blocked_copy_blames_neither_provider_nor_operation_id()
     assert "operation id" not in lowered
     assert "composer model" not in lowered
     assert "deployment policy" in lowered
+    # Freeform chat has no component highlight — only the guided review UI
+    # pins the blocked component — so this copy must not say "highlighted".
+    assert "highlighted" not in lowered
 
 
 _DECLINE_TEXT = "I must decline: this request needs a streaming-join capability no available plugin provides."

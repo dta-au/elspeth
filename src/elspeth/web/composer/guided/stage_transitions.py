@@ -283,6 +283,21 @@ def _selected_plugin(response: PluginSelectionResponse, permitted_plugins: Seque
     return plugin
 
 
+class WebSurfacePolicyRejectedError(ValueError):
+    """Deployment-policy refusal of a guided selection, safe for operator logs.
+
+    A ``ValueError`` subclass so every existing client-fault catch admits it
+    unchanged, but distinguishable at the guided 400 handler: its message is
+    server-composed end to end — the plugin name comes from the persisted
+    turn's own permitted set (membership is validated before the policy check
+    fires) and the explanation from the policy predicate — so, unlike the
+    generic selection ``ValueError`` whose message echoes the raw
+    client-supplied choice, its text may reach the operator log.
+    """
+
+    rejection_code = "web_surface_policy_rejected"
+
+
 def _require_web_authorable_source_plugin(plugin: str) -> None:
     """Reject a source plugin the web authoring surface prohibits categorically.
 
@@ -304,15 +319,17 @@ def _require_web_authorable_source_plugin(plugin: str) -> None:
     reason instead of the single predicate (the reason enum's one-producer note
     in ``composer/tools/_common.py`` is the tripwire).
 
-    Raises ``ValueError`` — the guided plane's client-fault idiom, matching the
-    literal-credential policy rejection in ``_validated_plugin_options``. The
-    explanation rides the exception for the operator log; the route answers its
-    closed generic 400 (guided response contract), so no policy text egresses.
+    Raises :class:`WebSurfacePolicyRejectedError` — the guided plane's
+    client-fault ``ValueError`` idiom, subtyped so the guided 400 handler can
+    log the policy explanation under its distinct rejection code (the generic
+    contract-rejection branch logs the class only, because generic messages
+    echo raw client input). The route still answers its closed generic 400,
+    so no policy text egresses to the client.
     """
 
     policy_error = web_aws_s3_source_policy_error(plugin)
     if policy_error is not None:
-        raise ValueError(f"source plugin {plugin!r} is prohibited on the web authoring surface: {policy_error}")
+        raise WebSurfacePolicyRejectedError(f"source plugin {plugin!r} is prohibited on the web authoring surface: {policy_error}")
 
 
 def _next_component_name(base: str, existing_names: Sequence[str]) -> str:

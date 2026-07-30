@@ -1954,15 +1954,18 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
     "provider_timeout": (504, "The composer model timed out before producing a pipeline. Retry the request."),
     "provider_unavailable": (503, "The composer model is unavailable. Retry the request."),
     "invalid_provider_response": (502, "The composer model returned an unusable pipeline plan. Retry the request."),
-    # Deliberately identical to the guided ``_SAFE_FAILURES["policy_blocked"]``
-    # copy: a policy refusal is a property of the deployment and the pipeline,
-    # not of the authoring surface or the model, so there is nothing to
-    # surface-qualify. Names neither the provider nor an operation id, and offers
-    # no retry.
+    # Same status and same message shape as the guided
+    # ``_SAFE_FAILURES["policy_blocked"]`` copy — a policy refusal is a
+    # property of the deployment and the pipeline, not of the authoring
+    # surface or the model — EXCEPT that freeform chat has no component
+    # highlight, so this copy must not say "highlighted" (the guided surface
+    # pins its blocked component in the review UI; here the detail text is
+    # the whole signal). Names neither the provider nor an operation id, and
+    # offers no retry.
     "policy_blocked": (
         422,
         "This pipeline is blocked by a deployment policy and cannot be built as configured. "
-        "Change the highlighted component — retrying will fail the same way.",
+        "Change the blocked component — retrying will fail the same way.",
     ),
     "operation_failed": (500, "The composer could not build a pipeline for this request."),
 }

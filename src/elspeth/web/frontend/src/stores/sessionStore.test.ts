@@ -610,6 +610,41 @@ describe("sessionStore", () => {
       expect(state.error).toContain("couldn't complete the composition");
     });
 
+    it("threads failure_code onto the failed optimistic message for policy_blocked (S1)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      // policy_blocked is permanent by construction — a deployment policy
+      // refused the pipeline — so the failed row must carry the code for
+      // the Retry affordance to suppress itself (MessageBubble).
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 403,
+        detail: "This pipeline is not permitted by deployment policy.",
+        failure_code: "policy_blocked",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.isComposing).toBe(false);
+      expect(state.messages[0].local_status).toBe("failed");
+      expect(state.messages[0].local_failure_code).toBe("policy_blocked");
+    });
+
+    it("leaves local_failure_code unset when the send failure carries no failure_code (S1)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        detail: "Something went wrong.",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.messages[0].local_status).toBe("failed");
+      expect(state.messages[0].local_failure_code).toBeUndefined();
+    });
+
     it("renders the honest audit-integrity banner and keeps the saved user row un-failed (F-4b)", async () => {
       const { sendMessage: mockSendMessage } = await import("@/api/client");
       // The fail-closed audit-integrity 500 is a READ-side verification

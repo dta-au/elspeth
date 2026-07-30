@@ -5032,26 +5032,86 @@ class TestEdgeContractFailureFormatting:
 
 
 class TestPluginPolicySuggestions:
-    """Each policy stage's suggestion must describe a repair for THAT stage.
+    """A policy finding's suggestion must describe a repair for THAT finding.
 
-    All four stages shared "Choose an available plugin or repair the required
-    control path". For a coverage failure the first half is wrong advice — the
-    control plugin IS available and selected; the graph routes around it — and
-    "repair the required control path" names no action.
+    All four stages once shared "Choose an available plugin or repair the
+    required control path". For a coverage failure the first half is wrong
+    advice — the control plugin IS available and selected; the graph routes
+    around it. And within the coverage stage the repair depends on the
+    finding's reason/role, not the stage: the on_error/'discard' advice for
+    an output-side error-route conflict is wrong advice for an
+    input-domination (prompt_shield) finding, whose repair is interposing the
+    shield upstream. Coverage findings therefore carry a per-finding
+    suggestion (composed in ``_control_coverage_finding``); the seam here
+    must pass it through verbatim and fall back to the shared default only
+    when a finding carries none.
     """
 
-    def test_required_control_coverage_has_its_own_remediation(self) -> None:
-        from elspeth.web.execution.validation import _plugin_policy_suggestion
+    def test_finding_suggestion_passes_through_to_validation_error(self) -> None:
+        """Input-domination coverage failure surfaces the interpose-upstream advice."""
+        from elspeth.web.dependencies import create_catalog_service
 
-        coverage = _plugin_policy_suggestion("required_control_coverage")
+        unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+        snapshot = PluginAvailabilitySnapshot.create(
+            policy_hash="required-control-policy",
+            principal_scope="local:alice",
+            available=unrestricted.available,
+            unavailable=(),
+            selected=unrestricted.selected,
+            usable_profile_aliases=(),
+            selected_profile_aliases=(),
+            control_modes=((PluginCapability.PROMPT_SHIELD, ControlMode.REQUIRED),),
+            binding_generation_fingerprint="required-control-generation",
+        )
+        state = _make_state(
+            nodes=(_make_node(plugin="llm"),),
+            outputs=(_make_output(),),
+        )
 
-        assert coverage != _plugin_policy_suggestion("plugin_enablement")
-        assert "on_error" in coverage
-        assert "'discard'" in coverage
-        assert "Choose an available plugin" not in coverage
+        result = validate_pipeline_for_trained_operator(
+            state,
+            _make_settings(),
+            _FakeYamlGenerator(),
+            plugin_snapshot=snapshot,
+        )
 
-    def test_other_policy_stages_keep_the_shared_remediation(self) -> None:
-        from elspeth.web.execution.validation import _DEFAULT_PLUGIN_POLICY_SUGGESTION, _plugin_policy_suggestion
+        assert result.is_valid is False
+        assert result.errors[0].error_code == "required_control_coverage"
+        suggestion = result.errors[0].suggestion
+        assert suggestion is not None
+        # The interpose-the-shield-upstream branch, not the on_error branch.
+        assert "upstream" in suggestion
+        assert "on_error" not in suggestion
+        assert "Choose an available plugin" not in suggestion
 
-        for stage in ("plugin_enablement", "operator_profile_options", "required_control_availability"):
-            assert _plugin_policy_suggestion(stage) == _DEFAULT_PLUGIN_POLICY_SUGGESTION  # type: ignore[arg-type]
+    def test_suggestionless_findings_keep_the_shared_remediation(self) -> None:
+        """Stages whose findings carry no per-finding suggestion use the default."""
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.execution.validation import _DEFAULT_PLUGIN_POLICY_SUGGESTION
+
+        catalog = create_catalog_service()
+        unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        disabled = PluginId("sink", "database")
+        snapshot = PluginAvailabilitySnapshot.create(
+            policy_hash="validation-policy",
+            principal_scope="local:alice",
+            available=unrestricted.available - {disabled},
+            unavailable=(PluginAvailability(disabled, PluginUnavailableReason.NOT_AUTHORIZED),),
+            selected=unrestricted.selected,
+            usable_profile_aliases=(),
+            selected_profile_aliases=(),
+            binding_generation_fingerprint="validation-policy-generation",
+        )
+        state = _make_state(outputs=(_make_output(plugin="database"),))
+
+        result = validate_pipeline_for_trained_operator(
+            state,
+            _make_settings(),
+            _FakeYamlGenerator(),
+            plugin_snapshot=snapshot,
+            profile_registry=MagicMock(spec=OperatorProfileRegistry),
+        )
+
+        assert result.is_valid is False
+        assert result.errors[0].error_code == "plugin_not_enabled"
+        assert result.errors[0].suggestion == _DEFAULT_PLUGIN_POLICY_SUGGESTION

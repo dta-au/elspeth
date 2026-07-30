@@ -179,6 +179,7 @@ from elspeth.web.sessions.protocol import (
     GuidedPipelineProposalResult,
     GuidedPipelineProposalStageCommand,
     GuidedPipelineProposalStageSettlement,
+    GuidedProposalInvalidationReason,
     GuidedSessionResult,
     GuidedStartStateConverged,
     GuidedStartStateOutcome,
@@ -506,6 +507,7 @@ _PIPELINE_REJECTION_REASONS = frozenset(
         "base_conflict",
         "request_cancelled",
         "superseded",
+        "guided_exit",
     }
 )
 
@@ -552,7 +554,11 @@ def _pipeline_rejected_payload(
     dispatch: PipelineDispatchAuditBinding | None,
 ) -> _PipelineRejectedEventPayload:
     reason = _validated_pipeline_rejection_reason(reason)
-    outcome = "rejected" if reason == "operator_rejected" else "superseded" if reason == "superseded" else "failed"
+    # ``guided_exit`` shares the "superseded" outcome family: both are
+    # invalidation-by-state-transition, not a fault ("failed") and not an
+    # operator verdict on the content ("rejected"). The reason_code keeps
+    # the two distinguishable in the audit trail.
+    outcome = "rejected" if reason == "operator_rejected" else "superseded" if reason in ("superseded", "guided_exit") else "failed"
     return {
         "schema": "pipeline_proposal_rejected.v1",
         "tool_call_id": authority.row.tool_call_id,
@@ -2024,8 +2030,15 @@ def _reject_guided_pending_proposal(
     authority: AuthoritativePipelineProposal,
     actor: str,
     created_at: datetime,
+    reason: GuidedProposalInvalidationReason,
 ) -> None:
-    """Append one immutable supersession event and terminalize the pending row."""
+    """Append one immutable rejection event and terminalize the pending row.
+
+    ``reason`` comes from the settlement command's
+    ``GuidedPendingProposalInvalidation`` — "superseded" when a newer draft or
+    rewind displaces the pending proposal, "guided_exit" when exit-to-freeform
+    abandons custody with no successor.
+    """
 
     session_id = str(authority.row.session_id)
     proposal_id = str(authority.row.id)
@@ -2043,7 +2056,7 @@ def _reject_guided_pending_proposal(
             proposal_id=proposal_id,
             event_type="proposal.rejected",
             actor=actor,
-            payload=_pipeline_rejected_payload(authority=authority, reason="superseded", dispatch=None),
+            payload=_pipeline_rejected_payload(authority=authority, reason=reason, dispatch=None),
             created_at=created_at,
         )
     )
@@ -9733,11 +9746,14 @@ class SessionServiceImpl:
                 primary_state = self._row_to_state_record(primary_row)
 
                 if invalidated_authority is not None:
+                    if command.invalidated_pending_proposal is None:  # pragma: no cover - invalidation verifier owns this
+                        raise AuditIntegrityError("guided proposal invalidation lost its command reason")
                     _reject_guided_pending_proposal(
                         conn,
                         authority=invalidated_authority,
                         actor=command.actor,
                         created_at=now,
+                        reason=command.invalidated_pending_proposal.reason,
                     )
 
                 row_count = len(audit_rows) + (1 if command.originating_message is not None else 0)

@@ -4146,6 +4146,14 @@ class TestStep2IntraStep:
         assert guided.active_edit_target is None
         proposals = asyncio.run(composer_test_client.app.state.session_service.list_composition_proposals(UUID(session_id)))
         assert len(proposals) == 1 and proposals[0].status == "rejected"
+        # The terminal event records the truthful cause: the author exited
+        # guided mode — no successor proposal displaced this one, so the
+        # reason must be "guided_exit", never "superseded".
+        events = asyncio.run(composer_test_client.app.state.session_service.list_proposal_events(UUID(session_id)))
+        rejected_events = [event for event in events if event.event_type == "proposal.rejected"]
+        assert len(rejected_events) == 1
+        assert rejected_events[0].payload["reason_code"] == "guided_exit"
+        assert rejected_events[0].payload["outcome"] == "superseded"
 
     def test_exit_to_freeform_at_step_4_wire_turn_clears_custody(
         self,
@@ -4173,6 +4181,10 @@ class TestStep2IntraStep:
         assert guided.active_edit_target is None
         proposals = asyncio.run(composer_test_client.app.state.session_service.list_composition_proposals(UUID(session_id)))
         assert len(proposals) == 1 and proposals[0].status == "rejected"
+        events = asyncio.run(composer_test_client.app.state.session_service.list_proposal_events(UUID(session_id)))
+        rejected_events = [event for event in events if event.event_type == "proposal.rejected"]
+        assert len(rejected_events) == 1
+        assert rejected_events[0].payload["reason_code"] == "guided_exit"
 
 
 # ---------------------------------------------------------------------------

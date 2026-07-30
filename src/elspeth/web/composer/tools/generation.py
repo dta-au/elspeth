@@ -857,9 +857,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # ── Plugin-unavailability family (same sweep) ──────────────────────────
     # Every ``PluginUnavailableReason`` value is a live tool ``error_code``
     # (``_plugin_policy_failure``), so each can reach planner feedback. Derived
-    # from the enum rather than transcribed: a new reason joins the catalogue and
-    # the explain patterns together or fails the totality assert in
-    # ``_PLUGIN_UNAVAILABLE_FIXES``.
+    # from the enum rather than transcribed: a new reason joins the catalogue
+    # and the explain patterns together, or the explain-pattern generator's
+    # ``_PLUGIN_UNAVAILABLE_FIXES[reason]`` lookup raises KeyError at import
+    # time — totality is enforced by that lookup, not by an assert.
     *(reason.value for reason in PluginUnavailableReason),
 )
 
