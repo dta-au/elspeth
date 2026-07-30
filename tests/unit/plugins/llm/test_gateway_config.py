@@ -31,9 +31,9 @@ from unittest.mock import Mock
 import pytest
 from pydantic import ValidationError
 
+from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS as _LLM_PRIVATE_OPTIONS
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, GatewayLLMProvider
 from elspeth.plugins.transforms.llm.transform import _PROVIDERS, LLMTransform
-from elspeth.web.plugin_policy.profiles import _LLM_PRIVATE_OPTIONS
 
 _OBSERVED_SCHEMA = {"mode": "observed"}
 

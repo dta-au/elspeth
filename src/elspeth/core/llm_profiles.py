@@ -12,6 +12,7 @@ function for exactly this reason.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -20,6 +21,43 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 CredentialScope = Literal["server", "user"]
 PROFILE_ALIAS_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\Z")
 SECRET_REF_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,255}\Z")
+
+# Provider/model-binding fields a resolved LLM profile injects into the
+# executable node config. These must never be authorable through a web- or
+# batch-authored node's public/safe options — only the operator-owned
+# profile catalog may set them. Shared by both authoring surfaces (web's
+# ``_LLMProfileResolver`` imports this constant rather than redefining it)
+# so the private-field allowlist cannot silently diverge between them.
+LLM_PROFILE_PRIVATE_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "api_key",
+        "api_key_secret",
+        "base_url",
+        "endpoint",
+        "deployment_name",
+        "region_name",
+        "api_version",
+        "credential_ref",
+        "credential_scope",
+        "contract_major",
+        "required_capabilities",
+        "tracing",
+        "timeout_seconds",
+        "max_tokens",
+        "pool_size",
+        "min_dispatch_delay_ms",
+        "max_dispatch_delay_ms",
+        "backoff_multiplier",
+        "recovery_step_ms",
+        "max_capacity_retry_seconds",
+        "prompt_template_source",
+        "lookup_source",
+        "system_prompt_source",
+        "resolved_prompt_template_hash",
+    }
+)
 
 
 def validate_profile_alias(alias: str) -> str:
@@ -165,3 +203,51 @@ class RuntimeLLMProfile:
             credential_ref=settings.credential_ref,
             provider_options=options,
         )
+
+
+def lower_llm_profile_options(
+    alias: str,
+    profile: RuntimeLLMProfile,
+    safe_options: Mapping[str, object],
+    *,
+    private_fields: frozenset[str] = LLM_PROFILE_PRIVATE_FIELDS,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Return ``(executable_options, audit_safe_options)`` for a resolved profile.
+
+    This is the ONE place that turns an operator :class:`RuntimeLLMProfile`
+    plus an author's safe/public options into the private executable node
+    config. Both authoring surfaces call it — the web plugin-policy
+    resolver's ``lower_options`` seam and the batch/CLI ``llm_profiles``
+    catalog lowering pass (:func:`elspeth.core.config._lower_llm_profile_nodes`)
+    — so the same logical profile cannot silently diverge between them (the
+    design's acceptance criterion: "Web and batch profile aliases lower to identical
+    private gateway bindings and audit-safe projections").
+
+    The injected ``api_key`` is a secret REFERENCE marker
+    (``{"secret_ref": ..., "secret_scope": ...}``), never a resolved secret
+    value — this function performs no I/O and holds no credential. Each
+    surface materializes that reference through its own existing mechanism
+    afterward (web: ``resolve_secret_refs`` against the secret store; batch:
+    ``${VAR}`` expansion against the process environment) — this function
+    does not know or care which.
+
+    Raises:
+        ValueError: if ``safe_options`` contains any operator-private field
+            name (``private_profile_option``) — the shape a lower-trust
+            author must never be able to set directly.
+    """
+    if set(safe_options) & private_fields:
+        raise ValueError("private_profile_option")
+    executable: dict[str, object] = dict(safe_options)
+    executable["provider"] = profile.provider
+    if profile.provider != "azure":
+        executable["model"] = profile.model
+    executable.update(profile.provider_options)
+    if profile.credential_ref is not None:
+        assert profile.credential_scope is not None
+        executable["api_key"] = {
+            "secret_ref": profile.credential_ref,
+            "secret_scope": profile.credential_scope,
+        }
+    audit_safe: dict[str, object] = {"profile": alias, **safe_options}
+    return executable, audit_safe

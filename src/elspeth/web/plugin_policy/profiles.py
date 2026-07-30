@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-from elspeth.core.llm_profiles import CredentialScope, RuntimeLLMProfile
+from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS, CredentialScope, RuntimeLLMProfile, lower_llm_profile_options
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 
 if TYPE_CHECKING:
@@ -108,38 +108,6 @@ class OperatorProfileResolver(Protocol):
     def check_local_requirements(self, alias: str) -> LocalRequirementResult: ...
 
 
-_LLM_PRIVATE_OPTIONS = frozenset(
-    {
-        "provider",
-        "model",
-        "api_key",
-        "api_key_secret",
-        "base_url",
-        "endpoint",
-        "deployment_name",
-        "region_name",
-        "api_version",
-        "credential_ref",
-        "credential_scope",
-        "contract_major",
-        "required_capabilities",
-        "tracing",
-        "timeout_seconds",
-        "max_tokens",
-        "pool_size",
-        "min_dispatch_delay_ms",
-        "max_dispatch_delay_ms",
-        "backoff_multiplier",
-        "recovery_step_ms",
-        "max_capacity_retry_seconds",
-        "prompt_template_source",
-        "lookup_source",
-        "system_prompt_source",
-        "resolved_prompt_template_hash",
-    }
-)
-
-
 class _LLMProfileResolver:
     def __init__(
         self,
@@ -170,7 +138,7 @@ class _LLMProfileResolver:
                 if not isinstance(properties, dict):
                     continue
                 for name, property_schema in properties.items():
-                    if name not in _LLM_PRIVATE_OPTIONS and isinstance(property_schema, dict):
+                    if name not in LLM_PROFILE_PRIVATE_FIELDS and isinstance(property_schema, dict):
                         safe_properties.setdefault(name, deepcopy(property_schema))
         safe_properties = {
             "profile": {
@@ -221,23 +189,13 @@ class _LLMProfileResolver:
         )
 
     def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
-        if set(safe_options) & _LLM_PRIVATE_OPTIONS:
+        if set(safe_options) & LLM_PROFILE_PRIVATE_FIELDS:
             raise ValueError("private_profile_option")
         try:
             profile = self._profiles[alias]
         except KeyError:
             raise ValueError("profile_unavailable") from None
-        executable = dict(safe_options)
-        executable["provider"] = profile.provider
-        if profile.provider != "azure":
-            executable["model"] = profile.model
-        executable.update(profile.provider_options)
-        if profile.credential_ref is not None:
-            assert profile.credential_scope is not None
-            executable["api_key"] = {
-                "secret_ref": profile.credential_ref,
-                "secret_scope": profile.credential_scope,
-            }
+        executable, audit_safe = lower_llm_profile_options(alias, profile, safe_options, private_fields=LLM_PROFILE_PRIVATE_FIELDS)
         # Web-authored multi-query LLM nodes cannot set the sequential retry
         # budget themselves — ``pool_size`` and ``max_capacity_retry_seconds``
         # are private profile options rejected by the node's public schema — yet
@@ -250,7 +208,6 @@ class _LLMProfileResolver:
             from elspeth.web.provider_config_policy import WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS
 
             executable["max_capacity_retry_seconds"] = WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS
-        audit_safe = {"profile": alias, **safe_options}
         return LoweredPluginConfig(
             executable_options=MappingProxyType(executable),
             audit_safe_options=MappingProxyType(audit_safe),
