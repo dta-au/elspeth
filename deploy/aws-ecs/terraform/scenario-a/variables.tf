@@ -182,19 +182,51 @@ variable "alarm_actions" {
   default = []
 }
 
+variable "alb_https_ingress_cidrs" {
+  type        = list(string)
+  description = "Explicit operator CIDRs allowed to reach the acceptance ALB over HTTPS."
+
+  validation {
+    condition = (
+      length(var.alb_https_ingress_cidrs) > 0 &&
+      length(distinct(var.alb_https_ingress_cidrs)) == length(var.alb_https_ingress_cidrs) &&
+      alltrue([for cidr in var.alb_https_ingress_cidrs : can(cidrnetmask(cidr)) && !endswith(cidr, "/0")])
+    )
+    error_message = "alb_https_ingress_cidrs must contain unique valid operator CIDRs and must not include 0.0.0.0/0."
+  }
+}
+
 variable "database_name" {
   type    = string
   default = "elspeth"
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]{0,62}$", var.database_name))
+    error_message = "database_name must be a safe PostgreSQL identifier of at most 63 characters."
+  }
 }
 
 variable "session_database_name" {
   type    = string
   default = "elspeth_session"
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]{0,62}$", var.session_database_name))
+    error_message = "session_database_name must be a safe PostgreSQL identifier of at most 63 characters."
+  }
 }
 
 variable "landscape_database_name" {
   type    = string
   default = "elspeth_landscape"
+
+  validation {
+    condition = (
+      can(regex("^[A-Za-z_][A-Za-z0-9_]{0,62}$", var.landscape_database_name)) &&
+      var.landscape_database_name != var.session_database_name
+    )
+    error_message = "landscape_database_name must be a safe PostgreSQL identifier distinct from session_database_name."
+  }
 }
 
 variable "aurora_engine_major_version" {

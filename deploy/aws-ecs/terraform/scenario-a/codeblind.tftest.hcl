@@ -35,6 +35,7 @@ variables {
   owner                           = "terraform-test"
   purpose                         = "Standalone Scenario A mocked plan"
   cleanup_deadline                = "2030-01-01T00:00:00Z"
+  alb_https_ingress_cidrs         = ["203.0.113.42/32"]
   cloudwatch_agent_image          = format("%s.dkr.ecr.ap-southeast-1.amazonaws.com/elspeth-cloudwatch-agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", join("", ["123456", "789012"]))
   cloudwatch_agent_ecr_repository = "elspeth-cloudwatch-agent"
   composer_model                  = "bedrock/apac.primary-profile"
@@ -97,4 +98,45 @@ run "reject_dot_wildcard_repository_candidate" {
   }
 
   expect_failures = [var.candidate_image]
+}
+
+run "reject_world_open_https_ingress" {
+  command = plan
+
+  variables {
+    alb_https_ingress_cidrs = ["0.0.0.0/0"]
+  }
+
+  expect_failures = [var.alb_https_ingress_cidrs]
+}
+
+run "reject_noncanonical_world_open_https_ingress" {
+  command = plan
+
+  variables {
+    alb_https_ingress_cidrs = ["198.51.100.7/0"]
+  }
+
+  expect_failures = [var.alb_https_ingress_cidrs]
+}
+
+run "reject_unsafe_database_identifier" {
+  command = plan
+
+  variables {
+    database_name = "elspeth; DROP DATABASE postgres"
+  }
+
+  expect_failures = [var.database_name]
+}
+
+run "reject_shared_runtime_database_names" {
+  command = plan
+
+  variables {
+    session_database_name   = "shared_runtime"
+    landscape_database_name = "shared_runtime"
+  }
+
+  expect_failures = [var.landscape_database_name]
 }

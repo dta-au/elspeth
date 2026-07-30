@@ -38,6 +38,15 @@ def _s3_receipt_details() -> dict[str, object]:
     }
 
 
+def _textract_receipt_details() -> dict[str, object]:
+    return {
+        "transform_registered": True,
+        "client_constructed": True,
+        "start_document_analysis_invocable": True,
+        "get_document_analysis_invocable": True,
+    }
+
+
 def _connection_budget_receipt(
     *,
     run_id: str,
@@ -606,6 +615,37 @@ def test_receipt_store_binds_exec_receipts_and_allows_shared_content_for_distinc
     }
     assert len(hashes) == 1
     assert len(json.loads(manifest_path.read_text())["evidence"]["receipts"]) == 3
+
+
+def test_receipt_store_accepts_verify_textract_exec_receipt(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "control.json"
+    _init_control_manifest(manifest_path, bind_resolved=False, prepare_apply_evidence=False)
+    task_arn = "arn:aws:ecs:ap-southeast-2:123456789012:task/cluster/textract-task-id"
+    env = {
+        "ELSPETH_ACCEPTANCE_CANDIDATE_SHA": "c" * 40,
+        "ELSPETH_ACCEPTANCE_TASK_ARN": task_arn,
+        "ELSPETH_ACCEPTANCE_SCENARIO_ID": "A",
+    }
+    encoded = acceptance.encode_exec_receipt("verify-textract", _textract_receipt_details(), env)
+    receipt = acceptance.extract_exec_receipt(
+        encoded,
+        expected_candidate_sha="c" * 40,
+        expected_task_arn=task_arn,
+        expected_scenario_id="A",
+        expected_check="verify-textract",
+    )
+
+    receipt_hash = acceptance.receipt_store(
+        manifest_path,
+        scenario_id="A",
+        kind="verify-textract",
+        subject_id=task_arn,
+        receipt_bytes=json.dumps(receipt).encode(),
+    )
+
+    assert len(receipt_hash) == 64
+    receipts = json.loads(manifest_path.read_text())["evidence"]["receipts"]
+    assert any(entry["kind"] == "verify-textract" for entry in receipts)
 
 
 def test_receipt_store_binds_guardrail_policy_receipt_to_protected_scenario_inventory(tmp_path: Path) -> None:

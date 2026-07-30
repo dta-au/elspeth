@@ -109,13 +109,13 @@ export backend_state_bucket=REPLACE_WITH_EXACT_BOOTSTRAP_STATE_BUCKET
 export ecr_repository=REPLACE_WITH_EXACT_BOOTSTRAP_APP_REPOSITORY
 export cloudwatch_agent_ecr_repository=REPLACE_WITH_EXACT_BOOTSTRAP_AGENT_REPOSITORY
 export iam_permissions_boundary_arn="arn:aws:iam::${aws_account_id}:policy/elspeth-${run_id}-ecs-boundary"
-scenario_a_namespace="a-$(printf '%s\0A' "$run_id" | sha256sum | cut -c1-20)"
-scenario_b_namespace="b-$(printf '%s\0B' "$run_id" | sha256sum | cut -c1-20)"
+export scenario_a_namespace="a-$(printf '%s\0A' "$run_id" | sha256sum | cut -c1-20)"
+export scenario_b_namespace="b-$(printf '%s\0B' "$run_id" | sha256sum | cut -c1-20)"
 compact_run_id="$(printf '%s' "$run_id" | tr -d '-')"
 export scenario_a_bucket="elspeth-${scenario_a_namespace}-$(printf '%.12s' "$compact_run_id")"
 export scenario_b_bucket="elspeth-${scenario_b_namespace}-$(printf '%.12s' "$compact_run_id")"
 mkdir -p bootstrap/.terraform
-envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_bucket} ${scenario_b_bucket}' \
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
   < iam/installer-policy.json.tftpl \
   > bootstrap/.terraform/installer-policy.json
 envsubst '${aws_account_id} ${run_id} ${iam_permissions_boundary_arn}' \
@@ -213,7 +213,9 @@ match the scenario tfvars. Do not make their keys equal.
 
 Copy `examples/scenario-a.tfvars.example` to an ignored
 `examples/scenario-a.tfvars`, replace every placeholder, and check that both
-Bedrock provider IDs are present and distinct.
+Bedrock provider IDs are present and distinct. Set `alb_https_ingress_cidrs`
+to the operator or trusted-network CIDRs that need HTTPS access; the package
+rejects an empty list, duplicates, invalid CIDRs, and `0.0.0.0/0`.
 
 Scenario A has no rollback or acceptance-coordinator inputs. Its compatibility
 inventory derives the candidate baseline and absolute tracked source paths from
@@ -474,9 +476,8 @@ docker run --rm --entrypoint python \
   verify-api --state-file /acceptance/state.json
 ```
 
-Finally prove the real Composer endpoint and the task role's S3, Bedrock, and
-Textract capabilities. The Composer request must return a non-empty assistant
-response. ECS Exec must already be enabled and its managed agent must be
+Finally prove the task role's S3, Bedrock, and Textract capabilities. ECS Exec
+must already be enabled and its managed agent must be
 `RUNNING`; the Session Manager plugin is a prerequisite. Each in-task verifier
 must return an `ELSPETH_ACCEPTANCE_RECEIPT_V1` line and exit zero.
 `verify-textract` reads the same `ELSPETH_ACCEPTANCE_S3_BUCKET`,
@@ -484,7 +485,15 @@ must return an `ELSPETH_ACCEPTANCE_RECEIPT_V1` line and exit zero.
 already rendered into the task definition — and proves the packaged
 `aws_textract_document_analysis` transform and the task role's
 `textract:StartDocumentAnalysis` / `textract:GetDocumentAnalysis` grants with
-negative-space probes; no document is ever uploaded or processed:
+negative-space probes; no document is ever uploaded or processed.
+
+### Optional non-gating Composer soak
+
+The live Composer request below exercises the stochastic LLM generation path
+and should return a non-empty assistant response. A failure in this optional
+soak does not invalidate the cold install; `verify-bedrock` remains the
+required deterministic proof of provider reachability and task-role
+authorization.
 
 ```sh
 LOGIN=$(curl --fail --silent --show-error --cacert "$acceptance_dir/ca.pem" \
@@ -500,7 +509,11 @@ curl --fail --silent --show-error --max-time 180 --cacert "$acceptance_dir/ca.pe
   -d '{"content":"Create a pipeline that reads a CSV blob and writes JSON without an LLM transform."}' \
   "$PUBLIC_URL/api/sessions/$COMPOSER_SESSION/messages" \
   | jq -e '.message.role == "assistant" and (.message.content | length > 0)'
+```
 
+Run the required in-task acceptance checks separately:
+
+```sh
 RUNNING_TASK=$(aws ecs list-tasks \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" \
@@ -586,9 +599,10 @@ The decoded receipt must report `safe_case_passed`, `attack_case_blocked` and
 `tutorial_ready: false`, and `landscape_evidence: true`. Both probe texts are
 hashed into the receipt, never retained verbatim.
 
-Any failed step is a failed cold install. Do not report acceptance from doctor
-checks alone, from a stable service running a different task definition, or
-from host-side AWS credentials standing in for the ECS task role.
+Any failed required step is a failed cold install. Do not report acceptance
+from doctor checks alone, from a stable service running a different task
+definition, or from host-side AWS credentials standing in for the ECS task
+role.
 
 The ECS task role is the only Bedrock credential source. The package does not
 accept static AWS keys, a profile, a custom endpoint, a model gateway, or an

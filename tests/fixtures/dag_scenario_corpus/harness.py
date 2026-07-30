@@ -354,6 +354,7 @@ def build_scenario(
         aggregations=bundle.aggregations,
         gates=list(settings.gates),
         coalesce_settings=list(settings.coalesce) if settings.coalesce else None,
+        row_union_settings=list(settings.row_unions) if settings.row_unions else None,
         queues=settings.queues,
     )
     graph.validate()
@@ -977,7 +978,7 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
             status=str(record["status"]),
             context_after=(
                 _normalize_node_state_json(record.get("context_after_json"), field="context_after_json")
-                if node_keys[str(record["node_id"])].startswith("coalesce:")
+                if node_keys[str(record["node_id"])].startswith(("coalesce:", "row_union:"))
                 else None
             ),
             error=(

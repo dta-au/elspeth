@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import subprocess
 import sys
@@ -301,6 +302,15 @@ EXPECTED_STATUS_MATRIX = {
         "unknown",
     ),
 }
+
+
+def test_corpus_harness_threads_and_projects_row_union_barriers() -> None:
+    build_source = inspect.getsource(corpus_harness.build_scenario)
+    projection_source = inspect.getsource(corpus_harness._stable_projection)
+
+    assert "row_union_settings=" in build_source
+    assert 'startswith(("coalesce:", "row_union:"))' in projection_source
+
 
 EXPECTED_ASSESSMENT_LOCATORS = {
     "core-builder-schema-plural-sources": (

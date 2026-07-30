@@ -89,13 +89,13 @@ class AuditRunStatusProjection:
         return int(r[0])
 
     def count_failed_coalesce_barrier_rows(self, run_id: str) -> int:
-        """Count distinct (coalesce node, source row) join barriers that FAILED.
+        """Count distinct (barrier node, source row) barriers that FAILED.
 
         ``rows_coalesce_failed`` semantics (elspeth-7294de558e): the counter is
-        per failed *barrier* — one pending key ``(coalesce_name, row_id)`` that
-        failed to merge — NOT per branch token.  The durable evidence is the
-        family of FAILED ``node_states`` that
-        ``CoalesceExecutor._fail_pending`` writes at the coalesce node: one
+        per failed *barrier* — one pending key ``(barrier_name, row_id)`` that
+        failed to resolve — NOT per branch token.  The durable evidence is the
+        family of FAILED ``node_states`` that the coalesce and row_union
+        executors write at the barrier node: one
         FAILED state per *arrived branch token*, all sharing the same
         ``(node_id, row_id)``.  A naive count of FAILED states (or of the
         per-branch ``(FAILURE, UNROUTED)`` ``token_outcomes``, which carry no
@@ -106,12 +106,12 @@ class AuditRunStatusProjection:
         ANCHOR CHOICE (pinned by
         ``tests/unit/core/landscape/test_query_methods.py::TestAuditRunStatusProjection``):
         the query anchors on ``node_states.status = 'failed'`` joined to
-        ``nodes.node_type = 'coalesce'`` — both indexed, structural columns —
+        ``nodes.node_type IN ('coalesce', 'row_union')`` — indexed, structural columns —
         rather than on the ``failure_reason`` strings inside ``error_json``
         (stringly, unindexed, and ambiguous: ``all_branches_lost`` is written
         by two different resolution paths).  ``row_id`` comes from the
         ``tokens`` join (branch tokens of one barrier inherit the same source
-        ``row_id`` — the pending key IS ``(coalesce_name, row_id)``).
+        ``row_id`` — the pending key is ``(barrier_name, row_id)``).
 
         ONE exclusion, applied Python-side on the parsed error payload: a
         ``late_arrival_after_merge`` state is a straggler token rejected AFTER
@@ -146,7 +146,7 @@ class AuditRunStatusProjection:
             Distinct failed-barrier count for the run (run-1 + all resumes).
 
         Raises:
-            AuditIntegrityError: If a FAILED coalesce node_state carries no
+            AuditIntegrityError: If a FAILED barrier node_state carries no
                 parseable ``error_json`` — the write side requires an error
                 payload for FAILED states, so its absence is Tier-1
                 audit-database corruption.
@@ -168,13 +168,13 @@ class AuditRunStatusProjection:
             )
             .where(node_states_table.c.run_id == run_id)
             .where(node_states_table.c.status == NodeStateStatus.FAILED.value)
-            .where(nodes_table.c.node_type == NodeType.COALESCE.value)
+            .where(nodes_table.c.node_type.in_((NodeType.COALESCE.value, NodeType.ROW_UNION.value)))
         )
         failed_barriers: set[tuple[str, str]] = set()
         for db_row in self._ops.execute_fetchall(query):
             if db_row.error_json is None:
                 raise AuditIntegrityError(
-                    f"FAILED coalesce node_state for node {db_row.node_id!r} / row {db_row.row_id!r} in run "
+                    f"FAILED barrier node_state for node {db_row.node_id!r} / row {db_row.row_id!r} in run "
                     f"{run_id!r} has no error_json — the write side requires an error payload for FAILED "
                     f"states, so this is a Tier-1 audit-database integrity violation."
                 )
@@ -182,13 +182,13 @@ class AuditRunStatusProjection:
                 error_payload = json.loads(db_row.error_json)
             except json.JSONDecodeError as exc:
                 raise AuditIntegrityError(
-                    f"FAILED coalesce node_state for node {db_row.node_id!r} / row {db_row.row_id!r} in run "
+                    f"FAILED barrier node_state for node {db_row.node_id!r} / row {db_row.row_id!r} in run "
                     f"{run_id!r} has unparseable error_json — Tier-1 audit-database integrity violation: {exc}"
                 ) from exc
-            # error_json for a FAILED coalesce node_state is polymorphic across
-            # two legitimate writers: coalesce_executor records a
-            # CoalesceFailureReason (a dict WITH a required failure_reason) for
-            # accept/merge failure outcomes, and the merge-cleanup handler
+            # error_json for a FAILED barrier node_state is polymorphic across
+            # legitimate writers: the barrier executors record a
+            # CoalesceFailureReason or RowUnionFailureReason (a dict WITH a
+            # required failure_reason), and the merge-cleanup handler
             # records an ExecutionError (a dict WITHOUT failure_reason, keys
             # {exception,type,phase}) for merge-time exceptions. Both are valid
             # FAILED barrier rows. A non-dict parsed payload is producible by
@@ -197,17 +197,17 @@ class AuditRunStatusProjection:
             # unparseable guards above.
             if not isinstance(error_payload, dict):
                 raise AuditIntegrityError(
-                    f"FAILED coalesce node_state for node {db_row.node_id!r} / row {db_row.row_id!r} in run "
+                    f"FAILED barrier node_state for node {db_row.node_id!r} / row {db_row.row_id!r} in run "
                     f"{run_id!r} has a non-object error_json payload (got {type(error_payload).__name__}) — the "
-                    f"write side serializes a CoalesceFailureReason or ExecutionError object, so this is a "
+                    f"write side serializes a barrier failure reason or ExecutionError object, so this is a "
                     f"Tier-1 audit-database integrity violation."
                 )
-            # Exclude only the benign late-arrival-after-merge case (a
-            # CoalesceFailureReason discriminator). Every other FAILED payload —
-            # including ExecutionError shapes with no failure_reason — is a real
-            # failed barrier. .get() reads the OPTIONAL discriminator across the
-            # two valid payload shapes without crashing on the keyless one.
-            if error_payload.get("failure_reason") == "late_arrival_after_merge":
+            # Exclude benign stragglers arriving after a successful coalesce
+            # merge or row_union release. Every other FAILED payload — including
+            # ExecutionError shapes with no failure_reason — is a real failed
+            # barrier. .get() reads the optional discriminator across the valid
+            # payload shapes without crashing on the keyless one.
+            if error_payload.get("failure_reason") in {"late_arrival_after_merge", "late_arrival_after_release"}:
                 continue
             failed_barriers.add((db_row.node_id, db_row.row_id))
         return len(failed_barriers)

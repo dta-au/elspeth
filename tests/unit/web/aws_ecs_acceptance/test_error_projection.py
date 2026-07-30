@@ -137,6 +137,16 @@ def test_declared_ca_bundle_must_be_readable_before_any_request(tmp_path: Path) 
         assert client.request_json("GET", "/api/health", expected_statuses={200}) == {}
 
 
+def test_requests_ca_bundle_is_ignored_because_httpx_does_not_consume_it(tmp_path: Path) -> None:
+    client = AcceptanceHttpClient.from_env(
+        _client_env(REQUESTS_CA_BUNDLE=str(tmp_path / "missing-requests-ca.pem")),
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+    )
+
+    with client:
+        assert client.request_json("GET", "/api/health", expected_statuses={200}) == {}
+
+
 def test_unexpected_http_status_projects_code_and_integer_status() -> None:
     transport = httpx.MockTransport(lambda _request: httpx.Response(503, json={"detail": "server secret"}))
     client = AcceptanceHttpClient(

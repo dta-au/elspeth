@@ -48,6 +48,7 @@ module "scenario" {
   transaction_search_baseline_sha256 = local.codeblind_transaction_search_sha256
   cognito_subject_sub                = var.cognito_subject_sub
   alarm_actions                      = var.alarm_actions
+  alb_https_ingress_cidrs            = var.alb_https_ingress_cidrs
   database_name                      = var.database_name
   session_database_name              = var.session_database_name
   landscape_database_name            = var.landscape_database_name

@@ -199,6 +199,12 @@ resource "aws_cloudwatch_log_group" "operator" {
   tags              = local.tags
 }
 
+resource "aws_cloudwatch_log_group" "container_insights" {
+  name              = local.container_insights_log_group
+  retention_in_days = 1
+  tags              = local.tags
+}
+
 data "aws_iam_policy_document" "event_log_delivery" {
   statement {
     sid = "EventBridgeToScenarioLog"

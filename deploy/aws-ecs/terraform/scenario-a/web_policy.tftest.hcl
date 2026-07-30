@@ -44,6 +44,7 @@ variables {
   owner                           = "terraform-test"
   purpose                         = "Web plugin policy contract"
   cleanup_deadline                = "2030-01-01T00:00:00Z"
+  alb_https_ingress_cidrs         = ["203.0.113.42/32"]
   cloudwatch_agent_image          = format("%s.dkr.ecr.ap-southeast-1.amazonaws.com/elspeth-cloudwatch-agent@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", join("", ["123456", "789012"]))
   cloudwatch_agent_ecr_repository = "elspeth-cloudwatch-agent"
   composer_model                  = "bedrock/apac.primary-profile"

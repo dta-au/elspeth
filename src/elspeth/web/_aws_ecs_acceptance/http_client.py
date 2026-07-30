@@ -31,7 +31,9 @@ _NO_BODY = object()
 # stack honors.  An unreadable bundle otherwise only surfaces as an opaque
 # connect failure (or an internal error at client construction), which cost
 # real debugging time during the 2026-07-30 cold install (F12).
-_CA_BUNDLE_ENV_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
+# HTTPX consumes SSL_CERT_FILE through its trust-environment handling. The
+# requests-specific REQUESTS_CA_BUNDLE variable must not block this client.
+_CA_BUNDLE_ENV_VARS = ("SSL_CERT_FILE",)
 
 
 def _require_readable_ca_bundle(env: Mapping[str, str]) -> None:

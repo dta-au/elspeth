@@ -109,8 +109,8 @@
         "secretsmanager:GetSecretValue"
       ],
       "Resource": [
-        "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:a-*",
-        "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:b-*"
+        "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:${scenario_a_namespace}-*",
+        "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:${scenario_b_namespace}-*"
       ]
     },
     {

@@ -8667,6 +8667,35 @@ class TestCoalesceTraversalInvariant:
         assert child_items == []
 
 
+class TestRowUnionTraversalInvariant:
+    def test_work_item_downstream_of_row_union_raises_invariant_error(self) -> None:
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        row_union_node = NodeID("row-union-1")
+        downstream_node = NodeID("downstream-2")
+        processor = _make_processor(
+            factory,
+            source_on_success="output",
+            node_step_map={source_node: 0, row_union_node: 1, downstream_node: 2},
+            node_to_next={source_node: row_union_node, row_union_node: downstream_node, downstream_node: None},
+            node_to_plugin={},
+            row_union_node_ids={RowUnionName("variant_union"): row_union_node},
+            structural_node_ids=frozenset({source_node, row_union_node, downstream_node}),
+        )
+        token = make_token_info(row_id="row-1", token_id="tok-1", branch_name="variant_a")
+        _persist_token_for_scheduler(factory, token)
+
+        with pytest.raises(OrchestrationInvariantError, match="downstream of row_union"):
+            processor._process_single_token(
+                token=token,
+                ctx=ctx,
+                current_node_id=downstream_node,
+                row_union_node_id=row_union_node,
+                row_union_name=RowUnionName("variant_union"),
+            )
+
+
 class TestTerminalWorkItemInvariant:
     """Tests for current_node_id=None work-item validation."""
 
@@ -9149,6 +9178,58 @@ class TestGateJumpPastCoalesceInvariant:
                 current_node_id=gate_node,
                 coalesce_node_id=coalesce_node,
                 coalesce_name=CoalesceName("merge"),
+            )
+
+    def test_gate_jump_past_row_union_raises_invariant_error(self) -> None:
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        gate_node = NodeID("gate-1")
+        row_union_node = NodeID("row-union::variant_union")
+        past_row_union_node = NodeID("transform-3")
+        config_gate = GateSettings(
+            name="router",
+            input="in_conn",
+            condition="'skip_ahead'",
+            routes={"skip_ahead": "skip_conn"},
+        )
+        processor = _make_processor(
+            factory,
+            source_on_success="default",
+            node_step_map={source_node: 0, gate_node: 1, row_union_node: 2, past_row_union_node: 3},
+            node_to_next={
+                source_node: gate_node,
+                gate_node: row_union_node,
+                row_union_node: past_row_union_node,
+                past_row_union_node: None,
+            },
+            node_to_plugin={gate_node: config_gate},
+            row_union_node_ids={RowUnionName("variant_union"): row_union_node},
+            structural_node_ids=frozenset({source_node, row_union_node, past_row_union_node}),
+        )
+        gate_result = GateResult(
+            row={"value": 42},
+            action=RoutingAction.route("skip_ahead"),
+            contract=_make_contract(),
+        )
+
+        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None):
+            return GateOutcome(result=gate_result, updated_token=token, next_node_id=past_row_union_node)
+
+        token = make_token_info(row_id="row-1", token_id="tok-1", branch_name="variant_a")
+        _persist_token_for_scheduler(factory, token)
+
+        with (
+            patch.object(processor._gate_executor, "execute_config_gate", side_effect=config_gate_side_effect),
+            patch.object(processor._nav, "resolve_jump_target_sink", return_value="some_sink"),
+            pytest.raises(OrchestrationInvariantError, match=r"Gate jump moved token.*past its row_union node"),
+        ):
+            processor._process_single_token(
+                token=token,
+                ctx=ctx,
+                current_node_id=gate_node,
+                row_union_node_id=row_union_node,
+                row_union_name=RowUnionName("variant_union"),
             )
 
     def test_gate_jump_before_coalesce_is_allowed(self) -> None:

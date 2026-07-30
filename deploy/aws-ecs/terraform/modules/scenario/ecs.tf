@@ -1,6 +1,8 @@
 resource "aws_ecs_cluster" "scenario" {
   name = local.cluster_name
 
+  depends_on = [aws_cloudwatch_log_group.container_insights]
+
   setting {
     name  = "containerInsights"
     value = "enabled"

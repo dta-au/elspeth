@@ -81,6 +81,94 @@ def _all_text() -> str:
     return "\n".join(path.read_text(encoding="utf-8") for path in _source_files())
 
 
+def test_scenario_a_https_ingress_is_explicit_and_never_world_open() -> None:
+    module_variables = _text("modules/scenario/variables.tf")
+    network = _text("modules/scenario/network.tf")
+    scenario_a = _text("scenario-a/main.tf")
+    example = _text("examples/scenario-a.tfvars.example")
+    alb_ingress = re.search(
+        r'resource "aws_vpc_security_group_ingress_rule" "alb_https" \{(?P<body>.*?)\n\}',
+        network,
+        re.DOTALL,
+    )
+
+    assert 'variable "alb_https_ingress_cidrs"' in module_variables
+    assert '!endswith(cidr, "/0")' in module_variables
+    assert alb_ingress is not None
+    assert re.search(r"for_each\s*=\s*toset\(var\.alb_https_ingress_cidrs\)", alb_ingress.group("body"))
+    assert re.search(r"cidr_ipv4\s*=\s*each\.value", alb_ingress.group("body"))
+    assert '"0.0.0.0/0"' not in alb_ingress.group("body")
+    assert re.search(r"alb_https_ingress_cidrs\s*=\s*var\.alb_https_ingress_cidrs", scenario_a)
+    assert 'alb_https_ingress_cidrs = ["REPLACE_WITH_OPERATOR_CIDR"]' in example
+
+
+def test_service_enable_command_pins_the_validated_task_revision() -> None:
+    outputs = _text("modules/scenario/outputs.tf")
+    command = re.search(r'output "service_enable_command" \{(?P<body>.*?)\n\}', outputs, re.DOTALL)
+
+    assert command is not None
+    assert "--task-definition" in command.group("body")
+    assert "aws_ecs_task_definition.candidate_web.arn" in command.group("body")
+    assert "--force-new-deployment" in command.group("body")
+
+
+def test_database_names_are_safe_and_distinct_before_resource_creation() -> None:
+    variables = _text("modules/scenario/variables.tf")
+
+    for name in ("database_name", "session_database_name", "landscape_database_name"):
+        block = re.search(rf'variable "{name}" \{{(?P<body>.*?)\n\}}', variables, re.DOTALL)
+        assert block is not None
+        assert "validation" in block.group("body")
+        assert "^[A-Za-z_][A-Za-z0-9_]{0,62}$" in block.group("body")
+    landscape = re.search(r'variable "landscape_database_name" \{(?P<body>.*?)\n\}', variables, re.DOTALL)
+    assert landscape is not None
+    assert "var.landscape_database_name != var.session_database_name" in landscape.group("body")
+
+
+def test_database_bootstrap_waits_for_network_and_execution_role_policies() -> None:
+    bootstrap = _text("modules/scenario/database_bootstrap.tf")
+    resource = re.search(r'resource "terraform_data" "database_bootstrap" \{(?P<body>.*)', bootstrap, re.DOTALL)
+
+    assert resource is not None
+    for dependency in (
+        "aws_route_table_association.public",
+        "aws_iam_role_policy_attachment.execution_managed",
+        "aws_iam_role_policy.execution_secrets",
+    ):
+        assert dependency in resource.group("body")
+
+
+def test_container_insights_performance_log_group_is_terraform_owned() -> None:
+    locals_text = _text("modules/scenario/locals.tf")
+    observability = _text("modules/scenario/iam_observability.tf")
+    ecs = _text("modules/scenario/ecs.tf")
+
+    assert re.search(
+        r'container_insights_log_group\s*=\s*"/aws/ecs/containerinsights/\$\{local\.cluster_name\}/performance"',
+        locals_text,
+    )
+    assert 'resource "aws_cloudwatch_log_group" "container_insights"' in observability
+    assert "depends_on = [aws_cloudwatch_log_group.container_insights]" in ecs
+
+
+def test_installer_secret_reads_are_bound_to_the_two_exact_run_namespaces() -> None:
+    template = _text("iam/installer-policy.json.tftpl")
+    secret_resources = re.search(r'"Sid": "ReadScenarioSecretValues"(?P<body>.*?)\n    \}', template, re.DOTALL)
+
+    assert secret_resources is not None
+    assert "secret:${scenario_a_namespace}-*" in secret_resources.group("body")
+    assert "secret:${scenario_b_namespace}-*" in secret_resources.group("body")
+    assert "secret:a-*" not in secret_resources.group("body")
+    assert "secret:b-*" not in secret_resources.group("body")
+
+
+def test_live_composer_generation_is_not_a_cold_install_gate() -> None:
+    readme = _text("README.md")
+
+    assert "Optional non-gating Composer soak" in readme
+    assert "does not invalidate the cold install" in readme
+
+
 def _hcl_map_keys(text: str, assignment: str) -> frozenset[str]:
     """Return the direct keys of one conventionally formatted HCL map."""
 
@@ -776,6 +864,8 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "backend_state_bucket": "elspeth-state-example",
         "ecr_repository": "elspeth-web-example",
         "cloudwatch_agent_ecr_repository": "elspeth-agent-example",
+        "scenario_a_namespace": "a-0123456789abcdefabcd",
+        "scenario_b_namespace": "b-0123456789abcdefabcd",
         "scenario_a_bucket": "elspeth-a-example",
         "scenario_b_bucket": "elspeth-b-example",
     }
@@ -833,6 +923,10 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-*",
     ]
     assert statements["ReadScenarioSecretValues"]["Action"] == ["secretsmanager:GetSecretValue"]
+    assert statements["ReadScenarioSecretValues"]["Resource"] == [
+        "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:a-0123456789abcdefabcd-*",
+        "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:b-0123456789abcdefabcd-*",
+    ]
 
     dashboards = statements["ManageRunDashboards"]
     assert dashboards["Resource"] == [

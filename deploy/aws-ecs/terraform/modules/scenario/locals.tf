@@ -46,14 +46,15 @@ locals {
   rollback_doctor_family    = "${local.namespace}-rollback-doctor"
   database_bootstrap_family = "${local.namespace}-database-bootstrap"
 
-  web_log_group      = "/aws/ecs/${local.namespace}-web"
-  doctor_log_group   = "/aws/ecs/${local.namespace}-doctor"
-  event_log_group    = "/aws/events/${local.namespace}-deployments"
-  operator_log_group = "/aws/ecs/${local.namespace}-operator-metrics"
-  log_policy_name    = "${local.namespace}-delivery-policy"
-  event_rule_name    = "${local.namespace}-deployments"
-  event_target_id    = "${local.namespace}-deployment-log"
-  dashboard_name     = "${local.namespace}-elspeth-aws-operator-v1"
+  web_log_group                = "/aws/ecs/${local.namespace}-web"
+  doctor_log_group             = "/aws/ecs/${local.namespace}-doctor"
+  event_log_group              = "/aws/events/${local.namespace}-deployments"
+  operator_log_group           = "/aws/ecs/${local.namespace}-operator-metrics"
+  container_insights_log_group = "/aws/ecs/containerinsights/${local.cluster_name}/performance"
+  log_policy_name              = "${local.namespace}-delivery-policy"
+  event_rule_name              = "${local.namespace}-deployments"
+  event_target_id              = "${local.namespace}-deployment-log"
+  dashboard_name               = "${local.namespace}-elspeth-aws-operator-v1"
 
   alarm_names = [
     "${local.namespace}-RunFailureRate",

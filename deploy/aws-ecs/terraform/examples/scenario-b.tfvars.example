@@ -14,6 +14,7 @@ target_platform         = "linux/amd64"
 owner                   = "REPLACE_WITH_OWNER"
 purpose                 = "ELSPETH disposable OIDC acceptance"
 cleanup_deadline        = "2030-01-01T00:00:00Z"
+alb_https_ingress_cidrs = ["REPLACE_WITH_OPERATOR_CIDR"]
 
 cloudwatch_agent_image          = "REPLACE_WITH_AGENT_IMAGE@sha256:REPLACE_WITH_64_HEX_DIGEST"
 cloudwatch_agent_ecr_repository = "REPLACE_WITH_BOOTSTRAP_AGENT_ECR_REPOSITORY_NAME"

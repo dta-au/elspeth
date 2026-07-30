@@ -408,10 +408,10 @@ def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
     if type(check) is not str or check not in {
         "verify-s3",
         "verify-bedrock",
+        "verify-textract",
         "verify-bedrock-guardrails",
         "verify-connection-budget",
         "verify-operator-telemetry",
-        "verify-textract",
     }:
         raise AcceptanceCheckError("exec_receipt_schema")
     if type(candidate_sha) is not str or _GIT_SHA_PATTERN.fullmatch(candidate_sha) is None:
@@ -880,6 +880,7 @@ _RECEIPT_KINDS = frozenset(
         "terraform-destroy-plan",
         "verify-s3",
         "verify-bedrock",
+        "verify-textract",
         "verify-bedrock-guardrails",
         "verify-operator-telemetry",
     }
