@@ -7886,6 +7886,120 @@ class SessionServiceImpl:
             parent_assistant_id=parent_assistant_id,
         )
 
+    async def add_message_with_transcript(
+        self,
+        session_id: UUID,
+        role: ChatMessageRole,
+        content: str,
+        *,
+        writer_principal: ChatMessageWriterPrincipal,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+        composition_state_id: UUID | None = None,
+        raw_content: str | None = None,
+        tool_call_id: str | None = None,
+        parent_assistant_id: UUID | None = None,
+    ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
+        """Insert a chat message and read the full transcript in ONE transaction.
+
+        Write-then-read split across two pooled connections is how the
+        freeform send path produced false Tier-1 ``AuditIntegrityError``
+        500s: ``add_message`` committed on one connection while the
+        follow-up ``get_messages`` snapshot ran on another, so a stale
+        reader (read/write-splitting proxy, pinned snapshot) could return
+        a transcript that did not yet contain the committed insert. This
+        method performs the insert and the transcript SELECT on the SAME
+        connection inside a single ``_session_process_locked_begin``
+        transaction holding ``_session_write_lock``, so the returned
+        transcript contains the inserted row as its maximum
+        ``sequence_no`` BY CONSTRUCTION — no retry or tolerance semantics
+        are involved, and none may be added.
+
+        Behaviour is otherwise identical to :meth:`add_message` (state
+        cross-session guard, sequence allocation under the write lock,
+        ``sessions.updated_at`` bump) plus :meth:`get_messages`'s
+        fail-closed guided-failure cohort verification, which runs over
+        the SAME rows the transcript is built from (after commit — the
+        insert stays durable even when verification fails, so "your
+        message was saved" remains true for the caller).
+
+        Returns ``(record, transcript)`` where ``record`` is the
+        DB-authoritative row for the inserted message and ``transcript``
+        is the full session transcript ordered by ``sequence_no``,
+        ending at ``record``.
+        """
+        now = self._now()
+        sid = str(session_id)
+        csid = str(composition_state_id) if composition_state_id else None
+        pid = str(parent_assistant_id) if parent_assistant_id else None
+        msg_id_holder: dict[str, str] = {}
+
+        def _sync() -> tuple[Sequence[Any], Sequence[Any]]:
+            with self._session_process_locked_begin(sid) as conn:
+                if csid is not None:
+                    _assert_state_in_session(
+                        conn,
+                        state_id=csid,
+                        expected_session_id=sid,
+                        caller="add_message_with_transcript",
+                    )
+                with self._session_write_lock(conn, sid):
+                    seq = self._reserve_sequence_range(conn, sid, count=1)
+                    msg_id_holder["id"] = self._insert_chat_message(
+                        conn,
+                        session_id=sid,
+                        role=role,
+                        content=content,
+                        raw_content=raw_content,
+                        # Same deep_thaw rationale as ``add_message``:
+                        # tool_calls may be a frozen mapping/tuple shape the
+                        # JSON encoder rejects.
+                        tool_calls=deep_thaw(tool_calls) if tool_calls else None,
+                        sequence_no=seq,
+                        writer_principal=writer_principal,
+                        composition_state_id=csid,
+                        tool_call_id=tool_call_id,
+                        parent_assistant_id=pid,
+                        created_at=now,
+                    )
+                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+                # Transcript snapshot on the SAME connection, inside the
+                # SAME transaction as the insert — this read sees its own
+                # write on every dialect, which is the entire point.
+                message_rows = conn.execute(
+                    select(chat_messages_table).where(chat_messages_table.c.session_id == sid).order_by(chat_messages_table.c.sequence_no)
+                ).fetchall()
+                failed_event_rows = conn.execute(
+                    select(
+                        guided_operation_events_table.c.session_id,
+                        guided_operation_events_table.c.operation_id,
+                        guided_operation_events_table.c.attempt,
+                        guided_operation_events_table.c.request_hash,
+                        guided_operation_events_table.c.failure_audit_cohort,
+                    )
+                    .where(guided_operation_events_table.c.session_id == sid)
+                    .where(guided_operation_events_table.c.event_kind == "failed")
+                ).fetchall()
+                return message_rows, failed_event_rows
+
+        message_rows, failed_event_rows = await self._run_sync(_sync)
+        # Pure verifier over the same rows the transcript is built from —
+        # parity with get_messages' fail-closed posture. Runs after commit,
+        # so a poisoned cohort rejects the READ, not the durable write.
+        self._verify_guided_failure_audit_cohort(message_rows, failed_event_rows)
+        transcript = [self._row_to_chat_message_record(row) for row in message_rows]
+        if not transcript or str(transcript[-1].id) != msg_id_holder["id"]:
+            # By construction (single transaction, session write lock held
+            # for the sequence allocation) the inserted row IS the maximum
+            # sequence_no in the snapshot just read. If this fires, the
+            # store violated read-your-own-write inside one transaction —
+            # genuine engine/store corruption, not a timing artifact.
+            raise AuditIntegrityError(
+                "Tier 1 audit anomaly: add_message_with_transcript same-"
+                f"transaction snapshot for session {sid} does not end at "
+                f"inserted message {msg_id_holder['id']}."
+            )
+        return transcript[-1], transcript
+
     def _verify_guided_failure_audit_cohort(
         self,
         message_rows: Sequence[Any],

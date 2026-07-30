@@ -1735,6 +1735,75 @@ class TestStep2IntraStep:
         assert detail["failure_code"] == "invalid_provider_response"
         assert "retry" in detail["detail"].lower()  # actionable, no planner internals
 
+    def test_policy_refusal_answers_422_policy_blocked_not_a_provider_fault(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A deployment-policy refusal is permanent, and the copy must say so.
+
+        Guided S3 investigation (2026-07-31): a session whose reviewed source was
+        ``aws_s3`` had its server-synthesized pass-through pipeline refused by the
+        authoritative source gate with ZERO provider calls. The refusal reached
+        the user as ``invalid_provider_response`` — HTTP 502, "The provider
+        returned an invalid response. Retry with a new operation id." — blaming a
+        provider that was never called and instructing a retry that could not
+        possibly succeed.
+
+        The planner exception raised here is exactly what
+        ``prepare_pipeline_plan`` produces on that path: ``VALIDATION_FAILED``
+        carrying the gate's own closed code (pinned end-to-end by
+        ``test_server_derived_rejection_carries_its_closed_codes``). Stubbing the
+        planner keeps this test about the ROUTE's classification, which is the
+        seam that mis-answered.
+        """
+        from elspeth.web.composer.pipeline_planner import PipelinePlannerError
+
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="policy-refusal.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+
+        async def policy_refused_planner(**kwargs: object) -> object:
+            raise PipelinePlannerError(
+                "server-derived pipeline failed candidate validation",
+                code="VALIDATION_FAILED",
+                detail_codes=("aws_s3_source_not_allowed",),
+            )
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            policy_refused_planner,
+        )
+
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {"revision_instruction": "Read the archive from the S3 bucket."},
+            },
+        )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["error_type"] == "guided_operation_terminal_failure"
+        assert detail["failure_code"] == "policy_blocked"
+        copy = detail["detail"].lower()
+        assert "provider" not in copy
+        assert "operation id" not in copy
+        assert "deployment policy" in copy
+
+        # The durable operation row carries the permanent code, so a replay of the
+        # same operation id answers the same permanent envelope.
+        with composer_test_client.app.state.session_engine.connect() as conn:
+            row = conn.execute(select(guided_operations_table).where(guided_operations_table.c.session_id == session_id)).mappings().all()
+        failed = [item for item in row if item["status"] == "failed"]
+        assert failed and all(item["failure_code"] == "policy_blocked" for item in failed)
+
     def test_prose_revision_appends_instruction_to_root_intent(
         self,
         composer_test_client: TestClient,

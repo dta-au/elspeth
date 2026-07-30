@@ -559,7 +559,17 @@ def test_mixed_gate_projection_is_canonical_and_exact_for_every_route_insertion_
     gate = next(node for node in payload["nodes"] if node["stable_id"] and node["node_type"] == "gate")
     assert gate["behavior"] == {
         "kind": "gate",
+        # F11: the authored predicate reaches the projection verbatim, and each
+        # ordinal alias is bound to its author-visible route key in the same
+        # canonical order (direct routes sorted first, then fork routes).
+        "condition": "row['accepted']",
         "route_aliases": route_aliases,
+        "routes": [
+            {"alias": route_aliases[0], "key": "alpha"},
+            {"alias": route_aliases[1], "key": "false"},
+            {"alias": route_aliases[2], "key": "beta"},
+            {"alias": route_aliases[3], "key": "true"},
+        ],
         "fork_branches": [
             {
                 "routes": route_aliases[2:],
@@ -622,6 +632,14 @@ def test_repeated_route_labels_are_gate_local_and_canonical_for_every_insertion_
     route_aliases = [proposal_structural_label("route", index) for index in range(4)]
     assert [gate["behavior"]["route_aliases"] for gate in gates] == [route_aliases[:2], route_aliases[2:]]
     assert len({alias for gate in gates for alias in gate["behavior"]["route_aliases"]}) == 4
+    # Each gate carries ITS OWN authored predicate, and repeated route labels
+    # ("true"/"false" on both gates) stay gate-local: the shared keys bind to
+    # each gate's distinct global ordinal aliases.
+    assert [gate["behavior"]["condition"] for gate in gates] == ["row['first']", "row['second']"]
+    assert [gate["behavior"]["routes"] for gate in gates] == [
+        [{"alias": route_aliases[0], "key": "false"}, {"alias": route_aliases[1], "key": "true"}],
+        [{"alias": route_aliases[2], "key": "false"}, {"alias": route_aliases[3], "key": "true"}],
+    ]
     assert [
         edge["flow"]
         for gate in gates

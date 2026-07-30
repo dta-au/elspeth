@@ -33,6 +33,7 @@ from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSes
 from elspeth.web.composer.guided_blob_refs import reviewed_schema_declared_field_names
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_from_dict, facts_to_dict
 from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS
+from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 _PATH_OPTION_NAMES: Final = frozenset({"path", "file"})
@@ -280,6 +281,38 @@ def _selected_plugin(response: PluginSelectionResponse, permitted_plugins: Seque
     if plugin not in _validated_permitted_plugins(permitted_plugins):
         raise ValueError(f"plugin {plugin!r} is not in the server-emitted permitted set")
     return plugin
+
+
+def _require_web_authorable_source_plugin(plugin: str) -> None:
+    """Reject a source plugin the web authoring surface prohibits categorically.
+
+    ``permitted_plugins`` is NOT sufficient authority here. A wizard respond
+    replays the PERSISTED turn's option list (``_schema8_permitted_plugins``),
+    and a persisted turn is immutable: a session that was emitted before the
+    deployment banned a source still offers it, and a stale tab or a resumed
+    session can answer with it long after the live catalog stopped listing it.
+    Without this check the selection is admitted at Step 1, carried through
+    options/inspection/review, and only refused at the far end of the flow by
+    the authoritative gate — the "first option of the first step is a guaranteed
+    dead end" failure this fixes.
+
+    Policy authority is ``web_aws_s3_source_policy_error`` — the SAME predicate
+    ``build_plugin_snapshot`` uses to mark a plugin
+    ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED``, so this pure module needs
+    no catalog to agree with the snapshot. If a second producer of
+    WEB_SURFACE_PROHIBITED ever appears, this check must consult the snapshot
+    reason instead of the single predicate (the reason enum's one-producer note
+    in ``composer/tools/_common.py`` is the tripwire).
+
+    Raises ``ValueError`` — the guided plane's client-fault idiom, matching the
+    literal-credential policy rejection in ``_validated_plugin_options``. The
+    explanation rides the exception for the operator log; the route answers its
+    closed generic 400 (guided response contract), so no policy text egresses.
+    """
+
+    policy_error = web_aws_s3_source_policy_error(plugin)
+    if policy_error is not None:
+        raise ValueError(f"source plugin {plugin!r} is prohibited on the web authoring surface: {policy_error}")
 
 
 def _next_component_name(base: str, existing_names: Sequence[str]) -> str:
@@ -803,6 +836,7 @@ def transition_source_plugin_selection(
         expected_turn_type=TurnType.SINGLE_SELECT,
     )
     plugin = _selected_plugin(response, permitted_plugins)
+    _require_web_authorable_source_plugin(plugin)
     facts = _validated_inspection_facts(inspection_facts) if inspection_facts is not None else None
     if facts is not None:
         _require_inspection_plugin_match(plugin, facts)
@@ -843,6 +877,7 @@ def transition_source_plugin_reselection(
     )
     stable_id, intent = _require_source_intent(session, target_id, "plugin_options")
     selected = _selected_plugin(PluginSelectionResponse(chosen=(plugin,)), permitted_plugins)
+    _require_web_authorable_source_plugin(selected)
     if selected == intent.plugin:
         raise ValueError("source plugin reselection must change the server-held plugin")
     facts = _validated_inspection_facts(inspection_facts) if inspection_facts is not None else None

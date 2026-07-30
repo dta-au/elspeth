@@ -171,14 +171,14 @@ def test_guided_full_router_seam_is_late_bound_with_one_production_controller() 
 def test_guided_route_handler_module_positions_remain_at_the_signed_layout() -> None:
     guided_tree = _module_tree("src/elspeth/web/sessions/routes/composer/guided.py")
     expected_positions = {
-        "get_guided": 47,
-        "get_guided_tutorial_sample": 48,
-        "post_guided_reenter": 49,
-        "reconcile_guided_start_operation": 50,
-        "post_guided_start": 51,
-        "post_guided_respond": 66,
-        "post_guided_chat": 68,
-        "post_guided_convert": 69,
+        "get_guided": 49,
+        "get_guided_tutorial_sample": 50,
+        "post_guided_reenter": 51,
+        "reconcile_guided_start_operation": 52,
+        "post_guided_start": 53,
+        "post_guided_respond": 68,
+        "post_guided_chat": 70,
+        "post_guided_convert": 71,
     }
 
     actual_positions = {

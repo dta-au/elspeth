@@ -125,7 +125,7 @@ from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_authored_composition_state
 from elspeth.web.sessions._auto_title import maybe_auto_title_session
@@ -1903,6 +1903,15 @@ async def _failed_turn_response_body(
 # prevent. ``COST_CAP_EXCEEDED`` and ``REQUEST_BYTES_EXHAUSTED`` are deliberately
 # absent (they fall through to ``operation_failed`` on both surfaces), matching
 # guided.
+#
+# ``policy_blocked`` is NOT keyed on ``PipelinePlannerError.code`` at all — it is
+# keyed on the rejection's ``detail_codes`` (see
+# :data:`PLANNER_POLICY_DETAIL_CODES`), because a deployment-policy refusal
+# surfaces under whichever planner code the refusal happened to exhaust
+# (``VALIDATION_FAILED`` on the server-derived path, ``REPAIR_EXHAUSTED`` when the
+# model burnt its budget re-authoring the same prohibited component). The code
+# alone cannot distinguish "the model produced garbage" from "the deployment
+# forbids this", so the detail-code test runs FIRST on both surfaces.
 _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
     {
         "COMPLETION_TOKENS_EXCEEDED",
@@ -1919,6 +1928,25 @@ _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
         "VALIDATION_FAILED",
     }
 )
+# The closed validation codes that mean "a deployment policy categorically
+# refuses this component", as opposed to "this candidate is wired wrong". A
+# rejection carrying any of them is PERMANENT: no repair to the pipeline and no
+# retry of the request can clear it, so both surfaces must answer
+# ``policy_blocked`` rather than a retryable provider fault.
+#
+# ``plugin_not_allowed_on_web`` is derived from
+# ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED`` rather than restated so the
+# two cannot drift; ``aws_s3_source_not_allowed`` is the authoritative source
+# gate's own code (``composer/tools/sessions.py``, ``execution/validation.py``),
+# which predates the snapshot-level reason and is emitted by a different seam.
+# A new categorical policy refusal MUST be added here or it silently reads as a
+# provider fault on both surfaces.
+PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "aws_s3_source_not_allowed",
+        PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value,
+    }
+)
 # ``failure_code -> (http_status, safe static detail)``. Mirrors the subset of
 # ``_SAFE_FAILURES`` the freeform planner can reach; the detail text is
 # provider-safe (no exception message, no provider content).
@@ -1926,8 +1954,29 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
     "provider_timeout": (504, "The composer model timed out before producing a pipeline. Retry the request."),
     "provider_unavailable": (503, "The composer model is unavailable. Retry the request."),
     "invalid_provider_response": (502, "The composer model returned an unusable pipeline plan. Retry the request."),
+    # Deliberately identical to the guided ``_SAFE_FAILURES["policy_blocked"]``
+    # copy: a policy refusal is a property of the deployment and the pipeline,
+    # not of the authoring surface or the model, so there is nothing to
+    # surface-qualify. Names neither the provider nor an operation id, and offers
+    # no retry.
+    "policy_blocked": (
+        422,
+        "This pipeline is blocked by a deployment policy and cannot be built as configured. "
+        "Change the highlighted component — retrying will fail the same way.",
+    ),
     "operation_failed": (500, "The composer could not build a pipeline for this request."),
 }
+
+
+def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
+    """Return whether a planner failure was a categorical deployment-policy refusal.
+
+    The single shared predicate behind both surfaces' failure-code mappers, so
+    the guided/freeform lockstep is mechanical rather than a comment: see
+    ``routes/composer/guided_plan.py::_guided_full_failure_code`` and
+    :func:`_freeform_planner_failure_code`.
+    """
+    return any(code in PLANNER_POLICY_DETAIL_CODES for code in exc.detail_codes)
 
 
 def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
@@ -1937,6 +1986,8 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
     guided ``_guided_full_failure_code``; kept as a separate function so the
     guided path stays untouched.
     """
+    if planner_failure_is_policy_blocked(exc):
+        return "policy_blocked"
     if exc.code == "TIMEOUT":
         return "provider_timeout"
     if exc.code == "PROVIDER_ERROR":
@@ -2635,6 +2686,7 @@ async def _inspect_latest_ready_session_blob(
 
 __all__ = [
     "AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST",
+    "PLANNER_POLICY_DETAIL_CODES",
     "SESSION_TERMINAL_RUN_STATUS_VALUES",
     "UTC",
     "UUID",
@@ -2879,6 +2931,7 @@ __all__ = [
     "merge_composer_meta_updates",
     "merge_implicit_decisions_meta",
     "metrics",
+    "planner_failure_is_policy_blocked",
     "record_session_completed",
     "record_session_switched",
     "redact_source_storage_path",

@@ -2065,8 +2065,18 @@ async def test_solve_step_chat_rejects_tool_scaffolding_in_reply(monkeypatch: py
         )
 
 
+_OMIT_TOOL_ARG = object()
+
+
 def _source_tool_args(**overrides: Any) -> str:
-    """A valid resolve_source argument blob (json-encoded), overridable per test."""
+    """A valid resolve_source argument blob (json-encoded), overridable per test.
+
+    Passing ``_OMIT_TOOL_ARG`` DELETES that key. Every resolve_source fixture
+    in the tree otherwise supplies a full key set by construction, so the
+    parser's absent-key and empty-value boundaries — the exact rejections a
+    live model hits when it is asked to resolve an UPLOADED file whose bytes it
+    cannot know — had no coverage at all.
+    """
     args: dict[str, Any] = {
         "resolution": "source",
         "plugin": "json",
@@ -2079,7 +2089,29 @@ def _source_tool_args(**overrides: Any) -> str:
         "assistant_message": "Created the source.",
     }
     args.update(overrides)
-    return json.dumps(args)
+    return json.dumps({name: value for name, value in args.items() if value is not _OMIT_TOOL_ARG})
+
+
+def test_parse_rejects_empty_content_as_a_shape_defect() -> None:
+    """An empty ``content`` is a model-output defect, not a valid resolution.
+
+    This rejection is deliberate (a source resolution must carry the bytes it
+    claims to create), and it is what makes an uploaded-blob bind request
+    unresolvable through the provider: the deterministic upload route must
+    answer that turn instead of routing it here.
+    """
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError, match="content must be a non-empty string"):
+        _parse_step_1_source_tool_arguments(_source_tool_args(content=""), plugin_hint="json")
+
+
+def test_parse_rejects_omitted_content_as_a_missing_key() -> None:
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError, match=r"missing required keys: \['content'\]"):
+        _parse_step_1_source_tool_arguments(_source_tool_args(content=_OMIT_TOOL_ARG), plugin_hint="json")
+
+
+def test_parse_rejects_null_content_as_a_shape_defect() -> None:
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError, match="content must be a non-empty string"):
+        _parse_step_1_source_tool_arguments(_source_tool_args(content=None), plugin_hint="json")
 
 
 def test_parse_defaults_on_validation_failure_to_discard_when_omitted() -> None:

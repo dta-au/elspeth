@@ -125,6 +125,50 @@ def _queue_state() -> CompositionState:
     )
 
 
+def _gate_state() -> CompositionState:
+    """One source feeding a boolean gate that routes to the reviewed output."""
+
+    return CompositionState(
+        source=None,
+        sources={
+            "rows": SourceSpec(
+                plugin="csv",
+                on_success="triage",
+                options={"schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="triage",
+                node_type="gate",
+                plugin=None,
+                input="triage",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row['score'] >= 7",
+                routes={"true": "combined", "false": "discard"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="combined",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(name="Gate wire review", description=""),
+        version=1,
+    )
+
+
 def _schema_output_state(fields: list[object]) -> CompositionState:
     return CompositionState(
         source=SourceSpec(
@@ -528,6 +572,98 @@ class TestStep4WireEmitter:
             "output_mode": "transform",
             "expected_output_count": "1",
         }
+
+    @staticmethod
+    def _gate_node(*, condition: str, routes: dict[str, str], fork_to: tuple[str, ...] | None = None) -> NodeSpec:
+        return NodeSpec(
+            id="triage",
+            node_type="gate",
+            plugin=None,
+            input="triage",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=condition,
+            routes=routes,
+            fork_to=fork_to,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def test_boolean_gate_projection_binds_condition_and_ordered_route_keys(self) -> None:
+        # F11: the authored predicate travels verbatim and each ordinal route
+        # alias is bound 1:1, in route_aliases order, to its boolean route key
+        # ("false" sorts before "true" in the canonical route walk).
+        node = self._gate_node(condition="row['amount'] > 500", routes={"true": "primary", "false": "review"})
+
+        assert _node_behavior(node, route_aliases={"false": "route-1", "true": "route-2"}, branch_aliases={}) == {
+            "kind": "gate",
+            "condition": "row['amount'] > 500",
+            "route_aliases": ["route-1", "route-2"],
+            "routes": [{"alias": "route-1", "key": "false"}, {"alias": "route-2", "key": "true"}],
+            "fork_branches": [],
+        }
+
+    def test_author_labeled_string_gate_projection_preserves_the_authored_route_keys(self) -> None:
+        node = self._gate_node(condition="row['tier']", routes={"high": "escalate", "low": "archive"})
+
+        assert _node_behavior(node, route_aliases={"high": "route-1", "low": "route-2"}, branch_aliases={}) == {
+            "kind": "gate",
+            "condition": "row['tier']",
+            "route_aliases": ["route-1", "route-2"],
+            "routes": [{"alias": "route-1", "key": "high"}, {"alias": "route-2", "key": "low"}],
+            "fork_branches": [],
+        }
+
+    def test_fork_gate_projection_binds_fork_routes_and_keeps_fork_branches_unchanged(self) -> None:
+        # Fork gates are NOT rejected by the new bindings: route_aliases and
+        # fork_branches keep their exact pre-F11 shape, and the added routes
+        # list covers the fork routes too (all derive from the same ordered
+        # route walk).
+        node = self._gate_node(
+            condition="row['ok']",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("branch_a", "branch_b"),
+        )
+
+        assert _node_behavior(
+            node,
+            route_aliases={"false": "route-1", "true": "route-2"},
+            branch_aliases={"branch_a": "branch-1", "branch_b": "branch-2"},
+        ) == {
+            "kind": "gate",
+            "condition": "row['ok']",
+            "route_aliases": ["route-1", "route-2"],
+            "routes": [{"alias": "route-1", "key": "false"}, {"alias": "route-2", "key": "true"}],
+            "fork_branches": [
+                {"routes": ["route-1", "route-2"], "branch": "branch-1"},
+                {"routes": ["route-1", "route-2"], "branch": "branch-2"},
+            ],
+        }
+
+    def test_wire_turn_forwards_the_projected_gate_behavior_verbatim(self) -> None:
+        # The wire stage must FORWARD the proposal projection's gate behavior,
+        # never re-derive it from candidate state: the projected condition here
+        # deliberately differs from the state's authored condition, and the
+        # projected value is the one that must reach the wire payload.
+        state = _gate_state()
+        projection, guided = _wire_authority(state)
+        gate_behavior = {
+            "kind": "gate",
+            "condition": "row['score'] >= 9",
+            "route_aliases": ["route-1", "route-2"],
+            "routes": [{"alias": "route-1", "key": "false"}, {"alias": "route-2", "key": "true"}],
+            "fork_branches": [],
+        }
+        projection["nodes"][0]["behavior"] = gate_behavior
+
+        turn = build_step_4_wire_turn(state, proposal_projection=projection, guided=guided)
+
+        wire_gate = next(node for node in turn["payload"]["nodes"] if node["node_type"] == "gate")
+        assert wire_gate["behavior"] == gate_behavior
+        assert wire_gate["behavior"]["condition"] == "row['score'] >= 9"
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
 
     def test_profile_bound_authored_fallback_renders_degraded_cardinality_without_raising(self) -> None:
         # inv-f6 F6 hardening: an authored-only validation_state (operator

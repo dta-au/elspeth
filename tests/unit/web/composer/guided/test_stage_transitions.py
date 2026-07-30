@@ -7,6 +7,7 @@ through its legal phases without constructing executable topology.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
 from uuid import UUID
 
@@ -37,6 +38,9 @@ from elspeth.web.composer.guided.stage_transitions import (
 )
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession, SinkIntent, SourceIntent, TurnRecord
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_to_dict
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
+from elspeth.web.provider_config_policy import AWS_S3_SOURCE_POLICY_ERROR
 
 SOURCE_A = "11111111-1111-4111-8111-111111111111"
 SOURCE_B = "22222222-2222-4222-8222-222222222222"
@@ -366,6 +370,81 @@ def test_source_plugin_reselection_rejects_noop_unpermitted_and_mismatched_facts
             permitted_plugins=("csv", "json"),
             inspection_facts=replace(_inspection(), source_kind="unknown"),
         )
+
+
+def test_source_selection_rejects_a_web_prohibited_plugin_the_persisted_turn_still_offers() -> None:
+    """``permitted_plugins`` is NOT sufficient authority for a policy-banned source.
+
+    A wizard respond replays the PERSISTED turn's option list, and a persisted
+    turn is immutable: a session emitted before the deployment banned ``aws_s3``
+    still offers it, so a stale tab or a resumed session can answer with it after
+    the live catalog stopped listing it. Admitting the selection here carried it
+    through options, inspection, and review before the authoritative gate refused
+    it at the far end of the flow — the "first option of the first step is a
+    guaranteed dead end" failure (F14, 2026-07-31). The rejection must fire at
+    selection time even when the permitted set names the plugin.
+    """
+    session, turn = _with_unanswered_turn(GuidedSession.initial(), TurnType.SINGLE_SELECT)
+
+    with pytest.raises(ValueError, match="prohibited on the web authoring surface") as caught:
+        transition_source_plugin_selection(
+            session,
+            turn=turn,
+            response=PluginSelectionResponse(chosen=("aws_s3",)),
+            # The stale turn's own list — this is the whole point.
+            permitted_plugins=("aws_s3", "csv", "json"),
+            inspection_facts=None,
+            new_stable_id=UUID(SOURCE_A),
+        )
+
+    # The refusal explains itself with the policy's single source of truth, so an
+    # operator reading the rejection log sees WHY, not just that something failed.
+    assert AWS_S3_SOURCE_POLICY_ERROR in str(caught.value)
+
+
+def test_source_plugin_reselection_rejects_a_web_prohibited_plugin_from_a_stale_permitted_set() -> None:
+    """Reselection is the second door into the same trap and must be shut too.
+
+    Guided chat drives this path (``_prepare_step_1_source_plugin_reselection``);
+    the wizard schema-form path drives it from the persisted turn. Both must
+    refuse before the pending intent is rewritten.
+    """
+    session, turn = _source_options_session(facts=None)
+
+    with pytest.raises(ValueError, match="prohibited on the web authoring surface"):
+        transition_source_plugin_reselection(
+            session,
+            target_id=SOURCE_A,
+            turn=turn,
+            plugin="aws_s3",
+            permitted_plugins=("aws_s3", "csv", "json"),
+            inspection_facts=None,
+        )
+
+    # Nothing was rewritten: the pending intent still holds its prior plugin.
+    assert session.pending_source_intents[SOURCE_A].plugin == "csv"
+
+
+def test_web_surface_source_ban_leaves_the_trained_operator_authority_untouched() -> None:
+    """The guided ban is a WEB-surface rule, not a global one.
+
+    Every authoritative ``aws_s3``-source gate is explicitly exempt for a
+    trained-operator snapshot (``execution/validation.py``,
+    ``composer/tools/sessions.py``, ``composer/tools/sources.py``), and
+    ``PluginAvailabilitySnapshot.for_trained_operator`` — the local-MCP
+    constructor documented as unreachable from web requests — still offers the
+    plugin. The guided transitions take no snapshot at all precisely because they
+    are reachable ONLY from the authenticated web routes, whose snapshot always
+    carries RESTRICTED authority; that is what makes the unconditional check
+    above correct rather than an accidental widening of the ban.
+    """
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+
+    assert snapshot.is_trained_operator is True
+    assert PluginId("source", "aws_s3") in snapshot.available
+    assert all(availability.reason is not PluginUnavailableReason.WEB_SURFACE_PROHIBITED for availability in snapshot.unavailable)
+    for transition in (transition_source_plugin_selection, transition_source_plugin_reselection):
+        assert "plugin_snapshot" not in inspect.signature(transition).parameters
 
 
 @pytest.mark.parametrize("chosen", [(), ("csv", "json"), ("blocked",)])

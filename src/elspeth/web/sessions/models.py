@@ -175,7 +175,13 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #   38 -> completed guided-plan declines also retain the exact assistant
 #        message ID used for replay. Epoch 37 cannot distinguish the original
 #        decline from later assistant messages sharing an unchanged state.
-SESSION_SCHEMA_EPOCH = 38
+#   39 -> ``guided_operations.failure_code`` gains the closed ``policy_blocked``
+#        value so a deployment-policy refusal settles as a permanent failure
+#        instead of being misattributed to the provider. Epoch 38's CHECK
+#        rejects the row outright; SQLite cannot ALTER a CHECK in place, so
+#        pre-release policy remains delete-and-recreate for stale session
+#        databases (sessions.db only — auth.db is never touched).
+SESSION_SCHEMA_EPOCH = 39
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -786,8 +792,8 @@ guided_operations_table = Table(
     ),
     CheckConstraint(
         "failure_code IS NULL OR failure_code IN ('provider_unavailable', 'provider_timeout', "
-        "'invalid_provider_response', 'stale_conflict', 'integrity_error', 'custody_error', 'quota_exceeded', "
-        "'operation_failed', 'request_cancelled')",
+        "'invalid_provider_response', 'policy_blocked', 'stale_conflict', 'integrity_error', 'custody_error', "
+        "'quota_exceeded', 'operation_failed', 'request_cancelled')",
         name="ck_guided_operations_failure_code",
     ),
     CheckConstraint(

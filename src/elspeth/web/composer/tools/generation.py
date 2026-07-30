@@ -46,6 +46,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools._common import (
     _DATA_ERROR_KEY,
+    _PLUGIN_UNAVAILABLE_EXPLANATIONS,
     ToolContext,
     ToolResult,
     _discovery_result,
@@ -69,6 +70,7 @@ from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
     RAW_HTML_CLEANUP_USER_TERM,
 )
+from elspeth.web.plugin_policy.models import PluginUnavailableReason
 from elspeth.web.provider_config_policy import AWS_S3_SOURCE_POLICY_ERROR
 
 _AUTHORING_VALIDATION_COUNTER = metrics.get_meter("elspeth.web.composer.tools").create_counter(
@@ -297,6 +299,47 @@ _GET_EXPRESSION_GRAMMAR_DECLARATION = ToolDeclaration(
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
 )
+
+
+# One suggested fix per plugin-unavailability reason. Every
+# ``PluginUnavailableReason`` value is emitted as a tool ``error_code``
+# (``_plugin_policy_failure`` -> ``_failure_result(..., error_code=reason.value)``),
+# so the planner's redacted repair feedback can carry any of them — yet the whole
+# family resolved to NOTHING through ``explain_validation_code`` until now: the
+# model saw a bare token like ``credential_unavailable`` and had no way to learn
+# whether to pick a different plugin, wait for an operator, or stop trying. This
+# dict is TOTAL over the enum (a new reason KeyErrors here at import time rather
+# than silently degrading to an unexplained code), and the *explanation* half is
+# reused verbatim from ``_PLUGIN_UNAVAILABLE_EXPLANATIONS`` so the copy the model
+# reads cannot drift from the copy the tool failure already carries.
+_PLUGIN_UNAVAILABLE_FIXES: Final[dict[PluginUnavailableReason, str]] = {
+    PluginUnavailableReason.NOT_AUTHORIZED: (
+        "Pick a plugin from the live catalogue (list_sources / list_sinks / list_transforms return only usable ones) — "
+        "re-emitting the same plugin cannot enable it. If the user needs this one specifically, say plainly that an "
+        "operator must turn it on in this deployment's plugin policy."
+    ),
+    PluginUnavailableReason.NOT_INSTALLED: (
+        "Pick an installed plugin from list_sources / list_sinks / list_transforms; check the name for a typo first. "
+        "No change to the options can conjure a plugin this deployment does not have."
+    ),
+    PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING: (
+        "Pick a different plugin from the live catalogue, or tell the user an operator must install the missing "
+        "requirement in this deployment — the pipeline itself cannot supply it."
+    ),
+    PluginUnavailableReason.CREDENTIAL_MISSING: (
+        "Pick a plugin whose credential this deployment already holds, or tell the user an operator must configure "
+        "this plugin's credential. Never invent a literal credential value or a secret_ref name to work around it."
+    ),
+    PluginUnavailableReason.PROFILE_UNAVAILABLE: (
+        "Pick a plugin the live catalogue offers, or tell the user an operator must configure an operator profile "
+        "for this one before it can be used."
+    ),
+    PluginUnavailableReason.WEB_SURFACE_PROHIBITED: (
+        "Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime instead. This refusal is "
+        "categorical: no option change, no credential, and no operator setting can make this plugin usable here, so do "
+        "not re-emit it."
+    ),
+}
 
 
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
@@ -718,6 +761,18 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         AWS_S3_SOURCE_POLICY_ERROR,
         "Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads.",
     ),
+    # Plugin-unavailability family. Exact-code patterns only (``re.escape``, no
+    # alternation): these codes are short and generic, and a loose pattern here
+    # would shadow an unrelated entry above. They sit LAST so every message-shaped
+    # pattern above still wins on a full validation message.
+    *(
+        (
+            re.escape(reason.value),
+            f"The pipeline names a plugin that cannot be used in this deployment: {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}.",
+            _PLUGIN_UNAVAILABLE_FIXES[reason],
+        )
+        for reason in PluginUnavailableReason
+    ),
 )
 
 
@@ -799,6 +854,13 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # Reaches planner feedback from the authoritative source gate; the planner
     # must learn the refusal is categorical rather than repair around it.
     "aws_s3_source_not_allowed",
+    # ── Plugin-unavailability family (same sweep) ──────────────────────────
+    # Every ``PluginUnavailableReason`` value is a live tool ``error_code``
+    # (``_plugin_policy_failure``), so each can reach planner feedback. Derived
+    # from the enum rather than transcribed: a new reason joins the catalogue and
+    # the explain patterns together or fails the totality assert in
+    # ``_PLUGIN_UNAVAILABLE_FIXES``.
+    *(reason.value for reason in PluginUnavailableReason),
 )
 
 

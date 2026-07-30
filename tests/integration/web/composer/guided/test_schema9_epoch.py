@@ -11,8 +11,8 @@ from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 
 
-def test_guided_decline_message_locator_runs_inside_session_epoch_38() -> None:
-    assert SESSION_SCHEMA_EPOCH == 38
+def test_policy_blocked_failure_code_runs_inside_session_epoch_39() -> None:
+    assert SESSION_SCHEMA_EPOCH == 39
     assert SQLITE_SCHEMA_EPOCH == 30
 
 
@@ -24,5 +24,5 @@ def test_epoch_35_session_store_fails_before_schema_use(tmp_path: Path) -> None:
         connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 35 WHERE store_kind = 'session'"))
         connection.execute(text("PRAGMA user_version = 35"))
 
-    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=38.*Delete the session DB file and restart"):
+    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=39.*Delete the session DB file and restart"):
         initialize_session_schema(engine)

@@ -521,6 +521,52 @@ def guided_redacted_current_state_context(state: CompositionState) -> dict[str, 
     }
 
 
+def _sink_options_with_declared_required_fields(
+    options: dict[str, JsonValue],
+    declared_fields: Sequence[str],
+) -> dict[str, JsonValue]:
+    """Materialize reviewed declared output fields into the sink's schema contract.
+
+    Step-2 field review captures ``SinkOutputResolved.required_fields``, but the
+    reviewed sink OPTIONS never carried them, so both the composer sink-contract
+    check and the runtime DAG validation (which key off ``options.schema``)
+    silently abstained — the operator's declared contract was display-only (F3).
+    Merge the declared fields into the sanctioned ``schema.required_fields``
+    expression (contracts/schema.py) at the binder seam so one edit reaches
+    candidate validation, the sealed proposal, committed state, YAML, and
+    runtime.
+
+    Rules:
+    - empty ``declared_fields`` never reaches this helper (options stay
+      byte-identical upstream);
+    - author-typed ``schema.required_fields`` is MERGED (union, author order
+      first), never overwritten;
+    - a malformed schema block or malformed ``required_fields`` value is left
+      untouched — candidate validation owns rejecting it
+      (``contract_config_invalid``), and rewriting it here would mask the
+      defect.
+    """
+    schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else "schema")
+    raw_schema = options.get(schema_key)
+    if raw_schema is None:
+        schema: dict[str, JsonValue] = {"mode": "observed"}
+    elif type(raw_schema) is dict:
+        schema = raw_schema
+    else:
+        return options
+    existing = schema.get("required_fields")
+    if existing is None:
+        authored: list[str] = []
+    elif type(existing) is list and all(type(item) is str for item in existing):
+        authored = cast(list[str], existing)
+    else:
+        return options
+    merged: list[JsonValue] = [*authored, *(field for field in declared_fields if field not in authored)]
+    schema["required_fields"] = merged
+    options[schema_key] = schema
+    return options
+
+
 def bind_guided_reviewed_components(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
@@ -583,11 +629,17 @@ def bind_guided_reviewed_components(
         candidate_name = candidate.get("sink_name", candidate.get("name"))
         if type(candidate_name) is str and candidate_name != reviewed_output.name:
             output_rename[candidate_name] = reviewed_output.name
+        rebound_options = cast(dict[str, JsonValue], deep_thaw(reviewed_output.options))
+        if reviewed_output.required_fields:
+            rebound_options = _sink_options_with_declared_required_fields(
+                rebound_options,
+                reviewed_output.required_fields,
+            )
         rebound_outputs.append(
             {
                 "sink_name": reviewed_output.name,
                 "plugin": reviewed_output.plugin,
-                "options": deep_thaw(reviewed_output.options),
+                "options": rebound_options,
                 "on_write_failure": reviewed_output.on_write_failure,
             }
         )
@@ -831,7 +883,18 @@ def _node_behavior(
     fork_to = list(node.fork_to or ())
     return {
         "kind": "gate",
+        # The authored predicate travels VERBATIM: without it the review
+        # surfaces show only opaque route ordinals, so an inverted or
+        # fabricated condition is invisible to the operator (F11). The
+        # condition is already operator-visible in the Ready YAML — this is
+        # a projection fix, not a new disclosure.
+        "condition": node.condition,
         "route_aliases": [route_aliases[name] for name in route_names],
+        # Bijective with route_aliases IN THE SAME ORDER (both derive from
+        # _ordered_gate_routes, fork routes included): each server ordinal
+        # alias is bound to its author-visible route key ("true"/"false" or
+        # an author label) so review surfaces can say which branch is which.
+        "routes": [{"alias": route_aliases[name], "key": name} for name in route_names],
         "fork_branches": [
             {
                 "routes": [route_aliases[name] for name in fork_routes],

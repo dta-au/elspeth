@@ -158,7 +158,24 @@ def prepare_guided_audit_rows(
             # model-dispatched Composer tools and intentionally do not live
             # in MANIFEST, so the generic unknown-tool sentinel would destroy
             # their payload custody (including payload-reference binding).
-            content = json.dumps({"error_class": None, "error_message": None})
+            #
+            # ``_kind`` discriminator: every sibling content shape in this
+            # module carries one (guided_tool_audit / guided_tool_failure_
+            # audit / llm_call_audit / chat_turn_audit). Without it these
+            # rows rendered as bare '{"error_class": null, "error_message":
+            # null}' — "empty audit rows" that misled incident diagnosis.
+            # Safe to add: the failure-cohort commitment hashes are computed
+            # from these prepared rows at the same settlement write, so row
+            # bytes and commitment stay coherent for new writes, and stored
+            # rows verify against their own stored bytes.
+            content = json.dumps(
+                {
+                    "_kind": "guided_synthetic_audit",
+                    "tool_name": invocation.tool_name,
+                    "error_class": None,
+                    "error_message": None,
+                }
+            )
             envelope = {"_kind": "audit", "invocation": invocation.to_dict()}
         else:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)

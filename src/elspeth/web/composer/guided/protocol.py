@@ -211,9 +211,18 @@ class _TransformBehavior(TypedDict):
     kind: Literal["transform"]
 
 
+class _GateRouteBinding(TypedDict):
+    """One ordinal route alias bound to its author-visible route key."""
+
+    alias: str
+    key: str
+
+
 class _GateBehavior(TypedDict):
     kind: Literal["gate"]
+    condition: str
     route_aliases: Sequence[str]
+    routes: Sequence[_GateRouteBinding]
     fork_branches: Sequence[Mapping[str, Any]]
 
 
@@ -1338,14 +1347,39 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
     if node_type in ("transform", "queue"):
         return _exact_nested_keys(behavior, frozenset({"kind"}), behavior_path)
     if node_type == "gate":
-        expected = frozenset({"kind", "route_aliases", "fork_branches"})
+        expected = frozenset({"kind", "condition", "route_aliases", "routes", "fork_branches"})
         if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
+            return error
+        # The authored predicate is bounded non-empty text and NOTHING MORE:
+        # no re-parsing or classification here — expression validity and
+        # route/condition parity are validated upstream at candidate
+        # validation (state.py), and a third ExpressionParser site would
+        # drift (elspeth-224fab9702).
+        if (error := _current_text_error(behavior["condition"], f"{behavior_path}.condition", nonempty=True)) is not None:
             return error
         route_aliases, error = _validate_alias_sequence(
             behavior["route_aliases"], kind="route", path=f"{behavior_path}.route_aliases", minimum=1
         )
         if error is not None:
             return error
+        assert route_aliases is not None
+        # ``routes`` binds each ordinal alias to its author-visible route key,
+        # bijective with ``route_aliases`` in the same order (fork gates
+        # included — both lists derive from the same ordered route walk).
+        route_bindings, error = _sequence_of_mappings(behavior["routes"], f"{behavior_path}.routes")
+        if error is not None:
+            return error
+        assert route_bindings is not None
+        if len(route_bindings) != len(route_aliases):
+            return f"{behavior_path}.routes must bind route_aliases one-to-one in the same order"
+        for index, binding in enumerate(route_bindings):
+            binding_path = f"{behavior_path}.routes[{index}]"
+            if (error := _exact_nested_keys(binding, frozenset({"alias", "key"}), binding_path)) is not None:
+                return error
+            if binding["alias"] != route_aliases[index]:
+                return f"{behavior_path}.routes must bind route_aliases one-to-one in the same order"
+            if (error := _current_text_error(binding["key"], f"{binding_path}.key", nonempty=True)) is not None:
+                return error
         fork_branches, error = _sequence_of_mappings(behavior["fork_branches"], f"{behavior_path}.fork_branches")
         if error is not None:
             return error

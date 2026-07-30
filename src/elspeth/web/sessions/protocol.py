@@ -77,10 +77,30 @@ GuidedOperationKind = Literal[
     "state_revert",
     "session_fork",
 ]
+# Closed enum mirroring the ``ck_guided_operations_failure_code`` CHECK
+# constraint in ``web/sessions/models.py``; the order here mirrors the CHECK
+# declaration for visual diff clarity. Same paired-contract posture as
+# ``ChatMessageWriterPrincipal`` below: extending one side only lets the Python
+# writer pass while the DB rejects the row (or vice versa), so both edits ship
+# together with a ``SESSION_SCHEMA_EPOCH`` bump.
+#
+# The vocabulary also carries a PERMANENT-vs-TRANSIENT split the client reads to
+# decide whether a retry can succeed. ``provider_unavailable`` /
+# ``provider_timeout`` / ``invalid_provider_response`` / ``stale_conflict`` are
+# transient (retry or reload can win); ``policy_blocked`` is permanent by
+# construction — a deployment policy refused the pipeline, so the identical
+# request will be refused identically no matter how many operation ids the
+# client mints.
 GuidedOperationFailureCode = Literal[
     "provider_unavailable",
     "provider_timeout",
     "invalid_provider_response",
+    # Permanent refusal from a deployment security policy (e.g. a source plugin
+    # prohibited on the web authoring surface). Distinct from
+    # ``invalid_provider_response`` precisely because there is nothing to retry:
+    # collapsing the two blamed the provider for a policy decision and told the
+    # user to retry an operation that cannot ever succeed.
+    "policy_blocked",
     "stale_conflict",
     "integrity_error",
     "custody_error",
@@ -2806,6 +2826,34 @@ class SessionServiceProtocol(Protocol):
         limit: int | None = 100,
         offset: int = 0,
     ) -> list[ChatMessageRecord]: ...
+
+    async def add_message_with_transcript(
+        self,
+        session_id: UUID,
+        role: ChatMessageRole,
+        content: str,
+        *,
+        writer_principal: ChatMessageWriterPrincipal,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+        composition_state_id: UUID | None = None,
+        raw_content: str | None = None,
+        tool_call_id: str | None = None,
+        parent_assistant_id: UUID | None = None,
+    ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
+        """Insert one message and return ``(record, full transcript)``.
+
+        The insert and the transcript read MUST happen inside one
+        write-locked transaction on one connection, so the returned
+        transcript ends at the inserted row by construction. Callers that
+        need "the transcript this write belongs to" (the freeform
+        send_message snapshot guard) MUST use this method instead of an
+        ``add_message`` + ``get_messages`` pair — the split pair reads on
+        a different pooled connection and a stale reader turns the Tier-1
+        snapshot guard into a false 500. Implementations MUST also apply
+        the same fail-closed guided-failure cohort verification as
+        ``get_messages`` over the same rows.
+        """
+        ...
 
     async def get_verified_guided_root_intent(
         self,
