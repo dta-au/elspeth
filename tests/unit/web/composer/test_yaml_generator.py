@@ -669,6 +669,30 @@ class TestGenerateYaml:
             "safe": "kept",
         }
 
+    def test_public_projection_preserves_semantic_option_keys_ending_in_blob_id(self) -> None:
+        """Plugin-owned field names are data, not web blob custody."""
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="out",
+                options={
+                    "path": "/private/input.csv",
+                    "field_mapping": {"customer_blob_id": "customer_id"},
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="csv", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        public_options = generate_public_pipeline_dict(state)["sources"]["source"]["options"]
+
+        assert public_options["field_mapping"] == {"customer_blob_id": "customer_id"}
+
     def test_public_yaml_strips_guided_blob_storage_path_without_committed_blob_ref(self) -> None:
         blob_path = "/home/john/elspeth/data/blobs/session/20b944e3_project_pages.json"
         blob_ref = "20b944e3-fd46-434f-b9a2-4fb508db30f0"

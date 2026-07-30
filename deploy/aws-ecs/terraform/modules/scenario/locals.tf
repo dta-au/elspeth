@@ -46,14 +46,15 @@ locals {
   rollback_doctor_family    = "${local.namespace}-rollback-doctor"
   database_bootstrap_family = "${local.namespace}-database-bootstrap"
 
-  web_log_group      = "/aws/ecs/${local.namespace}-web"
-  doctor_log_group   = "/aws/ecs/${local.namespace}-doctor"
-  event_log_group    = "/aws/events/${local.namespace}-deployments"
-  operator_log_group = "/aws/ecs/${local.namespace}-operator-metrics"
-  log_policy_name    = "${local.namespace}-delivery-policy"
-  event_rule_name    = "${local.namespace}-deployments"
-  event_target_id    = "${local.namespace}-deployment-log"
-  dashboard_name     = "${local.namespace}-elspeth-aws-operator-v1"
+  web_log_group                = "/aws/ecs/${local.namespace}-web"
+  doctor_log_group             = "/aws/ecs/${local.namespace}-doctor"
+  event_log_group              = "/aws/events/${local.namespace}-deployments"
+  operator_log_group           = "/aws/ecs/${local.namespace}-operator-metrics"
+  container_insights_log_group = "/aws/ecs/containerinsights/${local.cluster_name}/performance"
+  log_policy_name              = "${local.namespace}-delivery-policy"
+  event_rule_name              = "${local.namespace}-deployments"
+  event_target_id              = "${local.namespace}-deployment-log"
+  dashboard_name               = "${local.namespace}-elspeth-aws-operator-v1"
 
   alarm_names = [
     "${local.namespace}-RunFailureRate",
@@ -111,22 +112,73 @@ locals {
     prompt_shield  = "required"
     content_safety = "required"
   }
+  required_web_plugin_ids = toset([
+    "source:csv",
+    "source:json",
+    "source:text",
+    "sink:csv",
+    "sink:json",
+    "sink:text",
+    "transform:field_mapper",
+    "transform:llm",
+    "transform:web_scrape",
+  ])
 
   effective_plugin_allowlist     = var.plugin_allowlist == null ? local.default_plugin_allowlist : var.plugin_allowlist
   effective_plugin_preferences   = var.plugin_preferences == null ? local.default_plugin_preferences : var.plugin_preferences
   effective_plugin_control_modes = var.plugin_control_modes == null ? local.default_plugin_control_modes : var.plugin_control_modes
+  effective_authorized_plugin_ids = setunion(
+    local.required_web_plugin_ids,
+    toset(local.effective_plugin_allowlist),
+  )
 
   plugin_allowlist     = jsonencode(local.effective_plugin_allowlist)
   plugin_preferences   = jsonencode(local.effective_plugin_preferences)
   plugin_control_modes = jsonencode(local.effective_plugin_control_modes)
-  # A cross-region ("global."/"us."/"eu."/"apac.") inference profile is authorized by Bedrock
-  # against the underlying foundation model in whichever region it actually routes to, and that
-  # authorization check reports a region-less resource ARN. A single region-pinned
-  # foundation-model grant never matches that check, so derive an additional wildcard-region
-  # grant for every configured Composer model (primary and advisor) that carries one of these
-  # prefixes; a non-cross-region model keeps relying solely on the region-pinned ARNs supplied
-  # in var.bedrock_foundation_model_arns.
-  bedrock_cross_region_prefixes = ["global.", "us.", "eu.", "apac."]
+  # A cross-region inference profile is authorized by Bedrock against the underlying foundation
+  # model in whichever region it actually routes to, and that authorization check reports a
+  # region-less resource ARN. A single region-pinned foundation-model grant never matches that
+  # check, so derive an additional wildcard-region grant for every configured Composer model
+  # (primary and advisor) that carries one of these prefixes; a non-cross-region model keeps
+  # relying solely on the region-pinned ARNs supplied in var.bedrock_foundation_model_arns.
+  #
+  # This list is an explicit allowlist and MUST be extended as AWS ships new geography
+  # prefixes. It deliberately is not a pattern match: a model id's leading dotted label is
+  # ambiguous between a geography ("au.anthropic.claude-opus-5") and a provider
+  # ("zai.glm-4.7-flash", whose version segment also contains a dot), so no reliable
+  # structural rule separates the two. A missing geography prefix used to fail open-ended —
+  # terraform plan validated cleanly, no wildcard grant was derived, and bedrock:InvokeModel
+  # then denied intermittently depending on which destination region the profile routed to.
+  # The bedrock_unclassified_model_ids gate below closes that hole: a model id whose leading
+  # dotted label matches neither this list nor bedrock_known_provider_prefixes fails the plan
+  # (see the precondition on aws_iam_role_policy.task). After changing a Composer model, still
+  # confirm the rendered task-role policy carries an
+  # "arn:aws:bedrock:*::foundation-model/<base-id>" grant for it.
+  bedrock_cross_region_prefixes = ["global.", "us.", "eu.", "apac.", "au.", "jp.", "ca.", "br.", "in."]
+
+  # Leading dotted labels that are Bedrock model providers, not geographies. A match here
+  # classifies the model id as region-pinned, so it correctly receives no wildcard-region
+  # grant and relies on the region-pinned ARNs in var.bedrock_foundation_model_arns. Extend
+  # this list when AWS ships a new serverless provider; an unlisted label is refused at plan
+  # time rather than guessed at. GovCloud ("us-gov.") is deliberately absent: every ARN this
+  # module renders is in the "aws" partition, so a GovCloud profile must fail the gate rather
+  # than silently receive a wrong-partition grant.
+  bedrock_known_provider_prefixes = [
+    "ai21.",
+    "amazon.",
+    "anthropic.",
+    "cohere.",
+    "deepseek.",
+    "luma.",
+    "meta.",
+    "mistral.",
+    "openai.",
+    "qwen.",
+    "stability.",
+    "twelvelabs.",
+    "writer.",
+    "zai.",
+  ]
 
   # The grant follows the configuration instead of only the Composer pair.
   # Deriving it from the Composer models alone meant a profile naming any third
@@ -149,6 +201,26 @@ locals {
       null,
     )
   }
+
+  # Configured model ids whose leading dotted label is neither a known geography prefix nor a
+  # known provider label, and which no explicit var.bedrock_foundation_model_arns entry names
+  # (matched against both the full id and the id with its leading label stripped, because an
+  # unrecognised label could be either a provider or a geography). Anything left in this list
+  # is unclassifiable: deriving no grant would reproduce the silent intermittent AccessDeny
+  # this gate exists to prevent, so the precondition on aws_iam_role_policy.task rejects the
+  # plan and tells the operator what to supply instead.
+  bedrock_unclassified_model_ids = [
+    for model_id in local.bedrock_configured_model_ids : model_id
+    if strcontains(model_id, ".")
+    && local.bedrock_configured_model_cross_region_prefixes[model_id] == null
+    && !anytrue([
+      for prefix in local.bedrock_known_provider_prefixes : startswith(model_id, prefix)
+    ])
+    && !anytrue([
+      for arn in var.bedrock_foundation_model_arns :
+      endswith(arn, "/${model_id}") || endswith(arn, "/${try(regex("^[^.]+\\.(.+)$", model_id)[0], model_id)}")
+    ])
+  ]
 
   bedrock_cross_region_foundation_model_arns = distinct([
     for model_id, prefix in local.bedrock_configured_model_cross_region_prefixes :
@@ -189,6 +261,31 @@ locals {
       region_name = coalesce(profile.region_name, var.aws_region)
     }
   }
+  bedrock_profile_model_ids = {
+    for alias, profile in local.effective_llm_profile_bindings :
+    alias => trimprefix(profile.model, "bedrock/")
+  }
+  bedrock_profile_cross_region_prefixes = {
+    for alias, model_id in local.bedrock_profile_model_ids :
+    alias => local.bedrock_configured_model_cross_region_prefixes[model_id]
+  }
+  bedrock_profile_foundation_model_arns = distinct([
+    for alias, profile in local.effective_llm_profile_bindings :
+    "arn:aws:bedrock:${profile.region_name}::foundation-model/${local.bedrock_profile_model_ids[alias]}"
+    if local.bedrock_profile_cross_region_prefixes[alias] == null
+  ])
+  bedrock_profile_inference_profile_arns = distinct([
+    for alias, profile in local.effective_llm_profile_bindings :
+    "arn:aws:bedrock:${profile.region_name}:${var.aws_account_id}:inference-profile/${local.bedrock_profile_model_ids[alias]}"
+    if local.bedrock_profile_cross_region_prefixes[alias] != null
+  ])
+  bedrock_invoke_model_arns = distinct(concat(
+    tolist(var.bedrock_inference_profile_arns),
+    tolist(var.bedrock_foundation_model_arns),
+    local.bedrock_profile_foundation_model_arns,
+    local.bedrock_profile_inference_profile_arns,
+    local.bedrock_cross_region_foundation_model_arns,
+  ))
   llm_profiles = jsonencode(local.effective_llm_profile_bindings)
   # The tutorial needs A profile, not its OWN profile — it points at the ordinary
   # standard-tier one, the same way the systemd deployment points this at whichever

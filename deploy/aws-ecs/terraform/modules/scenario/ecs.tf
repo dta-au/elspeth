@@ -1,6 +1,8 @@
 resource "aws_ecs_cluster" "scenario" {
   name = local.cluster_name
 
+  depends_on = [aws_cloudwatch_log_group.container_insights]
+
   setting {
     name  = "containerInsights"
     value = "enabled"
@@ -74,7 +76,7 @@ locals {
       { name = "ELSPETH_CW_AGENT_OTEL_YAML_SHA256", value = local.cw_agent_otel_yaml_sha256 },
     ]
     healthCheck = {
-      command     = ["CMD-SHELL", "kill -0 1"]
+      command     = ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()"]
       interval    = 10
       timeout     = 5
       retries     = 6
@@ -242,13 +244,12 @@ resource "aws_ecs_task_definition" "candidate_web" {
 
     precondition {
       condition = alltrue(flatten([
-        for capability, mode in local.effective_plugin_control_modes : [
-          for implementation in lookup(local.effective_plugin_preferences, capability, []) :
-          contains(local.effective_plugin_allowlist, implementation)
+        for implementations in values(local.effective_plugin_preferences) : [
+          for implementation in implementations :
+          contains(local.effective_authorized_plugin_ids, implementation)
         ]
-        if mode == "required"
       ]))
-      error_message = "every implementation preferred for a \"required\" control must also appear in plugin_allowlist, or the web service cannot satisfy that control."
+      error_message = "every preferred implementation must be authorized by the always-authorized web core or plugin_allowlist."
     }
   }
 }

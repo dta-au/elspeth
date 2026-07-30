@@ -2562,6 +2562,21 @@ async def post_guided_respond(
                 source_inspection_facts=inspection_facts,
             )
         except (PluginConfigError, TypeError, ValueError) as exc:
+            # The client sees the closed generic detail, but the operator must
+            # be able to diagnose WHICH contract check rejected the response —
+            # a silent 400 here wedged the first-run tutorial undiagnosably
+            # (elspeth-a88c07cd47: server-held prefill failed its own plugin
+            # config model on every echo).
+            with contextlib.suppress(Exception):
+                slog.warning(
+                    "guided.respond_turn_contract_rejected",
+                    session_id=str(session_id),
+                    user_id=user.user_id,
+                    step=observed_guided.step.value,
+                    turn_type=current_turn["type"],
+                    rejection_code="invalid_guided_response",
+                    exc_class=type(exc).__name__,
+                )
             raise HTTPException(
                 status_code=400,
                 detail="Guided response does not satisfy the current turn contract.",

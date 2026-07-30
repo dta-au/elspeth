@@ -23,13 +23,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import pairwise
-from typing import Any, Final, TypedDict, cast
+from typing import Any, Final, Literal, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
-from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError, get_sink_config_model
 from elspeth.web.blobs.protocol import ALLOWED_MIME_TYPES, AllowedMimeType
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
@@ -1914,6 +1916,53 @@ def _parse_step_2_sink_tool_arguments(arguments: str) -> tuple[SinkResolved, str
     return SinkResolved(outputs=(output,)), assistant_message
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedSinkConfigRejection:
+    """Repair feedback plus closed operator-safe classification."""
+
+    rejection_code: Literal["unknown_sink_plugin", "invalid_sink_configuration"]
+    exception_class: str
+    repair_message: str
+
+
+def resolved_sink_config_error(sink: SinkResolved) -> ResolvedSinkConfigRejection | None:
+    """Return the plugin config-model rejection for a resolved sink, if any.
+
+    LLM-resolved options that satisfy ``resolve_sink``'s shape contract can
+    still violate the target plugin's config model (observed live: ``schema:
+    {mode: flexible}`` without ``fields``, elspeth-a88c07cd47). Options staged
+    as schema-form prefill become server-held authority that every
+    ``/guided/respond`` echo re-validates, so an invalid resolution must be
+    caught before staging — afterwards the session is unrecoverable from the
+    client.
+    """
+    (output,) = sink.outputs
+    try:
+        config_model = get_sink_config_model(output.plugin)
+    except UnknownPluginTypeError as exc:
+        return ResolvedSinkConfigRejection(
+            rejection_code="unknown_sink_plugin",
+            exception_class=type(exc).__name__,
+            repair_message=str(exc),
+        )
+    if config_model is None:
+        return None
+    # Mirror the respond-time authority check: thaw the frozen snapshot for
+    # the exact-type config model, and keep on_write_failure out — it is node
+    # wrapper policy, not plugin config.
+    thawed = cast(dict[str, Any], deep_thaw(dict(output.options)))
+    plugin_options = {name: value for name, value in thawed.items() if name != "on_write_failure"}
+    try:
+        config_model.from_dict(plugin_options, plugin_name=output.plugin)
+    except PluginConfigError as exc:
+        return ResolvedSinkConfigRejection(
+            rejection_code="invalid_sink_configuration",
+            exception_class=type(exc).__name__,
+            repair_message=str(exc),
+        )
+    return None
+
+
 _STEP_2_SINK_DISCOVERY_TOOL_NAMES: Final[frozenset[str]] = frozenset({"list_sinks", "get_plugin_schema"})
 """Read-only discovery tools the sink stage offers the composer model.
 
@@ -2125,8 +2174,29 @@ async def maybe_resolve_step_2_sink_chat(
                         f"{function.name} function.arguments must be a JSON string; got {type(arguments).__name__}"
                     )
                 sink, assistant = _parse_step_2_sink_tool_arguments(arguments)
+                config_rejection = resolved_sink_config_error(sink)
+                if config_rejection is None:
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return Step2SinkResolvedOutcome(sink=sink, assistant_message=assistant)
+                # Config-invalid resolution: thread the rejection back as the
+                # tool result so the model can correct itself within the same
+                # Send. At the iteration cap the loop degrades to the advisory
+                # fallback below instead of staging prefill that would wedge
+                # every subsequent /guided/respond echo (elspeth-a88c07cd47).
+                messages.append(_assistant_tool_calls_message(message, tool_calls))
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": terminal_calls[0].id,
+                        "content": (
+                            f"resolve_sink rejected: the options do not satisfy the {sink.outputs[0].plugin!r} "
+                            f"sink's configuration contract: {config_rejection.repair_message} "
+                            "Correct the options and call resolve_sink again."
+                        ),
+                    }
+                )
                 status = ComposerLLMCallStatus.SUCCESS
-                return Step2SinkResolvedOutcome(sink=sink, assistant_message=assistant)
+                continue
 
             # A clean, tool-call-free reply: the model judged the message
             # doesn't carry enough detail to act (or it's a plain question)

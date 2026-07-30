@@ -1614,6 +1614,7 @@ class TestRowUnionFailureTelemetry:
         assert [event.token_id for event in ctx.emitted_events] == ["token-1", "token-2"]
         assert all(event.outcome is TerminalOutcome.FAILURE for event in ctx.emitted_events)
         assert all(event.path is TerminalPath.UNROUTED for event in ctx.emitted_events)
+        assert counters.rows_coalesce_failed == 1
 
     def test_end_of_source_flush_emits_token_completed_for_every_consumed_token(self) -> None:
         executor = _FakeRowUnionExecutor(flush_outcomes=[self._failed_outcome()])
@@ -1629,3 +1630,4 @@ class TestRowUnionFailureTelemetry:
         )
 
         assert [event.token_id for event in ctx.emitted_events] == ["token-1", "token-2"]
+        assert counters.rows_coalesce_failed == 1

@@ -1075,6 +1075,29 @@ def test_schema_form_plugin_mismatch_never_selects_a_client_named_model_or_reser
     assert asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id))) == versions_before
 
 
+def test_unsupported_guided_selection_never_reaches_operator_logs(
+    composer_test_client: TestClient,
+) -> None:
+    from structlog.testing import capture_logs
+
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    canary = "raw-guided-selection-canary-7f3a9d"
+
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=_live_body(turn, chosen=[canary]),
+        )
+
+    assert response.status_code == 400, response.json()
+    rejection = next(entry for entry in logs if entry["event"] == "guided.respond_turn_contract_rejected")
+    assert rejection["rejection_code"] == "invalid_guided_response"
+    assert rejection["exc_class"] == "ValueError"
+    assert "error_detail" not in rejection
+    assert canary not in repr(logs)
+
+
 def test_expired_operation_is_not_taken_over_before_live_preflight(
     composer_test_client: TestClient,
 ) -> None:

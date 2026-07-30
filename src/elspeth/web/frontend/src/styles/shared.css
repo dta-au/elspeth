@@ -631,6 +631,51 @@
   gap: var(--space-1-5);
 }
 
+/* Collapsed pass state: the whole banner is a single expand affordance,
+   mirroring .audit-readiness-summary. Padding moves onto the button so the
+   full banner surface is clickable. */
+.validation-banner--collapsed {
+  padding: 0;
+}
+
+.validation-banner-summary-btn {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1-5);
+  width: 100%;
+  padding: var(--space-sm) var(--space-lg);
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.validation-banner-summary-btn:hover .validation-banner-summary {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.validation-banner-summary-meta {
+  margin-left: auto;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-regular);
+  color: var(--color-text-muted);
+}
+
+.validation-banner-collapse-btn {
+  margin-left: auto;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .validation-banner-summary {
   font-weight: var(--font-weight-semibold);
 }

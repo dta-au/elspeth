@@ -119,7 +119,10 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
                 "landscape_epoch": 29,
                 "run_web_plugin_policy_present": True,
             },
-            "structural_changes": "session_epoch_35_to_37_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier",
+            "structural_changes": (
+                f"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
+                "_blob_cleanup_guided_decline_and_row_union_barrier"
+            ),
             "semantics_only_changes": "none",
             "archive_export_decision": "required_before_forward_migration",
             "destructive_reset_required": False,

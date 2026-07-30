@@ -32,6 +32,11 @@ from elspeth.testing import make_field, make_row
 _state_counter = itertools.count(1)
 
 
+def _branch_loss_lookup(*, run_id: str, barrier_name: str, row_id: str) -> bool:
+    """Callable spec for the durable branch-loss point-read port."""
+    return False
+
+
 def _next_state_id() -> str:
     return f"state_{next(_state_counter):04d}"
 
@@ -75,6 +80,7 @@ def _make_executor(
     execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=_next_state_id())
     execution.get_completed_row_ids_for_nodes.return_value = set()
     execution.has_completed_row_for_node.return_value = False
+    execution.has_released_row_for_node.return_value = False
     data_flow = MagicMock(spec=DataFlowRepository)
     if clock is None:
         clock = MockClock(start=100.0)
@@ -89,6 +95,11 @@ def _make_executor(
         barrier_restore_reads=SimpleNamespace(
             get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
             has_completed_row_for_node=execution.has_completed_row_for_node,
+            has_released_row_for_node=execution.has_released_row_for_node,
+            has_branch_loss_for_group=MagicMock(
+                spec=_branch_loss_lookup,
+                return_value=False,
+            ),
         ),
     )
     return executor, execution, data_flow, clock
@@ -173,8 +184,77 @@ class TestLateArrival:
         assert late.held is False
         assert late.late_arrival is True
         assert late.outcomes_recorded is True
-        assert late.failure_reason is not None
+        assert late.failure_reason == "late_arrival_after_release"
         assert data_flow.record_token_outcome.call_args.kwargs["outcome"] is TerminalOutcome.FAILURE
+
+    def test_straggler_after_timeout_closure_carries_timeout_reason(self) -> None:
+        clock = MockClock(start=100.0)
+        executor, _execution, _data_flow, _ = _make_executor(clock=clock)
+        _register(executor, _make_settings(timeout_seconds=5.0))
+        executor.accept(_make_token(token_id="tok_a", branch_name="branch_a"), "variant_union")
+        clock.advance(10.0)
+        assert executor.check_timeouts("variant_union")[0].failure_reason == "row_union_timeout"
+
+        late = executor.accept(_make_token(token_id="tok_late", branch_name="branch_b"), "variant_union")
+
+        assert late.late_arrival is True
+        # The group never released — a straggler's audit record must carry
+        # the group's true closure reason, not "late_arrival_after_release".
+        assert late.failure_reason == "row_union_timeout"
+
+    def test_straggler_after_flush_closure_carries_flush_reason(self) -> None:
+        executor, _execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        executor.accept(_make_token(token_id="tok_a", branch_name="branch_a"), "variant_union")
+        assert executor.flush_pending()[0].failure_reason == "row_union_incomplete_at_flush"
+
+        late = executor.accept(_make_token(token_id="tok_late", branch_name="branch_b"), "variant_union")
+
+        assert late.late_arrival is True
+        assert late.failure_reason == "row_union_incomplete_at_flush"
+
+    def test_landscape_fallback_distinguishes_released_from_failed_closure(self) -> None:
+        executor, execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        execution.has_completed_row_for_node.return_value = True
+        execution.has_released_row_for_node.return_value = False
+
+        late = executor.accept(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union")
+
+        assert late.late_arrival is True
+        # A FAILED closure found through the Landscape point read must not be
+        # reported as a release.
+        assert late.failure_reason == "row_union_group_failed"
+        assert executor.is_group_released("variant_union", "row_1") is False
+
+    def test_landscape_failed_closure_preserves_durable_branch_loss_reason(self) -> None:
+        executor, execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        execution.has_completed_row_for_node.return_value = True
+        execution.has_released_row_for_node.return_value = False
+        executor._barrier_restore_reads.has_branch_loss_for_group.return_value = True
+
+        late = executor.accept(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union")
+
+        assert late.late_arrival is True
+        assert late.failure_reason == "row_union_branch_lost"
+        executor._barrier_restore_reads.has_branch_loss_for_group.assert_called_once_with(
+            run_id="run_1",
+            barrier_name="variant_union",
+            row_id="row_1",
+        )
+
+    def test_landscape_fallback_released_closure_is_late_arrival_after_release(self) -> None:
+        executor, execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        execution.has_completed_row_for_node.return_value = True
+        execution.has_released_row_for_node.return_value = True
+
+        late = executor.accept(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union")
+
+        assert late.late_arrival is True
+        assert late.failure_reason == "late_arrival_after_release"
+        assert executor.is_group_released("variant_union", "row_1") is True
 
 
 class TestTimeouts:
@@ -264,9 +344,74 @@ class TestBranchLoss:
         assert late.held is False
         assert late.failure_reason is not None
 
-    def test_recorded_loss_survives_completed_key_cache_eviction(self) -> None:
+    def test_lost_branch_after_release_records_nothing(self) -> None:
+        # Released tokens keep branch_name, so a terminal divert downstream
+        # of the union re-enters the loss path; a released group is not a
+        # pre-barrier loss and must not pollute the loss indexes.
+        executor, _execution, data_flow, _clock = _make_executor()
+        _register(executor)
+        executor.accept(_make_token(token_id="tok_a", branch_name="branch_a"), "variant_union")
+        executor.accept(_make_token(token_id="tok_b", branch_name="branch_b"), "variant_union")
+        assert executor.is_group_released("variant_union", "row_1") is True
+
+        outcome = executor.notify_branch_lost(
+            row_union_name="variant_union",
+            row_id="row_1",
+            lost_branch="branch_a",
+            reason="routed_to_sink",
+        )
+
+        assert outcome is None
+        assert executor.has_recorded_branch_loss("variant_union", "row_1", "branch_a") is False
+        data_flow.record_token_outcome.assert_not_called()
+        # The released closure survives untouched: a genuine straggler for
+        # this key is still reported against the release, not a branch loss.
+        assert executor.is_group_released("variant_union", "row_1") is True
+
+    def test_lost_branch_after_evicted_release_uses_durable_completion_before_recording(self) -> None:
+        executor, execution, _data_flow, _clock = _make_executor(max_completed_keys=1)
+        _register(executor)
+        for row_id in ("row_1", "row_2"):
+            executor.accept(_make_token(row_id=row_id, token_id=f"{row_id}-a", branch_name="branch_a"), "variant_union")
+            executor.accept(_make_token(row_id=row_id, token_id=f"{row_id}-b", branch_name="branch_b"), "variant_union")
+        execution.has_completed_row_for_node.reset_mock()
+        execution.has_completed_row_for_node.return_value = True
+        execution.has_released_row_for_node.return_value = True
+
+        outcome = executor.notify_branch_lost(
+            row_union_name="variant_union",
+            row_id="row_1",
+            lost_branch="branch_a",
+            reason="routed_to_sink",
+        )
+
+        assert outcome is None
+        assert executor.has_recorded_branch_loss("variant_union", "row_1", "branch_a") is False
+        execution.has_completed_row_for_node.assert_called_once_with(
+            run_id="run_1",
+            node_id="node_union",
+            row_id="row_1",
+        )
+        assert executor.is_group_released("variant_union", "row_1") is True
+
+    def test_is_group_released_false_for_failure_closed_group(self) -> None:
+        executor, _execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        executor.accept(_make_token(token_id="tok_a", branch_name="branch_a"), "variant_union")
+        executor.notify_branch_lost(
+            row_union_name="variant_union",
+            row_id="row_1",
+            lost_branch="branch_b",
+            reason="diverted_to_error_sink",
+        )
+        assert executor.is_group_released("variant_union", "row_1") is False
+
+    def test_recorded_loss_indexes_are_bounded_with_durable_fallback_after_eviction(self) -> None:
         executor, _execution, _data_flow, _clock = _make_executor(max_completed_keys=1)
         _register(executor)
+        executor._barrier_restore_reads.has_branch_loss_for_group.side_effect = (  # white-box cache regression
+            lambda *, run_id, barrier_name, row_id: run_id == "run_1" and barrier_name == "variant_union" and row_id == "row_1"
+        )
         for row_id in ("row_1", "row_2"):
             executor.notify_branch_lost(
                 row_union_name="variant_union",
@@ -275,6 +420,8 @@ class TestBranchLoss:
                 reason="diverted_to_error_sink",
             )
 
+        assert len(executor._recorded_losses) <= 1  # resident-memory bound is the contract
+        assert len(executor._recorded_loss_groups) <= 1  # resident-memory bound is the contract
         late = executor.accept(
             _make_token(row_id="row_1", token_id="tok_a", branch_name="branch_a"),
             "variant_union",
@@ -282,14 +429,44 @@ class TestBranchLoss:
 
         assert late.held is False
         assert late.failure_reason == "row_union_branch_lost"
+        executor._barrier_restore_reads.has_branch_loss_for_group.assert_called_once_with(
+            run_id="run_1",
+            barrier_name="variant_union",
+            row_id="row_1",
+        )
+
+    def test_durable_release_precedes_a_recent_branch_loss_hint(self) -> None:
+        executor, execution, _data_flow, _clock = _make_executor(max_completed_keys=1)
+        _register(executor)
+        executor.notify_branch_lost(
+            row_union_name="variant_union",
+            row_id="row_1",
+            lost_branch="branch_b",
+            reason="error_routed",
+        )
+        # Close a different group to evict row_1 from the completion cache
+        # while leaving its recent branch-loss hint resident.
+        executor.accept(_make_token(row_id="row_2", token_id="tok_2a", branch_name="branch_a"), "variant_union")
+        executor.accept(_make_token(row_id="row_2", token_id="tok_2b", branch_name="branch_b"), "variant_union")
+        execution.has_completed_row_for_node.return_value = True
+        execution.has_released_row_for_node.return_value = True
+
+        late = executor.accept(
+            _make_token(row_id="row_1", token_id="tok_late", branch_name="branch_a"),
+            "variant_union",
+        )
+
+        assert late.held is False
+        assert late.failure_reason == "late_arrival_after_release"
+        execution.has_released_row_for_node.assert_called_once()
 
 
 class TestRestoreFromJournal:
-    def test_restored_loss_fails_pending_sibling_instead_of_reopening_group(self) -> None:
+    def test_durable_loss_point_read_fails_pending_sibling_instead_of_reopening_group(self) -> None:
         executor, _execution, data_flow, _clock = _make_executor()
         _register(executor)
         restored = _make_token(token_id="tok_a", branch_name="branch_a")
-        executor.restore_branch_losses((("variant_union", "row_1", "branch_b"),))
+        executor._barrier_restore_reads.has_branch_loss_for_group.return_value = True
 
         outcomes = executor.restore_from_journal(entries=(RowUnionRestoreEntry(restored, "variant_union", "state-a", 90.0),))
 
@@ -297,6 +474,51 @@ class TestRestoreFromJournal:
         assert outcomes[0].failure_reason == "row_union_branch_lost"
         assert outcomes[0].consumed_tokens == (restored,)
         data_flow.record_token_outcome.assert_called_once()
+        executor._barrier_restore_reads.has_branch_loss_for_group.assert_called_once_with(
+            run_id="run_1",
+            barrier_name="variant_union",
+            row_id="row_1",
+        )
+
+    def test_all_durable_loss_reads_finish_before_any_recovery_state_mutation(self) -> None:
+        executor, execution, data_flow, _clock = _make_executor()
+        _register(executor)
+        restored_a = _make_token(row_id="row_1", token_id="tok_a", branch_name="branch_a")
+        restored_b = _make_token(row_id="row_2", token_id="tok_b", branch_name="branch_a")
+        executor._barrier_restore_reads.has_branch_loss_for_group.side_effect = (
+            True,
+            RuntimeError("second durable loss read failed"),
+        )
+
+        with pytest.raises(RuntimeError, match="second durable loss read failed"):
+            executor.restore_from_journal(
+                entries=(
+                    RowUnionRestoreEntry(restored_a, "variant_union", "state-a", 90.0),
+                    RowUnionRestoreEntry(restored_b, "variant_union", "state-b", 91.0),
+                )
+            )
+
+        execution.complete_node_state.assert_not_called()
+        data_flow.record_token_outcome.assert_not_called()
+        assert executor._pending == {}
+
+    def test_reconcile_released_group_refuses_recorded_loss_key(self) -> None:
+        # Pins the pristine-group guard the coordination seam depends on: a
+        # replayed loss for the key makes the group non-pristine, so the
+        # restore path must filter stale losses BEFORE restore_branch_losses
+        # (barrier_coordination drops losses contradicted by durable release
+        # evidence) rather than expect reconcile to tolerate them.
+        executor, _execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        executor.restore_branch_losses((("variant_union", "row_1", "branch_b"),))
+
+        with pytest.raises(OrchestrationInvariantError, match="non-pristine"):
+            executor.reconcile_released_group(
+                entries=(
+                    RowUnionRestoreEntry(_make_token(token_id="tok_a", branch_name="branch_a"), "variant_union", None, 90.0),
+                    RowUnionRestoreEntry(_make_token(token_id="tok_b", branch_name="branch_b"), "variant_union", None, 91.0),
+                )
+            )
 
     def test_reconcile_released_group_completes_only_still_open_states(self) -> None:
         executor, execution, _data_flow, _clock = _make_executor()

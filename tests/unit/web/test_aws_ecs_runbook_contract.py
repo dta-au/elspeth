@@ -155,7 +155,12 @@ def test_runbook_preserves_supported_agent_health_mode() -> None:
     task = next(document for document in _json_documents() if isinstance(document, dict) and "containerDefinitions" in document)
     sidecar = next(container for container in task["containerDefinitions"] if container["name"] == "cloudwatch-agent")
 
-    assert sidecar["healthCheck"]["command"] == ["CMD-SHELL", "kill -0 1"]
+    assert sidecar["healthCheck"]["command"] == [
+        "CMD",
+        "python",
+        "-c",
+        "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()",
+    ]
     assert sidecar["healthCheck"] == task_definition._CLOUDWATCH_AGENT_HEALTH_CHECK
     assert "-m ecs" not in json.dumps(sidecar)
 
@@ -935,6 +940,10 @@ def test_runbook_is_linked_from_operator_indexes() -> None:
 
     assert REDEPLOY_RUNBOOK.is_file()
     assert (
+        "| [AWS ECS Cold Install](aws-ecs-cold-install.md) "
+        "| Create a complete disposable stack with the tracked Scenario A Terraform package, including Aurora, monitoring, and Bedrock |"
+    ) in index
+    assert (
         "| [AWS ECS Existing-Service Redeploy](aws-ecs-existing-service-redeploy.md) "
         "| Build, scan, and deploy an immutable image to an existing ECS/Fargate service |"
     ) in index
@@ -942,6 +951,9 @@ def test_runbook_is_linked_from_operator_indexes() -> None:
         "| [AWS ECS Full Disposable Acceptance](aws-ecs-deployment.md) "
         "| Provision, exercise, and destroy the release-specific two-scenario acceptance environment |"
     ) in index
+    assert (
+        "[AWS ECS Cold Install](../runbooks/aws-ecs-cold-install.md) - Complete disposable stack with Aurora, monitoring, and Bedrock"
+    ) in guide
     assert (
         "[AWS ECS Existing-Service Redeploy](../runbooks/aws-ecs-existing-service-redeploy.md) - Everyday immutable image redeploy"
     ) in guide
@@ -1015,6 +1027,46 @@ def test_runbook_requires_immutable_rds_trust_before_release_promotion() -> None
     assert "c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700" in text
     assert text.index("session_tls") < text.index("0.7.2-RC-290726")
     assert text.index("landscape_tls") < text.index("0.7.2-RC-290726")
+
+
+def test_terraform_readme_one_shot_verifier_fails_closed_per_step() -> None:
+    """run_one_shot() must never print its ok line after a failed step: each
+    of run-task, wait tasks-stopped, and the exit-code test reports a
+    distinguishable stderr failure and returns nonzero on its own.
+    """
+    text = TERRAFORM_README.read_text(encoding="utf-8")
+    helper = text[text.index("run_one_shot() {") : text.index("run_one_shot \\")]
+
+    assert helper.count("|| {") == 3
+    assert helper.count("return 1") == 3
+    assert helper.count(">&2") == 3
+    ordered = (
+        "aws ecs run-task",
+        "FAILED (run-task)",
+        "aws ecs wait tasks-stopped",
+        "FAILED (wait tasks-stopped)",
+        "aws ecs describe-tasks",
+        "FAILED (nonzero container exit code)",
+        "printf '%s: ok\\n' \"$expected_command\"",
+    )
+    positions = [helper.index(marker) for marker in ordered]
+    assert positions == sorted(positions)
+    assert helper.rindex("return 1") < helper.index("printf '%s: ok")
+    result = subprocess.run(["sh", "-n"], input=helper, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_terraform_readme_acceptance_env_carries_the_server_data_dir_from_inventory() -> None:
+    """capture/verify-api derive the expected sink node id from the server's
+    canonical data dir, so acceptance.env must project the inventory's
+    ELSPETH_WEB__DATA_DIR alongside the tutorial profile.
+    """
+    text = TERRAFORM_README.read_text(encoding="utf-8")
+    env_block = text[text.index("umask 077") : text.index('>"$acceptance_dir/acceptance.env"')]
+
+    assert "printf 'ELSPETH_WEB__DATA_DIR=%s\\n' \\" in env_block
+    assert "jq -er '.values.ELSPETH_WEB__DATA_DIR'" in env_block
+    assert env_block.index("ELSPETH_WEB__DEFAULT_LLM_PROFILE=") < env_block.index("ELSPETH_WEB__DATA_DIR=")
 
 
 def test_terraform_readme_requires_immutable_rds_trust_before_release_promotion() -> None:

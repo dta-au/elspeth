@@ -151,7 +151,12 @@ resource "terraform_data" "database_bootstrap" {
     aws_secretsmanager_secret_version.bootstrap.version_id,
   ]
 
-  depends_on = [aws_secretsmanager_secret_version.bootstrap]
+  depends_on = [
+    aws_secretsmanager_secret_version.bootstrap,
+    aws_route_table_association.public,
+    aws_iam_role_policy_attachment.execution_managed,
+    aws_iam_role_policy.execution_secrets,
+  ]
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-ceu"]

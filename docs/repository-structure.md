@@ -23,7 +23,7 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 | Developer & CI automation | `scripts/` | Runnable repo automation: CI check logic, eval drivers, git hooks, audits, deploy helpers. |
 | Deliverable-artifact build | `tools/` | Build pipelines that render *distributable artifacts* (currently `tools/pdf/`). |
 | CI/CD & governance config | `config/`, `.github/`, `.githooks/` | Declarative policy + workflow triggers + local hook bindings (see [§ CI three-way](#ci-the-three-way-split)). |
-| Deployment | `deploy/`, root `Dockerfile` / `docker-compose.yaml` | How the service is shipped and run: `deploy/compose/` adds the maintained PostgreSQL Compose bundle, while `deploy/linux-systemd/` contains the portable native-Linux unit and environment example. The existing `deploy/elspeth-web.service` is staging-specific. |
+| Deployment | `deploy/`, root `Dockerfile` / `docker-compose.yaml` | How the service is shipped and run: `deploy/compose/` adds the maintained PostgreSQL Compose bundle, `deploy/aws-ecs/terraform/` contains the supported disposable ECS cold-install source, and `deploy/linux-systemd/` contains the portable native-Linux unit and environment example. The existing `deploy/elspeth-web.service` is staging-specific. |
 | Internal evaluation | `evals/` | LLM/composer evaluation harness + dated run records. **Local-only (gitignored) as of 2026-06-28** — *except* `evals/__init__.py` and `evals/lib/`, which stay tracked because `tests/unit/evals/` import `evals.lib.*`. The dated run records and harnesses live on contributors' machines, not in the repo. |
 | Engineering notes | `notes/` | Ad-hoc engineering memos and baselines — explicitly internal, low-ceremony. |
 | Auxiliary package | `elspeth-lints/` | The CI tier-model linter — its own Python package (own `pyproject.toml`) consumed by CI, not by `src/`. |
@@ -44,6 +44,7 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 - **`data/`** → `skills/` (deployment examples of the live composer skill prompt); runtime DBs live here at deploy time (gitignored).
 - **`docs/`** → see its own [index](README.md); plans/specs that are implemented are removed from active docs and may be preserved by maintainers in the ignored local archive.
 - **`deploy/`** → `compose/` (PostgreSQL and web Compose overlays),
+  `aws-ecs/terraform/` (disposable single-replica AWS cold-install source),
   `linux-systemd/` (portable native-Linux service and environment example), and
   the existing staging-specific service unit. Azure uses the portable Linux
   path; Kubernetes remains BYO and has no shipped directory in this release.
@@ -94,6 +95,7 @@ two pipelines no longer overlap.
 
 ### Deployment spread
 ✓ Distinct by *target*: `deploy/compose/` = maintained database/web overlays;
+`deploy/aws-ecs/terraform/` = maintained disposable AWS ECS infrastructure;
 `deploy/linux-systemd/` = portable host service and environment example; root
 `Dockerfile`/`docker-compose.yaml` = container image and CLI-oriented base;
 `scripts/deploy-vm.sh` + `validate_deployment.py` = automation that drives a

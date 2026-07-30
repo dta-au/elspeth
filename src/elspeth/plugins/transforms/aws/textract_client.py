@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -38,6 +39,21 @@ _MAX_ERROR_CODE_LENGTH = 128
 _MAX_JOB_ID_LENGTH = 64
 _MAX_NEXT_TOKEN_LENGTH = 1024
 _SDK_TOTAL_MAX_ATTEMPTS = 3
+
+_send_attempts = threading.local()
+
+
+def _record_send_attempt(**_: Any) -> None:
+    """Count one started HTTP attempt; registered on botocore's before-send event."""
+    _send_attempts.count = getattr(_send_attempts, "count", 0) + 1
+
+
+def _reset_send_attempts() -> None:
+    _send_attempts.count = 0
+
+
+def _observed_send_attempts() -> int:
+    return max(1, getattr(_send_attempts, "count", 0))
 
 
 class TextractResponseError(ValueError):
@@ -141,11 +157,11 @@ def _query_request(queries: Sequence[Mapping[str, Any]]) -> list[Mapping[str, An
     return result
 
 
-def _provider_error(error: Exception) -> tuple[str, bool, int, bool]:
+def _provider_error(error: Exception, *, observed_attempts: int) -> tuple[str, bool, int, bool]:
     from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 
     if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
-        return "transport_error", True, _SDK_TOTAL_MAX_ATTEMPTS, False
+        return "transport_error", True, observed_attempts, False
     if not isinstance(error, ClientError):
         return "botocore_error", False, 1, False
 
@@ -196,7 +212,9 @@ def build_textract_sdk_client(
         kwargs["aws_secret_access_key"] = aws_secret_access_key
         if aws_session_token is not None:
             kwargs["aws_session_token"] = aws_session_token
-    return cast("TextractSDKClient", boto3.client("textract", **kwargs))
+    client = boto3.client("textract", **kwargs)
+    client.meta.events.register("before-send.textract", _record_send_attempt)
+    return cast("TextractSDKClient", client)
 
 
 class TextractClient(AuditedClientBase):
@@ -313,6 +331,7 @@ class TextractClient(AuditedClientBase):
         attempts = 1
         try:
             self._acquire_rate_limit()
+            _reset_send_attempts()
             raw_response = self._sdk_client.start_document_analysis(**sdk_request)
             response = _mapping(raw_response)
             request_id_present, attempts = _parse_response_metadata(response.get("ResponseMetadata"))
@@ -336,7 +355,7 @@ class TextractClient(AuditedClientBase):
             call_status = CallStatus.ERROR
             error_payload = RawCallPayload({"type": error.category, "retryable": False})
         except _textract_provider_exception_types() as error:
-            code, retryable, attempts, idempotency_mismatch = _provider_error(error)
+            code, retryable, attempts, idempotency_mismatch = _provider_error(error, observed_attempts=_observed_send_attempts())
             receipt = None
             if idempotency_mismatch:
                 terminal_error = TextractIdempotencyInvariantError()
@@ -406,6 +425,7 @@ class TextractClient(AuditedClientBase):
         attempts = 1
         try:
             self._acquire_rate_limit()
+            _reset_send_attempts()
             raw_response = self._sdk_client.get_document_analysis(**sdk_request)
             response = _mapping(raw_response)
             request_id_present, attempts = _parse_response_metadata(response.get("ResponseMetadata"))
@@ -414,7 +434,6 @@ class TextractClient(AuditedClientBase):
             semantic_response = {key: value for key, value in response.items() if key not in {"ResponseMetadata", "NextToken"}}
             try:
                 semantic_size = len(canonical_json(semantic_response).encode("utf-8"))
-                frozen_semantic = cast("Mapping[str, Any]", deep_freeze(semantic_response))
             except (TypeError, ValueError, RecursionError, UnicodeError) as error:
                 raise TextractResponseError from error
             if semantic_size > self._max_response_bytes:
@@ -422,6 +441,10 @@ class TextractClient(AuditedClientBase):
                     "Amazon Textract response exceeded the maximum response size",
                     category="response_too_large",
                 )
+            try:
+                frozen_semantic = cast("Mapping[str, Any]", deep_freeze(semantic_response))
+            except (TypeError, ValueError, RecursionError, UnicodeError) as error:
+                raise TextractResponseError from error
             result_page: AnalysisResultPage | None = AnalysisResultPage(
                 semantic_response=frozen_semantic,
                 next_token=returned_next_token,
@@ -447,7 +470,7 @@ class TextractClient(AuditedClientBase):
             call_status = CallStatus.ERROR
             error_payload = RawCallPayload({"type": error.category, "retryable": False})
         except _textract_provider_exception_types() as error:
-            code, retryable, attempts, idempotency_mismatch = _provider_error(error)
+            code, retryable, attempts, idempotency_mismatch = _provider_error(error, observed_attempts=_observed_send_attempts())
             result_page = None
             returned_next_token = None
             if idempotency_mismatch:

@@ -888,6 +888,106 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
     return facts
 
 
+class RouteDestinationFactDict(TypedDict):
+    """Redaction-safe repair facts for one unresolved route destination."""
+
+    dangling_on_success: NotRequired[str]
+    dangling_on_error: NotRequired[str]
+    declared_sinks: list[str]
+    consumable_connections: NotRequired[list[str]]
+
+
+def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinationFactDict]:
+    """Redaction-safe wiring facts for dangling routing-destination rejections.
+
+    Maps each component whose ``on_success`` / ``on_error`` names a destination
+    that ``_validate_runtime_route_destinations`` cannot resolve — keyed exactly
+    as those validation entries name their component (``source`` /
+    ``source:<name>`` / ``node:<id>``) — to the facts a repair needs:
+    the dangling value itself, ``declared_sinks`` (the candidate's
+    ``outputs[].sink_name`` set), and for on_success failures
+    ``consumable_connections`` (the connections downstream nodes read as their
+    input). ``on_error`` and coalesce ``on_success`` may only target sinks, so
+    those facts deliberately omit ``consumable_connections``.
+
+    AWS acceptance runs 2026-07-30 (ticket elspeth-5904b1683a): the canonical
+    CSV-to-JSON prompt intermittently exhausted its repair budget on
+    ``source_on_success_dangling`` because the bare code names neither the
+    value that dangled nor the sink it should have matched, and the static
+    guidance pointed at ``get_pipeline_state`` — which reads the BASELINE
+    session state (empty on a fresh compose), not the rejected candidate.
+    Everything here is a sink name, node id, or connection name the planner
+    itself authored in the rejected candidate — the same redaction judgment as
+    :func:`coalesce_reachability_facts` — so forwarding it through the
+    message-stripped repair feedback does not re-open the redaction boundary.
+    """
+    output_names = {output.name for output in state.outputs}
+    consumer_connections = _runtime_consumer_connections(state.nodes)
+    declared_sinks = sorted(output_names)
+    consumable = sorted(consumer_connections)
+    facts: dict[str, RouteDestinationFactDict] = {}
+
+    def _merge(component: str, entry: RouteDestinationFactDict) -> None:
+        if component in facts:
+            facts[component].update(entry)
+        else:
+            facts[component] = entry
+
+    for source_name, source in state.sources.items():
+        target = source.on_success
+        if target not in output_names and target not in consumer_connections:
+            component = "source" if source_name == "source" else f"source:{source_name}"
+            _merge(
+                component,
+                {
+                    "dangling_on_success": target,
+                    "declared_sinks": declared_sinks,
+                    "consumable_connections": consumable,
+                },
+            )
+
+    for node in state.nodes:
+        component = f"node:{node.id}"
+        if node.node_type in ("transform", "aggregation"):
+            if node.on_success is not None and node.on_success not in output_names and node.on_success not in consumer_connections:
+                _merge(
+                    component,
+                    {
+                        "dangling_on_success": node.on_success,
+                        "declared_sinks": declared_sinks,
+                        "consumable_connections": consumable,
+                    },
+                )
+            if (
+                node.node_type == "transform"
+                and node.on_error is not None
+                and node.on_error != "discard"
+                and node.on_error not in output_names
+            ):
+                _merge(
+                    component,
+                    {
+                        "dangling_on_error": node.on_error,
+                        "declared_sinks": declared_sinks,
+                    },
+                )
+        elif (
+            node.node_type == "coalesce"
+            and node.on_success is not None
+            and node.on_success not in output_names
+            and node.on_success not in consumer_connections
+        ):
+            # coalesce_on_success_unknown_sink: the destination must be a sink.
+            _merge(
+                component,
+                {
+                    "dangling_on_success": node.on_success,
+                    "declared_sinks": declared_sinks,
+                },
+            )
+    return facts
+
+
 def _validate_runtime_route_destinations(
     sources: Mapping[str, SourceSpec],
     nodes: tuple[NodeSpec, ...],

@@ -45,6 +45,7 @@ EXPECTED_COMMANDS = {
     "verify-operator-telemetry",
     "verify-payloads",
     "verify-s3",
+    "verify-textract",
 }
 
 EXPECTED_PUBLIC_EXPORTS = {
@@ -137,6 +138,7 @@ EXPECTED_PUBLIC_EXPORTS = {
     "verify_operator_telemetry_outage",
     "verify_payloads",
     "verify_s3",
+    "verify_textract",
     "write_acceptance_state",
     "xray_trace_id",
 }
@@ -250,6 +252,7 @@ PRIVATE_OWNER_EXPORTS = {
     "scenario_inventory": frozenset({"PLUGIN_POLICY_ASSIGNMENT_NAMES", "SCENARIO_ASSIGNMENT_NAMES"}),
     "state": frozenset({"AcceptanceCredentials", "AcceptanceState", "read_acceptance_state", "write_acceptance_state"}),
     "task_definition": frozenset({"validate_task_definition_policy_binding"}),
+    "textract": frozenset({"verify_textract"}),
 }
 
 
@@ -344,6 +347,7 @@ EXPECTED_PARSER_SURFACE = {
                     "verify-connection-budget",
                     "verify-operator-telemetry",
                     "verify-s3",
+                    "verify-textract",
                 ),
             ),
             S("candidate_sha", required=True),
@@ -539,6 +543,7 @@ EXPECTED_PARSER_SURFACE = {
     ("verify-s3",): ParserSurface(()),
     ("verify-bedrock",): ParserSurface(()),
     ("verify-bedrock-guardrails",): ParserSurface(()),
+    ("verify-textract",): ParserSurface(()),
     ("sanitize-evidence",): ParserSurface(
         (
             S(
@@ -615,7 +620,7 @@ def test_parser_surface_is_the_exact_reviewed_contract() -> None:
 
 
 def test_all_selected_base_public_exports_remain_importable() -> None:
-    assert len(EXPECTED_PUBLIC_EXPORTS) == 91
+    assert len(EXPECTED_PUBLIC_EXPORTS) == 92
     missing = EXPECTED_PUBLIC_EXPORTS.difference(vars(acceptance))
     assert not missing
 
@@ -623,7 +628,7 @@ def test_all_selected_base_public_exports_remain_importable() -> None:
 def test_all_private_owned_exports_are_facade_reexports_by_identity() -> None:
     facade_owned = {"build_parser", "main"}
     private_owned = {name for names in PRIVATE_OWNER_EXPORTS.values() for name in names}
-    assert len(private_owned) == 89
+    assert len(private_owned) == 90
     assert private_owned.isdisjoint(facade_owned)
     assert private_owned | facade_owned == EXPECTED_PUBLIC_EXPORTS
 
@@ -857,6 +862,7 @@ EXPECTED_DISPATCH_CONTRACTS = {
     ),
     ("verify-payloads",): D("verify_payloads", "run-id"),
     ("verify-s3",): D("verify_s3", DISPATCH_ENVIRONMENT),
+    ("verify-textract",): D("verify_textract", DISPATCH_ENVIRONMENT),
 }
 
 
@@ -1025,6 +1031,7 @@ def test_json_output_and_static_failure_envelopes(
     assert json.loads(captured.err) == {
         "check": "facade_contract",
         "error_class": "AcceptanceCheckError",
+        "step": None,
     }
 
     def unexpected_failure() -> None:
@@ -1034,7 +1041,12 @@ def test_json_output_and_static_failure_envelopes(
     assert acceptance.main(["provision-storage"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == '{"error_class":"AcceptanceInternalError"}\n'
+    assert json.loads(captured.err) == {
+        "error_class": "AcceptanceInternalError",
+        "error_code": "acceptance_internal",
+        "step": None,
+    }
+    assert "must not leak" not in captured.err
 
 
 def test_scenario_namespace_selected_base_value(capsys: pytest.CaptureFixture[str]) -> None:

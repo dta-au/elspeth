@@ -38,6 +38,7 @@ def _auth_env(**updates: str) -> Mapping[str, str]:
         "ELSPETH_ACCEPTANCE_BASE_URL": "https://staging.example",
         "ELSPETH_ACCEPTANCE_BEARER_TOKEN": "bearer-secret",
         "ELSPETH_WEB__DEFAULT_LLM_PROFILE": "tutorial",
+        "ELSPETH_WEB__DATA_DIR": "/var/lib/elspeth",
     }
     values.update(updates)
     return values
@@ -197,7 +198,12 @@ def test_fixed_pipeline_yaml_rejects_noncanonical_session_id() -> None:
 
 
 _SESSION_ID = "8e826f53-5f13-420f-8678-5ec0caecd15f"
-_FIXED_OUTPUT_SINK_NODE_ID = "sink_output_d4f5d8b83aa5"
+# Derived from the sink options AFTER the server's resolve_sink_data_path()
+# rewrite: path = /var/lib/elspeth/outputs/<session>/aws-ecs-acceptance-<session>.csv.
+# The pre-rewrite (authored-path) id was sink_output_d4f5d8b83aa5 and must
+# never match again — see test_fixed_output_sink_node_id_matches_the_real_
+# preflight_and_builder below.
+_FIXED_OUTPUT_SINK_NODE_ID = "sink_output_33920bb8f986"
 
 _TUTORIAL_SESSION_ID = "f6a99a36-13f9-49c9-a3af-d9f6f7924a56"
 
@@ -572,6 +578,115 @@ def test_capture_rejects_differently_named_sink_that_shares_the_output_prefix(tm
         )
 
 
+def test_fixed_output_sink_node_id_matches_the_real_preflight_and_builder(tmp_path: Path) -> None:
+    """Regression for the resolved-path divergence: the client's expected
+    sink node id must equal the id the production preflight path rewrite and
+    DAG builder derive for this exact pipeline document. The pre-fix client
+    hashed the AUTHORED relative sink path, but resolve_runtime_yaml_paths()
+    rewrites it to the session-scoped absolute path before the builder
+    hashes the sink config, so the authored-path id never matched a real
+    run's manifest.
+    """
+    from elspeth.core.config import load_settings_from_yaml_string
+    from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
+    from elspeth.web.composer import yaml_generator
+    from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+    from elspeth.web.execution.preflight import build_runtime_graph, resolve_runtime_yaml_paths
+
+    data_dir = (tmp_path / "data").resolve()
+    source_path = data_dir / "blobs" / _SESSION_ID / "aws-ecs-acceptance-input.csv"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(acceptance.FIXED_INPUT_BYTES)
+
+    authored_yaml = acceptance.build_fixed_pipeline_yaml(session_id=_SESSION_ID, source_path=str(source_path))
+    state = composition_state_from_runtime_yaml(authored_yaml)
+    resolved_yaml = resolve_runtime_yaml_paths(yaml_generator.generate_yaml(state), str(data_dir), session_id=_SESSION_ID)
+    settings = load_settings_from_yaml_string(resolved_yaml, expand_env_vars=False)
+    graph = build_runtime_graph(settings, instantiate_plugins_from_config(settings, preflight_mode=True))
+
+    expected = capture_module._fixed_output_sink_node_id(_SESSION_ID, data_dir=str(data_dir))
+    assert dict(graph.get_sink_id_map()) == {"output": expected}
+    assert expected != "sink_output_d4f5d8b83aa5"
+
+
+def test_capture_rejects_the_pre_rewrite_authored_path_sink_node_id(tmp_path: Path) -> None:
+    """A manifest carrying the id hashed from the authored relative sink
+    path (the pre-fix client computation) must fail closed: the server only
+    ever reports the id hashed from the rewritten absolute path.
+    """
+    api = _AcceptanceApi()
+    api.artifacts = [
+        {
+            "artifact_id": _ARTIFACT_ID,
+            "sink_node_id": "sink_output_d4f5d8b83aa5",
+            "artifact_type": "file",
+            "content_hash": api.artifact_sha256,
+            "exists_now": True,
+            "downloadable": True,
+        }
+    ]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="artifact_manifest"):
+        acceptance.capture(
+            _auth_env(),
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(api),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
+
+
+@pytest.mark.parametrize(
+    "data_dir",
+    [None, "", "var/lib/elspeth", "/var/lib/elspeth/", "/var/lib/../elspeth", "/var/./lib/elspeth"],
+)
+def test_capture_rejects_missing_or_noncanonical_server_data_dir_before_any_request(tmp_path: Path, data_dir: str | None) -> None:
+    env = dict(_auth_env())
+    if data_dir is None:
+        del env["ELSPETH_WEB__DATA_DIR"]
+    else:
+        env["ELSPETH_WEB__DATA_DIR"] = data_dir
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={})
+
+    with pytest.raises(acceptance.AcceptanceInputError, match="ELSPETH_WEB__DATA_DIR"):
+        acceptance.capture(
+            env,
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(handler),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
+
+    assert calls == 0
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_verify_api_rejects_missing_server_data_dir_before_any_request(tmp_path: Path) -> None:
+    api = _AcceptanceApi()
+    state = acceptance.AcceptanceState.from_dict(
+        {
+            **_valid_state().to_dict(),
+            "uploaded_sha256": api.blob_sha256,
+            "blob_sha256": api.blob_sha256,
+            "artifact_sha256": api.artifact_sha256,
+        }
+    )
+    state_path = tmp_path / "state.json"
+    acceptance.write_acceptance_state(state_path, state)
+    env = dict(_auth_env())
+    del env["ELSPETH_WEB__DATA_DIR"]
+
+    with pytest.raises(acceptance.AcceptanceInputError, match="ELSPETH_WEB__DATA_DIR"):
+        acceptance.verify_api(env, state_file=state_path, transport=httpx.MockTransport(api))
+
+    assert api.calls == []
+
+
 def test_capture_accepts_uuid4_hex_artifact_id(tmp_path: Path) -> None:
     """The legacy (non-sink-effect) producer path defaults ``artifact_id``
     to ``core.ids.generate_id()`` -- ``uuid.uuid4().hex`` (32 lowercase hex
@@ -699,6 +814,7 @@ def test_verify_api_reauthenticates_then_performs_read_only_hash_identical_check
             "ELSPETH_ACCEPTANCE_USERNAME": "operator",
             "ELSPETH_ACCEPTANCE_PASSWORD": "password-secret",
             "ELSPETH_ACCEPTANCE_REGISTER": "1",
+            "ELSPETH_WEB__DATA_DIR": "/var/lib/elspeth",
         },
         state_file=state_path,
         transport=httpx.MockTransport(handler),

@@ -500,6 +500,84 @@ def test_prompt_shield_queue_fan_in_passes_when_every_path_is_shielded() -> None
     assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
 
 
+def _branch_llm(node_id: str, input_stream: str) -> NodeSpec:
+    return _node(
+        node_id,
+        "llm",
+        input_stream,
+        "main",
+        options={
+            "prompt_template": "{{ row.prompt }}",
+            "required_input_fields": ["prompt"],
+            "response_field": f"{node_id}_response",
+        },
+    )
+
+
+def _fork_gate(gate_id: str, input_stream: str, branches: tuple[str, ...]) -> NodeSpec:
+    return _node(
+        gate_id,
+        None,
+        input_stream,
+        None,
+        node_type="gate",
+        routes={"true": "fork", "false": "fork"},
+        fork_to=branches,
+    )
+
+
+def test_prompt_shield_dominates_every_branch_through_fork_gate() -> None:
+    # Config gates route rows without modifying them, so one shield above the
+    # fork dominates both LLM branches.
+    state = _state(
+        _shield("shield", "raw", "shielded"),
+        _fork_gate("fan_out", "shielded", ("branch_a", "branch_b")),
+        _branch_llm("llm_a", "branch_a"),
+        _branch_llm("llm_b", "branch_b"),
+        source_target="raw",
+    )
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_prompt_shield_dominates_through_routing_gate() -> None:
+    state = _state(
+        _shield("shield", "raw", "shielded"),
+        _node("router", None, "shielded", None, node_type="gate", routes={"hot": "llm_in", "cold": "discard"}),
+        _llm(),
+        source_target="raw",
+    )
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_fork_gate_without_upstream_shield_reports_every_branch() -> None:
+    state = _state(
+        _fork_gate("fan_out", "raw", ("branch_a", "branch_b")),
+        _branch_llm("llm_a", "branch_a"),
+        _branch_llm("llm_b", "branch_b"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert {finding.component_id for finding in findings} == {"llm_a", "llm_b"}
+
+
+def test_fork_gate_pass_through_keeps_per_branch_shielding_exact() -> None:
+    # A shield inside one branch covers that branch only; the gate pass-through
+    # must not leak its credit to the sibling.
+    state = _state(
+        _fork_gate("fan_out", "raw", ("branch_a", "branch_b")),
+        _shield("branch_shield", "branch_a", "shielded_a"),
+        _branch_llm("llm_a", "shielded_a"),
+        _branch_llm("llm_b", "branch_b"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert {finding.component_id for finding in findings} == {"llm_b"}
+
+
 def test_prompt_shield_cycle_fails_safe() -> None:
     state = _state(
         _node("cycle_a", "passthrough", "cycle_b_out", "cycle_a_out"),

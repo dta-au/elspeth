@@ -28,9 +28,7 @@ from .contracts import (
     _SHA256_PATTERN,
     FORBIDDEN_AWS_OVERRIDE_ENV,
     AcceptanceCheckError,
-    AcceptanceInputError,
-    _canonical_uuid,
-    _resolve_aws_region,
+    _resolve_acceptance_s3_location,
     _sha256,
 )
 
@@ -71,26 +69,9 @@ class _S3AcceptanceContext:
 
 
 def _resolve_s3_acceptance_inputs(env: Mapping[str, str]) -> tuple[str, str, str]:
-    bucket = env.get("ELSPETH_ACCEPTANCE_S3_BUCKET")
-    prefix = env.get("ELSPETH_ACCEPTANCE_S3_PREFIX")
     if any(name in env for name in FORBIDDEN_AWS_OVERRIDE_ENV):
         raise AcceptanceCheckError("s3_aws_override")
-    if type(bucket) is not str or not bucket.strip() or len(bucket) > 2048:
-        raise AcceptanceCheckError("s3_input")
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in bucket):
-        raise AcceptanceCheckError("s3_input")
-    if type(prefix) is not str or not prefix or prefix != prefix.strip("/"):
-        raise AcceptanceCheckError("s3_input")
-    segments = prefix.split("/")
-    if any(not segment or segment in {".", ".."} for segment in segments):
-        raise AcceptanceCheckError("s3_input")
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in prefix):
-        raise AcceptanceCheckError("s3_input")
-    try:
-        _canonical_uuid(segments[-1], label="S3 prefix identity")
-    except AcceptanceInputError:
-        raise AcceptanceCheckError("s3_input") from None
-    region = _resolve_aws_region(env, check="s3_input")
+    bucket, prefix, region = _resolve_acceptance_s3_location(env, check="s3_input")
     key = f"{prefix}/verify-s3.jsonl"
     if len(key.encode("utf-8")) > 1024:
         raise AcceptanceCheckError("s3_input")

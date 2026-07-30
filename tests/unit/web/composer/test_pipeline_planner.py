@@ -429,6 +429,18 @@ def _invalid_pipeline(data_dir: Path) -> dict[str, Any]:
     return pipeline
 
 
+def _pipeline_with_bogus_source_option(data_dir: Path) -> dict[str, Any]:
+    """An otherwise-valid pipeline whose csv source carries an unknown option.
+
+    Trips the pre-application ``plugin_options_invalid`` rejection on the
+    ``rejected_mutation`` component — the exact failure class observed on the
+    AWS acceptance runs (ticket elspeth-5904b1683a, F14).
+    """
+    pipeline = _pipeline(data_dir)
+    pipeline["source"]["options"]["bogus_option"] = True
+    return pipeline
+
+
 def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
     """A valid csv -> llm -> json plan whose LLM node carries the skill's short form.
 
@@ -2672,6 +2684,127 @@ def test_coalesce_feedback_rejects_missing_internal_reachability_fact(monkeypatc
         )
 
 
+def _dangling_destination_state() -> CompositionState:
+    """Candidate state with a dangling source on_success AND a bad transform on_error."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="ghost_connection",
+            options={"path": "input.csv", "schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="clean_rows",
+                node_type="transform",
+                plugin="field_mapper",
+                input="rows",
+                on_success="cleaned",
+                on_error="quarantine_typo",
+                options={"schema": {"mode": "observed"}, "mapping": {"name": "name"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="cleaned",
+                plugin="json",
+                options={
+                    "path": "outputs/result.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=2,
+    )
+
+
+def test_allowlisted_candidate_feedback_carries_route_destination_facts() -> None:
+    """Dangling-destination rejections carry instance wiring facts.
+
+    F14 (elspeth-5904b1683a): the canonical CSV-to-JSON acceptance prompt
+    intermittently exhausted its repair budget on ``source_on_success_dangling``
+    because the bare code named neither the value that dangled nor the sink it
+    should have matched, and the static guidance sent the model to
+    ``get_pipeline_state`` — which shows the BASELINE session state (empty on a
+    fresh compose), not the rejected candidate. The feedback now carries the
+    dangling value and the candidate's valid destinations — sink names and
+    connection names the planner itself authored, the same redaction class as
+    the coalesce reachability facts.
+    """
+    state = _dangling_destination_state()
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="source",
+                message="Source on_success 'ghost_connection' is neither a sink nor a known connection.",
+                severity="high",
+                error_code="source_on_success_dangling",
+            ),
+            ValidationEntry(
+                component="node:clean_rows",
+                message="Transform 'clean_rows' on_error 'quarantine_typo' references unknown sink.",
+                severity="high",
+                error_code="transform_on_error_unknown_sink",
+            ),
+        ),
+    )
+
+    feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary, updated_state=state)))
+
+    entries = feedback["validation"]["errors"]
+    source_entry = next(e for e in entries if e["error_code"] == "source_on_success_dangling")
+    assert source_entry["connectivity"] == {
+        "dangling_on_success": "ghost_connection",
+        "declared_sinks": ["cleaned"],
+        "consumable_connections": ["rows"],
+    }
+    on_error_entry = next(e for e in entries if e["error_code"] == "transform_on_error_unknown_sink")
+    # on_error may only target sinks, so the facts deliberately omit
+    # consumable_connections — steering the repair toward them would be wrong.
+    assert on_error_entry["connectivity"] == {
+        "dangling_on_error": "quarantine_typo",
+        "declared_sinks": ["cleaned"],
+    }
+    # Raw validator messages stay withheld; the facts replace them.
+    assert "is neither a sink nor a known connection" not in json.dumps(feedback)
+    # No repeat: the notice only rides an identical-fingerprint repetition.
+    assert "repeat_notice" not in feedback
+
+
+def test_route_destination_feedback_rejects_missing_internal_fact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A destination-dangling code with no matching fact fails loud, not silent."""
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="source",
+                message="closed diagnostic",
+                severity="high",
+                error_code="source_on_success_dangling",
+            ),
+        ),
+    )
+    monkeypatch.setattr(planner_module, "route_destination_facts", lambda _state: {})
+
+    with pytest.raises(KeyError, match="source"):
+        _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary, updated_state=object())))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", ["set_pipeline", "hallucinated_tool"])
 async def test_mutation_or_unknown_tool_is_rejected_without_dispatch_or_retry(
@@ -4181,6 +4314,149 @@ async def test_escape_hatch_fires_on_repair_exhaustion(
 
 
 @pytest.mark.asyncio
+async def test_oscillating_option_and_wiring_rejections_converge_within_budget(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The F14 acceptance-failure pattern converges inside the default budget.
+
+    AWS acceptance runs 2026-07-30 (elspeth-5904b1683a): the canonical
+    CSV-to-JSON prompt oscillated between ``plugin_options_invalid`` (on
+    ``rejected_mutation``) and ``source_on_success_dangling``, exhausting the
+    repair budget ~20% of the time. Both rejection classes must carry the
+    exact instance facts a repair needs: the options validator's own message
+    (``detail``) and the wiring facts (``connectivity`` — the dangling value
+    plus the candidate's valid destinations), so each repair is a copy-paste,
+    not a guess.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_bogus_source_option(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=2,
+        model_overrides={"escape_hatch_model": None},
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert proposal.proposal.repair_count == 2
+
+    # Repair turn 1: plugin_options_invalid carries the validator's own
+    # message naming the offending option (candidate-authored content only).
+    first_feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    options_entry = next(e for e in first_feedback["validation"]["errors"] if e["error_code"] == "plugin_options_invalid")
+    assert "bogus_option" in options_entry["detail"]
+    # The empty-baseline red herrings stay gated out of the repair feedback.
+    assert all(e["error_code"] not in ("no_source_configured", "no_sinks_configured") for e in first_feedback["validation"]["errors"])
+
+    # Repair turn 2: the dangling rejection names the dangling value and the
+    # candidate's actual valid destinations — no more get_pipeline_state
+    # misdirection toward the (empty) baseline state.
+    second_feedback = json.loads(completion.requests[2]["messages"][-1]["content"])
+    dangling_entry = next(e for e in second_feedback["validation"]["errors"] if e["error_code"] == "source_on_success_dangling")
+    assert dangling_entry["connectivity"] == {
+        "dangling_on_success": "rows",
+        "declared_sinks": ["not_rows"],
+        "consumable_connections": [],
+    }
+    # Distinct fingerprints: neither turn is a repetition, so no repeat notice.
+    assert "repeat_notice" not in first_feedback
+    assert "repeat_notice" not in second_feedback
+
+
+@pytest.mark.asyncio
+async def test_repeated_rejection_fingerprint_carries_repeat_notice(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """An identical rejection fingerprint repeating is named to the model.
+
+    Project doctrine: an identical-rejection fingerprint repeating across
+    attempts is OUR feedback-quality bug, never the model's budget — so at
+    minimum the loop must TELL the model the repetition happened (it has no
+    attempt counter of its own) instead of silently burning budget.
+    """
+    from structlog.testing import capture_logs
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    with capture_logs() as logs:
+        proposal = await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            repair_budget=2,
+            model_overrides={"escape_hatch_model": None},
+        )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    first_feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    second_feedback = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert "repeat_notice" not in first_feedback
+    assert "same rejection set" in second_feedback["repeat_notice"]
+
+    rejected = [entry for entry in logs if entry["event"] == "composer.planner_attempt" and entry["outcome"] == "candidate_rejected"]
+    assert [entry["repeated_fingerprint"] for entry in rejected] == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_receives_final_rejection_context(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The hatch advisor sees WHY the final candidate failed.
+
+    The over-budget attempt is dropped from the conversation (no dangling
+    assistant tool_calls message), which used to take its rejection feedback
+    with it — the advisor retried blind to the very failure that exhausted the
+    budget. The allowlisted feedback envelope now rides inside the hatch
+    notice: closed codes and candidate-authored names only.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=1,
+        model_overrides={
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+        },
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    hatch_request = completion.requests[2]
+    assert hatch_request["model"] == "openrouter/advisor-under-test"
+    notices = [
+        message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+    notice_content = str(notices[0]["content"])
+    assert "source_on_success_dangling" in notice_content
+    assert '"dangling_on_success":"rows"' in notice_content.replace(" ", "")
+    # The dropped attempt still leaves no dangling assistant tool_calls.
+    for message in hatch_request["messages"]:
+        if message["role"] == "assistant" and message.get("tool_calls"):
+            call_ids = {call["id"] for call in message["tool_calls"]}
+            answered = {reply["tool_call_id"] for reply in hatch_request["messages"] if reply["role"] == "tool"}
+            assert call_ids <= answered
+
+
+@pytest.mark.asyncio
 async def test_no_hatch_configured_preserves_discovery_exhaustion(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -4523,6 +4799,9 @@ async def test_repair_exhaustion_records_last_rejection_codes(
 
     assert excinfo.value.code == "REPAIR_EXHAUSTED"
     assert excinfo.value.detail_codes, "exhaustion must carry the last rejection's codes"
+    # A genuinely-unrepairable candidate still exhausts honestly: the terminal
+    # error names the wall, and no fake success escapes the loop.
+    assert "source_on_success_dangling" in excinfo.value.detail_codes
     # Codes are the closed, leak-safe discriminant — no messages/paths.
     assert all(isinstance(c, str) for c in excinfo.value.detail_codes)
 

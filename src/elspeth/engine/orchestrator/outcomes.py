@@ -432,6 +432,7 @@ def _handle_failed_row_union_outcome(
         consumed_tokens=tuple(outcome.consumed_tokens),
     )
     counters.rows_failed += len(outcome.consumed_tokens)
+    counters.rows_coalesce_failed += 1
     for token in outcome.consumed_tokens:
         _emit_failed_token_completed(ctx, token)
 

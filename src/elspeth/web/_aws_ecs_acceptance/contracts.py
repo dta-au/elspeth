@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
@@ -152,28 +154,196 @@ _TASK_DEFINITION_FAMILY_PATTERN = re.compile(
 )
 
 
+# Closed error-code vocabulary for the operator-facing failure envelope.
+# Every non-check acceptance failure projects onto exactly one of these
+# static codes; unknown exceptions map to ``acceptance_internal``.  Codes
+# never carry provider or server response content.
+ACCEPTANCE_ERROR_CODES = frozenset(
+    {
+        "state_file_unwritable",
+        "state_file_unreadable",
+        "state_file_untrusted",
+        "state_file_too_large",
+        "state_file_invalid",
+        "ca_unreadable",
+        "connection_failed",
+        "request_timeout",
+        "unexpected_http_status",
+        "response_too_large",
+        "response_shape_invalid",
+        "cross_origin_response",
+        "input_invalid",
+        "operator_telemetry_failed",
+        "acceptance_internal",
+    }
+)
+
+# Closed step vocabulary: the coarse acceptance phase that was executing
+# when a failure surfaced.  Step names are static and never derived from
+# runtime data.
+ACCEPTANCE_STEPS = frozenset(
+    {
+        "env_validate",
+        "client_setup",
+        "register",
+        "login",
+        "capture_fetch",
+        "verify_fetch",
+        "state_persist",
+        "state_load",
+    }
+)
+
+_ACCEPTANCE_STEP: ContextVar[str | None] = ContextVar("elspeth_acceptance_step", default=None)
+
+
+@contextlib.contextmanager
+def acceptance_step(name: str) -> Iterator[None]:
+    """Tag the executing acceptance step for the failure envelope.
+
+    On success the previous step is restored; on failure the innermost
+    step deliberately stays set so the top-level envelope can report it.
+    """
+
+    if name not in ACCEPTANCE_STEPS:
+        raise ValueError(f"unknown acceptance step: {name}")
+    token = _ACCEPTANCE_STEP.set(name)
+    yield
+    _ACCEPTANCE_STEP.reset(token)
+
+
+def current_acceptance_step() -> str | None:
+    """Return the innermost recorded acceptance step, if any."""
+
+    return _ACCEPTANCE_STEP.get()
+
+
+def reset_acceptance_step() -> None:
+    """Clear any step left set by a previously failed invocation."""
+
+    _ACCEPTANCE_STEP.set(None)
+
+
+def _closed_error_code(error_code: str) -> str:
+    return error_code if error_code in ACCEPTANCE_ERROR_CODES else "acceptance_internal"
+
+
 class AcceptanceInputError(RuntimeError):
     """Static failure raised before an acceptance request is sent."""
+
+    error_code = "input_invalid"
+    status: int | None = None
 
 
 class AcceptanceHttpError(RuntimeError):
     """Static HTTP failure that never includes a response or exception body."""
 
+    def __init__(self, message: str, *, error_code: str = "connection_failed", status: int | None = None) -> None:
+        super().__init__(message)
+        self.error_code = _closed_error_code(error_code)
+        self.status = status
+
 
 class AcceptanceStateError(RuntimeError):
     """Static protected-state failure that never includes file content."""
+
+    def __init__(self, message: str, *, error_code: str = "state_file_invalid") -> None:
+        super().__init__(message)
+        self.error_code = _closed_error_code(error_code)
+        self.status: int | None = None
 
 
 class AcceptanceCheckError(RuntimeError):
     """A static named acceptance check failure safe for operator output."""
 
-    def __init__(self, check: str) -> None:
+    def __init__(
+        self,
+        check: str,
+        *,
+        missing: tuple[str, ...] | None = None,
+        cause_class: str | None = None,
+        cause_fields: tuple[str, ...] | None = None,
+    ) -> None:
         super().__init__(f"acceptance check failed: {check}")
         self.check = check
+        self.missing = missing
+        self.cause_class = cause_class
+        self.cause_fields = cause_fields
+
+
+_CAUSE_FIELD_TOKEN = re.compile(r"\bELSPETH_[A-Z0-9_]*[A-Z0-9]\b")
+
+
+def check_error_with_cause(check: str, exc: BaseException) -> AcceptanceCheckError:
+    """Build a named check failure carrying only static cause identity.
+
+    A bare ``AcceptanceCheckError("storage_settings")`` proved undiagnosable
+    in the field (elspeth-dfd09564d5): the operator could not tell a missing
+    setting from a type error from an unknown key without extracting the
+    module from the image. This projection keeps the envelope fail-closed —
+    it emits the underlying exception CLASS name plus static identifiers
+    only: pydantic field locations when the exception exposes ``errors()``,
+    otherwise ``ELSPETH_*`` environment-variable tokens found in the message.
+    Message text and values are never emitted.
+    """
+    fields: tuple[str, ...] = ()
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        with contextlib.suppress(Exception):
+            fields = tuple(
+                dict.fromkeys(
+                    location
+                    for error in errors()
+                    if isinstance(error, Mapping)
+                    for location in (".".join(str(part) for part in error.get("loc", ())),)
+                    if location
+                )
+            )
+    if not fields:
+        fields = tuple(dict.fromkeys(_CAUSE_FIELD_TOKEN.findall(str(exc))))
+    return AcceptanceCheckError(
+        check,
+        cause_class=type(exc).__name__,
+        cause_fields=fields or None,
+    )
 
 
 class OperatorTelemetryAcceptanceError(RuntimeError):
     """Static acceptance failure safe for an operator receipt."""
+
+    error_code = "operator_telemetry_failed"
+    status: int | None = None
+
+
+def acceptance_error_envelope(exc: BaseException) -> dict[str, object]:
+    """Project one acceptance failure onto the closed operator envelope.
+
+    The projection is fail-closed: it only ever emits the static exception
+    class name, a code from :data:`ACCEPTANCE_ERROR_CODES` (or the static
+    check name), the closed step vocabulary, an integer HTTP status, and —
+    for missing live inputs — static environment variable names.  Response
+    bodies, paths, tokens, and exception text are never included.
+    """
+
+    envelope: dict[str, object] = {
+        "error_class": type(exc).__name__,
+        "step": current_acceptance_step(),
+    }
+    if isinstance(exc, AcceptanceCheckError):
+        envelope["check"] = exc.check
+        if exc.missing:
+            envelope["missing"] = sorted(exc.missing)
+        if exc.cause_class is not None:
+            envelope["cause_class"] = exc.cause_class
+        if exc.cause_fields:
+            envelope["cause_fields"] = sorted(exc.cause_fields)
+        return envelope
+    error_code = getattr(exc, "error_code", None)
+    envelope["error_code"] = error_code if isinstance(error_code, str) and error_code in ACCEPTANCE_ERROR_CODES else "acceptance_internal"
+    status = getattr(exc, "status", None)
+    if type(status) is int:
+        envelope["status"] = status
+    return envelope
 
 
 def normalize_acceptance_origin(raw: str) -> str:
@@ -369,6 +539,30 @@ def _resolve_aws_region(env: Mapping[str, str], *, check: str) -> str:
     if region is None or len(region) > 64 or re.fullmatch(r"[A-Za-z0-9-]+", region) is None:
         raise AcceptanceCheckError(check)
     return region
+
+
+def _resolve_acceptance_s3_location(env: Mapping[str, str], *, check: str) -> tuple[str, str, str]:
+    """Validate and return the acceptance (bucket, prefix, region) triple."""
+
+    bucket = env.get("ELSPETH_ACCEPTANCE_S3_BUCKET")
+    prefix = env.get("ELSPETH_ACCEPTANCE_S3_PREFIX")
+    if type(bucket) is not str or not bucket.strip() or len(bucket) > 2048:
+        raise AcceptanceCheckError(check)
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in bucket):
+        raise AcceptanceCheckError(check)
+    if type(prefix) is not str or not prefix or prefix != prefix.strip("/"):
+        raise AcceptanceCheckError(check)
+    segments = prefix.split("/")
+    if any(not segment or segment in {".", ".."} for segment in segments):
+        raise AcceptanceCheckError(check)
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in prefix):
+        raise AcceptanceCheckError(check)
+    try:
+        _canonical_uuid(segments[-1], label="S3 prefix identity")
+    except AcceptanceInputError:
+        raise AcceptanceCheckError(check) from None
+    region = _resolve_aws_region(env, check=check)
+    return bucket, prefix, region
 
 
 def _parse_task_definition_family(task_definition_arn: object) -> str | None:

@@ -53,6 +53,15 @@ _BEDROCK_DETAIL_FIELDS = frozenset(
     }
 )
 
+_TEXTRACT_DETAIL_FIELDS = frozenset(
+    {
+        "transform_registered",
+        "client_constructed",
+        "start_document_analysis_invocable",
+        "get_document_analysis_invocable",
+    }
+)
+
 _GUARDRAIL_DETAIL_FIELDS = frozenset({"controls", "plugin_policy"})
 
 _GUARDRAIL_CONTROL_FIELDS = frozenset(
@@ -126,7 +135,14 @@ _ROLLBACK_BASELINE_SESSION_EPOCH = 35
 
 _ROLLBACK_BASELINE_LANDSCAPE_EPOCH = 29
 
-_SCENARIO_B_STRUCTURAL_CHANGES = "session_epoch_35_to_37_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier"
+# Derived from the live epoch constants: a schema bump must rotate the label a
+# compatibility receipt attests, otherwise a stale receipt keeps validating
+# against a transition the candidate no longer performs.
+_SCENARIO_B_STRUCTURAL_CHANGES = (
+    f"session_epoch_{_ROLLBACK_BASELINE_SESSION_EPOCH}_to_{SESSION_SCHEMA_EPOCH}"
+    f"_landscape_epoch_{_ROLLBACK_BASELINE_LANDSCAPE_EPOCH}_to_{SQLITE_SCHEMA_EPOCH}"
+    "_blob_cleanup_guided_decline_and_row_union_barrier"
+)
 
 
 def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
@@ -193,6 +209,13 @@ def _validate_bedrock_receipt_details(details: Mapping[str, object]) -> None:
     if details["cost_source"] not in {"provider_reported", "litellm_calculated", "unavailable"}:
         raise AcceptanceCheckError("exec_receipt_schema")
     if (cost is None) != (details["cost_source"] == "unavailable"):
+        raise AcceptanceCheckError("exec_receipt_schema")
+
+
+def _validate_textract_receipt_details(details: Mapping[str, object]) -> None:
+    if set(details) != _TEXTRACT_DETAIL_FIELDS:
+        raise AcceptanceCheckError("exec_receipt_schema")
+    if any(details[field] is not True for field in _TEXTRACT_DETAIL_FIELDS):
         raise AcceptanceCheckError("exec_receipt_schema")
 
 
@@ -392,6 +415,7 @@ def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
     if type(check) is not str or check not in {
         "verify-s3",
         "verify-bedrock",
+        "verify-textract",
         "verify-bedrock-guardrails",
         "verify-connection-budget",
         "verify-operator-telemetry",
@@ -413,6 +437,8 @@ def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
         _validate_guardrail_receipt_details(details)
     elif check == "verify-connection-budget":
         _validate_connection_budget_receipt(details)
+    elif check == "verify-textract":
+        _validate_textract_receipt_details(details)
     else:
         _validate_operator_receipt_details(details)
     return payload
@@ -861,6 +887,7 @@ _RECEIPT_KINDS = frozenset(
         "terraform-destroy-plan",
         "verify-s3",
         "verify-bedrock",
+        "verify-textract",
         "verify-bedrock-guardrails",
         "verify-operator-telemetry",
     }

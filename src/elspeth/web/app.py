@@ -368,6 +368,81 @@ async def _periodic_orphan_cleanup(
             )
 
 
+_OPENROUTER_PROVIDER_ID = "openrouter"
+"""Provider discriminator for OpenRouter in ``WebSettings.llm_profiles``.
+
+This matches the ``provider`` field of a configured LLM profile (the
+discriminated-variant key ``WebLLMProfileSettings`` validates against),
+not the model-catalog id — the two happen to share a spelling.
+"""
+
+
+def _configured_llm_providers(settings: WebSettings) -> tuple[str, ...]:
+    """Sorted, deduplicated providers bound by the deployment's LLM profiles.
+
+    ``WebSettings.llm_profiles`` is the deployment's declaration of which
+    LLM providers it uses (``ELSPETH_WEB__LLM_PROFILES``): the AWS ECS
+    deployment binds Bedrock through the task role; staging binds
+    OpenRouter. An empty tuple means the deployment configured no LLM
+    provider at all.
+    """
+    return tuple(sorted({profile.provider for profile in settings.llm_profiles.values()}))
+
+
+async def _boot_prime_openrouter_catalog(settings: WebSettings) -> None:
+    """Prime the OpenRouter model catalog iff OpenRouter is a configured provider.
+
+    The live prime closes the validate/runtime drift bug where the bundled
+    litellm catalog still listed models OpenRouter has retired (e.g.
+    ``anthropic/claude-3.5-sonnet``), letting the value-source compliance
+    walker pass configs that 404 at runtime preflight. The request-level
+    probe is graceful inside ``prime_openrouter_catalog_from_live``; failures
+    before the request boundary (client construction/context management) are
+    startup failures rather than undocumented fallback decisions.
+
+    Gate (elspeth-c67ba40e4a): a deployment must not egress to providers it
+    has not configured. When no configured LLM profile binds the OpenRouter
+    provider (e.g. a Bedrock-only AWS ECS deployment), the prime is skipped
+    entirely — no boot-time request to openrouter.ai, no availability
+    dependency on an unused service — and the catalog reader serves the
+    bundled litellm fallback, exactly as it does when the prime fails.
+    """
+    slog = structlog.get_logger()
+    configured_providers = _configured_llm_providers(settings)
+    if _OPENROUTER_PROVIDER_ID not in configured_providers:
+        slog.info(
+            "openrouter_catalog_boot_prime_skipped",
+            reason="openrouter is not a configured LLM provider for this deployment",
+            configured_llm_providers=configured_providers,
+            action="serving bundled litellm catalog; no boot-time egress to openrouter.ai",
+        )
+        return
+
+    probe_start = time.monotonic()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=5.0)) as _probe_client:
+
+        async def _probe_get(url: str) -> httpx.Response:
+            # ``request("GET", ...)`` rather than ``.get(...)``: identical
+            # httpx semantics, but avoids the L3 walker's token-level
+            # false match on the literal ``.get`` (R1 targets defensive
+            # ``dict.get`` reads, not HTTP client method calls).
+            return await _probe_client.request("GET", url)
+
+        primed = await prime_openrouter_catalog_from_live(http_get=_probe_get)
+    probe_latency_ms = int((time.monotonic() - probe_start) * 1000)
+    if primed:
+        slog.info(
+            "openrouter_catalog_boot_prime_complete",
+            latency_ms=probe_latency_ms,
+        )
+    else:
+        slog.warning(
+            "openrouter_catalog_boot_prime_failed",
+            latency_ms=probe_latency_ms,
+            action="serving bundled litellm catalog (may include retired models)",
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Own the session engine for the complete application lifespan."""
@@ -551,36 +626,10 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # Prime the OpenRouter model catalog from the live ``/models``
-    # endpoint. Closes the validate/runtime drift bug where the bundled
-    # litellm catalog still listed models OpenRouter has retired (e.g.
-    # ``anthropic/claude-3.5-sonnet``), letting the value-source compliance
-    # walker pass configs that 404 at runtime preflight. The request-level
-    # probe is graceful inside ``prime_openrouter_catalog_from_live``; failures
-    # before the request boundary (client construction/context management) are
-    # startup failures rather than undocumented fallback decisions.
-    probe_start = time.monotonic()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=5.0)) as _probe_client:
-
-        async def _probe_get(url: str) -> httpx.Response:
-            # ``request("GET", ...)`` rather than ``.get(...)``: identical
-            # httpx semantics, but avoids the L3 walker's token-level
-            # false match on the literal ``.get`` (R1 targets defensive
-            # ``dict.get`` reads, not HTTP client method calls).
-            return await _probe_client.request("GET", url)
-
-        primed = await prime_openrouter_catalog_from_live(http_get=_probe_get)
-    probe_latency_ms = int((time.monotonic() - probe_start) * 1000)
-    if primed:
-        slog.info(
-            "openrouter_catalog_boot_prime_complete",
-            latency_ms=probe_latency_ms,
-        )
-    else:
-        slog.warning(
-            "openrouter_catalog_boot_prime_failed",
-            latency_ms=probe_latency_ms,
-            action="serving bundled litellm catalog (may include retired models)",
-        )
+    # endpoint — gated on OpenRouter actually being a configured LLM
+    # provider for this deployment (elspeth-c67ba40e4a). Rationale and
+    # gate semantics live on ``_boot_prime_openrouter_catalog``.
+    await _boot_prime_openrouter_catalog(settings)
 
     if settings.composer_boot_probe_enabled:
         from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config

@@ -773,7 +773,11 @@ def compute_judge_metadata_signature(
     }
     if judge_confidence is not None:
         payload["judge_confidence"] = judge_confidence
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    # allow_nan=False only changes behaviour when a non-finite value is
+    # present, so canonical bytes for existing finite payloads — and the
+    # signatures over them — are unchanged. Without it a NaN
+    # judge_confidence would sign bytes no strict verifier can re-parse.
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
     digest = hmac.new(hmac_key, canonical, hashlib.sha256).hexdigest()
     return f"{prefix}{digest}"
 

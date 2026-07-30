@@ -516,12 +516,15 @@ def _usable_llm_profile_alias(catalog: PolicyCatalogView) -> str | None:
     return dict(snapshot.usable_profile_aliases)[llm_id][0]
 
 
-def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapability) -> tuple[str, str] | None:
-    """Return a selected operator-profiled control only when policy requires it.
+def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapability) -> tuple[str, str | None] | None:
+    """Return the selected control plugin only when policy requires it.
 
     Recommended controls must never mutate a worked topology merely because an
-    implementation is selected. Returns ``None`` for recommend mode, no
-    selection, or a selection that is not operator-profiled.
+    implementation is selected. Returns ``None`` for recommend mode or no
+    selection. A selected plugin with no operator profile aliases (direct
+    user-configurable controls) is returned with ``alias=None`` — a required
+    control must still appear in the worked exemplar, or the exemplar teaches
+    a topology this deployment's coverage validator rejects.
     """
     snapshot = catalog.snapshot
     if dict(snapshot.control_modes).get(capability, ControlMode.RECOMMEND) is not ControlMode.REQUIRED:
@@ -532,10 +535,48 @@ def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapa
     alias = dict(snapshot.selected_profile_aliases).get(plugin_id)
     if alias is None:
         aliases = dict(snapshot.usable_profile_aliases).get(plugin_id, ())
-        if not aliases:
-            return None
-        alias = aliases[0]
+        alias = aliases[0] if aliases else None
     return plugin_id.name, alias
+
+
+# Deployment-owned service bindings a direct-config control still requires.
+# Placeholder values that pass option prevalidation, in the same spirit as
+# PLACEHOLDER_BLOB_ID — the planner substitutes the deployment's real binding
+# supplied by the user.
+_DIRECT_CONTROL_OPTION_EXEMPLARS: Final[dict[str, dict[str, object]]] = {
+    "azure_prompt_shield": {"endpoint": "https://your-resource.cognitiveservices.azure.com"},
+    "azure_content_safety": {
+        "endpoint": "https://your-resource.cognitiveservices.azure.com",
+        # The plugin's documented example thresholds — an effective blocking
+        # posture (all-6 thresholds are a no-op the coverage validator rejects).
+        "thresholds": {"hate": 2, "violence": 2, "sexual": 2, "self_harm": 0},
+    },
+}
+
+
+def _direct_control_options(summaries: Mapping[str, list[PluginSummary]], plugin_name: str) -> dict[str, object]:
+    """Required direct-config options for an alias-less control node.
+
+    A required control selected without operator profile aliases is authored
+    directly, so the exemplar must carry the plugin's remaining required
+    options or ``set_pipeline`` prevalidation rejects it. Declared credential
+    fields are wired as ``{"secret_ref": NAME}`` markers using the plugin's
+    canonical inventory candidate — the supported inline new-node form; the
+    remaining required service bindings come from the placeholder table.
+    """
+    plugin = next(entry for entry in summaries["transform"] if entry.name == plugin_name)
+    candidates_by_field = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
+    placeholders = _DIRECT_CONTROL_OPTION_EXEMPLARS.get(plugin_name, {})
+    options: dict[str, object] = {}
+    for field in plugin.config_fields:
+        if not field.required:
+            continue
+        candidates = candidates_by_field.get(field.name)
+        if candidates:
+            options[field.name] = {"secret_ref": candidates[0]}
+        elif field.name in placeholders:
+            options[field.name] = placeholders[field.name]
+    return options
 
 
 def _plugin_declares_field(summaries: Mapping[str, list[PluginSummary]], plugin_name: str, field_name: str) -> bool:
@@ -888,6 +929,16 @@ def fork_coalesce_exemplar_args(
         if shield_control is not None:
             shield_plugin, shield_alias = shield_control
             gate_input = "shielded_rows"
+            shield_options: dict[str, Any] = {
+                # Fields are exactly the branches' prompt inputs.
+                "fields": ["ticket_id", "body"],
+                "schema": {"mode": "observed"},
+            }
+            if shield_alias is not None:
+                # The operator-owned control binding stays behind the alias.
+                shield_options["profile"] = shield_alias
+            else:
+                shield_options.update(_direct_control_options(summaries, shield_plugin))
             control_nodes_before.append(
                 {
                     "id": "shield_ticket_text",
@@ -896,13 +947,7 @@ def fork_coalesce_exemplar_args(
                     "input": "rows",
                     "on_success": "shielded_rows",
                     "on_error": "discard",
-                    "options": {
-                        # The operator-owned Guardrail binding stays behind the
-                        # alias; fields are exactly the branches' prompt inputs.
-                        "profile": shield_alias,
-                        "fields": ["ticket_id", "body"],
-                        "schema": {"mode": "observed"},
-                    },
+                    "options": shield_options,
                 }
             )
         safety_control = _selected_control_profile(catalog, PluginCapability.CONTENT_SAFETY)
@@ -910,11 +955,15 @@ def fork_coalesce_exemplar_args(
             safety_plugin, safety_alias = safety_control
             tidy_input = "screened_rows"
             safety_options: dict[str, Any] = {
-                "profile": safety_alias,
                 # Both branches' response fields — one node, both output streams.
                 "fields": ["sentiment", "urgency"],
                 "schema": {"mode": "observed"},
             }
+            if safety_alias is not None:
+                # The operator-owned control binding stays behind the alias.
+                safety_options["profile"] = safety_alias
+            else:
+                safety_options.update(_direct_control_options(summaries, safety_plugin))
             if _plugin_declares_field(summaries, safety_plugin, "source"):
                 safety_options["source"] = "OUTPUT"
             control_nodes_after.append(

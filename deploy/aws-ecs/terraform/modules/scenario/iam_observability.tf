@@ -57,6 +57,7 @@ data "aws_iam_policy_document" "task" {
     sid = "UseAcceptanceObjects"
     actions = [
       "s3:GetObject",
+      "s3:GetObjectVersion",
       "s3:PutObject",
       "s3:DeleteObject",
     ]
@@ -75,13 +76,9 @@ data "aws_iam_policy_document" "task" {
   }
 
   statement {
-    sid     = "InvokeConfiguredBedrockModels"
-    actions = ["bedrock:InvokeModel"]
-    resources = concat(
-      tolist(var.bedrock_inference_profile_arns),
-      tolist(var.bedrock_foundation_model_arns),
-      local.bedrock_cross_region_foundation_model_arns,
-    )
+    sid       = "InvokeConfiguredBedrockModels"
+    actions   = ["bedrock:InvokeModel"]
+    resources = local.bedrock_invoke_model_arns
   }
 
   statement {
@@ -156,6 +153,23 @@ resource "aws_iam_role_policy" "task" {
   name   = "${local.namespace}-task-policy"
   role   = aws_iam_role.task.id
   policy = data.aws_iam_policy_document.task.json
+
+  # The wildcard-region Bedrock grant derivation in locals.tf classifies every configured
+  # model id by its leading dotted label. An unrecognised label used to fail open: no grant
+  # was derived, `terraform plan` validated cleanly, and bedrock:InvokeModel then denied
+  # intermittently at runtime depending on which destination region a geography profile
+  # routed to. Fail the plan instead and say exactly how to resolve it.
+  lifecycle {
+    precondition {
+      condition = length(local.bedrock_unclassified_model_ids) == 0
+      error_message = format(
+        "Bedrock model id(s) [%s] carry a leading dotted label that is neither a known cross-region geography prefix (%s) nor a known provider label (%s), so the module cannot decide whether a wildcard-region foundation-model grant is required. If the label is a new AWS geography, add it to bedrock_cross_region_prefixes in modules/scenario/locals.tf; if it is a new provider, add it to bedrock_known_provider_prefixes there. Alternatively name the model explicitly in bedrock_foundation_model_arns: \"arn:aws:bedrock:*::foundation-model/<id-without-geography-prefix>\" for a cross-region geography profile, or the region-pinned foundation-model ARN for a provider model.",
+        join(", ", local.bedrock_unclassified_model_ids),
+        join(" ", local.bedrock_cross_region_prefixes),
+        join(" ", local.bedrock_known_provider_prefixes),
+      )
+    }
+  }
 }
 
 resource "aws_cloudwatch_log_group" "web" {
@@ -179,6 +193,12 @@ resource "aws_cloudwatch_log_group" "event" {
 resource "aws_cloudwatch_log_group" "operator" {
   name              = local.operator_log_group
   retention_in_days = 30
+  tags              = local.tags
+}
+
+resource "aws_cloudwatch_log_group" "container_insights" {
+  name              = local.container_insights_log_group
+  retention_in_days = 1
   tags              = local.tags
 }
 
@@ -248,18 +268,18 @@ resource "aws_xray_sampling_rule" "scenario" {
 }
 
 locals {
-  cloudwatch_dimensions = [
-    "service.name", local.telemetry_service_name,
-    "deployment.environment", "production",
-    "service.version", var.candidate_sha,
-    "cloud.provider", "aws",
-    "aws.ecs.cluster.name", local.cluster_name,
-    "aws.ecs.service.name", local.service_name,
-    "aws.ecs.task.family", local.web_family,
-    "aws.ecs.task.revision", tostring(aws_ecs_task_definition.candidate_web.revision),
+  cloudwatch_dimension_keys = [
+    "service.name",
+    "deployment.environment",
+    "service.version",
+    "cloud.provider",
+    "aws.ecs.cluster.name",
+    "aws.ecs.service.name",
+    "aws.ecs.task.family",
+    "aws.ecs.task.revision",
   ]
 
-  cloudwatch_dimension_map = {
+  candidate_cloudwatch_dimension_map = {
     "service.name"           = local.telemetry_service_name
     "deployment.environment" = "production"
     "service.version"        = var.candidate_sha
@@ -270,38 +290,115 @@ locals {
     "aws.ecs.task.revision"  = tostring(aws_ecs_task_definition.candidate_web.revision)
   }
 
+  rollback_cloudwatch_dimension_map = var.scenario_id == "B" ? {
+    "service.name"           = local.telemetry_service_name
+    "deployment.environment" = "production"
+    "service.version"        = var.rollback_baseline_sha
+    "cloud.provider"         = "aws"
+    "aws.ecs.cluster.name"   = local.cluster_name
+    "aws.ecs.service.name"   = local.service_name
+    "aws.ecs.task.family"    = local.rollback_web_family
+    "aws.ecs.task.revision"  = tostring(aws_ecs_task_definition.rollback_web[0].revision)
+  } : null
+
+  cloudwatch_dimension_maps = concat(
+    [local.candidate_cloudwatch_dimension_map],
+    var.scenario_id == "B" ? [local.rollback_cloudwatch_dimension_map] : [],
+  )
+  cloudwatch_dimension_maps_by_id = {
+    for index, dimension_map in local.cloudwatch_dimension_maps :
+    "identity_${index}" => dimension_map
+  }
+  cloudwatch_dimension_lists = [
+    for dimension_map in local.cloudwatch_dimension_maps : flatten([
+      for key in local.cloudwatch_dimension_keys : [key, dimension_map[key]]
+    ])
+  ]
+
+  composer_failure_sources = [
+    "compose",
+    "recompose",
+    "convergence",
+    "plugin_crash",
+    "runtime_preflight",
+    "yaml_export",
+    "state_seed",
+    "cached_preflight",
+  ]
+  composer_failure_metric_specs = concat(
+    flatten([
+      for name in [
+        "composer.runtime_preflight.total",
+        "composer.authoring_validation.total",
+        ] : [
+        for source in local.composer_failure_sources : [
+          for result in ["failed", "exception"] : {
+            name = name
+            dimensions = {
+              result = result
+              source = source
+            }
+          }
+        ]
+      ]
+    ]),
+    [
+      {
+        name = "composer.runtime_preflight.total"
+        dimensions = {
+          outcome = "failure"
+        }
+      },
+      {
+        name = "composer.authoring_validation.total"
+        dimensions = {
+          outcome = "invalid"
+        }
+      },
+      {
+        name       = "composer.audit.fetch_failure_total"
+        dimensions = {}
+      },
+    ],
+  )
+
   metric_widgets = [
     {
-      title   = "Run failures and duration"
-      metrics = ["run.failure", "run.duration"]
-      stat    = "Sum"
-    },
-    {
-      title   = "External-call failures and latency"
-      metrics = ["external_call.failure", "external_call.latency"]
-      stat    = "Sum"
-    },
-    {
-      title   = "LLM token and cost totals"
-      metrics = ["llm.prompt_tokens", "llm.completion_tokens", "llm.cost"]
-      stat    = "Sum"
-    },
-    {
-      title = "Composer and runtime failures"
+      title = "Run failures and duration"
       metrics = [
-        "composer.runtime_preflight_total",
-        "composer.authoring_validation_total",
-        "composer.audit.fetch_failure_total",
+        { name = "run.failure", dimensions = {} },
+        { name = "run.duration", dimensions = {} },
       ]
       stat = "Sum"
     },
     {
+      title = "External-call failures and latency"
+      metrics = [
+        { name = "external_call.failure", dimensions = {} },
+        { name = "external_call.latency", dimensions = {} },
+      ]
+      stat = "Sum"
+    },
+    {
+      title = "LLM token totals"
+      metrics = [
+        { name = "llm.prompt_tokens", dimensions = {} },
+        { name = "llm.completion_tokens", dimensions = {} },
+      ]
+      stat = "Sum"
+    },
+    {
+      title   = "Composer and runtime failures"
+      metrics = local.composer_failure_metric_specs
+      stat    = "Sum"
+    },
+    {
       title = "Operator delivery health"
       metrics = [
-        "operator.telemetry.export_failures",
-        "operator.telemetry.queue_drops",
-        "operator.telemetry.last_success_age_seconds",
-        "operator.telemetry.collector_unavailable",
+        { name = "operator.telemetry.export_failures", dimensions = {} },
+        { name = "operator.telemetry.queue_drops", dimensions = {} },
+        { name = "operator.telemetry.last_success_age_seconds", dimensions = {} },
+        { name = "operator.telemetry.collector_unavailable", dimensions = {} },
       ]
       stat = "Maximum"
     },
@@ -401,12 +498,25 @@ resource "aws_cloudwatch_dashboard" "operator" {
           region = var.aws_region
           stat   = widget.stat
           period = 300
-          metrics = [
-            for metric_name in widget.metrics : concat(
-              ["ELSPETH/Operator", metric_name],
-              local.cloudwatch_dimensions,
-            )
-          ]
+          # CloudWatch requires an array OF ARRAYS of strings, one array per
+          # metric row. flatten() is recursive and would collapse every row
+          # into a single flat string list, which CreateDashboard rejects with
+          # one "Should be array" error per element. The spread joins the
+          # per-identity groups one level only, so each row stays an array.
+          metrics = concat([
+            for identity_dimensions in local.cloudwatch_dimension_lists : [
+              for metric in widget.metrics : concat(
+                ["ELSPETH/Operator", metric.name],
+                identity_dimensions,
+                flatten([
+                  for key in sort(keys(metric.dimensions)) : [
+                    key,
+                    metric.dimensions[key],
+                  ]
+                ]),
+              )
+            ]
+          ]...)
         }
       }],
     )
@@ -418,17 +528,35 @@ resource "aws_cloudwatch_metric_alarm" "operator_direct" {
 
   alarm_name          = "${local.namespace}-${each.key}"
   alarm_description   = each.value.owner_action
-  namespace           = "ELSPETH/Operator"
-  metric_name         = each.value.metric_name
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = each.value.evaluation_periods
-  period              = each.value.period
-  statistic           = each.value.statistic
-  extended_statistic  = each.value.extended_statistic
   threshold           = each.value.threshold
   treat_missing_data  = each.value.treat_missing_data
   alarm_actions       = concat([aws_sns_topic.operator_alarms.arn], var.alarm_actions)
-  dimensions          = local.cloudwatch_dimension_map
+
+  metric_query {
+    id          = "active_identity"
+    expression  = "MAX(METRICS())"
+    label       = each.key
+    return_data = true
+  }
+
+  dynamic "metric_query" {
+    for_each = local.cloudwatch_dimension_maps_by_id
+
+    content {
+      id          = metric_query.key
+      return_data = false
+
+      metric {
+        namespace   = "ELSPETH/Operator"
+        metric_name = each.value.metric_name
+        period      = each.value.period
+        stat        = coalesce(each.value.extended_statistic, each.value.statistic)
+        dimensions  = metric_query.value
+      }
+    }
+  }
 
   tags = local.tags
 }
@@ -444,34 +572,42 @@ resource "aws_cloudwatch_metric_alarm" "operator_export_failures" {
 
   metric_query {
     id          = "combined"
-    expression  = "failures + drops"
-    label       = "Export failures plus queue drops"
+    expression  = "IF(DIFF(SUM(METRICS())) > 0, DIFF(SUM(METRICS())), 0)"
+    label       = "New export failures or queue drops"
     return_data = true
   }
 
-  metric_query {
-    id          = "failures"
-    return_data = false
+  dynamic "metric_query" {
+    for_each = local.cloudwatch_dimension_maps_by_id
 
-    metric {
-      namespace   = "ELSPETH/Operator"
-      metric_name = "operator.telemetry.export_failures"
-      period      = 300
-      stat        = "Maximum"
-      dimensions  = local.cloudwatch_dimension_map
+    content {
+      id          = "failures_${metric_query.key}"
+      return_data = false
+
+      metric {
+        namespace   = "ELSPETH/Operator"
+        metric_name = "operator.telemetry.export_failures"
+        period      = 300
+        stat        = "Maximum"
+        dimensions  = metric_query.value
+      }
     }
   }
 
-  metric_query {
-    id          = "drops"
-    return_data = false
+  dynamic "metric_query" {
+    for_each = local.cloudwatch_dimension_maps_by_id
 
-    metric {
-      namespace   = "ELSPETH/Operator"
-      metric_name = "operator.telemetry.queue_drops"
-      period      = 300
-      stat        = "Maximum"
-      dimensions  = local.cloudwatch_dimension_map
+    content {
+      id          = "drops_${metric_query.key}"
+      return_data = false
+
+      metric {
+        namespace   = "ELSPETH/Operator"
+        metric_name = "operator.telemetry.queue_drops"
+        period      = 300
+        stat        = "Maximum"
+        dimensions  = metric_query.value
+      }
     }
   }
 

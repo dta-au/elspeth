@@ -1421,13 +1421,17 @@ class SinkEffectCoordinator:
                 raise LandscapeRecordError("finalized sink effect predecessor is missing its artifact")
             artifact = artifacts_by_effect[predecessor.effect_id]
             if not artifact.publication_performed:
-                # A no-publication (virtual or inherited) predecessor never
-                # touched the remote target, so its artifact is not remote
-                # evidence: declaring it would wedge the successor's
-                # precondition forever. Walk back to the most recent real
-                # publication in the stream (elspeth-fac5260c6a).
-                predecessor_id = predecessor.predecessor_effect_id
-                continue
+                plan = self._load_plan(predecessor)
+                if plan.safe_evidence.get("publication_kind") != "reaffirmed":
+                    # A virtual or inherited predecessor did not establish new
+                    # remote identity: walk back to the most recent real
+                    # publication in the stream (elspeth-fac5260c6a).
+                    predecessor_id = predecessor.predecessor_effect_id
+                    continue
+                # Reaffirmation performed no write, but its durable plan proved
+                # that these exact descriptor bytes already occupied the
+                # target. Preserve that verified descriptor as successor
+                # lineage; inspection will still fence against later tampering.
             if artifact.artifact_type not in {"file", "database", "webhook"}:
                 raise LandscapeRecordError("finalized sink effect predecessor has an invalid artifact type")
             return ArtifactDescriptor(

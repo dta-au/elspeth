@@ -27,6 +27,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ContractCheck
 from elspeth.web.doctor import (
     _aws_operator_telemetry_check,
+    _aws_textract_plugin_check,
     _bedrock_guardrail_plugins_check,
     _initialize_database,
     _inspect_database,
@@ -374,6 +375,7 @@ def test_capability_failures_are_isolated_and_preserve_complete_report(monkeypat
         "bedrock_provider",
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
+        "aws_textract_plugin",
         "psycopg_dependency",
         "psycopg2_dependency",
         "boto3_dependency",
@@ -512,6 +514,47 @@ def test_guardrail_registration_check_accepts_typed_capabilities(monkeypatch: py
     assert _bedrock_guardrail_plugins_check().ok is True
 
 
+def test_textract_registration_check_accepts_registered_transform() -> None:
+    check = _aws_textract_plugin_check()
+
+    assert check == ContractCheck(
+        "aws_textract_plugin",
+        True,
+        "aws_textract_document_analysis transform is registered",
+    )
+
+
+def test_textract_registration_check_fails_when_transform_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.infrastructure.manager as manager_module
+
+    class _Manager:
+        @staticmethod
+        def get_transforms() -> list[object]:
+            return [SimpleNamespace(name="llm")]
+
+    monkeypatch.setattr(manager_module, "get_shared_plugin_manager", _Manager)
+
+    check = _aws_textract_plugin_check()
+
+    assert check.ok is False
+    assert check.detail == "aws_textract_document_analysis transform must be registered"
+
+
+def test_textract_registration_check_redacts_discovery_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.infrastructure.manager as manager_module
+
+    def fail_manager() -> object:
+        raise RuntimeError("postgresql://user:password@private/db")  # secret-scan: allow-this-line
+
+    monkeypatch.setattr(manager_module, "get_shared_plugin_manager", fail_manager)
+
+    check = _aws_textract_plugin_check()
+
+    assert check.ok is False
+    assert "password" not in check.detail
+    assert "private" not in check.detail
+
+
 @pytest.mark.parametrize(
     ("module_name", "check_name"),
     [
@@ -542,7 +585,7 @@ def test_each_lazy_import_failure_keeps_other_named_checks(
     checks = plugin_and_dependency_checks()
     by_name = _by_name(checks)
 
-    assert len(checks) == 9
+    assert len(checks) == 10
     assert by_name[check_name].ok is False
     assert "secret import failure" not in by_name[check_name].detail
     assert "/private/path" not in by_name[check_name].detail
@@ -694,6 +737,7 @@ def test_deployment_collector_has_identical_common_contract_for_every_external_t
         "bedrock_provider",
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
+        "aws_textract_plugin",
         "boto3_dependency",
         "ijson_dependency",
     }.intersection(_by_name(checks))
@@ -789,6 +833,7 @@ def test_task1_check_names_are_exact_ordered_and_unique(tmp_path: Path) -> None:
         "bedrock_provider",
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
+        "aws_textract_plugin",
         "psycopg_dependency",
         "psycopg2_dependency",
         "boto3_dependency",
@@ -874,6 +919,7 @@ def _patch_auxiliary_checks_green(monkeypatch: pytest.MonkeyPatch) -> None:
                 "bedrock_provider",
                 "aws_operator_telemetry",
                 "bedrock_guardrail_plugins",
+                "aws_textract_plugin",
                 "psycopg_dependency",
                 "psycopg2_dependency",
                 "boto3_dependency",
@@ -1362,6 +1408,7 @@ def test_any_auxiliary_preflight_failure_blocks_all_initializers(
                     "bedrock_provider",
                     "aws_operator_telemetry",
                     "bedrock_guardrail_plugins",
+                    "aws_textract_plugin",
                     "psycopg_dependency",
                     "psycopg2_dependency",
                     "boto3_dependency",
@@ -1455,6 +1502,7 @@ def test_task2_order_remains_exact_and_unique_after_database_inspection(tmp_path
         "bedrock_provider",
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
+        "aws_textract_plugin",
         "psycopg_dependency",
         "psycopg2_dependency",
         "boto3_dependency",

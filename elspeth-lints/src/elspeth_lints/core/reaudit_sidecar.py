@@ -148,6 +148,7 @@ from elspeth_lints.core.reaudit import (
     ReauditOutcome,
     ReauditReport,
 )
+from elspeth_lints.core.strict_json import StrictJSONError, strict_json_loads
 
 # Bump on any breaking change to the JSONL schema. The loader refuses
 # to read a sidecar whose header advertises a different version — the
@@ -439,8 +440,8 @@ class SidecarWriter:
         tail = raw_bytes[last_newline + 1 :]
         if tail.strip():
             try:
-                json.loads(tail.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
+                strict_json_loads(tail.decode("utf-8"))
+            except (UnicodeDecodeError, StrictJSONError):
                 pass
             else:
                 self._file.write("\n")
@@ -519,7 +520,10 @@ class SidecarWriter:
     def _write_line(self, payload: dict[str, Any]) -> None:
         if self._file is None:
             raise RuntimeError("SidecarWriter not entered; use 'with SidecarWriter(...)'")
-        line = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        # allow_nan=False keeps the writer inside the dialect the strict
+        # loader accepts: a non-finite value would otherwise be emitted as
+        # bare NaN/Infinity and make the sidecar unreadable on --resume.
+        line = json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False)
         self._file.write(line + "\n")
         self._file.flush()
         os.fsync(self._file.fileno())
@@ -625,8 +629,8 @@ def load_sidecar(sidecar_path: Path) -> LoadedSidecar:
             continue
         is_last_line = line_index == last_index
         try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
+            payload = strict_json_loads(raw)
+        except StrictJSONError as exc:
             if is_last_line and not ends_with_newline:
                 # T6c recovery — partial last line from SIGKILL between
                 # write() and flush()+fsync(). The in-flight outcome is

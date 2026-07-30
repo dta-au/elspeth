@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.protocol import ComposerConvergenceError
@@ -208,6 +209,11 @@ async def test_over_cap_identity_violation_precedes_cap_telemetry_and_dispatch(
         0,
         [],
     )
+    attached_calls = caught.__dict__.get("llm_calls")
+    assert type(attached_calls) is tuple
+    assert len(attached_calls) == 1
+    assert type(attached_calls[0]) is ComposerLLMCall
+    assert attached_calls[0].status is ComposerLLMCallStatus.SUCCESS
 
 
 @pytest.mark.asyncio

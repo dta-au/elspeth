@@ -54,8 +54,10 @@ resource "aws_security_group" "alb" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_https" {
+  for_each = toset(var.alb_https_ingress_cidrs)
+
   security_group_id = aws_security_group.alb.id
-  cidr_ipv4         = "0.0.0.0/0"
+  cidr_ipv4         = each.value
   from_port         = 443
   to_port           = 443
   ip_protocol       = "tcp"

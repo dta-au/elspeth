@@ -235,7 +235,7 @@ output "runtime_doctor_overrides" {
 
 output "service_enable_command" {
   description = "Run only after the schema-init and ordinary runtime doctor tasks both exit zero."
-  value       = "aws --profile ${jsonencode(var.aws_profile)} --region ${jsonencode(var.aws_region)} ecs update-service --cluster ${jsonencode(aws_ecs_cluster.scenario.name)} --service ${jsonencode(aws_ecs_service.web.name)} --desired-count 1"
+  value       = "aws --profile ${jsonencode(var.aws_profile)} --region ${jsonencode(var.aws_region)} ecs update-service --cluster ${jsonencode(aws_ecs_cluster.scenario.name)} --service ${jsonencode(aws_ecs_service.web.name)} --task-definition ${jsonencode(aws_ecs_task_definition.candidate_web.arn)} --desired-count 1 --force-new-deployment"
 }
 
 output "teardown" {

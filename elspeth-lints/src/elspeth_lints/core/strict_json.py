@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Never
 
 
 class StrictJSONError(ValueError):
@@ -19,9 +19,17 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_non_json_numeric_constant(constant: str) -> Never:
+    raise StrictJSONError(f"non-JSON numeric constant {constant!r}")
+
+
 def strict_json_loads(payload: str | bytes) -> Any:
-    """Decode JSON while rejecting duplicate keys at every object depth."""
+    """Decode JSON while rejecting duplicate keys and non-JSON constants."""
     try:
-        return json.loads(payload, object_pairs_hook=_reject_duplicate_keys)
+        return json.loads(
+            payload,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_non_json_numeric_constant,
+        )
     except json.JSONDecodeError as exc:
         raise StrictJSONError(str(exc)) from exc

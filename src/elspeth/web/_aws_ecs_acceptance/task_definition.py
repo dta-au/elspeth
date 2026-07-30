@@ -66,8 +66,10 @@ _CLOUDWATCH_AGENT_COMMAND = (
 )
 _CLOUDWATCH_AGENT_HEALTH_CHECK = {
     "command": [
-        "CMD-SHELL",
-        "kill -0 1",
+        "CMD",
+        "python",
+        "-c",
+        "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()",
     ],
     "interval": 10,
     "timeout": 5,
@@ -81,6 +83,24 @@ _CLOUDWATCH_AGENT_ENV_NAMES = frozenset(
         "ELSPETH_CW_AGENT_OTEL_YAML_B64",
         "ELSPETH_CW_AGENT_OTEL_YAML_SHA256",
     }
+)
+_PUBLISHED_WEB_ENTRYPOINT = (
+    "/bin/sh",
+    "-ceu",
+    (
+        'metadata_url="$ECS_CONTAINER_METADATA_URI_V4/task"\n'
+        "family=$(python -c 'import json,sys,urllib.request; "
+        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Family"])\' "$metadata_url")\n'
+        "revision=$(python -c 'import json,sys,urllib.request; "
+        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Revision"])\' "$metadata_url")\n'
+        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY="$family"\n'
+        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION="$revision"\n'
+        'case "$1" in\n'
+        '  web|doctor) set -- elspeth "$@" ;;\n'
+        "esac\n"
+        'exec "$@"\n'
+    ),
+    "--",
 )
 _PUBLISHED_WEB_COMMAND = ("web", "--host", "0.0.0.0", "--port", "8451")
 
@@ -260,7 +280,9 @@ def validate_task_definition_policy_binding(
     if container.get("essential") is not True:
         raise AcceptanceCheckError("task_definition_policy_binding")
     is_published_web_container = expected_user is None and container_name == values["WEB_CONTAINER_NAME"]
-    if is_published_web_container and container.get("command") != list(_PUBLISHED_WEB_COMMAND):
+    if is_published_web_container and (
+        container.get("entryPoint") != list(_PUBLISHED_WEB_ENTRYPOINT) or container.get("command") != list(_PUBLISHED_WEB_COMMAND)
+    ):
         raise AcceptanceCheckError("task_definition_policy_binding")
     sidecars = [candidate for candidate in containers if isinstance(candidate, Mapping) and candidate.get("name") == "cloudwatch-agent"]
     if not sidecars:

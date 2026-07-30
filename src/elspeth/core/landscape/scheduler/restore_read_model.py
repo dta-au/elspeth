@@ -16,7 +16,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape.model_loaders import TokenOutcomeLoader
-from elspeth.core.landscape.schema import node_states_table, token_outcomes_table, tokens_table
+from elspeth.core.landscape.schema import coalesce_branch_losses_table, node_states_table, token_outcomes_table, tokens_table
 
 _TOKEN_ID_CHUNK_SIZE = 500
 
@@ -149,6 +149,73 @@ class BarrierRestoreReadModel:
                 node_states_table.c.node_id == node_id,
                 tokens_table.c.row_id == row_id,
                 node_states_table.c.completed_at.isnot(None),
+            )
+            .limit(1)
+        )
+        return self._ops.execute_fetchone(query) is not None
+
+    def get_released_row_ids_for_nodes(
+        self,
+        run_id: str,
+        node_ids: frozenset[str],
+    ) -> set[tuple[str, str]]:
+        """Status-COMPLETED ``(node_id, row_id)`` pairs for row_union restore.
+
+        Released-only sibling of :meth:`get_completed_row_ids_for_nodes`: a
+        FAILED closure has ``completed_at`` set too, so restore's
+        released-group classification must filter on status.
+        """
+        if not node_ids:
+            return set()
+
+        query = (
+            select(node_states_table.c.node_id, tokens_table.c.row_id)
+            .select_from(
+                node_states_table.join(
+                    tokens_table,
+                    node_states_table.c.token_id == tokens_table.c.token_id,
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.node_id.in_(node_ids),
+                node_states_table.c.completed_at.isnot(None),
+                node_states_table.c.status == NodeStateStatus.COMPLETED.value,
+            )
+            .distinct()
+        )
+        rows = self._ops.execute_fetchall(query)
+        return {(row.node_id, row.row_id) for row in rows}
+
+    def has_released_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
+        """Return whether one row completed as COMPLETED at one node in one run."""
+        query = (
+            select(node_states_table.c.state_id)
+            .select_from(
+                node_states_table.join(
+                    tokens_table,
+                    node_states_table.c.token_id == tokens_table.c.token_id,
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.node_id == node_id,
+                tokens_table.c.row_id == row_id,
+                node_states_table.c.completed_at.isnot(None),
+                node_states_table.c.status == NodeStateStatus.COMPLETED.value,
+            )
+            .limit(1)
+        )
+        return self._ops.execute_fetchone(query) is not None
+
+    def has_branch_loss_for_group(self, *, run_id: str, barrier_name: str, row_id: str) -> bool:
+        """Return whether the durable ledger records any loss for one barrier group."""
+        query = (
+            select(coalesce_branch_losses_table.c.loss_id)
+            .where(
+                coalesce_branch_losses_table.c.run_id == run_id,
+                coalesce_branch_losses_table.c.coalesce_name == barrier_name,
+                coalesce_branch_losses_table.c.row_id == row_id,
             )
             .limit(1)
         )

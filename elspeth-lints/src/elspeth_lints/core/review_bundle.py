@@ -101,9 +101,7 @@ class ActionPreview:
             if not isinstance(value, str):
                 raise ValueError(f"ActionPreview.{name} must be a string; got {type(value).__name__}")
         if not isinstance(self.authoritative, bool):
-            raise ValueError(
-                f"ActionPreview.authoritative must be a boolean; got {type(self.authoritative).__name__}"
-            )
+            raise ValueError(f"ActionPreview.authoritative must be a boolean; got {type(self.authoritative).__name__}")
         if self.authoritative:
             raise ValueError("ActionPreview.authoritative must be False; a bundle preview is never authoritative")
 

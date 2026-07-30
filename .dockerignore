@@ -104,6 +104,7 @@ landscape.db
 *.tfstate.*
 *.tfplan
 *.tfvars
+*.tfvars.json
 !*.tfvars.example
 
 # Secrets (never include in image!)

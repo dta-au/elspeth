@@ -6,9 +6,11 @@ telemetry. This runbook permits planned downtime: it deliberately uses a
 zero-overlap, single-task deployment.
 
 > **Scope:** This is the exhaustive, release-specific, two-scenario acceptance
-> and teardown program. Its Terraform package and owning remote state are not
-> tracked in this repository, so a clean source checkout cannot execute it from
-> top to bottom. For an ordinary rebuild and rollout to an existing ECS
+> and teardown program. Its supported Terraform source IS tracked in this
+> repository at [`deploy/aws-ecs/terraform/`](../../deploy/aws-ecs/terraform/README.md)
+> — start a cold install from that package's README. Only the owning remote
+> state (the per-run S3 state bucket and its contents) lives outside the
+> repository. For an ordinary rebuild and rollout to an existing ECS
 > service, use
 > [AWS ECS existing-service redeploy](aws-ecs-existing-service-redeploy.md).
 > Reconcile every schema epoch, task-definition input, and external Terraform
@@ -1505,9 +1507,9 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
   "previous_package_version": "0.7.1",
   "schema_facts": {
-    "candidate": {"session_epoch": 37, "landscape_epoch": 30, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 38, "landscape_epoch": 30, "run_web_plugin_policy_present": true},
     "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
-    "structural_changes": "session_epoch_35_to_37_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier",
+    "structural_changes": "session_epoch_35_to_38_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier",
     "semantics_only_changes": "none",
     "archive_export_decision": "required_before_forward_migration",
     "destructive_reset_required": false
@@ -1533,12 +1535,12 @@ Scenario A uses the same field set with `scenario_id: "A"`; empty strings for
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 37, Landscape epoch 30 and `run_web_plugin_policy` presence,
+session epoch 38, Landscape epoch 30 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
 any later deployment action. The 0.7.1 image understands session epoch 35,
-not epoch 37. Pre-1.0 candidates do not migrate predecessor schemas: the old
+not epoch 38. Pre-1.0 candidates do not migrate predecessor schemas: the old
 deployment is stopped and uninstalled, required evidence is archived/exported,
 and the databases are recreated before the candidate is installed. The previous
 image cannot reopen the recreated current database, so Scenario B rollback is
@@ -2130,12 +2132,14 @@ also allow is intersected away. Neither action names an ARN, so `"*"` is the
 only expressible resource; the effective scope remains the S3 object grant,
 because Textract reads `DocumentLocation.S3Object` under the task role's own
 credentials and can therefore only analyse objects already inside this run's
-prefix. No additional S3 permission is required beyond that prefix grant, and
-no Textract environment variable exists — the plugin is configured per node and
-authenticates through the default credential chain. Omitting the grant is a
-late failure: the pipeline composes and validates cleanly, then fails at run
-time with `AccessDenied`, because authorization is not checked until the job is
-submitted.
+prefix. The role needs `s3:GetObject` on that prefix and, whenever the transform
+configures `version_field`, `s3:GetObjectVersion` on the same scope; the
+reference task policy and permissions boundary grant both. No Textract
+environment variable exists — the plugin is configured per node and
+authenticates through the default credential chain. Omitting either required
+grant is a late failure: the pipeline composes and validates cleanly, then fails
+at run time with `AccessDenied` or `InvalidS3ObjectException`, because
+authorization is not checked until the job is submitted.
 
 A correctly-shaped IAM policy is not sufficient on its own: the chosen model
 id also needs an active model-access agreement in the target account.
@@ -2174,7 +2178,8 @@ approved Secrets Manager selector when either Composer model is
 made dependent on a live provider call; sanitized system status reports
 Composer availability separately.
 
-For S3, grant only `s3:GetObject` for approved source prefixes and
+For S3, grant only `s3:GetObject` for approved source prefixes,
+`s3:GetObjectVersion` on those prefixes when a source selects versions, and
 `s3:PutObject` for approved sink prefixes. Never grant wildcard buckets. The
 disposable acceptance role additionally gets `s3:DeleteObject` only for
 `ELSPETH_ACCEPTANCE_S3_BUCKET` plus its UUID-scoped
@@ -2289,9 +2294,10 @@ Record the approved digest-only CloudWatch Agent reference in the protected
 scenario inventory as `CLOUDWATCH_AGENT_IMAGE`. The rendered image reference
 must equal it byte-for-byte and contain no tag. The approved ECS runtime variant must include
 the AWS config-translator, the `amazon-cloudwatch-agent` binary itself, plus `/bin/sh`, `base64`,
-and `sha256sum`; those are part of the reviewed image contract and are exercised by
-the entrypoint below. The web container must override the image's diagnostic
-default with the exact service command `web --host 0.0.0.0 --port 8451`:
+`sha256sum`, and Python 3.13; those are part of the reviewed image contract and
+are exercised by the entrypoint and health probe below. The web container must
+override the image's diagnostic default with the exact service command
+`web --host 0.0.0.0 --port 8451`:
 
 ```json
 {
@@ -2310,7 +2316,7 @@ default with the exact service command `web --host 0.0.0.0 --port 8451`:
         {"name": "ELSPETH_CW_AGENT_OTEL_YAML_SHA256", "value": "${CLOUDWATCH_AGENT_OTEL_YAML_SHA256}"}
       ],
       "healthCheck": {
-        "command": ["CMD-SHELL", "kill -0 1"],
+        "command": ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()"],
         "interval": 10,
         "timeout": 5,
         "retries": 6,
@@ -2349,6 +2355,13 @@ default with the exact service command `web --host 0.0.0.0 --port 8451`:
   ]
 }
 ```
+
+The sidecar health check must reach the actual OTLP/gRPC listener at
+`127.0.0.1:4317`; checking PID 1 only proves that the setup shell has not
+exited. The Python connect uses a three-second socket timeout within ECS's
+five-second health-check timeout. It intentionally verifies listener readiness,
+not application-level gRPC health: a closed or not-yet-open collector socket
+keeps the web container's `HEALTHY` dependency unsatisfied.
 
 Do not add a task port map for the collector. Fargate containers in the task
 share the task network namespace, so the application reaches the loopback
@@ -3220,7 +3233,7 @@ fi
 
 The compatibility receipt plus `candidate-after-rollback-refusal` evidence is
 the refusal/forward-recovery record. If the candidate is unhealthy, keep traffic
-drained and repair forward with epoch-37 session/epoch-30 Landscape code.
+drained and repair forward with epoch-38 session/epoch-30 Landscape code.
 Predecessor database restoration and code downgrade are not supported repair
 paths. Never roll old code over the recreated schema.
 

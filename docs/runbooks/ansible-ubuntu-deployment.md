@@ -84,7 +84,7 @@ cd /opt/elspeth
 sudo --preserve-env=ELSPETH_JUDGE_METADATA_HMAC_KEY -u elspeth \
   uv run --frozen --extra dev elspeth-lints check --rules trust_tier.tier_model \
   --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model
-sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra postgres
+sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra aws --extra postgres
 node --version  # must report v24.x
 npm --version   # must report 11.x
 sudo -u elspeth npm --prefix src/elspeth/web/frontend ci
@@ -100,7 +100,7 @@ Record `git -C /opt/elspeth rev-parse HEAD` in the deployment log. Do not
 deploy a moving branch. Supply `ELSPETH_JUDGE_METADATA_HMAC_KEY` from the
 operator's protected secret store before the gate; never print or retain it in
 the deployment log. The final exact `uv sync` removes the development-only
-gate dependencies and leaves the production environment with only the four
+gate dependencies and leaves the production environment with only the five
 listed runtime extras. Stop if the gate or sync fails.
 
 Install the portable service and its environment file:
@@ -234,7 +234,7 @@ replacement until the old process is gone.
    sudo -u elspeth git -C /opt/elspeth checkout --detach "$ELSPETH_RELEASE_REF"
    test "$(git -C /opt/elspeth rev-parse HEAD)" = "$ELSPETH_RELEASE_REF"
    cd /opt/elspeth
-   sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra postgres
+   sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra aws --extra postgres
    sudo -u elspeth node --version  # must report v24.x
    sudo -u elspeth npm --version   # must report 11.x
    sudo -u elspeth npm --prefix src/elspeth/web/frontend ci
@@ -314,7 +314,7 @@ Rollback is also stop-before-start:
    sudo -u elspeth git -C /opt/elspeth checkout --detach "$ELSPETH_ROLLBACK_REF"
    test "$(git -C /opt/elspeth rev-parse HEAD)" = "$ELSPETH_ROLLBACK_REF"
    cd /opt/elspeth
-   sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra postgres
+   sudo -u elspeth uv sync --frozen --extra webui --extra azure --extra llm --extra aws --extra postgres
    sudo -u elspeth node --version  # must report v24.x
    sudo -u elspeth npm --version   # must report 11.x
    sudo -u elspeth npm --prefix src/elspeth/web/frontend ci

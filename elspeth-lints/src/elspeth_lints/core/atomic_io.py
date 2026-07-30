@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -83,6 +84,28 @@ class AtomicWriteShortWriteError(RuntimeError):
     side?). Uses a typed exception rather than ``assert`` because
     ``python -O`` strips asserts and the project's Tier-1 guarantees
     must survive optimisation.
+    """
+
+
+class AtomicWriteSymlinkError(RuntimeError):
+    """The target path or its parent directory is a symlink.
+
+    ``tree_snapshot`` in ``sign_bundle_transaction`` already refuses any
+    symlink under an allowlist root — files included — so the durable
+    writer must refuse the same shape rather than materialise state the
+    transaction layer would later reject as un-snapshottable.
+
+    A symlinked *parent* means the lock file, the private temp inode,
+    and the renamed target all land somewhere the caller did not name;
+    the ``.<name>.lock`` serialisation boundary is then shared with
+    whatever else resolves through that link. A symlinked *target* is
+    incoherent rather than redirecting: ``os.replace`` operates on the
+    link itself, so ``atomic_update_text`` would read *through* the link
+    and then replace the link, silently unlinking the read source.
+
+    Tier-1: refuse at the boundary. The operator's recourse is to
+    provision the allowlist directory and file as real filesystem
+    objects.
     """
 
 
@@ -167,6 +190,28 @@ def _fsync_directory(directory: Path) -> None:
         os.close(dir_fd)
 
 
+def _validate_write_target(path: Path) -> None:
+    """Require ``path``'s parent to be a real directory and ``path`` not to be a symlink.
+
+    Runs before the lock file is opened: ``_acquire_lock_fd`` creates
+    ``.<name>.lock`` inside the parent, so validating afterwards would
+    already have planted a file through the link.
+    """
+    parent = path.parent
+    try:
+        details = parent.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"atomic write: parent directory does not exist: {parent}. "
+            "Refusing to create it implicitly; the caller is responsible "
+            "for allowlist directory provisioning."
+        ) from None
+    if not stat.S_ISDIR(details.st_mode):
+        raise AtomicWriteSymlinkError(f"atomic write: parent path is not a directory: {parent}")
+    if path.is_symlink():
+        raise AtomicWriteSymlinkError(f"atomic write: refusing symlinked target: {path}")
+
+
 def _acquire_lock_fd(path: Path, *, wait: bool) -> int:
     """Acquire the sibling lock file for ``path`` and return its fd."""
     lock_path = _lock_path_for(path)
@@ -205,6 +250,9 @@ def atomic_write_text(
         AtomicWriteConflictError: another writer holds the per-file
             lock. Tier-1: do not retry silently; surface to the
             operator.
+        AtomicWriteSymlinkError: the target or its parent directory is
+            a symlink. Tier-1: refuse rather than write through a link
+            the caller did not name.
         OSError: filesystem failure (disk full, permission denied,
             fsync error, parent directory missing). Propagated
             verbatim — Tier-1 demands a loud crash rather than a
@@ -212,12 +260,7 @@ def atomic_write_text(
     """
     path = Path(path)
     parent = path.parent
-    if not parent.exists():
-        raise FileNotFoundError(
-            f"atomic_write_text: parent directory does not exist: {parent}. "
-            "Refusing to create it implicitly; the caller is responsible "
-            "for allowlist directory provisioning."
-        )
+    _validate_write_target(path)
 
     lock_fd: int | None = None
     if lock:
@@ -324,6 +367,10 @@ def atomic_update_text(
             "Refusing to create it implicitly; pass create_parent=True for "
             "callers that own allowlist directory provisioning."
         )
+    # Validate before the read as well as before the write: this helper
+    # reads through ``path`` and then replaces it, so a symlinked target
+    # would make the read source and the replaced inode different files.
+    _validate_write_target(path)
 
     lock_fd = _acquire_lock_fd(path, wait=True)
     try:

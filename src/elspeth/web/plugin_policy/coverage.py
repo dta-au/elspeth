@@ -451,6 +451,18 @@ def _producer_proves_input_control(
             )
             for predecessor in predecessors
         )
+    if producer.node_type == "gate" and producer.plugin is None:
+        # Config gates route and fork rows without modifying them (GateExecutor
+        # emits output_hash == input_hash and forks children with the parent's
+        # row data verbatim), so a control dominating the gate's single input
+        # dominates every route and fork branch it emits.
+        return _stream_proves_input_control(
+            producer.input,
+            graph,
+            source_streams=source_streams,
+            visited=visited,
+            protected_fields=protected_fields,
+        )
     if producer.plugin is None:
         return False
     try:

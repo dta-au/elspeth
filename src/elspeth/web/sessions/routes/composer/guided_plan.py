@@ -146,11 +146,15 @@ async def post_guided_plan(
         if type(result) is GuidedDeclinedResult:
             checkpoint = await service.get_state_in_session(result.checkpoint_state_id, session_id)
             decline_rows = [
-                message
-                for message in await service.get_messages(session_id, limit=None)
-                if message.composition_state_id == checkpoint.id and message.role == "assistant"
+                message for message in await service.get_messages(session_id, limit=None) if message.id == result.decline_message_id
             ]
-            if len(decline_rows) != 1 or decline_rows[0].writer_principal != "compose_loop":
+            if (
+                len(decline_rows) != 1
+                or decline_rows[0].session_id != session_id
+                or decline_rows[0].composition_state_id != checkpoint.id
+                or decline_rows[0].role != "assistant"
+                or decline_rows[0].writer_principal != "compose_loop"
+            ):
                 raise AuditIntegrityError("guided-full decline replay has a malformed assistant message locator")
             return project_guided_full_decline(decline_rows[0])
         if type(result) is not GuidedPipelineProposalResult:

@@ -107,10 +107,19 @@ from ._aws_ecs_acceptance.contracts import (
     SanitizedResourceIdentity as SanitizedResourceIdentity,
 )
 from ._aws_ecs_acceptance.contracts import (
+    acceptance_error_envelope as _acceptance_error_envelope,
+)
+from ._aws_ecs_acceptance.contracts import (
+    current_acceptance_step as _current_acceptance_step,
+)
+from ._aws_ecs_acceptance.contracts import (
     normalize_acceptance_origin as normalize_acceptance_origin,
 )
 from ._aws_ecs_acceptance.contracts import (
     plugin_policy_binding_sha256 as plugin_policy_binding_sha256,
+)
+from ._aws_ecs_acceptance.contracts import (
+    reset_acceptance_step as _reset_acceptance_step,
 )
 from ._aws_ecs_acceptance.control_service import (
     control_manifest_load_cleanup as control_manifest_load_cleanup,
@@ -290,6 +299,7 @@ from ._aws_ecs_acceptance.state import (
 from ._aws_ecs_acceptance.task_definition import (
     validate_task_definition_policy_binding as validate_task_definition_policy_binding,
 )
+from ._aws_ecs_acceptance.textract import verify_textract as verify_textract
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -331,6 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
             "verify-bedrock-guardrails",
             "verify-connection-budget",
             "verify-operator-telemetry",
+            "verify-textract",
         ),
     )
     extract_receipt.add_argument("--candidate-sha", required=True)
@@ -497,6 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
         "verify-s3",
         "verify-bedrock",
         "verify-bedrock-guardrails",
+        "verify-textract",
     ):
         commands.add_parser(command)
 
@@ -522,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
     """Dispatch the closed acceptance command surface with static failures."""
 
     args = build_parser().parse_args(argv)
+    _reset_acceptance_step()
 
     try:
         if args.command == "capture":
@@ -542,6 +555,7 @@ def main(argv: list[str] | None = None) -> int:
             "verify-bedrock-guardrails",
             "verify-connection-budget",
             "verify-operator-telemetry",
+            "verify-textract",
         }:
             with _suppress_process_output():
                 if args.command == "verify-s3":
@@ -550,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
                     details = asyncio.run(verify_bedrock(os.environ))
                 elif args.command == "verify-bedrock-guardrails":
                     details = run_bedrock_guardrails_live(os.environ)
+                elif args.command == "verify-textract":
+                    details = verify_textract(os.environ)
                 elif args.command == "verify-connection-budget":
                     details = verify_connection_budget_live(
                         os.environ,
@@ -769,14 +785,19 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(sanitize_evidence(args.kind, raw_evidence, plan_sha256=args.plan_sha256))
         else:
             raise AcceptanceCheckError("command_not_implemented")
-    except AcceptanceCheckError as exc:
-        _print_error({"error_class": type(exc).__name__, "check": exc.check})
-        return 1
-    except (AcceptanceHttpError, AcceptanceInputError, AcceptanceStateError, OperatorTelemetryAcceptanceError) as exc:
-        _print_error({"error_class": type(exc).__name__})
+    except (AcceptanceCheckError, AcceptanceHttpError, AcceptanceInputError, AcceptanceStateError, OperatorTelemetryAcceptanceError) as exc:
+        _print_error(_acceptance_error_envelope(exc))
         return 1
     except Exception:
-        _print_error({"error_class": "AcceptanceInternalError"})
+        # True last resort: nothing about the exception is trusted, so only
+        # the closed internal code and the tagged step are projected.
+        _print_error(
+            {
+                "error_class": "AcceptanceInternalError",
+                "error_code": "acceptance_internal",
+                "step": _current_acceptance_step(),
+            }
+        )
         return 1
     return 0
 

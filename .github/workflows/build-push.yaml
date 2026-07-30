@@ -6,12 +6,18 @@
 #
 # Triggers:
 #   - After CI passes on main branch
-#   - On version tags (v*)
+#   - On version tags (v*). This includes pre-release/RC tags such as
+#     v0.7.2-RC-280726: the tag may point at a release/* branch commit (CI
+#     runs on release/** pushes), and the required-checks gate below verifies
+#     that exact commit's CI evidence. Pushing the git tag is the operator
+#     action that publishes a release-candidate image; nothing else does.
 #   - Manual dispatch with registry selection
 #
 # Tags:
-#   - sha-<commit>  (immutable, for CI)
-#   - v1.2.3        (semantic version, for releases)
+#   - sha-<commit>   (immutable, for CI)
+#   - <git tag name> (the release job promotes the verified digest to the
+#                     literal tag, e.g. v1.2.3 or v0.7.2-RC-280726; the
+#                     pre-release suffix is preserved, never rewritten)
 
 name: Build and Push
 
@@ -631,6 +637,9 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           generate_release_notes: true
+          # A hyphen in the tag marks a semver pre-release (v0.7.2-RC-280726):
+          # publish it as a GitHub prerelease so an RC never becomes "latest".
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             ## Docker Images
 

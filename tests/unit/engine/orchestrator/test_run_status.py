@@ -27,11 +27,13 @@ from datetime import UTC, datetime
 import pytest
 
 from elspeth.contracts.audit import TokenOutcome
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.events import RunCompletionStatus
 from elspeth.contracts.run_result import RunResult
 from elspeth.engine.orchestrator import run_status
 from elspeth.engine.orchestrator.run_status import (
+    cli_completion_for,
     derive_resume_terminal_status_from_audit,
     is_counted_coalesced_output,
 )
@@ -204,3 +206,34 @@ def test_terminal_counter_parity_fields_follow_execution_counters() -> None:
     assert set(execution_counter_fields) == set(strict_fields) | excluded_fields
     assert strict_fields == tuple(field for field in execution_counter_fields if field not in excluded_fields)
     assert not [field for field in strict_fields if field not in run_result_fields]
+
+
+# ---------------------------------------------------------------------------
+# cli_completion_for: the CLI exit-code taxonomy (F17, elspeth-83ad093154)
+# ---------------------------------------------------------------------------
+# The `run` and `resume` commands exit the process with the code this mapping
+# returns; these tests lock the taxonomy so a drift here is caught before it
+# reaches CI/cron/ECS wrappers that branch on the exit code.
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_completion", "expected_exit_code"),
+    [
+        (RunStatus.COMPLETED, RunCompletionStatus.COMPLETED, 0),
+        (RunStatus.EMPTY, RunCompletionStatus.COMPLETED, 0),
+        (RunStatus.COMPLETED_WITH_FAILURES, RunCompletionStatus.PARTIAL, 1),
+        (RunStatus.FAILED, RunCompletionStatus.FAILED, 2),
+        (RunStatus.INTERRUPTED, RunCompletionStatus.INTERRUPTED, 3),
+    ],
+)
+def test_cli_completion_for_locks_exit_code_taxonomy(
+    terminal_status: RunStatus,
+    expected_completion: RunCompletionStatus,
+    expected_exit_code: int,
+) -> None:
+    assert cli_completion_for(terminal_status) == (expected_completion, expected_exit_code)
+
+
+def test_cli_completion_for_rejects_non_terminal_status() -> None:
+    with pytest.raises(OrchestrationInvariantError, match="terminal-status-only"):
+        cli_completion_for(RunStatus.RUNNING)

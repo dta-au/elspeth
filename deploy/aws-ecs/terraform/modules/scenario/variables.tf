@@ -30,7 +30,7 @@ variable "candidate_image" {
 
   validation {
     condition = can(regex(
-      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${var.candidate_ecr_repository}@sha256:[0-9a-f]{64}$",
+      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${replace(var.candidate_ecr_repository, ".", "\\.")}@sha256:[0-9a-f]{64}$",
       var.candidate_image,
     ))
     error_message = "candidate_image must be a digest in the explicitly approved account, region, and ECR repository."
@@ -52,7 +52,7 @@ variable "rollback_baseline_image" {
 
   validation {
     condition = can(regex(
-      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${var.candidate_ecr_repository}@sha256:[0-9a-f]{64}$",
+      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${replace(var.candidate_ecr_repository, ".", "\\.")}@sha256:[0-9a-f]{64}$",
       var.rollback_baseline_image,
     ))
     error_message = "rollback_baseline_image must be a digest in the explicitly approved account, region, and application ECR repository."
@@ -128,7 +128,7 @@ variable "cloudwatch_agent_image" {
 
   validation {
     condition = can(regex(
-      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${var.cloudwatch_agent_ecr_repository}@sha256:[0-9a-f]{64}$",
+      "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${replace(var.cloudwatch_agent_ecr_repository, ".", "\\.")}@sha256:[0-9a-f]{64}$",
       var.cloudwatch_agent_image,
     ))
     error_message = "cloudwatch_agent_image must be a digest in the explicitly approved account, region, and agent ECR repository."
@@ -243,19 +243,51 @@ variable "alarm_actions" {
   default = []
 }
 
+variable "alb_https_ingress_cidrs" {
+  type        = list(string)
+  description = "Explicit operator CIDRs allowed to reach the acceptance ALB over HTTPS."
+
+  validation {
+    condition = (
+      length(var.alb_https_ingress_cidrs) > 0 &&
+      length(distinct(var.alb_https_ingress_cidrs)) == length(var.alb_https_ingress_cidrs) &&
+      alltrue([for cidr in var.alb_https_ingress_cidrs : can(cidrnetmask(cidr)) && !endswith(cidr, "/0")])
+    )
+    error_message = "alb_https_ingress_cidrs must contain unique valid operator CIDRs and must not include 0.0.0.0/0."
+  }
+}
+
 variable "database_name" {
   type    = string
   default = "elspeth"
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]{0,62}$", var.database_name))
+    error_message = "database_name must be a safe PostgreSQL identifier of at most 63 characters."
+  }
 }
 
 variable "session_database_name" {
   type    = string
   default = "elspeth_session"
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]{0,62}$", var.session_database_name))
+    error_message = "session_database_name must be a safe PostgreSQL identifier of at most 63 characters."
+  }
 }
 
 variable "landscape_database_name" {
   type    = string
   default = "elspeth_landscape"
+
+  validation {
+    condition = (
+      can(regex("^[A-Za-z_][A-Za-z0-9_]{0,62}$", var.landscape_database_name)) &&
+      var.landscape_database_name != var.session_database_name
+    )
+    error_message = "landscape_database_name must be a safe PostgreSQL identifier distinct from session_database_name."
+  }
 }
 
 variable "aurora_engine_major_version" {
@@ -306,6 +338,39 @@ variable "plugin_preferences" {
   type        = map(list(string))
   default     = null
   description = "Ordered implementation choice per control capability, e.g. {prompt_shield = [\"transform:aws_bedrock_prompt_shield\"]}. Null keeps the module default."
+
+  validation {
+    condition = var.plugin_preferences == null || alltrue([
+      for capability in keys(var.plugin_preferences) : contains(["llm", "prompt_shield", "content_safety"], capability)
+    ])
+    error_message = "plugin_preferences keys must be one of \"llm\", \"prompt_shield\", or \"content_safety\"."
+  }
+
+  validation {
+    condition = var.plugin_preferences == null || var.plugin_allowlist == null || alltrue(flatten([
+      for implementations in values(var.plugin_preferences) : [
+        for implementation in implementations :
+        contains(
+          setunion(
+            toset(var.plugin_allowlist),
+            toset([
+              "source:csv",
+              "source:json",
+              "source:text",
+              "sink:csv",
+              "sink:json",
+              "sink:text",
+              "transform:field_mapper",
+              "transform:llm",
+              "transform:web_scrape",
+            ]),
+          ),
+          implementation,
+        )
+      ]
+    ]))
+    error_message = "every preferred implementation must be authorized by the always-authorized web core or plugin_allowlist."
+  }
 }
 
 variable "plugin_control_modes" {
@@ -318,6 +383,13 @@ variable "plugin_control_modes" {
       for mode in values(var.plugin_control_modes) : contains(["required", "recommend"], mode)
     ])
     error_message = "each plugin_control_modes value must be \"required\" or \"recommend\"."
+  }
+
+  validation {
+    condition = var.plugin_control_modes == null || alltrue([
+      for capability in keys(var.plugin_control_modes) : contains(["llm", "prompt_shield", "content_safety"], capability)
+    ])
+    error_message = "plugin_control_modes keys must be one of \"llm\", \"prompt_shield\", or \"content_safety\"."
   }
 
   # The web service compiles the policy at startup and fails closed on both of
@@ -335,16 +407,6 @@ variable "plugin_control_modes" {
     error_message = "a control set to \"required\" must name at least one implementation in plugin_preferences."
   }
 
-  validation {
-    condition = var.plugin_control_modes == null || var.plugin_preferences == null || var.plugin_allowlist == null || alltrue(flatten([
-      for capability, mode in var.plugin_control_modes : [
-        for implementation in lookup(var.plugin_preferences, capability, []) :
-        contains(var.plugin_allowlist, implementation)
-      ]
-      if mode == "required"
-    ]))
-    error_message = "every implementation preferred for a \"required\" control must also appear in plugin_allowlist."
-  }
 }
 
 variable "llm_profiles" {
@@ -379,9 +441,9 @@ variable "default_llm_profile" {
   # this it is discovered only after the service is rolled. Checking it here
   # fails `terraform plan` instead.
   validation {
-    condition = var.default_llm_profile == null || contains(
+    condition = contains(
       var.llm_profiles == null ? ["standard", "fast"] : keys(var.llm_profiles),
-      coalesce(var.default_llm_profile, ""),
+      coalesce(var.default_llm_profile, "standard"),
     )
     error_message = "default_llm_profile must name a configured llm_profiles alias; the module default pair is \"standard\" and \"fast\"."
   }

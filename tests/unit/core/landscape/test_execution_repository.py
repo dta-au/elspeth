@@ -594,6 +594,63 @@ class TestCompletedRowLookup:
         assert repo.has_completed_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is False
 
 
+class TestReleasedRowLookup:
+    """Released-only (status COMPLETED) row reads for row_union restore.
+
+    A FAILED closure has completed_at set too, so the completed reads see it;
+    the released reads must not — a failure-closed row_union group is not a
+    released one.
+    """
+
+    def test_released_reads_exclude_failed_closures(self) -> None:
+        _db, repo, fac, tok = _make_repo_with_token()
+        fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
+        fac.data_flow.create_token("row-2", token_id="tok-2")
+
+        released = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
+        failed = repo.begin_node_state("tok-2", "transform-1", "run-1", 1, {"name": "second"})
+        repo.complete_node_state(released.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
+        repo.complete_node_state(
+            failed.state_id,
+            NodeStateStatus.FAILED,
+            error=ExecutionError(exception="group failed", exception_type="ValueError"),
+            duration_ms=1.0,
+        )
+
+        assert repo.get_completed_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {
+            ("transform-1", "row-1"),
+            ("transform-1", "row-2"),
+        }
+        assert repo.get_released_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {("transform-1", "row-1")}
+        assert repo.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is True
+        assert repo.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-2") is False
+        assert repo.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-missing") is False
+
+    def test_restore_read_model_released_reads_exclude_failed_closures(self) -> None:
+        _db, repo, fac, tok = _make_repo_with_token()
+        fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
+        fac.data_flow.create_token("row-2", token_id="tok-2")
+
+        released = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
+        failed = repo.begin_node_state("tok-2", "transform-1", "run-1", 1, {"name": "second"})
+        repo.complete_node_state(released.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
+        repo.complete_node_state(
+            failed.state_id,
+            NodeStateStatus.FAILED,
+            error=ExecutionError(exception="group failed", exception_type="ValueError"),
+            duration_ms=1.0,
+        )
+
+        reads = fac.barrier_restore
+        assert reads.get_completed_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {
+            ("transform-1", "row-1"),
+            ("transform-1", "row-2"),
+        }
+        assert reads.get_released_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {("transform-1", "row-1")}
+        assert reads.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is True
+        assert reads.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-2") is False
+
+
 class TestCompleteNodeStateForbiddenFields:
     """Regression tests for elspeth-22e2bca0c1: forbidden fields per status."""
 

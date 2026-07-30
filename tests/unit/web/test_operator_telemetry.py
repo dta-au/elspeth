@@ -242,6 +242,17 @@ def test_aws_metric_export_preserves_only_bounded_acceptance_correlation() -> No
 
 
 @dataclass
+class _FakeSynchronousInstrument:
+    points: list[tuple[int | float, dict[str, object] | None]] = field(default_factory=list)
+
+    def add(self, value: int | float, attributes: dict[str, object] | None = None) -> None:
+        self.points.append((value, attributes))
+
+    def record(self, value: int | float, attributes: dict[str, object] | None = None) -> None:
+        self.points.append((value, attributes))
+
+
+@dataclass
 class _FakeProvider:
     readers: list[object]
     resource: object
@@ -250,6 +261,7 @@ class _FakeProvider:
     shutdown_calls: list[float] = field(default_factory=list)
     force_flush_error: BaseException | None = None
     gauges: dict[str, list[Any]] = field(default_factory=dict)
+    synchronous_instruments: dict[str, _FakeSynchronousInstrument] = field(default_factory=dict)
 
     def get_meter(self, _name: str, _version: str) -> _FakeProvider:
         return self
@@ -257,6 +269,16 @@ class _FakeProvider:
     def create_observable_gauge(self, name: str, *, callbacks: list[Any], **_kwargs: object) -> object:
         self.gauges[name] = callbacks
         return object()
+
+    def create_counter(self, name: str, **_kwargs: object) -> _FakeSynchronousInstrument:
+        instrument = _FakeSynchronousInstrument()
+        self.synchronous_instruments[name] = instrument
+        return instrument
+
+    def create_histogram(self, name: str, **_kwargs: object) -> _FakeSynchronousInstrument:
+        instrument = _FakeSynchronousInstrument()
+        self.synchronous_instruments[name] = instrument
+        return instrument
 
     def force_flush(self, timeout_millis: float = 10_000) -> bool:
         self.force_flush_calls.append(timeout_millis)

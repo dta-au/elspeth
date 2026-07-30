@@ -807,9 +807,14 @@ class TokenSchedulerRepository:
         """Branch-loss rows not yet replayed into leader memory (SE.5 intake read)."""
         return self.branch_losses.list_unadopted_coalesce_branch_losses(run_id=run_id)
 
-    def list_coalesce_branch_losses(self, *, run_id: str) -> list[CoalesceBranchLoss]:
+    def list_coalesce_branch_losses(
+        self,
+        *,
+        run_id: str,
+        coalesce_names: frozenset[str] | None = None,
+    ) -> list[CoalesceBranchLoss]:
         """ALL branch-loss rows, adopted or not (SE.4 takeover restore read)."""
-        return self.branch_losses.list_coalesce_branch_losses(run_id=run_id)
+        return self.branch_losses.list_coalesce_branch_losses(run_id=run_id, coalesce_names=coalesce_names)
 
     def adopt_coalesce_branch_losses(
         self,

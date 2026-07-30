@@ -31,6 +31,7 @@ EXPECTED_COMMANDS = {
     "orphan-sweep",
     "cleanup-evidence-finalize",
     "evidence-export-receipt",
+    "verify-textract",
 }
 
 

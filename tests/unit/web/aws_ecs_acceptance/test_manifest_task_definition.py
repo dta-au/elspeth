@@ -39,14 +39,34 @@ _CLOUDWATCH_AGENT_COMMAND = (
 )
 _CLOUDWATCH_AGENT_HEALTH_CHECK = {
     "command": [
-        "CMD-SHELL",
-        "kill -0 1",
+        "CMD",
+        "python",
+        "-c",
+        "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()",
     ],
     "interval": 10,
     "timeout": 5,
     "retries": 6,
     "startPeriod": 30,
 }
+_PUBLISHED_WEB_ENTRYPOINT = (
+    "/bin/sh",
+    "-ceu",
+    (
+        'metadata_url="$ECS_CONTAINER_METADATA_URI_V4/task"\n'
+        "family=$(python -c 'import json,sys,urllib.request; "
+        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Family"])\' "$metadata_url")\n'
+        "revision=$(python -c 'import json,sys,urllib.request; "
+        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Revision"])\' "$metadata_url")\n'
+        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY="$family"\n'
+        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION="$revision"\n'
+        'case "$1" in\n'
+        '  web|doctor) set -- elspeth "$@" ;;\n'
+        "esac\n"
+        'exec "$@"\n'
+    ),
+    "--",
+)
 
 
 def test_manifest_and_task_definition_modules_exist() -> None:
@@ -174,6 +194,7 @@ def _task_definition_policy_payload(
                     "name": container_name,
                     "essential": True,
                     "image": "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/elspeth-acceptance@sha256:" + "d" * 64,
+                    "entryPoint": list(_PUBLISHED_WEB_ENTRYPOINT),
                     "command": ["web", "--host", "0.0.0.0", "--port", "8451"],
                     "environment": environment,
                     "secrets": secrets,
@@ -282,6 +303,41 @@ def test_task_definition_policy_binding_requires_exact_published_web_command(tmp
     manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
     container = payload["taskDefinition"]["containerDefinitions"][0]
     container["command"] = ["--help"]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param(None, id="removed"),
+        pytest.param(["/bin/sh", "-c", "exit 0"], id="bypass-wrapper"),
+        pytest.param(
+            [
+                *_PUBLISHED_WEB_ENTRYPOINT[:2],
+                _PUBLISHED_WEB_ENTRYPOINT[2].replace('exec "$@"', 'exec elspeth "$@"'),
+                _PUBLISHED_WEB_ENTRYPOINT[3],
+            ],
+            id="mutated-wrapper",
+        ),
+    ],
+)
+def test_task_definition_policy_binding_requires_exact_published_web_entrypoint(
+    tmp_path: Path,
+    replacement: list[str] | None,
+) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    container = payload["taskDefinition"]["containerDefinitions"][0]
+    if replacement is None:
+        del container["entryPoint"]
+    else:
+        container["entryPoint"] = replacement
 
     with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
         acceptance.validate_task_definition_policy_binding(

@@ -174,7 +174,7 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   ECS; provider and tool data remain bounded and redacted.
 
 **Operational:** 0.7.2 is a pre-1.0 database cutover. The session store moves
-from epoch 35 to 37; guided schema remains at 10, and Landscape moves from epoch
+from epoch 35 to 38; guided schema remains at 10, and Landscape moves from epoch
 29 to 30. Archive or export evidence as required, stop the old service, recreate
 a stale session store and a Landscape store left at epoch 29, and install 0.7.2.
 Do not roll older code back over the recreated databases.
@@ -883,15 +883,18 @@ locked SQLAlchemy 2.0 line, `postgresql+psycopg://` selects psycopg 3 and a bare
 `postgresql+psycopg2://` URLs remain supported. The final runtime is a pinned,
 non-root distroless image with no package manager; add runtime capabilities
 through locked Python extras or a reviewed derived image, not by installing
-packages in a running container. The shipped Compose bundle is the only
-maintained bundle that provisions PostgreSQL; AWS and the maintained Azure
-Ubuntu VM path use external PostgreSQL in production. Run one web process and
-preserve payload persistence separately from database persistence. See the
+packages in a running container. The shipped Compose bundle can provision a
+PostgreSQL container, and the tracked AWS Terraform package provisions Aurora
+PostgreSQL outside the application task. The maintained Azure Ubuntu VM path
+uses external PostgreSQL in production. Run one web process and preserve
+payload persistence separately from database persistence. For a complete new
+AWS stack, follow the
+[AWS ECS cold-install runbook](docs/runbooks/aws-ecs-cold-install.md). See the
 [deployment platform matrix](docs/reference/deployment-platforms.md) for the
 maintained Compose, AWS ECS, and native Linux paths plus the explicit Azure VM
-and Kubernetes boundaries. The AWS procedure validates operator-supplied
-task-definition ARNs; it does not synthesize or clone a generic task
-definition.
+and Kubernetes boundaries. The separate
+[existing-service procedure](docs/runbooks/aws-ecs-existing-service-redeploy.md)
+discovers and narrowly clones that service's selected task definition.
 
 ```bash
 : "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
@@ -979,6 +982,7 @@ See [Architecture Documentation](ARCHITECTURE.md) for C4 diagrams and detailed d
 | [docs/reference/deployment-platforms.md](docs/reference/deployment-platforms.md) | Operators | Maintained deployment paths, database ownership, persistence, and deferred platform boundaries |
 | [docs/runbooks/](docs/runbooks/) | Operators | Deployment and operations |
 | [docs/runbooks/caddy-development-refresh.md](docs/runbooks/caddy-development-refresh.md) | Developers | Rebuild and restart the source-checkout Caddy/systemd development install |
+| [docs/runbooks/aws-ecs-cold-install.md](docs/runbooks/aws-ecs-cold-install.md) | Operators | Create a complete disposable AWS ECS stack with Aurora, monitoring, and Bedrock |
 | [docs/runbooks/aws-ecs-existing-service-redeploy.md](docs/runbooks/aws-ecs-existing-service-redeploy.md) | Operators | Build, scan, and deploy an immutable image to an existing ECS service |
 
 ---

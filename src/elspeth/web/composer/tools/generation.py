@@ -475,8 +475,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"coalesce_on_success_must_be_sink|coalesce_on_success_unknown_sink|Coalesce on_success must point to a sink|Coalesce '(.+)' on_success references unknown sink",
-        "A coalesce node's on_success may only name an existing sink; merged rows otherwise flow to whichever node reads the coalesce id as its input.",
-        "Either set the coalesce on_success to a sink name from outputs[], or leave on_success null and give the downstream node input='<coalesce node id>'.",
+        "A coalesce node's on_success may only name an existing sink; merged rows otherwise flow to whichever node reads the coalesce id as its input. "
+        "For coalesce_on_success_unknown_sink the rejection's 'connectivity' facts, when present, carry the offending value ('dangling_on_success') and the candidate's sink names ('declared_sinks').",
+        "Either set the coalesce on_success to a sink name from outputs[] (the connectivity facts' declared_sinks) exactly, or leave on_success null and give the downstream node input='<coalesce node id>'.",
     ),
     (
         r"coalesce_missing_policy|Coalesce '(.+)' is missing required field 'policy'",
@@ -541,13 +542,19 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"transform_on_success_dangling|aggregation_on_success_dangling|source_on_success_dangling|is neither a sink nor a known connection",
-        "An on_success destination must be an existing sink name or a connection another node reads as its input.",
-        "Point on_success at one of outputs[].sink_name exactly, or at the connection name a downstream node declares as its input. Call get_pipeline_state to list the current sink names and node input connections, then re-emit with a matching destination.",
+        "An on_success destination must be an existing sink name or a connection another node reads as its input. "
+        "The rejection's 'connectivity' facts, when present, name the exact mismatch in YOUR rejected candidate: "
+        "'dangling_on_success' is the value that matched nothing; 'declared_sinks' and 'consumable_connections' are the only valid destinations.",
+        "Re-emit with on_success set to one of the connectivity facts' declared_sinks or consumable_connections, copied exactly — "
+        "for a straight source-to-sink pipeline the source's on_success must equal the outputs[].sink_name byte-for-byte. "
+        "Change nothing else. Only without connectivity facts: call get_pipeline_state to list the CURRENT saved state's sink names "
+        "and node input connections (note it shows the saved state, not a rejected candidate).",
     ),
     (
         r"transform_on_error_unknown_sink|references unknown sink",
-        "An on_error destination may only be 'discard' or an existing sink name.",
-        "Set on_error='discard', or point it at one of outputs[].sink_name exactly.",
+        "An on_error destination may only be 'discard' or an existing sink name. The rejection's 'connectivity' facts, when present, "
+        "carry the offending value as 'dangling_on_error' and the candidate's sink names as 'declared_sinks'.",
+        "Set on_error='discard', or point it at one of the connectivity facts' declared_sinks (outputs[].sink_name) exactly.",
     ),
     (
         r"gate_route_labels_mismatch|route labels don't match",
