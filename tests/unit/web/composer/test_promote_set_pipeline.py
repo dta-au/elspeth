@@ -1705,7 +1705,6 @@ class TestSetPipelineRowUnion:
             {"input": "not_the_first_branch"},
             {"on_success": None},
             {"branches": {"only": "control_done"}},
-            {"timeout_seconds": -1},
         ],
     )
     def test_set_pipeline_rejects_malformed_row_union_atomically(self, override: dict[str, Any]) -> None:
@@ -1718,3 +1717,17 @@ class TestSetPipelineRowUnion:
 
         assert result.success is False
         assert result.updated_state is state
+
+    @pytest.mark.parametrize("invalid_timeout", [0, -1, float("nan"), float("inf")])
+    def test_set_pipeline_rejects_invalid_row_union_timeout_before_mutation(self, invalid_timeout: float) -> None:
+        state = _empty_state()
+
+        with pytest.raises(ToolArgumentError):
+            _execute_set_pipeline(
+                _valid_args_with_row_union({"timeout_seconds": invalid_timeout}),
+                state,
+                ToolContext(catalog=_mock_catalog()),
+            )
+
+        assert state.version == 1
+        assert state.nodes == ()
