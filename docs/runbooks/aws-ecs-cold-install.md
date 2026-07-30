@@ -279,10 +279,21 @@ print("ELSPETH AWS runtime imports passed")
 LOCAL_AGENT_IMAGE="elspeth-cloudwatch-agent:${CANDIDATE_SHA:0:12}"
 docker buildx build \
   --platform linux/amd64 \
+  --build-arg ELSPETH_RELEASE_SHA="$CANDIDATE_SHA" \
   --load --tag "$LOCAL_AGENT_IMAGE" \
   --file "$PACKAGE_DIR/cloudwatch-agent-image/Dockerfile" \
   "$PACKAGE_DIR"
+
+test "$(docker image inspect "$LOCAL_AGENT_IMAGE" \
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" \
+  = "$CANDIDATE_SHA"
 ```
+
+The agent build-arg is not optional. `cloudwatch-agent-image/Dockerfile`
+sets `org.opencontainers.image.revision` from `ELSPETH_RELEASE_SHA`, and the
+scenario re-inspects that label before Terraform may register any task
+definition. Omitting the build-arg bakes an empty label and the apply in
+step 7 fails with `cloudwatch_agent_image_revision_mismatch`.
 
 Publish both images to the repositories created by bootstrap:
 
@@ -314,6 +325,11 @@ CANDIDATE_IMAGE="$APP_REPOSITORY_URL@$APP_DIGEST"
 CLOUDWATCH_AGENT_IMAGE="$AGENT_REPOSITORY_URL@$AGENT_DIGEST"
 docker logout "$ECR_REGISTRY"
 ```
+
+Both references are digests, never tags. The two bootstrap repositories expire
+images differently: temporary application tags may expire, while the agent
+repository expires only untagged images after 30 days. A digest reference
+survives either policy; a tag reference does not.
 
 Require both ECR Basic scans to complete with zero findings:
 
@@ -461,12 +477,41 @@ doctor tasks pass.
 
 ## 8. Initialize schemas, then prove runtime credentials
 
+Provision the EFS runtime storage **before** either doctor. Both doctors check
+`payload_store_writable` and `blob_writable` by probing directories that do not
+exist on a freshly created file system, so on a cold install the schema-init
+doctor exits non-zero with `FileNotFoundError` until the `provision-storage`
+one-shot has created them. This is the expected first-run ordering, not a
+fault:
+
+```bash
+ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
+NETWORK=$(terraform -chdir=scenario-a output -raw runtime_doctor_network_configuration)
+PAYLOAD_VERIFIER_TASK_DEFINITION=$(terraform -chdir=scenario-a output -json resolved_inventory \
+  | jq -er '.values.PAYLOAD_VERIFIER_TASK_DEFINITION')
+
+PAYLOAD_TASK_ARN=$(aws ecs run-task \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" \
+  --task-definition "$PAYLOAD_VERIFIER_TASK_DEFINITION" \
+  --launch-type FARGATE \
+  --network-configuration "$NETWORK" \
+  --count 1 \
+  --query 'tasks[0].taskArn' --output text)
+aws ecs wait tasks-stopped \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --tasks "$PAYLOAD_TASK_ARN"
+test "$(aws ecs describe-tasks \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --tasks "$PAYLOAD_TASK_ARN" \
+  --query 'tasks[0].containers[?name==`elspeth-web`].exitCode | [0]' \
+  --output text)" = 0
+```
+
 The first doctor uses schema-owner credentials. The second uses the same
 least-privilege runtime credentials as the web service. Run them in that order:
 
 ```bash
-ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
-
 run_doctor_task() {
   local task_definition=$1
   local network_configuration=$2

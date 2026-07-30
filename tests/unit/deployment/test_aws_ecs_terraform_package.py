@@ -956,7 +956,7 @@ def test_candidate_image_handoff_copies_the_authenticated_ghcr_index_into_bootst
     handoff_heading = "### Promote the published candidate into bootstrap ECR"
     assert handoff_heading in readme
     handoff_start = readme.index(handoff_heading)
-    section = readme[handoff_start : readme.index("## 2. Generate partial backend inputs", handoff_start)]
+    section = readme[handoff_start : readme.index("## Backend inputs", handoff_start)]
 
     for required in (
         "GITHUB_USERNAME",
@@ -982,7 +982,7 @@ def test_candidate_image_handoff_copies_the_authenticated_ghcr_index_into_bootst
 def test_candidate_image_handoff_subshell_fails_before_emitting_an_unverified_reference() -> None:
     readme = _text("README.md")
     handoff_start = readme.index("### Promote the published candidate into bootstrap ECR")
-    section = readme[handoff_start : readme.index("## 2. Generate partial backend inputs", handoff_start)]
+    section = readme[handoff_start : readme.index("## Backend inputs", handoff_start)]
     subshell_start = section.index("(\n")
     subshell_end = section.index("\n)\nunset GITHUB_TOKEN", subshell_start)
     subshell = section[subshell_start:subshell_end]

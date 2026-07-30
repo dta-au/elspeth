@@ -6,13 +6,18 @@ deployment topology, then made portable and brought up to the current
 installation contract. It is source code, not a claim about any current AWS
 environment.
 
-For the end-to-end operator sequence—identity checks, image publication,
-Bedrock inputs, monitoring verification, application probes, and teardown—start
-with the project
-[AWS ECS cold-install runbook](../../../docs/runbooks/aws-ecs-cold-install.md).
-This README remains the package-level authority for Terraform inputs, IAM
-policy rendering, image and trust-root admission, and lifecycle details, and
-the runbook defers to it for each of those.
+**The ordered end-to-end install sequence is not here.** It lives in the
+project [AWS ECS cold-install runbook](../../../docs/runbooks/aws-ecs-cold-install.md),
+which is canonical for the operator walkthrough: identity checks, policy
+rendering, bootstrap, image publication, Bedrock inputs, Scenario A apply,
+the storage and doctor gates, service admission, monitoring verification,
+application probes, and teardown. Follow the runbook's numbered steps and use
+this README as the package reference they point back to.
+
+This README remains the authority for what the package contains and how it
+behaves: Terraform inputs and outputs, IAM policy rendering and the task-role
+boundary, state and backend mechanics, image and trust-root admission, the
+post-enable acceptance program, Scenario B, and upgrade/teardown lifecycle.
 
 ## Choose a topology
 
@@ -198,10 +203,10 @@ wildcard service actions, but another principal's Logs resource policy in that
 region could still be affected. This installer policy is therefore supported
 only in a dedicated empty account and is **not supported in a shared account**.
 
-## 1. Bootstrap state and image repositories
+## Bootstrap state and image repositories
 
-Copy `examples/bootstrap.tfvars.example` to an ignored
-`examples/bootstrap.tfvars`, replace every placeholder, then:
+The runbook's step 3 drives the bootstrap apply. The state and repository
+behaviour it depends on is defined here.
 
 ```sh
 terraform -chdir=bootstrap init
@@ -300,7 +305,7 @@ Copy the printed `candidate_image` assignment into the selected scenario
 tfvars. Do not substitute the GHCR reference: both scenario roots intentionally
 reject any candidate outside the bootstrap-created ECR repository.
 
-## 2. Generate partial backend inputs
+## Backend inputs
 
 The scenario roots contain only `backend "s3" {}`. Generate ignored
 `.tfbackend` inputs from the matching examples and replace the bucket and
@@ -315,13 +320,16 @@ The A and B files use separate state keys, S3 server-side encryption, and S3
 native state locking (`use_lockfile = true`). Their explicit `profile` must
 match the scenario tfvars. Do not make their keys equal.
 
-## 3. Install Scenario A
+## Scenario A install reference
 
-Copy `examples/scenario-a.tfvars.example` to an ignored
-`examples/scenario-a.tfvars`, replace every placeholder, and check that both
-Bedrock provider IDs are present and distinct. Set `alb_https_ingress_cidrs`
-to the operator or trusted-network CIDRs that need HTTPS access; the package
-rejects an empty list, duplicates, invalid CIDRs, and `0.0.0.0/0`.
+The runbook's steps 6 through 9 drive the Scenario A install. This section
+defines the inputs, admission gates, and lifecycle behaviour those steps rely
+on.
+
+`examples/scenario-a.tfvars` must name both Bedrock provider IDs, present and
+distinct. Set `alb_https_ingress_cidrs` to the operator or trusted-network
+CIDRs that need HTTPS access; the package rejects an empty list, duplicates,
+invalid CIDRs, and `0.0.0.0/0`.
 
 Scenario A has no rollback or acceptance-coordinator inputs. Its compatibility
 inventory derives the candidate baseline and absolute tracked source paths from
@@ -329,18 +337,6 @@ the package itself. `scenario-a/codeblind-compatibility.json` records the
 standalone-install facts and the absence of a pre-existing transaction-search
 baseline. It is deterministic package metadata, not an acceptance binding
 artifact. Scenario B retains its acceptance-only inputs.
-
-```sh
-terraform -chdir=scenario-a init \
-  -backend-config=../examples/scenario-a.s3.tfbackend
-terraform -chdir=scenario-a workspace show
-terraform -chdir=scenario-a workspace select default
-terraform -chdir=scenario-a plan \
-  -var-file=../examples/scenario-a.tfvars
-terraform -chdir=scenario-a apply \
-  -var-file=../examples/scenario-a.tfvars
-terraform -chdir=scenario-a output
-```
 
 Use only an explicitly selected workspace. The `default` workspace is the
 documented cold-install choice. Re-run the account and region checks before
@@ -353,77 +349,24 @@ uses schema-owner database URLs and is reserved for
 uses the same runtime-only database URLs as the web service and runs
 `doctor aws-ecs --json`.
 
-Provision the EFS runtime storage **before** either doctor task. The doctor
-checks `payload_store_writable` and `blob_writable` by probing directories that
-do not exist on a freshly created file system, so on a cold install the
-schema-init doctor exits non-zero with `FileNotFoundError` until the
-`provision-storage` one-shot has created them:
+Both doctors depend on the EFS runtime storage already existing. They check
+`payload_store_writable` and `blob_writable` by probing directories that do not
+exist on a freshly created file system, so the `provision-storage` one-shot
+(published as `PAYLOAD_VERIFIER_TASK_DEFINITION` in `resolved_inventory`) must
+run first or the schema-init doctor exits non-zero with `FileNotFoundError`.
 
-```sh
-export AWS_PROFILE=REPLACE_WITH_AWS_PROFILE
-export AWS_REGION=REPLACE_WITH_AWS_REGION
-ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
-NETWORK=$(terraform -chdir=scenario-a output -raw runtime_doctor_network_configuration)
-PAYLOAD_VERIFIER_TASK_DEFINITION=$(terraform -chdir=scenario-a output -json resolved_inventory \
-  | jq -er '.values.PAYLOAD_VERIFIER_TASK_DEFINITION')
-PAYLOAD_TASK_ARN=$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs run-task \
-  --cluster "$ECS_CLUSTER" \
-  --task-definition "$PAYLOAD_VERIFIER_TASK_DEFINITION" \
-  --launch-type FARGATE \
-  --network-configuration "$NETWORK" \
-  --count 1 \
-  --query 'tasks[0].taskArn' \
-  --output text)
-aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs wait tasks-stopped \
-  --cluster "$ECS_CLUSTER" --tasks "$PAYLOAD_TASK_ARN"
-test "$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs describe-tasks \
-  --cluster "$ECS_CLUSTER" --tasks "$PAYLOAD_TASK_ARN" \
-  --query 'tasks[0].containers[?name==`elspeth-web`].exitCode | [0]' \
-  --output text)" = 0
-```
+The runbook's step 8 runs the storage one-shot and then both doctor tasks in
+that order, using these outputs:
 
-Then run the two doctor tasks in that order with the explicit task definitions,
-network configurations, and command overrides:
-
-```sh
-SCHEMA_TASK_DEFINITION=$(terraform -chdir=scenario-a output -raw schema_init_doctor_task_definition_arn)
-SCHEMA_NETWORK=$(terraform -chdir=scenario-a output -raw schema_init_doctor_network_configuration)
-SCHEMA_OVERRIDES=$(terraform -chdir=scenario-a output -raw schema_init_doctor_overrides)
-SCHEMA_TASK_ARN=$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs run-task \
-  --cluster "$ECS_CLUSTER" \
-  --task-definition "$SCHEMA_TASK_DEFINITION" \
-  --launch-type FARGATE \
-  --network-configuration "$SCHEMA_NETWORK" \
-  --overrides "$SCHEMA_OVERRIDES" \
-  --count 1 \
-  --query 'tasks[0].taskArn' \
-  --output text)
-aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs wait tasks-stopped \
-  --cluster "$ECS_CLUSTER" --tasks "$SCHEMA_TASK_ARN"
-test "$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs describe-tasks \
-  --cluster "$ECS_CLUSTER" --tasks "$SCHEMA_TASK_ARN" \
-  --query 'tasks[0].containers[?name==`doctor`].exitCode | [0]' \
-  --output text)" = 0
-
-RUNTIME_TASK_DEFINITION=$(terraform -chdir=scenario-a output -raw runtime_doctor_task_definition_arn)
-RUNTIME_NETWORK=$(terraform -chdir=scenario-a output -raw runtime_doctor_network_configuration)
-RUNTIME_OVERRIDES=$(terraform -chdir=scenario-a output -raw runtime_doctor_overrides)
-RUNTIME_TASK_ARN=$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs run-task \
-  --cluster "$ECS_CLUSTER" \
-  --task-definition "$RUNTIME_TASK_DEFINITION" \
-  --launch-type FARGATE \
-  --network-configuration "$RUNTIME_NETWORK" \
-  --overrides "$RUNTIME_OVERRIDES" \
-  --count 1 \
-  --query 'tasks[0].taskArn' \
-  --output text)
-aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs wait tasks-stopped \
-  --cluster "$ECS_CLUSTER" --tasks "$RUNTIME_TASK_ARN"
-test "$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs describe-tasks \
-  --cluster "$ECS_CLUSTER" --tasks "$RUNTIME_TASK_ARN" \
-  --query 'tasks[0].containers[?name==`doctor`].exitCode | [0]' \
-  --output text)" = 0
-```
+| Output | Purpose |
+| --- | --- |
+| `resolved_inventory` → `.values.PAYLOAD_VERIFIER_TASK_DEFINITION` | `provision-storage` one-shot, run before either doctor |
+| `schema_init_doctor_task_definition_arn` | schema-owner `doctor aws-ecs --init-schema --json` task definition |
+| `schema_init_doctor_network_configuration` | its awsvpc network configuration |
+| `schema_init_doctor_overrides` | its command overrides |
+| `runtime_doctor_task_definition_arn` | least-privilege `doctor aws-ecs --json` task definition |
+| `runtime_doctor_network_configuration` | its awsvpc network configuration |
+| `runtime_doctor_overrides` | its command overrides |
 
 Both task exit codes must be `0`. Then print, inspect, and explicitly run
 `service_enable_command`; never enable the service after only the privileged
