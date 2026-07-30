@@ -1686,3 +1686,25 @@ def test_source_enumeration_sees_uncommitted_files_but_not_operator_inputs(tmp_p
     assert "examples/scenario-a.tfvars.example" in listed
     assert "examples/scenario-a.tfvars" not in listed
     assert "examples/scenario-a.s3.tfbackend" not in listed
+
+
+def test_dashboard_metrics_preserve_one_row_per_metric() -> None:
+    """CloudWatch requires `metrics` to be an array OF ARRAYS of strings.
+
+    Terraform's `flatten()` is recursive, so wrapping the
+    per-identity/per-metric comprehension in it collapses every metric row
+    into a single flat string list and CreateDashboard rejects the body with
+    one "Should be array" error per element (1885 of them against the live
+    account). The rows must be joined one level only — `concat(...)` with the
+    spread operator — so each row stays its own array.
+    """
+    observability = _text("modules/scenario/iam_observability.tf")
+    dashboard = observability[observability.index('resource "aws_cloudwatch_dashboard" "operator"') :]
+    row_builder = re.search(
+        r"metrics\s*=\s*(?P<joiner>\w+)\(\[\s*\n\s*for identity_dimensions in local\.cloudwatch_dimension_lists",
+        dashboard,
+    )
+    assert row_builder is not None, "dashboard metric rows are no longer built per identity dimension list"
+    assert row_builder.group("joiner") != "flatten", (
+        "dashboard metric rows must not be recursively flattened; join one level with concat(...) instead"
+    )

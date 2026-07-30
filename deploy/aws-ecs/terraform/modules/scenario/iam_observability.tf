@@ -498,7 +498,12 @@ resource "aws_cloudwatch_dashboard" "operator" {
           region = var.aws_region
           stat   = widget.stat
           period = 300
-          metrics = flatten([
+          # CloudWatch requires an array OF ARRAYS of strings, one array per
+          # metric row. flatten() is recursive and would collapse every row
+          # into a single flat string list, which CreateDashboard rejects with
+          # one "Should be array" error per element. The spread joins the
+          # per-identity groups one level only, so each row stays an array.
+          metrics = concat([
             for identity_dimensions in local.cloudwatch_dimension_lists : [
               for metric in widget.metrics : concat(
                 ["ELSPETH/Operator", metric.name],
@@ -508,7 +513,7 @@ resource "aws_cloudwatch_dashboard" "operator" {
                 ]),
               )
             ]
-          ])
+          ]...)
         }
       }],
     )
