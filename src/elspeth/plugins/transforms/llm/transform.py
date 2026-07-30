@@ -38,11 +38,9 @@ from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginC
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.value_source import register_value_source_plugin
-from elspeth.core.security.secret_loader import EnvSecretLoader, SecretNotFoundError
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.clients.llm import ContextLengthError, LLMClientError
-from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.pooling import PooledExecutor, RowContext
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
@@ -1653,24 +1651,17 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 resolved_prompt_template_hash=self._resolved_prompt_template_hash,
             )
         elif isinstance(self._config, GatewayConfig):
-            # credential_ref names a server-scoped secret (an env-var-shaped
-            # identifier, e.g. "ELSPETH_LLM_GATEWAY_BEARER_TOKEN") — it is
-            # NEVER the literal bearer value. v1 supports only
-            # credential_scope="server", so resolution is a direct env
-            # lookup here; the provider itself never reads ambient process
-            # state (it receives the already-resolved token), which also
-            # keeps provider unit tests free of environment-variable setup.
-            try:
-                api_key, _secret_ref = EnvSecretLoader().get_secret(self._config.credential_ref)
-            except SecretNotFoundError as exc:
-                raise PluginConfigError(
-                    f"Gateway credential_ref {self._config.credential_ref!r} could not be resolved: {exc}",
-                    plugin_name=self.name,
-                    plugin_class="GatewayConfig",
-                ) from exc
+            # GatewayConfig.api_key already carries the resolved bearer value
+            # — the same convention AzureOpenAIConfig.api_key and
+            # OpenRouterConfig.api_key use. Resolution from an operator
+            # secret reference happens upstream of config construction (the
+            # web path's ``resolve_secret_refs`` walk, or ``${VAR}``
+            # expansion for batch/CLI YAML), never here. See Phase 2 Task 4's
+            # report for why an earlier direct ``EnvSecretLoader`` lookup at
+            # this call site was replaced with this shared path.
             return GatewayLLMProvider(
                 endpoint=self._config.endpoint,
-                api_key=api_key,
+                api_key=self._config.api_key,
                 contract_major=self._config.contract_major,
                 required_capabilities=self._config.required_capabilities,
                 timeout_seconds=self._config.timeout_seconds,

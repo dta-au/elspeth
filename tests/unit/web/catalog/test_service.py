@@ -338,7 +338,7 @@ class TestGetSchema:
         }
         assert set(defs["OpenRouterConfig"]["required"]) >= {"model", "api_key", "prompt_template"}
         assert set(defs["BedrockConfig"]["required"]) >= {"model", "prompt_template", "provider"}
-        assert set(defs["GatewayConfig"]["required"]) >= {"model", "endpoint", "credential_ref", "prompt_template"}
+        assert set(defs["GatewayConfig"]["required"]) >= {"model", "endpoint", "api_key", "prompt_template"}
         assert "region_name" in defs["BedrockConfig"]["properties"]
         assert "api_key" not in defs["BedrockConfig"]["properties"]
 

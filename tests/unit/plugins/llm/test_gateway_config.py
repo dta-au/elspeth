@@ -10,7 +10,10 @@ Task 3). These tests cover:
   (not deduped) — a duplicate is treated as an authoring mistake worth
   failing closed on, consistent with the other closed-set validators here;
 - ``contract_major`` pinned to the single currently-supported value;
-- ``credential_ref`` shape via the shared ``SECRET_REF_PATTERN``;
+- ``api_key`` is required and holds an already-resolved credential (the same
+  convention ``AzureOpenAIConfig``/``OpenRouterConfig`` use — see Phase 2
+  Task 4's report for why the gateway's original ``credential_ref: str``
+  field was reconciled onto this shared shape);
 - registry/schema wiring (``_PROVIDERS``, ``get_config_schema()``,
   ``discriminated_variants()``);
 - the ``on_start`` limiter-selection chain choosing a gateway-specific
@@ -28,7 +31,6 @@ from unittest.mock import Mock
 import pytest
 from pydantic import ValidationError
 
-from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, GatewayLLMProvider
 from elspeth.plugins.transforms.llm.transform import _PROVIDERS, LLMTransform
 from elspeth.web.plugin_policy.profiles import _LLM_PRIVATE_OPTIONS
@@ -40,7 +42,7 @@ def _make_gateway_config(**overrides: Any) -> GatewayConfig:
     base: dict[str, Any] = {
         "model": "gpt-5-mini",
         "endpoint": "https://gateway.example.com/v1",
-        "credential_ref": "GATEWAY_API_KEY",
+        "api_key": "test-bearer-token",
         "prompt_template": "{{ row }}",
         "schema": _OBSERVED_SCHEMA,
     }
@@ -166,19 +168,26 @@ class TestGatewayContractMajor:
 
 
 # ---------------------------------------------------------------------------
-# credential_ref
+# api_key — already-resolved credential (same convention as Azure/OpenRouter)
 # ---------------------------------------------------------------------------
 
 
-class TestGatewayCredentialRef:
-    def test_accepts_shouting_snake_case(self) -> None:
-        config = _make_gateway_config(credential_ref="GATEWAY_API_KEY")
-        assert config.credential_ref == "GATEWAY_API_KEY"
+class TestGatewayApiKey:
+    def test_accepts_resolved_credential(self) -> None:
+        config = _make_gateway_config(api_key="a-resolved-bearer-token")
+        assert config.api_key == "a-resolved-bearer-token"
 
-    @pytest.mark.parametrize("credential_ref", ["not_upper", "lower_case", "123_STARTS_NUMERIC", "", "trailing_"])
-    def test_rejects_invalid_shape(self, credential_ref: str) -> None:
+    def test_requires_api_key(self) -> None:
         with pytest.raises(ValidationError):
-            _make_gateway_config(credential_ref=credential_ref)
+            _make_gateway_config(api_key=None)
+
+    def test_rejects_unresolved_secret_ref_marker(self) -> None:
+        """An unresolved ``{secret_ref: ...}`` marker fails GatewayConfig
+        construction with the SAME failure mode Azure/OpenRouter's
+        ``api_key: str`` field has today — proof the gateway credential seam
+        is not a second divergent path (see Phase 2 Task 4's report)."""
+        with pytest.raises(ValidationError):
+            _make_gateway_config(api_key={"secret_ref": "GATEWAY_API_KEY", "secret_scope": "server"})
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +226,7 @@ class TestGatewayRegistryAndSchema:
         assert len(schema["oneOf"]) == 4
         assert set(schema["discriminator"]["mapping"].keys()) == {"azure", "openrouter", "bedrock", "gateway"}
         gateway_schema = schema["$defs"]["GatewayConfig"]
-        assert set(gateway_schema["required"]) >= {"model", "endpoint", "credential_ref", "prompt_template"}
+        assert set(gateway_schema["required"]) >= {"model", "endpoint", "api_key", "prompt_template"}
 
     def test_get_config_model_dispatches_to_gateway_config(self) -> None:
         assert LLMTransform.get_config_model({"provider": "gateway"}) is GatewayConfig
@@ -236,7 +245,7 @@ def _make_gateway_transform_config(**overrides: Any) -> dict[str, Any]:
         "required_input_fields": ["text"],
         "model": "gpt-5-mini",
         "endpoint": "https://gateway.example.com/v1",
-        "credential_ref": "GATEWAY_API_KEY",
+        "api_key": "test-bearer-token",
     }
     base.update(overrides)
     return base
@@ -254,8 +263,7 @@ def _make_ctx() -> SimpleNamespace:
 
 
 class TestGatewayLimiterDispatch:
-    def test_gateway_provider_gets_gateway_limiter_not_openrouters(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("GATEWAY_API_KEY", "test-bearer-token")
+    def test_gateway_provider_gets_gateway_limiter_not_openrouters(self) -> None:
         transform = LLMTransform(_make_gateway_transform_config())
 
         mock_registry = Mock()
@@ -268,21 +276,6 @@ class TestGatewayLimiterDispatch:
 
         mock_registry.get_limiter.assert_called_once_with("gateway")
         assert isinstance(transform._provider, GatewayLLMProvider)
-
-    def test_create_provider_fails_closed_when_credential_ref_unresolved(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """credential_ref names an env var; an unset one is an "absent server
-        secret" config failure (per the design's fail-closed list), not a
-        deferred connect-time surprise."""
-        monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
-        transform = LLMTransform(_make_gateway_transform_config())
-
-        mock_registry = Mock()
-        mock_registry.get_limiter.return_value = object()
-        ctx = _make_ctx()
-        ctx.rate_limit_registry = mock_registry
-
-        with pytest.raises(PluginConfigError, match="GATEWAY_API_KEY"):
-            transform.on_start(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +314,7 @@ class TestGatewayPrivateOptionsCoverage:
 
     @pytest.mark.parametrize(
         "field_name",
-        ["endpoint", "credential_ref", "contract_major", "required_capabilities"],
+        ["endpoint", "api_key", "contract_major", "required_capabilities"],
     )
     def test_security_sensitive_fields_are_private(self, field_name: str) -> None:
         assert field_name in _LLM_PRIVATE_OPTIONS

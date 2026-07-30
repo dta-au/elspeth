@@ -41,6 +41,8 @@ class LLMProfileSettings(BaseModel):
     endpoint: str | None = Field(default=None, repr=False)
     deployment_name: str | None = Field(default=None, min_length=1, max_length=256, repr=False)
     api_version: str | None = Field(default=None, min_length=1, max_length=64, repr=False)
+    contract_major: int | None = Field(default=None, repr=False)
+    required_capabilities: tuple[str, ...] | None = Field(default=None, repr=False)
     timeout_seconds: float = Field(default=60.0, gt=0, le=300, repr=False)
     max_tokens: int | None = Field(default=None, gt=0, le=131072, repr=False)
 
@@ -53,8 +55,10 @@ class LLMProfileSettings(BaseModel):
         providers = LLMTransform.discriminated_variants()[1]
         if self.provider not in providers:
             raise ValueError("profile provider is not registered")
-        if self.provider != "openrouter" and "timeout_seconds" in self.model_fields_set:
+        if self.provider not in ("openrouter", "gateway") and "timeout_seconds" in self.model_fields_set:
             raise ValueError(f"{self.provider} profile does not support timeout_seconds")
+        if self.provider != "gateway" and ("contract_major" in self.model_fields_set or "required_capabilities" in self.model_fields_set):
+            raise ValueError(f"{self.provider} profile does not support contract_major or required_capabilities")
         if self.provider == "azure" and self.region_name is not None:
             raise ValueError("azure profile does not support region_name")
         if self.provider == "bedrock":
@@ -87,6 +91,39 @@ class LLMProfileSettings(BaseModel):
                 from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 
                 validate_credential_safe_https_url(self.endpoint, field_name="endpoint")
+            if self.provider == "gateway":
+                if self.credential_scope != "server":
+                    raise ValueError("gateway profile requires credential_scope 'server' in v1")
+                if self.region_name is not None or self.deployment_name is not None or self.api_version is not None:
+                    raise ValueError("gateway profile contains fields owned by another provider")
+                if self.endpoint is None:
+                    raise ValueError("gateway profile requires operator endpoint")
+                if self.contract_major is None:
+                    raise ValueError("gateway profile requires contract_major")
+                if self.required_capabilities is None:
+                    raise ValueError("gateway profile requires required_capabilities")
+                # Reuse Plan 09's GatewayConfig field validators for endpoint,
+                # contract_major, and required_capabilities shape rather than
+                # duplicating that logic here (endpoint validation in
+                # particular — the loopback-only-127.0.0.1 / no-userinfo /
+                # no-query / no-fragment / versioned-base-path rule — lives
+                # only in providers/gateway.py). This profile model never
+                # holds a resolved secret value, so api_key gets an inert
+                # placeholder that only needs to satisfy "non-empty str";
+                # GatewayConfig no longer validates api_key's shape (it holds
+                # an already-resolved credential at runtime, same convention
+                # as AzureOpenAIConfig/OpenRouterConfig — see Phase 2 Task 4's
+                # report for why).
+                providers[self.provider](
+                    provider="gateway",
+                    model=self.model,
+                    endpoint=self.endpoint,
+                    api_key="not a real credential placeholder",
+                    contract_major=self.contract_major,
+                    required_capabilities=self.required_capabilities,
+                    schema={"mode": "observed"},
+                    prompt_template="{{ row }}",
+                )
         return self
 
 
@@ -110,6 +147,12 @@ class RuntimeLLMProfile:
                 ("api_version", settings.api_version),
             ),
             "openrouter": (("timeout_seconds", settings.timeout_seconds),),
+            "gateway": (
+                ("endpoint", settings.endpoint),
+                ("contract_major", settings.contract_major),
+                ("required_capabilities", settings.required_capabilities),
+                ("timeout_seconds", settings.timeout_seconds),
+            ),
         }
         options = tuple(
             (name, value) for name, value in (*provider_fields[settings.provider], ("max_tokens", settings.max_tokens)) if value is not None

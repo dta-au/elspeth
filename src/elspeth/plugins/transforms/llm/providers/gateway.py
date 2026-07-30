@@ -21,14 +21,16 @@ Endpoint validation follows the design's contract:
 
 ``GatewayLLMProvider`` implements the current three-method ``LLMProvider``
 protocol: it POSTs to ``{endpoint}/chat/completions`` with a static bearer
-credential (resolved from ``GatewayConfig.credential_ref`` by
-``LLMTransform._create_provider``, never held as a literal on the config
-itself) and the ``X-ELSPETH-LLM-Gateway-Contract`` header, validates the
-echoed contract header and the response envelope, and maps the gateway's
-``error.code``-only error contract to ELSPETH's existing typed LLM error
-hierarchy. ``runtime_preflight`` checks gateway readiness (contract major,
-model alias, capabilities) THEN performs one bounded real completion — a
-readiness document alone is never accepted as proof of health.
+credential (``GatewayConfig.api_key`` — an already-resolved secret value,
+supplied on the config the same way ``AzureOpenAIConfig.api_key`` and
+``OpenRouterConfig.api_key`` are; see Phase 2 Task 4's report for why the
+gateway's credential seam was reconciled onto this shared convention) and
+the ``X-ELSPETH-LLM-Gateway-Contract`` header, validates the echoed contract
+header and the response envelope, and maps the gateway's ``error.code``-only
+error contract to ELSPETH's existing typed LLM error hierarchy.
+``runtime_preflight`` checks gateway readiness (contract major, model alias,
+capabilities) THEN performs one bounded real completion — a readiness
+document alone is never accepted as proof of health.
 """
 
 from __future__ import annotations
@@ -48,7 +50,6 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.value_source import ValueSource
-from elspeth.core.llm_profiles import SECRET_REF_PATTERN
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
@@ -156,7 +157,7 @@ class GatewayConfig(LLMConfig):
         description="Logical model alias resolved server-side by the gateway",
     )
     endpoint: str = Field(..., description="Gateway base URL; must end with the versioned base path '/v1'")
-    credential_ref: str = Field(..., description="Operator secret reference naming the gateway bearer credential")
+    api_key: str = Field(..., description="Resolved gateway bearer credential")
     contract_major: int = Field(
         default=1,
         description="Gateway contract major version this configuration expects",
@@ -173,13 +174,6 @@ class GatewayConfig(LLMConfig):
     @classmethod
     def _validate_endpoint(cls, value: str) -> str:
         return _validate_gateway_endpoint(value)
-
-    @field_validator("credential_ref")
-    @classmethod
-    def _validate_credential_ref(cls, value: str) -> str:
-        if SECRET_REF_PATTERN.fullmatch(value) is None:
-            raise ValueError("credential_ref must match the operator secret reference pattern")
-        return value
 
     @field_validator("contract_major")
     @classmethod

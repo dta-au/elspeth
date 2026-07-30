@@ -1539,10 +1539,10 @@
         }
       },
       {
-        "description": "Operator secret reference naming the gateway bearer credential",
+        "description": "Resolved gateway bearer credential",
         "kind": "text",
-        "label": "Credential Ref",
-        "name": "credential_ref",
+        "label": "API Key",
+        "name": "api_key",
         "nullable": false,
         "required": true,
         "visible_when": {
