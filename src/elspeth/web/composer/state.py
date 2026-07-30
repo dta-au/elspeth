@@ -3398,6 +3398,41 @@ class CompositionState:
             if candidate.node_type == "gate" and candidate.fork_to is not None
         }
         gate_fork_branches = {branch for branches in gate_fork_branches_by_id.values() for branch in branches}
+
+        # Mirror the engine's one-barrier-per-fork-branch rule. The DAG builder
+        # raises GraphValidationError when a branch name is claimed twice —
+        # by two coalesces, by a coalesce and a row_union, or by two row_unions
+        # ("Each fork branch can only join at one barrier"): the branch's
+        # arrival is delivered to exactly one barrier's pending map, so a
+        # second claimant has no runtime meaning. The engine compares raw
+        # branch NAMES before any reachability reasoning, so this check is
+        # unconditional too — a dual claim is invalid whether or not the
+        # aliases resolve to a gate fork_to. This is a cross-node TOPOLOGY
+        # finding, so it carries its own code rather than either barrier's
+        # intrinsic node-shape code: completing one barrier from an unrelated
+        # node must not roll that node's mutation back.
+        barrier_claimants: dict[str, list[str]] = {}
+        for node in self.nodes:
+            if node.node_type not in ("coalesce", "row_union"):
+                continue
+            # dict.fromkeys dedupes within a single barrier: a repeated alias
+            # inside one node is that node's own intrinsic branches error.
+            for branch_alias in dict.fromkeys(_coalesce_branch_names(node.branches)):
+                barrier_claimants.setdefault(branch_alias, []).append(node.id)
+        for branch_alias, claimants in barrier_claimants.items():
+            if len(claimants) < 2:
+                continue
+            errors.append(
+                _err(
+                    f"node:{claimants[1]}",
+                    f"Fork branch '{branch_alias}' is claimed by more than one barrier: {claimants}. "
+                    "Each fork branch may join at exactly one coalesce or row_union. "
+                    "Drop the branch from every barrier but one, or fork a distinct branch name per barrier.",
+                    "high",
+                    "fork_branch_multiple_barriers",
+                )
+            )
+
         for node in self.nodes:
             if node.node_type == "coalesce":
                 missing_branches = sorted(

@@ -400,6 +400,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Wire each branches[alias] value through processing that starts at the matching gate fork branch.",
     ),
     (
+        r"fork_branch_multiple_barriers",
+        "One fork branch is declared by two barriers (coalesce and/or row_union). A fork branch delivers its arrival to "
+        "exactly one barrier, so the engine rejects the second claim at graph build time.",
+        "Keep the branch on a single barrier: delete it from the other barrier's branches, or give each barrier its own "
+        "fork branch name in the gate's fork_to and wire that branch to it.",
+    ),
+    (
         r"row_union_on_success_must_be_connection",
         "A row_union release target names a sink, but the barrier may only release into downstream processing.",
         "Set row_union.on_success to a connection consumed by a downstream node, then route that node to the sink.",
@@ -798,6 +805,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "row_union_branch_not_downstream",
     "row_union_on_success_must_be_connection",
     "row_union_on_success_dangling",
+    # Cross-node barrier topology: mirrors the engine's "each fork branch can
+    # only join at one barrier" rule for coalesce/coalesce, coalesce/row_union
+    # and row_union/row_union claims.
+    "fork_branch_multiple_barriers",
     "transform_missing_on_success",
     "transform_missing_on_error",
     "transform_on_success_dangling",

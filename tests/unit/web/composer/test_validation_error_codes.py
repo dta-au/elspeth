@@ -317,6 +317,7 @@ class TestClosedCodeCatalogueInvariants:
             "row_union_branch_not_downstream",
             "row_union_on_success_must_be_connection",
             "row_union_on_success_dangling",
+            "fork_branch_multiple_barriers",
         ):
             assert code in _CLOSED_VALIDATION_ERROR_CODES, code
             guidance = explain_validation_code(code)
@@ -345,6 +346,13 @@ class TestClosedCodeCatalogueInvariants:
         assert downstream != intrinsic
         assert downstream != origin
         assert "downstream" in downstream[0] or "downstream" in downstream[1]
+
+        # The cross-node barrier-ownership code sits in the same cluster and
+        # must not fall through to any row_union node-shape entry either.
+        multiple_barriers = explain_validation_code("fork_branch_multiple_barriers")
+        assert multiple_barriers is not None
+        assert multiple_barriers not in (intrinsic, origin, downstream)
+        assert "barrier" in multiple_barriers[0]
 
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.

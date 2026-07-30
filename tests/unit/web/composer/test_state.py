@@ -6792,6 +6792,76 @@ class TestCompositionStateRowUnion:
         # mutation preflight blocks on.
         assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
 
+    def _coalesce(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "dup_merge",
+            "node_type": "coalesce",
+            "plugin": None,
+            "input": "join",
+            "on_success": "output",
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            # Identity branches: direct gate->barrier COPY edges that claim no
+            # ordinary connection consumer, so the duplicate-consumer check
+            # cannot mask the barrier-ownership conflict under test.
+            "branches": ("control_branch", "treatment_branch"),
+            "policy": "require_all",
+            "merge": "nested",
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def test_fork_branch_claimed_by_a_coalesce_and_a_row_union_is_rejected(self) -> None:
+        """Composer/runtime parity for the engine's one-barrier-per-branch rule.
+
+        The DAG builder raises ``GraphValidationError`` ("Each fork branch can
+        only join at one barrier") when a coalesce and a row_union both declare
+        the same branch, because the branch's arrival is delivered to exactly
+        one barrier's pending map. validate() used to pass this composition, so
+        generate_yaml handed the runtime a graph it refuses to build.
+        """
+        result = self._state(extra_nodes=(self._coalesce(),)).validate()
+
+        codes = {error.error_code for error in result.errors}
+        assert "fork_branch_multiple_barriers" in codes, result.errors
+        # composer_mcp.server gates generate_yaml on is_valid, so a red
+        # validate() is what stops the runtime-invalid YAML being exported.
+        assert not result.is_valid
+        conflict = next(error for error in result.errors if error.error_code == "fork_branch_multiple_barriers")
+        assert "control_branch" in conflict.message
+        assert "variant_union" in conflict.message
+        assert "dup_merge" in conflict.message
+        # A cross-node topology finding, not either barrier's intrinsic
+        # node-shape code the mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in codes
+
+    def test_fork_branch_claimed_by_two_coalesces_is_rejected(self) -> None:
+        """The same engine rule covers coalesce/coalesce claims."""
+        result = self._state(
+            extra_nodes=(self._coalesce(), self._coalesce(id="second_merge")),
+        ).validate()
+
+        assert any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors), result.errors
+
+    def test_fork_branch_claimed_by_two_row_unions_is_rejected(self) -> None:
+        """And row_union/row_union claims, which the engine rejects too."""
+        second_union = self._row_union(id="second_union", on_success="second_union_out")
+        result = self._state(
+            extra_nodes=(second_union, self._transform("after_second", "second_union_out", "output")),
+        ).validate()
+
+        assert any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors), result.errors
+
+    def test_valid_topology_does_not_report_a_barrier_conflict(self) -> None:
+        """A single barrier per branch stays clean — the rule is not a blanket ban."""
+        result = self._state().validate()
+
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors)
+
     def test_row_union_output_feeds_ordinary_node_without_placeholder_consumer(self) -> None:
         state = self._state()
 
