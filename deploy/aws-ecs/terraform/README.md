@@ -6,6 +6,14 @@ deployment topology, then made portable and brought up to the current
 installation contract. It is source code, not a claim about any current AWS
 environment.
 
+For the end-to-end operator sequence—identity checks, image publication,
+Bedrock inputs, monitoring verification, application probes, and teardown—start
+with the project
+[AWS ECS cold-install runbook](../../../docs/runbooks/aws-ecs-cold-install.md).
+This README remains the package-level authority for Terraform inputs, IAM
+policy rendering, image and trust-root admission, and lifecycle details, and
+the runbook defers to it for each of those.
+
 ## Choose a topology
 
 ### Scenario A: cold install (recommended)

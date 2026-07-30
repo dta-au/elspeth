@@ -940,6 +940,10 @@ def test_runbook_is_linked_from_operator_indexes() -> None:
 
     assert REDEPLOY_RUNBOOK.is_file()
     assert (
+        "| [AWS ECS Cold Install](aws-ecs-cold-install.md) "
+        "| Create a complete disposable stack with the tracked Scenario A Terraform package, including Aurora, monitoring, and Bedrock |"
+    ) in index
+    assert (
         "| [AWS ECS Existing-Service Redeploy](aws-ecs-existing-service-redeploy.md) "
         "| Build, scan, and deploy an immutable image to an existing ECS/Fargate service |"
     ) in index
@@ -947,6 +951,9 @@ def test_runbook_is_linked_from_operator_indexes() -> None:
         "| [AWS ECS Full Disposable Acceptance](aws-ecs-deployment.md) "
         "| Provision, exercise, and destroy the release-specific two-scenario acceptance environment |"
     ) in index
+    assert (
+        "[AWS ECS Cold Install](../runbooks/aws-ecs-cold-install.md) - Complete disposable stack with Aurora, monitoring, and Bedrock"
+    ) in guide
     assert (
         "[AWS ECS Existing-Service Redeploy](../runbooks/aws-ecs-existing-service-redeploy.md) - Everyday immutable image redeploy"
     ) in guide

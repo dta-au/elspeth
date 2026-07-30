@@ -132,12 +132,13 @@ The image contains PostgreSQL clients, not a PostgreSQL server or the `psql`
 command. These clients are the psycopg v3 and psycopg2 Python drivers. The
 image supports
 `postgresql+psycopg://` with psycopg v3 and
-`postgresql+psycopg2://` with psycopg2. Compose is the only shipped bundle
-that provisions PostgreSQL. AWS ECS, Azure production, and BYO Kubernetes
-deployments require external PostgreSQL. Native Linux may use SQLite on one
-persistent host. Azure production requires external Azure Database for
-PostgreSQL. Azure VM SQLite is supported only for explicitly non-production
-use on one persistent host.
+`postgresql+psycopg2://` with psycopg2. Compose provisions a PostgreSQL
+container. The tracked AWS ECS Terraform package provisions Aurora PostgreSQL
+outside the application task. Azure production and BYO Kubernetes deployments
+require operator-provided external PostgreSQL. Native Linux may use SQLite on
+one persistent host. Azure production requires external Azure Database for
+PostgreSQL. Azure VM SQLite is supported only for explicitly non-production use
+on one persistent host.
 
 ```bash
 docker run --rm \
@@ -543,6 +544,7 @@ docker run --rm \
 ## See Also
 
 - [Deployment Platforms](../reference/deployment-platforms.md) - Maintained and BYO support boundaries
+- [AWS ECS Cold Install](../runbooks/aws-ecs-cold-install.md) - Complete disposable stack with Aurora, monitoring, and Bedrock
 - [AWS ECS Existing-Service Redeploy](../runbooks/aws-ecs-existing-service-redeploy.md) - Everyday immutable image redeploy
 - [AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance
 - [Your First Pipeline](your-first-pipeline.md) - Getting started guide

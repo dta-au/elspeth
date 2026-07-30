@@ -13,6 +13,8 @@ ENVIRONMENT_REFERENCE = REPO_ROOT / "docs" / "reference" / "environment-variable
 REPOSITORY_STRUCTURE = REPO_ROOT / "docs" / "repository-structure.md"
 RUNBOOK_INDEX = REPO_ROOT / "docs" / "runbooks" / "index.md"
 AWS_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-deployment.md"
+AWS_COLD_INSTALL_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-cold-install.md"
+AWS_TERRAFORM_PACKAGE = REPO_ROOT / "deploy" / "aws-ecs" / "terraform"
 UBUNTU_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "ansible-ubuntu-deployment.md"
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 
@@ -46,8 +48,10 @@ def test_support_matrix_links_only_shipped_deployment_artifacts() -> None:
 
     for relative_path in (
         "../guides/docker.md",
+        "../runbooks/aws-ecs-cold-install.md",
         "../runbooks/aws-ecs-deployment.md",
         "../runbooks/ansible-ubuntu-deployment.md",
+        "../../deploy/aws-ecs/terraform",
         "../../deploy/compose",
         "../../deploy/linux-systemd/elspeth-web.service",
     ):
@@ -74,7 +78,8 @@ def test_support_matrix_states_the_shared_runtime_contract() -> None:
         "PostgreSQL clients, not a PostgreSQL server",
         "postgresql+psycopg://",
         "postgresql+psycopg2://",
-        "Compose is the only shipped bundle that provisions PostgreSQL",
+        "Compose provisions a PostgreSQL container",
+        "tracked AWS ECS Terraform package provisions Aurora PostgreSQL",
         "immutable, release-specific image",
         "one web process or replica",
         "Payload persistence is separate from database persistence",
@@ -87,12 +92,12 @@ def test_support_matrix_states_the_shared_runtime_contract() -> None:
     assert "UID/GID 1000" not in text
 
     assert "Every other production topology supplies its own external PostgreSQL service" not in text
-    assert "AWS ECS, Azure production, and Kubernetes BYO deployments require operator-provided external PostgreSQL" in text
+    assert "Azure production and Kubernetes BYO deployments require operator-provided external PostgreSQL" in text
     assert "Native Linux may instead use SQLite on one persistent host" in text
 
 
 def test_maintained_entry_points_repeat_the_database_and_process_boundaries() -> None:
-    for path in (README, DOCKER_GUIDE, AWS_RUNBOOK, UBUNTU_RUNBOOK):
+    for path in (README, DOCKER_GUIDE, AWS_RUNBOOK, AWS_COLD_INSTALL_RUNBOOK, UBUNTU_RUNBOOK):
         text = _normalized(path)
         assert "PostgreSQL clients" in text, path
         assert "not a PostgreSQL server" in text, path
@@ -247,17 +252,20 @@ def test_aws_retains_the_zero_overlap_ecs_controls() -> None:
     assert "doctor aws-ecs --init-schema" in text
 
 
-def test_aws_docs_require_operator_supplied_task_definition_arns_without_claiming_clone() -> None:
-    for path in (PLATFORM_DOC, README, CHANGELOG, AWS_RUNBOOK):
+def test_aws_docs_distinguish_tracked_cold_install_from_acceptance_inputs() -> None:
+    for path in (PLATFORM_DOC, README, CHANGELOG, AWS_RUNBOOK, AWS_COLD_INSTALL_RUNBOOK):
         assert "live-task clone" not in _read(path).lower(), path
 
     matrix = _normalized(PLATFORM_DOC)
-    assert "operator supplies candidate, doctor, and previous task-definition ARNs" in matrix
+    assert "tracked AWS ECS Terraform package" in matrix
+    assert "creates a VPC, Aurora PostgreSQL" in matrix
+    assert AWS_TERRAFORM_PACKAGE.is_dir()
+    assert "deploy/aws-ecs/terraform" in _read(AWS_COLD_INSTALL_RUNBOOK)
     assert "CANDIDATE_TASK_DEFINITION" in _read(AWS_RUNBOOK)
     assert "DOCTOR_TASK_DEFINITION" in _read(AWS_RUNBOOK)
     assert "PREVIOUS_TASK_DEFINITION" in _read(AWS_RUNBOOK)
-    assert "operator-supplied task-definition ARNs" in _normalized(README)
-    assert "operator-supplied task-definition ARNs" in _normalized(CHANGELOG)
+    assert "aws-ecs-cold-install.md" in _read(README)
+    assert "AWS ECS Terraform cold-install package" in _normalized(CHANGELOG)
 
 
 def test_azure_sqlite_scope_is_consistent() -> None:
@@ -295,6 +303,7 @@ def test_navigation_and_repository_structure_are_honest() -> None:
     assert "BYO" in runbook_index
 
     assert "`deploy/compose/`" in structure
+    assert "`deploy/aws-ecs/terraform/`" in structure
     assert "`deploy/linux-systemd/`" in structure
     for absent_path in ("deploy/azure-container-apps", "deploy/kubernetes", "deploy/platforms"):
         assert absent_path not in structure
