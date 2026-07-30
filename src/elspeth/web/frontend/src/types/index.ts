@@ -111,9 +111,17 @@ export interface SourceSpec {
  * Mirrors the backend `NodeType` / `COMPOSER_NODE_TYPES` in
  * src/elspeth/web/composer/state.py. `queue` is the structural fan-in
  * primitive: id == input, plugin null, description-only options — one or more
- * upstream producers, exactly one ordinary downstream consumer.
+ * upstream producers, exactly one ordinary downstream consumer. `row_union`
+ * is the correlated N-to-N barrier: it waits for every branch, then forwards
+ * each branch row without merging records.
  */
-export type NodeType = "transform" | "gate" | "aggregation" | "coalesce" | "queue";
+export type NodeType =
+  | "transform"
+  | "gate"
+  | "aggregation"
+  | "coalesce"
+  | "row_union"
+  | "queue";
 
 /**
  * A node in the pipeline composition DAG.
@@ -136,6 +144,7 @@ export interface NodeSpec {
   trigger?: Record<string, unknown> | null;
   output_mode?: "default" | "passthrough" | "transform" | null;
   expected_output_count?: number | null;
+  timeout_seconds?: number | null;
 }
 
 /** An edge connecting two nodes in the DAG. */

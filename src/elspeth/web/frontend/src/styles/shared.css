@@ -66,6 +66,13 @@
   border: 1px solid var(--color-badge-coalesce-border);
 }
 
+/* Row union — correlated N-to-N fan-in; waits, then preserves every row. */
+.type-badge-row_union {
+  background-color: var(--color-badge-row-union-bg);
+  color: var(--color-badge-row-union);
+  border: 1px solid var(--color-badge-row-union-border);
+}
+
 /* Queue — pink (structural fan-in; interleaves incoming rows) */
 .type-badge-queue {
   background-color: var(--color-badge-queue-bg);

@@ -147,6 +147,10 @@ function flowText(flow: ProposalFlow): string {
       return flow.branch === null ? "Queue continuation" : `Queue continuation on ${flow.branch}`;
     case "coalesce_success":
       return flow.branch === null ? "Coalesce success" : `Coalesce success on ${flow.branch}`;
+    case "row_union_success":
+      return flow.branch === null
+        ? "Row union success"
+        : `Row union success on ${flow.branch}`;
     case "output_write_failure":
       return "Output write failure";
   }
@@ -176,6 +180,14 @@ function behaviorDetails(behavior: ProposalNodeBehavior): string[] {
         `Branches: ${behavior.branch_aliases.join(", ")}`,
         `Policy: ${humanToken(behavior.policy)}`,
         `Merge: ${humanToken(behavior.merge)}`,
+      ];
+    case "row_union":
+      return [
+        `Branches preserved: ${behavior.branch_aliases.join(", ")}`,
+        "Policy: wait for every branch, then forward each row",
+        ...(behavior.timeout_seconds === null
+          ? []
+          : [`Timeout: ${behavior.timeout_seconds} seconds`]),
       ];
   }
 }

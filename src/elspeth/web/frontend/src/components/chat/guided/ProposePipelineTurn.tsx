@@ -72,6 +72,10 @@ function flowLabel(flow: ProposalFlow): string {
       return flow.branch === null ? "queue continues" : `queue continues in ${flow.branch}`;
     case "coalesce_success":
       return flow.branch === null ? "after join" : `after join in ${flow.branch}`;
+    case "row_union_success":
+      return flow.branch === null
+        ? "after row union"
+        : `after row union in ${flow.branch}`;
     case "output_write_failure":
       return "on write failure";
   }
@@ -94,6 +98,12 @@ function behaviorSummary(behavior: ProposalNodeBehavior): string {
       return "Queue continues in sequence without correlating records.";
     case "coalesce":
       return `Joins ${behavior.branch_aliases.join(", ")} using ${behavior.policy} / ${behavior.merge}.`;
+    case "row_union": {
+      const timeout = behavior.timeout_seconds === null
+        ? ""
+        : `; timeout ${behavior.timeout_seconds}s`;
+      return `Waits for ${behavior.branch_aliases.join(", ")}, then forwards every row without merging records${timeout}.`;
+    }
   }
 }
 

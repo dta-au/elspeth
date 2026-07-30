@@ -16,12 +16,15 @@
 
 import {
   buildPlainPhraseMap,
+  COALESCE_PHRASE,
   PROCESS_ROW_PHRASE,
+  QUEUE_PHRASE,
   READ_API_PHRASE,
   READ_CSV_PHRASE,
   READ_DATA_PHRASE,
   READ_JSON_PHRASE,
   SCRAPE_PAGE_PHRASE,
+  ROW_UNION_PHRASE,
   UNKNOWN_COMPONENT_PHRASE,
   WRITE_CSV_PHRASE,
   WRITE_JSON_PHRASE,
@@ -251,9 +254,27 @@ function roleFromComponentType(componentType: string | null | undefined): Genera
   const t = componentType.toLowerCase();
   if (t === "source") return "source";
   if (t === "sink" || t === "output") return "output";
-  if (t === "transform" || t === "node" || t === "gate" || t === "aggregation" || t === "coalesce") {
+  if (
+    t === "transform"
+    || t === "node"
+    || t === "gate"
+    || t === "aggregation"
+    || t === "coalesce"
+    || t === "row_union"
+    || t === "queue"
+  ) {
     return "transform";
   }
+  return null;
+}
+
+function structuralPhraseFromComponentType(
+  componentType: string | null | undefined,
+): string | null {
+  const type = componentType?.toLowerCase();
+  if (type === "row_union") return ROW_UNION_PHRASE;
+  if (type === "coalesce") return COALESCE_PHRASE;
+  if (type === "queue") return QUEUE_PHRASE;
   return null;
 }
 
@@ -270,8 +291,12 @@ function fallbackPhraseForGeneratedId(
   // explicit token in the id is a stronger signal than a caller-supplied
   // type. The hint fills the gap only when the id carries no role token of
   // its own (elspeth-ede84df6b3).
-  const role = firstGeneratedRole(id) ?? roleFromComponentType(componentType);
-  if (role !== null) return phraseForRoleFormat(role, id);
+  const explicitRole = firstGeneratedRole(id);
+  if (explicitRole !== null) return phraseForRoleFormat(explicitRole, id);
+  const structuralPhrase = structuralPhraseFromComponentType(componentType);
+  if (structuralPhrase !== null) return structuralPhrase;
+  const hintedRole = roleFromComponentType(componentType);
+  if (hintedRole !== null) return phraseForRoleFormat(hintedRole, id);
   // No role signal at all (neither an id token nor a usable component_type
   // hint). CSV/JSON carry no direction of their own — guessing write-vs-read
   // here previously defaulted to a write-direction phrase and pointed at the

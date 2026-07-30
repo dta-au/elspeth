@@ -24,6 +24,7 @@ const BADGE_TOKEN_KINDS = [
   "sink",
   "aggregation",
   "coalesce",
+  "row_union",
   "queue",
 ] as const;
 
@@ -465,8 +466,9 @@ describe("role-family surface contrast", () => {
 
   it("uses opaque badge background tokens with non-text contrast in both themes", () => {
     for (const kind of BADGE_TOKEN_KINDS) {
-      const foregroundToken = `--color-badge-${kind}`;
-      const backgroundToken = `--color-badge-${kind}-bg`;
+      const cssKind = kind.replace("_", "-");
+      const foregroundToken = `--color-badge-${cssKind}`;
+      const backgroundToken = `--color-badge-${cssKind}-bg`;
 
       const darkForeground = extractRootToken(foregroundToken);
       const darkBackground = extractRootToken(backgroundToken);
@@ -511,6 +513,38 @@ describe("queue badge tokens (composer-queue-exposure)", () => {
   });
 });
 
+describe("row_union badge tokens", () => {
+  it("keeps row_union distinct from every existing badge in both themes", () => {
+    for (const kind of [
+      "source",
+      "transform",
+      "gate",
+      "sink",
+      "aggregation",
+      "coalesce",
+      "queue",
+    ] as const) {
+      expect(extractRootToken("--color-badge-row-union")).not.toBe(
+        extractRootToken(`--color-badge-${kind}`),
+      );
+      expect(extractLightThemeToken("--color-badge-row-union")).not.toBe(
+        extractLightThemeToken(`--color-badge-${kind}`),
+      );
+    }
+  });
+
+  it("keeps row_union text comfortably legible on its badge background", () => {
+    expect(contrastRatio(
+      extractRootToken("--color-badge-row-union"),
+      extractRootToken("--color-badge-row-union-bg"),
+    )).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(
+      extractLightThemeToken("--color-badge-row-union"),
+      extractLightThemeToken("--color-badge-row-union-bg"),
+    )).toBeGreaterThanOrEqual(4.5);
+  });
+});
+
 describe("forced-colors accessibility fallbacks", () => {
   it("defines system-color fallbacks for stateful high-contrast surfaces", () => {
     const forcedColorsBlock = extractForcedColorsBlock();
@@ -524,6 +558,7 @@ describe("forced-colors accessibility fallbacks", () => {
     expect(forcedColorsBlock).toContain(".type-badge-sink");
     expect(forcedColorsBlock).toContain(".type-badge-aggregation");
     expect(forcedColorsBlock).toContain(".type-badge-coalesce");
+    expect(forcedColorsBlock).toContain(".type-badge-row_union");
     expect(forcedColorsBlock).toContain(".type-badge-queue");
     expect(forcedColorsBlock).toContain(".react-flow__edge-path");
     expect(forcedColorsBlock).toContain(".yaml-toolbar-btn[data-copied=\"true\"]");

@@ -170,6 +170,7 @@ function selectedComponentConfig(
         branches: node.branches,
         policy: node.policy,
         merge: node.merge,
+        timeout_seconds: node.timeout_seconds,
       }),
       options: node.options,
     };
@@ -407,7 +408,9 @@ export function GraphView() {
     (node: Node) => {
       const nodeKind = miniMapNodeKindById.get(node.id);
       return readThemeColor(
-        nodeKind ? `--color-badge-${nodeKind}` : FALLBACK_MINIMAP_NODE_COLOR_VAR,
+        nodeKind
+          ? `--color-badge-${nodeKind.replace("_", "-")}`
+          : FALLBACK_MINIMAP_NODE_COLOR_VAR,
         FALLBACK_MINIMAP_NODE_COLOR_VAR,
       );
     },
@@ -669,6 +672,7 @@ export function GraphView() {
     const existingConnections = new Set(
       rfEdges.map(e => `${e.source}->${e.target}`)
     );
+    const explicitConnections = new Set(existingConnections);
     const nodeIds = new Set(rfNodes.map(n => n.id));
 
     // Always infer missing edges from connection properties.
@@ -702,6 +706,11 @@ export function GraphView() {
     const queueIds = new Set(
       compositionState.nodes
         .filter((node) => node.node_type === "queue")
+        .map((node) => node.id),
+    );
+    const rowUnionIds = new Set(
+      compositionState.nodes
+        .filter((node) => node.node_type === "row_union")
         .map((node) => node.id),
     );
 
@@ -745,7 +754,51 @@ export function GraphView() {
       }
     }
 
-    // Phase 1: draw every producer → queue edge. Deterministic (sorted by
+    // Phase 1: draw every producer → row_union edge from the authoritative
+    // alias→connection mapping. NodeSpec.input is only the backend-compatible
+    // first-branch placeholder for row_union; it is deliberately ignored so
+    // the graph cannot invent a duplicate unlabelled input edge.
+    const inferredRowUnionAliases = new Set<string>();
+    for (const rowUnion of compositionState.nodes.filter(
+      (node) => node.node_type === "row_union",
+    )) {
+      const branches =
+        rowUnion.branches !== null
+        && rowUnion.branches !== undefined
+        && !Array.isArray(rowUnion.branches)
+          ? Object.entries(rowUnion.branches)
+          : [];
+      for (const [alias, connection] of branches) {
+        const producers = [
+          ...(connectionProducers.get(connection) ?? []),
+        ].sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+        for (const producer of producers) {
+          if (producer.nodeId === rowUnion.id) continue;
+          const connectionKey = `${producer.nodeId}->${rowUnion.id}`;
+          const aliasKey = `${connectionKey}:${alias}`;
+          if (explicitConnections.has(connectionKey)) continue;
+          if (inferredRowUnionAliases.has(aliasKey)) continue;
+          const isError = producer.edgeType === "error";
+          rfEdges.push({
+            id:
+              `inferred-row-union-in-${producer.nodeId}-${rowUnion.id}-${alias}`,
+            source: producer.nodeId,
+            target: rowUnion.id,
+            label: alias,
+            animated: isError,
+            style: {
+              stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
+              strokeWidth: 1.5,
+            },
+            labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+          });
+          inferredRowUnionAliases.add(aliasKey);
+          existingConnections.add(connectionKey);
+        }
+      }
+    }
+
+    // Phase 2: draw every producer → queue edge. Deterministic (sorted by
     // producer id) so source insertion order cannot change the output; a
     // self-producer is skipped. This runs BEFORE the direct-edge blocks below so
     // these ids own the producer→queue pairs and the dedup set suppresses the
@@ -774,9 +827,10 @@ export function GraphView() {
       }
     }
 
-    // Phase 2: infer edges by matching node.input to its upstream producer.
+    // Phase 3: infer edges by matching node.input to its upstream producer.
     for (const node of compositionState.nodes) {
       if (!node.input) continue;
+      if (rowUnionIds.has(node.id)) continue;
 
       // A queue is the SOLE canonical producer of its own connection: synthesise
       // the queue node as the producer (queue → consumer), never the upstream
@@ -805,7 +859,9 @@ export function GraphView() {
         if (existingConnections.has(`${producer.nodeId}->${node.id}`)) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
-          id: `inferred-conn-${producer.nodeId}-${node.id}`,
+          id: rowUnionIds.has(producer.nodeId)
+            ? `inferred-row-union-out-${producer.nodeId}-${node.id}`
+            : `inferred-conn-${producer.nodeId}-${node.id}`,
           source: producer.nodeId,
           target: node.id,
           label: producer.label,

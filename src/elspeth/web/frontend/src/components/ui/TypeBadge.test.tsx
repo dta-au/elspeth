@@ -42,4 +42,9 @@ describe("TypeBadge", () => {
     const badge = screen.getByTestId("qb");
     expect(badge).toHaveClass("type-badge", "type-badge-queue", "x");
   });
+  it("renders a distinct row_union badge and preserves an overridden label", () => {
+    render(<TypeBadge type="row_union">Row union</TypeBadge>);
+    const badge = screen.getByText("Row union");
+    expect(badge).toHaveClass("type-badge", "type-badge-row_union");
+  });
 });

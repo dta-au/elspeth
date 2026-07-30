@@ -56,15 +56,30 @@ const BLOCKER_SUMMARY = {
 } as const;
 const PROPOSAL_SUMMARY_TEMPLATE = "guided.proposal.summary.full_graph.v1";
 const PROPOSAL_RATIONALE_TEMPLATE = "guided.proposal.rationale.review_required.v1";
-const NODE_TYPES = new Set(["transform", "gate", "aggregation", "queue", "coalesce"]);
+const NODE_TYPES = new Set([
+  "transform",
+  "gate",
+  "aggregation",
+  "queue",
+  "coalesce",
+  "row_union",
+]);
 const FLOW_KINDS = new Set([
   "source_success", "source_validation_failure", "node_success", "node_error",
-  "gate_route", "gate_fork", "queue_continue", "coalesce_success", "output_write_failure",
+  "gate_route", "gate_fork", "queue_continue", "coalesce_success",
+  "row_union_success", "output_write_failure",
 ]);
 const TRIGGER_KINDS = ["count", "timeout", "condition"] as const;
 const COALESCE_POLICIES = new Set(["require_all", "quorum", "best_effort", "first"]);
 const COALESCE_MERGES = new Set(["union", "nested", "select"]);
-const COMPOSITION_NODE_TYPES = new Set(["transform", "gate", "aggregation", "coalesce", "queue"]);
+const COMPOSITION_NODE_TYPES = new Set([
+  "transform",
+  "gate",
+  "aggregation",
+  "coalesce",
+  "row_union",
+  "queue",
+]);
 const COMPOSITION_EDGE_TYPES = new Set(["on_success", "on_error", "route_true", "route_false", "fork"]);
 const POLICY_REASONS = new Set([
   "plugin_not_enabled", "plugin_not_installed", "plugin_unavailable",
@@ -125,6 +140,7 @@ function decodeProposalNodeType(
     case "aggregation":
     case "queue":
     case "coalesce":
+    case "row_union":
       return decoded;
     default:
       return invalid(path, "unknown node type");
@@ -307,7 +323,39 @@ function validateProposalBehavior(value: unknown, nodeType: string, path: string
     if (exact.expected_output_count !== null) canonicalIntegerString(exact.expected_output_count, `${behaviorPath}.expected_output_count`, false);
     return { kind: nodeType, routeAliases: [], forkBranches: [], branchAliases: [] };
   }
-  const exact = exactRecord(behavior, behaviorPath, ["kind", "branch_aliases", "policy", "merge"]);
+  if (nodeType === "row_union") {
+    const exact = exactRecord(
+      behavior,
+      behaviorPath,
+      ["kind", "branch_aliases", "policy", "timeout_seconds"],
+    );
+    const branchAliases = aliasArray(
+      exact.branch_aliases,
+      "branch",
+      `${behaviorPath}.branch_aliases`,
+      2,
+    );
+    if (stringValue(exact.policy, `${behaviorPath}.policy`) !== "require_all") {
+      invalid(`${behaviorPath}.policy`, "expected require_all");
+    }
+    if (exact.timeout_seconds !== null) {
+      finitePositiveNumber(
+        exact.timeout_seconds,
+        `${behaviorPath}.timeout_seconds`,
+      );
+    }
+    return {
+      kind: nodeType,
+      routeAliases: [],
+      forkBranches: [],
+      branchAliases,
+    };
+  }
+  const exact = exactRecord(
+    behavior,
+    behaviorPath,
+    ["kind", "branch_aliases", "policy", "merge"],
+  );
   const branchAliases = aliasArray(exact.branch_aliases, "branch", `${behaviorPath}.branch_aliases`, 2);
   if (!COALESCE_POLICIES.has(stringValue(exact.policy, `${behaviorPath}.policy`))) invalid(`${behaviorPath}.policy`, "unknown policy");
   if (!COALESCE_MERGES.has(stringValue(exact.merge, `${behaviorPath}.merge`))) invalid(`${behaviorPath}.merge`, "unknown merge");
@@ -331,7 +379,13 @@ function validateProposalFlow(value: unknown, path: string): DecodedProposalFlow
   const flow = record(value, path);
   const kind = stringValue(flow.kind, `${path}.kind`);
   if (!FLOW_KINDS.has(kind)) invalid(`${path}.kind`, "unknown flow kind");
-  if (["source_success", "node_success", "queue_continue", "coalesce_success"].includes(kind)) {
+  if ([
+    "source_success",
+    "node_success",
+    "queue_continue",
+    "coalesce_success",
+    "row_union_success",
+  ].includes(kind)) {
     const exact = exactRecord(flow, path, ["kind", "branch"]);
     const branch = exact.branch === null ? null : structuralAlias(exact.branch, "branch", `${path}.branch`);
     return { kind, branch };
@@ -467,6 +521,7 @@ function validateProposalPayload(value: unknown, path: string): void {
   const gateRoutes = new Map<string, string[]>();
   const gateForks = new Map<string, Array<{ routes: string[]; branch: string }>>();
   const branchOrigins = new Map<string, string[]>();
+  const branchOriginGates = new Map<string, string[]>();
   const branchAdjacency = new Map<string, Map<string, Set<string>>>();
   const branchUses: Array<{ branch: string; from: string; flowKind: string; path: string }> = [];
   const legalNodeFlows: Record<string, ReadonlySet<string>> = {
@@ -475,6 +530,7 @@ function validateProposalPayload(value: unknown, path: string): void {
     gate: new Set(["gate_route", "gate_fork"]),
     queue: new Set(["queue_continue"]),
     coalesce: new Set(["coalesce_success"]),
+    row_union: new Set(["row_union_success"]),
   };
   const legalTargets: Record<string, ReadonlySet<ProposalEndpointKind>> = {
     source_success: new Set(["node", "output"]),
@@ -485,6 +541,7 @@ function validateProposalPayload(value: unknown, path: string): void {
     gate_fork: new Set(["node", "output"]),
     queue_continue: new Set(["node", "output"]),
     coalesce_success: new Set(["node", "output"]),
+    row_union_success: new Set(["node"]),
     output_write_failure: new Set(["output", "discard"]),
   };
   for (const edge of decodedEdges) {
@@ -498,7 +555,16 @@ function validateProposalPayload(value: unknown, path: string): void {
     if (edge.from.kind === "node" && !legalNodeFlows[nodeById.get(fromId)!.nodeType].has(edge.flow.kind)) invalid(`${edge.path}.flow`, "illegal for node_type");
     if (!legalTargets[edge.flow.kind].has(edge.to.kind)) invalid(`${edge.path}.flow`, "illegal for target endpoint kind");
     if (fromId === toId) invalid(edge.path, "self-loop");
-    if (edge.to.kind === "node" && nodeById.get(toId)!.nodeType === "coalesce" && edge.flow.branch == null) invalid(`${edge.path}.flow`, "coalesce input requires branch alias");
+    if (
+      edge.to.kind === "node"
+      && ["coalesce", "row_union"].includes(nodeById.get(toId)!.nodeType)
+      && edge.flow.branch == null
+    ) {
+      invalid(
+        `${edge.path}.flow`,
+        "correlated barrier input requires branch alias",
+      );
+    }
     adjacency.get(fromId)!.add(toId);
     reverseAdjacency.get(toId)!.add(fromId);
     outgoingFlows.set(fromId, [...(outgoingFlows.get(fromId) ?? []), edge.flow]);
@@ -507,6 +573,10 @@ function validateProposalPayload(value: unknown, path: string): void {
     if (edge.flow.kind === "gate_fork") {
       gateForks.set(fromId, [...(gateForks.get(fromId) ?? []), { routes: edge.flow.routes!, branch: edge.flow.branch! }]);
       branchOrigins.set(edge.flow.branch!, [...(branchOrigins.get(edge.flow.branch!) ?? []), toId]);
+      branchOriginGates.set(
+        edge.flow.branch!,
+        [...(branchOriginGates.get(edge.flow.branch!) ?? []), fromId],
+      );
     }
     if (edge.flow.branch != null) {
       const branchGraph = branchAdjacency.get(edge.flow.branch) ?? new Map<string, Set<string>>();
@@ -537,10 +607,44 @@ function validateProposalPayload(value: unknown, path: string): void {
       if (queueTargets.length !== 1 || !nodeById.has(queueTarget) || nodeById.get(queueTarget)!.nodeType === "queue") {
         invalid(path, "queue continuation does not target one ordinary non-queue node");
       }
-    } else {
+    } else if (node.nodeType === "coalesce") {
       if (kinds.length !== 1 || kinds[0] !== "coalesce_success") invalid(path, "coalesce lacks exact success flow");
       const incomingBranches = (incomingEdges.get(node.stableId) ?? []).flatMap(({ flow }) => flow.branch == null ? [] : [flow.branch]);
       if (JSON.stringify(incomingBranches) !== JSON.stringify(node.behavior.branchAliases)) invalid(path, "coalesce branches disagree with incoming flows");
+    } else {
+      if (kinds.length !== 1 || kinds[0] !== "row_union_success") {
+        invalid(path, "row_union lacks exact success flow");
+      }
+      const incomingBranches = (incomingEdges.get(node.stableId) ?? [])
+        .flatMap(({ flow }) => flow.branch == null ? [] : [flow.branch]);
+      if (
+        JSON.stringify(incomingBranches)
+        !== JSON.stringify(node.behavior.branchAliases)
+      ) {
+        invalid(path, "row_union branches disagree with incoming flows");
+      }
+      const rowUnionTargets = [...adjacency.get(node.stableId)!];
+      const rowUnionTarget = rowUnionTargets[0];
+      if (
+        rowUnionTargets.length !== 1
+        || !nodeById.has(rowUnionTarget)
+        || !["transform", "gate", "aggregation"].includes(
+          nodeById.get(rowUnionTarget)!.nodeType,
+        )
+      ) {
+        invalid(
+          path,
+          "row_union success must target one ordinary processing node",
+        );
+      }
+      const originGates = new Set(
+        node.behavior.branchAliases.flatMap(
+          (branch) => branchOriginGates.get(branch) ?? [],
+        ),
+      );
+      if (originGates.size !== 1) {
+        invalid(path, "row_union branches must originate under one gate_fork");
+      }
     }
   }
   for (const sourceId of sources) {
@@ -569,14 +673,19 @@ function validateProposalPayload(value: unknown, path: string): void {
   const branchAliases = new Set(branchOrigins.keys());
   const expectedBranches = new Set(Array.from({ length: branchAliases.size }, (_, index) => `branch-${index + 1}`));
   if (branchAliases.size !== expectedBranches.size || [...branchAliases].some((alias) => !expectedBranches.has(alias)) || [...branchOrigins.values()].some((origins) => origins.length !== 1)) invalid(path, "fork branch aliases are not unique global ordinals");
-  const branchCoalesceOwner = new Map<string, string>();
-  for (const node of nodes.filter((item) => item.nodeType === "coalesce")) {
+  const branchBarrierOwner = new Map<string, string>();
+  for (const node of nodes.filter(
+    (item) => item.nodeType === "coalesce" || item.nodeType === "row_union",
+  )) {
     for (const branch of node.behavior.branchAliases) {
-      const existingOwner = branchCoalesceOwner.get(branch);
+      const existingOwner = branchBarrierOwner.get(branch);
       if (existingOwner !== undefined && existingOwner !== node.stableId) {
-        invalid(path, "fork branch alias is consumed by more than one coalesce node");
+        invalid(
+          path,
+          "fork branch alias is consumed by more than one coalesce/row_union node",
+        );
       }
-      branchCoalesceOwner.set(branch, node.stableId);
+      branchBarrierOwner.set(branch, node.stableId);
     }
   }
   for (const use of branchUses) {
@@ -594,10 +703,14 @@ function validateProposalPayload(value: unknown, path: string): void {
     }
     if (!seen.has(use.from)) invalid(`${use.path}.flow`, "branch use is not downstream of gate_fork origin");
   }
-  for (const node of nodes.filter((item) => item.nodeType === "coalesce")) {
+  for (const node of nodes.filter(
+    (item) => item.nodeType === "coalesce" || item.nodeType === "row_union",
+  )) {
     for (const branch of node.behavior.branchAliases) {
       const origins = branchOrigins.get(branch);
-      if (origins === undefined) invalid(path, "coalesce branch has no fork origin");
+      if (origins === undefined) {
+        invalid(path, "correlated barrier branch has no fork origin");
+      }
       const branchGraph = branchAdjacency.get(branch)!;
       const seen = new Set(origins);
       const frontier = [...origins];
@@ -607,7 +720,9 @@ function validateProposalPayload(value: unknown, path: string): void {
           if (!seen.has(target)) { seen.add(target); frontier.push(target); }
         }
       }
-      if (!seen.has(node.stableId)) invalid(path, "coalesce branch disconnected from fork origin");
+      if (!seen.has(node.stableId)) {
+        invalid(path, "correlated barrier branch disconnected from fork origin");
+      }
     }
   }
 
@@ -958,7 +1073,8 @@ function decodeProposalFlow(value: unknown, path: string): ProposalFlow {
     case "source_success":
     case "node_success":
     case "queue_continue":
-    case "coalesce_success": {
+    case "coalesce_success":
+    case "row_union_success": {
       const exact = exactRecord(flow, path, ["kind", "branch"]);
       return {
         kind,
@@ -1078,6 +1194,34 @@ function decodeProposalBehavior(
         merge,
       };
     }
+    case "row_union": {
+      const exact = exactRecord(
+        behavior,
+        behaviorPath,
+        ["kind", "branch_aliases", "policy", "timeout_seconds"],
+      );
+      const policy = stringValue(exact.policy, `${behaviorPath}.policy`);
+      if (policy !== "require_all") {
+        invalid(`${behaviorPath}.policy`, "expected require_all");
+      }
+      const timeoutSeconds = exact.timeout_seconds === null
+        ? null
+        : finitePositiveNumber(
+          exact.timeout_seconds,
+          `${behaviorPath}.timeout_seconds`,
+        );
+      return {
+        kind: "row_union",
+        branch_aliases: aliasArray(
+          exact.branch_aliases,
+          "branch",
+          `${behaviorPath}.branch_aliases`,
+          2,
+        ),
+        policy,
+        timeout_seconds: timeoutSeconds,
+      };
+    }
   }
 }
 
@@ -1193,7 +1337,13 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
     const output = stringValue(cardinality.output, `${cardinalityPath}.output`);
     const allowedInputs: WireRowCardinality["input"][] = ["none", "one", "batch", "branches", "many_producers"];
     const allowedOutputs: WireRowCardinality["output"][] = [
-      "one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch_set", "expected_count",
+      "one",
+      "zero_or_one",
+      "zero_or_many",
+      "one_per_item",
+      "one_per_branch",
+      "one_per_branch_set",
+      "expected_count",
     ];
     if (!allowedInputs.includes(input as WireRowCardinality["input"])) invalid(`${cardinalityPath}.input`, "unknown cardinality");
     if (!allowedOutputs.includes(output as WireRowCardinality["output"])) invalid(`${cardinalityPath}.output`, "unknown cardinality");
@@ -1246,6 +1396,23 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
         "row_cardinality", "structured_output_fields",
       ]);
       const nodeType = decodeProposalNodeType(node.node_type, `${nodePath}.node_type`);
+      const rowCardinality = decodeCardinality(
+        node.row_cardinality,
+        `${nodePath}.row_cardinality`,
+      );
+      if (
+        nodeType === "row_union"
+        && (
+          rowCardinality.input !== "branches"
+          || rowCardinality.output !== "one_per_branch"
+          || rowCardinality.expected_output_count !== null
+        )
+      ) {
+        invalid(
+          `${nodePath}.row_cardinality`,
+          "row_union requires branches to one_per_branch cardinality",
+        );
+      }
       return {
         stable_id: canonicalUuid(node.stable_id, `${nodePath}.stable_id`),
         label: stringValue(node.label, `${nodePath}.label`),
@@ -1254,7 +1421,7 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
         behavior: decodeProposalBehavior(node.behavior, nodeType, nodePath),
         required_fields: stringArray(node.required_fields, `${nodePath}.required_fields`),
         guaranteed_fields: stringArray(node.guaranteed_fields, `${nodePath}.guaranteed_fields`),
-        row_cardinality: decodeCardinality(node.row_cardinality, `${nodePath}.row_cardinality`),
+        row_cardinality: rowCardinality,
         structured_output_fields: arrayValue(node.structured_output_fields, `${nodePath}.structured_output_fields`).map(
           (item, fieldIndex) => {
             const fieldPath = `${nodePath}.structured_output_fields[${fieldIndex}]`;
@@ -1516,7 +1683,18 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
       item,
       nodePath,
       ["id", "node_type", "plugin", "input", "on_success", "on_error", "options"],
-      ["condition", "routes", "fork_to", "branches", "policy", "merge", "trigger", "output_mode", "expected_output_count"],
+      [
+        "condition",
+        "routes",
+        "fork_to",
+        "branches",
+        "policy",
+        "merge",
+        "trigger",
+        "output_mode",
+        "expected_output_count",
+        "timeout_seconds",
+      ],
     );
     const nodeType = stringValue(node.node_type, `${nodePath}.node_type`);
     if (!COMPOSITION_NODE_TYPES.has(nodeType)) invalid(`${nodePath}.node_type`, "unknown node type");
@@ -1561,6 +1739,14 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
       decoded.expected_output_count = node.expected_output_count === null
         ? null
         : integerValue(node.expected_output_count, `${nodePath}.expected_output_count`);
+    }
+    if (node.timeout_seconds !== undefined) {
+      decoded.timeout_seconds = node.timeout_seconds === null
+        ? null
+        : finitePositiveNumber(
+          node.timeout_seconds,
+          `${nodePath}.timeout_seconds`,
+        );
     }
     return decoded;
   });

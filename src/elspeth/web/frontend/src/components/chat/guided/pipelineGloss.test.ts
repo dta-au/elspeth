@@ -141,3 +141,48 @@ describe("pipelineGloss — queue fan-in", () => {
     expect(map.get("inbound")).toBe("interleave the incoming rows");
   });
 });
+
+describe("pipelineGloss — row_union correlated N-to-N barrier", () => {
+  function rowUnionComposition() {
+    return makeComposition(1, {
+      sources: {
+        experiments: { plugin: "csv", options: {} },
+      },
+      nodes: [
+        {
+          id: "variant_union",
+          node_type: "row_union",
+          plugin: null,
+          input: "control_done",
+          on_success: "experiment_rows",
+          on_error: null,
+          options: {},
+          branches: {
+            control: "control_done",
+            treatment: "treatment_done",
+          },
+          timeout_seconds: 12.5,
+        },
+      ],
+      outputs: [{ name: "results", plugin: "json", options: {} }],
+    });
+  }
+
+  it("says row_union waits for every branch and preserves every row", () => {
+    const gloss = pipelineGloss(rowUnionComposition());
+
+    expect(gloss).toContain(
+      "wait for every branch, then preserve every branch row",
+    );
+    expect(gloss).not.toContain("merge the branches");
+    expect(gloss).not.toContain("interleave the incoming rows");
+  });
+
+  it("keys the distinct row_union phrase by node id", () => {
+    const map = buildPlainPhraseMap(rowUnionComposition());
+
+    expect(map.get("variant_union")).toBe(
+      "wait for every branch, then preserve every branch row",
+    );
+  });
+});

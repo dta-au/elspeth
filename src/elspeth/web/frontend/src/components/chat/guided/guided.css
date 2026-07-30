@@ -2247,6 +2247,12 @@
   stroke: var(--color-accent);
 }
 
+.guided-readonly-graph__node--row_union {
+  fill: var(--color-badge-row-union-bg);
+  stroke: var(--color-badge-row-union);
+  stroke-width: 2;
+}
+
 .guided-readonly-graph__node--discard {
   stroke: var(--color-error);
   stroke-dasharray: 4 3;

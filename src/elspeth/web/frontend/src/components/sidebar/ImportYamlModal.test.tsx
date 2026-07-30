@@ -141,6 +141,22 @@ const QUEUE_MALFORMED_ENTRY_YAML =
   "  result:\n" +
   "    plugin: json\n";
 
+const ROW_UNION_PIPELINE_YAML =
+  "sources:\n" +
+  "  experiments:\n" +
+  "    plugin: csv\n" +
+  "    on_success: routed\n" +
+  "row_unions:\n" +
+  "  - name: variant_union\n" +
+  "    branches:\n" +
+  "      control: control_done\n" +
+  "      treatment: treatment_done\n" +
+  "    on_success: experiment_rows\n" +
+  "    timeout_seconds: 12.5\n" +
+  "sinks:\n" +
+  "  results:\n" +
+  "    plugin: json\n";
+
 function makeBlob(overrides: Partial<BlobMetadata> = {}): BlobMetadata {
   return {
     id: "22222222-2222-2222-2222-222222222222",
@@ -518,6 +534,18 @@ describe("ImportYamlModal", () => {
     // section, nor counted as a source/output.
     expect(
       screen.getByText("2 sources, 2 processing steps, 1 output"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Ready for server validation/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+  });
+
+  it("recognises a top-level row_unions list and counts it as a processing step", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(ROW_UNION_PIPELINE_YAML);
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(
+      screen.getByText("1 source, 1 processing step, 1 output"),
     ).toBeInTheDocument();
     expect(screen.getByText(/Ready for server validation/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
@@ -1267,5 +1295,16 @@ describe("analyseImportYamlDraft queue recognition", () => {
 
   it("names queues in the required-section message", () => {
     expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toContain("queues");
+  });
+
+  it("counts row_unions as a list of processing steps", () => {
+    const analysis = analyseImportYamlDraft(ROW_UNION_PIPELINE_YAML);
+
+    expect(analysis.sectionsParsed).toBe(true);
+    expect(analysis.canImport).toBe(true);
+    expect(analysis.sourceCount).toBe(1);
+    expect(analysis.stepCount).toBe(1);
+    expect(analysis.outputCount).toBe(1);
+    expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toContain("row_unions");
   });
 });

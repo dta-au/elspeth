@@ -230,6 +230,49 @@ describe("ProposePipelineTurn", () => {
     expect(screen.getByText("output-2 · csv")).toBeVisible();
   });
 
+  it("renders row_union as a distinct N-to-N barrier with its own success flow and honest copy", () => {
+    const rowUnionPayload = payload();
+    rowUnionPayload.nodes[3] = {
+      ...rowUnionPayload.nodes[3],
+      node_type: "row_union",
+      behavior: {
+        kind: "row_union",
+        branch_aliases: ["branch-1", "branch-2"],
+        policy: "require_all",
+        timeout_seconds: 12.5,
+      },
+    };
+    rowUnionPayload.graph.edges[10] = {
+      ...rowUnionPayload.graph.edges[10],
+      flow: { kind: "row_union_success", branch: null },
+    };
+
+    const { container } = render(
+      <ProposePipelineTurn
+        payload={rowUnionPayload}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(
+      container.querySelector('[data-node-kind="row_union"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector(
+        ".guided-readonly-graph__node--row_union",
+      ),
+    ).not.toBeNull();
+    expect(
+      screen.getByText(
+        /waits for branch-1, branch-2, then forwards every row without merging records; timeout 12.5s/i,
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getAllByText(/after row union → output-1/i).length,
+    ).toBeGreaterThan(0);
+  });
+
   it("uses fixed local copy for server template ids and never renders template ids as rationale", () => {
     render(
       <ProposePipelineTurn

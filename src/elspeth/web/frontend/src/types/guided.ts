@@ -555,6 +555,7 @@ export type ProposalFlow =
   | { kind: "gate_fork"; routes: string[]; branch: string }
   | { kind: "queue_continue"; branch: string | null }
   | { kind: "coalesce_success"; branch: string | null }
+  | { kind: "row_union_success"; branch: string | null }
   | { kind: "output_write_failure" };
 
 export type ProposalNodeBehavior =
@@ -580,6 +581,12 @@ export type ProposalNodeBehavior =
       branch_aliases: string[];
       policy: "require_all" | "quorum" | "best_effort" | "first";
       merge: "union" | "nested" | "select";
+    }
+  | {
+      kind: "row_union";
+      branch_aliases: string[];
+      policy: "require_all";
+      timeout_seconds: number | null;
     };
 
 export interface ProposePipelinePayload {
@@ -618,7 +625,13 @@ export interface ProposePipelinePayload {
   nodes: Array<{
     stable_id: string;
     label: string;
-    node_type: "transform" | "gate" | "aggregation" | "queue" | "coalesce";
+    node_type:
+      | "transform"
+      | "gate"
+      | "aggregation"
+      | "queue"
+      | "coalesce"
+      | "row_union";
     plugin: ProposalPluginRef | null;
     behavior: ProposalNodeBehavior;
   }>;
@@ -632,7 +645,14 @@ export interface ProposePipelinePayload {
 
 export interface WireRowCardinality {
   input: "none" | "one" | "batch" | "branches" | "many_producers";
-  output: "one" | "zero_or_one" | "zero_or_many" | "one_per_item" | "one_per_branch_set" | "expected_count";
+  output:
+    | "one"
+    | "zero_or_one"
+    | "zero_or_many"
+    | "one_per_item"
+    | "one_per_branch"
+    | "one_per_branch_set"
+    | "expected_count";
   expected_output_count: string | null;
 }
 

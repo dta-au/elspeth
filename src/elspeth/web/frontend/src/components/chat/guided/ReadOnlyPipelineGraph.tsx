@@ -4,7 +4,16 @@ import dagre from "@dagrejs/dagre";
 export interface ReadOnlyPipelineGraphNode {
   id: string;
   label: string;
-  kind: "source" | "transform" | "gate" | "aggregation" | "queue" | "coalesce" | "output" | "discard";
+  kind:
+    | "source"
+    | "transform"
+    | "gate"
+    | "aggregation"
+    | "queue"
+    | "coalesce"
+    | "row_union"
+    | "output"
+    | "discard";
   subtitle: string | null;
 }
 

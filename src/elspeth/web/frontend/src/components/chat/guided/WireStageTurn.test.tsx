@@ -251,6 +251,63 @@ describe("WireStageTurn", () => {
     expect(screen.queryByText(/\/private\//)).not.toBeInTheDocument();
   });
 
+  it("renders row_union as N-to-N branch preservation, not coalesce or queue semantics", () => {
+    const rowUnionId = "00000000-0000-4000-8000-000000000025";
+    const nodes: WireStageData["nodes"] = [
+      {
+        stable_id: rowUnionId,
+        label: "variant union",
+        node_type: "row_union",
+        plugin: null,
+        behavior: {
+          kind: "row_union",
+          branch_aliases: ["branch-1", "branch-2"],
+          policy: "require_all",
+          timeout_seconds: 12.5,
+        },
+        required_fields: [],
+        guaranteed_fields: ["variant"],
+        row_cardinality: {
+          input: "branches",
+          output: "one_per_branch",
+          expected_output_count: null,
+        },
+        structured_output_fields: [],
+      },
+    ];
+    const connections: WireStageData["connections"] = [
+      {
+        stable_id: "00000000-0000-4000-8000-000000000046",
+        from_endpoint: { kind: "node", stable_id: rowUnionId },
+        to_endpoint: { kind: "node", stable_id: NODE_ID },
+        flow: { kind: "row_union_success", branch: null },
+        schema_contract: null,
+      },
+    ];
+
+    render(
+      <WireStageTurn
+        data={canonicalData({ nodes, connections })}
+        onConfirm={vi.fn()}
+        confirmDisabled={false}
+      />,
+    );
+
+    expect(
+      screen.getByText("Cardinality: branches → one per branch"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Branches preserved: branch-1, branch-2"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Policy: wait for every branch, then forward each row"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Timeout: 12.5 seconds")).toBeInTheDocument();
+    expect(screen.getByText("Row union success")).toBeInTheDocument();
+    expect(screen.queryByText(/merge: union/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/queued items individually/i)).not.toBeInTheDocument();
+  });
+
   it("renders detailed success, route, branch, and failure semantics with stable connection ids", () => {
     const connections: WireStageData["connections"] = [
       ...canonicalData().connections,

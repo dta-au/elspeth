@@ -82,6 +82,7 @@ vi.mock("@xyflow/react", () => ({
       // own --color-badge-queue token (Task 6 minimap recognition). Harmless
       // for compositions without such a node — it resolves to the fallback.
       data-queue-color={nodeColor?.({ id: "inbound" })}
+      data-row-union-color={nodeColor?.({ id: "variant_union" })}
       data-unknown-color={nodeColor?.({ id: "unknown" })}
       data-stroke-color={nodeStrokeColor?.({ id: "source" })}
     />
@@ -780,6 +781,188 @@ describe("GraphView", () => {
       expect(screen.getByTestId("minimap")).toHaveAttribute(
         "data-queue-color",
         "#ff91c8",
+      );
+    });
+  });
+
+  describe("row_union correlated branch fan-in", () => {
+    function rowUnionState(): CompositionState {
+      return makeState({
+        sources: {
+          experiments: {
+            plugin: "csv",
+            options: {},
+            on_success: "routed",
+          },
+        },
+        nodes: [
+          makeNode({
+            id: "experiment_gate",
+            node_type: "gate",
+            plugin: null,
+            input: "routed",
+            on_success: null,
+            routes: {
+              control: "control_raw",
+              treatment: "treatment_raw",
+            },
+            fork_to: ["control", "treatment"],
+          }),
+          makeNode({
+            id: "control_score",
+            input: "control_raw",
+            on_success: "control_done",
+          }),
+          makeNode({
+            id: "treatment_score",
+            input: "treatment_raw",
+            on_success: "treatment_done",
+          }),
+          {
+            id: "variant_union",
+            node_type: "row_union",
+            plugin: null,
+            // Backend compatibility placeholder only. It must not invent an
+            // extra scalar input edge in the graph.
+            input: "control_done",
+            on_success: "experiment_rows",
+            on_error: null,
+            options: {},
+            branches: {
+              control: "control_done",
+              treatment: "treatment_done",
+            },
+            timeout_seconds: 12.5,
+          },
+          makeNode({
+            id: "compare",
+            node_type: "aggregation",
+            plugin: "batch_experiment_compare",
+            input: "experiment_rows",
+            on_success: "results",
+          }),
+        ],
+        outputs: [{ name: "results", plugin: "json", options: {} }],
+        edges: [],
+      });
+    }
+
+    function renderedEdgeIds(): string[] {
+      return Array.from(document.querySelectorAll('[data-testid^="edge-"]'))
+        .map((el) => el.getAttribute("data-testid") ?? "")
+        .sort();
+    }
+
+    it("draws every branch producer into row_union by alias and one success edge without placeholder bypasses", () => {
+      useSessionStore.setState({ compositionState: rowUnionState() });
+      render(<GraphView />);
+
+      const ids = renderedEdgeIds();
+      expect(ids).toContain(
+        "edge-inferred-row-union-in-control_score-variant_union-control",
+      );
+      expect(ids).toContain(
+        "edge-inferred-row-union-in-treatment_score-variant_union-treatment",
+      );
+      expect(
+        screen.getByTestId(
+          "edge-inferred-row-union-in-control_score-variant_union-control",
+        ),
+      ).toHaveTextContent("control");
+      expect(
+        screen.getByTestId(
+          "edge-inferred-row-union-in-treatment_score-variant_union-treatment",
+        ),
+      ).toHaveTextContent("treatment");
+      expect(ids).toContain(
+        "edge-inferred-row-union-out-variant_union-compare",
+      );
+
+      // The scalar placeholder input is the first branch's connection for
+      // backend compatibility. Rendering it through ordinary input inference
+      // would create a duplicate, unlabelled edge.
+      expect(ids).not.toContain(
+        "edge-inferred-conn-control_score-variant_union",
+      );
+      // Every route into compare comes from the union itself: no branch
+      // producer bypass and no union self-loop.
+      expect(ids.filter((id) => id.endsWith("-compare"))).toEqual([
+        "edge-inferred-row-union-out-variant_union-compare",
+      ]);
+      expect(
+        ids.some((id) => id.includes("variant_union-variant_union")),
+      ).toBe(false);
+    });
+
+    it("preserves every alias when two branches name the same producer connection", () => {
+      const state = rowUnionState();
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.branches = {
+        control: "control_done",
+        treatment: "control_done",
+      };
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByTestId(
+          "edge-inferred-row-union-in-control_score-variant_union-control",
+        ),
+      ).toHaveTextContent("control");
+      expect(
+        screen.getByTestId(
+          "edge-inferred-row-union-in-control_score-variant_union-treatment",
+        ),
+      ).toHaveTextContent("treatment");
+    });
+
+    it("exposes a distinct row_union badge in the keyboard inspector", async () => {
+      useSessionStore.setState({
+        selectedNodeId: null,
+        selectNode: (nodeId: string | null) =>
+          useSessionStore.setState({ selectedNodeId: nodeId } as never),
+        compositionState: rowUnionState(),
+      } as never);
+      render(<GraphView />);
+
+      const list = screen.getByRole("list", {
+        name: /pipeline components/i,
+      });
+      await userEvent.click(
+        within(list).getByRole("button", {
+          name: /row_union: variant_union/i,
+        }),
+      );
+
+      const panel = screen.getByRole("complementary", {
+        name: /variant_union configuration/i,
+      });
+      expect(within(panel).getByText("row_union")).toHaveClass(
+        "type-badge",
+        "type-badge-row_union",
+      );
+      expect(within(panel).getByText("12.5")).toBeInTheDocument();
+    });
+
+    it("colours row_union in the minimap using its dedicated kebab-case token", () => {
+      document.documentElement.style.setProperty(
+        "--color-badge-row-union",
+        "#aeb8ff",
+      );
+      const state = rowUnionState();
+      state.nodes.push(
+        makeNode({ id: "padding-1", input: "unused-1" }),
+        makeNode({ id: "padding-2", input: "unused-2" }),
+      );
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(screen.getByTestId("minimap")).toHaveAttribute(
+        "data-row-union-color",
+        "#aeb8ff",
       );
     });
   });
