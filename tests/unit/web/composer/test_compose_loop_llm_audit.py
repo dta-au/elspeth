@@ -311,6 +311,61 @@ def test_provider_reasoning_does_not_invoke_provider_descriptors() -> None:
     assert calls == []
 
 
+def test_provider_artifact_admits_real_litellm_tool_call() -> None:
+    """A real LiteLLM tool call must audit as an artifact, not as the sentinel.
+
+    ``litellm.types.utils.ChatCompletionMessageToolCall`` declares no pydantic
+    model fields: ``id``/``type``/``function`` live in ``__pydantic_extra__``
+    and its ``__dict__`` is empty. Reading ``__dict__`` alone yields no
+    data-only representation, so the whole artifact silently degrades to
+    ``PROVIDER_ARTIFACT_UNAVAILABLE`` in the durable audit record
+    (ADR-032; same defect class as elspeth-9ea866438b).
+    """
+    from litellm.types.utils import ChatCompletionMessageToolCall, Function
+
+    tool_call = ChatCompletionMessageToolCall(
+        id="call_1",
+        type="function",
+        function=Function(name="do_thing", arguments='{"a": 1}'),
+    )
+    assert object.__getattribute__(tool_call, "__dict__") == {}  # the storage split this test pins
+
+    record = _record_with_reasoning_artifact(tool_call)
+
+    assert record.reasoning_details == {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "do_thing", "arguments": '{"a": 1}'},
+    }
+
+
+def test_provider_artifact_admits_pydantic_extra_allow_model() -> None:
+    """Undeclared fields on an ``extra="allow"`` model must reach the audit record."""
+    import pydantic
+
+    class _ProviderArtifact(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(extra="allow")
+
+        declared: str
+
+    artifact = _ProviderArtifact(declared="visible", undeclared="also visible")
+
+    record = _record_with_reasoning_artifact(artifact)
+
+    assert record.reasoning_details == {"declared": "visible", "undeclared": "also visible"}
+
+
+def test_provider_artifact_without_data_fields_still_degrades_to_sentinel() -> None:
+    """The sentinel fallback is preserved, not removed, by the extras merge."""
+
+    class _Opaque:
+        __slots__ = ()
+
+    record = _record_with_reasoning_artifact(_Opaque())
+
+    assert record.reasoning_details == "<provider-artifact-unavailable>"
+
+
 def test_provider_reasoning_content_degrades_when_oversized() -> None:
     response = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(reasoning="x" * 65_537))],

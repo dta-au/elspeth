@@ -33,6 +33,7 @@ import re
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from types import MemberDescriptorType
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import (
@@ -97,6 +98,50 @@ class _ReasoningMetadata(TypedDict):
     thinking_blocks: Any | None
 
 
+_PYDANTIC_EXTRA_SLOT = "__pydantic_extra__"
+
+
+def _pydantic_extra_fields(value: Any) -> Mapping[str, Any] | None:
+    """Return a pydantic v2 ``extra="allow"`` overflow mapping, or ``None``.
+
+    Pydantic v2 models with ``extra="allow"`` (LiteLLM response objects) store
+    undeclared provider fields in the ``__pydantic_extra__`` slot rather than
+    in ``__dict__``. ``usage`` on a real ``ModelResponse`` lives there, and a
+    real ``litellm.types.utils.ChatCompletionMessageToolCall`` declares no
+    model fields at all — its whole payload (``id``/``type``/``function``) is
+    in that slot and its ``__dict__`` is empty. Any reader that consults
+    ``__dict__`` alone therefore sees a real provider object as field-less
+    (ADR-032; the defect class of elspeth-9ea866438b).
+
+    The slot is resolved through the owning class's ``__mro__`` and read only
+    when it is a genuine ``__slots__`` member descriptor. A provider object
+    that defines ``__pydantic_extra__`` as its own property is treated as
+    having no extras rather than having its descriptor invoked, which keeps
+    this a data-only read: no provider-controlled code runs. That posture is
+    pinned by ``test_provider_reasoning_does_not_invoke_provider_descriptors``.
+    """
+    for klass in type(value).__mro__:
+        descriptor = klass.__dict__.get(_PYDANTIC_EXTRA_SLOT)
+        if descriptor is None:
+            continue
+        if type(descriptor) is not MemberDescriptorType:
+            return None
+        try:
+            extra = descriptor.__get__(value, type(value))
+        except AttributeError:
+            return None
+        return extra if isinstance(extra, dict) and extra else None
+    return None
+
+
+def _merge_pydantic_extra(value: Any, fields: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Overlay an object's own ``__dict__`` fields onto its pydantic extras."""
+    extra = _pydantic_extra_fields(value)
+    if extra is None:
+        return fields
+    return {**extra, **fields}
+
+
 def _provider_field_map(value: Any) -> Mapping[str, Any] | None:
     if isinstance(value, Mapping):
         return value
@@ -108,18 +153,7 @@ def _provider_field_map(value: Any) -> Mapping[str, Any] | None:
         return None
     if not isinstance(fields, Mapping):
         return None
-    # Pydantic v2 models with ``extra="allow"`` (LiteLLM response objects)
-    # store undeclared provider fields in the ``__pydantic_extra__`` slot,
-    # not ``__dict__`` — ``usage`` on a real ModelResponse lives there.
-    # Reading the slot is still a data-only read: no provider-named
-    # property is ever invoked.
-    try:
-        extra = object.__getattribute__(value, "__pydantic_extra__")
-    except AttributeError:
-        return fields
-    if isinstance(extra, dict) and extra:
-        return {**extra, **fields}
-    return fields
+    return _merge_pydantic_extra(value, fields)
 
 
 def _provider_field(value: Any, field: str) -> Any:
@@ -299,14 +333,30 @@ def _first_response_message(response: Any | None) -> Any | None:
 
 
 def _provider_artifact_owned_fields(value: Any) -> Mapping[str, Any] | None:
-    """Return data-only object fields without invoking provider serializers."""
+    """Return data-only object fields without invoking provider serializers.
+
+    Reads the same two data-only stores ``_provider_field_map`` reads —
+    ``__dict__`` plus the pydantic v2 ``extra="allow"`` overflow slot — because
+    a real provider object frequently keeps its entire payload in the latter.
+    Consulting ``__dict__`` alone returned ``None`` here, which raised
+    ``JsonBoundaryError`` and made ``_json_safe_provider_artifact`` store the
+    ``PROVIDER_ARTIFACT_UNAVAILABLE`` sentinel in place of the real artifact,
+    silently (ADR-032).
+
+    This deliberately does NOT delegate to ``_provider_field_map``: that helper
+    short-circuits ``Mapping`` inputs and reads ``__dict__`` via ``vars()``,
+    whereas the artifact walker handles ``dict`` itself and must reach the
+    instance store through ``object.__getattribute__`` so that a provider
+    ``__getattribute__`` override cannot run. An object with no data fields at
+    all also stays ``None`` here so the sentinel fallback is preserved.
+    """
     try:
         raw_fields = object.__getattribute__(value, "__dict__")
     except (AttributeError, TypeError):
         return None
     if type(raw_fields) is not dict:
         return None
-    fields = dict(raw_fields)
+    fields = dict(_merge_pydantic_extra(value, raw_fields))
     return fields or None
 
 
