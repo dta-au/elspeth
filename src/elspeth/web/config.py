@@ -190,8 +190,13 @@ class WebSettings(BaseModel):
     # Operator-held bearer credential for composer_endpoint_base_url. Same
     # shape as operator_metrics_bearer_token: a directly env-set secret, not
     # a per-user secret-store reference (the boot probe and the planner have
-    # no authenticated user_id to resolve one against). Optional — an
-    # unauthenticated loopback dev gateway is a legitimate deployment.
+    # no authenticated user_id to resolve one against). The affordance as a
+    # whole is optional (both fields None is the default, unconfigured
+    # state) but once composer_endpoint_base_url is set this field is
+    # REQUIRED — an unauthenticated loopback dev gateway is NOT a supported
+    # configuration; see _validate_composer_endpoint_credential_pairing,
+    # which fails closed rather than letting LiteLLM fall back to an
+    # ambient provider credential.
     composer_endpoint_api_key: SecretStr | None = Field(default=None)
     # Operator-set LLM sampling. Default None means omitted from the
     # provider request, which is the coherent default for reasoning-model
@@ -883,6 +888,41 @@ class WebSettings(BaseModel):
                 "composer_advisor_model must differ from composer_model "
                 f"(both resolve to {_canonical(self.composer_model)!r}); the advisor "
                 "is the independent reviewer and cannot be the primary composer"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_composer_endpoint_credential_pairing(self) -> WebSettings:
+        """Endpoint + credential must be configured together, per role.
+
+        An endpoint with no key is a credential-egress trap, not a valid
+        "unauthenticated gateway" configuration: LiteLLM does not require an
+        explicit ``api_key`` argument, so an unpaired ``*_endpoint_base_url``
+        would silently fall back to whatever ambient provider credential the
+        process environment happens to expose (``OPENAI_API_KEY`` and
+        friends) and send it to the operator-configured endpoint — exactly
+        the scenario this affordance exists to let an operator route through
+        a third-party gateway. Fail closed at config time rather than warn in
+        prose (this project's posture everywhere else). A key with no
+        endpoint is symmetric nonsense: it is inert (never read without a
+        base URL to pair it with) and signals a misconfiguration the
+        operator should fix, not silently ignore.
+
+        Each role is independent — see the two-model independence rule above.
+        """
+        if (self.composer_endpoint_base_url is None) != (self.composer_endpoint_api_key is None):
+            raise ValueError(
+                "composer_endpoint_base_url and composer_endpoint_api_key must be configured together: "
+                "an endpoint with no key would let LiteLLM silently fall back to an ambient provider "
+                "credential (e.g. OPENAI_API_KEY) and send it to the configured endpoint; a key with no "
+                "endpoint is inert and never used"
+            )
+        if (self.composer_advisor_endpoint_base_url is None) != (self.composer_advisor_endpoint_api_key is None):
+            raise ValueError(
+                "composer_advisor_endpoint_base_url and composer_advisor_endpoint_api_key must be "
+                "configured together: an endpoint with no key would let LiteLLM silently fall back to an "
+                "ambient provider credential (e.g. OPENAI_API_KEY) and send it to the configured endpoint; "
+                "a key with no endpoint is inert and never used"
             )
         return self
 

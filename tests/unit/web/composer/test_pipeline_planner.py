@@ -3809,6 +3809,53 @@ def test_escape_hatch_api_key_requires_escape_hatch_model() -> None:
         _model(_ScriptedCompletion(), escape_hatch_api_key="advisor-secret")
 
 
+def test_api_base_without_api_key_rejected() -> None:
+    """Defense-in-depth (belt-and-braces alongside the WebSettings-level
+    pairing validator): a PlannerModelConfig built with an unpaired primary
+    endpoint must be rejected at construction, not silently forwarded."""
+    with pytest.raises(ValueError, match="api_base and api_key must be configured together"):
+        _model(_ScriptedCompletion(), api_base="https://primary-gateway.example.test/v1")
+
+
+def test_api_key_without_api_base_rejected() -> None:
+    with pytest.raises(ValueError, match="api_base and api_key must be configured together"):
+        _model(_ScriptedCompletion(), api_key="orphaned-primary-key")
+
+
+def test_escape_hatch_api_base_without_api_key_rejected() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_base and escape_hatch_api_key must be configured together"):
+        _model(
+            _ScriptedCompletion(),
+            escape_hatch_model="openrouter/advisor-under-test",
+            escape_hatch_provider="openrouter",
+            escape_hatch_api_base="https://advisor-gateway.example.test/v1",
+        )
+
+
+def test_escape_hatch_api_key_without_api_base_rejected() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_base and escape_hatch_api_key must be configured together"):
+        _model(
+            _ScriptedCompletion(),
+            escape_hatch_model="openrouter/advisor-under-test",
+            escape_hatch_provider="openrouter",
+            escape_hatch_api_key="orphaned-advisor-key",
+        )
+
+
+def test_both_endpoint_pairs_configured_together_is_valid() -> None:
+    config = _model(
+        _ScriptedCompletion(),
+        api_base="https://primary-gateway.example.test/v1",
+        api_key="primary-secret",
+        escape_hatch_model="openrouter/advisor-under-test",
+        escape_hatch_provider="openrouter",
+        escape_hatch_api_base="https://advisor-gateway.example.test/v1",
+        escape_hatch_api_key="advisor-secret",
+    )
+    assert config.api_base == "https://primary-gateway.example.test/v1"
+    assert config.escape_hatch_api_base == "https://advisor-gateway.example.test/v1"
+
+
 @pytest.mark.asyncio
 async def test_discovery_pressure_notice_injected_at_two_turns_remaining(
     tmp_path: Path,

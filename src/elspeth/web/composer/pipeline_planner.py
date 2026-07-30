@@ -241,6 +241,20 @@ class PlannerModelConfig:
             raise ValueError("escape_hatch_api_base requires escape_hatch_model to be configured")
         if self.escape_hatch_api_key is not None and self.escape_hatch_model is None:
             raise ValueError("escape_hatch_api_key requires escape_hatch_model to be configured")
+        # Defense-in-depth pairing (belt-and-braces alongside
+        # WebSettings._validate_composer_endpoint_credential_pairing): a
+        # constructed PlannerModelConfig must never carry a base URL without
+        # its explicit key, or vice versa, for either role. An endpoint with
+        # no key would let LiteLLM silently fall back to an ambient provider
+        # credential (e.g. OPENAI_API_KEY) and send it to the configured
+        # endpoint. This does not replace the settings-level validator (the
+        # only production source of these values); it forecloses the same
+        # bug reappearing if a future caller ever constructs this dataclass
+        # from something other than validated WebSettings fields.
+        if (self.api_base is None) != (self.api_key is None):
+            raise ValueError("api_base and api_key must be configured together (or both omitted)")
+        if (self.escape_hatch_api_base is None) != (self.escape_hatch_api_key is None):
+            raise ValueError("escape_hatch_api_base and escape_hatch_api_key must be configured together (or both omitted)")
         for integer_field_name, integer_value in (
             ("max_composition_turns", self.max_composition_turns),
             ("max_discovery_turns", self.max_discovery_turns),
