@@ -1725,6 +1725,17 @@ class TestComposerEndpointAffordance:
 
         assert settings.composer_endpoint_base_url == "http://127.0.0.1:8787/v1"
 
+    def test_endpoint_allows_http_ipv6_loopback(self) -> None:
+        """The numeric IPv6 loopback form named in the rejection message
+        (``[::1]``) must actually be accepted — locks in the claim made by
+        ``test_endpoint_rejects_name_based_localhost``'s error text."""
+        settings = _settings(
+            composer_endpoint_base_url="http://[::1]:8787/v1",
+            composer_endpoint_api_key="loopback-bearer-token",
+        )
+
+        assert settings.composer_endpoint_base_url == "http://[::1]:8787/v1"
+
     def test_endpoint_rejects_name_based_localhost(self) -> None:
         """``localhost`` is resolver-dependent (/etc/hosts, NSS, container
         DNS) and is not proof of on-box egress for a credential-bearing URL —
