@@ -39,6 +39,7 @@ from .contracts import (
     _string_field,
     _utc_timestamp,
     _uuid_field,
+    acceptance_step,
 )
 from .http_client import AcceptanceHttpClient
 from .state import AcceptanceState, read_acceptance_state, write_acceptance_state
@@ -207,21 +208,23 @@ def capture(
 ) -> AcceptanceState:
     """Capture one fixed public-API run and atomically persist its safe state."""
 
-    register_value = env.get("ELSPETH_ACCEPTANCE_REGISTER")
-    if register_value not in {None, "0", "1"}:
-        raise AcceptanceInputError("ELSPETH_ACCEPTANCE_REGISTER must be 0 or 1")
-    tutorial_profile = env.get("ELSPETH_WEB__DEFAULT_LLM_PROFILE")
-    if type(tutorial_profile) is not str or not tutorial_profile.strip() or tutorial_profile != tutorial_profile.strip():
-        raise AcceptanceInputError("tutorial profile alias is invalid")
-    server_data_dir = _server_data_dir(env)
+    with acceptance_step("env_validate"):
+        register_value = env.get("ELSPETH_ACCEPTANCE_REGISTER")
+        if register_value not in {None, "0", "1"}:
+            raise AcceptanceInputError("ELSPETH_ACCEPTANCE_REGISTER must be 0 or 1")
+        tutorial_profile = env.get("ELSPETH_WEB__DEFAULT_LLM_PROFILE")
+        if type(tutorial_profile) is not str or not tutorial_profile.strip() or tutorial_profile != tutorial_profile.strip():
+            raise AcceptanceInputError("tutorial profile alias is invalid")
+        server_data_dir = _server_data_dir(env)
     captured_at = _utc_timestamp(now())
     client = AcceptanceHttpClient.from_env(env, transport=transport)
-    register = register_value == "1"
-    if register and client.credentials.mode != "local":
-        raise AcceptanceInputError("registration is available only for local acceptance authentication")
+    with acceptance_step("env_validate"):
+        register = register_value == "1"
+        if register and client.credentials.mode != "local":
+            raise AcceptanceInputError("registration is available only for local acceptance authentication")
 
     uploaded_sha256 = _sha256(FIXED_INPUT_BYTES)
-    with client:
+    with client, acceptance_step("capture_fetch"):
         client.authenticate(register=register)
         session = _mapping(client.request_json("POST", "/api/sessions", expected_statuses={201}, json_body={}), check="session_create")
         session_id = _uuid_field(session, "id", check="session_create")
@@ -414,9 +417,10 @@ def verify_api(
     """Re-authenticate and verify the captured API resources without mutation."""
 
     state = read_acceptance_state(state_file)
-    server_data_dir = _server_data_dir(env)
+    with acceptance_step("env_validate"):
+        server_data_dir = _server_data_dir(env)
     client = AcceptanceHttpClient.from_env(env, transport=transport)
-    with client:
+    with client, acceptance_step("verify_fetch"):
         client.authenticate(register=False)
         session = _mapping(
             client.request_json("GET", f"/api/sessions/{state.session_id}", expected_statuses={200}),

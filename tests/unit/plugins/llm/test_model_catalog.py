@@ -423,3 +423,52 @@ async def test_catalog_snapshot_source_reflects_prime_state() -> None:
     sha_live, source_live = model_catalog.read_openrouter_catalog_snapshot_id()
     assert source_live == "live"
     assert sha_live != sha_bundled
+
+
+def test_module_import_forces_litellm_local_cost_map() -> None:
+    """Importing the catalog module pins LiteLLM to its bundled cost map.
+
+    LiteLLM fetches its model-cost map from raw.githubusercontent.com at
+    ``import litellm`` time unless ``LITELLM_LOCAL_MODEL_COST_MAP`` is set
+    (elspeth-c67ba40e4a: no deployment may silently egress to third
+    parties). The guard lives at module level in ``model_catalog`` — the
+    single point of truth for litellm access — so a fresh interpreter that
+    imports it before litellm never fetches the remote map. Run in a
+    subprocess: in-process the module is already imported, so the
+    import-time effect cannot be observed directly.
+    """
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import os\n"
+        "assert 'LITELLM_LOCAL_MODEL_COST_MAP' not in os.environ, 'test requires a clean env'\n"
+        "import elspeth.plugins.transforms.llm.model_catalog  # noqa: F401\n"
+        "assert os.environ['LITELLM_LOCAL_MODEL_COST_MAP'] == 'True'\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "LITELLM_LOCAL_MODEL_COST_MAP"}
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+
+
+def test_operator_override_of_litellm_cost_map_is_preserved() -> None:
+    """``setdefault`` semantics: an explicit operator value is never clobbered.
+
+    An operator who deliberately re-enables LiteLLM's remote cost-map
+    fetch (or spells the opt-in differently) keeps their value; ELSPETH
+    only supplies the safe default when the variable is unset.
+    """
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import os\n"
+        "import elspeth.plugins.transforms.llm.model_catalog  # noqa: F401\n"
+        "assert os.environ['LITELLM_LOCAL_MODEL_COST_MAP'] == 'False'\n"
+    )
+    env = dict(os.environ)
+    env["LITELLM_LOCAL_MODEL_COST_MAP"] = "False"
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr

@@ -439,13 +439,22 @@ def test_cross_region_bedrock_profile_gets_wildcard_region_foundation_model_gran
     module_locals = _text("modules/scenario/locals.tf")
     iam = _text("modules/scenario/iam_observability.tf")
 
-    # A cross-region ("global."/"us."/"eu."/"apac.") composer_model or composer_advisor_model
-    # profile is authorized by Bedrock against the underlying foundation model in whichever
-    # region it routes to, and that authorization check reports a region-less resource ARN. A
-    # single region-pinned foundation-model grant can never match that check, so the module must
-    # derive a wildcard-region grant for every configured model that carries one of these
-    # prefixes.
-    assert re.search(r'bedrock_cross_region_prefixes\s*=\s*\["global\.", "us\.", "eu\.", "apac\."\]', module_locals)
+    # A cross-region geography composer_model or composer_advisor_model profile is authorized by
+    # Bedrock against the underlying foundation model in whichever region it routes to, and that
+    # authorization check reports a region-less resource ARN. A single region-pinned
+    # foundation-model grant can never match that check, so the module must derive a
+    # wildcard-region grant for every configured model that carries one of these prefixes.
+    #
+    # Assert membership rather than an exact frozen list: the allowlist must grow as AWS ships
+    # new geographies, so pinning the whole literal made every addition a test edit with no
+    # safety value. Each prefix below is one AWS ships today; losing any of them is the
+    # regression worth catching. A model id whose leading label matches neither the geography
+    # list nor the provider allowlist no longer fails open at runtime — the precondition pinned
+    # below fails the plan instead.
+    prefixes_match = re.search(r"bedrock_cross_region_prefixes\s*=\s*\[([^\]]*)\]", module_locals)
+    assert prefixes_match
+    declared_prefixes = set(re.findall(r'"([^"]+)"', prefixes_match.group(1)))
+    assert {"global.", "us.", "eu.", "apac.", "au."} <= declared_prefixes
     assert re.search(r'trimprefix\(var\.composer_model, "bedrock/"\)', module_locals)
     assert re.search(r'trimprefix\(var\.composer_advisor_model, "bedrock/"\)', module_locals)
     assert "bedrock_cross_region_foundation_model_arns" in module_locals
@@ -469,6 +478,24 @@ def test_cross_region_bedrock_profile_gets_wildcard_region_foundation_model_gran
     # wildcard-region foundation-model resource or the effective permission is still denied.
     bootstrap = _text("bootstrap/main.tf")
     assert '"arn:aws:bedrock:*::foundation-model/*"' in bootstrap
+
+    # A leading dotted label cannot be told apart structurally from a provider label, so the
+    # module classifies every configured model id against the geography prefixes plus an
+    # explicit provider-label allowlist. An unclassifiable id used to fail open: no wildcard
+    # grant was derived, `terraform plan` validated cleanly, and invocation then denied
+    # intermittently at runtime. A module-internal precondition (unnameable from a root
+    # tftest's `expect_failures`, so pinned here) now fails the plan instead.
+    assert "bedrock_known_provider_prefixes" in module_locals
+    assert "bedrock_unclassified_model_ids" in module_locals
+    task_policy = re.search(
+        r'resource "aws_iam_role_policy" "task" \{(?P<body>.*?)\n\}',
+        iam,
+        re.DOTALL,
+    )
+    assert task_policy is not None
+    task_policy_body = task_policy.group("body")
+    assert "precondition" in task_policy_body
+    assert "length(local.bedrock_unclassified_model_ids) == 0" in task_policy_body
 
 
 def test_task_role_can_list_the_acceptance_bucket_so_head_object_can_report_missing() -> None:

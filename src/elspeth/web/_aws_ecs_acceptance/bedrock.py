@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import sys
@@ -245,15 +246,87 @@ def _build_operator_profile_registry(settings: Any) -> OperatorProfileRegistry:
     return OperatorProfileRegistry(policy=policy, settings=runtime)
 
 
+_GUARDRAIL_GATE_ENV = "ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS"
+
+_MAX_GUARDRAIL_CONFIG_ENV_BYTES = 64 * 1024
+
+
+def _guardrail_config_defaults(env: Mapping[str, str], plugin_id: str) -> tuple[str | None, str | None]:
+    """Derive (alias, version) defaults from the rendered guardrail policy env.
+
+    The deployment already renders ``ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES``
+    (plugin -> approved alias) and ``ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES``
+    (approved bindings including ``guardrail_version``) into the task
+    definition, so the live check can default the PROFILE_ALIAS and
+    EXPECTED_VERSION inputs from them.  The safe/blocked probe texts stay
+    operator-supplied: the check needs a human-chosen attack string.
+    Unparseable or non-matching config yields no default and the input is
+    reported missing.
+    """
+
+    raw_defaults = env.get("ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES")
+    raw_profiles = env.get("ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES")
+    if (
+        type(raw_defaults) is not str
+        or type(raw_profiles) is not str
+        or len(raw_defaults) > _MAX_GUARDRAIL_CONFIG_ENV_BYTES
+        or len(raw_profiles) > _MAX_GUARDRAIL_CONFIG_ENV_BYTES
+    ):
+        return None, None
+    try:
+        defaults = json.loads(raw_defaults)
+        profiles = json.loads(raw_profiles)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, None
+    if not isinstance(defaults, dict) or not isinstance(profiles, list):
+        return None, None
+    alias = defaults.get(plugin_id)
+    if type(alias) is not str or not alias:
+        return None, None
+    versions = [
+        profile.get("guardrail_version")
+        for profile in profiles
+        if isinstance(profile, dict) and profile.get("plugin") == plugin_id and profile.get("alias") == alias
+    ]
+    if len(versions) != 1 or type(versions[0]) is not str:
+        return alias, None
+    return alias, versions[0]
+
+
 def _guardrail_live_inputs(env: Mapping[str, str]) -> tuple[tuple[str, str, str, str, str], ...]:
-    if env.get("ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS") != "1":
+    gate = env.get(_GUARDRAIL_GATE_ENV)
+    if gate is None:
+        raise AcceptanceCheckError("guardrails_live_inputs_missing", missing=(_GUARDRAIL_GATE_ENV,))
+    if gate != "1":
         raise AcceptanceCheckError("guardrails_gate")
-    values: list[tuple[str, str, str, str, str]] = []
+    missing: list[str] = []
+    resolved: list[tuple[str, str | None, str | None, str | None, str | None]] = []
     for plugin_id, alias_name, safe_name, blocked_name, version_name in _GUARDRAIL_INPUTS:
+        default_alias, default_version = _guardrail_config_defaults(env, plugin_id)
         alias = env.get(alias_name)
+        if alias is None:
+            alias = default_alias
+        version = env.get(version_name)
+        if version is None and env.get(alias_name) in {None, default_alias}:
+            # The rendered-config version default only binds to the
+            # rendered-config alias; an operator-supplied divergent alias
+            # must supply its own expected version.
+            version = default_version
         safe_text = env.get(safe_name)
         blocked_text = env.get(blocked_name)
-        version = env.get(version_name)
+        if alias is None:
+            missing.append(alias_name)
+        if version is None:
+            missing.append(version_name)
+        if safe_text is None:
+            missing.append(safe_name)
+        if blocked_text is None:
+            missing.append(blocked_name)
+        resolved.append((plugin_id, alias, safe_text, blocked_text, version))
+    if missing:
+        raise AcceptanceCheckError("guardrails_live_inputs_missing", missing=tuple(missing))
+    values: list[tuple[str, str, str, str, str]] = []
+    for plugin_id, alias, safe_text, blocked_text, version in resolved:
         if (
             type(alias) is not str
             or not alias
@@ -454,6 +527,8 @@ def verify_bedrock_guardrails(
     try:
         settings = settings_loader()
         registry = registry_factory(settings)
+    except AcceptanceCheckError:
+        raise
     except Exception:
         raise AcceptanceCheckError("guardrails_settings") from None
     checked_at = _utc_timestamp(now())
@@ -532,6 +607,11 @@ def run_bedrock_guardrails_live(
         settings = settings_loader()
         policy_evidence, policy_receipt = policy_acceptance_factory(settings, env)
         manager = telemetry_manager_factory(settings)
+    except AcceptanceCheckError:
+        # A named check failure (for example ``guardrails_live_inputs_missing``
+        # or ``guardrails_gate``) must surface as itself, never be
+        # re-labelled as a settings failure (F13).
+        raise
     except Exception:
         raise AcceptanceCheckError("guardrails_settings") from None
 

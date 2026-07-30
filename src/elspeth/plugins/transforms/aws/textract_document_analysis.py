@@ -19,7 +19,7 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
-from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
+from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory, TransformErrorReason
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract import PipelineRow
@@ -54,6 +54,21 @@ _QUERY_PAGE_PATTERN = re.compile(r"^[0-9*\-]+$")
 _FACET_NAMES = ("pages", "tables", "forms", "queries", "signatures", "layout")
 _BUCKET_PATTERN = re.compile(r"^[0-9A-Za-z.\-_]*$")
 _SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
+
+# Textract raises InvalidS3ObjectException whenever it cannot READ the object —
+# it does not distinguish authorization failures from missing or corrupt files.
+# In scoped deployments the most common cause is an object outside the S3 read
+# prefix granted to the runtime role, so classify it with an access-scope hint
+# rather than letting operators suspect the document itself.
+_S3_OBJECT_UNREADABLE_CODE = "InvalidS3ObjectException"
+_S3_OBJECT_UNREADABLE_CAUSE = "s3_object_unreadable"
+_S3_OBJECT_UNREADABLE_HINT = (
+    "Amazon Textract could not read the S3 object. Most commonly the object is outside the "
+    "S3 read scope granted to the pipeline's AWS role (check the role's s3:GetObject prefix "
+    "against the document's bucket/key); it can also mean the object does not exist or is "
+    "stored in a different region than the Textract endpoint. Verify access scope before "
+    "suspecting a corrupt or unsupported file."
+)
 
 logger = structlog.get_logger(__name__)
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
@@ -290,7 +305,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b7447ff1319f0ce5"
+    source_file_hash: str | None = "sha256:0660a95d0c207f74"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -586,10 +601,11 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         except TextractIdempotencyInvariantError as error:
             raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
         except TextractServiceError as error:
-            return TransformResult.error(
-                {"reason": "submit_failed", "error_type": "service_error", "code": error.code},
-                retryable=error.retryable,
-            )
+            submit_error: TransformErrorReason = {"reason": "submit_failed", "error_type": "service_error", "code": error.code}
+            if error.code == _S3_OBJECT_UNREADABLE_CODE:
+                submit_error["cause"] = _S3_OBJECT_UNREADABLE_CAUSE
+                submit_error["error"] = _S3_OBJECT_UNREADABLE_HINT
+            return TransformResult.error(submit_error, retryable=error.retryable)
         except TextractResponseError as error:
             submit_reason: TransformErrorCategory = "result_too_large" if error.category == "response_too_large" else "malformed_response"
             return TransformResult.error({"reason": submit_reason, "error_type": "submit_response"}, retryable=False)

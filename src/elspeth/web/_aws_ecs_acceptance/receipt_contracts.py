@@ -53,6 +53,15 @@ _BEDROCK_DETAIL_FIELDS = frozenset(
     }
 )
 
+_TEXTRACT_DETAIL_FIELDS = frozenset(
+    {
+        "transform_registered",
+        "client_constructed",
+        "start_document_analysis_invocable",
+        "get_document_analysis_invocable",
+    }
+)
+
 _GUARDRAIL_DETAIL_FIELDS = frozenset({"controls", "plugin_policy"})
 
 _GUARDRAIL_CONTROL_FIELDS = frozenset(
@@ -193,6 +202,13 @@ def _validate_bedrock_receipt_details(details: Mapping[str, object]) -> None:
     if details["cost_source"] not in {"provider_reported", "litellm_calculated", "unavailable"}:
         raise AcceptanceCheckError("exec_receipt_schema")
     if (cost is None) != (details["cost_source"] == "unavailable"):
+        raise AcceptanceCheckError("exec_receipt_schema")
+
+
+def _validate_textract_receipt_details(details: Mapping[str, object]) -> None:
+    if set(details) != _TEXTRACT_DETAIL_FIELDS:
+        raise AcceptanceCheckError("exec_receipt_schema")
+    if any(details[field] is not True for field in _TEXTRACT_DETAIL_FIELDS):
         raise AcceptanceCheckError("exec_receipt_schema")
 
 
@@ -395,6 +411,7 @@ def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
         "verify-bedrock-guardrails",
         "verify-connection-budget",
         "verify-operator-telemetry",
+        "verify-textract",
     }:
         raise AcceptanceCheckError("exec_receipt_schema")
     if type(candidate_sha) is not str or _GIT_SHA_PATTERN.fullmatch(candidate_sha) is None:
@@ -413,6 +430,8 @@ def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
         _validate_guardrail_receipt_details(details)
     elif check == "verify-connection-budget":
         _validate_connection_budget_receipt(details)
+    elif check == "verify-textract":
+        _validate_textract_receipt_details(details)
     else:
         _validate_operator_receipt_details(details)
     return payload

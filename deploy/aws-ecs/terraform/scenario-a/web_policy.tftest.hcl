@@ -189,6 +189,74 @@ run "guardrail_policy_is_operator_tunable" {
   }
 }
 
+# ── Bedrock model-id classification for the wildcard-region grant ─────────
+#
+# The module classifies every configured model id by its leading dotted label:
+# a known geography prefix derives a wildcard-region foundation-model grant, a
+# known provider label correctly derives none, and anything else fails the
+# plan through the precondition on aws_iam_role_policy.task (an unrecognised
+# geography used to fail open — plan validated cleanly and bedrock:InvokeModel
+# denied intermittently at runtime, depending on which destination region the
+# profile routed to). Only the accepting classifications are exercised here;
+# the rejecting precondition cannot be named by expect_failures (see the
+# rejection-cases note below) and is pinned structurally in
+# tests/unit/deployment/test_aws_ecs_terraform_package.py.
+
+# F4 regression (elspeth-b7f3ddaf63): au.anthropic.claude-sonnet-4-6 routes
+# ap-southeast-2 AND ap-southeast-4 but derived no wildcard grant because the
+# original allowlist stopped at global./us./eu./apac. This run fails if au.
+# (or the classification gate around it) ever regresses to unclassified.
+run "au_geography_prefix_is_classified" {
+  command = plan
+
+  variables {
+    composer_model         = "bedrock/au.primary-profile"
+    composer_advisor_model = "bedrock/au.advisor-profile"
+  }
+
+  assert {
+    condition     = strcontains(output.resolved_inventory.values.ELSPETH_WEB__LLM_PROFILES, "bedrock/au.primary-profile")
+    error_message = "an au.-prefixed Composer model must plan cleanly and reach the rendered LLM profiles."
+  }
+}
+
+run "provider_label_is_classified_as_region_pinned" {
+  command = plan
+
+  variables {
+    composer_model = "bedrock/zai.glm-4.7-flash"
+    bedrock_foundation_model_arns = [
+      "arn:aws:bedrock:ap-southeast-2::foundation-model/zai.glm-4.7-flash",
+      "arn:aws:bedrock:ap-southeast-3::foundation-model/advisor-model",
+    ]
+  }
+
+  assert {
+    condition     = strcontains(output.resolved_inventory.values.ELSPETH_WEB__LLM_PROFILES, "bedrock/zai.glm-4.7-flash")
+    error_message = "a known provider-prefixed model must plan cleanly without a geography classification."
+  }
+}
+
+# nz. is deliberately on neither allowlist. Naming the label-stripped model in
+# bedrock_foundation_model_arns is the documented escape valve, so this run
+# planning cleanly proves the gate honours it.
+run "unknown_label_passes_with_explicit_foundation_model_arn" {
+  command = plan
+
+  variables {
+    composer_model = "bedrock/nz.primary-profile"
+    bedrock_foundation_model_arns = [
+      "arn:aws:bedrock:*::foundation-model/primary-profile",
+      "arn:aws:bedrock:ap-southeast-3::foundation-model/advisor-model",
+    ]
+  }
+
+  assert {
+    condition     = strcontains(output.resolved_inventory.values.ELSPETH_WEB__LLM_PROFILES, "bedrock/nz.primary-profile")
+    error_message = "an unknown-label model covered by an explicit foundation-model ARN must plan cleanly."
+  }
+}
+
 # ── Rejection cases ───────────────────────────────────────────────────────
 #
 # The rejection rules live on the MODULE's variables and its

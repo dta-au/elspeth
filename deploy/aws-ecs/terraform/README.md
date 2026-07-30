@@ -68,6 +68,21 @@ rely on an implicit profile, region, or remembered account. Each provider binds
 its resources to its explicit profile while `allowed_account_ids`
 independently protects the account boundary.
 
+### Producing the candidate image
+
+Published ELSPETH images come from the repository's `Build and Push` workflow
+(`.github/workflows/build-push.yaml`). It publishes `sha-<commit>` tags for
+every trusted merge to `main`, and it publishes a release or release-candidate
+image only when the operator pushes a git tag matching `v*` — for example
+`v0.7.2`, or the pre-release shape `v0.7.2-RC-280726` for a release-candidate
+handoff. The workflow builds, smoke-tests, and then promotes the verified
+digest to `ghcr.io/<owner>/elspeth:<git-tag>`, where `<git-tag>` is the literal
+tag name including the leading `v` and any `-RC-...` suffix. No
+release-candidate image exists until that git tag is pushed: publication is an
+explicit operator action, not a side effect of merging a release branch.
+Resolve whichever tag you install from to its immutable digest and put the
+digest reference in the tfvars.
+
 ### Installer policy and task-role boundary
 
 The package deliberately splits IAM authority across two principals:
@@ -230,14 +245,39 @@ uses schema-owner database URLs and is reserved for
 uses the same runtime-only database URLs as the web service and runs
 `doctor aws-ecs --json`.
 
-Run them in that order with the explicit task definitions, network
-configurations, and command overrides:
+Provision the EFS runtime storage **before** either doctor task. The doctor
+checks `payload_store_writable` and `blob_writable` by probing directories that
+do not exist on a freshly created file system, so on a cold install the
+schema-init doctor exits non-zero with `FileNotFoundError` until the
+`provision-storage` one-shot has created them:
 
 ```sh
 export AWS_PROFILE=REPLACE_WITH_AWS_PROFILE
 export AWS_REGION=REPLACE_WITH_AWS_REGION
 ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
+NETWORK=$(terraform -chdir=scenario-a output -raw runtime_doctor_network_configuration)
+PAYLOAD_VERIFIER_TASK_DEFINITION=$(terraform -chdir=scenario-a output -json resolved_inventory \
+  | jq -er '.values.PAYLOAD_VERIFIER_TASK_DEFINITION')
+PAYLOAD_TASK_ARN=$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs run-task \
+  --cluster "$ECS_CLUSTER" \
+  --task-definition "$PAYLOAD_VERIFIER_TASK_DEFINITION" \
+  --launch-type FARGATE \
+  --network-configuration "$NETWORK" \
+  --count 1 \
+  --query 'tasks[0].taskArn' \
+  --output text)
+aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs wait tasks-stopped \
+  --cluster "$ECS_CLUSTER" --tasks "$PAYLOAD_TASK_ARN"
+test "$(aws --profile "$AWS_PROFILE" --region "$AWS_REGION" ecs describe-tasks \
+  --cluster "$ECS_CLUSTER" --tasks "$PAYLOAD_TASK_ARN" \
+  --query 'tasks[0].containers[?name==`elspeth-web`].exitCode | [0]' \
+  --output text)" = 0
+```
 
+Then run the two doctor tasks in that order with the explicit task definitions,
+network configurations, and command overrides:
+
+```sh
 SCHEMA_TASK_DEFINITION=$(terraform -chdir=scenario-a output -raw schema_init_doctor_task_definition_arn)
 SCHEMA_NETWORK=$(terraform -chdir=scenario-a output -raw schema_init_doctor_network_configuration)
 SCHEMA_OVERRIDES=$(terraform -chdir=scenario-a output -raw schema_init_doctor_overrides)
@@ -289,11 +329,22 @@ so ordinary image deployments remain an explicit operator action.
 The Terraform package and the candidate image are sufficient for acceptance;
 do not require a source checkout after apply. Run the following immediately
 after the two doctor tasks pass. It selects the candidate task definition,
-waits for the service and target, and proves both HTTP gates:
+waits for the service and target, and proves both HTTP gates.
+
+The acceptance directory created below is later bind-mounted into the candidate
+image, whose process runs as UID/GID 1654. Grant that UID access explicitly:
+the acceptance client writes its state file into the mount and reads the CA
+from it, and an owner-only directory
+belonging to a different UID makes both fail. Acceptance failures are
+self-describing: the client's error envelope names the acceptance `step` that
+was executing and a closed-vocabulary `error_code` — a missing grant here
+surfaces as `state_file_unwritable` or `ca_unreadable` rather than an opaque
+internal error.
 
 ```sh
 acceptance_dir=$(mktemp -d -p /tmp elspeth-source-free-acceptance.XXXXXX)
 chmod 700 "$acceptance_dir"
+setfacl -m u:1654:rwx "$acceptance_dir"
 trap 'rm -rf -- "$acceptance_dir"' EXIT
 
 INVENTORY=$(terraform -chdir=scenario-a output -json resolved_inventory)
@@ -309,6 +360,10 @@ CANDIDATE_IMAGE=$(aws ecs describe-task-definition \
   --output text)
 terraform -chdir=scenario-a output -raw acceptance_tls_ca_pem >"$acceptance_dir/ca.pem"
 chmod 600 "$acceptance_dir/ca.pem"
+# The in-container client reads this CA as UID 1654. The certificate is public
+# material (the matching private key never leaves encrypted remote state), so
+# grant that read rather than widening the mode.
+setfacl -m u:1654:r "$acceptance_dir/ca.pem"
 
 aws ecs update-service \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
@@ -329,10 +384,12 @@ curl --fail --silent --show-error --cacert "$acceptance_dir/ca.pem" \
   "$PUBLIC_URL/api/ready" | jq -e '.ready == true'
 ```
 
-Run the two EFS-backed one-shot definitions. Both must stop with exit code
-zero; `provision-storage` proves the runtime UID can create, fsync, read, and
-remove bounded probes, while `verify-local-auth` proves the mounted auth store
-is readable through the intended local-auth contract:
+Re-run the two EFS-backed one-shot definitions now that the service is serving.
+Both must stop with exit code zero; `provision-storage` proves the runtime UID
+can still create, fsync, read, and remove bounded probes alongside a live web
+task (it already ran before the doctors, above), while `verify-local-auth`
+proves the mounted auth store is readable through the intended local-auth
+contract:
 
 ```sh
 NETWORK=$(terraform -chdir=scenario-a output -raw runtime_doctor_network_configuration)
@@ -417,11 +474,17 @@ docker run --rm --entrypoint python \
   verify-api --state-file /acceptance/state.json
 ```
 
-Finally prove the real Composer endpoint and the task role's S3/Bedrock
-capabilities. The Composer request must return a non-empty assistant response.
-ECS Exec must already be enabled and its managed agent must be `RUNNING`; the
-Session Manager plugin is a prerequisite. Each in-task verifier must return an
-`ELSPETH_ACCEPTANCE_RECEIPT_V1` line and exit zero:
+Finally prove the real Composer endpoint and the task role's S3, Bedrock, and
+Textract capabilities. The Composer request must return a non-empty assistant
+response. ECS Exec must already be enabled and its managed agent must be
+`RUNNING`; the Session Manager plugin is a prerequisite. Each in-task verifier
+must return an `ELSPETH_ACCEPTANCE_RECEIPT_V1` line and exit zero.
+`verify-textract` reads the same `ELSPETH_ACCEPTANCE_S3_BUCKET`,
+`ELSPETH_ACCEPTANCE_S3_PREFIX`, and `AWS_REGION` values as `verify-s3` — all
+already rendered into the task definition — and proves the packaged
+`aws_textract_document_analysis` transform and the task role's
+`textract:StartDocumentAnalysis` / `textract:GetDocumentAnalysis` grants with
+negative-space probes; no document is ever uploaded or processed:
 
 ```sh
 LOGIN=$(curl --fail --silent --show-error --cacert "$acceptance_dir/ca.pem" \
@@ -451,7 +514,7 @@ test "$(aws ecs describe-tasks \
   --cluster "$ECS_CLUSTER" --tasks "$RUNNING_TASK" \
   --query 'tasks[0].containers[?name==`elspeth-web`].managedAgents[?name==`ExecuteCommandAgent`].lastStatus | [0]' \
   --output text)" = RUNNING
-for check in verify-s3 verify-bedrock verify-bedrock-guardrails; do
+for check in verify-s3 verify-bedrock verify-textract; do
   aws ecs execute-command \
     --profile "$AWS_PROFILE" --region "$AWS_REGION" \
     --cluster "$ECS_CLUSTER" --task "$RUNNING_TASK" \
@@ -460,6 +523,68 @@ for check in verify-s3 verify-bedrock verify-bedrock-guardrails; do
     | grep -F ELSPETH_ACCEPTANCE_RECEIPT_V1
 done
 ```
+
+`verify-bedrock-guardrails` is not self-contained like the checks above: it
+performs a live positive-and-negative call against each Guardrail, so the
+operator supplies the probe texts rather than letting the check invent them.
+Five values are required on the command itself:
+`ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS=1` plus the four safe and blocked probe
+texts. The `ELSPETH_LIVE_BEDROCK_{PROMPT,CONTENT}_PROFILE_ALIAS` and
+`_EXPECTED_VERSION` inputs are optional when the task definition carries the
+Terraform-rendered `ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES` and
+`ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES` values: the check defaults each
+alias and its expected version from that rendered configuration. The version
+default binds only to the rendered alias, so an operator who supplies a
+divergent alias must also supply its own expected version. Any input the
+check cannot resolve fails with `guardrails_live_inputs_missing`, naming the
+absent variables.
+
+The defaulted aliases and versions come straight from the candidate task
+definition — read the rendered values as shown below to confirm what the check
+will bind to rather than assuming. Each blocked text must genuinely trip its
+own filter set: a prompt-injection attempt for the prompt shield (which
+screens input) and content matching a configured harm category for content
+safety (which screens output). A blocked text that does not trip the Guardrail
+fails the check as `guardrails_receipt`, not as a pass.
+
+In the unmodified reference deployment the rendered aliases are
+`prompt-approved` and `content-approved` (`modules/scenario/locals.tf`) and each
+expected version is `1` — the first immutable version Terraform publishes for
+each Guardrail.
+
+Read the rendered aliases and versions first, then pass the five required
+assignments on one in-container command. The probe texts contain spaces, so each
+value stays double-quoted inside the single-quoted `sh -c` argument:
+
+```sh
+aws ecs describe-task-definition \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`] | [0].environment' \
+  --output json \
+  | jq -r '.[] | select(.name | test("BEDROCK_GUARDRAIL")) | "\(.name) = \(.value)"'
+
+aws ecs execute-command \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --task "$RUNNING_TASK" \
+  --container elspeth-web --interactive \
+  --command '/bin/sh -c '\''ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS=1 \
+ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT="REPLACE_WITH_BENIGN_QUESTION" \
+ELSPETH_LIVE_BEDROCK_PROMPT_BLOCKED_TEXT="REPLACE_WITH_PROMPT_INJECTION_ATTEMPT" \
+ELSPETH_LIVE_BEDROCK_CONTENT_SAFE_TEXT="REPLACE_WITH_BENIGN_STATEMENT" \
+ELSPETH_LIVE_BEDROCK_CONTENT_BLOCKED_TEXT="REPLACE_WITH_TEXT_MATCHING_A_CONFIGURED_HARM_CATEGORY" \
+python -m elspeth.web.aws_ecs_acceptance verify-bedrock-guardrails'\''' \
+  | grep -F ELSPETH_ACCEPTANCE_RECEIPT_V1
+```
+
+To pin a divergent alias instead of the rendered default, add the matching
+`ELSPETH_LIVE_BEDROCK_{PROMPT,CONTENT}_PROFILE_ALIAS` and
+`_EXPECTED_VERSION` assignments alongside the five above.
+
+The decoded receipt must report `safe_case_passed`, `attack_case_blocked` and
+`request_ids_present` true for both controls, `tutorial_profile_ready: true`,
+`tutorial_ready: false`, and `landscape_evidence: true`. Both probe texts are
+hashed into the receipt, never retained verbatim.
 
 Any failed step is a failed cold install. Do not report acceptance from doctor
 checks alone, from a stable service running a different task definition, or
@@ -470,17 +595,44 @@ accept static AWS keys, a profile, a custom endpoint, a model gateway, or an
 AgentCore setting. Composer model names are ordinary non-secret environment
 values. `bedrock:InvokeModel` is limited to the ARNs supplied in tfvars.
 Whichever of `composer_model`/`composer_advisor_model` is a cross-region
-(`global.`/`us.`/`eu.`/`apac.`) profile also needs a wildcard-region
-foundation-model grant (`arn:aws:bedrock:*::foundation-model/<base-model-id>`)
-alongside the region-pinned inference-profile ARN, because Bedrock authorizes
-that call against the underlying foundation model in whichever region the
-profile actually routes to; the module derives this grant automatically, and
-the run-scoped permissions boundary already allows the matching wildcard
-resource so the grant is not intersected away. The task role also needs
-bucket-scoped, unconditioned `s3:ListBucket` on the acceptance bucket,
-because without it S3 cannot distinguish a missing object from a forbidden
-one and returns `403` instead of `404`; the boundary grants the matching
-bucket-level resource.
+geography profile also needs a wildcard-region foundation-model grant
+(`arn:aws:bedrock:*::foundation-model/<base-model-id>`) alongside the
+region-pinned inference-profile ARN, because Bedrock authorizes that call
+against the underlying foundation model in whichever region the profile actually
+routes to; the module derives this grant automatically, and the run-scoped
+permissions boundary already allows the matching wildcard resource so the grant
+is not intersected away.
+
+The derivation matches an explicit allowlist in `modules/scenario/locals.tf` —
+the geography prefixes `global.`, `us.`, `eu.`, `apac.`, `au.`, `jp.`, `ca.`,
+`br.`, `in.` (`bedrock_cross_region_prefixes`) plus a list of known provider
+labels (`bedrock_known_provider_prefixes`) — because a model id's leading label
+cannot be told apart structurally from a provider label (compare
+`au.anthropic.claude-sonnet-4-6` with `zai.glm-4.7-flash`). A configured model
+id whose leading dotted label matches neither list fails `terraform plan` with
+an error naming the model, instead of silently receiving no wildcard grant and
+then denying intermittently at runtime. To clear that error, extend the
+matching allowlist in `modules/scenario/locals.tf`, or name the model
+explicitly in `bedrock_foundation_model_arns`: the wildcard-region form
+(`arn:aws:bedrock:*::foundation-model/<id-without-geography-prefix>`) for a
+cross-region geography profile, or the region-pinned foundation-model ARN for
+a provider model. Check a geography profile's real destinations with
+`aws bedrock get-inference-profile --inference-profile-identifier <id>
+--query 'models[].modelArn'` — it routes to more than one region. After
+changing a Composer model, confirm the grant landed rather than assuming it:
+
+```sh
+aws iam get-role-policy \
+  --profile "$AWS_PROFILE" \
+  --role-name "$(terraform -chdir=scenario-a output -raw task_role_arn | sed 's|.*/||')" \
+  --policy-name "$(terraform -chdir=scenario-a output -raw task_role_arn | sed 's|.*/||' | sed 's|-task-role$|-task-policy|')" \
+  --query 'PolicyDocument.Statement[?Sid==`InvokeConfiguredBedrockModels`].Resource' --output json
+```
+
+The task role also needs bucket-scoped, unconditioned `s3:ListBucket` on the
+acceptance bucket, because without it S3 cannot distinguish a missing object
+from a forbidden one and returns `403` instead of `404`; the boundary grants
+the matching bucket-level resource.
 
 Aurora creates one administrative database first, then the database bootstrap
 task creates independent `elspeth_session` and `elspeth_landscape` databases.
@@ -523,7 +675,7 @@ Only the baked, root-owned, 0444 image path above is trusted.
 OCI digest
 `sha256:c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700`
 predates this contract. It is an acceptance-attempt artifact and is not
-eligible for `0.7.2-RC-290726`.
+eligible for the `v0.7.2-RC-290726` release candidate.
 
 Before promoting a candidate, verify the baked bundle, the OCI CA labels, the
 live Aurora CA identifier, and the `readonlyRootFilesystem` split:

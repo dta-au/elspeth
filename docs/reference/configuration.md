@@ -719,12 +719,41 @@ static options**: `bucket_field` and `key_field` name the input fields holding
 the bucket and key, so one manifest row drives one document. `version_field` is
 optional and pins a specific S3 object version.
 
+Because those references come from row data, the manifest source must **declare
+the fields as a fixed schema**. `required_input_fields` is a graph-validated
+contract: against a dynamic (`mode: observed`) producer the graph fails to build
+with `Schema contract violation … Producer (csv) guarantees: (none - dynamic
+schema)`. This complete example runs as written:
+
 ```yaml
+sources:
+  manifest:
+    plugin: csv
+    on_success: extract_in
+    options:
+      path: /app/input/manifest.csv
+      on_validation_failure: discard   # required on the csv source
+      schema:
+        mode: fixed                    # required: proves doc_bucket/doc_key exist
+        fields:
+          - "doc_id: str"
+          - "doc_bucket: str"
+          - "doc_key: str"
+
+sinks:
+  extracted:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: /app/output/extracted.json
+      schema:
+        mode: observed
+
 transforms:
   - name: extract_invoice
     plugin: aws_textract_document_analysis
-    input: manifest_rows
-    on_success: summarize_in
+    input: extract_in
+    on_success: extracted
     on_error: discard
     options:
       region: ap-southeast-2
@@ -736,6 +765,13 @@ transforms:
       required_input_fields: [doc_bucket, doc_key]
       schema:
         mode: observed
+```
+
+with a manifest of the shape:
+
+```csv
+doc_id,doc_bucket,doc_key
+1,my-documents-bucket,invoices/2026-07/invoice-001.pdf
 ```
 
 `feature_types` is a unique selection from `TABLES`, `FORMS`, `QUERIES`,
@@ -760,6 +796,31 @@ Textract reads `DocumentLocation.S3Object` under the caller's own credentials
 and can therefore only analyse documents the identity could already read. The
 AWS ECS scenario module grants both actions to the task role and carries the
 same statement in the permissions boundary.
+
+**The S3 object must fall inside the caller's own object grant, and a document
+outside it fails misleadingly.** The effective read scope is whatever
+`s3:GetObject` grant the pipeline identity holds. In the reference AWS ECS
+deployment the task role's grant is scoped to `<bucket>/<namespace>/<run_id>/*`,
+so documents must live under that granted prefix — a document elsewhere in the
+*same* bucket is unreadable. Textract reports that as
+`{"code": "InvalidS3ObjectException", "error_type": "service_error", "reason":
+"submit_failed"}`; the provider does not distinguish an authorization miss from
+a missing or corrupt file. ELSPETH therefore classifies this code with
+`cause: s3_object_unreadable` and an `error` hint in the audit reason: check
+the role's `s3:GetObject` scope (then object existence and region) before
+suspecting the document itself. Read the granted prefix from the task-role
+policy rather than guessing:
+
+```sh
+aws iam get-role-policy --role-name <task-role> --policy-name <task-policy> \
+  --query 'PolicyDocument.Statement[?Sid==`UseAcceptanceObjects`].Resource' --output json
+```
+
+To tell an authorization problem from a bad document, submit the identical
+object with a principal you know can read it
+(`aws textract start-document-analysis --document-location ...`). If that
+succeeds, the file is fine and the pipeline identity's object grant is the
+problem.
 
 **Bounds and polling.** Each document is capped by `max_result_pages`,
 `max_blocks`, and `max_result_bytes`, and the job poll is governed by

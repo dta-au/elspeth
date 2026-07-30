@@ -124,6 +124,26 @@ Run completed: RunStatus.COMPLETED
 
 The **Run ID** is your key for querying the audit trail later.
 
+### Exit Codes
+
+`elspeth run --execute` (and `elspeth resume --execute`) exit with the
+engine's completion taxonomy, so scripts and CI wrappers can branch on the
+result:
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | Completed successfully — every row reached a clean outcome. Also returned for a run whose source yielded zero rows. |
+| 1 | Completed with failures — at least one row failed or was quarantined (including a run where every row was quarantined). |
+| 2 | Failed — no row reached success or quarantine. |
+| 3 | Interrupted or evicted before completion. |
+| 4 | Framework or audit-integrity error. |
+
+Rows a source drops via a configured `on_validation_failure: discard` never
+enter the pipeline: the validation error is still recorded in the audit
+trail, but the run exits `0` when every ingested row succeeds. A transform's
+`on_error: discard` is different — the dropped row is recorded as a
+quarantined outcome, so the run reports completed-with-failures (exit `1`).
+
 ---
 
 ## Viewing Available Plugins
@@ -297,6 +317,7 @@ Resume mode:
 - Uses `NullSource` (data comes from stored payloads)
 - Appends to existing output files (doesn't overwrite)
 - Continues from last successful checkpoint
+- Exits with the same [exit codes](#exit-codes) as `elspeth run --execute`
 
 ---
 
