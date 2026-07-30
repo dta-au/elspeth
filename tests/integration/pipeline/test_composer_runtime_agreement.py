@@ -112,6 +112,11 @@ where the architectural fix landed:
   accounting and inferred queue liveness from the coalesce node's first
   compatibility ``input`` field. Pinned in both directions by
   ``TestComposerRuntimeQueueAgreement``.
+* Shape 13 — row_union YAML import/export agreement. Composer import preserves
+  both branch forms and structural timeout, export emits the runtime-only
+  ``row_unions`` shape without a synthetic input, and regenerated settings
+  rebuild the same production graph as the shipped A/B example. Pinned by
+  ``TestComposerRuntimeRowUnionAgreement``.
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
@@ -4419,3 +4424,101 @@ class TestComposerRuntimeQueueAgreement:
         settings = load_settings_from_yaml_string(composer_yaml_generator.generate_yaml(state))
         with pytest.raises(GraphValidationError, match="queue 'inbound' with no downstream consumer"):
             self._build_runtime_graph_for_settings(settings)
+
+
+class TestComposerRuntimeRowUnionAgreement:
+    """Shape 13 — shipped row_union YAML round-trips composer <-> runtime.
+
+    Bug-verification protocol: before the row_union lowering existed,
+    ``test_row_union_example_round_trips_semantics_and_runtime_graph`` failed
+    during Composer import with ``RuntimeYamlImportError: row_unions are not
+    supported by Composer import``. With importer support but the generator's
+    ``doc["row_unions"]`` assignment removed, the same test fails its
+    semantic-section equality because regenerated YAML has no ``row_unions``
+    key. Those are the exact production seams this class pins.
+    """
+
+    _SEMANTIC_SECTIONS = ("sources", "transforms", "gates", "row_unions", "aggregations", "sinks")
+
+    def _example_yaml(self) -> str:
+        example = Path(__file__).resolve().parents[3] / "examples" / "row_union_ab_experiment" / "settings.yaml"
+        return example.read_text(encoding="utf-8")
+
+    def _build_runtime_graph_for_settings(self, settings: ElspethSettings) -> ExecutionGraph:
+        bundle = instantiate_plugins_from_config(settings, preflight_mode=True)
+        return ExecutionGraph.from_plugin_instances(
+            sources=bundle.sources,
+            source_settings_map=bundle.source_settings_map,
+            transforms=bundle.transforms,
+            sinks=bundle.sinks,
+            aggregations=bundle.aggregations,
+            gates=list(settings.gates),
+            coalesce_settings=list(settings.coalesce) if settings.coalesce else None,
+            queues=settings.queues,
+            row_union_settings=list(settings.row_unions),
+        )
+
+    def _semantic_pipeline(self, doc: dict[str, Any]) -> dict[str, Any]:
+        return {section: doc[section] for section in self._SEMANTIC_SECTIONS if section in doc}
+
+    def _graph_signature(
+        self,
+        graph: ExecutionGraph,
+    ) -> tuple[dict[str, tuple[Any, ...]], set[tuple[str, str, str, str]]]:
+        nodes: dict[str, tuple[Any, ...]] = {
+            str(node.node_id): (
+                node.node_type,
+                node.plugin_name,
+                node.config,
+                node.input_schema_config,
+                node.output_schema_config,
+            )
+            for node in graph.get_nodes()
+        }
+        edges = {(str(edge.from_node), str(edge.to_node), edge.label, edge.mode.value) for edge in graph.get_edges()}
+        return nodes, edges
+
+    def test_row_union_example_round_trips_semantics_and_runtime_graph(self) -> None:
+        import yaml
+
+        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        original_yaml = self._example_yaml()
+        original_doc = yaml.safe_load(original_yaml)
+        state = composition_state_from_runtime_yaml(original_yaml)
+        composer_result = state.validate()
+        assert composer_result.is_valid, [error.message for error in composer_result.errors]
+
+        regenerated_yaml = composer_yaml_generator.generate_yaml(state)
+        regenerated_doc = yaml.safe_load(regenerated_yaml)
+        assert self._semantic_pipeline(regenerated_doc) == self._semantic_pipeline(original_doc)
+
+        original_settings = load_settings_from_yaml_string(original_yaml)
+        regenerated_settings = load_settings_from_yaml_string(regenerated_yaml)
+        assert regenerated_settings.row_unions == original_settings.row_unions
+
+        original_graph = self._build_runtime_graph_for_settings(original_settings)
+        regenerated_graph = self._build_runtime_graph_for_settings(regenerated_settings)
+        original_graph.validate()
+        regenerated_graph.validate()
+        assert self._graph_signature(regenerated_graph) == self._graph_signature(original_graph)
+
+    def test_regenerated_row_union_keeps_early_trigger_guard_actionable(self) -> None:
+        import yaml
+
+        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        state = composition_state_from_runtime_yaml(self._example_yaml())
+        regenerated_doc = yaml.safe_load(composer_yaml_generator.generate_yaml(state))
+        regenerated_doc["aggregations"][0]["trigger"] = {"count": 2}
+        settings = load_settings_from_yaml_string(yaml.safe_dump(regenerated_doc, sort_keys=False))
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            self._build_runtime_graph_for_settings(settings)
+
+        message = str(exc_info.value)
+        assert "downstream of row_union 'variant_union'" in message
+        assert "count/timeout/condition trigger" in message
+        assert "Use the implicit end_of_source trigger" in message
