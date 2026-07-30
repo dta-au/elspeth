@@ -27,6 +27,7 @@ from elspeth.web.composer.guided.protocol import (
 def _wire_payload_for_cardinality(
     *,
     node_type: str | None = None,
+    input_cardinality: str | None = None,
     output_cardinality: str,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -96,6 +97,8 @@ def _wire_payload_for_cardinality(
             "timeout_seconds": None,
         }
         row_cardinality["input"] = "branches"
+    if input_cardinality is not None:
+        row_cardinality["input"] = input_cardinality
     payload["nodes"] = [
         {
             "stable_id": "00000000-0000-4000-8000-000000000002",
@@ -691,6 +694,21 @@ class TestPayloadValidation:
         error = validate_payload(TurnType.CONFIRM_WIRING, payload)
 
         assert error == "payload.nodes[0].row_cardinality.output must be 'one_per_branch' for row_union nodes"
+
+    @pytest.mark.parametrize("input_cardinality", ["none", "one", "batch", "many_producers"])
+    def test_confirm_wiring_requires_branches_input_cardinality_for_row_union(
+        self,
+        input_cardinality: str,
+    ) -> None:
+        payload = _wire_payload_for_cardinality(
+            node_type="row_union",
+            input_cardinality=input_cardinality,
+            output_cardinality="one_per_branch",
+        )
+
+        error = validate_payload(TurnType.CONFIRM_WIRING, payload)
+
+        assert error == "payload.nodes[0].row_cardinality.input must be 'branches' for row_union nodes"
 
     def test_confirm_wiring_accepts_one_per_branch_cardinality_for_row_union(self) -> None:
         payload = _wire_payload_for_cardinality(

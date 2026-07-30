@@ -671,7 +671,8 @@ export function GraphView() {
     const toGraphNodeId = (id: string): string =>
       sourceIds.has(id) ? sourceComponentId(id) : id;
 
-    const rfEdges: Edge[] = compositionState.edges.map((edge, i) => ({
+    const explicitEdges = compositionState.edges;
+    const rfEdges: Edge[] = explicitEdges.map((edge, i) => ({
       id: `e-${edge.from_node}-${edge.to_node}-${i}`,
       source: toGraphNodeId(edge.from_node),
       target: toGraphNodeId(edge.to_node),
@@ -688,7 +689,42 @@ export function GraphView() {
     const existingConnections = new Set(
       rfEdges.map(e => `${e.source}->${e.target}`)
     );
-    const explicitConnections = new Set(existingConnections);
+    const explicitEdgeIndexesByConnection = new Map<string, number[]>();
+    for (const [index, edge] of rfEdges.entries()) {
+      const connectionKey = `${edge.source}->${edge.target}`;
+      const indexes = explicitEdgeIndexesByConnection.get(connectionKey) ?? [];
+      indexes.push(index);
+      explicitEdgeIndexesByConnection.set(connectionKey, indexes);
+    }
+    const claimedExplicitRowUnionEdges = new Set<number>();
+    function claimExplicitRowUnionAlias(
+      connectionKey: string,
+      alias: string,
+    ): boolean {
+      const candidateIndexes =
+        explicitEdgeIndexesByConnection.get(connectionKey) ?? [];
+      const matchingIndex = candidateIndexes.find(
+        (index) =>
+          !claimedExplicitRowUnionEdges.has(index)
+          && explicitEdges[index]?.label === alias,
+      );
+      const unlabelledIndex = candidateIndexes.find(
+        (index) =>
+          !claimedExplicitRowUnionEdges.has(index)
+          && explicitEdges[index]?.label === null,
+      );
+      const claimedIndex = matchingIndex ?? unlabelledIndex;
+      if (claimedIndex === undefined) return false;
+
+      claimedExplicitRowUnionEdges.add(claimedIndex);
+      if (explicitEdges[claimedIndex]?.label === null) {
+        rfEdges[claimedIndex] = {
+          ...rfEdges[claimedIndex],
+          label: alias,
+        };
+      }
+      return true;
+    }
     const nodeIds = new Set(rfNodes.map(n => n.id));
 
     // Always infer missing edges from connection properties.
@@ -811,8 +847,11 @@ export function GraphView() {
           if (producer.nodeId === rowUnion.id) continue;
           const connectionKey = `${producer.nodeId}->${rowUnion.id}`;
           const aliasKey = `${connectionKey}:${alias}`;
-          if (explicitConnections.has(connectionKey)) continue;
           if (inferredRowUnionAliases.has(aliasKey)) continue;
+          if (claimExplicitRowUnionAlias(connectionKey, alias)) {
+            inferredRowUnionAliases.add(aliasKey);
+            continue;
+          }
           const isError = producer.edgeType === "error";
           rfEdges.push({
             id: inferredEdgeId(

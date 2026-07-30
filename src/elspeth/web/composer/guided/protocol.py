@@ -1120,6 +1120,8 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
             return f"{path}.expected_output_count must exactly bind expected_count"
         if value["output"] == "one_per_branch" and owner_node_type != "row_union":
             return f"{path}.output 'one_per_branch' is only valid for row_union nodes"
+        if owner_node_type == "row_union" and value["input"] != "branches":
+            return f"{path}.input must be 'branches' for row_union nodes"
         if owner_node_type == "row_union" and value["output"] != "one_per_branch":
             return f"{path}.output must be 'one_per_branch' for row_union nodes"
         return None

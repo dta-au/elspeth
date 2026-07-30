@@ -35,6 +35,7 @@ interface ReadOnlyPipelineGraphProps {
 const NODE_WIDTH = 168;
 const NODE_HEIGHT = 62;
 const GRAPH_PADDING = 32;
+const EDGE_LABEL_VERTICAL_PADDING = 12;
 
 interface PositionedNode extends ReadOnlyPipelineGraphNode {
   x: number;
@@ -99,6 +100,37 @@ function edgeLaneOffsets(
   return offsets;
 }
 
+function graphVerticalBounds(
+  layoutHeight: number,
+  edges: ReadOnlyPipelineGraphEdge[],
+  nodesById: ReadonlyMap<string, PositionedNode>,
+  laneOffsetByEdgeId: ReadonlyMap<string, number>,
+): { minY: number; height: number } {
+  let minY = 0;
+  let maxY = layoutHeight;
+  for (const edge of edges) {
+    const source = nodesById.get(edge.source);
+    const target = nodesById.get(edge.target);
+    if (source === undefined || target === undefined) continue;
+
+    const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
+    const labelY = (source.y + target.y) / 2 + laneOffset - 5;
+    minY = Math.min(
+      minY,
+      source.y + laneOffset,
+      target.y + laneOffset,
+      labelY - EDGE_LABEL_VERTICAL_PADDING,
+    );
+    maxY = Math.max(
+      maxY,
+      source.y + laneOffset,
+      target.y + laneOffset,
+      labelY + EDGE_LABEL_VERTICAL_PADDING,
+    );
+  }
+  return { minY, height: maxY - minY };
+}
+
 /**
  * Presentation-only full-DAG renderer. Its input is already-decoded display
  * data: it does not inspect CompositionState and does not infer topology.
@@ -118,12 +150,22 @@ export function ReadOnlyPipelineGraph({
     () => edgeLaneOffsets(edges),
     [edges],
   );
+  const verticalBounds = useMemo(
+    () =>
+      graphVerticalBounds(
+        layout.height,
+        edges,
+        byId,
+        laneOffsetByEdgeId,
+      ),
+    [layout.height, edges, byId, laneOffsetByEdgeId],
+  );
 
   return (
     <div className="guided-readonly-graph">
       <svg
         className="guided-readonly-graph__canvas"
-        viewBox={`0 0 ${layout.width} ${layout.height}`}
+        viewBox={`0 ${verticalBounds.minY} ${layout.width} ${verticalBounds.height}`}
         role="img"
         aria-labelledby={titleId}
       >

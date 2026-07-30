@@ -59,4 +59,47 @@ describe("ReadOnlyPipelineGraph", () => {
       container.querySelector('text[data-edge-id="treatment-edge"]'),
     ).toHaveTextContent("treatment");
   });
+
+  it("includes every admitted parallel branch lane in the SVG viewBox", () => {
+    const edges = Array.from({ length: 64 }, (_, index) => ({
+      id: `branch-${index + 1}`,
+      source: "experiment-gate",
+      target: "variant-union",
+      label: `branch-${index + 1}`,
+      isError: false,
+    }));
+    const { container } = render(
+      <ReadOnlyPipelineGraph
+        ariaLabel="64 identity fork branches into row union"
+        nodes={[
+          {
+            id: "experiment-gate",
+            label: "experiment gate",
+            kind: "gate",
+            subtitle: null,
+          },
+          {
+            id: "variant-union",
+            label: "variant union",
+            kind: "row_union",
+            subtitle: null,
+          },
+        ]}
+        edges={edges}
+      />,
+    );
+
+    const viewBox = container.querySelector("svg")?.getAttribute("viewBox");
+    expect(viewBox).not.toBeNull();
+    const [, minY, , height] = viewBox!.split(/\s+/).map(Number);
+    const maxY = minY + height;
+    const labelYs = Array.from(
+      container.querySelectorAll("text[data-edge-id]"),
+      (label) => Number(label.getAttribute("y")),
+    );
+
+    expect(labelYs).toHaveLength(64);
+    expect(minY).toBeLessThan(Math.min(...labelYs));
+    expect(maxY).toBeGreaterThan(Math.max(...labelYs));
+  });
 });

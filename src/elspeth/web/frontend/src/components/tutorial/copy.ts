@@ -87,14 +87,10 @@ export const TURN_7_LEARNING_BULLETS = [
   },
   {
     title: "Ask Elspeth.",
-    // Trails into the freeform-for-complex note (operator 2026-07-23),
-    // folded into this existing chat-panel guidance rather than a new item:
-    // both halves are conversational escalations — ask when confused, and
-    // switch modes when the guided wizard isn't enough. "Switch to" is
-    // deliberate (freeform is a distinct mode reached via the mode switch,
-    // not the same surface). Shared verbatim with the skip path.
+    // Guided/freeform parity guidance is folded into this existing chat-panel
+    // item and shared verbatim with the skip path.
     body:
-      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. And for particularly complex pipelines you will need to switch to freeform mode and build the pipeline up step by step rather than through the guided wizard.",
+      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. Guided and freeform can build the same pipelines: choose guided for structured prompts or freeform for a conversational, step-by-step exchange. That is an interaction preference, not a capability limit.",
   },
   {
     title: "LLMs are confident even when they're wrong.",

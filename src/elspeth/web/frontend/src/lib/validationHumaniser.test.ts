@@ -241,6 +241,13 @@ describe("makePhraseFor", () => {
     expect(phraseFor("output_csv_a1b2", "source")).toBe("write a CSV");
   });
 
+  it("prioritises an authoritative row_union type over generated id-role heuristics", () => {
+    const phraseFor = makePhraseFor(null);
+    expect(phraseFor("output_guided_row_union_a1b2", "row_union")).toBe(
+      "wait for every branch, then preserve every branch row",
+    );
+  });
+
   it("ignores an unrecognised component_type value and falls through to the id-substring guess", () => {
     const phraseFor = makePhraseFor(null);
     expect(phraseFor("transform_csv_normalize_a1b2c3", "graph")).toBe("process each row");

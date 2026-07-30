@@ -287,14 +287,16 @@ function fallbackPhraseForGeneratedId(
   componentType?: string | null,
 ): string | null {
   const id = componentId.toLowerCase();
-  // The id's own role token takes precedence over the structured hint — an
-  // explicit token in the id is a stronger signal than a caller-supplied
-  // type. The hint fills the gap only when the id carries no role token of
-  // its own (elspeth-ede84df6b3).
-  const explicitRole = firstGeneratedRole(id);
-  if (explicitRole !== null) return phraseForRoleFormat(explicitRole, id);
+  // Structural component types are semantic identities, not directional
+  // hints. They remain authoritative even when a generated id happens to
+  // contain a source/output/transform token.
   const structuralPhrase = structuralPhraseFromComponentType(componentType);
   if (structuralPhrase !== null) return structuralPhrase;
+  // For non-structural types, the id's own role token takes precedence over
+  // the structured directional hint. The hint fills the gap only when the id
+  // carries no role token of its own (elspeth-ede84df6b3).
+  const explicitRole = firstGeneratedRole(id);
+  if (explicitRole !== null) return phraseForRoleFormat(explicitRole, id);
   const hintedRole = roleFromComponentType(componentType);
   if (hintedRole !== null) return phraseForRoleFormat(hintedRole, id);
   // No role signal at all (neither an id token nor a usable component_type

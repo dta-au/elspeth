@@ -936,6 +936,51 @@ describe("GraphView", () => {
       ]);
     });
 
+    it.each([
+      ["a partial branch set", ["control"]],
+      ["one null-labelled identity edge", [null]],
+      ["two null-labelled identity edges", [null, null]],
+      ["a labelled edge after a null-labelled edge", [null, "control"]],
+    ])(
+      "preserves every identity-fork alias with %s",
+      (_caseName, explicitLabels) => {
+        const state = rowUnionState();
+        state.nodes = state.nodes.filter(
+          (node) => !["control_score", "treatment_score"].includes(node.id),
+        );
+        const union = state.nodes.find((node) => node.id === "variant_union");
+        expect(union).toBeDefined();
+        union!.input = "control_raw";
+        union!.branches = {
+          control: "control_raw",
+          treatment: "treatment_raw",
+        };
+        state.edges = explicitLabels.map((label, index) =>
+          makeEdge({
+            id: `partial-identity-fork-${index}`,
+            from_node: "experiment_gate",
+            to_node: "variant_union",
+            edge_type: "fork",
+            label,
+          }),
+        );
+        useSessionStore.setState({ compositionState: state });
+
+        render(<GraphView />);
+
+        const identityEdges = Array.from(
+          document.querySelectorAll(
+            '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+          ),
+        );
+        expect(identityEdges).toHaveLength(2);
+        expect(identityEdges.map((edge) => edge.textContent).sort()).toEqual([
+          "control",
+          "treatment",
+        ]);
+      },
+    );
+
     it("uses a queue as the authoritative row union producer without an upstream bypass", () => {
       const state = rowUnionState();
       state.nodes = [
