@@ -13,6 +13,7 @@ from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchNodeOptionsArgumentsModel,
     SpliceTransformArgumentsModel,
+    _StrictTimeoutSeconds,
 )
 from elspeth.web.composer.state import (
     CoalesceBranches,
@@ -42,6 +43,7 @@ from elspeth.web.composer.tools._common import (
     _mutation_result,
     _options_with_default_llm_reviews,
     _plugin_policy_failure,
+    _post_mutation_invariant_error,
     _prevalidate_transform_for_context,
     _reserved_connection_names,
     _row_union_node_contract_error,
@@ -82,7 +84,7 @@ class _UpsertNodeArgumentsModel(BaseModel):
     trigger: dict[str, Any] | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
-    timeout_seconds: float | None = None
+    timeout_seconds: _StrictTimeoutSeconds | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -177,10 +179,12 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "on_success": {
             "type": ["string", "null"],
             "description": (
-                "Output connection. Required for transform/aggregation/coalesce. Null for "
-                "gates (routing is via condition/routes). When set, this is the connection-name "
-                "string the node PUBLISHES — some downstream input/sink_name MUST equal this "
-                "value. The runtime matches strings, not topology."
+                "Output connection. Required for transform/aggregation/row_union. Null for gates "
+                "(routing is via condition/routes). A row_union MUST publish to a downstream "
+                "processing connection, never directly to a sink. A coalesce normally publishes "
+                "under its own node id; its optional on_success may name only a sink. For ordinary "
+                "nodes this connection-name string is consumed by some downstream input/sink_name. "
+                "The runtime matches strings, not topology."
             ),
             "examples": ["fetched_text", "scored_rows", "lines_out"],
         },
@@ -205,9 +209,10 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "additionalProperties": {"type": "string"},
             "description": (
-                "Branches to merge (coalesce only). Use list form when branch identity and input "
-                "connection are the same, or object form {branch_name: input_connection} when a "
-                "branch flows through transforms before coalescing."
+                "Branch inputs for coalesce or row_union. Use list form when branch identity and "
+                "input connection are the same, or object form {branch_name: input_connection} "
+                "when a branch flows through transforms. A row_union consumes EVERY branches "
+                "value as a real input and releases the original rows without merging fields."
             ),
         },
         "policy": {"type": ["string", "null"], "description": "Merge trigger policy (coalesce only)."},
@@ -633,6 +638,10 @@ def _execute_upsert_node(
         return _failure_result(state, message, error_code=error_code)
 
     proposed_state = state.with_node(node)
+    invariant_error = _post_mutation_invariant_error(proposed_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError):
@@ -1096,6 +1105,10 @@ def _execute_upsert_edge(
                     if node.fork_to != fork_targets:
                         new_state = new_state.with_node(replace(node, fork_to=fork_targets))
 
+    invariant_error = _post_mutation_invariant_error(new_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     return _mutation_result(new_state, (from_node, to_node))
 
 
@@ -1305,6 +1318,10 @@ def _execute_patch_node_options(
     if queue_contract_error is not None:
         return _failure_result(state, queue_contract_error)
     proposed_state = state.with_node(new_node)
+    invariant_error = _post_mutation_invariant_error(proposed_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError):

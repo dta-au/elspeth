@@ -1611,6 +1611,93 @@ class TestSetPipelineRowUnion:
             "treatment": "treatment_done",
         }
 
+    @pytest.mark.parametrize("invalid_timeout", [True, "30"])
+    def test_timeout_rejects_non_numeric_tier_3_values_without_mutation(self, invalid_timeout: object) -> None:
+        state = _empty_state()
+
+        with pytest.raises(ToolArgumentError):
+            _execute_set_pipeline(
+                _valid_args_with_row_union({"timeout_seconds": invalid_timeout}),
+                state,
+                ToolContext(catalog=_mock_catalog()),
+            )
+
+        assert state.version == 1
+        assert state.nodes == ()
+
+    @pytest.mark.parametrize("timeout_seconds", [30, 30.5])
+    def test_timeout_accepts_actual_int_and_float_values(self, timeout_seconds: int | float) -> None:
+        result = _execute_set_pipeline(
+            _valid_args_with_row_union({"timeout_seconds": timeout_seconds}),
+            _empty_state(),
+            ToolContext(catalog=_mock_catalog()),
+        )
+
+        assert result.success is True, result.to_dict()
+        assert result.updated_state.nodes[0].timeout_seconds == float(timeout_seconds)
+
+    @pytest.mark.parametrize(
+        "node",
+        [
+            {
+                "id": "transform_node",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "rows",
+                "on_success": "transformed",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "gate_node",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "discard", "false": "discard"},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "aggregation_node",
+                "node_type": "aggregation",
+                "plugin": None,
+                "input": "rows",
+                "on_success": "aggregated",
+                "on_error": "discard",
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "queue_node",
+                "node_type": "queue",
+                "plugin": None,
+                "input": "queue_node",
+                "options": {},
+                "timeout_seconds": 30,
+            },
+        ],
+        ids=["transform", "gate", "aggregation", "queue"],
+    )
+    def test_timeout_rejects_non_barrier_node_types_atomically(self, node: dict[str, Any]) -> None:
+        state = _empty_state()
+        arguments = {
+            "source": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {"path": "in.csv", "schema": {"mode": "observed"}},
+            },
+            "nodes": [node],
+            "edges": [],
+            "outputs": [],
+        }
+
+        result = _execute_set_pipeline(arguments, state, ToolContext(catalog=_mock_catalog()))
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert "timeout_seconds" in result.data["error"]
+
     @pytest.mark.parametrize(
         "override",
         [

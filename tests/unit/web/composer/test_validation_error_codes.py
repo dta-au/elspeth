@@ -281,6 +281,15 @@ class TestStructuralRejectionCodes:
 
 
 class TestClosedCodeCatalogueInvariants:
+    def test_unknown_node_type_guidance_includes_row_union_n_to_n_reconvergence(self) -> None:
+        guidance = explain_validation_code("unknown_node_type")
+
+        assert guidance is not None
+        explanation, fix = guidance
+        assert "row_union" in explanation
+        assert "row_union" in fix
+        assert "N-to-N" in fix
+
     def test_schema_contract_codes_are_registered_and_explainable(self) -> None:
         for code in (
             "schema_contract_violation",

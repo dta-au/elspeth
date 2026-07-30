@@ -26,6 +26,7 @@ from elspeth.web.composer.tools._common import (
     _failure_result,
     _mutation_result,
     _plugin_policy_failure,
+    _post_mutation_invariant_error,
     _prevalidate_sink,
     _validate_mutation_arguments,
     _validate_plugin_name,
@@ -176,6 +177,10 @@ def _execute_set_output(
         on_write_failure=validated.on_write_failure,
     )
     new_state = state.with_output(output)
+    invariant_error = _post_mutation_invariant_error(new_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     return _mutation_result(new_state, (validated.sink_name,))
 
 

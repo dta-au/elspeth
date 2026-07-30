@@ -4876,7 +4876,7 @@ class TestEdgeContractFailureFormatting:
         assert "patch_node_options(node_id='sink_results_d4e5f6'" not in suggestion
         assert "patch_node_options(node_id='clean_text'" in suggestion
 
-    def test_suggestion_maps_row_union_dag_id_to_composer_node(self) -> None:
+    def test_row_union_producer_suggests_patching_real_downstream_consumer(self) -> None:
         exc = self._make_edge_error(
             from_node_id="row_union_variant_union_a1b2c3",
             to_node_id="transform_consume_d4e5f6",
@@ -4927,8 +4927,66 @@ class TestEdgeContractFailureFormatting:
 
         suggestion = _build_edge_contract_suggestion(exc, state=state, graph=graph)
 
-        assert "node 'variant_union' (row_union)" in suggestion
+        assert "plugin-free row_union 'variant_union'" in suggestion
+        assert "patch_node_options(node_id='consume'" in suggestion
+        assert "patch_node_options(node_id='variant_union'" not in suggestion
         assert "patch_node_options(node_id='row_union_variant_union_a1b2c3'" not in suggestion
+
+    def test_row_union_consumer_suggests_patching_real_branch_producer(self) -> None:
+        exc = self._make_edge_error(
+            from_node_id="transform_control_path_a1b2c3",
+            to_node_id="row_union_variant_union_d4e5f6",
+            missing_fields=("variant",),
+        )
+        control_path = NodeSpec(
+            id="control_path",
+            node_type="transform",
+            plugin="field_mapper",
+            input="control",
+            on_success="control_done",
+            on_error="discard",
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        union = NodeSpec(
+            id="variant_union",
+            node_type="row_union",
+            plugin=None,
+            input="control_done",
+            on_success="unioned_rows",
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches={"control": "control_done", "treatment": "treatment_done"},
+            policy=None,
+            merge=None,
+        )
+        state = _make_state(
+            source_options={"schema": {"mode": "observed"}},
+            nodes=(control_path, union),
+            outputs=(_make_output(name="unioned_rows"),),
+        )
+        graph = _EdgeSuggestionGraph(
+            sources=("source_csv_z9y8x7",),
+            node_configs={"source_csv_z9y8x7": {"source_name": "source"}},
+            transform_id_map={0: "transform_control_path_a1b2c3"},
+            sink_id_map={"unioned_rows": "sink_results_f7g8h9"},
+            row_union_id_map={"variant_union": "row_union_variant_union_d4e5f6"},
+        )
+
+        suggestion = _build_edge_contract_suggestion(exc, state=state, graph=graph)
+
+        assert "plugin-free row_union 'variant_union'" in suggestion
+        assert "patch_node_options(node_id='control_path'" in suggestion
+        assert "patch_node_options(node_id='variant_union'" not in suggestion
+        assert "patch_node_options(node_id='row_union_variant_union_d4e5f6'" not in suggestion
 
     def test_suggestion_for_type_mismatch_mentions_changing_declared_type(self) -> None:
         exc = self._make_edge_error(

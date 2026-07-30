@@ -636,13 +636,24 @@ def _duplicate_consumer_repair_suggestions(
     if not duplicate_error_components:
         return []
 
-    consumers_by_connection: dict[str, list[NodeSpec]] = {}
+    # ``branch_alias`` is None for an ordinary ``node.input`` consumer and
+    # names the branch slot for a row_union consumer. The row_union's own
+    # ``input`` is only an adapter placeholder and must never be repaired as
+    # though it were an independent consumption edge.
+    consumers_by_connection: dict[str, list[tuple[NodeSpec, str | None]]] = {}
     for node in state.nodes:
-        if node.node_type == "coalesce":
+        if node.node_type in ("coalesce", "queue", "row_union"):
             continue
-        if node.input not in consumers_by_connection:
-            consumers_by_connection[node.input] = []
-        consumers_by_connection[node.input].append(node)
+        consumers_by_connection.setdefault(node.input, []).append((node, None))
+    for node in state.nodes:
+        if node.node_type != "row_union":
+            continue
+        for row_union_branch_alias, branch_connection in zip(
+            _coalesce_branch_names(node.branches),
+            _coalesce_branch_connections(node.branches),
+            strict=True,
+        ):
+            consumers_by_connection.setdefault(branch_connection, []).append((node, row_union_branch_alias))
 
     reserved_node_ids = {node.id for node in state.nodes}
     reserved_connection_names = _reserved_connection_names(state)
@@ -656,10 +667,10 @@ def _duplicate_consumer_repair_suggestions(
         gate_id = _unique_name(f"fork_{connection_fragment}", reserved_node_ids)
         branch_names = [
             _unique_name(
-                f"{connection_fragment}_to_{_repair_identifier_fragment(node.id, fallback='node')}",
+                f"{connection_fragment}_to_{_repair_identifier_fragment(binding[0].id, fallback='node')}",
                 reserved_connection_names,
             )
-            for node in consumer_nodes
+            for binding in consumer_nodes
         ]
         gate_args: dict[str, object] = {
             "id": gate_id,
@@ -670,7 +681,7 @@ def _duplicate_consumer_repair_suggestions(
             "on_error": None,
             "options": {},
             "condition": "True",
-            "routes": {},
+            "routes": {"true": "fork", "false": "fork"},
             "fork_to": branch_names,
             "branches": None,
             "policy": None,
@@ -681,9 +692,18 @@ def _duplicate_consumer_repair_suggestions(
         }
         tool_sequence: list[_RepairToolCall] = []
         affected_consumers: list[_AffectedConsumer] = []
-        for node, branch_name in zip(consumer_nodes, branch_names, strict=True):
+        for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
             patched_consumer = _serialize_node(node)
-            patched_consumer["input"] = branch_name
+            if consumer_branch_alias is None:
+                patched_consumer["input"] = branch_name
+            else:
+                branch_names_in_order = _coalesce_branch_names(node.branches)
+                branch_connections = _coalesce_branch_connections(node.branches)
+                patched_branches = dict(zip(branch_names_in_order, branch_connections, strict=True))
+                patched_branches[consumer_branch_alias] = branch_name
+                patched_consumer["branches"] = patched_branches
+                if consumer_branch_alias == branch_names_in_order[0]:
+                    patched_consumer["input"] = branch_name
             tool_sequence.append({"tool": "upsert_node", "arguments": patched_consumer})
             affected_consumers.append(
                 {
@@ -2617,6 +2637,30 @@ _ROW_UNION_INTRINSIC_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "row_union_timeout_invalid",
     }
 )
+
+_MUTATION_BLOCKING_INVARIANT_CODES: Final[frozenset[str]] = _ROW_UNION_INTRINSIC_ERROR_CODES | {
+    "row_union_on_success_must_be_connection",
+    "node_timeout_unsupported",
+}
+
+
+def _post_mutation_invariant_error(
+    proposed_state: CompositionState,
+) -> tuple[str, str] | None:
+    """Return an invariant a mutation must not persist.
+
+    Composer permits incomplete topology during incremental authoring, so a
+    mutation cannot require the entire pipeline to validate. This shared
+    preflight selects only intrinsic node-shape and namespace invariants whose
+    persistence would make later generic mutation tools violate their own
+    contracts. Callers return the original state on failure, giving the tools
+    one rollback discipline without weakening ordinary validation telemetry.
+    """
+    for entry in proposed_state.validate().errors:
+        if entry.error_code in _MUTATION_BLOCKING_INVARIANT_CODES:
+            assert entry.error_code is not None
+            return entry.message, entry.error_code
+    return None
 
 
 def _row_union_node_contract_error(

@@ -520,8 +520,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     # the only signal it carries, so each must be explainable here.
     (
         r"unknown[ _]node_type",
-        "The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, transform. There is no 'fork' node_type.",
-        "Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node — node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input, and branches rejoin at a COALESCE node (branches + policy + merge). A node after the coalesce consumes it by setting input='<coalesce id>' — the coalesce's own on_success may only name a sink.",
+        "The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.",
+        "Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node — "
+        "node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, "
+        "fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. "
+        "Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. "
+        "Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases "
+        "to arriving connections, input repeats the first branch value, and on_success names downstream processing.",
     ),
     (
         r"coalesce_on_success_must_be_sink|coalesce_on_success_unknown_sink|Coalesce on_success must point to a sink|Coalesce '(.+)' on_success references unknown sink",

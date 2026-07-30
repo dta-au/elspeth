@@ -114,6 +114,21 @@ def test_inline_blob_mime_types_share_the_blob_contract_closed_set() -> None:
         }
         SetPipelineArgumentsModel.model_validate(payload)
 
+
+def test_provider_schemas_explicitly_describe_row_union_routing_fields() -> None:
+    definitions = get_tool_definitions()
+    upsert = next(definition["parameters"] for definition in definitions if definition["name"] == "upsert_node")
+    set_pipeline = _registered_set_pipeline_schema()
+    pipeline_node = set_pipeline["properties"]["nodes"]["items"]
+
+    for properties in (upsert["properties"], pipeline_node["properties"]):
+        on_success_description = properties["on_success"]["description"]
+        branches_description = properties["branches"]["description"]
+        assert "row_union" in on_success_description
+        assert "processing connection" in on_success_description
+        assert "row_union" in branches_description
+        assert "consum" in branches_description
+
     unsupported = deepcopy(_BASE_PIPELINE)
     unsupported["source"]["inline_blob"] = {
         "filename": "input.xml",

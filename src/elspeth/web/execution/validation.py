@@ -481,6 +481,24 @@ def _build_edge_contract_suggestion(
         component_type=None,
     )
 
+    if producer.component_type == "row_union":
+        return "\n".join(
+            (
+                f"The plugin-free row_union '{producer.component_id}' exposes an engine-owned observed schema; "
+                "it has no plugin schema options to patch.",
+                f"Relax the real downstream consumer {consumer.display_name} so it accepts the released branch rows.",
+                f"Tool: {consumer.schema_patch_tool_call}",
+            )
+        )
+    if consumer.component_type == "row_union":
+        return "\n".join(
+            (
+                f"The plugin-free row_union '{consumer.component_id}' has no consumer schema options to patch.",
+                f"Repair the real branch producer {producer.display_name} whose output contract failed at the barrier.",
+                f"Tool: {producer.schema_patch_tool_call}",
+            )
+        )
+
     parts: list[str] = []
     parts.append("Most edge-contract failures come from the consumer over-declaring fields it doesn't operate on. Try option (a) first.")
     parts.append("")

@@ -69,6 +69,7 @@ from elspeth.web.composer.tools._common import (
     _normalize_trusted_legacy_interpretation_requirements,
     _options_with_default_llm_reviews,
     _plugin_policy_failure,
+    _post_mutation_invariant_error,
     _prevalidate_sink,
     _prevalidate_source,
     _prevalidate_transform_for_context,
@@ -1167,6 +1168,10 @@ def build_set_pipeline_candidate(
         metadata=metadata_spec,
         version=state.version + 1,
     )
+    invariant_error = _post_mutation_invariant_error(new_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, new_state)
     except TypeError as exc:
@@ -1544,7 +1549,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                                 "publishes its merged rows under its own node id — a downstream "
                                 "consumer sets input='<coalesce id>' — and its on_success, when set, "
                                 "may ONLY name a sink; pointing a coalesce on_success at another "
-                                "node's input is rejected."
+                                "node's input is rejected. ROW_UNION EXCEPTION: row_union requires "
+                                "on_success to name a downstream processing connection, never a sink."
                             ),
                             "examples": ["fetched_text", "scored_rows", "lines_out"],
                         },
@@ -1563,6 +1569,11 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "type": ["array", "object", "null"],
                             "items": {"type": "string"},
                             "additionalProperties": {"type": "string"},
+                            "description": (
+                                "Branch inputs for coalesce or row_union. For row_union, every "
+                                "branches value is a real consumed input connection; input must "
+                                "repeat the first value only as an adapter placeholder."
+                            ),
                         },
                         "policy": {"type": ["string", "null"]},
                         "merge": {"type": ["string", "null"]},
