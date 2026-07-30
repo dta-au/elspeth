@@ -15171,8 +15171,8 @@ class TestUpsertNodeRowUnion:
         assert inspected.success is True
         assert inspected.data["node"]["timeout_seconds"] == 45.0
 
-    @pytest.mark.parametrize("invalid_timeout", [True, "30"])
-    def test_timeout_rejects_non_numeric_tier_3_values_without_mutation(self, invalid_timeout: object) -> None:
+    @pytest.mark.parametrize("invalid_timeout", [True, "30", 0, -1, float("nan"), float("inf")])
+    def test_timeout_rejects_invalid_tier_3_values_without_mutation(self, invalid_timeout: object) -> None:
         from elspeth.web.composer.protocol import ToolArgumentError
 
         state = _empty_state()
@@ -15332,8 +15332,6 @@ class TestUpsertNodeRowUnion:
             {"branches": {"only": "control_done"}},
             {"policy": "require_all"},
             {"merge": "union"},
-            {"timeout_seconds": 0},
-            {"timeout_seconds": float("inf")},
         ],
     )
     def test_intrinsically_malformed_row_union_is_rejected_atomically(self, override: dict[str, Any]) -> None:
@@ -15348,6 +15346,46 @@ class TestUpsertNodeRowUnion:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
+
+
+class TestStructuralBarrierTimeoutBoundary:
+    @staticmethod
+    def _coalesce_arguments(timeout_seconds: object) -> dict[str, Any]:
+        return {
+            "id": "joined",
+            "node_type": "coalesce",
+            "plugin": None,
+            "input": "control_done",
+            "branches": {
+                "control": "control_done",
+                "treatment": "treatment_done",
+            },
+            "policy": "require_all",
+            "merge": "union",
+            "timeout_seconds": timeout_seconds,
+        }
+
+    @pytest.mark.parametrize("invalid_timeout", [0, -1, float("nan"), float("inf")])
+    @pytest.mark.parametrize("tool_name", ["upsert_node", "set_pipeline"])
+    def test_invalid_coalesce_timeout_is_rejected_before_mutation(
+        self,
+        tool_name: str,
+        invalid_timeout: float,
+    ) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        state = _empty_state()
+        node = self._coalesce_arguments(invalid_timeout)
+        arguments = node
+        if tool_name == "set_pipeline":
+            arguments = _valid_pipeline_args()
+            arguments["nodes"] = [node]
+
+        with pytest.raises(ToolArgumentError):
+            execute_tool(tool_name, arguments, state, _mock_catalog())
+
+        assert state.version == 1
+        assert state.nodes == ()
 
 
 class TestQueueBoundaryFieldEvidenceAbstains:

@@ -55,7 +55,11 @@ def _reject_coerced_timeout_seconds(value: object) -> object:
     return value
 
 
-_StrictTimeoutSeconds = Annotated[float, BeforeValidator(_reject_coerced_timeout_seconds)]
+_StrictTimeoutSeconds = Annotated[
+    float,
+    BeforeValidator(_reject_coerced_timeout_seconds),
+    Field(gt=0, allow_inf_nan=False),
+]
 
 # Fixed sentinel for response keys that appear in the input but are not
 # declared in the manifest entry's known_response_keys or
