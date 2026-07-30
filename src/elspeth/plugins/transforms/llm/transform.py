@@ -1326,15 +1326,21 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             raise ValueError(f"Unknown LLM provider '{provider_name}'. Valid providers: {sorted(_PROVIDERS)}")
         config_cls, _ = _PROVIDERS[provider_name]
 
-        # `profile` is a provenance-only marker the batch/CLI operator profile
-        # catalog lowering pass (core.config._lower_llm_profile_nodes) leaves
-        # in `self.config` (set by BaseTransform.__init__ above, from the SAME
-        # `config` dict) purely so the DAG's per-node audit config and the
-        # run's settings_json snapshot can answer "which llm_profiles alias
-        # did this node use" — no provider config model declares this field,
-        # and every provider config class forbids extra fields, so it must be
-        # excluded before validation rather than declared on LLMConfig itself.
-        provider_config = {key: value for key, value in config.items() if key != "profile"} if "profile" in config else config
+        # `profile_alias` is a provenance-only marker the batch/CLI operator
+        # profile catalog lowering pass (core.config._lower_llm_profile_nodes)
+        # leaves in `self.config` (set by BaseTransform.__init__ above, from
+        # the SAME `config` dict) purely so the DAG's per-node audit config
+        # and the run's settings_json snapshot can answer "which llm_profiles
+        # alias did this node use" — no provider config model declares this
+        # field, and every provider config class forbids extra fields, so it
+        # must be excluded before validation rather than declared on
+        # LLMConfig itself. Named distinctly from the authored `profile`
+        # selector key on purpose: keying the retained alias as `profile`
+        # here would put a lowered node right back into the exact shape
+        # _lower_llm_profile_nodes's own ambiguity check rejects (`profile`
+        # + `provider` both present), making that pass unsafe to run twice
+        # over its own output.
+        provider_config = {key: value for key, value in config.items() if key != "profile_alias"} if "profile_alias" in config else config
 
         # Parse config with provider-specific model.
         # config_cls is one of the registered provider config classes at runtime;

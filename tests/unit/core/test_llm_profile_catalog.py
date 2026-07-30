@@ -32,7 +32,14 @@ projections — both surfaces call the single shared
 - a profile-selecting BATCH node's alias is recoverable from the run's own
   audit trail (`resolve_config()`'s settings_json snapshot), matching what
   `run_web_plugin_policy.selected_profile_aliases_json` already gives web —
-  and that the alias value is never the profile's endpoint or credential_ref.
+  and that the alias value is never the profile's endpoint or credential_ref
+  (retained under the distinct `profile_alias` key, never the authored
+  `profile` selector key itself); and
+- lowering is round-trip safe BY CONSTRUCTION: feeding an already-lowered
+  node back through the same pass never raises (it has no `profile` key
+  left to act on), while a genuinely ambiguous AUTHORED node (`profile` and
+  `provider` both written by hand) still fails closed — proving the
+  ambiguity check is intact, not merely disarmed for lowered output.
 """
 
 from __future__ import annotations
@@ -179,11 +186,16 @@ class TestBatchProfileNodeLowering:
         assert options["contract_major"] == 1
         assert options["required_capabilities"] == ("text", "tools", "usage")
         assert options["api_key"] == "sk-test-value"
-        # The alias is RETAINED (not stripped) in the executable options —
-        # a provenance-only marker so it is recoverable from the run's own
-        # audit trail (see TestBatchRunAuditRecordsAlias below).
-        # LLMTransform.__init__ excludes it before provider construction.
-        assert options["profile"] == "gw-primary"
+        # The alias is RETAINED (not stripped) in the executable options,
+        # under a key DISTINCT from the authored `profile` selector — a
+        # provenance-only marker so it is recoverable from the run's own
+        # audit trail (see TestBatchRunAuditRecordsAlias below) without ever
+        # putting a lowered node back into the exact shape the ambiguity
+        # check rejects (`profile` + `provider` both present — see
+        # TestLoweringIsRoundTripSafe). LLMTransform.__init__ excludes
+        # `profile_alias` before provider construction.
+        assert options["profile_alias"] == "gw-primary"
+        assert "profile" not in options
         assert options["prompt_template"] == "{{ row }}"
 
     def test_unknown_alias_fails_closed(self) -> None:
@@ -324,6 +336,7 @@ class TestExplicitProviderNodesUnaffected:
         lowered = settings.transforms[0].options
         assert lowered["provider"] == options["provider"]
         assert "profile" not in lowered
+        assert "profile_alias" not in lowered
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +422,10 @@ class TestBatchRunAuditRecordsAlias:
     column or table. ``LLMTransform.__init__`` excludes the marker before
     provider construction (no provider config model declares it), so real
     execution is unaffected.
+
+    The alias rides under ``profile_alias``, NOT the authored ``profile``
+    selector key — see ``TestLoweringIsRoundTripSafe`` for why reusing
+    ``profile`` would be unsafe.
     """
 
     _SAFE_OPTIONS: ClassVar[dict[str, object]] = {"prompt_template": "{{ row }}", "schema": {"mode": "observed"}}
@@ -423,13 +440,13 @@ class TestBatchRunAuditRecordsAlias:
         resolved = resolve_config(settings)
         node_options = resolved["transforms"][0]["options"]
 
-        assert node_options["profile"] == "gw-primary"
+        assert node_options["profile_alias"] == "gw-primary"
         # ALIAS ONLY: the recorded value is the opaque alias, never the
         # profile's private endpoint or its credential reference name.
-        assert node_options["profile"] != _GATEWAY_PROFILE["endpoint"]
-        assert node_options["profile"] != _GATEWAY_PROFILE["credential_ref"]
-        assert _GATEWAY_PROFILE["endpoint"] not in node_options["profile"]
-        assert _GATEWAY_PROFILE["credential_ref"] not in node_options["profile"]
+        assert node_options["profile_alias"] != _GATEWAY_PROFILE["endpoint"]
+        assert node_options["profile_alias"] != _GATEWAY_PROFILE["credential_ref"]
+        assert _GATEWAY_PROFILE["endpoint"] not in node_options["profile_alias"]
+        assert _GATEWAY_PROFILE["credential_ref"] not in node_options["profile_alias"]
 
     def test_llm_transform_constructs_and_retains_the_alias_for_audit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Prove the DAG's per-node audit path (which reads the live plugin's
@@ -447,6 +464,71 @@ class TestBatchRunAuditRecordsAlias:
         settings = load_settings_from_config_dict(cfg, expand_env_vars=True)
         transform = LLMTransform(dict(settings.transforms[0].options))
 
-        assert transform.config["profile"] == "gw-primary"
+        assert transform.config["profile_alias"] == "gw-primary"
         assert transform._config.provider == "gateway"
         assert transform._config.model == "standard"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: the alias retention key must not collide with the ambiguity
+# check — defused BY CONSTRUCTION (a distinct key), not by call-ordering.
+# ---------------------------------------------------------------------------
+
+
+class TestLoweringIsRoundTripSafe:
+    """`_lower_llm_profile_nodes` is safe to run twice over its own output.
+
+    Nothing re-feeds a lowered dict back through this pass today, so this
+    was never observable in production — but the protection must be
+    structural, not an accident of the one call site that happens to exist.
+    Proven in both directions: a lowered node fed back through the pass must
+    NOT raise (round-trip safe), and a genuinely ambiguous AUTHORED node
+    (both `profile` and `provider` written by hand) must STILL raise — the
+    ambiguity check is intact and precise, not merely disarmed for
+    already-lowered output.
+    """
+
+    def test_lowered_output_round_trips_without_raising(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-test-value")
+        cfg = _config(
+            transforms=[_llm_node({"profile": "gw-primary", "prompt_template": "{{ row }}", "schema": {"mode": "observed"}})],
+            llm_profiles={"gw-primary": _GATEWAY_PROFILE},
+        )
+        lowered_settings = load_settings_from_config_dict(cfg, expand_env_vars=True)
+        lowered_options = dict(lowered_settings.transforms[0].options)
+        # Sanity: this really is the shape the ambiguity check is checking
+        # for — `provider` present — just keyed as `profile_alias`, not
+        # `profile`.
+        assert "provider" in lowered_options
+        assert "profile_alias" in lowered_options
+        assert "profile" not in lowered_options
+
+        # Feed the lowered output back through the SAME pass, exactly as a
+        # persisted-run reload or run-clone caller would if one existed.
+        # Must NOT raise.
+        round_tripped_cfg = _config(
+            transforms=[_llm_node(dict(lowered_options))],
+            llm_profiles={"gw-primary": _GATEWAY_PROFILE},
+        )
+        again = load_settings_from_config_dict(round_tripped_cfg, expand_env_vars=True)
+        # No `profile` key means this pass has nothing to lower — the node
+        # is inert to it, exactly like any other explicit-provider node.
+        assert dict(again.transforms[0].options) == lowered_options
+
+    def test_genuinely_ambiguous_authored_node_still_raises(self) -> None:
+        """The ambiguity check remains intact — not just inert for lowered output."""
+        cfg = _config(
+            transforms=[
+                _llm_node(
+                    {
+                        "profile": "gw-primary",
+                        "provider": "gateway",
+                        "prompt_template": "{{ row }}",
+                        "schema": {"mode": "observed"},
+                    }
+                )
+            ],
+            llm_profiles={"gw-primary": _GATEWAY_PROFILE},
+        )
+        with pytest.raises(ValueError, match="both 'profile' and 'provider'"):
+            load_settings_from_config_dict(cfg, expand_env_vars=True)

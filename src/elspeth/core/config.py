@@ -2337,10 +2337,24 @@ def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -
         # BaseTransform.config. Web's parallel answer to "which profile did
         # this node use" lives in run_web_plugin_policy.selected_profile_aliases_json
         # (a web-only Landscape table); batch has no such table, so the
-        # alias must travel inside the node's own options. `profile` is a
-        # provenance-only key no provider config model declares —
-        # LLMTransform.__init__ strips it before provider construction.
-        executable["profile"] = alias
+        # alias must travel inside the node's own options.
+        #
+        # Deliberately NOT keyed as "profile" (the authored selector key):
+        # this same dict is what a second pass through this function would
+        # see if a lowered run's settings were ever re-loaded (persisted-run
+        # replay, run cloning — no such caller exists today, but nothing
+        # prevents one being added later). If the alias rode under "profile"
+        # ALONGSIDE the now-also-present "provider" key, that re-load would
+        # look identical to a genuinely ambiguous authored node and trip the
+        # "specifies both 'profile' and 'provider'" rejection above — an
+        # accidental self-collision, not a real conflict. "profile_alias" is
+        # a distinct key the ambiguity check never inspects and no provider
+        # config model or authoring surface uses, so this pass is safe to
+        # run twice over its own output (round-trip safe by construction, not
+        # by relying on the two checks never being fed the same dict twice).
+        # `LLMTransform.__init__` strips this key before provider
+        # construction — no provider config model declares it.
+        executable["profile_alias"] = alias
         node["options"] = executable
     return raw_config
 
