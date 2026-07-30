@@ -1380,13 +1380,23 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
       const source = exactRecord(item, sourcePath, [
         "stable_id", "label", "plugin", "on_validation_failure", "guaranteed_fields", "row_cardinality",
       ]);
+      const rowCardinality = decodeCardinality(
+        source.row_cardinality,
+        `${sourcePath}.row_cardinality`,
+      );
+      if (rowCardinality.output === "one_per_branch") {
+        invalid(
+          `${sourcePath}.row_cardinality`,
+          "one_per_branch output is reserved for row_union",
+        );
+      }
       return {
         stable_id: canonicalUuid(source.stable_id, `${sourcePath}.stable_id`),
         label: stringValue(source.label, `${sourcePath}.label`),
         plugin: stringValue(source.plugin, `${sourcePath}.plugin`),
         on_validation_failure: stringValue(source.on_validation_failure, `${sourcePath}.on_validation_failure`),
         guaranteed_fields: stringArray(source.guaranteed_fields, `${sourcePath}.guaranteed_fields`),
-        row_cardinality: decodeCardinality(source.row_cardinality, `${sourcePath}.row_cardinality`),
+        row_cardinality: rowCardinality,
       };
     }),
     nodes: arrayValue(payload.nodes, `${path}.nodes`).map((item, index) => {
@@ -1411,6 +1421,15 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
         invalid(
           `${nodePath}.row_cardinality`,
           "row_union requires branches to one_per_branch cardinality",
+        );
+      }
+      if (
+        nodeType !== "row_union"
+        && rowCardinality.output === "one_per_branch"
+      ) {
+        invalid(
+          `${nodePath}.row_cardinality`,
+          "one_per_branch output is reserved for row_union",
         );
       }
       return {

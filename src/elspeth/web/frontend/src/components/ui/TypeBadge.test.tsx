@@ -47,4 +47,10 @@ describe("TypeBadge", () => {
     const badge = screen.getByText("Row union");
     expect(badge).toHaveClass("type-badge", "type-badge-row_union");
   });
+  it("uses human-readable row union copy by default", () => {
+    render(<TypeBadge type="row_union" />);
+    const badge = screen.getByText("row union");
+    expect(badge).toHaveClass("type-badge", "type-badge-row_union");
+    expect(screen.queryByText("row_union")).not.toBeInTheDocument();
+  });
 });

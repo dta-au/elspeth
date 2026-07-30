@@ -108,6 +108,47 @@ function aggregationNode(
   };
 }
 
+function nonRowUnionNodeWithRowUnionCardinality(
+  nodeType: "transform" | "gate" | "aggregation" | "queue" | "coalesce",
+): Record<string, unknown> {
+  if (nodeType === "aggregation") {
+    return aggregationNode({}, {
+      output: "one_per_branch",
+      expected_output_count: null,
+    });
+  }
+  const behaviorByType = {
+    transform: { kind: "transform" },
+    gate: {
+      kind: "gate",
+      route_aliases: ["route-1"],
+      fork_branches: [],
+    },
+    queue: { kind: "queue" },
+    coalesce: {
+      kind: "coalesce",
+      branch_aliases: ["branch-1", "branch-2"],
+      policy: "require_all",
+      merge: "nested",
+    },
+  } as const;
+  return {
+    stable_id: "00000000-0000-4000-8000-000000000003",
+    label: nodeType,
+    node_type: nodeType,
+    plugin: nodeType === "transform" ? "passthrough" : null,
+    behavior: behaviorByType[nodeType],
+    required_fields: [],
+    guaranteed_fields: [],
+    row_cardinality: {
+      input: nodeType === "coalesce" ? "branches" : "one",
+      output: "one_per_branch",
+      expected_output_count: null,
+    },
+    structured_output_fields: [],
+  };
+}
+
 function rowUnionProposalWireResponse(): Record<string, unknown> {
   const sourceId = "00000000-0000-4000-8000-000000000401";
   const gateId = "00000000-0000-4000-8000-000000000402";
@@ -383,6 +424,35 @@ describe("guided schema-10 wire decoder", () => {
     expect(() => decodeGetGuidedResponse(wireResponse({
       nodes: [aggregationNode({}, { output: "one", expected_output_count: "1" })],
     }))).toThrow("expected_output_count");
+  });
+
+  it("rejects one_per_branch cardinality on sources", () => {
+    expect(() => decodeGetGuidedResponse(wireResponse({
+      sources: [{
+        stable_id: "00000000-0000-4000-8000-000000000004",
+        label: "source",
+        plugin: "csv",
+        on_validation_failure: "discard",
+        guaranteed_fields: [],
+        row_cardinality: {
+          input: "none",
+          output: "one_per_branch",
+          expected_output_count: null,
+        },
+      }],
+    }))).toThrow(/one_per_branch|row_union|cardinality/i);
+  });
+
+  it.each([
+    "transform",
+    "gate",
+    "aggregation",
+    "queue",
+    "coalesce",
+  ] as const)("rejects one_per_branch cardinality on %s nodes", (nodeType) => {
+    expect(() => decodeGetGuidedResponse(wireResponse({
+      nodes: [nonRowUnionNodeWithRowUnionCardinality(nodeType)],
+    }))).toThrow(/one_per_branch|row_union|cardinality/i);
   });
 
   it("decodes the exact row_union behavior and distinct row_union_success flow", () => {

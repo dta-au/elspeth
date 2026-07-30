@@ -54,6 +54,22 @@ const EDGE_LABEL_MAP: Record<string, string> = {
   fork: "fork",
 };
 
+function humanNodeType(typeLabel: string): string {
+  return typeLabel === "row_union" ? "row union" : typeLabel;
+}
+
+/**
+ * Keep simple inferred ids readable while length-prefixing any hyphenated
+ * component. Plain delimiter joining is ambiguous for valid ids such as
+ * ("a-b", "c") and ("a", "b-c").
+ */
+function inferredEdgeId(kind: string, ...parts: string[]): string {
+  const payload = parts.some((part) => part.includes("-"))
+    ? parts.map((part) => `${part.length}:${part}`).join("|")
+    : parts.join("-");
+  return `inferred-${kind}-${payload}`;
+}
+
 type MiniMapNodeKind = keyof typeof BADGE_COLORS;
 type ValidationStatus = "valid" | "warning" | "error";
 
@@ -548,7 +564,7 @@ export function GraphView() {
                   className="graph-node-badge"
                   style={{ backgroundColor: badgeBg, color: badgeColor }}
                 >
-                  {typeLabel}
+                  {humanNodeType(typeLabel)}
                 </span>
                 <span className="graph-node-label">
                   {id}
@@ -752,6 +768,20 @@ export function GraphView() {
           });
         }
       }
+      if (
+        node.node_type === "gate"
+        && node.routes
+        && Object.values(node.routes).includes("fork")
+        && node.fork_to
+      ) {
+        for (const branchConnection of node.fork_to) {
+          registerProducer(branchConnection, {
+            nodeId: node.id,
+            edgeType: "success",
+            label: branchConnection,
+          });
+        }
+      }
     }
 
     // Phase 1: draw every producer → row_union edge from the authoritative
@@ -769,9 +799,14 @@ export function GraphView() {
           ? Object.entries(rowUnion.branches)
           : [];
       for (const [alias, connection] of branches) {
-        const producers = [
-          ...(connectionProducers.get(connection) ?? []),
-        ].sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+        const producers: ProducerInfo[] = queueIds.has(connection)
+          ? [{
+              nodeId: connection,
+              edgeType: "success",
+              label: "success",
+            }]
+          : [...(connectionProducers.get(connection) ?? [])]
+              .sort((a, b) => a.nodeId.localeCompare(b.nodeId));
         for (const producer of producers) {
           if (producer.nodeId === rowUnion.id) continue;
           const connectionKey = `${producer.nodeId}->${rowUnion.id}`;
@@ -780,8 +815,12 @@ export function GraphView() {
           if (inferredRowUnionAliases.has(aliasKey)) continue;
           const isError = producer.edgeType === "error";
           rfEdges.push({
-            id:
-              `inferred-row-union-in-${producer.nodeId}-${rowUnion.id}-${alias}`,
+            id: inferredEdgeId(
+              "row-union-in",
+              producer.nodeId,
+              rowUnion.id,
+              alias,
+            ),
             source: producer.nodeId,
             target: rowUnion.id,
             label: alias,
@@ -812,7 +851,7 @@ export function GraphView() {
         if (existingConnections.has(`${producer.nodeId}->${queueId}`)) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
-          id: `inferred-queue-in-${producer.nodeId}-${queueId}`,
+          id: inferredEdgeId("queue-in", producer.nodeId, queueId),
           source: producer.nodeId,
           target: queueId,
           label: producer.label,
@@ -839,7 +878,7 @@ export function GraphView() {
         if (node.input === node.id) continue; // the queue's own implicit output
         if (!existingConnections.has(`${node.input}->${node.id}`)) {
           rfEdges.push({
-            id: `inferred-queue-out-${node.input}-${node.id}`,
+            id: inferredEdgeId("queue-out", node.input, node.id),
             source: node.input,
             target: node.id,
             label: "success",
@@ -860,8 +899,8 @@ export function GraphView() {
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: rowUnionIds.has(producer.nodeId)
-            ? `inferred-row-union-out-${producer.nodeId}-${node.id}`
-            : `inferred-conn-${producer.nodeId}-${node.id}`,
+            ? inferredEdgeId("row-union-out", producer.nodeId, node.id)
+            : inferredEdgeId("conn", producer.nodeId, node.id),
           source: producer.nodeId,
           target: node.id,
           label: producer.label,
@@ -885,7 +924,7 @@ export function GraphView() {
         !existingConnections.has(`${sourceId}->${source.on_success}`)
       ) {
         rfEdges.push({
-          id: `inferred-sink-${sourceId}-${source.on_success}`,
+          id: inferredEdgeId("sink", sourceId, source.on_success),
           source: sourceId,
           target: source.on_success,
           label: "success",
@@ -906,7 +945,7 @@ export function GraphView() {
         !existingConnections.has(`${node.id}->${node.on_success}`)
       ) {
         rfEdges.push({
-          id: `inferred-sink-${node.id}-${node.on_success}`,
+          id: inferredEdgeId("sink", node.id, node.on_success),
           source: node.id,
           target: node.on_success,
           label: "success",
@@ -923,7 +962,7 @@ export function GraphView() {
         !existingConnections.has(`${node.id}->${node.on_error}`)
       ) {
         rfEdges.push({
-          id: `inferred-sink-${node.id}-${node.on_error}-error`,
+          id: inferredEdgeId("sink", node.id, node.on_error, "error"),
           source: node.id,
           target: node.on_error,
           label: "error",
@@ -939,7 +978,7 @@ export function GraphView() {
         for (const [routeLabel, targetId] of Object.entries(node.routes)) {
           if (nodeIds.has(targetId) && !existingConnections.has(`${node.id}->${targetId}`)) {
             rfEdges.push({
-              id: `inferred-sink-${node.id}-${targetId}-${routeLabel}`,
+              id: inferredEdgeId("sink", node.id, targetId, routeLabel),
               source: node.id,
               target: targetId,
               label: routeLabel,
@@ -983,7 +1022,7 @@ export function GraphView() {
       return {
         id,
         status,
-        label: `${typeLabel}: ${id}${plugin ? ` (${plugin})` : ""} — ${validity}${message ? `. ${message}` : ""}`,
+        label: `${humanNodeType(typeLabel)}: ${id}${plugin ? ` (${plugin})` : ""} — ${validity}${message ? `. ${message}` : ""}`,
       };
     };
     const out: Array<{ id: string; status?: ValidationStatus; label: string }> = [];
@@ -999,6 +1038,18 @@ export function GraphView() {
     return out;
   }, [compositionState, nodeValidationMap, nodeMessageMap]);
 
+  const accessibleEdges = useMemo(
+    () =>
+      edges.map((edge) => ({
+        id: edge.id,
+        label:
+          `${edge.source} to ${edge.target}: ${
+            typeof edge.label === "string" ? edge.label : "connection"
+          }`,
+      })),
+    [edges],
+  );
+
   // Empty state — must match the hasContent check above so that a
   // source-to-sink pipeline (zero transform nodes) still renders.
   if (nodes.length === 0) {
@@ -1012,7 +1063,16 @@ export function GraphView() {
   }
 
   const nodeCount = nodes.length;
-  const ariaLabel = `Pipeline graph with ${nodeCount} component${nodeCount !== 1 ? "s" : ""} (source, transforms, sinks).`;
+  const rowUnionCount =
+    compositionState?.nodes.filter((node) => node.node_type === "row_union")
+      .length ?? 0;
+  const rowUnionSummary =
+    rowUnionCount > 0
+      ? `, including ${rowUnionCount} row union${rowUnionCount === 1 ? "" : "s"}`
+      : "";
+  const ariaLabel =
+    `Pipeline graph with ${nodeCount} component${nodeCount !== 1 ? "s" : ""}`
+    + `${rowUnionSummary} (sources, processing steps, sinks).`;
 
   return (
     // ReactFlowProvider lets Controls/MiniMap render OUTSIDE the <ReactFlow>
@@ -1052,6 +1112,14 @@ export function GraphView() {
             </li>
           ))}
         </ol>
+        <ul
+          className="visually-hidden"
+          aria-label="Pipeline branch connections"
+        >
+          {accessibleEdges.map((edge) => (
+            <li key={edge.id}>{edge.label}</li>
+          ))}
+        </ul>
         {/* role="img" is children-presentational: everything inside it is
             pruned from the accessibility tree. It therefore scopes the
             DIAGRAM ONLY — the live "pending #N" pill and the interactive

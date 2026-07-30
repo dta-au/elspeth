@@ -568,6 +568,18 @@ describe("forced-colors accessibility fallbacks", () => {
     expect(forcedColorsBlock).toContain(".tutorial-progress-dot--active");
     expect(forcedColorsBlock).toContain(".tutorial-progress-bar");
   });
+
+  it("lets forced-colors badges use effective system foreground and surface colors", () => {
+    const forcedColorsBlock = extractForcedColorsBlock();
+    const badgeRule = /\.type-badge-source,[\s\S]*?\.type-badge-queue\s*\{(?<declarations>[^}]*)\}/
+      .exec(forcedColorsBlock);
+    const declarations = badgeRule?.groups?.declarations ?? "";
+
+    expect(declarations).toContain("color: ButtonText");
+    expect(declarations).toContain("background-color: Canvas");
+    expect(declarations).toContain("border-color: ButtonText");
+    expect(declarations).not.toContain("forced-color-adjust: none");
+  });
 });
 
 // ---------------------------------------------------------------------------

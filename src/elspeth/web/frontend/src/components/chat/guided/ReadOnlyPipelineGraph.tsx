@@ -65,11 +65,38 @@ function layoutGraph(
   };
 }
 
-function edgePath(source: PositionedNode, target: PositionedNode): string {
+function edgePath(
+  source: PositionedNode,
+  target: PositionedNode,
+  laneOffset: number,
+): string {
   const startX = source.x + NODE_WIDTH / 2;
   const endX = target.x - NODE_WIDTH / 2;
   const bend = Math.max(24, (endX - startX) / 2);
-  return `M ${startX} ${source.y} C ${startX + bend} ${source.y}, ${endX - bend} ${target.y}, ${endX} ${target.y}`;
+  return (
+    `M ${startX} ${source.y} `
+    + `C ${startX + bend} ${source.y + laneOffset}, `
+    + `${endX - bend} ${target.y + laneOffset}, ${endX} ${target.y}`
+  );
+}
+
+function edgeLaneOffsets(
+  edges: ReadOnlyPipelineGraphEdge[],
+): Map<string, number> {
+  const edgeIdsByEndpoints = new Map<string, string[]>();
+  for (const edge of edges) {
+    const key = `${edge.source.length}:${edge.source}|${edge.target.length}:${edge.target}`;
+    const ids = edgeIdsByEndpoints.get(key) ?? [];
+    ids.push(edge.id);
+    edgeIdsByEndpoints.set(key, ids);
+  }
+  const offsets = new Map<string, number>();
+  for (const ids of edgeIdsByEndpoints.values()) {
+    ids.forEach((id, index) => {
+      offsets.set(id, (index - (ids.length - 1) / 2) * 22);
+    });
+  }
+  return offsets;
 }
 
 /**
@@ -86,6 +113,10 @@ export function ReadOnlyPipelineGraph({
   const byId = useMemo(
     () => new Map(layout.nodes.map((node) => [node.id, node])),
     [layout.nodes],
+  );
+  const laneOffsetByEdgeId = useMemo(
+    () => edgeLaneOffsets(edges),
+    [edges],
   );
 
   return (
@@ -104,17 +135,30 @@ export function ReadOnlyPipelineGraph({
             if (source === undefined || target === undefined) {
               throw new Error(`ReadOnlyPipelineGraph edge ${edge.id} has an unresolved endpoint`);
             }
+            const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
+            const labelX = (source.x + target.x) / 2;
+            const labelY = (source.y + target.y) / 2 + laneOffset - 5;
             return (
-              <path
-                key={edge.id}
-                data-edge-id={edge.id}
-                className={
-                  edge.isError
-                    ? "guided-readonly-graph__edge guided-readonly-graph__edge--error"
-                    : "guided-readonly-graph__edge"
-                }
-                d={edgePath(source, target)}
-              />
+              <g key={edge.id}>
+                <path
+                  data-edge-id={edge.id}
+                  className={
+                    edge.isError
+                      ? "guided-readonly-graph__edge guided-readonly-graph__edge--error"
+                      : "guided-readonly-graph__edge"
+                  }
+                  d={edgePath(source, target, laneOffset)}
+                />
+                <text
+                  data-edge-id={edge.id}
+                  className="guided-readonly-graph__edge-label"
+                  x={labelX}
+                  y={labelY}
+                  textAnchor="middle"
+                >
+                  {edge.label}
+                </text>
+              </g>
             );
           })}
         </g>

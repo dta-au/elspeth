@@ -17,9 +17,10 @@ export interface TypeBadgeProps extends HTMLAttributes<HTMLSpanElement> {
 
 export function TypeBadge({ type = "source", className = "", children, ...rest }: TypeBadgeProps) {
   const cls = ["type-badge", `type-badge-${type}`, className].filter(Boolean).join(" ");
+  const defaultLabel = type === "row_union" ? "row union" : type;
   return (
     <span className={cls} {...rest}>
-      {children ?? type}
+      {children ?? defaultLabel}
     </span>
   );
 }

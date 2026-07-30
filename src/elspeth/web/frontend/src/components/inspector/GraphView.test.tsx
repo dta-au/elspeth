@@ -49,7 +49,12 @@ vi.mock("@xyflow/react", () => ({
         </div>
       ))}
       {edges?.map((e: any) => (
-        <div key={e.id} data-testid={`edge-${e.id}`}>
+        <div
+          key={e.id}
+          data-testid={`edge-${e.id}`}
+          data-edge-source={e.source}
+          data-edge-target={e.target}
+        >
           {e.label}
         </div>
       ))}
@@ -803,10 +808,9 @@ describe("GraphView", () => {
             input: "routed",
             on_success: null,
             routes: {
-              control: "control_raw",
-              treatment: "treatment_raw",
+              split: "fork",
             },
-            fork_to: ["control", "treatment"],
+            fork_to: ["control_raw", "treatment_raw"],
           }),
           makeNode({
             id: "control_score",
@@ -874,6 +878,16 @@ describe("GraphView", () => {
           "edge-inferred-row-union-in-treatment_score-variant_union-treatment",
         ),
       ).toHaveTextContent("treatment");
+      expect(
+        screen.getByTestId(
+          "edge-inferred-conn-experiment_gate-control_score",
+        ),
+      ).toHaveTextContent("control_raw");
+      expect(
+        screen.getByTestId(
+          "edge-inferred-conn-experiment_gate-treatment_score",
+        ),
+      ).toHaveTextContent("treatment_raw");
       expect(ids).toContain(
         "edge-inferred-row-union-out-variant_union-compare",
       );
@@ -892,6 +906,191 @@ describe("GraphView", () => {
       expect(
         ids.some((id) => id.includes("variant_union-variant_union")),
       ).toBe(false);
+    });
+
+    it("draws identity fork branches directly from their owning gate to row union", () => {
+      const state = rowUnionState();
+      state.nodes = state.nodes.filter(
+        (node) => !["control_score", "treatment_score"].includes(node.id),
+      );
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.input = "control_raw";
+      union!.branches = {
+        control: "control_raw",
+        treatment: "treatment_raw",
+      };
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      const identityEdges = Array.from(
+        document.querySelectorAll(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+        ),
+      );
+      expect(identityEdges).toHaveLength(2);
+      expect(identityEdges.map((edge) => edge.textContent).sort()).toEqual([
+        "control",
+        "treatment",
+      ]);
+    });
+
+    it("uses a queue as the authoritative row union producer without an upstream bypass", () => {
+      const state = rowUnionState();
+      state.nodes = [
+        makeNode({
+          id: "experiment_gate",
+          node_type: "gate",
+          plugin: null,
+          input: "routed",
+          on_success: null,
+          routes: { split: "fork" },
+          fork_to: ["control_queue", "treatment_raw"],
+        }),
+        makeNode({
+          id: "control_queue",
+          node_type: "queue",
+          plugin: null,
+          input: "control_queue",
+          on_success: null,
+        }),
+        makeNode({
+          id: "treatment_score",
+          input: "treatment_raw",
+          on_success: "treatment_done",
+        }),
+        {
+          id: "variant_union",
+          node_type: "row_union",
+          plugin: null,
+          input: "control_queue",
+          on_success: "experiment_rows",
+          on_error: null,
+          options: {},
+          branches: {
+            control: "control_queue",
+            treatment: "treatment_done",
+          },
+          timeout_seconds: null,
+        },
+        makeNode({
+          id: "compare",
+          node_type: "aggregation",
+          plugin: "batch_experiment_compare",
+          input: "experiment_rows",
+          on_success: "results",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        document.querySelector(
+          '[data-edge-source="experiment_gate"][data-edge-target="control_queue"]',
+        ),
+      ).not.toBeNull();
+      expect(
+        document.querySelector(
+          '[data-edge-source="control_queue"][data-edge-target="variant_union"]',
+        ),
+      ).toHaveTextContent("control");
+      expect(
+        document.querySelector(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+        ),
+      ).toBeNull();
+    });
+
+    it("gives adversarial hyphenated ids and aliases collision-proof inferred edge ids", () => {
+      const state = makeState({
+        nodes: [
+          makeNode({
+            id: "a-b",
+            input: "unused-left",
+            on_success: "left-ready",
+          }),
+          makeNode({
+            id: "a",
+            input: "unused-right",
+            on_success: "right-ready",
+          }),
+          makeNode({
+            id: "c",
+            node_type: "row_union",
+            plugin: null,
+            input: "left-ready",
+            on_success: null,
+            branches: { "d-e": "left-ready" },
+          }),
+          makeNode({
+            id: "b-c",
+            node_type: "row_union",
+            plugin: null,
+            input: "right-ready",
+            on_success: null,
+            branches: { "d-e": "right-ready" },
+          }),
+        ],
+      });
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      const left = document.querySelector(
+        '[data-edge-source="a-b"][data-edge-target="c"]',
+      );
+      const right = document.querySelector(
+        '[data-edge-source="a"][data-edge-target="b-c"]',
+      );
+      expect(left).not.toBeNull();
+      expect(right).not.toBeNull();
+      expect(left?.getAttribute("data-testid")).not.toBe(
+        right?.getAttribute("data-testid"),
+      );
+    });
+
+    it("exposes row union branch ownership in the accessible graph alternative and summary", () => {
+      const state = rowUnionState();
+      state.nodes = state.nodes.filter(
+        (node) => !["control_score", "treatment_score"].includes(node.id),
+      );
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.input = "control_raw";
+      union!.branches = {
+        control: "control_raw",
+        treatment: "treatment_raw",
+      };
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByRole("img", { name: /1 row union/i }),
+      ).toBeInTheDocument();
+      const branchConnections = screen.getByRole("list", {
+        name: /pipeline branch connections/i,
+      });
+      expect(
+        within(branchConnections).getByText(
+          "experiment_gate to variant_union: control",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(branchConnections).getByText(
+          "experiment_gate to variant_union: treatment",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(screen.getByTestId("node-variant_union")).getByText("row union"),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", {
+          name: /row union: variant_union/i,
+        }),
+      ).toBeInTheDocument();
     });
 
     it("preserves canonical explicit row_union branch labels without inferred duplicates", () => {
@@ -965,7 +1164,7 @@ describe("GraphView", () => {
       ).toHaveTextContent("treatment");
     });
 
-    it("exposes a distinct row_union badge in the keyboard inspector", async () => {
+    it("exposes a distinct row union badge in the keyboard inspector", async () => {
       useSessionStore.setState({
         selectedNodeId: null,
         selectNode: (nodeId: string | null) =>
@@ -979,14 +1178,14 @@ describe("GraphView", () => {
       });
       await userEvent.click(
         within(list).getByRole("button", {
-          name: /row_union: variant_union/i,
+          name: /row union: variant_union/i,
         }),
       );
 
       const panel = screen.getByRole("complementary", {
         name: /variant_union configuration/i,
       });
-      expect(within(panel).getByText("row_union")).toHaveClass(
+      expect(within(panel).getByText("row union")).toHaveClass(
         "type-badge",
         "type-badge-row_union",
       );
