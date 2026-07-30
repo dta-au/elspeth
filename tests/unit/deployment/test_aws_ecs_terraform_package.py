@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -32,7 +33,9 @@ EXPECTED_FILES = {
     "examples/scenario-a.tfvars.example",
     "examples/scenario-b.s3.tfbackend.example",
     "examples/scenario-b.tfvars.example",
-    "iam/installer-policy.json.tftpl",
+    "iam/installer-control-plane-policy.json.tftpl",
+    "iam/installer-regional-resources-policy.json.tftpl",
+    "iam/installer-relationships-policy.json.tftpl",
     "iam/lifecycle-policy.json.tftpl",
     "modules/scenario/database_bootstrap.tf",
     "modules/scenario/ecs.tf",
@@ -101,6 +104,35 @@ def _text(relative: str) -> str:
 
 def _all_text() -> str:
     return "\n".join(path.read_text(encoding="utf-8") for path in _source_files())
+
+
+_INSTALLER_POLICY_VALUES = {
+    "aws_account_id": "123456789012",
+    "aws_region": "ap-southeast-1",
+    "run_id": "12345678-1234-4123-8123-123456789abc",
+    "backend_state_bucket": "elspeth-state-example",
+    "ecr_repository": "elspeth-web-example",
+    "cloudwatch_agent_ecr_repository": "elspeth-agent-example",
+    "scenario_a_namespace": "a-0123456789abcdefabcd",
+    "scenario_b_namespace": "b-0123456789abcdefabcd",
+    "scenario_a_bucket": "elspeth-a-example",
+    "scenario_b_bucket": "elspeth-b-example",
+}
+
+
+def _installer_policy_template_text() -> str:
+    return "\n".join(path.read_text(encoding="utf-8") for path in sorted((PACKAGE / "iam").glob("installer*.json.tftpl")))
+
+
+def _render_installer_policy_documents() -> list[tuple[Path, str, dict[str, Any]]]:
+    documents: list[tuple[Path, str, dict[str, Any]]] = []
+    for path in sorted((PACKAGE / "iam").glob("installer*.json.tftpl")):
+        rendered = path.read_text(encoding="utf-8")
+        for name, value in _INSTALLER_POLICY_VALUES.items():
+            rendered = rendered.replace(f"${{{name}}}", value)
+        assert "${" not in rendered
+        documents.append((path, rendered, json.loads(rendered)))
+    return documents
 
 
 def test_scenario_a_https_ingress_is_explicit_and_never_world_open() -> None:
@@ -174,7 +206,7 @@ def test_container_insights_performance_log_group_is_terraform_owned() -> None:
 
 
 def test_installer_secret_reads_are_bound_to_the_two_exact_run_namespaces() -> None:
-    template = _text("iam/installer-policy.json.tftpl")
+    template = _installer_policy_template_text()
     secret_resources = re.search(r'"Sid": "ReadScenarioSecretValues"(?P<body>.*?)\n    \}', template, re.DOTALL)
 
     assert secret_resources is not None
@@ -368,7 +400,55 @@ def test_inconsistent_web_policy_fails_at_plan_not_at_startup() -> None:
     assert "precondition" in body
     assert "effective_plugin_control_modes" in body
     assert "effective_plugin_preferences" in body
-    assert "contains(local.effective_plugin_allowlist, implementation)" in body
+    assert "contains(local.effective_authorized_plugin_ids, implementation)" in body
+
+
+def test_terraform_web_policy_validation_matches_the_closed_runtime_contract() -> None:
+    variables = _text("modules/scenario/variables.tf")
+    module_locals = _text("modules/scenario/locals.tf")
+    ecs = _text("modules/scenario/ecs.tf")
+
+    preference_block = variables[variables.index('variable "plugin_preferences"') : variables.index('variable "plugin_control_modes"')]
+    mode_block = variables[variables.index('variable "plugin_control_modes"') : variables.index('variable "llm_profiles"')]
+    default_profile_block = variables[variables.index('variable "default_llm_profile"') : variables.index('variable "prompt_guardrail"')]
+    closed_capabilities = '["llm", "prompt_shield", "content_safety"]'
+
+    assert closed_capabilities in preference_block
+    assert "for capability in keys(var.plugin_preferences)" in preference_block
+    assert closed_capabilities in mode_block
+    assert "for capability in keys(var.plugin_control_modes)" in mode_block
+
+    assert 'coalesce(var.default_llm_profile, "standard")' in default_profile_block
+    assert "var.default_llm_profile == null || contains(" not in default_profile_block
+
+    assert "required_web_plugin_ids = toset([" in module_locals
+    for plugin_id in (
+        "source:csv",
+        "source:json",
+        "source:text",
+        "sink:csv",
+        "sink:json",
+        "sink:text",
+        "transform:field_mapper",
+        "transform:llm",
+        "transform:web_scrape",
+    ):
+        assert f'"{plugin_id}"' in module_locals
+    assert "effective_authorized_plugin_ids = setunion(" in module_locals
+
+    candidate = re.search(
+        r'resource "aws_ecs_task_definition" "candidate_web" \{(?P<body>.*?)\n\}',
+        ecs,
+        re.DOTALL,
+    )
+    assert candidate is not None
+    candidate_body = candidate.group("body")
+    assert "for implementations in values(local.effective_plugin_preferences)" in candidate_body
+    assert "contains(local.effective_authorized_plugin_ids, implementation)" in candidate_body
+
+    authorization = candidate_body[candidate_body.index("for implementations in values") :]
+    assert 'if mode == "required"' not in authorization
+    assert "preferred implementation must be authorized" in authorization
 
 
 def test_terraform_and_provider_versions_are_current_and_locked() -> None:
@@ -540,8 +620,10 @@ def test_bedrock_composer_uses_the_task_role_without_static_credentials() -> Non
     assert "AWS_ENDPOINT_URL" not in all_text
     assert "AGENTCORE" not in terraform_text.upper()
     assert '"bedrock:InvokeModel"' in iam
-    assert "var.bedrock_inference_profile_arns" in iam
-    assert "var.bedrock_foundation_model_arns" in iam
+    module_locals = _text("modules/scenario/locals.tf")
+    assert "var.bedrock_inference_profile_arns" in module_locals
+    assert "var.bedrock_foundation_model_arns" in module_locals
+    assert "resources = local.bedrock_invoke_model_arns" in iam
     assert '"Resource" = ["*"]' not in iam
 
 
@@ -579,9 +661,10 @@ def test_cross_region_bedrock_profile_gets_wildcard_region_foundation_model_gran
     bedrock_statement = _statement_body(iam, "InvokeConfiguredBedrockModels")
     # Retention: the region-pinned inference-profile and foundation-model grants must stay —
     # the wildcard grant is additive, not a replacement.
-    assert "var.bedrock_inference_profile_arns" in bedrock_statement
-    assert "var.bedrock_foundation_model_arns" in bedrock_statement
-    assert "local.bedrock_cross_region_foundation_model_arns" in bedrock_statement
+    assert "resources = local.bedrock_invoke_model_arns" in bedrock_statement
+    assert "var.bedrock_inference_profile_arns" in module_locals
+    assert "var.bedrock_foundation_model_arns" in module_locals
+    assert "local.bedrock_cross_region_foundation_model_arns" in module_locals
 
     # The runtime task-role grant alone is not enough: it is intersected with the run-scoped
     # permissions boundary bootstrap creates, so the boundary must independently allow the same
@@ -608,6 +691,38 @@ def test_cross_region_bedrock_profile_gets_wildcard_region_foundation_model_gran
     assert "length(local.bedrock_unclassified_model_ids) == 0" in task_policy_body
 
 
+def test_every_effective_llm_profile_derives_region_aware_exact_bedrock_resources() -> None:
+    module_locals = _text("modules/scenario/locals.tf")
+    iam = _text("modules/scenario/iam_observability.tf")
+    bootstrap = _text("bootstrap/main.tf")
+
+    assert "bedrock_profile_model_ids" in module_locals
+    assert "bedrock_profile_cross_region_prefixes" in module_locals
+    assert "bedrock_profile_foundation_model_arns" in module_locals
+    assert ('"arn:aws:bedrock:${profile.region_name}::foundation-model/${local.bedrock_profile_model_ids[alias]}"') in module_locals
+    assert "if local.bedrock_profile_cross_region_prefixes[alias] == null" in module_locals
+
+    assert "bedrock_profile_inference_profile_arns" in module_locals
+    assert (
+        '"arn:aws:bedrock:${profile.region_name}:${var.aws_account_id}:inference-profile/${local.bedrock_profile_model_ids[alias]}"'
+    ) in module_locals
+    assert "if local.bedrock_profile_cross_region_prefixes[alias] != null" in module_locals
+
+    assert "bedrock_invoke_model_arns = distinct(concat(" in module_locals
+    for required in (
+        "var.bedrock_inference_profile_arns",
+        "var.bedrock_foundation_model_arns",
+        "local.bedrock_profile_foundation_model_arns",
+        "local.bedrock_profile_inference_profile_arns",
+        "local.bedrock_cross_region_foundation_model_arns",
+    ):
+        assert required in module_locals
+
+    bedrock_statement = _statement_body(iam, "InvokeConfiguredBedrockModels")
+    assert "resources = local.bedrock_invoke_model_arns" in bedrock_statement
+    assert '"arn:aws:bedrock:*:${var.aws_account_id}:inference-profile/*"' in bootstrap
+
+
 def test_task_role_can_list_the_acceptance_bucket_so_head_object_can_report_missing() -> None:
     iam = _text("modules/scenario/iam_observability.tf")
     bootstrap = _text("bootstrap/main.tf")
@@ -631,11 +746,45 @@ def test_task_role_can_list_the_acceptance_bucket_so_head_object_can_report_miss
     assert re.search(r'actions\s*=\s*\["s3:ListBucket"\]', bootstrap)
 
 
+def test_versioned_textract_inputs_are_allowed_by_task_role_boundary_and_operator_guidance() -> None:
+    iam = _text("modules/scenario/iam_observability.tf")
+    bootstrap = _text("bootstrap/main.tf")
+
+    runtime_objects = _statement_body(iam, "UseAcceptanceObjects")
+    boundary_objects = _statement_body(bootstrap, "UseElspethObjects")
+    for statement in (runtime_objects, boundary_objects):
+        assert '"s3:GetObject"' in statement
+        assert '"s3:GetObjectVersion"' in statement
+
+    configuration = (REPO_ROOT / "docs" / "reference" / "configuration.md").read_text(encoding="utf-8")
+    runbook = (REPO_ROOT / "docs" / "runbooks" / "aws-ecs-deployment.md").read_text(encoding="utf-8")
+    assert "`version_field`" in configuration
+    assert "`s3:GetObjectVersion`" in configuration
+    assert "`version_field`" in runbook
+    assert "`s3:GetObjectVersion`" in runbook
+
+
 def test_composer_boot_probe_exercises_primary_and_advisor_models() -> None:
     module_locals = _text("modules/scenario/locals.tf")
     assert '{ name = "ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED", value = "true" }' in module_locals
     assert '{ name = "ELSPETH_WEB__COMPOSER_MODEL", value = var.composer_model }' in module_locals
     assert '{ name = "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", value = var.composer_advisor_model }' in module_locals
+
+
+def test_cloudwatch_agent_health_probe_checks_the_bounded_loopback_otlp_listener() -> None:
+    ecs = _text("modules/scenario/ecs.tf")
+    dockerfile = _text("cloudwatch-agent-image/Dockerfile")
+    runbook = (REPO_ROOT / "docs" / "runbooks" / "aws-ecs-deployment.md").read_text(encoding="utf-8")
+    probe = "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()"
+
+    assert 'command     = ["CMD", "python", "-c", "' + probe + '"]' in ecs
+    assert "kill -0 1" not in ecs
+    assert "FROM python:3.13-slim@" in dockerfile
+
+    assert '"command": ["CMD", "python", "-c", "' + probe + '"]' in runbook
+    assert "`127.0.0.1:4317`" in runbook
+    assert "three-second socket timeout" in runbook
+    assert "kill -0 1" not in runbook
 
 
 def test_every_image_is_proven_before_any_credentialed_task_definition() -> None:
@@ -658,9 +807,9 @@ def test_every_image_is_proven_before_any_credentialed_task_definition() -> None
     assert 'resource "terraform_data" "candidate_image_provenance"' in provenance
     assert 'resource "terraform_data" "rollback_image_provenance"' in provenance
     assert 'resource "terraform_data" "cloudwatch_agent_image_provenance"' in provenance
-    assert 'docker pull "$CANDIDATE_IMAGE"' in provenance
-    assert 'docker pull "$ROLLBACK_IMAGE"' in provenance
-    assert 'docker pull "$CLOUDWATCH_AGENT_IMAGE"' in provenance
+    assert 'docker pull --platform "$TARGET_PLATFORM" "$CANDIDATE_IMAGE"' in provenance
+    assert 'docker pull --platform "$TARGET_PLATFORM" "$ROLLBACK_IMAGE"' in provenance
+    assert 'docker pull --platform "$TARGET_PLATFORM" "$CLOUDWATCH_AGENT_IMAGE"' in provenance
     assert "org.opencontainers.image.revision" in provenance
     assert 'test "$revision" = "$CANDIDATE_SHA"' in provenance
     assert 'test "$revision" = "$ROLLBACK_SHA"' in provenance
@@ -729,6 +878,32 @@ def test_image_provenance_isolates_docker_credentials_from_the_operator_default(
         assert export_index < block.index("docker image inspect")
 
 
+def test_image_provenance_binds_every_check_to_the_selected_target_platform() -> None:
+    provenance = _text("modules/scenario/image_provenance.tf")
+    resources = (
+        ("candidate_image_provenance", "CANDIDATE_IMAGE"),
+        ("rollback_image_provenance", "ROLLBACK_IMAGE"),
+        ("cloudwatch_agent_image_provenance", "CLOUDWATCH_AGENT_IMAGE"),
+    )
+
+    for index, (resource_name, image_name) in enumerate(resources):
+        start = provenance.index(f'resource "terraform_data" "{resource_name}"')
+        end = provenance.index('resource "terraform_data"', start + 1) if index < len(resources) - 1 else len(provenance)
+        block = provenance[start:end]
+        triggers_start = block.index("triggers_replace = [")
+        triggers_end = block.index("]", triggers_start)
+        triggers = block[triggers_start:triggers_end]
+
+        assert "var.target_platform" in triggers
+        assert "TARGET_PLATFORM" in block
+        assert re.search(
+            rf'docker pull\s+--platform "\$TARGET_PLATFORM"\s+"\${re.escape(image_name)}"',
+            block,
+        )
+        assert block.count('--platform "$TARGET_PLATFORM"') == 2
+        assert re.search(r"TARGET_PLATFORM\s*=\s*var\.target_platform", block)
+
+
 def test_database_password_rotation_reexecutes_the_database_bootstrap() -> None:
     bootstrap = _text("modules/scenario/database_bootstrap.tf")
     triggers = bootstrap[bootstrap.index("triggers_replace = [") : bootstrap.index("]", bootstrap.index("triggers_replace = ["))]
@@ -769,6 +944,36 @@ def test_source_free_cold_install_runs_the_full_post_enable_acceptance() -> None
         '--task-definition "$CANDIDATE_TASK_DEFINITION"',
     ):
         assert required in section
+
+
+def test_candidate_image_handoff_copies_the_authenticated_ghcr_index_into_bootstrap_ecr() -> None:
+    readme = _text("README.md")
+    producing_start = readme.index("### Producing the candidate image")
+    producing = readme[producing_start : readme.index("### Installer policy and task-role boundary", producing_start)]
+    handoff_heading = "### Promote the published candidate into bootstrap ECR"
+    assert handoff_heading in readme
+    handoff_start = readme.index(handoff_heading)
+    section = readme[handoff_start : readme.index("## 2. Generate partial backend inputs", handoff_start)]
+
+    for required in (
+        "GITHUB_USERNAME",
+        "GITHUB_TOKEN",
+        "docker login ghcr.io",
+        "terraform -chdir=bootstrap output -raw ecr_repository_url",
+        "aws ecr get-login-password",
+        "docker buildx imagetools create",
+        "GHCR_IMAGE_DIGEST",
+        "ECR_IMAGE_DIGEST",
+        'test "$ECR_IMAGE_DIGEST" = "$GHCR_IMAGE_DIGEST"',
+        'CANDIDATE_IMAGE="$ECR_REPOSITORY_URL@$ECR_IMAGE_DIGEST"',
+    ):
+        assert required in section
+
+    assert section.index("docker login ghcr.io") < section.index("docker buildx imagetools create")
+    assert section.index("aws ecr get-login-password") < section.index("docker buildx imagetools create")
+    assert section.index("docker buildx imagetools create") < section.index('CANDIDATE_IMAGE="$ECR_REPOSITORY_URL@$ECR_IMAGE_DIGEST"')
+    assert readme.index("terraform -chdir=bootstrap apply") < handoff_start
+    assert "put the GHCR digest reference in the tfvars" not in producing
 
 
 def test_fresh_machine_pulls_the_candidate_before_local_inspection() -> None:
@@ -874,28 +1079,23 @@ def test_scenario_a_codeblind_inputs_have_no_acceptance_coordinator_dependencies
     }
 
 
+def test_installer_customer_managed_policy_documents_stay_within_iam_size_limit() -> None:
+    documents = _render_installer_policy_documents()
+    assert documents
+
+    rendered_sizes = {path.name: len(re.sub(r"\s+", "", rendered)) for path, rendered, _document in documents}
+    assert all(size <= 6_144 for size in rendered_sizes.values()), rendered_sizes
+    assert len(documents) >= 3
+
+    statement_sids = [statement["Sid"] for _path, _rendered, document in documents for statement in document["Statement"]]
+    assert len(statement_sids) == len(set(statement_sids))
+
+
 def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
-    template_path = PACKAGE / "iam" / "installer-policy.json.tftpl"
-    assert template_path.is_file()
-    template = template_path.read_text(encoding="utf-8")
-    rendered = template
-    values = {
-        "aws_account_id": "123456789012",
-        "aws_region": "ap-southeast-1",
-        "run_id": "12345678-1234-4123-8123-123456789abc",
-        "backend_state_bucket": "elspeth-state-example",
-        "ecr_repository": "elspeth-web-example",
-        "cloudwatch_agent_ecr_repository": "elspeth-agent-example",
-        "scenario_a_namespace": "a-0123456789abcdefabcd",
-        "scenario_b_namespace": "b-0123456789abcdefabcd",
-        "scenario_a_bucket": "elspeth-a-example",
-        "scenario_b_bucket": "elspeth-b-example",
-    }
-    for name, value in values.items():
-        rendered = rendered.replace(f"${{{name}}}", value)
-    assert "${" not in rendered
-    policy = json.loads(rendered)
-    statements = {statement["Sid"]: statement for statement in policy["Statement"]}
+    documents = _render_installer_policy_documents()
+    template = _installer_policy_template_text()
+    values = _INSTALLER_POLICY_VALUES
+    statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
 
     assert "ManageElspethInfrastructure" not in statements
     assert "ReadDiscovery" in statements
@@ -1072,6 +1272,9 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     readme = _text("README.md")
     for name in values:
         assert f"${{{name}}}" in readme
+    assert "three customer-managed policies" in readme
+    assert "6,144" in readme
+    assert "inline policies" in readme
     assert "dedicated empty account" in readme
     assert "not supported in a shared account" in readme
 

@@ -163,12 +163,13 @@ class RowUnionExecutor:
         # generic late-arrival message.
         self._completed_keys: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._max_completed_keys = max_completed_keys
-        # Recorded branch losses for §E.5 replay dedup:
+        # Recent branch losses for §E.5 replay dedup, bounded like the
+        # completion cache. Durable storage remains the source of truth.
         # (row_union_name, row_id, branch_name)
-        self._recorded_losses: set[tuple[str, str, str]] = set()
-        # Group-level index for correctness after the bounded completed-key
-        # cache evicts an early loss before any sibling arrives.
-        self._recorded_loss_groups: set[tuple[str, str]] = set()
+        self._recorded_losses: OrderedDict[tuple[str, str, str], None] = OrderedDict()
+        # Group-level recent-loss cache. Durable point reads preserve
+        # correctness after an entry leaves this bounded resident index.
+        self._recorded_loss_groups: OrderedDict[tuple[str, str], None] = OrderedDict()
 
     # ------------------------------------------------------------------
     # Registration
@@ -201,8 +202,10 @@ class RowUnionExecutor:
         """Restore adopted pending groups from durable scheduler and audit rows.
 
         Validation completes before executor memory is replaced. Fully
-        adopted groups are released immediately; the caller must commit the
-        returned outcomes through the scheduler barrier-completion seam.
+        adopted groups are released immediately; groups with a durable branch
+        loss fail through point reads without preloading historical losses.
+        The caller must commit returned outcomes through the scheduler
+        barrier-completion seam.
         """
         if self._pending:
             raise OrchestrationInvariantError("row_union restore requires an empty executor pending map")
@@ -238,7 +241,11 @@ class RowUnionExecutor:
         self._pending = restored
         outcomes: list[RowUnionOutcome] = []
         for key in tuple(self._pending):
-            if key in self._recorded_loss_groups:
+            if key in self._recorded_loss_groups or self._barrier_restore_reads.has_branch_loss_for_group(
+                run_id=self._run_id,
+                barrier_name=key[0],
+                row_id=key[1],
+            ):
                 outcomes.append(self._fail_pending(self._settings[key[0]], key, "row_union_branch_lost"))
         for key in tuple(self._pending):
             settings = self._settings[key[0]]
@@ -254,8 +261,7 @@ class RowUnionExecutor:
                 raise OrchestrationInvariantError(f"Cannot restore loss for unknown row_union '{row_union_name}'")
             if branch_name not in self._settings[row_union_name].branches:
                 raise OrchestrationInvariantError(f"Cannot restore loss for branch '{branch_name}' in row_union '{row_union_name}'")
-            self._recorded_losses.add((row_union_name, row_id, branch_name))
-            self._recorded_loss_groups.add((row_union_name, row_id))
+            self._remember_branch_loss(row_union_name, row_id, branch_name)
 
     def reconcile_released_group(
         self,
@@ -349,14 +355,24 @@ class RowUnionExecutor:
         key = (row_union_name, token.row_id)
         now = arrival_time if arrival_time is not None else self._clock.monotonic()
 
-        closed_by_recorded_loss = key in self._recorded_loss_groups
-        if key in self._completed_keys or closed_by_recorded_loss or self._check_landscape_for_completion(row_union_name, token.row_id):
+        if key in self._completed_keys or self._check_landscape_for_completion(row_union_name, token.row_id):
             return self._fail_late_arrival(
                 token,
                 settings,
                 node_id,
                 step,
-                closed_reason=_CLOSED_BY_BRANCH_LOSS if closed_by_recorded_loss else self._completed_keys.get(key, _CLOSED_BY_RELEASE),
+                closed_reason=self._completed_keys.get(key, _CLOSED_BY_RELEASE),
+            )
+        if key in self._recorded_loss_groups or self._barrier_restore_reads.has_branch_loss_for_group(
+            run_id=self._run_id, barrier_name=row_union_name, row_id=token.row_id
+        ):
+            self._mark_completed(key, _CLOSED_BY_BRANCH_LOSS)
+            return self._fail_late_arrival(
+                token,
+                settings,
+                node_id,
+                step,
+                closed_reason=_CLOSED_BY_BRANCH_LOSS,
             )
 
         if key not in self._pending:
@@ -559,7 +575,7 @@ class RowUnionExecutor:
         return outcomes
 
     def has_recorded_branch_loss(self, row_union_name: str, row_id: str, branch_name: str) -> bool:
-        """Idempotency check for §E.5 branch-loss replay dedup."""
+        """Recent-cache idempotency check for §E.5 branch-loss replay dedup."""
         return (row_union_name, row_id, branch_name) in self._recorded_losses
 
     def is_group_released(self, row_union_name: str, row_id: str) -> bool:
@@ -585,21 +601,19 @@ class RowUnionExecutor:
         key is marked completed so later siblings fail closed via the
         late-arrival arm instead of waiting forever.
 
-        A group that already RELEASED is exempt entirely: released tokens
-        keep their branch_name, so a terminal divert downstream of the union
-        re-enters this path — that is not a pre-barrier loss, and recording
-        it would poison the loss indexes for this key.
+        A group that already closed is exempt entirely. In particular,
+        released tokens keep their branch_name, so a terminal divert
+        downstream of the union re-enters this path — that is not a
+        pre-barrier loss, and recording it would poison the loss indexes for
+        this key. Landscape point reads preserve this rule after cache
+        eviction.
         """
         if row_union_name not in self._settings:
             raise OrchestrationInvariantError(f"row_union '{row_union_name}' not registered")
         key = (row_union_name, row_id)
-        if self._completed_keys.get(key) == _CLOSED_BY_RELEASE:
+        if key in self._completed_keys or self._check_landscape_for_completion(row_union_name, row_id):
             return None
-        self._recorded_losses.add((row_union_name, row_id, lost_branch))
-
-        self._recorded_loss_groups.add(key)
-        if key in self._completed_keys:
-            return None
+        self._remember_branch_loss(row_union_name, row_id, lost_branch)
         if key not in self._pending:
             # Nothing held yet: mark the group dead so future arrivals
             # fail closed instead of holding forever.
@@ -642,3 +656,16 @@ class RowUnionExecutor:
         self._completed_keys[key] = reason
         while len(self._completed_keys) > self._max_completed_keys:
             self._completed_keys.popitem(last=False)
+
+    def _remember_branch_loss(self, row_union_name: str, row_id: str, branch_name: str) -> None:
+        """Cache recent loss identities for replay dedup and fast group checks."""
+        loss_key = (row_union_name, row_id, branch_name)
+        group_key = (row_union_name, row_id)
+        self._recorded_losses[loss_key] = None
+        self._recorded_losses.move_to_end(loss_key)
+        self._recorded_loss_groups[group_key] = None
+        self._recorded_loss_groups.move_to_end(group_key)
+        while len(self._recorded_losses) > self._max_completed_keys:
+            self._recorded_losses.popitem(last=False)
+        while len(self._recorded_loss_groups) > self._max_completed_keys:
+            self._recorded_loss_groups.popitem(last=False)

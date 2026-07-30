@@ -1,0 +1,221 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "acm:DescribeCertificate",
+        "acm:GetCertificate",
+        "acm:ListCertificates",
+        "acm:ListTagsForCertificate",
+        "bedrock:GetGuardrail",
+        "bedrock:ListGuardrails",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:ListDashboards",
+        "cloudwatch:ListMetrics",
+        "cloudwatch:ListTagsForResource",
+        "cognito-idp:Describe*",
+        "cognito-idp:List*",
+        "ec2:Describe*",
+        "ecr:Describe*",
+        "ecr:GetLifecyclePolicy",
+        "ecr:List*",
+        "ecs:Describe*",
+        "ecs:List*",
+        "elasticfilesystem:Describe*",
+        "elasticloadbalancing:Describe*",
+        "events:DescribeRule",
+        "events:List*",
+        "iam:Get*",
+        "iam:List*",
+        "logs:Describe*",
+        "logs:GetLogEvents",
+        "logs:List*",
+        "rds:Describe*",
+        "rds:ListTagsForResource",
+        "s3:GetBucket*",
+        "s3:GetEncryptionConfiguration",
+        "s3:ListAllMyBuckets",
+        "s3:ListBucket",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetResourcePolicy",
+        "secretsmanager:List*",
+        "sns:GetTopicAttributes",
+        "sns:List*",
+        "sts:GetCallerIdentity",
+        "xray:Get*",
+        "xray:List*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PushAndCleanElspethImages",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchDeleteImage",
+        "ecr:BatchGetImage",
+        "ecr:CompleteLayerUpload",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:UploadLayerPart"
+      ],
+      "Resource": [
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${ecr_repository}",
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${cloudwatch_agent_ecr_repository}"
+      ]
+    },
+    {
+      "Sid": "AuthenticateForEcrPush",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
+      "Sid": "RunScenarioTasks",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RunTask"
+      ],
+      "Resource": [
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/a-*:*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/b-*:*"
+      ],
+      "Condition": {
+        "ArnLike": {
+          "ecs:cluster": [
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-a-*",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-b-*"
+          ]
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
+      "Sid": "ReadScenarioSecretValues",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:${scenario_a_namespace}-*",
+        "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:${scenario_b_namespace}-*"
+      ]
+    },
+    {
+      "Sid": "ManageRunScopedInlinePolicies",
+      "Effect": "Allow",
+      "Action": [
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}"
+        }
+      }
+    },
+    {
+      "Sid": "ManageKnownExecutionRoleAttachment",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}"
+        },
+        "ArnEquals": {
+          "iam:PolicyARN": "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+        }
+      }
+    },
+    {
+      "Sid": "PassRunScopedRolesToEcsTasksOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "CreateRequiredServiceLinkedRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateServiceLinkedRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::${aws_account_id}:role/aws-service-role/ecs.amazonaws.com/*",
+        "arn:aws:iam::${aws_account_id}:role/aws-service-role/elasticloadbalancing.amazonaws.com/*",
+        "arn:aws:iam::${aws_account_id}:role/aws-service-role/rds.amazonaws.com/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": [
+            "ecs.amazonaws.com",
+            "elasticloadbalancing.amazonaws.com",
+            "rds.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ManageRunDashboards",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:DeleteDashboards",
+        "cloudwatch:PutDashboard"
+      ],
+      "Resource": [
+        "arn:aws:cloudwatch::${aws_account_id}:dashboard/a-*",
+        "arn:aws:cloudwatch::${aws_account_id}:dashboard/b-*"
+      ]
+    },
+    {
+      "Sid": "DedicatedAccountOnlyUntaggedMutations",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DeleteResourcePolicy",
+        "logs:PutResourcePolicy"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    }
+  ]
+}

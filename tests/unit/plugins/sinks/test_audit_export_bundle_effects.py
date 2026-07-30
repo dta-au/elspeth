@@ -509,11 +509,12 @@ def test_private_csv_spool_corruption_is_tier_one_and_output_files_use_fd_permis
     monkeypatch.setattr(os, "chmod", reject_path_chmod)
     directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        owned_names: list[str] = []
         spool = bundle_effects._RecordSpool("run.csv", io.StringIO("[]\n"), set())
         with pytest.raises(bundle_effects.AuditExportBundlePreconditionError, match="private spool"):
-            bundle_effects._write_csv_file_at(directory_fd, "run.csv", spool)
+            bundle_effects._write_csv_file_at(directory_fd, "run.csv", spool, owned_names)
 
-        entry = bundle_effects._write_exact_file_at(directory_fd, "audit_manifest.v2.json", b"{}")
+        entry = bundle_effects._write_exact_file_at(directory_fd, "audit_manifest.v2.json", b"{}", owned_names)
     finally:
         os.close(directory_fd)
 
@@ -545,9 +546,40 @@ def test_output_hash_rejects_file_replacement_after_write(
     directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         with pytest.raises(bundle_effects.AuditExportBundlePreconditionError, match="changed"):
-            bundle_effects._write_exact_file_at(directory_fd, "audit_manifest.v2.json", b"original")
+            bundle_effects._write_exact_file_at(directory_fd, "audit_manifest.v2.json", b"original", [])
     finally:
         os.close(directory_fd)
+
+
+@pytest.mark.parametrize("failure_name", ["node.csv", bundle_effects.AUDIT_MANIFEST_NAME])
+def test_prepare_removes_owned_file_when_writer_fails_after_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_name: str,
+) -> None:
+    original_hash = bundle_effects._hash_regular_file_at
+
+    class InjectedWriterFailure(OSError):
+        pass
+
+    def fail_selected_hash(
+        directory_fd: int,
+        name: str,
+        expected_identity: os.stat_result,
+    ) -> tuple[str, int]:
+        if name == failure_name:
+            observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            assert observed.st_dev == expected_identity.st_dev
+            assert observed.st_ino == expected_identity.st_ino
+            raise InjectedWriterFailure("injected failure after owned file creation")
+        return original_hash(directory_fd, name, expected_identity)
+
+    monkeypatch.setattr(bundle_effects, "_hash_regular_file_at", fail_selected_hash)
+
+    with pytest.raises(InjectedWriterFailure, match="after owned file creation"):
+        _prepare(tmp_path / "audit")
+
+    assert not list(tmp_path.iterdir())
 
 
 def test_casefold_filename_collision_fails_before_publication(tmp_path: Path) -> None:

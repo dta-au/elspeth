@@ -112,10 +112,25 @@ locals {
     prompt_shield  = "required"
     content_safety = "required"
   }
+  required_web_plugin_ids = toset([
+    "source:csv",
+    "source:json",
+    "source:text",
+    "sink:csv",
+    "sink:json",
+    "sink:text",
+    "transform:field_mapper",
+    "transform:llm",
+    "transform:web_scrape",
+  ])
 
   effective_plugin_allowlist     = var.plugin_allowlist == null ? local.default_plugin_allowlist : var.plugin_allowlist
   effective_plugin_preferences   = var.plugin_preferences == null ? local.default_plugin_preferences : var.plugin_preferences
   effective_plugin_control_modes = var.plugin_control_modes == null ? local.default_plugin_control_modes : var.plugin_control_modes
+  effective_authorized_plugin_ids = setunion(
+    local.required_web_plugin_ids,
+    toset(local.effective_plugin_allowlist),
+  )
 
   plugin_allowlist     = jsonencode(local.effective_plugin_allowlist)
   plugin_preferences   = jsonencode(local.effective_plugin_preferences)
@@ -246,6 +261,31 @@ locals {
       region_name = coalesce(profile.region_name, var.aws_region)
     }
   }
+  bedrock_profile_model_ids = {
+    for alias, profile in local.effective_llm_profile_bindings :
+    alias => trimprefix(profile.model, "bedrock/")
+  }
+  bedrock_profile_cross_region_prefixes = {
+    for alias, model_id in local.bedrock_profile_model_ids :
+    alias => local.bedrock_configured_model_cross_region_prefixes[model_id]
+  }
+  bedrock_profile_foundation_model_arns = distinct([
+    for alias, profile in local.effective_llm_profile_bindings :
+    "arn:aws:bedrock:${profile.region_name}::foundation-model/${local.bedrock_profile_model_ids[alias]}"
+    if local.bedrock_profile_cross_region_prefixes[alias] == null
+  ])
+  bedrock_profile_inference_profile_arns = distinct([
+    for alias, profile in local.effective_llm_profile_bindings :
+    "arn:aws:bedrock:${profile.region_name}:${var.aws_account_id}:inference-profile/${local.bedrock_profile_model_ids[alias]}"
+    if local.bedrock_profile_cross_region_prefixes[alias] != null
+  ])
+  bedrock_invoke_model_arns = distinct(concat(
+    tolist(var.bedrock_inference_profile_arns),
+    tolist(var.bedrock_foundation_model_arns),
+    local.bedrock_profile_foundation_model_arns,
+    local.bedrock_profile_inference_profile_arns,
+    local.bedrock_cross_region_foundation_model_arns,
+  ))
   llm_profiles = jsonencode(local.effective_llm_profile_bindings)
   # The tutorial needs A profile, not its OWN profile — it points at the ordinary
   # standard-tier one, the same way the systemd deployment points this at whichever

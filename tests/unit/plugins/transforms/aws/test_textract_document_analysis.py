@@ -714,6 +714,7 @@ def test_submit_invalid_s3_object_classifies_access_scope_hint() -> None:
     assert result.reason["cause"] == "s3_object_unreadable"
     hint = result.reason["error"]
     assert "s3:GetObject" in hint
+    assert "s3:GetObjectVersion" in hint
     assert "read scope" in hint
     assert result.retryable is False
 

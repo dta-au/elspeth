@@ -65,9 +65,10 @@ _S3_OBJECT_UNREADABLE_CAUSE = "s3_object_unreadable"
 _S3_OBJECT_UNREADABLE_HINT = (
     "Amazon Textract could not read the S3 object. Most commonly the object is outside the "
     "S3 read scope granted to the pipeline's AWS role (check the role's s3:GetObject prefix "
-    "against the document's bucket/key); it can also mean the object does not exist or is "
-    "stored in a different region than the Textract endpoint. Verify access scope before "
-    "suspecting a corrupt or unsupported file."
+    "against the document's bucket/key and, when version_field is configured, its "
+    "s3:GetObjectVersion permission); it can also mean the object does not exist or is stored "
+    "in a different region than the Textract endpoint. Verify access scope before suspecting "
+    "a corrupt or unsupported file."
 )
 
 logger = structlog.get_logger(__name__)
@@ -305,7 +306,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0660a95d0c207f74"
+    source_file_hash: str | None = "sha256:1aa32fa8b982f024"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False

@@ -1364,24 +1364,35 @@ def build_execution_graph(
         # aggregation that simply omits the field lands in the rejected arm —
         # hence the diagnostic names the field explicitly.
         #
-        # The walk runs BACKWARD and MUST stop at the fork gate. Fork -> branch
-        # is a COPY edge only for an identity branch; a transform-chain branch
-        # is wired gate -> first node as MOVE, so an unbounded backward walk
-        # would cross into pre-fork topology and reject an aggregation that
-        # sits before the fork — the very remedy this diagnostic recommends.
-        fork_gate_node_ids = {gate_node_id for _gate_name, gate_node_id in row_union_branch_gates.values()}
+        # The walk runs BACKWARD and MUST stop at THIS union's originating fork
+        # gate(s). Fork -> branch is a COPY edge only for an identity branch; a
+        # transform-chain branch is wired gate -> first node as MOVE, so an
+        # unbounded backward walk would cross into pre-fork topology and reject
+        # an aggregation that sits before the fork — the very remedy this
+        # diagnostic recommends. A fork for another union is not a boundary:
+        # stopping there would hide hazards earlier in the current branch.
+        configured_fork_gate_names = {gate_entry.node_id: gate_entry.name for gate_entry in gate_entries if gate_entry.fork_to}
         for union_name, union_node_id in row_union_ids.items():
+            union_fork_gate_node_ids = {
+                gate_node_id
+                for branch_name, (_gate_name, gate_node_id) in row_union_branch_gates.items()
+                if row_union_branch_specs[branch_name].row_union_name == union_name
+            }
             seen_upstream: set[NodeID] = set()
             upstream_frontier: list[NodeID] = [union_node_id]
+            nested_fork_gate_names: set[str] = set()
             while upstream_frontier:
                 current = upstream_frontier.pop()
                 for in_edge in graph.get_incoming_edges(current):
                     upstream = in_edge.from_node
-                    if upstream in seen_upstream or upstream in fork_gate_node_ids:
+                    if upstream in seen_upstream or upstream in union_fork_gate_node_ids:
                         continue
                     seen_upstream.add(upstream)
                     if graph.get_node_info(upstream).node_type == NodeType.SINK:
                         continue
+                    nested_fork_gate_name = configured_fork_gate_names.get(upstream)
+                    if nested_fork_gate_name is not None:
+                        nested_fork_gate_names.add(nested_fork_gate_name)
                     upstream_agg = aggregation_settings_by_node.get(upstream)
                     if upstream_agg is not None and upstream_agg.output_mode == OutputMode.TRANSFORM:
                         raise GraphValidationError(
@@ -1398,6 +1409,16 @@ def build_execution_graph(
                             component_type="row_union",
                         )
                     upstream_frontier.append(upstream)
+            if nested_fork_gate_names:
+                raise GraphValidationError(
+                    f"Fork gate(s) {sorted(nested_fork_gate_names)} are nested inside a branch that feeds "
+                    f"row_union '{union_name}'. A nested fork replaces the enclosing branch identity and "
+                    f"terminalizes its parent before the enclosing row_union can receive or durably lose "
+                    f"that branch, so the union group can never be satisfied. Move the nested fork before "
+                    f"the fork that feeds '{union_name}', or terminate the branch at a sink.",
+                    component_id=str(union_name),
+                    component_type="row_union",
+                )
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)

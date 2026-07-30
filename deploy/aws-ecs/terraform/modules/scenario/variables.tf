@@ -338,6 +338,39 @@ variable "plugin_preferences" {
   type        = map(list(string))
   default     = null
   description = "Ordered implementation choice per control capability, e.g. {prompt_shield = [\"transform:aws_bedrock_prompt_shield\"]}. Null keeps the module default."
+
+  validation {
+    condition = var.plugin_preferences == null || alltrue([
+      for capability in keys(var.plugin_preferences) : contains(["llm", "prompt_shield", "content_safety"], capability)
+    ])
+    error_message = "plugin_preferences keys must be one of \"llm\", \"prompt_shield\", or \"content_safety\"."
+  }
+
+  validation {
+    condition = var.plugin_preferences == null || var.plugin_allowlist == null || alltrue(flatten([
+      for implementations in values(var.plugin_preferences) : [
+        for implementation in implementations :
+        contains(
+          setunion(
+            toset(var.plugin_allowlist),
+            toset([
+              "source:csv",
+              "source:json",
+              "source:text",
+              "sink:csv",
+              "sink:json",
+              "sink:text",
+              "transform:field_mapper",
+              "transform:llm",
+              "transform:web_scrape",
+            ]),
+          ),
+          implementation,
+        )
+      ]
+    ]))
+    error_message = "every preferred implementation must be authorized by the always-authorized web core or plugin_allowlist."
+  }
 }
 
 variable "plugin_control_modes" {
@@ -350,6 +383,13 @@ variable "plugin_control_modes" {
       for mode in values(var.plugin_control_modes) : contains(["required", "recommend"], mode)
     ])
     error_message = "each plugin_control_modes value must be \"required\" or \"recommend\"."
+  }
+
+  validation {
+    condition = var.plugin_control_modes == null || alltrue([
+      for capability in keys(var.plugin_control_modes) : contains(["llm", "prompt_shield", "content_safety"], capability)
+    ])
+    error_message = "plugin_control_modes keys must be one of \"llm\", \"prompt_shield\", or \"content_safety\"."
   }
 
   # The web service compiles the policy at startup and fails closed on both of
@@ -367,16 +407,6 @@ variable "plugin_control_modes" {
     error_message = "a control set to \"required\" must name at least one implementation in plugin_preferences."
   }
 
-  validation {
-    condition = var.plugin_control_modes == null || var.plugin_preferences == null || var.plugin_allowlist == null || alltrue(flatten([
-      for capability, mode in var.plugin_control_modes : [
-        for implementation in lookup(var.plugin_preferences, capability, []) :
-        contains(var.plugin_allowlist, implementation)
-      ]
-      if mode == "required"
-    ]))
-    error_message = "every implementation preferred for a \"required\" control must also appear in plugin_allowlist."
-  }
 }
 
 variable "llm_profiles" {
@@ -411,9 +441,9 @@ variable "default_llm_profile" {
   # this it is discovered only after the service is rolled. Checking it here
   # fails `terraform plan` instead.
   validation {
-    condition = var.default_llm_profile == null || contains(
+    condition = contains(
       var.llm_profiles == null ? ["standard", "fast"] : keys(var.llm_profiles),
-      coalesce(var.default_llm_profile, ""),
+      coalesce(var.default_llm_profile, "standard"),
     )
     error_message = "default_llm_profile must name a configured llm_profiles alias; the module default pair is \"standard\" and \"fast\"."
   }

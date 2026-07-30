@@ -799,17 +799,20 @@ same statement in the permissions boundary.
 
 **The S3 object must fall inside the caller's own object grant, and a document
 outside it fails misleadingly.** The effective read scope is whatever
-`s3:GetObject` grant the pipeline identity holds. In the reference AWS ECS
-deployment the task role's grant is scoped to `<bucket>/<namespace>/<run_id>/*`,
-so documents must live under that granted prefix — a document elsewhere in the
-*same* bucket is unreadable. Textract reports that as
+`s3:GetObject` grant the pipeline identity holds. When `version_field` is
+configured, the identity also needs `s3:GetObjectVersion` on that same object
+scope; `s3:GetObject` alone does not authorize the version-pinned read. In the
+reference AWS ECS deployment both actions are granted on
+`<bucket>/<namespace>/<run_id>/*`, so documents must live under that prefix — a
+document elsewhere in the *same* bucket is unreadable. Textract reports that as
 `{"code": "InvalidS3ObjectException", "error_type": "service_error", "reason":
 "submit_failed"}`; the provider does not distinguish an authorization miss from
 a missing or corrupt file. ELSPETH therefore classifies this code with
 `cause: s3_object_unreadable` and an `error` hint in the audit reason: check
-the role's `s3:GetObject` scope (then object existence and region) before
-suspecting the document itself. Read the granted prefix from the task-role
-policy rather than guessing:
+the role's `s3:GetObject` scope and, for a version-pinned row,
+`s3:GetObjectVersion` (then object existence and region) before suspecting the
+document itself. Read the granted prefix from the task-role policy rather than
+guessing:
 
 ```sh
 aws iam get-role-policy --role-name <task-role> --policy-name <task-policy> \
