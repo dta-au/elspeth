@@ -259,6 +259,17 @@ def _build_gateway_app(
     # from within the uvicorn server thread's own event loop for the
     # fixture's lifetime; it is garbage-collected once that thread and loop
     # shut down.
+    #
+    # Constructed here on the calling (test) thread but only ever awaited
+    # from the uvicorn server thread's event loop (this function returns the
+    # app to be handed to that server before any request is made). This is
+    # safe only because httpx.AsyncClient defers all event-loop-bound state
+    # (its internal connection pool / anyio backend) to lazy init on first
+    # async use -- it does not bind to a loop at construction time. If a
+    # future httpx upgrade changes that (e.g. binding a loop reference
+    # eagerly in __init__), this would start failing with a
+    # cross-event-loop error the first time the server thread touches the
+    # client, which is the diagnostic signal to look for if this ever flakes.
     upstream_client = httpx.AsyncClient(transport=router_transport)
 
     env = {
@@ -323,6 +334,12 @@ def _running_gateway_server(app: Any) -> Iterator[str]:
     finally:
         server.should_exit = True
         thread.join(timeout=10.0)
+        if thread.is_alive():
+            raise RuntimeError(
+                "gateway e2e server thread did not exit within 10s after "
+                "should_exit=True -- it would otherwise leak a thread/socket "
+                "silently for the rest of the suite"
+            )
 
 
 def _make_provider(
