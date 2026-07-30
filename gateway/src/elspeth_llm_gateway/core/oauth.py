@@ -24,6 +24,7 @@ import asyncio
 import base64
 import time
 from collections.abc import Callable
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -31,23 +32,40 @@ from elspeth_llm_gateway.core.config import GatewayConfig
 from elspeth_llm_gateway.core.errors import GatewayError, GatewayErrorCode
 from elspeth_llm_gateway.core.parsing import StrictJsonError, parse_strict_json
 
-_LOOPBACK_PREFIX = "http://127.0.0.1"
+_LOOPBACK_HOST = "127.0.0.1"
 
 
 def _is_valid_token_url(url: str) -> bool:
-    """``https://...`` or exactly ``http://127.0.0.1`` (host boundary, not a substring).
+    """``https://<host>/...`` with a real host, or ``http://`` with host exactly ``127.0.0.1``.
 
-    A plain ``str.startswith("http://127.0.0.1")`` would also accept
-    ``http://127.0.0.1.evil.com/token`` — the prefix matches, but the host is
-    not loopback at all. Requiring the character immediately after the
-    prefix to be absent, ``:``, or ``/`` closes that hole.
+    Parses rather than prefix-matches: a bare ``str.startswith`` guard would
+    accept ``http://127.0.0.1.evil.com/token`` (matching prefix, non-loopback
+    host) and would say nothing about a URL carrying embedded userinfo
+    (``https://user:pass@host/token``) — httpx applies that userinfo as an
+    outgoing Basic ``Authorization`` header, silently overriding the one this
+    module constructs for ``client_secret_basic``, and about to send the
+    wrong (URL-embedded) credentials to the token endpoint. Requiring
+    ``username``/``password`` to be absent and the ``hostname`` to be
+    non-empty and — for ``http`` — exactly the loopback address closes both
+    holes.
     """
-    if url.startswith("https://"):
-        return True
-    if not url.startswith(_LOOPBACK_PREFIX):
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
         return False
-    rest = url[len(_LOOPBACK_PREFIX) :]
-    return rest == "" or rest[0] in (":", "/")
+
+    if parsed.username is not None or parsed.password is not None:
+        return False
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme == "http":
+        return hostname == _LOOPBACK_HOST
+    return False
 
 
 class TokenManager:

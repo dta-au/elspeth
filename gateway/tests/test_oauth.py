@@ -12,6 +12,7 @@ from elspeth_llm_gateway.core.oauth import TokenManager
 TOKEN_URL = "https://auth.example.com/token"
 CLIENT_ID = "client-id-value"
 CLIENT_SECRET = "c" * 40
+BODY_SENTINEL = "BODY-SENTINEL-9f3a2c"  # planted in every failure body; must never reach str(exc)
 
 BASE_ENV = {
     "ELSPETH_LLM_GATEWAY_INBOUND_BEARER": "b" * 40,
@@ -64,35 +65,51 @@ async def client():
         yield http_client
 
 
-def _ok_response(*, access_token="tok", token_type="bearer", expires_in=300, extra=None):
+def _ok_response(*, access_token="tok", token_type="bearer", expires_in=300, sentinel=False):
     body = {"access_token": access_token, "token_type": token_type, "expires_in": expires_in}
-    if extra:
-        body.update(extra)
+    if sentinel:
+        body["sentinel"] = BODY_SENTINEL
     return httpx.Response(200, json=body)
 
 
 # --- constructor guard ---------------------------------------------------------
 
 
-def test_constructor_accepts_https_token_url(client):
+async def test_constructor_accepts_https_token_url(client):
     config = _config()
     TokenManager(config, client)  # must not raise
 
 
-def test_constructor_accepts_loopback_http_token_url(client):
+async def test_constructor_accepts_loopback_http_token_url(client):
     config = _config(ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL="http://127.0.0.1:8080/token")
     TokenManager(config, client)  # must not raise
 
 
-def test_constructor_rejects_plain_http_token_url(client):
+async def test_constructor_rejects_plain_http_token_url(client):
     config = _config(ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL="http://auth.example.com/token")
     with pytest.raises(ValueError):
         TokenManager(config, client)
 
 
-def test_constructor_rejects_loopback_lookalike_host(client):
+async def test_constructor_rejects_loopback_lookalike_host(client):
     """``http://127.0.0.1.evil.com`` must not pass a naive ``startswith`` guard."""
     config = _config(ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL="http://127.0.0.1.evil.com/token")
+    with pytest.raises(ValueError):
+        TokenManager(config, client)
+
+
+async def test_constructor_rejects_bare_https_scheme_with_no_host(client):
+    """A parsed check (not a prefix match) must reject a URL with no host at all."""
+    config = _config(ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL="https://")
+    with pytest.raises(ValueError):
+        TokenManager(config, client)
+
+
+async def test_constructor_rejects_embedded_userinfo(client):
+    """httpx applies URL-embedded userinfo as its own Basic auth header, silently
+    overriding the header this module constructs for client_secret_basic — so a
+    token URL carrying a username/password must be rejected at construction."""
+    config = _config(ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL="https://user:pass@auth.example.com/token")
     with pytest.raises(ValueError):
         TokenManager(config, client)
 
@@ -269,12 +286,12 @@ def _assert_leak_free(exc: GatewayError) -> None:
     assert exc.code == GatewayErrorCode.OAUTH_TOKEN_UNAVAILABLE
     assert CLIENT_ID not in text
     assert CLIENT_SECRET not in text
-    assert "response body" not in text.lower()
+    assert BODY_SENTINEL not in text
 
 
 @respx.mock
 async def test_non_200_status_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=httpx.Response(500, text="upstream on fire, secret=" + CLIENT_SECRET))
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(500, text=f"upstream on fire, secret={CLIENT_SECRET} {BODY_SENTINEL}"))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -286,7 +303,7 @@ async def test_non_200_status_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_non_json_body_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, text="not json, client_secret=" + CLIENT_SECRET))
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, text=f"not json, client_secret={CLIENT_SECRET} {BODY_SENTINEL}"))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -298,7 +315,7 @@ async def test_non_json_body_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_non_object_json_body_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=["not", "an", "object"]))
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=["not", "an", "object", BODY_SENTINEL]))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -310,7 +327,9 @@ async def test_non_object_json_body_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_missing_access_token_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"token_type": "bearer", "expires_in": 300}))
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"token_type": "bearer", "expires_in": 300, "sentinel": BODY_SENTINEL})
+    )
     config = _config()
     manager = TokenManager(config, client)
 
@@ -322,7 +341,7 @@ async def test_missing_access_token_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_empty_access_token_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=_ok_response(access_token=""))
+    respx.post(TOKEN_URL).mock(return_value=_ok_response(access_token="", sentinel=True))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -334,7 +353,7 @@ async def test_empty_access_token_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_wrong_token_type_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=_ok_response(token_type="mac"))
+    respx.post(TOKEN_URL).mock(return_value=_ok_response(token_type="mac", sentinel=True))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -357,7 +376,7 @@ async def test_token_type_is_case_insensitive_bearer_accepted(client):
 
 @respx.mock
 async def test_missing_token_type_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok", "expires_in": 300}))
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok", "expires_in": 300, "sentinel": BODY_SENTINEL}))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -369,7 +388,7 @@ async def test_missing_token_type_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_zero_expires_in_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=0))
+    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=0, sentinel=True))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -381,7 +400,7 @@ async def test_zero_expires_in_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_negative_expires_in_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=-5))
+    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=-5, sentinel=True))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -393,7 +412,7 @@ async def test_negative_expires_in_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_non_int_expires_in_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in="300"))
+    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in="300", sentinel=True))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -405,7 +424,7 @@ async def test_non_int_expires_in_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_bool_expires_in_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=True))
+    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=True, sentinel=True))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -417,7 +436,7 @@ async def test_bool_expires_in_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_float_expires_in_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=300.5))
+    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=300.5, sentinel=True))
     config = _config()
     manager = TokenManager(config, client)
 
@@ -429,16 +448,15 @@ async def test_float_expires_in_raises_oauth_token_unavailable(client):
 
 @respx.mock
 async def test_transport_error_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(side_effect=httpx.ConnectError("connection refused"))
+    respx.post(TOKEN_URL).mock(side_effect=httpx.ConnectError(f"connection refused {BODY_SENTINEL}"))
     config = _config()
     manager = TokenManager(config, client)
 
     with pytest.raises(GatewayError) as exc_info:
         await manager.get_token()
 
-    text = str(exc_info.value)
-    assert exc_info.value.code == GatewayErrorCode.OAUTH_TOKEN_UNAVAILABLE
-    assert "connection refused" not in text
+    _assert_leak_free(exc_info.value)
+    assert "connection refused" not in str(exc_info.value)
 
 
 # --- fixed-lifetime fallback -----------------------------------------------------
@@ -475,7 +493,9 @@ async def test_expires_in_absent_uses_fixed_lifetime_when_configured(client):
 
 @respx.mock
 async def test_expires_in_absent_and_no_fixed_lifetime_raises_oauth_token_unavailable(client):
-    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "tok", "token_type": "bearer"}))
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok", "token_type": "bearer", "sentinel": BODY_SENTINEL})
+    )
     config = _config(ELSPETH_LLM_GATEWAY_OAUTH_FIXED_LIFETIME_SECONDS=None)
     manager = TokenManager(config, client)
 
@@ -487,7 +507,7 @@ async def test_expires_in_absent_and_no_fixed_lifetime_raises_oauth_token_unavai
 
 @respx.mock
 async def test_expires_in_present_invalid_never_falls_back_to_fixed_lifetime(client):
-    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=0))
+    respx.post(TOKEN_URL).mock(return_value=_ok_response(expires_in=0, sentinel=True))
     config = _config(ELSPETH_LLM_GATEWAY_OAUTH_FIXED_LIFETIME_SECONDS="300")
     manager = TokenManager(config, client)
 
