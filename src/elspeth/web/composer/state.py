@@ -841,6 +841,38 @@ def _runtime_consumer_connections(nodes: tuple[NodeSpec, ...]) -> set[str]:
     return consumers
 
 
+def _runtime_connection_is_downstream(
+    origin: str,
+    target: str,
+    nodes: tuple[NodeSpec, ...],
+) -> bool:
+    """Return whether ``target`` is reachable through runtime routing from ``origin``."""
+    reachable = {origin}
+    while True:
+        expanded = set(reachable)
+        for node in nodes:
+            inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
+            if reachable.isdisjoint(inputs):
+                continue
+            if node.node_type == "coalesce" and node.on_success is None:
+                expanded.add(node.id)
+            elif node.on_success is not None:
+                expanded.add(node.on_success)
+            if node.on_error is not None and node.on_error != "discard":
+                expanded.add(node.on_error)
+            if node.routes is not None:
+                expanded.update(
+                    route_target for route_target in node.routes.values() if route_target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET)
+                )
+            if node.fork_to is not None:
+                expanded.update(node.fork_to)
+        if target in expanded:
+            return True
+        if expanded == reachable:
+            return False
+        reachable = expanded
+
+
 def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, Any]]:
     """Redaction-safe wiring facts for coalesce branch-reachability rejections.
 
@@ -3360,12 +3392,12 @@ class CompositionState:
 
         # 8. Connection completeness
         runtime_connections = _runtime_connection_targets(self.sources, self.nodes)
-        gate_fork_branches = {
-            branch
+        gate_fork_branches_by_id = {
+            candidate.id: frozenset(candidate.fork_to)
             for candidate in self.nodes
             if candidate.node_type == "gate" and candidate.fork_to is not None
-            for branch in candidate.fork_to
         }
+        gate_fork_branches = {branch for branches in gate_fork_branches_by_id.values() for branch in branches}
         for node in self.nodes:
             if node.node_type == "coalesce":
                 missing_branches = sorted(
@@ -3382,7 +3414,9 @@ class CompositionState:
                     )
                 continue
             if node.node_type == "row_union":
-                missing_aliases = sorted(branch for branch in _coalesce_branch_names(node.branches) if branch not in gate_fork_branches)
+                branch_aliases = _coalesce_branch_names(node.branches)
+                branch_connections = _coalesce_branch_connections(node.branches)
+                missing_aliases = sorted(branch for branch in branch_aliases if branch not in gate_fork_branches)
                 if missing_aliases:
                     errors.append(
                         _err(
@@ -3392,9 +3426,7 @@ class CompositionState:
                             "row_union_branch_alias_unreachable",
                         )
                     )
-                missing_branches = sorted(
-                    branch for branch in _coalesce_branch_connections(node.branches) if branch not in runtime_connections
-                )
+                missing_branches = sorted(branch for branch in branch_connections if branch not in runtime_connections)
                 if missing_branches:
                     errors.append(
                         _err(
@@ -3404,6 +3436,41 @@ class CompositionState:
                             "row_union_branch_unreachable",
                         )
                     )
+                if not missing_aliases and not missing_branches:
+                    common_gate_ids = sorted(
+                        gate_id
+                        for gate_id, fork_branches in gate_fork_branches_by_id.items()
+                        if set(branch_aliases).issubset(fork_branches)
+                    )
+                    if not common_gate_ids:
+                        alias_origins = ", ".join(
+                            f"'{alias}' from {sorted(gate_id for gate_id, branches in gate_fork_branches_by_id.items() if alias in branches)}"
+                            for alias in branch_aliases
+                        )
+                        errors.append(
+                            _err(
+                                f"node:{node.id}",
+                                f"row_union '{node.id}' branch aliases must all come from one common gate fork_to "
+                                f"so they share one correlation origin; observed {alias_origins}. "
+                                "Choose every alias from a single gate or create a separate row_union per fork.",
+                                "high",
+                                "row_union_branch_invalid",
+                            )
+                        )
+                    else:
+                        for branch_alias, branch_connection in zip(branch_aliases, branch_connections, strict=True):
+                            if _runtime_connection_is_downstream(branch_alias, branch_connection, self.nodes):
+                                continue
+                            errors.append(
+                                _err(
+                                    f"node:{node.id}",
+                                    f"row_union '{node.id}' branch alias '{branch_alias}' maps to input connection "
+                                    f"'{branch_connection}', which is not downstream of that alias's fork edge. "
+                                    "Wire each branches[alias] value through processing that starts at the same gate fork branch.",
+                                    "high",
+                                    "row_union_branch_invalid",
+                                )
+                            )
                 continue
 
             if node.input not in runtime_connections:

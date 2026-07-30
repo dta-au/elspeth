@@ -6732,6 +6732,60 @@ class TestCompositionStateRowUnion:
 
         assert result.is_valid, result.errors
 
+    def test_row_union_rejects_branch_aliases_from_multiple_fork_gates(self) -> None:
+        second_gate = self._gate(
+            id="fork_treatment",
+            input="second_fork_in",
+            fork_to=("treatment_branch", "treatment_overflow"),
+        )
+        state = CompositionState(
+            sources={
+                "control_source": self._source(on_success="fork_in"),
+                "treatment_source": self._source(on_success="second_fork_in"),
+            },
+            nodes=(
+                self._gate(fork_to=("control_branch", "control_overflow")),
+                second_gate,
+                self._transform("control", "control_branch", "control_done"),
+                self._transform("control_overflow", "control_overflow", "control_overflow_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                self._transform("treatment_overflow", "treatment_overflow", "treatment_overflow_done"),
+                self._row_union(),
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(
+                self._output(),
+                self._output("control_overflow_done"),
+                self._output("treatment_overflow_done"),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        origin_error = next(error for error in result.errors if error.error_code == "row_union_branch_invalid")
+        assert "one common gate fork_to" in origin_error.message
+        assert "fork_rows" in origin_error.message
+        assert "fork_treatment" in origin_error.message
+
+    def test_row_union_rejects_branch_connection_from_a_different_alias(self) -> None:
+        row_union = self._row_union(
+            input="treatment_done",
+            branches={
+                "control_branch": "treatment_done",
+                "treatment_branch": "control_done",
+            },
+        )
+
+        result = self._state(row_union=row_union).validate()
+
+        mapping_error = next(error for error in result.errors if error.error_code == "row_union_branch_invalid")
+        assert "control_branch" in mapping_error.message
+        assert "treatment_done" in mapping_error.message
+        assert "not downstream" in mapping_error.message
+
     def test_row_union_output_feeds_ordinary_node_without_placeholder_consumer(self) -> None:
         state = self._state()
 
