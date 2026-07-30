@@ -178,6 +178,11 @@ class _CoalesceSuccessFlow(TypedDict):
     branch: str | None
 
 
+class _RowUnionSuccessFlow(TypedDict):
+    kind: Literal["row_union_success"]
+    branch: str | None
+
+
 class _OutputWriteFailureFlow(TypedDict):
     kind: Literal["output_write_failure"]
 
@@ -191,6 +196,7 @@ _ProposalFlow = (
     | _GateForkFlow
     | _QueueContinueFlow
     | _CoalesceSuccessFlow
+    | _RowUnionSuccessFlow
     | _OutputWriteFailureFlow
 )
 
@@ -237,13 +243,20 @@ class _CoalesceBehavior(TypedDict):
     merge: Literal["union", "nested", "select"]
 
 
-_ProposalNodeBehavior = _TransformBehavior | _GateBehavior | _AggregationBehavior | _QueueBehavior | _CoalesceBehavior
+class _RowUnionBehavior(TypedDict):
+    kind: Literal["row_union"]
+    branch_aliases: Sequence[str]
+    policy: Literal["require_all"]
+    timeout_seconds: float | None
+
+
+_ProposalNodeBehavior = _TransformBehavior | _GateBehavior | _AggregationBehavior | _QueueBehavior | _CoalesceBehavior | _RowUnionBehavior
 
 
 class _ProposalNodeSummary(TypedDict):
     stable_id: str
     label: str
-    node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce"]
+    node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce", "row_union"]
     plugin: _ProposalPluginRef | None
     behavior: _ProposalNodeBehavior
 
@@ -296,7 +309,7 @@ class ProposePipelinePayload(TypedDict):
 
 class _WireRowCardinality(TypedDict):
     input: Literal["none", "one", "batch", "branches", "many_producers"]
-    output: Literal["one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch_set", "expected_count"]
+    output: Literal["one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch", "one_per_branch_set", "expected_count"]
     expected_output_count: str | None
 
 
@@ -676,7 +689,7 @@ _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "interpretation_required": "guided.proposal.blocker.interpretation_required.v1",
 }
 _COMPONENT_KINDS = frozenset({"source", "node", "edge", "output"})
-_NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce"})
+_NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce", "row_union"})
 _FLOW_KINDS = frozenset(
     {
         "source_success",
@@ -687,6 +700,7 @@ _FLOW_KINDS = frozenset(
         "gate_fork",
         "queue_continue",
         "coalesce_success",
+        "row_union_success",
         "output_write_failure",
     }
 )
@@ -1084,7 +1098,9 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         return "payload.draft_hash must be 64 lowercase hexadecimal characters"
     cardinality_keys = frozenset({"input", "output", "expected_output_count"})
     cardinality_inputs = frozenset({"none", "one", "batch", "branches", "many_producers"})
-    cardinality_outputs = frozenset({"one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch_set", "expected_count"})
+    cardinality_outputs = frozenset(
+        {"one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch", "one_per_branch_set", "expected_count"}
+    )
 
     def validate_cardinality(value: object, path: str) -> str | None:
         if (nested_error := _exact_nested_keys(value, cardinality_keys, path)) is not None:
@@ -1410,6 +1426,27 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
         ):
             return error
         return None
+    if node_type == "row_union":
+        expected = frozenset({"kind", "branch_aliases", "policy", "timeout_seconds"})
+        if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
+            return error
+        _, error = _validate_alias_sequence(
+            behavior["branch_aliases"],
+            kind="branch",
+            path=f"{behavior_path}.branch_aliases",
+            minimum=2,
+        )
+        if error is not None:
+            return error
+        if behavior["policy"] != "require_all":
+            return f"{behavior_path}.policy must be 'require_all'"
+        timeout_seconds = behavior["timeout_seconds"]
+        if (
+            timeout_seconds is not None
+            and (error := _finite_positive_number_error(timeout_seconds, f"{behavior_path}.timeout_seconds")) is not None
+        ):
+            return error
+        return None
     expected = frozenset({"kind", "branch_aliases", "policy", "merge"})
     if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
         return error
@@ -1454,7 +1491,7 @@ def _validate_proposal_flow(value: object, path: str) -> str | None:
     kind = value.get("kind")
     if kind not in _FLOW_KINDS:
         return f"{path}.kind is outside the closed flow vocabulary"
-    if kind in ("source_success", "node_success", "queue_continue", "coalesce_success"):
+    if kind in ("source_success", "node_success", "queue_continue", "coalesce_success", "row_union_success"):
         if (error := _exact_nested_keys(value, frozenset({"kind", "branch"}), path)) is not None:
             return error
         branch = value["branch"]
@@ -1656,6 +1693,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     gate_routes: dict[str, list[str]] = {}
     gate_forks: dict[str, list[tuple[tuple[str, ...], str]]] = {}
     branch_origins: dict[str, list[str]] = {}
+    branch_origin_gates: dict[str, list[str]] = {}
     branch_adjacency: dict[str, dict[str, set[str]]] = {}
     branch_uses: list[tuple[str, str, str, str]] = []
 
@@ -1695,6 +1733,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
                 "gate": frozenset({"gate_route", "gate_fork"}),
                 "queue": frozenset({"queue_continue"}),
                 "coalesce": frozenset({"coalesce_success"}),
+                "row_union": frozenset({"row_union_success"}),
             }
             if flow_kind not in legal_node_flows[node_type]:
                 return f"{path}.flow is not legal for its node_type"
@@ -1707,15 +1746,18 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             "gate_fork": frozenset({"node", "output"}),
             "queue_continue": frozenset({"node", "output"}),
             "coalesce_success": frozenset({"node", "output"}),
+            "row_union_success": frozenset({"node"}),
             "output_write_failure": frozenset({"output", "discard"}),
         }
+        if flow_kind == "row_union_success" and to_kind != "node":
+            return f"{path}.row_union_success must target an ordinary processing node"
         if to_kind not in legal_to_kinds[flow_kind]:
             return f"{path}.flow is not legal for its to_endpoint kind"
         if from_stable_id == to_stable_id:
             return f"{path} is a self-loop"
         branch = flow.get("branch")
-        if to_kind == "node" and node_by_id[to_stable_id]["node_type"] == "coalesce" and branch is None:
-            return f"{path}.flow into a coalesce node requires a branch alias"
+        if to_kind == "node" and node_by_id[to_stable_id]["node_type"] in ("coalesce", "row_union") and branch is None:
+            return f"{path}.flow into a correlated barrier node requires a branch alias"
         adjacency[from_stable_id].add(to_stable_id)
         reverse_adjacency[to_stable_id].add(from_stable_id)
         outgoing_flows.setdefault(from_stable_id, []).append(flow)
@@ -1725,6 +1767,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         elif flow_kind == "gate_fork":
             gate_forks.setdefault(from_stable_id, []).append((tuple(flow["routes"]), flow["branch"]))
             branch_origins.setdefault(flow["branch"], []).append(to_stable_id)
+            branch_origin_gates.setdefault(flow["branch"], []).append(from_stable_id)
         if branch is not None:
             branch_graph = branch_adjacency.setdefault(branch, {})
             branch_graph.setdefault(from_stable_id, set()).add(to_stable_id)
@@ -1765,6 +1808,21 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges.get(stable_id, ()) if flow.get("branch") is not None)
             if incoming_branches != tuple(behavior["branch_aliases"]):
                 return "payload coalesce branch aliases do not match its incoming flows"
+        elif node["node_type"] == "row_union":
+            if flow_kinds != ("row_union_success",):
+                return "payload row_union node requires exactly one row_union_success flow"
+            incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges.get(stable_id, ()) if flow.get("branch") is not None)
+            if incoming_branches != tuple(behavior["branch_aliases"]):
+                return "payload row_union branch aliases do not match its incoming flows"
+            target_ids = adjacency[stable_id]
+            if len(target_ids) != 1:
+                return "payload row_union node requires exactly one ordinary processing target"
+            target_id = next(iter(target_ids))
+            if target_id not in node_by_id or node_by_id[target_id]["node_type"] not in ("transform", "gate", "aggregation"):
+                return "payload row_union success must target one ordinary processing node"
+            origin_gates = {gate_id for branch in behavior["branch_aliases"] for gate_id in branch_origin_gates.get(branch, ())}
+            if len(origin_gates) != 1:
+                return "payload row_union branches must originate under one gate_fork"
 
     for source in sources:
         flow_kinds = tuple(flow["kind"] for flow in outgoing_flows.get(source["stable_id"], ()))
@@ -1796,17 +1854,17 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     if branch_aliases != expected_branches or any(len(origins) != 1 for origins in branch_origins.values()):
         return "payload fork branch aliases must be globally unique server ordinals"
 
-    branch_coalesce_owner: dict[str, str] = {}
+    branch_barrier_owner: dict[str, str] = {}
     for node in nodes:
-        if node["node_type"] != "coalesce":
+        if node["node_type"] not in ("coalesce", "row_union"):
             continue
         behavior = node["behavior"]
         assert isinstance(behavior, Mapping)
         for branch in behavior["branch_aliases"]:
-            existing_owner = branch_coalesce_owner.get(branch)
+            existing_owner = branch_barrier_owner.get(branch)
             if existing_owner is not None and existing_owner != node["stable_id"]:
-                return "payload fork branch alias cannot be consumed by more than one coalesce node"
-            branch_coalesce_owner[branch] = node["stable_id"]
+                return "payload fork branch alias cannot be consumed by more than one coalesce/row_union node"
+            branch_barrier_owner[branch] = node["stable_id"]
 
     for branch, from_stable_id, flow_kind, path in branch_uses:
         origins = branch_origins.get(branch)
@@ -1826,14 +1884,14 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.flow branch alias is not downstream of its authoritative gate_fork origin"
 
     for node in nodes:
-        if node["node_type"] != "coalesce":
+        if node["node_type"] not in ("coalesce", "row_union"):
             continue
         behavior = node["behavior"]
         assert isinstance(behavior, Mapping)
         for branch in behavior["branch_aliases"]:
             origins = branch_origins.get(branch)
             if origins is None:
-                return "payload coalesce branch alias has no authoritative gate_fork origin"
+                return "payload correlated barrier branch alias has no authoritative gate_fork origin"
             branch_graph = branch_adjacency[branch]
             frontier = list(origins)
             visited = set(frontier)
@@ -1843,7 +1901,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
                     visited.add(target_id)
                     frontier.append(target_id)
             if node["stable_id"] not in visited:
-                return "payload coalesce branch is not connected to its gate_fork origin"
+                return "payload correlated barrier branch is not connected to its gate_fork origin"
 
     indegree = dict.fromkeys(component_kind_by_id, 0)
     for from_id, target_ids in adjacency.items():

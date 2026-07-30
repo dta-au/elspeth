@@ -12,6 +12,7 @@ import pytest
 
 import elspeth.web.composer.guided.planning as guided_planning
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.guided.planning import (
     build_guided_proposal_projection,
@@ -781,6 +782,171 @@ def test_fork_coalesce_ab_projection_routes_every_branch_output_into_the_coalesc
     # The coalesce republishes its merged rows to the downstream field_mapper.
     coalesce_outgoing = [edge for edge in payload["graph"]["edges"] if edge["from_endpoint"].get("stable_id") == coalesce_id]
     assert [edge["flow"]["kind"] for edge in coalesce_outgoing] == ["coalesce_success"]
+
+
+def _ab_row_union_proposal(guided: GuidedSession) -> PipelineProposal:
+    """A fork -> two tagged variants -> row_union -> experiment comparison."""
+    return PipelineProposal.create(
+        pipeline={
+            "sources": {
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "csv_rows",
+                    "options": {"path": "blob:00000000-0000-0000-0000-000000000001", "schema": {"mode": "observed"}},
+                    "on_validation_failure": "discard",
+                }
+            },
+            "nodes": [
+                {
+                    "id": "fork_gate",
+                    "node_type": "gate",
+                    "plugin": None,
+                    "input": "csv_rows",
+                    "on_success": None,
+                    "on_error": None,
+                    "options": {},
+                    "condition": "True",
+                    "routes": {"true": "fork", "false": "fork"},
+                    "fork_to": ["control_branch", "treatment_branch"],
+                },
+                {
+                    "id": "tag_control",
+                    "node_type": "transform",
+                    "plugin": "value_transform",
+                    "input": "control_branch",
+                    "on_success": "control_scored",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}, "operations": []},
+                },
+                {
+                    "id": "tag_treatment",
+                    "node_type": "transform",
+                    "plugin": "value_transform",
+                    "input": "treatment_branch",
+                    "on_success": "treatment_scored",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}, "operations": []},
+                },
+                {
+                    "id": "variant_union",
+                    "node_type": "row_union",
+                    "plugin": None,
+                    "input": "control_scored",
+                    "on_success": "experiment_rows",
+                    "on_error": None,
+                    "options": {},
+                    "branches": {
+                        "control_branch": "control_scored",
+                        "treatment_branch": "treatment_scored",
+                    },
+                    "policy": None,
+                    "merge": None,
+                    "timeout_seconds": 12.5,
+                },
+                {
+                    "id": "compare",
+                    "node_type": "aggregation",
+                    "plugin": "batch_experiment_compare",
+                    "input": "experiment_rows",
+                    "on_success": "colour_ab_out",
+                    "on_error": "discard",
+                    "options": {
+                        "schema": {"mode": "observed"},
+                        "variant_field": "prompt_variant",
+                        "score_field": "score",
+                    },
+                    "trigger": {},
+                    "output_mode": "transform",
+                },
+            ],
+            "edges": [],
+            "outputs": [
+                {
+                    "name": "colour_ab_out",
+                    "plugin": "json",
+                    "options": {"path": "out.json", "schema": {"mode": "observed"}},
+                    "on_write_failure": "discard",
+                }
+            ],
+        },
+        base=PresentBase(state_id=CHECKPOINT_ID, composition_content_hash="a" * 64),
+        reviewed_facts=guided_private_reviewed_facts(guided),
+        surface=PlannerSurface.GUIDED_STAGED,
+        repair_count=0,
+        skill_hash=stable_hash("guided planner skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+
+
+def test_fork_row_union_ab_projection_preserves_every_branch_and_n_to_n_success() -> None:
+    guided = _ab_coalesce_guided()
+    proposal = _ab_row_union_proposal(guided)
+    catalog = {
+        "source": frozenset({"csv"}),
+        "transform": frozenset({"value_transform", "batch_experiment_compare"}),
+        "sink": frozenset({"json"}),
+    }
+
+    payload = build_guided_proposal_projection(
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+
+    verify_guided_proposal_projection(
+        payload=payload,
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+    row_union = next(node for node in payload["nodes"] if node["node_type"] == "row_union")
+    assert row_union["behavior"] == {
+        "kind": "row_union",
+        "branch_aliases": ["branch-1", "branch-2"],
+        "policy": "require_all",
+        "timeout_seconds": 12.5,
+    }
+    incoming = [edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == row_union["stable_id"]]
+    assert [edge["flow"]["branch"] for edge in incoming] == ["branch-1", "branch-2"]
+    outgoing = [edge for edge in payload["graph"]["edges"] if edge["from_endpoint"].get("stable_id") == row_union["stable_id"]]
+    assert [edge["flow"]["kind"] for edge in outgoing] == ["row_union_success"]
+    assert outgoing[0]["to_endpoint"]["kind"] == "node"
+
+
+def test_fork_row_union_projection_preserves_declared_branch_order_when_producers_are_reversed() -> None:
+    guided = _ab_coalesce_guided()
+    original = _ab_row_union_proposal(guided)
+    pipeline = deep_thaw(original.pipeline)
+    pipeline["nodes"][1:3] = reversed(pipeline["nodes"][1:3])
+    proposal = PipelineProposal.create(
+        pipeline=pipeline,
+        base=PresentBase(state_id=CHECKPOINT_ID, composition_content_hash="a" * 64),
+        reviewed_facts=guided_private_reviewed_facts(guided),
+        surface=PlannerSurface.GUIDED_STAGED,
+        repair_count=0,
+        skill_hash=stable_hash("guided planner skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+
+    payload = build_guided_proposal_projection(
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids={
+            "source": frozenset({"csv"}),
+            "transform": frozenset({"value_transform", "batch_experiment_compare"}),
+            "sink": frozenset({"json"}),
+        },
+    )
+
+    row_union = next(node for node in payload["nodes"] if node["node_type"] == "row_union")
+    assert row_union["behavior"]["branch_aliases"] == ["branch-1", "branch-2"]
+    incoming = [edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == row_union["stable_id"]]
+    assert [edge["flow"]["branch"] for edge in incoming] == ["branch-1", "branch-2"]
 
 
 def _ab_coalesce_proposal_ordered(

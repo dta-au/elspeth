@@ -234,6 +234,136 @@ def _fork_coalesce_payload() -> dict[str, Any]:
     return payload
 
 
+def _fork_row_union_payload() -> dict[str, Any]:
+    payload = _payload()
+    route = proposal_structural_label("route", 0)
+    branches = [proposal_structural_label("branch", index) for index in range(2)]
+    gate_id = NODE_ID
+    control_id = NODE_2_ID
+    treatment_id = "00000000-0000-4000-8000-000000000414"
+    union_id = "00000000-0000-4000-8000-000000000415"
+    aggregate_id = "00000000-0000-4000-8000-000000000416"
+    payload["nodes"] = [
+        {
+            "stable_id": gate_id,
+            "label": proposal_component_label("node", 0),
+            "node_type": "gate",
+            "plugin": None,
+            "behavior": {
+                "kind": "gate",
+                "route_aliases": [route],
+                "fork_branches": [{"routes": [route], "branch": branch} for branch in branches],
+            },
+        },
+        *(
+            {
+                "stable_id": stable_id,
+                "label": proposal_component_label("node", index),
+                "node_type": "transform",
+                "plugin": {"kind": "transform", "id": "passthrough"},
+                "behavior": {"kind": "transform"},
+            }
+            for index, stable_id in ((1, control_id), (2, treatment_id))
+        ),
+        {
+            "stable_id": union_id,
+            "label": proposal_component_label("node", 3),
+            "node_type": "row_union",
+            "plugin": None,
+            "behavior": {
+                "kind": "row_union",
+                "branch_aliases": branches,
+                "policy": "require_all",
+                "timeout_seconds": 12.5,
+            },
+        },
+        {
+            "stable_id": aggregate_id,
+            "label": proposal_component_label("node", 4),
+            "node_type": "aggregation",
+            "plugin": {"kind": "transform", "id": "batch_experiment_compare"},
+            "behavior": {
+                "kind": "aggregation",
+                "trigger_kinds": [],
+                "count": None,
+                "timeout_seconds": None,
+                "output_mode": "transform",
+                "expected_output_count": None,
+            },
+        },
+    ]
+    edge_ids = [f"00000000-0000-4000-8000-{index:012d}" for index in range(600, 612)]
+    payload["graph"]["edges"] = [
+        {
+            "stable_id": edge_ids[0],
+            "from_endpoint": {"kind": "source", "stable_id": SOURCE_ID},
+            "to_endpoint": {"kind": "node", "stable_id": gate_id},
+            "flow": {"kind": "source_success", "branch": None},
+        },
+        {
+            "stable_id": edge_ids[1],
+            "from_endpoint": {"kind": "source", "stable_id": SOURCE_ID},
+            "to_endpoint": {"kind": "discard"},
+            "flow": {"kind": "source_validation_failure"},
+        },
+        *(
+            {
+                "stable_id": edge_id,
+                "from_endpoint": {"kind": "node", "stable_id": gate_id},
+                "to_endpoint": {"kind": "node", "stable_id": target_id},
+                "flow": {"kind": "gate_fork", "routes": [route], "branch": branch},
+            }
+            for edge_id, target_id, branch in zip(edge_ids[2:4], (control_id, treatment_id), branches, strict=True)
+        ),
+        *(
+            {
+                "stable_id": edge_id,
+                "from_endpoint": {"kind": "node", "stable_id": producer_id},
+                "to_endpoint": {"kind": "node", "stable_id": union_id},
+                "flow": {"kind": "node_success", "branch": branch},
+            }
+            for edge_id, producer_id, branch in zip(edge_ids[4:6], (control_id, treatment_id), branches, strict=True)
+        ),
+        *(
+            {
+                "stable_id": edge_id,
+                "from_endpoint": {"kind": "node", "stable_id": producer_id},
+                "to_endpoint": {"kind": "discard"},
+                "flow": {"kind": "node_error"},
+            }
+            for edge_id, producer_id in zip(edge_ids[6:8], (control_id, treatment_id), strict=True)
+        ),
+        {
+            "stable_id": edge_ids[8],
+            "from_endpoint": {"kind": "node", "stable_id": union_id},
+            "to_endpoint": {"kind": "node", "stable_id": aggregate_id},
+            "flow": {"kind": "row_union_success", "branch": None},
+        },
+        {
+            "stable_id": edge_ids[9],
+            "from_endpoint": {"kind": "node", "stable_id": aggregate_id},
+            "to_endpoint": {"kind": "output", "stable_id": OUTPUT_ID},
+            "flow": {"kind": "node_success", "branch": None},
+        },
+        {
+            "stable_id": edge_ids[10],
+            "from_endpoint": {"kind": "node", "stable_id": aggregate_id},
+            "to_endpoint": {"kind": "discard"},
+            "flow": {"kind": "node_error"},
+        },
+        {
+            "stable_id": edge_ids[11],
+            "from_endpoint": {"kind": "output", "stable_id": OUTPUT_ID},
+            "to_endpoint": {"kind": "discard"},
+            "flow": {"kind": "output_write_failure"},
+        },
+    ]
+    payload["component_counts"] = {"sources": 1, "nodes": 5, "edges": 12, "outputs": 1}
+    payload["blockers"] = []
+    payload["edit_targets"] = []
+    return payload
+
+
 def _queue_payload() -> dict[str, Any]:
     payload = _payload()
     payload["nodes"] = [
@@ -905,6 +1035,91 @@ def test_propose_pipeline_represents_fork_and_coalesce_with_shared_branch_aliase
     payload = _fork_coalesce_payload()
 
     assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
+def test_propose_pipeline_represents_fork_and_row_union_with_distinct_n_to_n_success() -> None:
+    payload = _fork_row_union_payload()
+
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("branch_aliases", ["branch-1"]),
+        ("branch_aliases", ["branch-1", "branch-1"]),
+        ("policy", "quorum"),
+        ("timeout_seconds", True),
+        ("timeout_seconds", 0),
+        ("timeout_seconds", float("inf")),
+    ],
+)
+def test_propose_pipeline_rejects_invalid_row_union_behavior(field: str, value: object) -> None:
+    payload = _fork_row_union_payload()
+    payload["nodes"][3]["behavior"][field] = value
+
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is not None
+
+
+def test_propose_pipeline_rejects_row_union_branch_set_from_multiple_fork_gates() -> None:
+    payload = _fork_row_union_payload()
+    second_gate_id = "00000000-0000-4000-8000-000000000417"
+    direct_route = proposal_structural_label("route", 1)
+    second_fork_route = proposal_structural_label("route", 2)
+    payload["nodes"].insert(
+        1,
+        {
+            "stable_id": second_gate_id,
+            "label": proposal_component_label("node", 1),
+            "node_type": "gate",
+            "plugin": None,
+            "behavior": {
+                "kind": "gate",
+                "route_aliases": [second_fork_route],
+                "fork_branches": [{"routes": [second_fork_route], "branch": "branch-2"}],
+            },
+        },
+    )
+    for index, node in enumerate(payload["nodes"]):
+        node["label"] = proposal_component_label("node", index)
+    payload["nodes"][0]["behavior"] = {
+        "kind": "gate",
+        "route_aliases": [direct_route, "route-1"],
+        "fork_branches": [{"routes": ["route-1"], "branch": "branch-1"}],
+    }
+    payload["graph"]["edges"][3]["from_endpoint"]["stable_id"] = second_gate_id
+    payload["graph"]["edges"][3]["flow"]["routes"] = [second_fork_route]
+    payload["graph"]["edges"].insert(
+        3,
+        {
+            "stable_id": "00000000-0000-4000-8000-000000000699",
+            "from_endpoint": {"kind": "node", "stable_id": payload["nodes"][0]["stable_id"]},
+            "to_endpoint": {"kind": "node", "stable_id": second_gate_id},
+            "flow": {"kind": "gate_route", "route": direct_route, "branch": None},
+        },
+    )
+    payload["component_counts"]["nodes"] += 1
+    payload["component_counts"]["edges"] += 1
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+
+    assert error is not None
+    assert "one gate_fork" in error
+
+
+@pytest.mark.parametrize("target", ["output", "row_union"])
+def test_propose_pipeline_row_union_success_requires_one_ordinary_processing_target(target: str) -> None:
+    payload = _fork_row_union_payload()
+    success = payload["graph"]["edges"][8]
+    if target == "output":
+        success["to_endpoint"] = {"kind": "output", "stable_id": OUTPUT_ID}
+    else:
+        success["to_endpoint"] = {"kind": "node", "stable_id": payload["nodes"][3]["stable_id"]}
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+
+    assert error is not None
+    assert "row_union" in error or "self-loop" in error
 
 
 def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces() -> None:

@@ -1,14 +1,14 @@
 """Three-surface real-path parity matrix (Plan 05 Task 3).
 
-Nine canonical capability fixtures x three arbitrary authoring surfaces
-(freeform, guided-full, guided-staged), for 27 real-path cases. Each case drives one surface's
+Ten canonical capability fixtures x three arbitrary authoring surfaces
+(freeform, guided-full, guided-staged), for 30 real-path cases. Each case drives one surface's
 production entrypoint from the fixture intent all the way to the immutable
 committed ``CompositionState`` (real prompt/tool assembly → terminal parser →
 custody → candidate validation → durable proposal → acceptance / confirm-wiring
 → audited ``set_pipeline`` → public YAML compiler) and asserts the committed
 graph is semantically isomorphic to the ground-truth reference.
 
-All three surfaces drive all nine fixtures. Former guided-staged exclusions for
+All three surfaces drive all ten fixtures. Former guided-staged exclusions for
 ``multi_source_queue``, ``fork_coalesce``, and ``multi_output`` remain in this
 matrix as permanent regressions for their repaired stage-protocol boundaries.
 
@@ -45,7 +45,7 @@ SURFACES = ["freeform", "guided_full", "guided_staged"]
 # so byte-exact public-YAML equality and exact-name semantic expectations hold.
 _NAME_PRESERVING_SURFACES = frozenset({"freeform", "guided_full"})
 
-# Explicit (surface, fixture) grid: all 9 fixtures on all 3 surfaces = 27
+# Explicit (surface, fixture) grid: all 10 fixtures on all 3 surfaces = 30
 # real-path parity cases.
 _SURFACE_FIXTURE_PARAMS = [(surface, fixture) for surface in SURFACES for fixture in PARITY_FIXTURES]
 
@@ -88,7 +88,17 @@ def _assert_semantic_expectations(state: Any, fixture: dict[str, Any]) -> None:
         node_id = expected["id"]
         assert node_id in nodes, f"{fixture['class']}: missing node {node_id!r}"
         actual = nodes[node_id]
-        for key in ("node_type", "plugin", "input", "on_success", "condition", "policy", "merge", "output_mode"):
+        for key in (
+            "node_type",
+            "plugin",
+            "input",
+            "on_success",
+            "condition",
+            "policy",
+            "merge",
+            "output_mode",
+            "timeout_seconds",
+        ):
             if key in expected:
                 assert actual.get(key) == expected[key], (
                     f"{fixture['class']}: node[{node_id}].{key} = {actual.get(key)!r} != {expected[key]!r}"
@@ -139,6 +149,23 @@ def _assert_guided_staged_naming(state: Any, fixture: dict[str, Any]) -> None:
     )
 
 
+def _assert_row_union_semantics(state: Any) -> None:
+    """Keep the correlated N-to-N contract exact even when staged names differ."""
+    committed = state.to_dict()
+    row_union = next(node for node in committed["nodes"] if node["node_type"] == "row_union")
+    assert row_union["plugin"] is None
+    assert row_union["timeout_seconds"] == 12.5
+    assert row_union.get("policy") is None
+    assert row_union.get("merge") is None
+    assert list(row_union["branches"]) == ["control_branch", "treatment_branch"]
+    assert list(row_union["branches"].values()) == ["control_scored", "treatment_scored"]
+    assert row_union["input"] == "control_scored"
+    downstream = next(node for node in committed["nodes"] if node["node_type"] == "aggregation")
+    assert downstream["input"] == row_union["on_success"]
+    gate = next(node for node in committed["nodes"] if node["node_type"] == "gate")
+    assert list(gate["fork_to"]) == list(row_union["branches"])
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("surface", "fixture"),
@@ -157,6 +184,8 @@ async def test_surface_derives_isomorphic_committed_graph(
     #    applied to every surface). Cross-surface parity is transitive: all
     #    three surfaces are anchored to the same per-fixture reference.
     assert_isomorphic(committed, reference, left=f"{surface}:{fixture['class']}", right="reference")
+    if fixture["class"] == "row_union":
+        _assert_row_union_semantics(committed)
 
     if surface in _NAME_PRESERVING_SURFACES:
         # 2. Public compiled-pipeline (runtime graph) semantics agree byte-exact

@@ -601,6 +601,8 @@ def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
         return {"input": "batch", "output": "zero_or_many", "expected_output_count": None}
     if node.node_type == "coalesce":
         return {"input": "branches", "output": "one_per_branch_set", "expected_output_count": None}
+    if node.node_type == "row_union":
+        return {"input": "branches", "output": "one_per_branch", "expected_output_count": None}
     if node.node_type == "queue":
         return {"input": "many_producers", "output": "one_per_item", "expected_output_count": None}
     if node.node_type == "gate":

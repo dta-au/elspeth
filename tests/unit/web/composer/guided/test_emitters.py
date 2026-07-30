@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.guided.emitters import (
+    _node_cardinality,
     _step_index,
     build_component_review_turn,
     build_initial_step_1_turn,
@@ -519,6 +520,33 @@ class TestStep4WireEmitter:
             "timeout_seconds": 12.5,
             "output_mode": "transform",
             "expected_output_count": "1",
+        }
+
+    def test_row_union_projection_preserves_n_to_n_cardinality(self) -> None:
+        node = NodeSpec(
+            id="variants",
+            node_type="row_union",
+            plugin=None,
+            input="control_done",
+            on_success="experiment_rows",
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches={
+                "control_branch": "control_done",
+                "treatment_branch": "treatment_done",
+            },
+            policy=None,
+            merge=None,
+            timeout_seconds=None,
+        )
+
+        assert _node_cardinality(node, executable_node=SimpleNamespace()) == {
+            "input": "branches",
+            "output": "one_per_branch",
+            "expected_output_count": None,
         }
 
 
