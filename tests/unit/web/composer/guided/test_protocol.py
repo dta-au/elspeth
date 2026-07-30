@@ -24,6 +24,94 @@ from elspeth.web.composer.guided.protocol import (
 )
 
 
+def _wire_payload_for_cardinality(
+    *,
+    node_type: str | None = None,
+    output_cardinality: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "proposal_id": "00000000-0000-4000-8000-000000000001",
+        "draft_hash": "d" * 64,
+        "sources": [],
+        "nodes": [],
+        "outputs": [],
+        "connections": [],
+        "semantic_contracts": [],
+        "warnings": [],
+        "blockers": [],
+        "can_confirm": True,
+    }
+    row_cardinality = {
+        "input": "none" if node_type is None else "one",
+        "output": output_cardinality,
+        "expected_output_count": None,
+    }
+    if node_type is None:
+        payload["sources"] = [
+            {
+                "stable_id": "00000000-0000-4000-8000-000000000002",
+                "label": "source-1",
+                "plugin": "csv",
+                "on_validation_failure": "discard",
+                "guaranteed_fields": [],
+                "row_cardinality": row_cardinality,
+            }
+        ]
+        return payload
+    behavior: dict[str, Any]
+    plugin: str | None = None
+    if node_type == "transform":
+        behavior = {"kind": "transform"}
+        plugin = "passthrough"
+    elif node_type == "gate":
+        behavior = {"kind": "gate", "route_aliases": ["route-1"], "fork_branches": []}
+    elif node_type == "aggregation":
+        behavior = {
+            "kind": "aggregation",
+            "trigger_kinds": [],
+            "count": None,
+            "timeout_seconds": None,
+            "output_mode": "transform",
+            "expected_output_count": None,
+        }
+        plugin = "batch_stats"
+        row_cardinality["input"] = "batch"
+    elif node_type == "queue":
+        behavior = {"kind": "queue"}
+        row_cardinality["input"] = "many_producers"
+    elif node_type == "coalesce":
+        behavior = {
+            "kind": "coalesce",
+            "branch_aliases": ["branch-1", "branch-2"],
+            "policy": "require_all",
+            "merge": "union",
+        }
+        row_cardinality["input"] = "branches"
+    else:
+        assert node_type == "row_union"
+        behavior = {
+            "kind": "row_union",
+            "branch_aliases": ["branch-1", "branch-2"],
+            "policy": "require_all",
+            "timeout_seconds": None,
+        }
+        row_cardinality["input"] = "branches"
+    payload["nodes"] = [
+        {
+            "stable_id": "00000000-0000-4000-8000-000000000002",
+            "label": "node-1",
+            "node_type": node_type,
+            "plugin": plugin,
+            "behavior": behavior,
+            "required_fields": [],
+            "guaranteed_fields": [],
+            "row_cardinality": row_cardinality,
+            "structured_output_fields": [],
+        }
+    ]
+    return payload
+
+
 class TestTurnType:
     def test_seven_turn_types_defined(self) -> None:
         expected = {
@@ -569,6 +657,47 @@ class TestPayloadValidation:
             "blockers": [],
             "can_confirm": True,
         }
+        assert validate_payload(TurnType.CONFIRM_WIRING, payload) is None
+
+    @pytest.mark.parametrize(
+        "node_type",
+        [None, "transform", "gate", "aggregation", "queue", "coalesce"],
+        ids=["source", "transform", "gate", "aggregation", "queue", "coalesce"],
+    )
+    def test_confirm_wiring_rejects_one_per_branch_cardinality_outside_row_union(
+        self,
+        node_type: str | None,
+    ) -> None:
+        payload = _wire_payload_for_cardinality(
+            node_type=node_type,
+            output_cardinality="one_per_branch",
+        )
+
+        error = validate_payload(TurnType.CONFIRM_WIRING, payload)
+
+        owner_path = "payload.sources[0]" if node_type is None else "payload.nodes[0]"
+        assert error == f"{owner_path}.row_cardinality.output 'one_per_branch' is only valid for row_union nodes"
+
+    @pytest.mark.parametrize("output_cardinality", ["one", "zero_or_many", "one_per_item", "one_per_branch_set"])
+    def test_confirm_wiring_requires_one_per_branch_cardinality_for_row_union(
+        self,
+        output_cardinality: str,
+    ) -> None:
+        payload = _wire_payload_for_cardinality(
+            node_type="row_union",
+            output_cardinality=output_cardinality,
+        )
+
+        error = validate_payload(TurnType.CONFIRM_WIRING, payload)
+
+        assert error == "payload.nodes[0].row_cardinality.output must be 'one_per_branch' for row_union nodes"
+
+    def test_confirm_wiring_accepts_one_per_branch_cardinality_for_row_union(self) -> None:
+        payload = _wire_payload_for_cardinality(
+            node_type="row_union",
+            output_cardinality="one_per_branch",
+        )
+
         assert validate_payload(TurnType.CONFIRM_WIRING, payload) is None
 
     def test_confirm_wiring_payload_missing_key_rejected(self) -> None:

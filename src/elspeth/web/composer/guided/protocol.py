@@ -1102,7 +1102,12 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         {"one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch", "one_per_branch_set", "expected_count"}
     )
 
-    def validate_cardinality(value: object, path: str) -> str | None:
+    def validate_cardinality(
+        value: object,
+        path: str,
+        *,
+        owner_node_type: object | None = None,
+    ) -> str | None:
         if (nested_error := _exact_nested_keys(value, cardinality_keys, path)) is not None:
             return nested_error
         assert isinstance(value, Mapping)
@@ -1113,6 +1118,10 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
             return nested_error
         if (count is not None) != (value["output"] == "expected_count"):
             return f"{path}.expected_output_count must exactly bind expected_count"
+        if value["output"] == "one_per_branch" and owner_node_type != "row_union":
+            return f"{path}.output 'one_per_branch' is only valid for row_union nodes"
+        if owner_node_type == "row_union" and value["output"] != "one_per_branch":
+            return f"{path}.output must be 'one_per_branch' for row_union nodes"
         return None
 
     sources, error = _current_sequence(payload["sources"], "payload.sources")
@@ -1180,7 +1189,13 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         for name in ("required_fields", "guaranteed_fields"):
             if (error := _current_string_sequence(node[name], f"{path}.{name}")[1]) is not None:
                 return error
-        if (error := validate_cardinality(node["row_cardinality"], f"{path}.row_cardinality")) is not None:
+        if (
+            error := validate_cardinality(
+                node["row_cardinality"],
+                f"{path}.row_cardinality",
+                owner_node_type=node["node_type"],
+            )
+        ) is not None:
             return error
         if (error := _public_json_error(node["structured_output_fields"], f"{path}.structured_output_fields")) is not None:
             return error
