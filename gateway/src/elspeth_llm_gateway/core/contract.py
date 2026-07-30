@@ -4,7 +4,11 @@ This is the wire boundary: every model here rejects unknown fields
 (``extra="forbid"``) so that a client cannot silently smuggle an unsupported
 OpenAI feature (``stream``, ``n``, ``logprobs``, ...) past validation. Only
 the fields declared below are accepted; everything else is a hard rejection,
-not a warning.
+not a warning. The single exception is ``max_completion_tokens``, OpenAI's
+modern spelling of ``max_tokens`` and the field LiteLLM's ``openai`` path
+actually puts on the wire: ``ChatRequest`` folds it into ``max_tokens``
+before validation and rejects a request that supplies both spellings. See
+``ChatRequest._accept_max_completion_tokens_alias``.
 
 ``Bounds`` and ``bounds_check`` enforce the gateway's configured limits
 (message count, tool count, string length, schema size/depth, temperature
@@ -205,6 +209,55 @@ class ChatRequest(BaseModel):
     tools: list[ChatTool] | None = None
     tool_choice: str | NamedToolChoice | None = None
     response_format: ResponseFormat | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_max_completion_tokens_alias(cls, data: object) -> object:
+        """Accept OpenAI's modern ``max_completion_tokens`` spelling.
+
+        ``max_completion_tokens`` is the field the current OpenAI Chat
+        Completions API uses in place of the deprecated ``max_tokens``, and
+        LiteLLM's ``openai`` provider path emits it: a caller-supplied
+        ``max_tokens`` is *translated* — the original key is dropped and
+        only ``max_completion_tokens`` reaches the wire (verified
+        empirically against the installed LiteLLM). Without this alias every
+        LiteLLM client that sets a token cap is rejected by
+        ``extra="forbid"``, which is boot-fatal for ELSPETH's own composer
+        boot probe (it always sends ``max_tokens=16``).
+
+        The alias is folded into ``max_tokens`` here, in a ``mode="before"``
+        validator, rather than declared as a second field. That is
+        deliberate: it means ``bounds_check``, ``to_canonical_request`` and
+        every adapter keep reading the single ``max_tokens`` attribute, so
+        the configured ``max_max_tokens`` cap applies to both spellings *by
+        construction* — there is no second code path that could drift out of
+        step with the first.
+
+        **Supplying both spellings is rejected**, by key presence and not by
+        value: two spellings of one cap is an ambiguous request the gateway
+        must not silently resolve by picking a winner. Key presence (so an
+        explicit ``"max_tokens": null`` alongside the alias is also
+        rejected) is the same rule ``extra="forbid"`` already applies to
+        every unsupported field, so the boundary has one consistent notion
+        of "the client sent this". LiteLLM never sends both, so no real
+        client is affected.
+
+        The strict-unknown-field posture is untouched: this validator
+        recognises exactly one additional key and removes it. Everything
+        else still falls through to ``extra="forbid"``.
+        """
+        if not isinstance(data, dict):
+            return data
+        if "max_completion_tokens" not in data:
+            return data
+        if "max_tokens" in data:
+            raise ValueError("max_tokens and max_completion_tokens must not both be supplied")
+        # Copy rather than mutate: the caller's parsed request body (see
+        # ``core.app``'s ``ChatRequest.model_validate(parsed)``) must not be
+        # rewritten as a side effect of validating it.
+        aliased = dict(data)
+        aliased["max_tokens"] = aliased.pop("max_completion_tokens")
+        return aliased
 
     @model_validator(mode="after")
     def _check_messages_non_empty(self) -> Self:

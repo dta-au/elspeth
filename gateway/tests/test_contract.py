@@ -493,6 +493,103 @@ def test_bounds_check_accepts_max_tokens_at_cap():
     bounds_check(request, _bounds(max_max_tokens=50))
 
 
+# --- max_completion_tokens: OpenAI's modern spelling of max_tokens ----------
+#
+# LiteLLM's ``openai`` provider path *translates* a caller-supplied
+# ``max_tokens`` into ``max_completion_tokens`` and drops the original key,
+# so this alias is what a plain LiteLLM client actually puts on the wire.
+
+
+def test_max_completion_tokens_alone_populates_max_tokens():
+    request = ChatRequest.model_validate({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 16})
+
+    assert request.max_tokens == 16
+
+
+def test_max_completion_tokens_is_not_retained_as_a_separate_attribute():
+    """The alias folds into the single ``max_tokens`` field.
+
+    Downstream (``bounds_check``, ``to_canonical_request``, every adapter)
+    reads exactly one attribute, which is what makes the cap apply to both
+    spellings by construction rather than via a parallel code path.
+    """
+    request = ChatRequest.model_validate({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 16})
+
+    assert not hasattr(request, "max_completion_tokens")
+    assert "max_completion_tokens" not in request.model_dump()
+
+
+def test_supplying_both_max_tokens_spellings_is_rejected():
+    with pytest.raises(ValidationError):
+        ChatRequest.model_validate(
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16, "max_completion_tokens": 16}
+        )
+
+
+def test_supplying_both_spellings_is_rejected_by_key_presence_not_value():
+    """An explicit ``null`` still counts as supplied.
+
+    ``extra="forbid"`` already rejects an unsupported field by key presence
+    regardless of its value; the ambiguity rule uses the same notion of
+    "the client sent this" so the boundary has one consistent story.
+    """
+    with pytest.raises(ValidationError):
+        ChatRequest.model_validate(
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": None, "max_completion_tokens": 16}
+        )
+
+
+def test_max_completion_tokens_alias_does_not_weaken_unknown_field_rejection():
+    """Recognising one more key must not widen the strict posture."""
+    with pytest.raises(ValidationError):
+        ChatRequest.model_validate(
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 16, "stream": True}
+        )
+
+
+@pytest.mark.parametrize("value", ["16", 16, 1.5, [], {}, None])
+def test_max_completion_tokens_is_type_checked_exactly_like_max_tokens(value):
+    """Parity, asserted as parity rather than as an absolute rule.
+
+    The alias is folded into ``max_tokens`` *before* field validation, so
+    both spellings go through one and the same ``int | None`` validator —
+    including pydantic's default lax coercions. Asserting the two outcomes
+    are identical pins that, and cannot drift if the field's own type or
+    strictness is ever changed.
+    """
+    base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+    def _outcome(field: str) -> object:
+        try:
+            return ChatRequest.model_validate({**base, field: value}).max_tokens
+        except ValidationError:
+            return ValidationError
+
+    assert _outcome("max_completion_tokens") == _outcome("max_tokens")
+
+
+def test_bounds_check_rejects_max_completion_tokens_above_cap():
+    request = ChatRequest.model_validate({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 100})
+    with pytest.raises(GatewayError) as exc_info:
+        bounds_check(request, _bounds(max_max_tokens=50))
+    assert exc_info.value.code == GatewayErrorCode.INVALID_REQUEST
+
+
+@pytest.mark.parametrize("max_completion_tokens", [0, -1])
+def test_bounds_check_rejects_non_positive_max_completion_tokens(max_completion_tokens):
+    request = ChatRequest.model_validate(
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": max_completion_tokens}
+    )
+    with pytest.raises(GatewayError) as exc_info:
+        bounds_check(request, _bounds())
+    assert exc_info.value.code == GatewayErrorCode.INVALID_REQUEST
+
+
+def test_bounds_check_accepts_max_completion_tokens_at_cap():
+    request = ChatRequest.model_validate({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 50})
+    bounds_check(request, _bounds(max_max_tokens=50))
+
+
 def test_bounds_defaults():
     bounds = Bounds(
         max_messages=10,

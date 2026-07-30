@@ -37,6 +37,34 @@ now accepted too. The static bearer is not optional — every `/v1/*` request
 still requires a valid `Authorization: Bearer <token>` regardless of what
 contract header, if any, it sends.
 
+### The accepted request subset
+
+The inbound body is a strict *subset* of Chat Completions: `model`,
+`messages`, `temperature`, `seed`, `max_tokens`, `tools`, `tool_choice`,
+and `response_format`. Anything else — `stream`, `n`, `logprobs`, any
+other unsupported OpenAI field, at any nesting level — is a hard
+`invalid_request` (400), not a silently ignored extra.
+
+One alias exists: **`max_completion_tokens`**, OpenAI's current spelling of
+`max_tokens`, is accepted and folded into `max_tokens`. This is not
+cosmetic — LiteLLM's `openai` provider path *translates* a caller-supplied
+`max_tokens` into `max_completion_tokens` and drops the original key, so
+that alias is the only token cap a plain LiteLLM client ever puts on the
+wire. Two rules follow:
+
+- Supplying **both** spellings is rejected (`invalid_request`, 400). Two
+  spellings of one cap is an ambiguity the gateway will not resolve by
+  silently picking a winner; the check is by key presence, so an explicit
+  `"max_tokens": null` alongside the alias is rejected too — the same
+  notion of "the client sent this" that governs every unsupported field.
+- The configured `ELSPETH_LLM_GATEWAY_MAX_MAX_TOKENS` bound applies
+  identically to either spelling; the cap is not escapable by choosing the
+  other name.
+
+The conformance kit pins all three behaviours (see
+`conformance/test_capabilities.py`), so a derived image that drops the
+alias fails qualification.
+
 ## Quick-start: the local mock stack
 
 `gateway/mock/stack.py` runs three uvicorn servers side by side, wired

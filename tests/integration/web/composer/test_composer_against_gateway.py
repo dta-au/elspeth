@@ -18,39 +18,49 @@ library surface); it re-derives the same mechanism, sized for composer
 traffic rather than the low-level ``GatewayLLMProvider`` traffic the other
 suite drives.
 
-Central criterion 8 (tool-call / tool-result round trip) is NOT included as
-a passing test here. Driving it exposed a real, pre-existing defect in
-``elspeth.web.composer.tool_batch._admit_tool_batch`` -- see
-``.superpowers/sdd/2026-07-31-llm-gateway-phase3-endpoint-affordance/task-3-report.md``
-for the full reproduction and evidence. Per this phase's own constraint
-("If a genuine defect in Phase 1/2/3 surfaces, STOP and report BLOCKED...
-Do NOT weaken an assertion to make it pass"), that test is not landed here;
-a landed red/xfail test would also muddy the release-branch full-suite gate
-this phase does not own.
+Driving criterion 8 originally surfaced two genuine, independent defects,
+both of which are now FIXED; this module is the end-to-end proof of both.
 
-A second, independent genuine defect surfaced while probing the real boot
-probe against the live gateway (``elspeth.web.composer.boot_probe``, which
-unconditionally sends ``max_tokens=16``): LiteLLM's ``openai`` provider path
-translates any caller-supplied ``max_tokens`` into the wire field
-``max_completion_tokens`` (confirmed empirically -- see the task report),
-which the gateway's ``ChatRequest`` (``extra="forbid"``, no
-``max_completion_tokens`` field) rejects as an unrecognised field. This
-affects the boot probe (always) and the advisor role's real calls (which
-also set ``max_tokens`` from ``composer_advisor_max_completion_tokens``)
-whenever either is pointed at the gateway -- it does NOT affect the
-primary role's ordinary compose-loop turns, confirmed empirically:
-``_call_llm``/``_call_text_llm`` never set ``max_tokens``, which is why the
-text round trip below passes. A boot-probe-against-the-gateway test is
-therefore also not landed here (same red-test discipline); see the task
-report for the full reproduction. What IS proven here, durably:
+1. ``elspeth.web.composer.tool_batch._admit_tool_batch`` validated provider
+   tool calls with ``runtime_checkable`` ``Protocol`` ``isinstance()``
+   checks. Since Python 3.12 those resolve members via
+   ``inspect.getattr_static``, which bypasses ``__getattr__`` -- and
+   LiteLLM's ``ChatCompletionMessageToolCall`` declares no pydantic model
+   fields at all, so ``id``/``function`` resolve only through
+   ``BaseModel.__getattr__``. The admission guard therefore rejected every
+   genuine tool call from every provider (elspeth-9ea866438b). The unit-level
+   regression lives in
+   ``tests/unit/web/composer/test_compose_loop_tool_call_cap.py``; the
+   full round trip is ``test_composer_tool_round_trip_against_gateway``
+   below.
+2. The gateway's inbound ``ChatRequest`` (``extra="forbid"``) had no
+   ``max_completion_tokens`` field, while LiteLLM's ``openai`` provider path
+   *translates* any caller-supplied ``max_tokens`` into that wire field and
+   drops the original key. ``elspeth.web.composer.boot_probe`` always sends
+   ``max_tokens=16`` and ``app.py`` re-raises ``ComposerBootConfigError``, so
+   the web app failed to boot whenever ``composer_endpoint_base_url``
+   pointed at this gateway. The gateway now accepts the alias;
+   ``test_boot_probe_succeeds_against_gateway`` below is the proof at the
+   boot-probe level.
+
+Note which paths each defect touched, because the asymmetry explains why the
+text round trip passed all along: the primary role's ordinary compose-loop
+turns never set ``max_tokens`` (``_call_llm``/``_call_text_llm``), so only
+the boot probe and the advisor role (which sets
+``composer_advisor_max_completion_tokens``) were affected by defect 2.
+
+What is proven here, durably:
 
 - The gateway's tool-call response shape satisfies the freeform loop's HARD
   attribute access (``response.choices[0].message.tool_calls[i].id`` /
   ``.function.name`` / ``.function.arguments``, ``finish_reason``) when
-  consumed via a real ``litellm.acompletion`` call -- i.e. the gateway side
-  of criterion 8 is NOT the blocker.
-- A real text (non-tool) round trip through Composer's actual compose loop
-  against the live gateway.
+  consumed via a real ``litellm.acompletion`` call.
+- **Criterion 8**: a real tool-call / tool-result round trip through
+  Composer's actual compose loop against the live gateway -- the provider's
+  tool call is admitted, dispatched, and its result recorded.
+- A real text (non-tool) round trip through the same loop.
+- The composer boot probe succeeds against the live gateway with default
+  settings.
 - No gateway/agency internals (the inbound bearer, the OAuth client
   secret) leak into persisted chat history, log output, or a raised
   exception's message on a real gateway-side failure.
@@ -436,6 +446,124 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
     assert result.assistant_message == "MOCK:hello composer-against-gateway"
     assert result.tool_outcomes == ()
     assert result.tool_invocations == ()
+
+
+# ---------------------------------------------------------------------------
+# Design acceptance criterion 8 -- the tool-call / tool-result round trip
+# through the real compose loop. This is the criterion the whole "endpoint
+# affordance" phase exists for, and the one that was blocked by the
+# ``_admit_tool_batch`` Protocol-isinstance defect (elspeth-9ea866438b):
+# every genuine LiteLLM tool call was rejected at admission with
+# "Composer tool batch is missing a provider tool-call ID" before any
+# dispatch could happen.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_base_url: str) -> None:
+    """Provider tool call -> admission -> dispatch -> tool result -> next turn.
+
+    The mock upstream keys on the LAST conversation entry, so this drives a
+    genuine two-turn exchange: turn 1's ``USE_TOOL list_sources {}`` yields a
+    real provider tool call, Composer admits and dispatches it, and turn 2
+    sees the tool result as the last entry and terminates with plain text.
+
+    Nothing here is stubbed on the provider side -- ``llm=None`` means the
+    real ``self._call_llm`` -> real ``litellm.acompletion`` -> live gateway
+    path runs, so the objects reaching ``_admit_tool_batch`` are genuine
+    ``litellm.types.utils.ChatCompletionMessageToolCall`` instances whose
+    fields resolve through ``__getattr__``.
+    """
+    sessions_service = _build_sessions_service(tmp_path)
+    session_id = str(uuid4())
+    _insert_session_row(sessions_service, session_id)
+    service = _build_service(tmp_path, gateway_base_url, sessions_service)
+
+    result = await service._run_one_turn_for_test(session_id=session_id, message="USE_TOOL list_sources {}")
+
+    # The tool call was admitted and dispatched -- the defect made this an
+    # AuditIntegrityError before the first await, so an empty tuple here is
+    # exactly the regression.
+    assert len(result.tool_outcomes) == 1
+    outcome = result.tool_outcomes[0]
+    assert outcome.call.id == "mock-call-ref-1"
+    assert outcome.call.function.name == "list_sources"
+    assert outcome.call.function.arguments == "{}"
+    assert outcome.error_class is None
+    assert outcome.error_message is None
+    assert outcome.response is not None
+    assert outcome.response.success is True
+
+    # The tool result was fed back and the provider produced a second,
+    # terminal turn from it -- i.e. a full round trip, not just a dispatch.
+    # The mock upstream echoes the LAST conversation entry, so the terminal
+    # text is the serialized ``list_sources`` result: asserting the catalog's
+    # own source name survives that trip is what proves the tool RESULT (not
+    # merely the tool CALL) crossed the boundary in both directions.
+    assert result.assistant_message is not None
+    assert result.assistant_message.startswith("MOCK:")
+    assert '"success": true' in result.assistant_message
+    assert "csv" in result.assistant_message
+
+    # The admitted call is recorded in the audit trail, under the provider's
+    # own tool-call id.
+    assert len(result.tool_invocations) == 1
+    assert result.tool_invocations[0].tool_call_id == "mock-call-ref-1"
+    assert result.tool_invocations[0].tool_name == "list_sources"
+
+
+# ---------------------------------------------------------------------------
+# The boot probe against the live gateway. ``probe_composer_config``
+# unconditionally sends ``max_tokens=16``, which LiteLLM's ``openai`` path
+# translates to the wire field ``max_completion_tokens``; the gateway's
+# ``extra="forbid"`` ``ChatRequest`` rejected that as an unknown field, so
+# the probe raised ``ComposerBootConfigError`` and ``app.py`` re-raised it --
+# the web app could not boot at all against this gateway.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_boot_probe_succeeds_against_gateway(gateway_base_url: str) -> None:
+    """Default settings, real probe, live gateway -- boot is not fatal.
+
+    ``ComposerBootConfigError`` is asserted by absence deliberately rather
+    than caught: a raise here IS the failure this test exists to catch, and
+    letting it propagate names the real error rather than an assertion
+    message.
+    """
+    from elspeth.web.composer.boot_probe import probe_composer_config
+
+    probed = await probe_composer_config(
+        model=_MODEL_ALIAS,
+        temperature=None,
+        seed=None,
+        api_base=f"{gateway_base_url}/v1",
+        api_key=_INBOUND_BEARER,
+    )
+
+    # True (not the transient-failure False) -- the request was accepted and
+    # answered, so this proves acceptance rather than a swallowed transport
+    # error.
+    assert probed is True
+
+
+@pytest.mark.asyncio
+async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(gateway_base_url: str) -> None:
+    """The probe's other real payload shape: temperature + seed alongside the
+    translated token cap. ``seed`` is a gated capability the reference
+    adapter declares, so this also proves the alias did not disturb the
+    capability path."""
+    from elspeth.web.composer.boot_probe import probe_composer_config
+
+    probed = await probe_composer_config(
+        model=_MODEL_ALIAS,
+        temperature=0.2,
+        seed=7,
+        api_base=f"{gateway_base_url}/v1",
+        api_key=_INBOUND_BEARER,
+    )
+
+    assert probed is True
 
 
 # ---------------------------------------------------------------------------

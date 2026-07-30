@@ -91,6 +91,59 @@ async def test_unknown_top_level_field_is_rejected(gateway_client, chat_headers,
     assert response.json()["error"]["code"] == "invalid_request"
 
 
+# --- max_completion_tokens: the modern spelling of max_tokens -------------------
+#
+# A qualifying agency needs to see this explicitly, because it is the one
+# key outside the declared field list that a conforming gateway must
+# accept: OpenAI's current Chat Completions API uses
+# ``max_completion_tokens``, and LiteLLM's ``openai`` provider path
+# *translates* a caller's ``max_tokens`` into it -- the original key is
+# dropped, so a plain LiteLLM client with any token cap sends only this
+# spelling. A derived image that rejects it cannot serve LiteLLM callers at
+# all (it is boot-fatal for ELSPETH's own composer boot probe).
+#
+# ``test_unknown_top_level_field_is_rejected`` immediately above is the
+# companion proof that accepting this one key did NOT relax the
+# strict-unknown-field posture generally; it is not duplicated here.
+
+
+async def test_max_completion_tokens_is_accepted_as_the_max_tokens_spelling(gateway_client, chat_headers, chat_body_factory):
+    body = chat_body_factory("hello", max_completion_tokens=16)
+
+    response = await gateway_client.post(_CHAT_URL, json=body, headers=chat_headers)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "MOCK:hello"
+
+
+async def test_supplying_both_max_tokens_spellings_is_rejected(gateway_client, chat_headers, chat_body_factory):
+    """Two spellings of one cap is an ambiguity the gateway must not resolve
+    by silently picking a winner. Rejection is by key presence, so this
+    holds regardless of whether the two values agree."""
+    body = chat_body_factory("hello", max_tokens=16, max_completion_tokens=16)
+
+    response = await gateway_client.post(_CHAT_URL, json=body, headers=chat_headers)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+async def test_configured_max_tokens_bound_is_enforced_on_the_alias_spelling(gateway_client, chat_headers, chat_body_factory):
+    """The cap must not be escapable by choosing the other spelling.
+
+    ``32768`` is the ``max_max_tokens`` default (``Bounds``); the
+    conformance stack does not override it, so ``32769`` is over the bound
+    without needing any deployment-specific fixture. A derived image that
+    lowers the bound rejects this too, so the assertion holds either way.
+    """
+    body = chat_body_factory("hello", max_completion_tokens=32769)
+
+    response = await gateway_client.post(_CHAT_URL, json=body, headers=chat_headers)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
 # --- text completion happy path -------------------------------------------------
 
 
