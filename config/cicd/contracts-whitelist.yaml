@@ -469,6 +469,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._post_chat_completion:request_body"
   - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._build_llm_request_payload:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._record_logical_llm_success:raw_response"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:_validate_readyz_adapter_identity:payload"
   - "src/elspeth/plugins/infrastructure/clients/replayer.py:ReplayMissError.__init__:request_data"
   - "src/elspeth/plugins/infrastructure/clients/replayer.py:CallReplayer.replay:request_data"
   - "src/elspeth/plugins/infrastructure/clients/verifier.py:CallVerifier.verify:request_data"

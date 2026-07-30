@@ -30,7 +30,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     ServerError,
 )
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult
-from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider, _validate_gateway_success_response
 
 _ENDPOINT = "https://gateway.example.com/v1"
 _READYZ_ROOT = "https://gateway.example.com"
@@ -321,6 +321,10 @@ class TestErrorCodeMapping:
             ("upstream_unauthorized", LLMClientError, False),
             ("upstream_response_invalid", LLMClientError, False),
             ("internal_error", LLMClientError, False),
+            # ELSPETH's own bearer was rejected by the gateway's inbound
+            # auth layer — named explicitly (not just falling through to
+            # the anonymous default branch) so this is diagnosable.
+            ("inbound_authentication_failed", LLMClientError, False),
         ],
     )
     def test_maps_each_gateway_code(
@@ -433,6 +437,83 @@ class TestErrorCodeMapping:
         body = {"error": {"message": "x", "type": "gateway_error", "code": _BODY_SENTINEL, "retryable": False, "request_id": "r"}}
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body, status_code=400))
         with pytest.raises(LLMClientError) as exc_info:
+            provider.execute_query(
+                messages=[{"role": "user", "content": "hi"}],
+                model="standard",
+                temperature=0.0,
+                max_tokens=100,
+                state_id="state-1",
+                token_id="tok-1",
+            )
+        assert _BODY_SENTINEL not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Success-path leak guard — CRITICAL fix-round-1 regression coverage.
+#
+# The error-envelope leak tests above only probe the error path (fix-round-1
+# critical finding: the static-constant discipline covered the error path
+# but NOT the success-validation path, where three sites interpolated
+# agency-controlled body data — top-level JSON keys, finish_reason, and a
+# usage dict key — directly into exception messages). These call
+# ``_validate_gateway_success_response`` directly, mirroring how the
+# reviewer proved the leak, and assert the sentinel appears in NONE of the
+# messages raised along that path.
+# ---------------------------------------------------------------------------
+
+
+class TestSuccessPathLeakGuard:
+    def test_sentinel_in_top_level_key_never_leaks(self) -> None:
+        """A sentinel-named top-level key with no 'choices' must not leak
+        via ``list(data.keys())``-style interpolation."""
+        body = _completion_body()
+        del body["choices"]
+        body[_BODY_SENTINEL] = "irrelevant"
+        response = _gateway_response(body)
+        with pytest.raises(LLMClientError) as exc_info:
+            _validate_gateway_success_response(response, usage_required=False)
+        assert _BODY_SENTINEL not in str(exc_info.value)
+
+    def test_sentinel_in_finish_reason_never_leaks(self) -> None:
+        """A sentinel placed in ``finish_reason`` alongside blank content
+        must not leak via an f-string embedding the raw value."""
+        body = _completion_body(content="   ", finish_reason=_BODY_SENTINEL)
+        response = _gateway_response(body)
+        with pytest.raises(ContentPolicyError) as exc_info:
+            _validate_gateway_success_response(response, usage_required=False)
+        assert _BODY_SENTINEL not in str(exc_info.value)
+
+    def test_sentinel_in_usage_key_name_never_leaks(self) -> None:
+        """A sentinel-named usage key carrying a non-finite float must not
+        leak via an f-string embedding the raw key name.
+
+        Built from raw bytes (not the ``json=`` kwarg, which round-trips
+        through stdlib ``json.dumps`` and rejects ``Infinity`` outright) —
+        mirrors how the provider itself parses it via
+        ``reject_nonfinite_constant``.
+        """
+        body = _completion_body()
+        raw = json.dumps(body).encode()
+        # Splice a non-finite usage value in as a raw JSON literal — the
+        # gateway's own parser (``reject_nonfinite_constant``) accepts the
+        # bare token the same way OpenRouter's does.
+        raw = raw[:-1] + f', "usage": {{"{_BODY_SENTINEL}": Infinity}}}}'.encode()
+        response = httpx.Response(
+            status_code=200,
+            content=raw,
+            headers={"content-type": "application/json", _CONTRACT_HEADER: "1"},
+        )
+        with pytest.raises(LLMClientError) as exc_info:
+            _validate_gateway_success_response(response, usage_required=False)
+        assert _BODY_SENTINEL not in str(exc_info.value)
+
+    @respx.mock
+    def test_end_to_end_success_path_sentinels_never_leak(self, provider: GatewayLLMProvider) -> None:
+        """Same three sentinel placements, driven through the real
+        execute_query() HTTP path rather than the validator directly."""
+        body = _completion_body(content="   ", finish_reason=_BODY_SENTINEL)
+        respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body))
+        with pytest.raises(ContentPolicyError) as exc_info:
             provider.execute_query(
                 messages=[{"role": "user", "content": "hi"}],
                 model="standard",
@@ -669,6 +750,24 @@ class TestAuditRows:
 # ---------------------------------------------------------------------------
 
 
+class TestConstructorValidation:
+    """Direct construction re-validates config-shape invariants defensively —
+    mirrors the existing endpoint re-validation, extended to contract_major
+    (fix-round-1 minor: the constructor checked endpoint but not
+    contract_major on the same defensive path)."""
+
+    def test_rejects_unsupported_contract_major(self, audit_recorder: FakeAuditRecorder, telemetry_emit: FakeTelemetryEmit) -> None:
+        with pytest.raises(ValueError, match="not supported"):
+            GatewayLLMProvider(
+                endpoint=_ENDPOINT,
+                api_key="test-bearer-token",
+                contract_major=2,
+                recorder=audit_recorder,
+                run_id="run-1",
+                telemetry_emit=telemetry_emit,
+            )
+
+
 class TestClose:
     def test_close_clears_clients(self, provider: GatewayLLMProvider) -> None:
         provider._get_http_client("state-1", token_id="tok-1")
@@ -760,3 +859,75 @@ class TestRuntimePreflight:
         sent_body = json.loads(route.calls.last.request.content)
         assert sent_body["model"] == "standard"
         assert sent_body["max_tokens"] == 32
+
+    @respx.mock
+    def test_preflight_fails_when_readyz_contract_header_missing(self, provider: GatewayLLMProvider) -> None:
+        """readyz echoes the contract header too — verified the same way as
+        the completions path (fix-round-1 minor)."""
+        respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body()))
+        with pytest.raises(LLMClientError) as exc_info:
+            provider.runtime_preflight(operation_id="op-1", model="standard")
+        assert exc_info.value.retryable is False
+
+    @respx.mock
+    def test_preflight_fails_when_readyz_contract_header_mismatched(self, provider: GatewayLLMProvider) -> None:
+        respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "2"}))
+        with pytest.raises(LLMClientError) as exc_info:
+            provider.runtime_preflight(operation_id="op-1", model="standard")
+        assert exc_info.value.retryable is False
+
+    @respx.mock
+    def test_preflight_fails_when_capabilities_key_missing(self, provider: GatewayLLMProvider) -> None:
+        """A missing ``capabilities`` key is a malformed document, NOT an
+        empty declared set — with no required_capabilities configured, the
+        old behavior silently passed. This must fail closed instead
+        (fix-round-1 minor)."""
+        body = _readyz_body()
+        del body["capabilities"]
+        respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"}))
+        with pytest.raises(LLMClientError) as exc_info:
+            provider.runtime_preflight(operation_id="op-1", model="standard")
+        assert exc_info.value.retryable is False
+
+    @respx.mock
+    def test_preflight_fails_when_adapter_block_missing(self, provider: GatewayLLMProvider) -> None:
+        """readyz's ``adapter`` identity block must be present and shaped
+        right — a document that omits it (but otherwise says ``ready``)
+        must not pass (fix-round-1 important finding: adapter identity was
+        never checked at all)."""
+        body = _readyz_body()
+        del body["adapter"]
+        respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"}))
+        with pytest.raises(LLMClientError) as exc_info:
+            provider.runtime_preflight(operation_id="op-1", model="standard")
+        assert exc_info.value.retryable is False
+
+    @respx.mock
+    @pytest.mark.parametrize(
+        "malformed_adapter",
+        [
+            {"name": "", "version": "1.0.0", "adapter_api_major": 1, "fingerprint": "abc"},  # blank name
+            {"name": "x", "version": "1.0.0", "adapter_api_major": "1", "fingerprint": "abc"},  # non-int major
+            {"name": "x", "version": "1.0.0", "adapter_api_major": True, "fingerprint": "abc"},  # bool, not int
+            {"name": "x", "version": "1.0.0", "fingerprint": "abc"},  # missing adapter_api_major
+        ],
+    )
+    def test_preflight_fails_when_adapter_block_malformed(self, provider: GatewayLLMProvider, malformed_adapter: dict[str, Any]) -> None:
+        body = _readyz_body()
+        body["adapter"] = malformed_adapter
+        respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"}))
+        with pytest.raises(LLMClientError) as exc_info:
+            provider.runtime_preflight(operation_id="op-1", model="standard")
+        assert exc_info.value.retryable is False
+
+    @respx.mock
+    def test_preflight_captures_adapter_identity_as_forensic_metadata(self, provider: GatewayLLMProvider) -> None:
+        respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "1"}))
+        respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(content="ok")))
+        provider.runtime_preflight(operation_id="op-1", model="standard")
+        assert provider._last_readyz_adapter_identity == {
+            "name": "reference_v1_invoke",
+            "version": "1.0.0",
+            "adapter_api_major": 1,
+            "fingerprint": "abc123",
+        }

@@ -252,6 +252,12 @@ _GATEWAY_NON_RETRYABLE_CONFIG_CODES = frozenset(
         "upstream_unauthorized",
         "upstream_response_invalid",
         "internal_error",
+        # ELSPETH's own static bearer was rejected by the gateway's inbound
+        # auth layer — not in the binding mapping table (which covers
+        # upstream/agency-facing codes), but named explicitly here rather
+        # than left to fall through anonymously to the default branch below,
+        # so "our own credential is wrong" is diagnosable from the code path.
+        "inbound_authentication_failed",
     }
 )
 
@@ -289,6 +295,47 @@ def _classify_gateway_http_error(response: httpx.Response) -> LLMClientError:
     return _gateway_error_for_code(_extract_gateway_error_code(response))
 
 
+def _validate_readyz_adapter_identity(payload: dict[str, Any]) -> dict[str, str | int]:
+    """Validate the readyz ``adapter`` identity block's presence and shape.
+
+    Per the integration design ("checks gateway readiness, contract major,
+    ADAPTER IDENTITY, model alias, and capabilities"), readiness is not just
+    ``ready: true`` — the adapter block must actually be there and shaped
+    right. This checks presence/shape and returns the values as forensic
+    metadata; it does NOT compare against an *expected* identity (that needs
+    a new GatewayConfig field, which is out of scope here — see the report).
+    """
+    adapter = payload.get("adapter")
+    if not isinstance(adapter, dict):
+        raise LLMClientError("Gateway readiness adapter identity block is missing or malformed", retryable=False)
+
+    name = adapter.get("name")
+    version = adapter.get("version")
+    adapter_api_major = adapter.get("adapter_api_major")
+    fingerprint = adapter.get("fingerprint")
+
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or not isinstance(version, str)
+        or not version.strip()
+        # bool is an int subclass — exclude it explicitly, same discipline
+        # as TokenUsage.from_dict's non-bool int coercion.
+        or not isinstance(adapter_api_major, int)
+        or isinstance(adapter_api_major, bool)
+        or not isinstance(fingerprint, str)
+        or not fingerprint.strip()
+    ):
+        raise LLMClientError("Gateway readiness adapter identity block is missing or malformed", retryable=False)
+
+    return {
+        "name": name,
+        "version": version,
+        "adapter_api_major": adapter_api_major,
+        "fingerprint": fingerprint,
+    }
+
+
 def _validate_gateway_success_response(
     response: httpx.Response,
     *,
@@ -310,7 +357,9 @@ def _validate_gateway_success_response(
 
     choices = data.get("choices")
     if not choices:
-        raise LLMClientError(f"Gateway response is missing 'choices': {list(data.keys())}", retryable=False)
+        # Fixed text only — the top-level JSON keys are agency-controlled
+        # data and must never be interpolated into an exception message.
+        raise LLMClientError("Gateway response is missing 'choices'", retryable=False)
 
     try:
         content = choices[0]["message"]["content"]
@@ -326,7 +375,8 @@ def _validate_gateway_success_response(
     if not content.strip():
         if raw_finish_reason == "tool_calls":
             raise LLMClientError("Gateway returned a tool_calls response (not supported by ELSPETH)", retryable=False)
-        raise ContentPolicyError(f"Gateway returned empty content (finish_reason={raw_finish_reason})")
+        # finish_reason is agency-controlled data — never interpolated.
+        raise ContentPolicyError("Gateway returned empty content")
 
     raw_usage = data.get("usage")
     if usage_required and raw_usage is None:
@@ -335,9 +385,11 @@ def _validate_gateway_success_response(
             retryable=False,
         )
     if isinstance(raw_usage, dict):
-        for usage_key, usage_val in raw_usage.items():
+        for usage_val in raw_usage.values():
             if isinstance(usage_val, float) and not math.isfinite(usage_val):
-                raise LLMClientError(f"Non-finite value in gateway usage.{usage_key}", retryable=False)
+                # The usage key name is agency-controlled data — never
+                # interpolated, even though it's "just a key name".
+                raise LLMClientError("Non-finite value in gateway usage", retryable=False)
     usage = TokenUsage.from_dict(raw_usage)
 
     finish_reason = parse_finish_reason(str(raw_finish_reason)) if raw_finish_reason is not None else None
@@ -393,9 +445,16 @@ class GatewayLLMProvider:
         # already enforces this shape at config-construction time, but this
         # provider can also be constructed directly (tests, future callers).
         self._base_url = _validate_gateway_endpoint(endpoint)
+        if contract_major not in _SUPPORTED_GATEWAY_CONTRACT_MAJORS:
+            raise ValueError(
+                f"contract_major {contract_major} is not supported; supported majors: {sorted(_SUPPORTED_GATEWAY_CONTRACT_MAJORS)}"
+            )
         self._contract_major = contract_major
         self._required_capabilities = required_capabilities
         self._usage_required = "usage" in required_capabilities
+        # Populated by _check_readyz — forensic-only until a GatewayConfig
+        # field pins an *expected* adapter identity (owed; see report).
+        self._last_readyz_adapter_identity: dict[str, str | int] | None = None
         # Pre-built auth + contract headers — avoids storing the raw bearer
         # token as a separately named attribute.
         self._request_headers = {
@@ -634,6 +693,11 @@ class GatewayLLMProvider:
             except httpx.RequestError as e:
                 raise NetworkError(_STATIC_GATEWAY_ERROR) from e
 
+            # Same contract-header verification as the completions path —
+            # readyz echoes the header too, and a mismatch there is just as
+            # much a wire-contract violation as on /chat/completions.
+            _validate_contract_header(response, self._contract_major)
+
             try:
                 payload = json.loads(response.content, parse_constant=reject_nonfinite_constant)
             except (ValueError, TypeError) as e:
@@ -651,12 +715,20 @@ class GatewayLLMProvider:
             if payload.get("contract_major") != self._contract_major:
                 raise LLMClientError("Gateway readiness contract_major does not match configuration", retryable=False)
 
+            self._last_readyz_adapter_identity = _validate_readyz_adapter_identity(payload)
+
             model_aliases = payload.get("model_aliases")
             if not isinstance(model_aliases, list) or model not in model_aliases:
                 raise LLMClientError("Gateway readiness does not report the configured model alias", retryable=False)
 
             declared_capabilities = payload.get("capabilities")
-            declared = set(declared_capabilities) if isinstance(declared_capabilities, list) else set()
+            if not isinstance(declared_capabilities, list):
+                # Missing/malformed capabilities is a malformed document, NOT
+                # an empty declared set — treating it as empty would let a
+                # profile with no required_capabilities silently pass
+                # against a readyz body that never actually reported any.
+                raise LLMClientError("Gateway readiness capabilities field is missing or malformed", retryable=False)
+            declared = set(declared_capabilities)
             missing = set(self._required_capabilities) - declared
             if missing:
                 raise LLMClientError(
