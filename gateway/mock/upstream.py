@@ -13,6 +13,20 @@ Behavior is keyed on the *last* ``conversation`` entry's ``text``:
   ``"operations"``.
 - ``"TRIGGER_FAULT <kind>"`` -> the matching fault body and HTTP status
   (``throttle`` 429, ``overloaded`` 503, ``screening``/``too_long`` 400).
+- ``"TRIGGER_HALT <kind>"`` -> a *success* body (HTTP 200) whose ``halt``
+  is exactly ``<kind>`` (``truncated``, ``screened``, or ``complete``),
+  reaching the three halt values ``TRIGGER_FAULT``/the default text-echo
+  path don't:
+    - ``truncated`` -> ``result.text = "MOCK:truncated"``, halt
+      ``"truncated"`` -> the adapter maps this to ``FinishReason.LENGTH``.
+    - ``screened`` -> **no** ``result.text`` at all (the salvage-less
+      branch the reference adapter's docstring calls out: a halt that
+      salvages no text still needs ``CanonicalResponse.text=""``, never
+      ``None``) -> the adapter maps this to
+      ``FinishReason.CONTENT_FILTER``.
+    - ``complete`` -> ``result.text = "MOCK:complete"``, halt
+      ``"complete"`` (accepted for symmetry with the other two).
+  A ``<kind>`` outside this set is a malformed trigger (see below).
 - otherwise, keyed on the request's ``format.kind``:
     - ``"schema"`` -> the last text, JSON-encoded under the response
       schema's first declared property name (``"echo"`` when the schema
@@ -29,6 +43,35 @@ Behavior is keyed on the *last* ``conversation`` entry's ``text``:
 ``directives`` / ``directive_policy`` (present only when the request
 declares tools / sets ``tool_choice``) are accepted but otherwise ignored --
 this mock's behavior never depends on them.
+
+Two notes for whoever writes the Task 13 conformance kit against this mock:
+
+1. ``TRIGGER_FAULT screening`` (a 400 *fault* body -> the gateway's
+   ``classify_error`` maps it to ``content_policy_rejected``) is a
+   *different code path* from ``TRIGGER_HALT screened`` (a 200 *success*
+   body with halt ``"screened"`` -> ``FinishReason.CONTENT_FILTER``). They
+   share the word "screen[ed]" but exercise different adapter methods
+   (``classify_error`` vs ``parse_success``) and land on different
+   ``elspeth_llm_gateway.sdk.types`` enums (``ErrorClassification.code`` vs
+   ``FinishReason``). Do not treat one as covering the other.
+2. ``TRIGGER_FAULT throttle`` returns HTTP 429 with a fault body, but the
+   gateway's transport short-circuits *any* HTTP 429 into
+   ``upstream_rate_limited`` before the adapter's ``classify_error`` ever
+   runs (see the "Design note on the throttle -> upstream_rate_limited
+   mapping" section of ``reference.adapter``'s module docstring). A
+   conformance test that fires this trigger exercises the transport's 429
+   short-circuit, *not* the adapter's ``"throttle"`` fault-kind branch --
+   that branch is reachable only via a direct unit test of
+   ``classify_error``, never through this mock over HTTP.
+
+A malformed trigger -- ``"USE_TOOL <op>"`` with no JSON payload at all, or
+a payload that isn't valid JSON -- returns a clean, deterministic HTTP 400
+with ``{"error": "malformed_trigger"}`` rather than crashing. This shape is
+a mock-only diagnostic (it is not part of the fictional
+``reference_v1_invoke`` fault contract -- it is not a ``{"fault": {...}}``
+body and carries no ``kind``); it exists purely so a malformed trigger in a
+test fixture fails loudly and cleanly instead of surfacing as an opaque
+500.
 """
 
 import json
@@ -46,9 +89,21 @@ _FAULT_STATUS: dict[str, int] = {
     "too_long": 400,
 }
 
+_VALID_HALT_TRIGGER_KINDS = frozenset({"truncated", "screened", "complete"})
+
 # A single, fixed call ref: deterministic, and this mock never issues more
 # than one invocation per USE_TOOL trigger.
 _MOCK_TOOL_CALL_REF = "mock-call-ref-1"
+
+
+def _malformed_trigger_response() -> JSONResponse:
+    """A clean, deterministic 400 for any unparsable trigger text.
+
+    See the module docstring's final paragraph: this shape is a mock-only
+    diagnostic, not part of the fictional ``reference_v1_invoke`` fault
+    contract.
+    """
+    return JSONResponse(status_code=400, content={"error": "malformed_trigger"})
 
 
 def _last_text(conversation: list[dict]) -> str:
@@ -80,8 +135,14 @@ def create_mock_upstream_app(*, require_bearer_prefix: str = _DEFAULT_BEARER_PRE
         input_units = _total_conversation_chars(conversation) // 4
 
         if last_text.startswith("USE_TOOL "):
-            _, operation, payload_json = last_text.split(" ", 2)
-            payload = json.loads(payload_json)
+            trigger_parts = last_text.split(" ", 2)
+            if len(trigger_parts) < 3:
+                return _malformed_trigger_response()
+            _, operation, payload_json = trigger_parts
+            try:
+                payload = json.loads(payload_json)
+            except json.JSONDecodeError:
+                return _malformed_trigger_response()
             reply = json.dumps(payload)
             return JSONResponse(
                 status_code=200,
@@ -93,9 +154,38 @@ def create_mock_upstream_app(*, require_bearer_prefix: str = _DEFAULT_BEARER_PRE
             )
 
         if last_text.startswith("TRIGGER_FAULT "):
-            _, kind = last_text.split(" ", 1)
+            trigger_parts = last_text.split(" ", 1)
+            if len(trigger_parts) < 2:
+                return _malformed_trigger_response()
+            _, kind = trigger_parts
             status = _FAULT_STATUS.get(kind, 400)
             return JSONResponse(status_code=status, content={"fault": {"kind": kind}})
+
+        if last_text.startswith("TRIGGER_HALT "):
+            trigger_parts = last_text.split(" ", 1)
+            if len(trigger_parts) < 2:
+                return _malformed_trigger_response()
+            _, kind = trigger_parts
+            if kind not in _VALID_HALT_TRIGGER_KINDS:
+                return _malformed_trigger_response()
+            if kind == "screened":
+                # The salvage-less branch: no result.text at all. The
+                # reference adapter's parse_success treats a missing
+                # "text" under halt="screened" as text="" (never None),
+                # never a KeyError -- see reference.adapter's docstring.
+                return JSONResponse(
+                    status_code=200,
+                    content={"halt": "screened", "accounting": {"input_units": input_units, "output_units": 0}},
+                )
+            text = f"MOCK:{kind}"
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "result": {"text": text},
+                    "halt": kind,
+                    "accounting": {"input_units": input_units, "output_units": len(text) // 4},
+                },
+            )
 
         response_format = body.get("format")
         if response_format is not None and response_format.get("kind") == "schema":

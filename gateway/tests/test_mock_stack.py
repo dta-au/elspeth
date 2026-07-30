@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 import mock.stack as mock_stack
 import pytest
+from elspeth_llm_gateway.reference.adapter import ReferenceV1InvokeAdapter
+from elspeth_llm_gateway.sdk.types import FinishReason
 from mock.oauth import create_mock_oauth_app
 from mock.upstream import create_mock_upstream_app
 
@@ -200,6 +202,26 @@ async def test_use_tool_trigger_returns_invocation_and_halts_operations():
     assert isinstance(invocations[0]["ref"], str) and invocations[0]["ref"]
 
 
+async def test_use_tool_with_no_json_payload_returns_400_not_500():
+    """ "USE_TOOL <op>" with nothing after it must fail cleanly, not raise
+    an unhandled ValueError from unpacking a too-short split."""
+    app = create_mock_upstream_app()
+
+    response = await _invoke(app, _conversation("USE_TOOL search_catalog"))
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "malformed_trigger"}
+
+
+async def test_use_tool_with_invalid_json_payload_returns_400_not_500():
+    app = create_mock_upstream_app()
+
+    response = await _invoke(app, _conversation("USE_TOOL search_catalog {not valid json"))
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "malformed_trigger"}
+
+
 @pytest.mark.parametrize(
     "kind,expected_status",
     [
@@ -216,6 +238,75 @@ async def test_trigger_fault_returns_matching_status_and_body(kind, expected_sta
 
     assert response.status_code == expected_status
     assert response.json() == {"fault": {"kind": kind}}
+
+
+async def test_trigger_halt_truncated_carries_text_and_halt_truncated():
+    app = create_mock_upstream_app()
+
+    response = await _invoke(app, _conversation("TRIGGER_HALT truncated"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["halt"] == "truncated"
+    assert body["result"]["text"] == "MOCK:truncated"
+
+
+async def test_trigger_halt_screened_carries_no_result_text():
+    """The salvage-less branch: halt="screened" with no result.text at all
+    -- the reference adapter maps this to CanonicalResponse.text="" (never
+    None, never a KeyError), and FinishReason.CONTENT_FILTER."""
+    app = create_mock_upstream_app()
+
+    response = await _invoke(app, _conversation("TRIGGER_HALT screened"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["halt"] == "screened"
+    assert "result" not in body or "text" not in body["result"]
+
+
+async def test_trigger_halt_complete_carries_text_and_halt_complete():
+    app = create_mock_upstream_app()
+
+    response = await _invoke(app, _conversation("TRIGGER_HALT complete"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["halt"] == "complete"
+    assert body["result"]["text"] == "MOCK:complete"
+
+
+async def test_trigger_halt_unknown_kind_returns_400_not_500():
+    app = create_mock_upstream_app()
+
+    response = await _invoke(app, _conversation("TRIGGER_HALT bogus"))
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "malformed_trigger"}
+
+
+@pytest.mark.parametrize(
+    "trigger_text,expected_finish_reason",
+    [
+        ("TRIGGER_HALT truncated", FinishReason.LENGTH),
+        ("TRIGGER_HALT screened", FinishReason.CONTENT_FILTER),
+        ("TRIGGER_HALT complete", FinishReason.STOP),
+    ],
+)
+def test_trigger_halt_bodies_round_trip_through_the_real_adapter(trigger_text, expected_finish_reason):
+    """End-to-end proof (not just a body/halt assertion): the exact JSON
+    this mock emits for each TRIGGER_HALT kind, fed through the real
+    ReferenceV1InvokeAdapter.parse_success, produces the FinishReason the
+    Task 13 conformance kit needs every halt value to reach."""
+    bodies = {
+        "TRIGGER_HALT truncated": {"result": {"text": "MOCK:truncated"}, "halt": "truncated"},
+        "TRIGGER_HALT screened": {"halt": "screened"},
+        "TRIGGER_HALT complete": {"result": {"text": "MOCK:complete"}, "halt": "complete"},
+    }
+
+    response = ReferenceV1InvokeAdapter().parse_success(bodies[trigger_text])
+
+    assert response.finish_reason == expected_finish_reason
 
 
 async def test_schema_format_echoes_under_first_declared_property():
