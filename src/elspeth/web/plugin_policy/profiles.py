@@ -121,6 +121,8 @@ _LLM_PRIVATE_OPTIONS = frozenset(
         "api_version",
         "credential_ref",
         "credential_scope",
+        "contract_major",
+        "required_capabilities",
         "tracing",
         "timeout_seconds",
         "max_tokens",

@@ -2,7 +2,7 @@
 
 LLMTransform dispatches to SingleQueryStrategy or MultiQueryStrategy
 based on whether queries are configured. Provider dispatch (Azure,
-OpenRouter, Bedrock) is handled via _PROVIDERS registry.
+OpenRouter, Bedrock, Gateway) is handled via _PROVIDERS registry.
 
 Architecture:
     LLMTransform (BatchTransformMixin)
@@ -67,6 +67,7 @@ from elspeth.plugins.transforms.llm.provider import (
 )
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig, _configure_azure_monitor
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterConfig, OpenRouterLLMProvider
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig, parse_tracing_config
@@ -250,10 +251,17 @@ def _finish_reason_error(
 # OpenRouterLLMProvider, BedrockLLMProvider) are verified against LLMProvider by mypy at their
 # definition sites. The provider class is stored here for documentation only —
 # actual construction uses isinstance narrowing in _create_provider().
+#
+# "gateway" is registered for config-and-schema purposes only (Phase 2 Task 2
+# of the LLM gateway integration plan): GatewayLLMProvider does not exist yet
+# (Task 3), so `object` is a deliberate placeholder — never instantiated, and
+# never read except as this dict's value type. `_create_provider()` raises
+# NotImplementedError before it would ever need a real provider class here.
 _PROVIDERS: dict[str, tuple[type[LLMConfig], type]] = {
     "azure": (AzureOpenAIConfig, AzureLLMProvider),
     "openrouter": (OpenRouterConfig, OpenRouterLLMProvider),
     "bedrock": (BedrockConfig, BedrockLLMProvider),
+    "gateway": (GatewayConfig, object),
 }
 
 
@@ -1140,6 +1148,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         "azure"      → AzureOpenAIConfig + AzureLLMProvider
         "openrouter" → OpenRouterConfig  + OpenRouterLLMProvider
         "bedrock"    → BedrockConfig     + BedrockLLMProvider
+        "gateway"    → GatewayConfig     + GatewayLLMProvider (Phase 2 Task 3;
+                       config-only for now — construction raises NotImplementedError)
 
     Strategy selection:
         queries is not None → MultiQueryStrategy
@@ -1326,7 +1336,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # config_cls is one of the registered provider config classes at runtime;
         # from_dict() returns Self on the subclass, but mypy sees type[LLMConfig].
         self._config = cast(
-            "AzureOpenAIConfig | OpenRouterConfig | BedrockConfig",
+            "AzureOpenAIConfig | OpenRouterConfig | BedrockConfig | GatewayConfig",
             config_cls.from_dict(config, plugin_name=self.name),
         )
         self._initialize_declared_input_fields(self._config)
@@ -1485,7 +1495,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         self._batch_initialized = False
 
     @property
-    def provider_config(self) -> AzureOpenAIConfig | OpenRouterConfig | BedrockConfig:
+    def provider_config(self) -> AzureOpenAIConfig | OpenRouterConfig | BedrockConfig | GatewayConfig:
         """Read-only accessor for the typed provider config.
 
         Exposes the post-validation ``LLMConfig`` subclass so cross-cutting
@@ -1570,6 +1580,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             if isinstance(self._config, AzureOpenAIConfig)
             else "bedrock"
             if isinstance(self._config, BedrockConfig)
+            else "gateway"
+            if isinstance(self._config, GatewayConfig)
             else "openrouter"
         )
         self._limiter = ctx.rate_limit_registry.get_limiter(limiter_name) if ctx.rate_limit_registry is not None else None
@@ -1643,6 +1655,16 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
                 resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            )
+        elif isinstance(self._config, GatewayConfig):
+            # GatewayConfig is registered (Phase 2 Task 2) for config parsing
+            # and schema publication only. GatewayLLMProvider does not exist
+            # yet — Phase 2 Task 3 adds it. Fail closed and loudly rather than
+            # falling through to another provider's isinstance branch below.
+            raise NotImplementedError(
+                "GatewayLLMProvider is not implemented yet (Phase 2 Task 3). "
+                "GatewayConfig is currently registered for configuration and "
+                "schema purposes only; it cannot be used to run an LLM transform."
             )
         else:
             raise RuntimeError(f"Unknown config type: {type(self._config).__name__}")

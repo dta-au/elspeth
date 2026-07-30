@@ -322,13 +322,14 @@ class TestGetSchema:
         info = catalog.get_schema("transform", "llm")
         schema = info.json_schema
         assert "oneOf" in schema
-        assert len(schema["oneOf"]) == 3
+        assert len(schema["oneOf"]) == 4
         assert schema["discriminator"]["propertyName"] == "provider"
-        assert set(schema["discriminator"]["mapping"].keys()) == {"azure", "openrouter", "bedrock"}
+        assert set(schema["discriminator"]["mapping"].keys()) == {"azure", "openrouter", "bedrock", "gateway"}
         defs = schema["$defs"]
         assert "AzureOpenAIConfig" in defs
         assert "OpenRouterConfig" in defs
         assert "BedrockConfig" in defs
+        assert "GatewayConfig" in defs
         assert set(defs["AzureOpenAIConfig"]["required"]) >= {
             "deployment_name",
             "endpoint",
@@ -337,6 +338,7 @@ class TestGetSchema:
         }
         assert set(defs["OpenRouterConfig"]["required"]) >= {"model", "api_key", "prompt_template"}
         assert set(defs["BedrockConfig"]["required"]) >= {"model", "prompt_template", "provider"}
+        assert set(defs["GatewayConfig"]["required"]) >= {"model", "endpoint", "credential_ref", "prompt_template"}
         assert "region_name" in defs["BedrockConfig"]["properties"]
         assert "api_key" not in defs["BedrockConfig"]["properties"]
 
