@@ -246,7 +246,7 @@ EXPECTED_STATUS_MATRIX = {
         "unknown",
         "unknown",
         "pass",
-        "fail",
+        "pass",
         "partial",
         "unknown",
     ),
@@ -425,6 +425,9 @@ EXPECTED_ASSESSMENT_LOCATORS = {
         "tests/integration/core/dag/test_dag_scenario_production_path.py"
         "::test_row_union_two_variant_ab_preserves_complete_declared_groups_and_statistics",
     ),
+    "composer-row-union-authoring-parity": (
+        "tests/integration/web/composer/parity/test_fixture_matrix.py::test_surface_derives_isomorphic_committed_graph",
+    ),
 }
 
 EXPECTED_ASSESSMENT_EVIDENCE = tuple(
@@ -435,7 +438,7 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "e72da690552ff36187da5fae1afb6200bd64b0fb8bc8f902d681b5c7b5c86869"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb84c65a0b5100f4354830f9"
 EXPECTED_CASE_REGISTRY_SHA256 = "eaf1848b7f994ee54a240625b628bfff437046179b6a0cd368e3c013cf0f7a0c"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
@@ -4913,11 +4916,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 109
-    assert len(assessment_evidence) == 62
+    assert len(manifest.evidence) == 110
+    assert len(assessment_evidence) == 63
     assert len(harness_evidence) == 47
-    assert len({reference.id for reference in manifest.evidence}) == 109
-    assert len({reference.locator for reference in manifest.evidence}) == 109
+    assert len({reference.id for reference in manifest.evidence}) == 110
+    assert len({reference.locator for reference in manifest.evidence}) == 110
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,

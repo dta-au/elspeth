@@ -500,6 +500,11 @@ evidence:
     locator: tests/integration/core/dag/test_dag_scenario_production_path.py::test_row_union_two_variant_ab_preserves_complete_declared_groups_and_statistics
     claim: The canonical two-variant A/B case pins the production graph, long-format statistics, declared control/treatment group order, complete batch membership, and terminal scheduler work.
     stages: [config, build, runtime, audit]
+  - id: composer-row-union-authoring-parity
+    kind: pytest
+    locator: tests/integration/web/composer/parity/test_fixture_matrix.py::test_surface_derives_isomorphic_committed_graph
+    claim: Freeform, guided-full, and guided-staged authoring derive the canonical row-union A/B graph and public runtime pipeline semantics.
+    stages: [config, build]
   - id: harness-aggregation-immutable-batch-eof-immutable-membership
     kind: harness
     locator: aggregation-immutable-batch:eof-immutable-membership
@@ -4105,10 +4110,8 @@ scenarios:
         exit_gate: The row-union corpus contention case passes single-effective-owner, declared-order release, and stale-worker fencing assertions.
       freeform: *freeform_pass
       guided:
-        status: fail
-        reason: No guided-authoring corpus case proves the canonical row-union A/B topology.
-        owner_issue: elspeth-a5b86149d4
-        exit_gate: The guided-authoring corpus case passes canonical graph equality for the row-union A/B scenario.
+        status: pass
+        evidence: [composer-row-union-authoring-parity]
       round_trip:
         status: partial
         evidence: [yaml-importer-generator, yaml-importer-generator-02]
