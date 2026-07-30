@@ -119,14 +119,50 @@ locals {
   plugin_allowlist     = jsonencode(local.effective_plugin_allowlist)
   plugin_preferences   = jsonencode(local.effective_plugin_preferences)
   plugin_control_modes = jsonencode(local.effective_plugin_control_modes)
-  # A cross-region ("global."/"us."/"eu."/"apac.") inference profile is authorized by Bedrock
-  # against the underlying foundation model in whichever region it actually routes to, and that
-  # authorization check reports a region-less resource ARN. A single region-pinned
-  # foundation-model grant never matches that check, so derive an additional wildcard-region
-  # grant for every configured Composer model (primary and advisor) that carries one of these
-  # prefixes; a non-cross-region model keeps relying solely on the region-pinned ARNs supplied
-  # in var.bedrock_foundation_model_arns.
-  bedrock_cross_region_prefixes = ["global.", "us.", "eu.", "apac."]
+  # A cross-region inference profile is authorized by Bedrock against the underlying foundation
+  # model in whichever region it actually routes to, and that authorization check reports a
+  # region-less resource ARN. A single region-pinned foundation-model grant never matches that
+  # check, so derive an additional wildcard-region grant for every configured Composer model
+  # (primary and advisor) that carries one of these prefixes; a non-cross-region model keeps
+  # relying solely on the region-pinned ARNs supplied in var.bedrock_foundation_model_arns.
+  #
+  # This list is an explicit allowlist and MUST be extended as AWS ships new geography
+  # prefixes. It deliberately is not a pattern match: a model id's leading dotted label is
+  # ambiguous between a geography ("au.anthropic.claude-opus-5") and a provider
+  # ("zai.glm-4.7-flash", whose version segment also contains a dot), so no reliable
+  # structural rule separates the two. A missing geography prefix used to fail open-ended —
+  # terraform plan validated cleanly, no wildcard grant was derived, and bedrock:InvokeModel
+  # then denied intermittently depending on which destination region the profile routed to.
+  # The bedrock_unclassified_model_ids gate below closes that hole: a model id whose leading
+  # dotted label matches neither this list nor bedrock_known_provider_prefixes fails the plan
+  # (see the precondition on aws_iam_role_policy.task). After changing a Composer model, still
+  # confirm the rendered task-role policy carries an
+  # "arn:aws:bedrock:*::foundation-model/<base-id>" grant for it.
+  bedrock_cross_region_prefixes = ["global.", "us.", "eu.", "apac.", "au.", "jp.", "ca.", "br.", "in."]
+
+  # Leading dotted labels that are Bedrock model providers, not geographies. A match here
+  # classifies the model id as region-pinned, so it correctly receives no wildcard-region
+  # grant and relies on the region-pinned ARNs in var.bedrock_foundation_model_arns. Extend
+  # this list when AWS ships a new serverless provider; an unlisted label is refused at plan
+  # time rather than guessed at. GovCloud ("us-gov.") is deliberately absent: every ARN this
+  # module renders is in the "aws" partition, so a GovCloud profile must fail the gate rather
+  # than silently receive a wrong-partition grant.
+  bedrock_known_provider_prefixes = [
+    "ai21.",
+    "amazon.",
+    "anthropic.",
+    "cohere.",
+    "deepseek.",
+    "luma.",
+    "meta.",
+    "mistral.",
+    "openai.",
+    "qwen.",
+    "stability.",
+    "twelvelabs.",
+    "writer.",
+    "zai.",
+  ]
 
   # The grant follows the configuration instead of only the Composer pair.
   # Deriving it from the Composer models alone meant a profile naming any third
@@ -149,6 +185,26 @@ locals {
       null,
     )
   }
+
+  # Configured model ids whose leading dotted label is neither a known geography prefix nor a
+  # known provider label, and which no explicit var.bedrock_foundation_model_arns entry names
+  # (matched against both the full id and the id with its leading label stripped, because an
+  # unrecognised label could be either a provider or a geography). Anything left in this list
+  # is unclassifiable: deriving no grant would reproduce the silent intermittent AccessDeny
+  # this gate exists to prevent, so the precondition on aws_iam_role_policy.task rejects the
+  # plan and tells the operator what to supply instead.
+  bedrock_unclassified_model_ids = [
+    for model_id in local.bedrock_configured_model_ids : model_id
+    if strcontains(model_id, ".")
+    && local.bedrock_configured_model_cross_region_prefixes[model_id] == null
+    && !anytrue([
+      for prefix in local.bedrock_known_provider_prefixes : startswith(model_id, prefix)
+    ])
+    && !anytrue([
+      for arn in var.bedrock_foundation_model_arns :
+      endswith(arn, "/${model_id}") || endswith(arn, "/${try(regex("^[^.]+\\.(.+)$", model_id)[0], model_id)}")
+    ])
+  ]
 
   bedrock_cross_region_foundation_model_arns = distinct([
     for model_id, prefix in local.bedrock_configured_model_cross_region_prefixes :

@@ -12,6 +12,7 @@ import weakref
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -1624,8 +1625,27 @@ class TestLifespanShutdown:
 
     @pytest.mark.asyncio
     async def test_lifespan_propagates_catalog_client_context_failure(self, tmp_path) -> None:
-        """Outer HTTP-client construction failures are startup failures, not fallback decisions."""
-        app = create_app(_settings(tmp_path))
+        """Outer HTTP-client construction failures are startup failures, not fallback decisions.
+
+        The catalog prime is gated on OpenRouter being a configured LLM
+        provider (elspeth-c67ba40e4a), so the deployment must bind an
+        ``openrouter`` profile for the probe client to be constructed at
+        all — without one the prime (and this failure mode) never runs.
+        """
+        app = create_app(
+            _settings(
+                tmp_path,
+                llm_profiles={
+                    "tutorial": {
+                        "provider": "openrouter",
+                        "model": "openai/gpt-5-mini",
+                        "credential_scope": "server",
+                        "credential_ref": "OPENROUTER_API_KEY",
+                    }
+                },
+                default_llm_profile="tutorial",
+            )
+        )
 
         with (
             patch("httpx.AsyncClient", return_value=_EnteringAsyncClientRaises()),
@@ -3401,3 +3421,108 @@ class TestAwsEcsValidateOnlyStartup:
         assert (data_dir / "runs").is_dir()
         assert initialize_calls == 1
         app.state.session_engine.dispose()
+
+
+class TestBootPrimeOpenRouterCatalogGate:
+    """elspeth-c67ba40e4a: boot catalog prime follows configured LLM providers.
+
+    A deployment must not egress to providers it has not configured: the
+    boot-time OpenRouter ``/models`` prime runs only when a configured LLM
+    profile binds the ``openrouter`` provider. Bedrock-only (AWS ECS via
+    the task role) and profile-less deployments skip the prime entirely —
+    no request to openrouter.ai — and serve the bundled litellm fallback.
+    """
+
+    _OPENROUTER_PROFILE: ClassVar[dict[str, str]] = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5-mini",
+        "credential_scope": "server",
+        "credential_ref": "OPENROUTER_API_KEY",
+    }
+    _BEDROCK_PROFILE: ClassVar[dict[str, str]] = {
+        "provider": "bedrock",
+        "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+        "region_name": "ap-southeast-2",
+    }
+
+    def _run_boot_prime(self, settings: WebSettings, monkeypatch, *, prime_result: bool = True) -> tuple[int, list[dict]]:
+        """Run the boot-prime helper with the live prime mocked out.
+
+        Returns ``(prime_call_count, captured_logs)``. The mock replaces
+        ``prime_openrouter_catalog_from_live`` on the app module so no
+        real HTTP request can occur regardless of the gate's decision.
+        """
+        calls: list[object] = []
+
+        async def _fake_prime(*, http_get: object) -> bool:
+            calls.append(http_get)
+            return prime_result
+
+        monkeypatch.setattr(app_module, "prime_openrouter_catalog_from_live", _fake_prime)
+        with capture_logs() as logs:
+            asyncio.run(app_module._boot_prime_openrouter_catalog(settings))
+        return len(calls), logs
+
+    def _event(self, logs: list[dict], event: str) -> dict:
+        matches = [entry for entry in logs if entry["event"] == event]
+        assert len(matches) == 1, f"expected exactly one {event!r} log, got {logs!r}"
+        return matches[0]
+
+    def test_bedrock_only_deployment_skips_prime(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"llm-default": dict(self._BEDROCK_PROFILE)},
+            default_llm_profile="llm-default",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 0
+        skipped = self._event(logs, "openrouter_catalog_boot_prime_skipped")
+        assert skipped["configured_llm_providers"] == ("bedrock",)
+        assert not any(entry["event"] == "openrouter_catalog_boot_prime_complete" for entry in logs)
+
+    def test_no_llm_profiles_skips_prime(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(tmp_path)
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 0
+        skipped = self._event(logs, "openrouter_catalog_boot_prime_skipped")
+        assert skipped["configured_llm_providers"] == ()
+
+    def test_openrouter_deployment_primes(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"tutorial": dict(self._OPENROUTER_PROFILE)},
+            default_llm_profile="tutorial",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 1
+        self._event(logs, "openrouter_catalog_boot_prime_complete")
+        assert not any(entry["event"] == "openrouter_catalog_boot_prime_skipped" for entry in logs)
+
+    def test_mixed_providers_primes_once(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={
+                "tutorial": dict(self._OPENROUTER_PROFILE),
+                "bedrock-task-role": dict(self._BEDROCK_PROFILE),
+            },
+            default_llm_profile="tutorial",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 1
+        self._event(logs, "openrouter_catalog_boot_prime_complete")
+
+    def test_failed_prime_logs_fallback_warning(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"tutorial": dict(self._OPENROUTER_PROFILE)},
+            default_llm_profile="tutorial",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch, prime_result=False)
+
+        assert prime_calls == 1
+        failed = self._event(logs, "openrouter_catalog_boot_prime_failed")
+        assert failed["log_level"] == "warning"

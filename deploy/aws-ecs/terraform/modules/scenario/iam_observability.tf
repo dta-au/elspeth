@@ -156,6 +156,23 @@ resource "aws_iam_role_policy" "task" {
   name   = "${local.namespace}-task-policy"
   role   = aws_iam_role.task.id
   policy = data.aws_iam_policy_document.task.json
+
+  # The wildcard-region Bedrock grant derivation in locals.tf classifies every configured
+  # model id by its leading dotted label. An unrecognised label used to fail open: no grant
+  # was derived, `terraform plan` validated cleanly, and bedrock:InvokeModel then denied
+  # intermittently at runtime depending on which destination region a geography profile
+  # routed to. Fail the plan instead and say exactly how to resolve it.
+  lifecycle {
+    precondition {
+      condition = length(local.bedrock_unclassified_model_ids) == 0
+      error_message = format(
+        "Bedrock model id(s) [%s] carry a leading dotted label that is neither a known cross-region geography prefix (%s) nor a known provider label (%s), so the module cannot decide whether a wildcard-region foundation-model grant is required. If the label is a new AWS geography, add it to bedrock_cross_region_prefixes in modules/scenario/locals.tf; if it is a new provider, add it to bedrock_known_provider_prefixes there. Alternatively name the model explicitly in bedrock_foundation_model_arns: \"arn:aws:bedrock:*::foundation-model/<id-without-geography-prefix>\" for a cross-region geography profile, or the region-pinned foundation-model ARN for a provider model.",
+        join(", ", local.bedrock_unclassified_model_ids),
+        join(" ", local.bedrock_cross_region_prefixes),
+        join(" ", local.bedrock_known_provider_prefixes),
+      )
+    }
+  }
 }
 
 resource "aws_cloudwatch_log_group" "web" {

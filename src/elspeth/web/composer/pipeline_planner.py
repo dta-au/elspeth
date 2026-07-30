@@ -70,7 +70,14 @@ from elspeth.web.composer.progress import (
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
-from elspeth.web.composer.state import CompositionState, ValidationEntry, ValidationSummary, coalesce_reachability_facts
+from elspeth.web.composer.state import (
+    CompositionState,
+    RouteDestinationFactDict,
+    ValidationEntry,
+    ValidationSummary,
+    coalesce_reachability_facts,
+    route_destination_facts,
+)
 from elspeth.web.composer.tools._common import RuntimePreflight, ToolContext, ToolResult
 from elspeth.web.composer.tools._dispatch import (
     execute_discovery_tool_with_context,
@@ -342,6 +349,7 @@ class _PlannerAttemptTrail:
         codes: tuple[str, ...] = (),
         planner_code: str | None = None,
         tool_calls: int = 0,
+        repeated_fingerprint: bool = False,
     ) -> None:
         if phase not in self.phase_counts:
             self.phase_counts[phase] = 0
@@ -361,6 +369,9 @@ class _PlannerAttemptTrail:
             rejection_codes=rejection_codes,
             planner_code=planner_code,
             tool_calls=tool_calls,
+            # True when this rejection's (component, code) fingerprint already
+            # appeared in this request — the doctrine's "our bug" signal.
+            repeated_fingerprint=repeated_fingerprint,
         )
 
     def log_summary(self, final_outcome: str) -> None:
@@ -749,7 +760,43 @@ def _candidate_rejection_codes(result: ToolResult) -> tuple[str, ...]:
     return tuple(entry.error_code or "validation_error" for entry in _rejection_entries(result))
 
 
-def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
+# Closed routing-destination codes whose feedback carries instance wiring
+# facts from ``route_destination_facts`` (the rejected candidate's dangling
+# value plus its valid destinations). Same custody class as the coalesce
+# reachability facts: node ids, sink names, and connection names the planner
+# itself authored in the candidate being answered.
+_ROUTE_DESTINATION_FACT_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "source_on_success_dangling",
+        "transform_on_success_dangling",
+        "aggregation_on_success_dangling",
+        "transform_on_error_unknown_sink",
+        "coalesce_on_success_unknown_sink",
+    }
+)
+
+
+def _rejection_fingerprint(result: ToolResult) -> tuple[tuple[str, str], ...]:
+    """Identity of one candidate rejection: sorted (component, code) pairs.
+
+    Two rejections with the same fingerprint failed for the same reasons on
+    the same components — the previous repair changed nothing that mattered.
+    Project doctrine: an identical fingerprint repeating across attempts is a
+    feedback-quality defect (ours), so the loop must at minimum TELL the model
+    the repetition happened instead of silently burning budget on it.
+    """
+    return tuple(sorted((entry.component, entry.error_code or "validation_error") for entry in _rejection_entries(result)))
+
+
+_REPEAT_NOTICE = (
+    "This candidate failed with EXACTLY the same rejection set (same components, same codes) "
+    "as an earlier candidate in this request: the intervening changes did not fix — or "
+    "reintroduced — the failure. Change ONLY the fields the errors below name, keep every "
+    "other part of your last candidate byte-identical, and re-emit."
+)
+
+
+def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint: bool = False) -> dict[str, Any]:
     """Project only structured validation fields already safe for tool output.
 
     Raw validation messages are withheld — they can quote plugin names, option
@@ -777,6 +824,7 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
     validation = result.validation
     errors: list[dict[str, Any]] = []
     reachability_facts: dict[str, dict[str, Any]] | None = None
+    destination_facts: dict[str, RouteDestinationFactDict] | None = None
     for entry in _rejection_entries(result):
         code = entry.error_code or "validation_error"
         projected: dict[str, Any] = {
@@ -790,6 +838,19 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
             projected["explanation"], projected["suggested_fix"] = guidance
         if code == "plugin_options_invalid":
             projected["detail"] = entry.message
+        if code in _ROUTE_DESTINATION_FACT_CODES:
+            # Instance wiring facts derived from the REJECTED candidate state
+            # the result carries — the dangling value and the exact valid
+            # destinations (sink names / consumable connections) the planner
+            # itself authored. Without them the bare code names neither WHICH
+            # value dangled nor what it should match, and the static guidance
+            # can only send the model to get_pipeline_state — which reads the
+            # BASELINE session state, not the rejected candidate (empty on a
+            # fresh compose). AWS acceptance runs 2026-07-30 exhausted their
+            # repair budget on exactly that blindness (elspeth-5904b1683a).
+            if destination_facts is None:
+                destination_facts = route_destination_facts(result.updated_state)
+            projected["connectivity"] = destination_facts[entry.component]
         if code == "coalesce_branch_unreachable":
             # Instance wiring facts derived from the REJECTED state the result
             # carries — same redaction class as the contract facts below (node
@@ -813,7 +874,7 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
             # boundary this allowlist protects.
             projected["contract"] = entry.contract.to_dict()
         errors.append(projected)
-    return {
+    feedback: dict[str, Any] = {
         "success": False,
         "validation": {
             "is_valid": validation.is_valid,
@@ -826,6 +887,12 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
         # derailed otherwise-converging repairs.
         "guidance": "To expand any code, call explain_validation_error with the exact code string.",
     }
+    if repeated_fingerprint:
+        # Static text, never per-request data: names the repetition the model
+        # cannot see on its own (it has no attempt counter) so budget stops
+        # burning on byte-identical failures without the model knowing.
+        feedback["repeat_notice"] = _REPEAT_NOTICE
+    return feedback
 
 
 class _DeferredIntentClaimFeedbackError(TypedDict):
@@ -1541,6 +1608,11 @@ async def _plan_pipeline_inner(
     nodeless_nudge_given = False
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
+    # (component, code) fingerprints of every candidate rejection so far in
+    # this request. A repeat means the intervening repair changed nothing that
+    # mattered — the feedback then says so explicitly (repeat_notice) instead
+    # of letting the model burn budget without knowing it is looping.
+    seen_rejection_fingerprints: set[tuple[tuple[str, str], ...]] = set()
 
     async def call_model(
         *,
@@ -1817,14 +1889,25 @@ async def _plan_pipeline_inner(
     def _hatch_available() -> bool:
         return model_config.escape_hatch_model is not None and not hatch_spent
 
-    def _engage_escape_hatch(error: PipelinePlannerError) -> None:
+    def _engage_escape_hatch(error: PipelinePlannerError, *, rejection_feedback: Mapping[str, Any] | None = None) -> None:
         # The over-budget attempt is dropped from the conversation so no
         # assistant tool_calls message dangles without its tool results.
+        # When the exhaustion was a candidate rejection, the advisor would
+        # otherwise never learn WHY the final candidate failed (the dropped
+        # attempt takes its feedback with it) — so the same allowlisted,
+        # message-stripped envelope the repair turn would have received rides
+        # inside the hatch notice. Closed codes and candidate-authored names
+        # only; no new disclosure surface.
         nonlocal hatch_error, hatch_turn_next, hatch_spent
         hatch_error = error
         hatch_turn_next = True
         hatch_spent = True
-        messages.append({"role": "user", "content": _escape_hatch_notice()})
+        content = _escape_hatch_notice()
+        if rejection_feedback is not None:
+            content += "\n\nFor context: the final candidate (dropped from the conversation above) was rejected with:\n" + canonical_json(
+                rejection_feedback
+            )
+        messages.append({"role": "user", "content": content})
 
     while True:
         is_hatch_turn = hatch_turn_next
@@ -1947,7 +2030,7 @@ async def _plan_pipeline_inner(
                         trail.log_attempt(
                             attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
                         )
-                        _engage_escape_hatch(_rejection_exhausted())
+                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=terminal_feedback)
                         continue
                     trail.log_attempt(
                         attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
@@ -2031,7 +2114,7 @@ async def _plan_pipeline_inner(
                         trail.log_attempt(
                             attempt_phase, "deferred_claim", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
                         )
-                        _engage_escape_hatch(_rejection_exhausted())
+                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=_deferred_intent_claim_feedback())
                         continue
                     trail.log_attempt(
                         attempt_phase, "deferred_claim", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
@@ -2059,7 +2142,7 @@ async def _plan_pipeline_inner(
                         trail.log_attempt(
                             attempt_phase, "arg_error", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
                         )
-                        _engage_escape_hatch(_rejection_exhausted())
+                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=_allowlisted_argument_feedback(exc))
                         continue
                     trail.log_attempt(
                         attempt_phase, "arg_error", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
@@ -2077,6 +2160,10 @@ async def _plan_pipeline_inner(
                 continue
             except _PipelineCandidateRejected as exc:
                 last_rejection_codes = _candidate_rejection_codes(exc.result)
+                rejection_fingerprint = _rejection_fingerprint(exc.result)
+                repeated_fingerprint = rejection_fingerprint in seen_rejection_fingerprints
+                seen_rejection_fingerprints.add(rejection_fingerprint)
+                candidate_feedback = _allowlisted_candidate_feedback(exc.result, repeated_fingerprint=repeated_fingerprint)
                 if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") == "1":
                     # Operator-opted diagnostic seam. Validator messages are never
                     # logged: even an opt-in diagnostic must not persist authored
@@ -2104,21 +2191,37 @@ async def _plan_pipeline_inner(
                 if repair_count > repair_budget:
                     if _hatch_available():
                         trail.log_attempt(
-                            attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
+                            attempt_phase,
+                            "candidate_rejected",
+                            codes=last_rejection_codes,
+                            planner_code="REPAIR_EXHAUSTED",
+                            led_to="hatch",
+                            repeated_fingerprint=repeated_fingerprint,
                         )
-                        _engage_escape_hatch(_rejection_exhausted())
+                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=candidate_feedback)
                         continue
                     trail.log_attempt(
-                        attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
+                        attempt_phase,
+                        "candidate_rejected",
+                        codes=last_rejection_codes,
+                        planner_code="REPAIR_EXHAUSTED",
+                        led_to="terminal",
+                        repeated_fingerprint=repeated_fingerprint,
                     )
                     raise _rejection_exhausted() from None
-                trail.log_attempt(attempt_phase, "candidate_rejected", codes=last_rejection_codes, led_to="repair")
+                trail.log_attempt(
+                    attempt_phase,
+                    "candidate_rejected",
+                    codes=last_rejection_codes,
+                    led_to="repair",
+                    repeated_fingerprint=repeated_fingerprint,
+                )
                 messages.append(_assistant_tool_calls_message(message, calls))
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.call_id,
-                        "content": canonical_json(_allowlisted_candidate_feedback(exc.result)),
+                        "content": canonical_json(candidate_feedback),
                     }
                 )
                 continue

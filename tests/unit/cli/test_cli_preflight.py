@@ -635,11 +635,16 @@ def test_cli_resume_reissues_admission_for_post_resume_live_mode(tmp_path: Path)
 
     def capture_execute(**kwargs: Any) -> SimpleNamespace:
         captured.update(kwargs)
+        # Real RunStatus: the resume command maps result.status through
+        # cli_completion_for() to derive the process exit code (F17,
+        # elspeth-83ad093154), which rejects non-enum stand-ins.
+        from elspeth.contracts.enums import RunStatus
+
         return SimpleNamespace(
             rows_processed=0,
             rows_succeeded=0,
             rows_failed=0,
-            status=SimpleNamespace(value="completed"),
+            status=RunStatus.COMPLETED,
         )
 
     with (
@@ -673,6 +678,100 @@ def test_cli_resume_reissues_admission_for_post_resume_live_mode(tmp_path: Path)
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
         admission=captured["sink_effect_admission"],
     )
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_exit_code"),
+    [
+        ("completed", 0),
+        ("empty", 0),
+        ("completed_with_failures", 1),
+        ("failed", 2),
+    ],
+)
+def test_cli_run_exit_code_reflects_terminal_status(
+    tmp_path: Path,
+    terminal_status: str,
+    expected_exit_code: int,
+) -> None:
+    """F17 (elspeth-83ad093154): `run --execute` exits with the
+    cli_completion_for code for the run's terminal status instead of
+    unconditionally returning 0 after execution."""
+    from elspeth.contracts.enums import RunStatus
+
+    settings_path = _make_minimal_config_yaml(tmp_path, with_depends_on=False)
+
+    with (
+        patch("elspeth.cli._load_settings_with_secrets") as mock_load,
+        patch("elspeth.plugins.infrastructure.runtime_factory.instantiate_plugins_from_config") as mock_plugins,
+        patch("elspeth.cli.ExecutionGraph") as mock_graph_cls,
+        patch("elspeth.cli._ensure_output_directories", return_value=[]),
+        patch("elspeth.cli_helpers.resolve_audit_passphrase", return_value=None),
+        patch("elspeth.engine.bootstrap.resolve_preflight", return_value=None),
+        patch("elspeth.cli._execute_pipeline_with_instances") as mock_execute,
+        patch("elspeth.plugins.infrastructure.probe_factory.build_collection_probes", return_value=[]),
+    ):
+        mock_load.return_value = (_fake_config(with_depends_on=False), [])
+        mock_plugins.return_value = _FakePluginBundle()
+        mock_graph_cls.from_plugin_instances.return_value = _FakeGraph()
+        mock_execute.return_value = {
+            "run_id": "test-run-id",
+            "status": RunStatus(terminal_status),
+            "rows_processed": 2,
+        }
+
+        result = runner.invoke(app, ["run", "-s", str(settings_path), "--execute"])
+
+    assert result.exit_code == expected_exit_code, result.output
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_exit_code"),
+    [
+        ("completed", 0),
+        ("empty", 0),
+        ("completed_with_failures", 1),
+        ("failed", 2),
+    ],
+)
+def test_cli_resume_exit_code_reflects_terminal_status(
+    tmp_path: Path,
+    terminal_status: str,
+    expected_exit_code: int,
+) -> None:
+    """F17 (elspeth-83ad093154): `resume --execute` maps the resumed run's
+    terminal status through cli_completion_for — a resume that finishes
+    PARTIAL or FAILED must not exit 0."""
+    from elspeth.contracts.checkpoint import ResumeCheck
+    from elspeth.contracts.enums import RunStatus
+
+    settings_path, _db_path = _make_resume_config_and_database(tmp_path)
+    (tmp_path / "payloads").mkdir(mode=0o700)
+    resume_point = SimpleNamespace(sequence_number=0, barrier_scalars=None)
+
+    def fake_execute(**kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            rows_processed=2,
+            rows_succeeded=1,
+            rows_failed=1,
+            status=RunStatus(terminal_status),
+        )
+
+    with (
+        patch("elspeth.cli.ExecutionGraph") as graph_cls,
+        patch("elspeth.core.checkpoint.RecoveryManager") as recovery_cls,
+        patch("elspeth.cli._execute_resume_with_instances", side_effect=fake_execute),
+    ):
+        graph_cls.from_plugin_instances.return_value = _FakeGraph()
+        recovery = recovery_cls.return_value
+        recovery.can_resume.return_value = ResumeCheck(can_resume=True)
+        recovery.get_resume_point.return_value = resume_point
+        recovery.get_unprocessed_rows.return_value = []
+        recovery.count_blocked_barrier_items.return_value = 0
+        result = runner.invoke(app, ["resume", "run-1", "-s", str(settings_path), "--execute"])
+
+    assert result.exit_code == expected_exit_code, result.output
+    assert "Resume complete" in result.output
 
 
 def test_cli_join_rejects_legacy_sink_before_join_admission(tmp_path: Path) -> None:

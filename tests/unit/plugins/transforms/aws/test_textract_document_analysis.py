@@ -702,6 +702,34 @@ def test_submit_service_error_preserves_retryability(retryable: bool) -> None:
     assert result.retryable is retryable
 
 
+def test_submit_invalid_s3_object_classifies_access_scope_hint() -> None:
+    error = TextractServiceError(code="InvalidS3ObjectException", retryable=False)
+    result = _run(_transform_for_client(FakeTextractClient(pages=[], start=error)))
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "submit_failed"
+    assert result.reason["error_type"] == "service_error"
+    assert result.reason["code"] == "InvalidS3ObjectException"
+    assert result.reason["cause"] == "s3_object_unreadable"
+    hint = result.reason["error"]
+    assert "s3:GetObject" in hint
+    assert "read scope" in hint
+    assert result.retryable is False
+
+
+def test_submit_other_service_errors_carry_no_s3_scope_hint() -> None:
+    error = TextractServiceError(code="AccessDeniedException", retryable=False)
+    result = _run(_transform_for_client(FakeTextractClient(pages=[], start=error)))
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "submit_failed"
+    assert result.reason["code"] == "AccessDeniedException"
+    assert "cause" not in result.reason
+    assert "error" not in result.reason
+
+
 @pytest.mark.parametrize("retryable", [False, True])
 def test_poll_service_error_preserves_retryability(retryable: bool) -> None:
     error = TextractServiceError(code="ThrottlingException" if retryable else "AccessDeniedException", retryable=retryable)

@@ -133,6 +133,22 @@ def _aws_s3_plugin_check() -> ContractCheck:
     )
 
 
+def _aws_textract_plugin_check() -> ContractCheck:
+    name = "aws_textract_plugin"
+    try:
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        transforms = {plugin.name for plugin in get_shared_plugin_manager().get_transforms()}
+        ok = "aws_textract_document_analysis" in transforms
+    except Exception as exc:
+        return ContractCheck(name, False, sanitize_error("AWS Textract transform discovery failed", exc))
+    return ContractCheck(
+        name,
+        ok,
+        "aws_textract_document_analysis transform is registered" if ok else "aws_textract_document_analysis transform must be registered",
+    )
+
+
 def _bedrock_provider_check() -> ContractCheck:
     name = "bedrock_provider"
     try:
@@ -278,6 +294,7 @@ def plugin_and_dependency_checks(
         _bedrock_provider_check(),
         _aws_operator_telemetry_check(settings),
         _bedrock_guardrail_plugins_check(),
+        _aws_textract_plugin_check(),
         *shared_checks[:2],
         _dependency_check("boto3", "boto3_dependency"),
         _dependency_check("ijson", "ijson_dependency"),
