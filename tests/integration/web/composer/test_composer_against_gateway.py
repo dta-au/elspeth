@@ -464,13 +464,20 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
     gateway/agency internals leak into the persisted turn, the exception
     message, or anything logged during the attempt.
     """
+    from litellm.exceptions import ServiceUnavailableError
+
     caplog.set_level(logging.DEBUG)
     sessions_service = _build_sessions_service(tmp_path)
     session_id = str(uuid4())
     _insert_session_row(sessions_service, session_id)
     service = _build_service(tmp_path, gateway_base_url, sessions_service)
 
-    with pytest.raises(Exception) as excinfo:
+    # The exact exception class the mock upstream's 503 ("overloaded")
+    # deterministically maps to, confirmed empirically. Narrowed
+    # deliberately (not `Exception`): an unrelated failure elsewhere in the
+    # turn must not satisfy this `raises` and cause the leak assertions
+    # below to scan the wrong exception's message and pass vacuously.
+    with pytest.raises(ServiceUnavailableError) as excinfo:
         await service._run_one_turn_for_test(session_id=session_id, message="TRIGGER_FAULT overloaded")
 
     exception_text = str(excinfo.value)
