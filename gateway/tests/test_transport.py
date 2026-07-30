@@ -160,6 +160,23 @@ async def test_401_then_200_replays_once_with_fresh_token(client):
 
 
 @respx.mock
+async def test_adapter_content_type_header_is_overridden_not_duplicated(client):
+    """InvokePlan lower-cases header names at construction, so an
+    adapter-supplied ``content-type`` would otherwise collide, case-only,
+    with the ``Content-Type`` the transport adds -- httpx would then send
+    both as separate wire headers instead of one replacing the other."""
+    _mock_tokens("tok-1")
+    upstream_route = respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={}))
+    config = _config()
+    transport = _transport(config, client)
+
+    await transport.invoke(_plan(headers={"content-type": "application/vnd.custom+json"}))
+
+    sent_headers = upstream_route.calls[0].request.headers
+    assert sent_headers.get_list("content-type") == ["application/json"]
+
+
+@respx.mock
 async def test_401_then_401_raises_upstream_unauthorized_exactly_two_calls(client):
     _mock_tokens("tok-1", "tok-2")
     upstream_route = respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(401))

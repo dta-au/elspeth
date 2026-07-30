@@ -142,7 +142,15 @@ class UpstreamClient:
             _revalidate_headers(plan.headers)
 
             token = await self._token_manager.get_token()
+            # InvokePlan lower-cases every header name at construction, so an
+            # adapter-supplied "content-type" would otherwise sit alongside
+            # our own "Content-Type" as two distinct dict keys -- httpx sends
+            # both as separate wire headers rather than one overriding the
+            # other. Authorization needs no such handling: it is one of
+            # InvokePlan's forbidden names, so plan.headers can never carry
+            # it (enforced again by _revalidate_headers above).
             headers = dict(plan.headers)
+            headers.pop("content-type", None)
             headers["Authorization"] = f"Bearer {token}"
             headers["Content-Type"] = "application/json"
 
