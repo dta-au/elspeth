@@ -14,6 +14,7 @@ import hashlib
 import importlib.metadata
 import inspect
 import logging
+import os
 import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -28,7 +29,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from elspeth_llm_gateway import ADAPTER_API_MAJOR, CONTRACT_MAJOR
 from elspeth_llm_gateway.core.auth import check_bearer
-from elspeth_llm_gateway.core.config import ConfigError, GatewayConfig
+from elspeth_llm_gateway.core.config import ConfigError, GatewayConfig, load_config
 from elspeth_llm_gateway.core.contract import ChatRequest
 from elspeth_llm_gateway.core.errors import GatewayError, GatewayErrorCode, error_envelope
 from elspeth_llm_gateway.core.events import log_event
@@ -327,3 +328,19 @@ def create_app(
     app.add_middleware(RequestIDMiddleware)
 
     return app
+
+
+def build() -> FastAPI:
+    """``uvicorn --factory`` entry point: build the app from process environment.
+
+    This is the sole function the container image's ``ENTRYPOINT`` names
+    (``elspeth_llm_gateway.core.app:build``) -- it reads ``os.environ``
+    through ``load_config`` (the same fail-closed, whole-namespace-policed
+    path every other caller of ``load_config`` goes through) and hands the
+    result straight to ``create_app`` with no injected adapter or upstream
+    client, exactly as a real deployment runs. A ``ConfigError`` raised here
+    propagates out of uvicorn's factory import and fails the container at
+    startup, before it ever binds a port -- there is no fallback or partial
+    app to serve.
+    """
+    return create_app(load_config(os.environ))

@@ -1,0 +1,10 @@
+.venv
+.pytest_cache
+.benchmarks
+__pycache__
+*.pyc
+tests
+conformance
+scaffold
+mock
+README.md
