@@ -692,19 +692,35 @@ def _duplicate_consumer_repair_suggestions(
         }
         tool_sequence: list[_RepairToolCall] = []
         affected_consumers: list[_AffectedConsumer] = []
+        # One row_union can contribute two (node, alias) bindings when two of
+        # its aliases share a connection. Every patch for a node must land on
+        # one running payload: re-serializing the original node per binding
+        # emits two upsert_node calls for the same id, and the second reverts
+        # the first. Insertion order preserves the cross-node sequence.
+        patched_consumers: dict[str, dict[str, Any]] = {}
         for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
-            patched_consumer = _serialize_node(node)
+            patched_consumer = patched_consumers.get(node.id)
+            if patched_consumer is None:
+                patched_consumer = _serialize_node(node)
+                patched_consumers[node.id] = patched_consumer
             if consumer_branch_alias is None:
                 patched_consumer["input"] = branch_name
             else:
-                branch_names_in_order = _coalesce_branch_names(node.branches)
-                branch_connections = _coalesce_branch_connections(node.branches)
-                patched_branches = dict(zip(branch_names_in_order, branch_connections, strict=True))
+                patched_branches = patched_consumer["branches"]
+                if not isinstance(patched_branches, dict):
+                    patched_branches = dict(
+                        zip(
+                            _coalesce_branch_names(node.branches),
+                            _coalesce_branch_connections(node.branches),
+                            strict=True,
+                        )
+                    )
                 patched_branches[consumer_branch_alias] = branch_name
                 patched_consumer["branches"] = patched_branches
-                if consumer_branch_alias == branch_names_in_order[0]:
-                    patched_consumer["input"] = branch_name
-            tool_sequence.append({"tool": "upsert_node", "arguments": patched_consumer})
+                # ``input`` is only the adapter placeholder for the first
+                # branch connection; re-derive it from the accumulated mapping
+                # so it stays consistent no matter which aliases were repaired.
+                patched_consumer["input"] = next(iter(patched_branches.values()))
             affected_consumers.append(
                 {
                     "id": node.id,
@@ -712,6 +728,7 @@ def _duplicate_consumer_repair_suggestions(
                     "new_input": branch_name,
                 }
             )
+        tool_sequence.extend({"tool": "upsert_node", "arguments": patched_consumer} for patched_consumer in patched_consumers.values())
         tool_sequence.append({"tool": "upsert_node", "arguments": gate_args})
         tool_sequence.append({"tool": "preview_pipeline", "arguments": {}})
         suggestions.append(

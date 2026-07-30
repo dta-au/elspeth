@@ -11671,6 +11671,170 @@ class TestPreviewPipeline:
         assert "row_union_input_mismatch" not in remaining_codes
         assert "fork_branch_no_destination" in remaining_codes
 
+    def test_duplicate_consumer_repair_patches_one_node_once_for_two_branch_bindings(self) -> None:
+        """Two aliases of one row_union sharing a connection collapse to one upsert.
+
+        A repair skeleton rebuilt from the original node per binding emits two
+        ``upsert_node`` calls for the same id, and the second reverts the first
+        — applying the suggested sequence leaves the duplicate in place. The
+        patches must accumulate onto one payload per node id while the fork
+        gate still publishes one distinct branch per binding.
+        """
+        state = (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="fan_out",
+                    node_type="gate",
+                    plugin=None,
+                    input="rows",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("control", "treatment"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="control_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="control",
+                    on_success="control_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="treatment_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="treatment",
+                    on_success="treatment_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            # Inner barrier: its release connection is downstream of BOTH fork
+            # branches, so the outer row_union can bind both aliases to it.
+            .with_node(
+                NodeSpec(
+                    id="inner_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control_done",
+                    on_success="union_out",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches={"control": "control_done", "treatment": "treatment_done"},
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="outer_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="union_out",
+                    on_success="union_out2",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    # BOTH aliases claim the one connection: one node, two bindings.
+                    branches={"control": "union_out", "treatment": "union_out"},
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="consume_union",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="union_out2",
+                    on_success="main",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="main",
+                    plugin="json",
+                    options={"path": "outputs/main.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        assert "duplicate_connection_consumer" in {entry["error_code"] for entry in preview.data["errors"]}
+        repair = next(entry for entry in preview.data["graph_repair_suggestions"] if entry["connection"] == "union_out")
+
+        upsert_ids = [step["arguments"]["id"] for step in repair["tool_sequence"] if step["tool"] == "upsert_node"]
+        assert len(upsert_ids) == len(set(upsert_ids)), repair["tool_sequence"]
+        assert upsert_ids.count("outer_union") == 1
+
+        union_step = next(step for step in repair["tool_sequence"] if step["arguments"].get("id") == "outer_union")
+        patched_branches = union_step["arguments"]["branches"]
+        assert patched_branches["control"] != patched_branches["treatment"]
+        assert "union_out" not in patched_branches.values()
+        assert union_step["arguments"]["input"] == patched_branches["control"]
+
+        gate_step = repair["tool_sequence"][-2]
+        assert gate_step["arguments"]["node_type"] == "gate"
+        assert sorted(gate_step["arguments"]["fork_to"]) == sorted(patched_branches.values())
+        assert repair["tool_sequence"][-1] == {"tool": "preview_pipeline", "arguments": {}}
+
+        repaired_state = state
+        for step in repair["tool_sequence"][:-1]:
+            step_result = execute_tool(step["tool"], dict(step["arguments"]), repaired_state, _mock_catalog())
+            assert step_result.success is True, step_result.to_dict()
+            repaired_state = step_result.updated_state
+
+        repaired_preview = execute_tool("preview_pipeline", {}, repaired_state, _mock_catalog())
+        remaining_codes = {entry["error_code"] for entry in repaired_preview.data["errors"]}
+        assert "duplicate_connection_consumer" not in remaining_codes
+        assert "row_union_input_mismatch" not in remaining_codes
+
     def test_preview_source_with_schema_config_field_name(self) -> None:
         state = _empty_state().with_source(
             SourceSpec(
