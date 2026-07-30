@@ -174,6 +174,23 @@ def test_build_invoke_tool_choice_named_carries_operation():
     assert plan.body["directive_policy"] == {"mode": "named", "operation": "lookup"}
 
 
+def test_build_invoke_named_without_function_raises_value_error():
+    adapter = ReferenceV1InvokeAdapter()
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(CanonicalMessage(role="user", content="hi"),),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+        tool_choice="named",
+        tool_choice_function=None,
+    )
+
+    with pytest.raises(ValueError):
+        adapter.build_invoke(request)
+
+
 def test_build_invoke_absent_tool_choice_omits_directive_policy():
     adapter = ReferenceV1InvokeAdapter()
     request = CanonicalRequest(
@@ -305,7 +322,34 @@ def test_parse_success_operations_missing_invocations_raises_value_error():
         adapter.parse_success({"result": {}, "halt": "operations"})
 
 
+def test_parse_success_operations_empty_invocations_raises_value_error():
+    adapter = ReferenceV1InvokeAdapter()
+    with pytest.raises(ValueError):
+        adapter.parse_success({"result": {"invocations": []}, "halt": "operations"})
+
+
+@pytest.mark.parametrize("missing_field", ["ref", "operation", "payload"])
+def test_parse_success_invocation_missing_field_raises_value_error(missing_field):
+    adapter = ReferenceV1InvokeAdapter()
+    invocation = {"ref": "c1", "operation": "lookup", "payload": {"q": "x"}}
+    del invocation[missing_field]
+    with pytest.raises(ValueError):
+        adapter.parse_success({"result": {"invocations": [invocation]}, "halt": "operations"})
+
+
 # --- parse_success(): accounting -> usage -------------------------------------
+
+
+def test_parse_success_accounting_missing_input_units_raises_value_error():
+    adapter = ReferenceV1InvokeAdapter()
+    with pytest.raises(ValueError):
+        adapter.parse_success({"result": {"text": "hi"}, "halt": "complete", "accounting": {"output_units": 5}})
+
+
+def test_parse_success_accounting_missing_output_units_raises_value_error():
+    adapter = ReferenceV1InvokeAdapter()
+    with pytest.raises(ValueError):
+        adapter.parse_success({"result": {"text": "hi"}, "halt": "complete", "accounting": {"input_units": 5}})
 
 
 def test_parse_success_usage_present():

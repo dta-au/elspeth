@@ -108,6 +108,19 @@ _FAULT_KIND_TO_CLASSIFICATION: dict[str, ErrorClassification] = {
 _FALLBACK_CLASSIFICATION = ErrorClassification(code="upstream_response_invalid", retryable=False)
 
 
+def _build_tool_call(invocation: dict) -> CanonicalToolCall:
+    # TRANSLATION POINT: a real agency's tool-invocation result shape will
+    # differ from this fictional ref/operation/payload shape.
+    for field in ("ref", "operation", "payload"):
+        if field not in invocation:
+            raise ValueError(f"reference_v1_invoke: invocation missing {field!r}")
+    return CanonicalToolCall(
+        call_id=invocation["ref"],
+        name=invocation["operation"],
+        arguments_json=json.dumps(invocation["payload"]),
+    )
+
+
 def _conversation_entry(message: CanonicalMessage) -> dict:
     # TRANSLATION POINT: a real agency's message-entry shape (role names,
     # field names for text/tool-calls/tool-results) will differ from this
@@ -175,6 +188,8 @@ class ReferenceV1InvokeAdapter:
             # carries the chosen operation name.
             directive_policy: dict = {"mode": request.tool_choice}
             if request.tool_choice == "named":
+                if request.tool_choice_function is None:
+                    raise ValueError("reference_v1_invoke: tool_choice='named' requires tool_choice_function")
                 directive_policy["operation"] = request.tool_choice_function
             body["directive_policy"] = directive_policy
 
@@ -209,16 +224,12 @@ class ReferenceV1InvokeAdapter:
             # shape will differ from this fictional invocations/ref/
             # operation/payload shape.
             if "invocations" not in result:
-                raise ValueError(f"reference_v1_invoke: result missing text/invocations for halt={halt!r}")
+                raise ValueError(f"reference_v1_invoke: result missing 'invocations' for halt={halt!r}")
+            invocations = result["invocations"]
+            if not invocations:
+                raise ValueError(f"reference_v1_invoke: empty invocations for halt={halt!r}")
             text = None
-            tool_calls = tuple(
-                CanonicalToolCall(
-                    call_id=invocation["ref"],
-                    name=invocation["operation"],
-                    arguments_json=json.dumps(invocation["payload"]),
-                )
-                for invocation in result["invocations"]
-            )
+            tool_calls = tuple(_build_tool_call(invocation) for invocation in invocations)
         else:
             tool_calls = ()
             if "text" in result:
@@ -231,11 +242,15 @@ class ReferenceV1InvokeAdapter:
                 # Missing "text" here is a malformed upstream contract for a
                 # non-screened halt: fail closed with an explicit,
                 # clearly-worded ValueError rather than a bare KeyError.
-                raise ValueError(f"reference_v1_invoke: result missing text/invocations for halt={halt!r}")
+                raise ValueError(f"reference_v1_invoke: result missing 'text' for halt={halt!r}")
 
         usage: CanonicalUsage | None = None
         if "accounting" in body:
             accounting = body["accounting"]
+            if "input_units" not in accounting:
+                raise ValueError("reference_v1_invoke: accounting missing 'input_units'")
+            if "output_units" not in accounting:
+                raise ValueError("reference_v1_invoke: accounting missing 'output_units'")
             input_units = accounting["input_units"]
             output_units = accounting["output_units"]
             usage = CanonicalUsage(
