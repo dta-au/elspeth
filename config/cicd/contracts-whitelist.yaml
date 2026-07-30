@@ -40,7 +40,7 @@ allowed_external_types:
   # elspeth.plugins (and eventually the pipeline gateway provider) import it
   # from core. Web plugin policy is one of several intended consumers, not a
   # violation of a contracts/-only boundary.
-  - "core/llm_profiles:RuntimeWebLLMProfile"
+  - "core/llm_profiles:RuntimeLLMProfile"
 
 # dict[str, Any] patterns that are intentional
 # Format: "file_path:context:param_name"

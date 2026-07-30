@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr, Valid
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.core.config import PayloadStoreSettings
+from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.transforms.aws.guardrail_profiles import (
     BEDROCK_GUARDRAIL_PLUGIN_IDS,
@@ -30,7 +31,6 @@ from elspeth.web.auth.urls import (
     validate_oidc_browser_origins,
     validate_oidc_issuer,
 )
-from elspeth.web.plugin_policy.profiles import WebLLMProfileSettings, validate_profile_alias
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
     is_reserved_server_secret_name,
@@ -280,7 +280,7 @@ class WebSettings(BaseModel):
             PluginCapability.CONTENT_SAFETY: ControlMode.RECOMMEND,
         }
     )
-    llm_profiles: Mapping[str, WebLLMProfileSettings] = Field(default_factory=dict)
+    llm_profiles: Mapping[str, LLMProfileSettings] = Field(default_factory=dict)
     default_llm_profile: str | None = None
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = ()
     bedrock_guardrail_default_profiles: Mapping[str, str] = Field(default_factory=dict)
@@ -593,7 +593,7 @@ class WebSettings(BaseModel):
 
     @field_validator("llm_profiles")
     @classmethod
-    def _validate_llm_profile_aliases(cls, value: Mapping[str, WebLLMProfileSettings]) -> Mapping[str, WebLLMProfileSettings]:
+    def _validate_llm_profile_aliases(cls, value: Mapping[str, LLMProfileSettings]) -> Mapping[str, LLMProfileSettings]:
         for alias in value:
             validate_profile_alias(alias)
         return value

@@ -18,17 +18,17 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CredentialScope = Literal["server", "user"]
-_ALIAS = re.compile(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\Z")
-_SECRET_REF = re.compile(r"[A-Z][A-Z0-9_]{0,255}\Z")
+PROFILE_ALIAS_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\Z")
+SECRET_REF_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,255}\Z")
 
 
 def validate_profile_alias(alias: str) -> str:
-    if _ALIAS.fullmatch(alias) is None:
+    if PROFILE_ALIAS_PATTERN.fullmatch(alias) is None:
         raise ValueError("profile alias must be a lowercase opaque identifier")
     return alias
 
 
-class WebLLMProfileSettings(BaseModel):
+class LLMProfileSettings(BaseModel):
     """Operator-owned provider binding; private fields stay out of reprs."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
@@ -45,7 +45,7 @@ class WebLLMProfileSettings(BaseModel):
     max_tokens: int | None = Field(default=None, gt=0, le=131072, repr=False)
 
     @model_validator(mode="after")
-    def _validate_provider_binding(self) -> WebLLMProfileSettings:
+    def _validate_provider_binding(self) -> LLMProfileSettings:
         # Plan 09 owns this registry.  Profile validation consumes it rather
         # than maintaining a second provider allowlist.
         from elspeth.plugins.transforms.llm.transform import LLMTransform
@@ -73,7 +73,7 @@ class WebLLMProfileSettings(BaseModel):
         else:
             if self.credential_scope is None or self.credential_ref is None:
                 raise ValueError("credentialed profile requires explicit scope and reference")
-            if _SECRET_REF.fullmatch(self.credential_ref) is None:
+            if SECRET_REF_PATTERN.fullmatch(self.credential_ref) is None:
                 raise ValueError("credential reference has invalid syntax")
             if self.provider == "openrouter" and any(
                 value is not None for value in (self.region_name, self.endpoint, self.deployment_name, self.api_version)
@@ -91,7 +91,7 @@ class WebLLMProfileSettings(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
-class RuntimeWebLLMProfile:
+class RuntimeLLMProfile:
     alias: str
     provider: str = field(repr=False)
     model: str = field(repr=False)
@@ -100,7 +100,7 @@ class RuntimeWebLLMProfile:
     provider_options: tuple[tuple[str, object], ...] = field(default=(), repr=False)
 
     @classmethod
-    def from_settings(cls, alias: str, settings: WebLLMProfileSettings) -> RuntimeWebLLMProfile:
+    def from_settings(cls, alias: str, settings: LLMProfileSettings) -> RuntimeLLMProfile:
         validate_profile_alias(alias)
         provider_fields = {
             "bedrock": (("region_name", settings.region_name),),

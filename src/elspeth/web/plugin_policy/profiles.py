@@ -13,9 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-from elspeth.core.llm_profiles import CredentialScope, RuntimeWebLLMProfile
-from elspeth.core.llm_profiles import WebLLMProfileSettings as WebLLMProfileSettings
-from elspeth.core.llm_profiles import validate_profile_alias as validate_profile_alias
+from elspeth.core.llm_profiles import CredentialScope, RuntimeLLMProfile
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 
 if TYPE_CHECKING:
@@ -29,7 +27,7 @@ class RuntimeWebPluginConfig:
     plugin_allowlist: tuple[str, ...]
     plugin_preferences: tuple[tuple[PluginCapability, tuple[str, ...]], ...]
     plugin_control_modes: tuple[tuple[PluginCapability, ControlMode], ...]
-    llm_profiles: tuple[tuple[str, RuntimeWebLLMProfile], ...] = field(repr=False)
+    llm_profiles: tuple[tuple[str, RuntimeLLMProfile], ...] = field(repr=False)
     default_llm_profile: str | None
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = field(repr=False)
     bedrock_guardrail_default_profiles: tuple[tuple[str, str], ...]
@@ -49,7 +47,7 @@ class RuntimeWebPluginConfig:
             ),
             plugin_control_modes=tuple(sorted(settings.plugin_control_modes.items(), key=lambda item: item[0].value)),
             llm_profiles=tuple(
-                (alias, RuntimeWebLLMProfile.from_settings(alias, profile)) for alias, profile in sorted(settings.llm_profiles.items())
+                (alias, RuntimeLLMProfile.from_settings(alias, profile)) for alias, profile in sorted(settings.llm_profiles.items())
             ),
             default_llm_profile=settings.default_llm_profile,
             bedrock_guardrail_profiles=tuple(sorted(settings.bedrock_guardrail_profiles, key=lambda profile: profile.alias)),
@@ -143,7 +141,7 @@ _LLM_PRIVATE_OPTIONS = frozenset(
 class _LLMProfileResolver:
     def __init__(
         self,
-        profiles: tuple[tuple[str, RuntimeWebLLMProfile], ...],
+        profiles: tuple[tuple[str, RuntimeLLMProfile], ...],
         *,
         preferred_alias: str | None,
     ) -> None:
@@ -293,7 +291,7 @@ class _LLMProfileResolver:
         return tuple(result)
 
     @staticmethod
-    def _binding_generation(profile: RuntimeWebLLMProfile, *, credential_generation: str | None) -> str:
+    def _binding_generation(profile: RuntimeLLMProfile, *, credential_generation: str | None) -> str:
         return hashlib.sha256(
             json.dumps(
                 {
