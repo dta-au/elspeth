@@ -1841,7 +1841,17 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             projected_routes = tuple(dict.fromkeys([*direct_routes, *fork_routes]))
             if projected_routes != tuple(behavior["route_aliases"]):
                 return "payload gate route aliases do not match its projected flows"
-            if tuple(gate_forks.get(stable_id, ())) != tuple((tuple(item["routes"]), item["branch"]) for item in behavior["fork_branches"]):
+            # Bind each fork branch by ALIAS, not by edge position. A row_union
+            # releases in its authored ``branches`` order, so planning.py orders
+            # the barrier's incoming edges by that order — and when a gate forks
+            # STRAIGHT into the row_union those are the very gate_fork edges read
+            # here. Both orderings are authored and legitimate, and one edge list
+            # cannot express both, so compare the fork set by identity. The
+            # behavior's own ``fork_branches`` order still carries the authored
+            # ``fork_to`` order; only this cross-check stops reading position.
+            projected_forks = sorted(gate_forks.get(stable_id, ()))
+            declared_forks = sorted((tuple(item["routes"]), item["branch"]) for item in behavior["fork_branches"])
+            if projected_forks != declared_forks:
                 return "payload gate fork branches do not match its projected flows"
         elif node["node_type"] == "queue":
             if flow_kinds != ("queue_continue",):

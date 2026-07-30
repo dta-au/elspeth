@@ -1285,6 +1285,69 @@ def test_propose_pipeline_rejects_barrier_branch_produced_outside_its_own_fork_a
     assert "downstream" in error or "not connected" in error
 
 
+def _fork_directly_into_row_union(payload: dict[str, Any], *, reversed_release: bool) -> None:
+    """Drop both arm transforms so the gate forks straight into the row_union.
+
+    ``reversed_release`` binds the row_union's release order to the opposite of
+    the gate's authored ``fork_to`` order — both orders are authored and legal,
+    and with a direct fork they are carried by the very same edges.
+    """
+    nodes = payload["nodes"]
+    union_id = nodes[3]["stable_id"]
+    producer_ids = {nodes[1]["stable_id"], nodes[2]["stable_id"]}
+    del nodes[1:3]
+    kept: list[dict[str, Any]] = []
+    for edge in payload["graph"]["edges"]:
+        if edge["from_endpoint"].get("stable_id") in producer_ids:
+            continue
+        if edge["flow"]["kind"] == "gate_fork":
+            edge["to_endpoint"] = {"kind": "node", "stable_id": union_id}
+        kept.append(edge)
+    fork_positions = [index for index, edge in enumerate(kept) if edge["flow"]["kind"] == "gate_fork"]
+    if reversed_release:
+        first, second = fork_positions
+        kept[first], kept[second] = kept[second], kept[first]
+    payload["graph"]["edges"] = kept
+    union = next(node for node in nodes if node["node_type"] == "row_union")
+    union["behavior"]["branch_aliases"] = [kept[index]["flow"]["branch"] for index in fork_positions]
+    for index, node in enumerate(nodes):
+        node["label"] = proposal_component_label("node", index)
+    payload["component_counts"]["nodes"] = len(nodes)
+    payload["component_counts"]["edges"] = len(kept)
+
+
+def test_propose_pipeline_accepts_direct_fork_row_union_releasing_in_fork_order() -> None:
+    payload = _fork_row_union_payload()
+    _fork_directly_into_row_union(payload, reversed_release=False)
+
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
+def test_propose_pipeline_accepts_direct_fork_row_union_releasing_against_fork_order() -> None:
+    payload = _fork_row_union_payload()
+    _fork_directly_into_row_union(payload, reversed_release=True)
+
+    assert payload["nodes"][1]["behavior"]["branch_aliases"] == ["branch-2", "branch-1"]
+    assert [item["branch"] for item in payload["nodes"][0]["behavior"]["fork_branches"]] == ["branch-1", "branch-2"]
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
+@pytest.mark.parametrize("mutation", ["drop_one", "wrong_routes", "unprojected_branch"])
+def test_propose_pipeline_rejects_gate_fork_branches_absent_from_projected_flows(mutation: str) -> None:
+    payload = _fork_row_union_payload()
+    fork_branches = payload["nodes"][0]["behavior"]["fork_branches"]
+    if mutation == "drop_one":
+        del fork_branches[1]
+    elif mutation == "wrong_routes":
+        fork_branches[0]["routes"] = [proposal_structural_label("route", 1)]
+        fork_branches[1]["routes"] = [proposal_structural_label("route", 1)]
+        payload["nodes"][0]["behavior"]["route_aliases"] = [proposal_structural_label("route", 1)]
+    else:
+        fork_branches[1]["branch"] = fork_branches[0]["branch"]
+
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is not None
+
+
 def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces() -> None:
     payload = _payload()
     gate_a_id = NODE_ID

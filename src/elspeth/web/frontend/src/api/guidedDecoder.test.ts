@@ -681,6 +681,62 @@ describe("guided schema-10 wire decoder", () => {
     );
   });
 
+  it("decodes a direct gate fork whose row_union releases against fork order", () => {
+    const response = rowUnionProposalWireResponse();
+    const payload = (response.next_turn as { payload: Record<string, unknown> })
+      .payload;
+    const nodes = payload.nodes as Array<Record<string, unknown>>;
+    const counts = payload.component_counts as Record<string, number>;
+    const unionId = (nodes[3] as { stable_id: string }).stable_id;
+    const producerIds = new Set([
+      (nodes[1] as { stable_id: string }).stable_id,
+      (nodes[2] as { stable_id: string }).stable_id,
+    ]);
+    nodes.splice(1, 2);
+    nodes.forEach((node, index) => {
+      node.label = `node-${index + 1}`;
+    });
+    const graph = payload.graph as { edges: Array<Record<string, unknown>> };
+    const kept = graph.edges.filter(
+      (edge) => !producerIds.has(
+        (edge.from_endpoint as { stable_id?: string }).stable_id ?? "",
+      ),
+    );
+    for (const edge of kept) {
+      if ((edge.flow as { kind: string }).kind === "gate_fork") {
+        edge.to_endpoint = { kind: "node", stable_id: unionId };
+      }
+    }
+    const forkPositions = kept.flatMap(
+      (edge, index) => (edge.flow as { kind: string }).kind === "gate_fork" ? [index] : [],
+    );
+    const [first, second] = forkPositions;
+    [kept[first], kept[second]] = [kept[second], kept[first]];
+    graph.edges = kept;
+    // The gate keeps its authored fork order; the row_union releases in reverse.
+    (nodes[1].behavior as { branch_aliases: string[] }).branch_aliases = forkPositions.map(
+      (index) => (kept[index].flow as { branch: string }).branch,
+    );
+    counts.nodes = nodes.length;
+    counts.edges = kept.length;
+
+    const decoded = decodeGetGuidedResponse(response);
+
+    expect(decoded.next_turn?.type).toBe("propose_pipeline");
+    if (decoded.next_turn?.type !== "propose_pipeline") {
+      throw new Error("direct fork fixture did not decode as a proposal");
+    }
+    expect(decoded.next_turn.payload.nodes[1].behavior).toMatchObject({
+      branch_aliases: ["branch-2", "branch-1"],
+    });
+    expect(decoded.next_turn.payload.nodes[0].behavior).toMatchObject({
+      fork_branches: [
+        { routes: ["route-1"], branch: "branch-1" },
+        { routes: ["route-1"], branch: "branch-2" },
+      ],
+    });
+  });
+
   it("decodes multi-stage branch arms whose interior hop carries no branch alias", () => {
     const response = rowUnionProposalWireResponse();
     const payload = (response.next_turn as { payload: Record<string, unknown> })

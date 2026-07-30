@@ -1024,6 +1024,59 @@ def test_fork_row_union_projection_accepts_multi_transform_branch_arms() -> None
     assert all(edge["flow"]["branch"] is None for edge in interior)
 
 
+def test_fork_row_union_projection_binds_release_order_by_alias_not_fork_position() -> None:
+    """A gate may fork straight into a row_union that releases in another order.
+
+    ``fork_to`` order and ``branches`` order are both authored, and with a direct
+    fork one edge list carries both. Neither authored order may be corrupted.
+    """
+    guided = _ab_coalesce_guided()
+    pipeline = deep_thaw(_ab_row_union_proposal(guided).pipeline)
+    pipeline["nodes"] = [node for node in pipeline["nodes"] if node["id"] not in ("tag_control", "tag_treatment")]
+    union = next(node for node in pipeline["nodes"] if node["id"] == "variant_union")
+    union["branches"] = {"treatment_branch": "treatment_branch", "control_branch": "control_branch"}
+    union["input"] = "treatment_branch"
+    proposal = PipelineProposal.create(
+        pipeline=pipeline,
+        base=PresentBase(state_id=CHECKPOINT_ID, composition_content_hash="a" * 64),
+        reviewed_facts=guided_private_reviewed_facts(guided),
+        surface=PlannerSurface.GUIDED_STAGED,
+        repair_count=0,
+        skill_hash=stable_hash("guided planner skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+    catalog = {
+        "source": frozenset({"csv"}),
+        "transform": frozenset({"value_transform", "batch_experiment_compare"}),
+        "sink": frozenset({"json"}),
+    }
+    assert not guided_candidate_state(proposal).validate().errors
+
+    payload = build_guided_proposal_projection(
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+
+    verify_guided_proposal_projection(
+        payload=payload,
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+    gate = next(node for node in payload["nodes"] if node["node_type"] == "gate")
+    row_union = next(node for node in payload["nodes"] if node["node_type"] == "row_union")
+    # The gate keeps its authored fork_to order...
+    assert [item["branch"] for item in gate["behavior"]["fork_branches"]] == ["branch-1", "branch-2"]
+    # ...while the row_union keeps its authored, divergent release order.
+    assert row_union["behavior"]["branch_aliases"] == ["branch-2", "branch-1"]
+    incoming = [edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == row_union["stable_id"]]
+    assert [edge["flow"]["branch"] for edge in incoming] == ["branch-2", "branch-1"]
+
+
 def _ab_coalesce_proposal_ordered(
     guided: GuidedSession,
     *,

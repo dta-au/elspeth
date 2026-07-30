@@ -621,7 +621,13 @@ function validateProposalPayload(value: unknown, path: string): void {
       if (directRoutes.some((route) => forkRoutes.includes(route))) invalid(path, "gate route selects direct target and fork fanout");
       const projectedRoutes = [...new Set([...directRoutes, ...forkRoutes])];
       if (JSON.stringify(projectedRoutes) !== JSON.stringify(node.behavior.routeAliases)) invalid(path, "gate route aliases disagree with flows");
-      if (JSON.stringify(gateForks.get(node.stableId) ?? []) !== JSON.stringify(node.behavior.forkBranches)) invalid(path, "gate fork branches disagree with flows");
+      // Bind fork branches by ALIAS, not by edge position: a row_union releases
+      // in its authored branches order, which permutes the gate_fork edges when
+      // a gate forks straight into it. Mirrors protocol.py.
+      const forkKey = (item: { routes: string[]; branch: string }) => JSON.stringify([item.branch, item.routes]);
+      const projectedForks = (gateForks.get(node.stableId) ?? []).map(forkKey).sort();
+      const declaredForks = node.behavior.forkBranches.map(forkKey).sort();
+      if (JSON.stringify(projectedForks) !== JSON.stringify(declaredForks)) invalid(path, "gate fork branches disagree with flows");
     } else if (node.nodeType === "queue") {
       if (kinds.length !== 1 || kinds[0] !== "queue_continue" || !(incomingEdges.get(node.stableId)?.length)) invalid(path, "queue lacks exact producer/successor flow");
       const queueTargets = [...adjacency.get(node.stableId)!];
