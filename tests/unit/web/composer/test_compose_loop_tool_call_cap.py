@@ -19,6 +19,7 @@ def _real_litellm_tool_call(
     *,
     call_id: Any = "call_real_1",
     omit_id: bool = False,
+    omit_function: bool = False,
     function: Any = _UNSET,
 ) -> Any:
     """Build a genuine ``litellm.types.utils.ChatCompletionMessageToolCall``.
@@ -40,6 +41,9 @@ def _real_litellm_tool_call(
       envelope (``None``, a bare string, or one carrying non-``str``
       ``name``/``arguments``) is passed in directly. ``Function`` itself
       coerces/validates those, so it cannot express the malformed cases.
+      ``omit_function`` pops it the same way ``omit_id`` does, reaching the
+      guard's other ``_MISSING_TOOL_CALL_FIELD`` branch (the one where the
+      whole envelope is absent, not merely wrong-typed).
 
     ``litellm`` is imported inside the callable: it is a seconds-scale
     import and this is a unit-suite module.
@@ -51,6 +55,8 @@ def _real_litellm_tool_call(
     tool_call = ChatCompletionMessageToolCall(id=call_id, type="function", function=function)
     if omit_id:
         tool_call.__pydantic_extra__.pop("id")
+    if omit_function:
+        tool_call.__pydantic_extra__.pop("function")
     return tool_call
 
 
@@ -82,6 +88,7 @@ def test_tool_batch_admission_accepts_a_real_litellm_tool_call() -> None:
         ({"call_id": 7}, "Composer tool batch contains a non-string provider tool-call ID"),
         ({"call_id": "  "}, "Composer tool batch contains a blank provider tool-call ID"),
         ({"call_id": "x" * 257}, "Composer tool batch contains an oversized provider tool-call ID"),
+        ({"omit_function": True}, "Composer tool batch contains malformed provider function metadata"),
         ({"function": None}, "Composer tool batch contains malformed provider function metadata"),
         ({"function": "not-an-envelope"}, "Composer tool batch contains malformed provider function metadata"),
         (

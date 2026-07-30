@@ -348,13 +348,13 @@ def _build_service(tmp_path: Path, base_url: str, sessions_service: SessionServi
 
 
 # ---------------------------------------------------------------------------
-# Step 2 -- the durable response-shape proof (design acceptance criterion 8,
-# gateway side). Drives a real ``litellm.acompletion`` call -- not the
-# low-level GatewayLLMProvider, not a hand-rolled HTTP client -- against the
-# live gateway, and inspects the exact HARD attribute-access chain the
-# freeform loop uses (service.py:3112-3117, tool_batch.py's
-# ``_ProviderToolFunctionMetadata``/consumption of ``tc.id`` /
-# ``tc.function.name`` / ``tc.function.arguments``).
+# The durable response-shape proof (design acceptance criterion 8, gateway
+# side). Drives a real ``litellm.acompletion`` call -- not the low-level
+# GatewayLLMProvider, not a hand-rolled HTTP client -- against the live
+# gateway, and inspects the exact HARD attribute-access chain the freeform
+# loop uses (``service.py``'s ``_call_model`` and ``tool_batch.py``'s
+# ``_admit_tool_batch``: ``tc.id`` / ``tc.function.name`` /
+# ``tc.function.arguments``).
 # ---------------------------------------------------------------------------
 
 
@@ -364,13 +364,13 @@ class TestGatewayResponseShapeSatisfiesFreeformAttributeAccess:
         """USE_TOOL trigger -> real litellm.acompletion -> dotted attribute
         access on tool_calls, exactly as the freeform loop performs it.
 
-        This is the definitive answer to the brief's Step 2 question: the
-        GATEWAY's response shape is fully consumable via
+        The GATEWAY's response shape is fully consumable via
         ``response.choices[0].message.tool_calls[i].id`` /
         ``.function.name`` / ``.function.arguments`` -- no dict-key access,
-        no gateway-side fix needed. (The separate, blocking defect this
-        task surfaced lives in Composer's OWN tool-batch admission code,
-        not here -- see the module docstring and the task report.)
+        and no gateway-side fix was ever needed. Defect 1 in the module
+        docstring lived in Composer's OWN tool-batch admission code, never
+        here; this test is the evidence that separated the two, and stays as
+        the narrow proof of the gateway half.
         """
         import litellm
 
