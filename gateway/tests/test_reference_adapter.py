@@ -94,6 +94,7 @@ def test_build_invoke_golden_full_request():
             "seed": 7,
             "max_output": 256,
         },
+        "directive_policy": {"mode": "auto"},
         "directives": [{"operation": "lookup", "about": "looks stuff up", "payload_schema": {"type": "object"}}],
         "format": {"kind": "schema", "schema": {"type": "object", "properties": {}}},
     }
@@ -135,6 +136,58 @@ def test_build_invoke_json_object_format():
     plan = adapter.build_invoke(request)
 
     assert plan.body["format"] == {"kind": "object"}
+
+
+@pytest.mark.parametrize("mode", ["auto", "none", "required"])
+def test_build_invoke_tool_choice_directive_policy_mode(mode):
+    adapter = ReferenceV1InvokeAdapter()
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(CanonicalMessage(role="user", content="hi"),),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+        tool_choice=mode,
+    )
+
+    plan = adapter.build_invoke(request)
+
+    assert plan.body["directive_policy"] == {"mode": mode}
+
+
+def test_build_invoke_tool_choice_named_carries_operation():
+    adapter = ReferenceV1InvokeAdapter()
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(CanonicalMessage(role="user", content="hi"),),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+        tool_choice="named",
+        tool_choice_function="lookup",
+    )
+
+    plan = adapter.build_invoke(request)
+
+    assert plan.body["directive_policy"] == {"mode": "named", "operation": "lookup"}
+
+
+def test_build_invoke_absent_tool_choice_omits_directive_policy():
+    adapter = ReferenceV1InvokeAdapter()
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(CanonicalMessage(role="user", content="hi"),),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+    )
+
+    plan = adapter.build_invoke(request)
+
+    assert "directive_policy" not in plan.body
 
 
 def test_build_invoke_tool_round_trip():
@@ -229,6 +282,27 @@ def test_parse_success_unknown_halt_raises_value_error():
     adapter = ReferenceV1InvokeAdapter()
     with pytest.raises(ValueError):
         adapter.parse_success({"result": {"text": "x"}, "halt": "mystery"})
+
+
+# --- parse_success(): malformed result shapes raise ValueError, not KeyError -
+
+
+def test_parse_success_missing_result_key_raises_value_error():
+    adapter = ReferenceV1InvokeAdapter()
+    with pytest.raises(ValueError):
+        adapter.parse_success({"halt": "complete"})
+
+
+def test_parse_success_missing_text_raises_value_error():
+    adapter = ReferenceV1InvokeAdapter()
+    with pytest.raises(ValueError):
+        adapter.parse_success({"result": {}, "halt": "truncated"})
+
+
+def test_parse_success_operations_missing_invocations_raises_value_error():
+    adapter = ReferenceV1InvokeAdapter()
+    with pytest.raises(ValueError):
+        adapter.parse_success({"result": {}, "halt": "operations"})
 
 
 # --- parse_success(): accounting -> usage -------------------------------------

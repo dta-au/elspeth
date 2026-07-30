@@ -30,6 +30,10 @@ Request body POSTed to ``v1/invoke``::
         "directives": [
             {"operation": "<name>", "about": "<description>", "payload_schema": {...}}
         ]?,
+        "directive_policy": {
+            "mode": "auto" | "none" | "required" | "named",
+            "operation": "<name>"?
+        }?,
         "format": {"kind": "object"} | {"kind": "schema", "schema": {...}}?
     }
 
@@ -37,7 +41,10 @@ A conversation entry carries ``text`` when the canonical message has
 content, ``operations`` when it is an assistant message requesting tool
 calls, and ``operation_ref`` when it is a tool-result message answering a
 prior call. ``directives`` is present only when the request declares tools;
-``format`` is present only when the request declares a response format.
+``directive_policy`` is present only when the request sets ``tool_choice``
+(``mode`` mirrors it verbatim; ``operation`` is added, from
+``tool_choice_function``, only when ``mode`` is ``"named"``); ``format`` is
+present only when the request declares a response format.
 
 Success response body::
 
@@ -160,6 +167,17 @@ class ReferenceV1InvokeAdapter:
 
         body: dict = {"conversation": conversation, "generation": generation}
 
+        if request.tool_choice is not None:
+            # TRANSLATION POINT: a real agency's choice-constraint field
+            # name/shape will differ from this fictional directive_policy
+            # shape. mode mirrors request.tool_choice verbatim
+            # ("auto"/"none"/"required"/"named"); "named" additionally
+            # carries the chosen operation name.
+            directive_policy: dict = {"mode": request.tool_choice}
+            if request.tool_choice == "named":
+                directive_policy["operation"] = request.tool_choice_function
+            body["directive_policy"] = directive_policy
+
         if request.tools:
             # TRANSLATION POINT: a real agency's tool-declaration field
             # names will differ from this fictional
@@ -190,6 +208,8 @@ class ReferenceV1InvokeAdapter:
             # TRANSLATION POINT: a real agency's tool-invocation result
             # shape will differ from this fictional invocations/ref/
             # operation/payload shape.
+            if "invocations" not in result:
+                raise ValueError(f"reference_v1_invoke: result missing text/invocations for halt={halt!r}")
             text = None
             tool_calls = tuple(
                 CanonicalToolCall(
@@ -201,15 +221,17 @@ class ReferenceV1InvokeAdapter:
             )
         else:
             tool_calls = ()
-            if halt == "screened" and "text" not in result:
+            if "text" in result:
+                text = result["text"]
+            elif halt == "screened":
                 # RULING: a halt that salvages no text still needs
                 # text-present (never None) on CanonicalResponse.
                 text = ""
             else:
                 # Missing "text" here is a malformed upstream contract for a
-                # non-screened halt: fail closed with the natural KeyError
-                # rather than fabricating a default.
-                text = result["text"]
+                # non-screened halt: fail closed with an explicit,
+                # clearly-worded ValueError rather than a bare KeyError.
+                raise ValueError(f"reference_v1_invoke: result missing text/invocations for halt={halt!r}")
 
         usage: CanonicalUsage | None = None
         if "accounting" in body:
