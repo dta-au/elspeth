@@ -1767,7 +1767,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             "output_write_failure": frozenset({"output", "discard"}),
         }
         if flow_kind == "row_union_success" and to_kind != "node":
-            return f"{path}.row_union_success must target an ordinary processing node"
+            return f"{path}.row_union_success must target an ordinary processing or queue node"
         if to_kind not in legal_to_kinds[flow_kind]:
             return f"{path}.flow is not legal for its to_endpoint kind"
         if from_stable_id == to_stable_id:
@@ -1833,10 +1833,10 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
                 return "payload row_union branch aliases do not match its incoming flows"
             target_ids = adjacency[stable_id]
             if len(target_ids) != 1:
-                return "payload row_union node requires exactly one ordinary processing target"
+                return "payload row_union node requires exactly one ordinary processing or queue target"
             target_id = next(iter(target_ids))
-            if target_id not in node_by_id or node_by_id[target_id]["node_type"] not in ("transform", "gate", "aggregation"):
-                return "payload row_union success must target one ordinary processing node"
+            if target_id not in node_by_id or node_by_id[target_id]["node_type"] not in ("transform", "gate", "aggregation", "queue"):
+                return "payload row_union success must target one ordinary processing or queue node"
             origin_gates = {gate_id for branch in behavior["branch_aliases"] for gate_id in branch_origin_gates.get(branch, ())}
             if len(origin_gates) != 1:
                 return "payload row_union branches must originate under one gate_fork"

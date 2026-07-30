@@ -364,6 +364,38 @@ def _fork_row_union_payload() -> dict[str, Any]:
     return payload
 
 
+def _route_row_union_through_queue(payload: dict[str, Any]) -> None:
+    queue_id = "00000000-0000-4000-8000-000000000417"
+    queue_edge_id = "00000000-0000-4000-8000-000000000612"
+    aggregate = payload["nodes"][4]
+    aggregate["label"] = proposal_component_label("node", 5)
+    payload["nodes"].insert(
+        4,
+        {
+            "stable_id": queue_id,
+            "label": proposal_component_label("node", 4),
+            "node_type": "queue",
+            "plugin": None,
+            "behavior": {"kind": "queue"},
+        },
+    )
+    payload["graph"]["edges"][8]["to_endpoint"] = {
+        "kind": "node",
+        "stable_id": queue_id,
+    }
+    payload["graph"]["edges"].insert(
+        9,
+        {
+            "stable_id": queue_edge_id,
+            "from_endpoint": {"kind": "node", "stable_id": queue_id},
+            "to_endpoint": {"kind": "node", "stable_id": aggregate["stable_id"]},
+            "flow": {"kind": "queue_continue", "branch": None},
+        },
+    )
+    payload["component_counts"]["nodes"] += 1
+    payload["component_counts"]["edges"] += 1
+
+
 def _queue_payload() -> dict[str, Any]:
     payload = _payload()
     payload["nodes"] = [
@@ -1043,6 +1075,13 @@ def test_propose_pipeline_represents_fork_and_row_union_with_distinct_n_to_n_suc
     assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
 
 
+def test_propose_pipeline_accepts_row_union_success_targeting_queue_before_processing_node() -> None:
+    payload = _fork_row_union_payload()
+    _route_row_union_through_queue(payload)
+
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -1108,7 +1147,7 @@ def test_propose_pipeline_rejects_row_union_branch_set_from_multiple_fork_gates(
 
 
 @pytest.mark.parametrize("target", ["output", "row_union"])
-def test_propose_pipeline_row_union_success_requires_one_ordinary_processing_target(target: str) -> None:
+def test_propose_pipeline_row_union_success_requires_one_processing_or_queue_target(target: str) -> None:
     payload = _fork_row_union_payload()
     success = payload["graph"]["edges"][8]
     if target == "output":
@@ -1120,6 +1159,44 @@ def test_propose_pipeline_row_union_success_requires_one_ordinary_processing_tar
 
     assert error is not None
     assert "row_union" in error or "self-loop" in error
+
+
+@pytest.mark.parametrize("barrier_type", ["coalesce", "row_union"])
+def test_propose_pipeline_rejects_row_union_success_targeting_downstream_barrier(barrier_type: str) -> None:
+    payload = _fork_row_union_payload()
+    target = payload["nodes"][4]
+    payload["graph"]["edges"][8]["flow"]["branch"] = "branch-1"
+    target["node_type"] = barrier_type
+    target["plugin"] = None
+    target["behavior"] = (
+        {
+            "kind": "coalesce",
+            "branch_aliases": ["branch-1", "branch-2"],
+            "policy": "require_all",
+            "merge": "nested",
+        }
+        if barrier_type == "coalesce"
+        else {
+            "kind": "row_union",
+            "branch_aliases": ["branch-1", "branch-2"],
+            "policy": "require_all",
+            "timeout_seconds": None,
+        }
+    )
+    payload["graph"]["edges"][9]["to_endpoint"] = {
+        "kind": "node",
+        "stable_id": payload["nodes"][1]["stable_id"],
+    }
+    payload["graph"]["edges"][9]["flow"] = {
+        "kind": f"{barrier_type}_success",
+        "branch": None,
+    }
+    del payload["graph"]["edges"][10]
+    payload["component_counts"]["edges"] -= 1
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+
+    assert error == "payload row_union success must target one ordinary processing or queue node"
 
 
 def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces() -> None:

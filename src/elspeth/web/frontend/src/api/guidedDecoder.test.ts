@@ -353,6 +353,41 @@ function rowUnionProposalWireResponse(): Record<string, unknown> {
   };
 }
 
+function routeRowUnionThroughQueue(
+  response: Record<string, unknown>,
+): void {
+  const payload = (response.next_turn as {
+    payload: Record<string, unknown>;
+  }).payload;
+  const nodes = payload.nodes as Array<Record<string, unknown>>;
+  const graph = payload.graph as {
+    edges: Array<Record<string, unknown>>;
+  };
+  const counts = payload.component_counts as Record<string, number>;
+  const aggregate = nodes[4];
+  const queueId = "00000000-0000-4000-8000-000000000408";
+  aggregate.label = "node-6";
+  nodes.splice(4, 0, {
+    stable_id: queueId,
+    label: "node-5",
+    node_type: "queue",
+    plugin: null,
+    behavior: { kind: "queue" },
+  });
+  graph.edges[8].to_endpoint = {
+    kind: "node",
+    stable_id: queueId,
+  };
+  graph.edges.splice(9, 0, {
+    stable_id: "00000000-0000-4000-8000-000000000512",
+    from_endpoint: { kind: "node", stable_id: queueId },
+    to_endpoint: { kind: "node", stable_id: aggregate.stable_id },
+    flow: { kind: "queue_continue", branch: null },
+  });
+  counts.nodes += 1;
+  counts.edges += 1;
+}
+
 describe("guided schema-10 wire decoder", () => {
   it("decodes the server-owned source-blob-compatible option set", () => {
     const decoded = decodeGetGuidedResponse(singleSelectWireResponse());
@@ -477,6 +512,25 @@ describe("guided schema-10 wire decoder", () => {
     });
   });
 
+  it("decodes row_union_success targeting a queue before an ordinary processing node", () => {
+    const response = rowUnionProposalWireResponse();
+    routeRowUnionThroughQueue(response);
+
+    const decoded = decodeGetGuidedResponse(response);
+
+    expect(decoded.next_turn?.type).toBe("propose_pipeline");
+    if (decoded.next_turn?.type !== "propose_pipeline") {
+      throw new Error("row_union queue fixture did not decode as a proposal");
+    }
+    expect(decoded.next_turn.payload.nodes[4]).toMatchObject({
+      node_type: "queue",
+      behavior: { kind: "queue" },
+    });
+    expect(decoded.next_turn.payload.graph.edges.slice(8, 10).map(
+      (edge) => edge.flow.kind,
+    )).toEqual(["row_union_success", "queue_continue"]);
+  });
+
   it.each([
     ["one branch", { branch_aliases: ["branch-1"] }],
     ["duplicate branches", { branch_aliases: ["branch-1", "branch-1"] }],
@@ -498,7 +552,7 @@ describe("guided schema-10 wire decoder", () => {
     expect(() => decodeGetGuidedResponse(response)).toThrow(/behavior/);
   });
 
-  it("rejects row_union_success targeting an output instead of one ordinary processing node", () => {
+  it("rejects row_union_success targeting an output instead of one processing or queue node", () => {
     const response = rowUnionProposalWireResponse();
     const payload = (response.next_turn as { payload: Record<string, unknown> })
       .payload;
@@ -514,6 +568,54 @@ describe("guided schema-10 wire decoder", () => {
       /row_union_success|target/i,
     );
   });
+
+  it.each(["coalesce", "row_union"] as const)(
+    "rejects row_union_success targeting a downstream %s barrier",
+    (barrierType) => {
+      const response = rowUnionProposalWireResponse();
+      const payload = (response.next_turn as {
+        payload: Record<string, unknown>;
+      }).payload;
+      const nodes = payload.nodes as Array<Record<string, unknown>>;
+      const edges = (payload.graph as {
+        edges: Array<Record<string, unknown>>;
+      }).edges;
+      const counts = payload.component_counts as Record<string, number>;
+      edges[8].flow = {
+        kind: "row_union_success",
+        branch: "branch-1",
+      };
+      nodes[4].node_type = barrierType;
+      nodes[4].plugin = null;
+      nodes[4].behavior = barrierType === "coalesce"
+        ? {
+            kind: "coalesce",
+            branch_aliases: ["branch-1", "branch-2"],
+            policy: "require_all",
+            merge: "nested",
+          }
+        : {
+            kind: "row_union",
+            branch_aliases: ["branch-1", "branch-2"],
+            policy: "require_all",
+            timeout_seconds: null,
+          };
+      edges[9].to_endpoint = {
+        kind: "node",
+        stable_id: nodes[1].stable_id,
+      };
+      edges[9].flow = {
+        kind: `${barrierType}_success`,
+        branch: null,
+      };
+      edges.splice(10, 1);
+      counts.edges -= 1;
+
+      expect(() => decodeGetGuidedResponse(response)).toThrow(
+        /row_union success must target one ordinary processing or queue node/i,
+      );
+    },
+  );
 
   it("rejects row_union branches that originate under different gate forks", () => {
     const response = rowUnionProposalWireResponse();

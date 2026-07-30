@@ -628,13 +628,13 @@ function validateProposalPayload(value: unknown, path: string): void {
       if (
         rowUnionTargets.length !== 1
         || !nodeById.has(rowUnionTarget)
-        || !["transform", "gate", "aggregation"].includes(
+        || !["transform", "gate", "aggregation", "queue"].includes(
           nodeById.get(rowUnionTarget)!.nodeType,
         )
       ) {
         invalid(
           path,
-          "row_union success must target one ordinary processing node",
+          "row_union success must target one ordinary processing or queue node",
         );
       }
       const originGates = new Set(
