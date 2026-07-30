@@ -29,9 +29,9 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   lines can fire on unrelated edits. Append `# secret-scan: allow-this-line`
   to a false positive; do not bypass the hook with `--no-verify`.
 - `git stash` is blocked by a hook — use worktrees or commits instead.
-- `AGENTS.md` and `CLAUDE.md` are untracked and machine-local: they do not
-  exist inside fresh worktrees and edits to them are unversioned — back up
-  before rewriting.
+- `AGENTS.md` and `CLAUDE.md` are tracked in git (since 2026-07-28) so fresh
+  worktrees inherit them. Commit edits to them like any other file; installer
+  upgrades that rewrite these files show up as diffs — review before staging.
 - Directory-scoped guides exist where the details live:
   `examples/AGENTS.md` (how to run every example) and
   `src/elspeth/plugins/transforms/AGENTS.md` (row data vs audit provenance).
@@ -56,6 +56,20 @@ signatures, checksums, audit chains, or admission gates that protect actual
 code, releases, exports, runtime data, or deployed artifacts. If removing a
 practice is a marginal call or may discard a real safeguard, surface the tradeoff
 to the developer before removing it.
+
+## Standing authorization: skills and subagents
+
+Agents are always authorized to invoke skills and dispatch subagents at their
+sole discretion — no per-use permission is needed. Any constraints stated
+elsewhere in this guide or in project-specific guidance still apply (e.g. the
+[O1] judge-key custody rule, worktree/venv discipline, operator gates on
+destructive shared-state actions).
+
+Optimization priorities when choosing how to work, in order:
+
+1. **Code quality** — correctness, integrity, and maintainability come first.
+2. **Wall-clock time** — parallelize (subagents, workflows) to finish sooner.
+3. **Efficiency** — token/compute cost matters, but only after the first two.
 
 <!-- filigree:instructions:v3.1.0:c1c023c3 -->
 <!-- filigree:last-writer:filigree install -->
