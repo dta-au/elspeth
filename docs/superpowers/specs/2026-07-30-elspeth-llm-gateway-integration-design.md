@@ -100,7 +100,7 @@ llm_profiles:
     provider: gateway
     model: standard
     credential_scope: server
-    credential_ref: ELSPETH_LLM_GATEWAY_BEARER_TOKEN
+    credential_ref: LLM_GATEWAY_BEARER_TOKEN
     endpoint: http://127.0.0.1:8787/v1
     contract_major: 1
     required_capabilities: [text, tools, usage]
@@ -109,7 +109,7 @@ llm_profiles:
     provider: gateway
     model: fast
     credential_scope: server
-    credential_ref: ELSPETH_LLM_GATEWAY_BEARER_TOKEN
+    credential_ref: LLM_GATEWAY_BEARER_TOKEN
     endpoint: http://127.0.0.1:8787/v1
     contract_major: 1
     required_capabilities: [text, tools, usage]
@@ -118,7 +118,7 @@ llm_profiles:
     provider: gateway
     model: standard
     credential_scope: server
-    credential_ref: ELSPETH_LLM_GATEWAY_BEARER_TOKEN
+    credential_ref: LLM_GATEWAY_BEARER_TOKEN
     endpoint: http://127.0.0.1:8787/v1
     contract_major: 1
     required_capabilities: [text, json_schema, usage]
