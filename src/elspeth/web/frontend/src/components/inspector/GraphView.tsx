@@ -1073,6 +1073,10 @@ export function GraphView() {
     // first-branch placeholder for row_union; it is deliberately ignored so
     // the graph cannot invent a duplicate unlabelled input edge.
     const inferredRowUnionAliases = new Set<string>();
+    // Row unions whose aliases phase 1 actually enumerated. Recorded here, at
+    // the one place the predicate is evaluated, so the phase-1b guard can
+    // never drift from "phase 1 spoke for this node's inbound wiring".
+    const aliasMappedRowUnionIds = new Set<string>();
     for (const rowUnion of compositionState.nodes.filter(
       (node) => node.node_type === "row_union",
     )) {
@@ -1082,6 +1086,8 @@ export function GraphView() {
         && !Array.isArray(rowUnion.branches)
           ? Object.entries(rowUnion.branches)
           : [];
+      if (branches.length === 0) continue;
+      aliasMappedRowUnionIds.add(rowUnion.id);
       for (const [alias, connection] of branches) {
         const producers: ProducerInfo[] = queueIds.has(connection)
           ? [{
@@ -1122,6 +1128,33 @@ export function GraphView() {
           existingConnections.add(connectionKey);
         }
       }
+    }
+
+    // Phase 1b: once phase 1 has spoken, `branches` is the ONLY route into an
+    // alias-mapped row union — every inbound lane, of every edge_type, comes
+    // from that mapping (phase 1 carries error styling via producer.edgeType).
+    // An explicit edge into such a union that no alias claimed is stale
+    // wiring: `with_node` replaces a node in place and never reconciles
+    // `edges` (unlike `without_node`, which prunes edges touching the removed
+    // node), and validation only checks that edge endpoints resolve — never
+    // that a label names a live alias. So a renamed alias or a repointed
+    // branch leaves a validation-VALID composition whose edge list still
+    // describes the old wiring. Rendering it would show operators — in the
+    // diagram AND in its accessible text alternative — a route into the union
+    // that the authoritative state does not have.
+    //
+    // Removal is by descending index so the remaining explicit indexes stay
+    // aligned; `existingConnections` is deliberately left intact, since it
+    // only ever suppresses duplicates and phase 1 does not consult it.
+    const staleRowUnionEdgeIndexes: number[] = [];
+    for (let index = 0; index < explicitEdges.length; index += 1) {
+      if (claimedExplicitRowUnionEdges.has(index)) continue;
+      const target = rfEdges[index]?.target;
+      if (target === undefined || !aliasMappedRowUnionIds.has(target)) continue;
+      staleRowUnionEdgeIndexes.push(index);
+    }
+    for (const index of staleRowUnionEdgeIndexes.reverse()) {
+      rfEdges.splice(index, 1);
     }
 
     // Phase 2: draw every producer → queue edge. Deterministic (sorted by

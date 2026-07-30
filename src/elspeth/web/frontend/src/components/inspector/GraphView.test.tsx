@@ -1329,6 +1329,132 @@ describe("GraphView", () => {
       ).toBe(false);
     });
 
+    it("drops a stale-label explicit edge into an alias-mapped row union", () => {
+      // Reachable state: `with_node` (upsert_node) replaces a row_union in
+      // place and never reconciles `edges` (contrast `without_node`, which
+      // prunes edges touching the removed node), and validation only checks
+      // that edge endpoints resolve — never that a label names a live branch
+      // alias. So renaming an alias leaves a validation-VALID composition
+      // carrying an edge labelled with the OLD alias.
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "legacy-control-to-union",
+          from_node: "control_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "legacy_control",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      const ids = renderedEdgeIds();
+      expect(
+        ids.filter((id) => id.includes("-control_score-variant_union")),
+      ).toEqual([
+        "edge-inferred-row-union-in-control_score-variant_union-control",
+      ]);
+      expect(
+        Array.from(document.querySelectorAll('[data-testid^="edge-"]')).some(
+          (edge) => edge.textContent?.includes("legacy_control"),
+        ),
+      ).toBe(false);
+    });
+
+    it("drops a stale-source explicit edge into an alias-mapped row union", () => {
+      // Same reachable path, other shape: the branch was repointed at a new
+      // producer, so the surviving edge names a source that no longer feeds
+      // any branch connection. Its label matches a live alias, so a
+      // label-only check would wave it through.
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "stale-gate-to-union",
+          from_node: "experiment_gate",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "control",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      const { container } = render(<GraphView />);
+
+      expect(
+        container.querySelectorAll(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+        ),
+      ).toHaveLength(0);
+      expect(renderedEdgeIds()).toContain(
+        "edge-inferred-row-union-in-control_score-variant_union-control",
+      );
+    });
+
+    it("drops an explicit edge whose alias names a connection no node publishes", () => {
+      // Deliberate, not an oversight: the alias is live but its connection has
+      // no producer, so the authoritative mapping cannot draw the lane and
+      // nothing replaces the dropped edge. An edge asserting a route the
+      // branches mapping cannot produce is the same phantom this guard exists
+      // to remove — and widening the guard to "alias with a resolvable
+      // producer" would resurrect stale edges every time a producer is
+      // momentarily unwired mid-authoring.
+      const state = rowUnionState();
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.branches = {
+        control: "control_done",
+        treatment: "unpublished_connection",
+      };
+      state.edges = [
+        makeEdge({
+          id: "treatment-to-union",
+          from_node: "treatment_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "treatment",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      const ids = renderedEdgeIds();
+      expect(
+        ids.filter((id) => id.includes("-treatment_score-variant_union")),
+      ).toEqual([]);
+      expect(ids).toContain(
+        "edge-inferred-row-union-in-control_score-variant_union-control",
+      );
+    });
+
+    it("keeps explicit edges into a row union with no alias mapping", () => {
+      // Without a branches mapping there is no authoritative inbound wiring to
+      // be the single source of truth, so the explicit edge is all the
+      // operator has — dropping it would blank the union's inbound routes.
+      const state = rowUnionState();
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.branches = null;
+      state.edges = [
+        makeEdge({
+          id: "control-to-union",
+          from_node: "control_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "control",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByTestId("edge-e-control_score-variant_union-0"),
+      ).toHaveTextContent("control");
+    });
+
     it("preserves every alias when two branches name the same producer connection", () => {
       const state = rowUnionState();
       const union = state.nodes.find((node) => node.id === "variant_union");
