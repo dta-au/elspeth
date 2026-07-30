@@ -29,7 +29,6 @@ resource "terraform_data" "candidate_image_provenance" {
         >"$work/docker-login.out"
       docker pull --platform "$TARGET_PLATFORM" "$CANDIDATE_IMAGE" >"$work/docker-pull.out"
       revision=$(docker image inspect \
-        --platform "$TARGET_PLATFORM" \
         --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
         "$CANDIDATE_IMAGE")
       test "$revision" = "$CANDIDATE_SHA" || {
@@ -82,7 +81,6 @@ resource "terraform_data" "rollback_image_provenance" {
         >"$work/docker-login.out"
       docker pull --platform "$TARGET_PLATFORM" "$ROLLBACK_IMAGE" >"$work/docker-pull.out"
       revision=$(docker image inspect \
-        --platform "$TARGET_PLATFORM" \
         --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
         "$ROLLBACK_IMAGE")
       test "$revision" = "$ROLLBACK_SHA" || {
@@ -135,7 +133,6 @@ resource "terraform_data" "cloudwatch_agent_image_provenance" {
         >"$work/docker-login.out"
       docker pull --platform "$TARGET_PLATFORM" "$CLOUDWATCH_AGENT_IMAGE" >"$work/docker-pull.out"
       revision=$(docker image inspect \
-        --platform "$TARGET_PLATFORM" \
         --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
         "$CLOUDWATCH_AGENT_IMAGE")
       test "$revision" = "$CANDIDATE_SHA" || {

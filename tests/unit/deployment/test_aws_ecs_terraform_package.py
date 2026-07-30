@@ -900,7 +900,10 @@ def test_image_provenance_binds_every_check_to_the_selected_target_platform() ->
             rf'docker pull\s+--platform "\$TARGET_PLATFORM"\s+"\${re.escape(image_name)}"',
             block,
         )
-        assert block.count('--platform "$TARGET_PLATFORM"') == 2
+        assert block.count('--platform "$TARGET_PLATFORM"') == 1
+        inspect = block[block.index("docker image inspect") : block.index('test "$revision"')]
+        assert "--platform" not in inspect
+        assert f'"${image_name}"' in inspect
         assert re.search(r"TARGET_PLATFORM\s*=\s*var\.target_platform", block)
 
 
@@ -974,6 +977,19 @@ def test_candidate_image_handoff_copies_the_authenticated_ghcr_index_into_bootst
     assert section.index("docker buildx imagetools create") < section.index('CANDIDATE_IMAGE="$ECR_REPOSITORY_URL@$ECR_IMAGE_DIGEST"')
     assert readme.index("terraform -chdir=bootstrap apply") < handoff_start
     assert "put the GHCR digest reference in the tfvars" not in producing
+
+
+def test_candidate_image_handoff_subshell_fails_before_emitting_an_unverified_reference() -> None:
+    readme = _text("README.md")
+    handoff_start = readme.index("### Promote the published candidate into bootstrap ECR")
+    section = readme[handoff_start : readme.index("## 2. Generate partial backend inputs", handoff_start)]
+    subshell_start = section.index("(\n")
+    subshell_end = section.index("\n)\nunset GITHUB_TOKEN", subshell_start)
+    subshell = section[subshell_start:subshell_end]
+
+    assert re.match(r"\(\n\s+set -e\n", subshell)
+    assert subshell.index("set -e") < subshell.index("docker login ghcr.io")
+    assert subshell.index('test "$ECR_IMAGE_DIGEST" = "$GHCR_IMAGE_DIGEST"') < subshell.index("printf 'candidate_image")
 
 
 def test_fresh_machine_pulls_the_candidate_before_local_inspection() -> None:

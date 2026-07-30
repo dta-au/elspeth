@@ -827,20 +827,20 @@ async def post_guided_chat_schema8(
                         # this guard covers every other producer of a
                         # sink resolution.
                         (resolved_output,) = sink_resolution.outputs
-                        prefill_config_error = resolved_sink_config_error(sink_resolution)
-                        if prefill_config_error is not None:
+                        prefill_config_rejection = resolved_sink_config_error(sink_resolution)
+                        if prefill_config_rejection is not None:
                             slog.warning(
                                 "guided.step_2_sink_prefill_config_rejected",
                                 session_id=str(session_id),
                                 user_id=user.user_id,
-                                plugin=resolved_output.plugin,
-                                error_detail=prefill_config_error[:500],
+                                rejection_code=prefill_config_rejection.rejection_code,
+                                exc_class=prefill_config_rejection.exception_class,
                             )
                             chat_result = StepChatResult(
                                 assistant_message=(
                                     "I couldn't apply that output configuration because it fails the "
-                                    f"'{resolved_output.plugin}' plugin's validation, so I didn't change "
-                                    "your pipeline. Describe the output again and I'll rebuild it."
+                                    "selected plugin's validation, so I didn't change your pipeline. "
+                                    "Describe the output again and I'll rebuild it."
                                 ),
                                 status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
                                 latency_ms=chat_result.latency_ms,

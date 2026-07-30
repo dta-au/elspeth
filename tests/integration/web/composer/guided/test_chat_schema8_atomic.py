@@ -43,6 +43,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedChatRequest
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -1300,6 +1301,60 @@ def test_sink_resolution_prefills_schema_form_from_chat_options(
     assert sink_prefilled["path"] == "out.json"
     assert sink_prefilled["schema"]["mode"] == "observed"
     assert sink_prefilled["on_write_failure"] == "discard"
+
+
+def test_invalid_sink_prefill_never_reaches_operator_logs(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    session_id = _create_session(composer_test_client)
+    sink_state = _Step2Journey()._drive_to_step_2_single_select(composer_test_client, session_id)
+    sink_turn = sink_state["next_turn"]
+    canary = "raw-model-config-canary-7f3a9d"
+
+    async def invalid_sink_provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        sink = SinkResolved(
+            outputs=(
+                SinkOutputResolved(
+                    name="result",
+                    plugin="json",
+                    options={
+                        "path": "out.json",
+                        "schema": {"mode": "observed"},
+                        canary: "untrusted",
+                    },
+                    required_fields=(),
+                    schema_mode="observed",
+                    on_write_failure="discard",
+                ),
+            )
+        )
+        return Step2SinkResolvedResult(
+            chat=StepChatResult(
+                assistant_message="I set up the JSON sink.",
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=1,
+                error_class=None,
+            ),
+            sink=sink,
+        )
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", invalid_sink_provider, raising=False)
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/chat",
+            json=_chat_body(sink_turn, message="Save the results."),
+        )
+
+    assert response.status_code == 200, response.json()
+    rejection = next(entry for entry in logs if entry["event"] == "guided.step_2_sink_prefill_config_rejected")
+    assert rejection["rejection_code"] == "invalid_sink_configuration"
+    assert rejection["exc_class"] == "PluginConfigError"
+    assert "plugin" not in rejection
+    assert "error_detail" not in rejection
+    assert canary not in repr(logs)
 
 
 def test_inline_source_defers_to_existing_ready_uploaded_blob(

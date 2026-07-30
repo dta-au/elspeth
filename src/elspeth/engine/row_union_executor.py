@@ -238,15 +238,19 @@ class RowUnionExecutor:
                 state_id=entry.state_id,
             )
 
-        self._pending = restored
-        outcomes: list[RowUnionOutcome] = []
-        for key in tuple(self._pending):
+        durable_loss_keys: list[tuple[str, str]] = []
+        for key in restored:
             if key in self._recorded_loss_groups or self._barrier_restore_reads.has_branch_loss_for_group(
                 run_id=self._run_id,
                 barrier_name=key[0],
                 row_id=key[1],
             ):
-                outcomes.append(self._fail_pending(self._settings[key[0]], key, "row_union_branch_lost"))
+                durable_loss_keys.append(key)
+
+        self._pending = restored
+        outcomes: list[RowUnionOutcome] = []
+        for key in durable_loss_keys:
+            outcomes.append(self._fail_pending(self._settings[key[0]], key, "row_union_branch_lost"))
         for key in tuple(self._pending):
             settings = self._settings[key[0]]
             pending = self._pending[key]
@@ -645,10 +649,18 @@ class RowUnionExecutor:
         node_id = self._node_ids[row_union_name]
         if not self._barrier_restore_reads.has_completed_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id):
             return False
+        key = (row_union_name, row_id)
         if self._barrier_restore_reads.has_released_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id):
-            self._mark_completed((row_union_name, row_id), _CLOSED_BY_RELEASE)
+            closed_reason = _CLOSED_BY_RELEASE
+        elif key in self._recorded_loss_groups or self._barrier_restore_reads.has_branch_loss_for_group(
+            run_id=self._run_id,
+            barrier_name=row_union_name,
+            row_id=row_id,
+        ):
+            closed_reason = _CLOSED_BY_BRANCH_LOSS
         else:
-            self._mark_completed((row_union_name, row_id), _CLOSED_BY_PRIOR_FAILURE)
+            closed_reason = _CLOSED_BY_PRIOR_FAILURE
+        self._mark_completed(key, closed_reason)
         return True
 
     def _mark_completed(self, key: tuple[str, str], reason: str) -> None:

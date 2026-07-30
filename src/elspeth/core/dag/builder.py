@@ -1378,6 +1378,35 @@ def build_execution_graph(
                 for branch_name, (_gate_name, gate_node_id) in row_union_branch_gates.items()
                 if row_union_branch_specs[branch_name].row_union_name == union_name
             }
+            ancestor_descendant_fork_pairs: set[tuple[str, str]] = set()
+            for descendant_gate_id in union_fork_gate_node_ids:
+                fork_ancestor_frontier = [descendant_gate_id]
+                fork_ancestor_seen: set[NodeID] = set()
+                while fork_ancestor_frontier:
+                    fork_ancestor_current = fork_ancestor_frontier.pop()
+                    for in_edge in graph.get_incoming_edges(fork_ancestor_current):
+                        upstream = in_edge.from_node
+                        if upstream in fork_ancestor_seen:
+                            continue
+                        fork_ancestor_seen.add(upstream)
+                        if upstream in union_fork_gate_node_ids:
+                            ancestor_descendant_fork_pairs.add(
+                                (
+                                    configured_fork_gate_names[upstream],
+                                    configured_fork_gate_names[descendant_gate_id],
+                                )
+                            )
+                        fork_ancestor_frontier.append(upstream)
+            if ancestor_descendant_fork_pairs:
+                raise GraphValidationError(
+                    f"row_union '{union_name}' declares branches produced by ancestor/descendant "
+                    f"fork gates {sorted(ancestor_descendant_fork_pairs)}. A require-all union cannot "
+                    f"span fork generations: the nested fork path replaces its ancestor branch, while "
+                    f"the non-nested path omits every nested branch, so no execution can supply all "
+                    f"declared branches. Use branches from one fork generation per row_union.",
+                    component_id=str(union_name),
+                    component_type="row_union",
+                )
             seen_upstream: set[NodeID] = set()
             upstream_frontier: list[NodeID] = [union_node_id]
             nested_fork_gate_names: set[str] = set()

@@ -526,6 +526,47 @@ async def test_sink_resolve_invalid_plugin_config_feeds_back_and_repairs() -> No
 
 
 @pytest.mark.asyncio
+async def test_sink_resolve_unknown_plugin_feeds_back_and_repairs() -> None:
+    """A hallucinated sink name is repairable within the same Send."""
+    unknown_plugin_args = {
+        **_RESOLVE_SINK_ARGS,
+        "output": {
+            **_RESOLVE_SINK_ARGS["output"],
+            "plugin": "hallucinated_sink_plugin",
+        },
+    }
+    responses = [
+        _response(tool_calls=[_tool_call("c1", "resolve_sink", unknown_plugin_args)]),
+        _response(tool_calls=[_tool_call("c2", "resolve_sink", _RESOLVE_SINK_ARGS)]),
+    ]
+    captured_messages: list[list[dict[str, Any]]] = []
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        captured_messages.append(kwargs["messages"])
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save the results",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+        )
+
+    assert result.sink is not None
+    assert result.sink.outputs[0].plugin == "json"
+    feedback = [message for message in captured_messages[1] if message.get("role") == "tool" and message.get("tool_call_id") == "c1"]
+    assert len(feedback) == 1
+    assert "Unknown sink type" in feedback[0]["content"]
+
+
+@pytest.mark.asyncio
 async def test_sink_resolve_invalid_plugin_config_at_cap_returns_empty() -> None:
     """Config-invalid resolves never wedge: at the iteration cap the loop
     degrades to the advisory fallback instead of staging toxic prefill."""

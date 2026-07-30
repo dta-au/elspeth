@@ -227,6 +227,23 @@ class TestLateArrival:
         assert late.failure_reason == "row_union_group_failed"
         assert executor.is_group_released("variant_union", "row_1") is False
 
+    def test_landscape_failed_closure_preserves_durable_branch_loss_reason(self) -> None:
+        executor, execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        execution.has_completed_row_for_node.return_value = True
+        execution.has_released_row_for_node.return_value = False
+        executor._barrier_restore_reads.has_branch_loss_for_group.return_value = True
+
+        late = executor.accept(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union")
+
+        assert late.late_arrival is True
+        assert late.failure_reason == "row_union_branch_lost"
+        executor._barrier_restore_reads.has_branch_loss_for_group.assert_called_once_with(
+            run_id="run_1",
+            barrier_name="variant_union",
+            row_id="row_1",
+        )
+
     def test_landscape_fallback_released_closure_is_late_arrival_after_release(self) -> None:
         executor, execution, _data_flow, _clock = _make_executor()
         _register(executor)
@@ -462,6 +479,28 @@ class TestRestoreFromJournal:
             barrier_name="variant_union",
             row_id="row_1",
         )
+
+    def test_all_durable_loss_reads_finish_before_any_recovery_state_mutation(self) -> None:
+        executor, execution, data_flow, _clock = _make_executor()
+        _register(executor)
+        restored_a = _make_token(row_id="row_1", token_id="tok_a", branch_name="branch_a")
+        restored_b = _make_token(row_id="row_2", token_id="tok_b", branch_name="branch_a")
+        executor._barrier_restore_reads.has_branch_loss_for_group.side_effect = (
+            True,
+            RuntimeError("second durable loss read failed"),
+        )
+
+        with pytest.raises(RuntimeError, match="second durable loss read failed"):
+            executor.restore_from_journal(
+                entries=(
+                    RowUnionRestoreEntry(restored_a, "variant_union", "state-a", 90.0),
+                    RowUnionRestoreEntry(restored_b, "variant_union", "state-b", 91.0),
+                )
+            )
+
+        execution.complete_node_state.assert_not_called()
+        data_flow.record_token_outcome.assert_not_called()
+        assert executor._pending == {}
 
     def test_reconcile_released_group_refuses_recorded_loss_key(self) -> None:
         # Pins the pristine-group guard the coordination seam depends on: a
