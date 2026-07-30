@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, final
 from uuid import UUID
 
 if TYPE_CHECKING:
+    from pydantic import SecretStr
+
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalState
@@ -1067,6 +1069,12 @@ class ComposerSettings(Protocol):
     def composer_model(self) -> str: ...
 
     @property
+    def composer_endpoint_base_url(self) -> str | None: ...
+
+    @property
+    def composer_endpoint_api_key(self) -> SecretStr | None: ...
+
+    @property
     def composer_temperature(self) -> float | None: ...
 
     @property
@@ -1104,6 +1112,12 @@ class ComposerSettings(Protocol):
 
     @property
     def composer_advisor_model(self) -> str: ...
+
+    @property
+    def composer_advisor_endpoint_base_url(self) -> str | None: ...
+
+    @property
+    def composer_advisor_endpoint_api_key(self) -> SecretStr | None: ...
 
     @property
     def composer_advisor_max_calls_per_compose(self) -> int: ...

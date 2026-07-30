@@ -103,6 +103,23 @@ def _is_loopback_origin(value: str) -> bool:
     return address.is_loopback
 
 
+def _validate_composer_endpoint_base_url(value: str, *, field_name: str) -> str:
+    """Validate an operator-set OpenAI-compatible endpoint base URL.
+
+    Same credential-safety discipline as every other credential-bearing URL
+    in this codebase (``validate_credential_safe_https_url``: HTTPS required,
+    HTTP permitted only for loopback, no embedded userinfo) plus an explicit
+    query/fragment rejection — a path IS allowed (``/v1`` is the normal
+    OpenAI-compatible mount point), unlike ``public_base_url`` which must be
+    a bare origin.
+    """
+    safe_url = validate_credential_safe_https_url(value, field_name=field_name, allow_http_loopback=True)
+    parsed = urlparse(safe_url)
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"{field_name} must not include a query string or fragment")
+    return safe_url
+
+
 class WebSettings(BaseModel):
     """Configuration for the ELSPETH web application.
 
@@ -157,6 +174,25 @@ class WebSettings(BaseModel):
     # server injects no allowlist. Set this only to host your own copy (a fork).
     tutorial_sample_base_url: str | None = Field(default=None)
     composer_model: str = "gpt-5.5"
+    # Operator affordance: point the PRIMARY composer role at any
+    # OpenAI-compatible endpoint (a self-hosted gateway, a local dev proxy,
+    # an agency-run translation layer) instead of the provider LiteLLM would
+    # otherwise route to from the model prefix. None (the default) omits
+    # ``api_base``/``api_key`` from every LiteLLM call entirely, so an
+    # unconfigured deployment is byte-identical to pre-endpoint-affordance
+    # behaviour. Configuration surface only — see
+    # docs/superpowers/plans/2026-07-31-llm-gateway-phase3-endpoint-affordance.md.
+    # Setting this does NOT rewrite ``composer_model``: LiteLLM shapes the
+    # request off the model prefix, not off ``api_base``, so a custom
+    # endpoint generally wants an ``openai/``-prefixed (or bare OpenAI-name)
+    # model — that remains the operator's lever, deliberately not automated.
+    composer_endpoint_base_url: str | None = Field(default=None)
+    # Operator-held bearer credential for composer_endpoint_base_url. Same
+    # shape as operator_metrics_bearer_token: a directly env-set secret, not
+    # a per-user secret-store reference (the boot probe and the planner have
+    # no authenticated user_id to resolve one against). Optional — an
+    # unauthenticated loopback dev gateway is a legitimate deployment.
+    composer_endpoint_api_key: SecretStr | None = Field(default=None)
     # Operator-set LLM sampling. Default None means omitted from the
     # provider request, which is the coherent default for reasoning-model
     # defaults like gpt-5.5 that reject non-default temperature values.
@@ -193,6 +229,15 @@ class WebSettings(BaseModel):
     composer_expose_provider_errors: bool = False
     e2e_state_seed_enabled: bool = False
     composer_advisor_model: str = "anthropic/claude-sonnet-4-6"
+    # Independent endpoint affordance for the ADVISOR role — see
+    # composer_endpoint_base_url. Deliberately separate settings: the
+    # two-model independence rule (_validate_advisor_distinct_from_primary)
+    # keeps the advisor's failure modes independent of the primary composer,
+    # and an operator may legitimately run the advisor direct against its
+    # provider while the primary composer goes through a gateway (or vice
+    # versa). Neither role defaults to the other's endpoint.
+    composer_advisor_endpoint_base_url: str | None = Field(default=None)
+    composer_advisor_endpoint_api_key: SecretStr | None = Field(default=None)
     composer_advisor_max_calls_per_compose: int = Field(
         default=4,
         ge=0,
@@ -470,6 +515,20 @@ class WebSettings(BaseModel):
         if _is_loopback_or_private_origin(safe_url) and not (parsed.scheme == "http" and _is_loopback_origin(safe_url)):
             raise ValueError("public_base_url must target a public origin unless using HTTP loopback for local development")
         return safe_url
+
+    @field_validator("composer_endpoint_base_url")
+    @classmethod
+    def _validate_composer_endpoint_base_url_field(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_composer_endpoint_base_url(v, field_name="composer_endpoint_base_url")
+
+    @field_validator("composer_advisor_endpoint_base_url")
+    @classmethod
+    def _validate_composer_advisor_endpoint_base_url_field(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_composer_endpoint_base_url(v, field_name="composer_advisor_endpoint_base_url")
 
     @field_validator("secret_key")
     @classmethod

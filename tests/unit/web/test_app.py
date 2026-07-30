@@ -1559,6 +1559,79 @@ class TestLifespanShutdown:
             assert attributes["probe_status"] == "success"
 
     @pytest.mark.asyncio
+    async def test_lifespan_probes_each_role_against_its_own_endpoint(self, monkeypatch, tmp_path) -> None:
+        """Phase 3 Task 2: each role probes ITS OWN configured endpoint — a
+        misconfigured custom endpoint must fail boot, not a user's first turn.
+        The primary and advisor endpoints are deliberately different here to
+        prove there is no cross-role mixup.
+        """
+        app = create_app(
+            _settings(
+                tmp_path,
+                composer_boot_probe_enabled=True,
+                composer_advisor_model="anthropic/claude-sonnet-4-6",
+                composer_endpoint_base_url="https://primary-gateway.example.test/v1",
+                composer_endpoint_api_key="primary-bearer-token",  # secret-scan: allow-this-line
+                composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+                composer_advisor_endpoint_api_key="advisor-bearer-token",  # secret-scan: allow-this-line
+            )
+        )
+        probed: list[dict[str, object]] = []
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+
+        async def _probe(**kwargs: object) -> bool:
+            probed.append(kwargs)
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        assert len(probed) == 2
+        primary_call, advisor_call = probed
+        assert primary_call["model"] == "gpt-5.5"
+        assert primary_call["api_base"] == "https://primary-gateway.example.test/v1"
+        assert primary_call["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+        assert advisor_call["model"] == "anthropic/claude-sonnet-4-6"
+        assert advisor_call["api_base"] == "https://advisor-gateway.example.test/v1"
+        assert advisor_call["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
+
+    @pytest.mark.asyncio
+    async def test_lifespan_probe_omits_endpoint_kwargs_when_unset(self, monkeypatch, tmp_path) -> None:
+        app = create_app(
+            _settings(
+                tmp_path,
+                composer_boot_probe_enabled=True,
+                composer_advisor_model="anthropic/claude-sonnet-4-6",
+            )
+        )
+        probed: list[dict[str, object]] = []
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+
+        async def _probe(**kwargs: object) -> bool:
+            probed.append(kwargs)
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        assert len(probed) == 2
+        for call in probed:
+            assert call["api_base"] is None
+            assert call["api_key"] is None
+
+    @pytest.mark.asyncio
     async def test_lifespan_records_transient_failure_when_composer_probe_times_out(self, monkeypatch, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
         counter = _RecordingCounter()

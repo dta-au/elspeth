@@ -152,6 +152,12 @@ from elspeth.web.sessions.protocol import (
     CompositionProposalRecord,
     CompositionStateData,
     CompositionStateRecord,
+    InterpretationEventAlreadyResolvedError,
+    InterpretationEventNotFoundError,
+    InterpretationNodeMissingError,
+    InterpretationNodePluginMutatedError,
+    InterpretationPlaceholderConsumedError,
+    InterpretationUnsupportedChoiceError,
     InvalidForkTargetError,
     ProposalEventRecord,
     ProposalLifecycleStatus,
@@ -199,14 +205,6 @@ from elspeth.web.sessions.schemas import (
     UpdateSessionRequest,
     ValidationEntryResponse,
     WorkflowProfileResponse,
-)
-from elspeth.web.sessions.service import (
-    InterpretationEventAlreadyResolvedError,
-    InterpretationEventNotFoundError,
-    InterpretationNodeMissingError,
-    InterpretationNodePluginMutatedError,
-    InterpretationPlaceholderConsumedError,
-    InterpretationUnsupportedChoiceError,
 )
 
 slog = structlog.get_logger()

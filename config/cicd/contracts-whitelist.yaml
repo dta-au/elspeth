@@ -869,6 +869,12 @@ allowed_dict_patterns:
   # Any)``) — the same untyped external-library boundary as the entries above —
   # so it cannot be reduced to a TypedDict without shadowing LiteLLM's own API.
   - "src/elspeth/web/composer/service.py:_apply_openrouter_app_identity:kwargs"
+  # ``_apply_endpoint_kwargs`` (Phase 3 Task 2 endpoint affordance) adds
+  # ``api_base``/``api_key`` to the same open-ended LiteLLM ``acompletion``
+  # kwargs dict as the entry above, for the same reason: it is LiteLLM's
+  # untyped external-library completion surface, not a contract this
+  # codebase owns the shape of.
+  - "src/elspeth/web/composer/service.py:_apply_endpoint_kwargs:kwargs"
   # Blob sync helpers — return dicts for LLM-visible tool response payloads.
   # The list_composer_blobs shape is deliberately metadata-only, enforced by
   # the construction helper; bytes/previews/storage paths stay outside the

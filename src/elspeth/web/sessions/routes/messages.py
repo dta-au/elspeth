@@ -272,6 +272,15 @@ def register_message_routes(router: APIRouter) -> None:
                             model=settings.composer_model,
                             temperature=settings.composer_temperature,
                             seed=settings.composer_seed,
+                            # Auto-title uses the PRIMARY composer role only
+                            # (Phase 3 Task 2 endpoint affordance) — never
+                            # the advisor's endpoint.
+                            api_base=settings.composer_endpoint_base_url,
+                            api_key=(
+                                settings.composer_endpoint_api_key.get_secret_value()
+                                if settings.composer_endpoint_api_key is not None
+                                else None
+                            ),
                         )
                     )
 

@@ -20,7 +20,7 @@ import math
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import pairwise
 from typing import Any, Final, TypedDict, cast
@@ -1154,6 +1154,13 @@ class DeferredIntentManagementChatRequest:
     seed: int | None
     timeout_seconds: float
     context_block: StepChatContextInput
+    # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
+    # composer role only (see module callers), so this always carries the
+    # primary endpoint, never the advisor's. None/None reproduces the exact
+    # pre-affordance kwargs. ``repr=False`` on the key keeps it out of any
+    # dataclass repr that might land in a log line.
+    api_base: str | None = None
+    api_key: str | None = field(default=None, repr=False)
 
 
 def _deferred_management_outcome_from_message(message: Any) -> DeferredIntentManagementChatOutcome:
@@ -1202,6 +1209,10 @@ async def maybe_manage_deferred_intent_chat(
         kwargs["temperature"] = request.temperature
     if request.seed is not None:
         kwargs["seed"] = request.seed
+    if request.api_base is not None:
+        kwargs["api_base"] = request.api_base
+    if request.api_key is not None:
+        kwargs["api_key"] = request.api_key
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()
     status: ComposerLLMCallStatus | None = None
@@ -1485,6 +1496,11 @@ async def maybe_resolve_step_1_source_chat(
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
     allow_plugin_reselection: bool = False,
+    # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
+    # composer role only; callers always pass the primary endpoint, never
+    # the advisor's. None/None reproduces the exact pre-affordance kwargs.
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> Step1SourceChatOutcome:
     """Try to resolve a Step-1 schema-form chat message into source data.
 
@@ -1578,6 +1594,10 @@ async def maybe_resolve_step_1_source_chat(
             kwargs["temperature"] = temperature
         if seed is not None:
             kwargs["seed"] = seed
+        if api_base is not None:
+            kwargs["api_base"] = api_base
+        if api_key is not None:
+            kwargs["api_key"] = api_key
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -1967,6 +1987,11 @@ async def maybe_resolve_step_2_sink_chat(
     context_block: StepChatContextInput | None = None,
     progress: ComposerProgressSink | None = None,
     revision_target_index: int | None = None,
+    # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
+    # composer role only; callers always pass the primary endpoint, never
+    # the advisor's. None/None reproduces the exact pre-affordance kwargs.
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> Step2SinkChatOutcome:
     """Resolve a Step-2 chat message into a sink config via a discovery loop.
 
@@ -2057,6 +2082,10 @@ async def maybe_resolve_step_2_sink_chat(
             kwargs["temperature"] = temperature
         if seed is not None:
             kwargs["seed"] = seed
+        if api_base is not None:
+            kwargs["api_base"] = api_base
+        if api_key is not None:
+            kwargs["api_key"] = api_key
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -2231,6 +2260,11 @@ async def solve_step_chat(
     recorder: BufferingRecorder | None = None,
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
+    # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
+    # composer role only; callers always pass the primary endpoint, never
+    # the advisor's. None/None reproduces the exact pre-affordance kwargs.
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> str:
     """Send a user chat message to the LLM scoped to *step*; return the assistant reply.
 
@@ -2294,6 +2328,10 @@ async def solve_step_chat(
         kwargs["temperature"] = temperature
     if seed is not None:
         kwargs["seed"] = seed
+    if api_base is not None:
+        kwargs["api_base"] = api_base
+    if api_key is not None:
+        kwargs["api_key"] = api_key
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()
     status: ComposerLLMCallStatus | None = None
