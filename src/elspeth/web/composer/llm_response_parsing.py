@@ -323,13 +323,39 @@ def _response_field(value: Any, field: str) -> Any:
     return _provider_field(value, field)
 
 
-def _first_response_message(response: Any | None) -> Any | None:
+def _first_response_choice(response: Any | None) -> Any | None:
     if response is None:
         return None
     choices = _response_field(response, "choices")
     if not isinstance(choices, list | tuple) or not choices:
         return None
-    return _response_field(choices[0], "message")
+    return choices[0]
+
+
+def _first_response_message(response: Any | None) -> Any | None:
+    return _response_field(_first_response_choice(response), "message")
+
+
+def _finish_reason_from_response(response: Any | None) -> str | None:
+    """Return the provider's raw ``choices[0].finish_reason`` string, verbatim.
+
+    Tier-3 extraction: the value is read through ``_provider_field`` so the
+    pydantic v2 ``extra="allow"`` overflow slot is merged in — a reader that
+    consulted ``__dict__`` alone would see a real provider object as
+    field-less and silently record ``None`` (ADR-032; the defect class of
+    elspeth-9ea866438b).
+
+    Only the *value* is asserted, never the object's type: a non-``str`` or
+    blank finish reason is treated as absent. The surviving string is stored
+    exactly as received — no mapping onto the pipeline's ``FinishReason``
+    vocabulary (which lives in ``elspeth.plugins`` and must not be imported
+    from ``contracts``), and no normalisation of unrecognised values, so a
+    provider term ELSPETH has never seen still reaches the audit trail.
+    """
+    finish_reason = _provider_field(_first_response_choice(response), "finish_reason")
+    if type(finish_reason) is not str or not finish_reason.strip():
+        return None
+    return finish_reason
 
 
 def _provider_artifact_owned_fields(value: Any) -> Mapping[str, Any] | None:
@@ -550,6 +576,7 @@ def build_llm_call_record(
         model_requested=model_requested,
         model_returned=safe_response_model(response),
         status=status,
+        finish_reason=_finish_reason_from_response(response),
         prompt_tokens=usage.prompt_tokens,
         completion_tokens=usage.completion_tokens,
         total_tokens=usage.total_tokens,

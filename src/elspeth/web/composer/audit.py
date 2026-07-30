@@ -289,6 +289,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "model_requested",
     "model_returned",
     "status",
+    "finish_reason",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",

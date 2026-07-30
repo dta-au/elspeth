@@ -107,6 +107,20 @@ class ComposerLLMCall:
     assistant chat content. Missing fields stay ``None`` rather than being
     fabricated.
 
+    ``finish_reason`` is the provider's own termination signal for the call,
+    stored as the **raw provider string, verbatim** — never normalised,
+    mapped, or coerced into an ELSPETH vocabulary. It is the only audit
+    evidence that distinguishes a completed answer (``stop``) from one the
+    provider truncated (``length``) or refused (``content_filter``); without
+    it a truncated composer turn is indistinguishable from a short one.
+    Recording the string as-received means an unrecognised or newly
+    introduced provider value survives to the audit trail intact rather than
+    being flattened into a known bucket. A response that carries no finish
+    reason stays ``None`` — the same fabrication policy the cache and
+    reasoning fields follow. This field is *evidence only*: unlike the
+    pipeline LLM transform, the composer does not treat a non-``stop`` value
+    as an error, so it makes truncation visible without changing control flow.
+
     ``temperature`` and ``seed`` capture the sampling parameters actually sent
     on composer LLM requests. Both are operator-set
     (``WebSettings.composer_temperature`` / ``composer_seed``) and recorded as
@@ -132,6 +146,7 @@ class ComposerLLMCall:
     error_message: str | None
     temperature: float | None
     seed: int | None
+    finish_reason: str | None = None
     cached_prompt_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
@@ -151,6 +166,10 @@ class ComposerLLMCall:
         _require_non_empty_str(self.model_requested, "model_requested")
         _require_non_empty_str(self.model_returned, "model_returned", optional=True)
         _require_non_empty_str(self.provider_request_id, "provider_request_id", optional=True)
+        # An empty/whitespace finish_reason is not "the provider said nothing"
+        # — absence is ``None``. A blank string reaching here is a defect in
+        # the extraction site, not provider data worth recording.
+        _require_non_empty_str(self.finish_reason, "finish_reason", optional=True)
         _require_non_empty_str(self.messages_hash, "messages_hash")
         _require_non_empty_str(self.tools_spec_hash, "tools_spec_hash", optional=True)
         if type(self.declared_tool_names) is not tuple:
