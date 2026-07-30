@@ -2,13 +2,16 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.7.2 blob cleanup, guided decline, and row_union barrier (session epoch 37 and Landscape epoch 30)
+## Current Cutover: 0.7.2 blob cleanup, guided decline, and row_union barrier (session epoch 38 and Landscape epoch 30)
 
-0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to 37. Epoch 36 ensures a committed
+0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to 38. Epoch 36 ensures a committed
 blob deletion whose tombstone unlink or directory fsync fails remains retryable
 after restart. Epoch 37 adds the completed `guided_plan` `declined`
-result kind and its state-only result locator. An epoch-35 or epoch-36 database
-cannot represent the complete current contract and must be recreated.
+result kind and its state-only result locator. Epoch 38 additionally retains the
+exact assistant message ID a completed decline replays; epoch 37 cannot
+distinguish the original decline from later assistant messages sharing an
+unchanged state. An epoch-35, epoch-36, or epoch-37 database cannot represent the
+complete current contract and must be recreated.
 
 0.7.1 advances the session store from epoch 26 through epoch 35. Epoch 27 lets
 `user_preferences.freeform_intro_dismissed_at` persist the account-wide
@@ -21,7 +24,8 @@ boundary makes a fork quota failure settle and replay as a stable HTTP 413.
 Later hard cuts add guided pipeline-proposal replay (31), exact failed-operation
 audit cohorts (32), guided-start negative admission (33), guided schema 10 (34),
 exclusive guided-confirmation proposal admission (35), retryable blob-deletion
-cleanup (36), and ordinary guided-plan decline settlement (37). The universal web
+cleanup (36), ordinary guided-plan decline settlement (37), and exact decline
+replay message identity (38). The universal web
 plugin-policy work in 0.7.1 also advances
 `SQLITE_SCHEMA_EPOCH` from 22 to 23 and adds `run_web_plugin_policy`. This
 table is optional per run but required in the schema: web runs receive one
@@ -40,7 +44,7 @@ blocked work item to its declared row_union barrier.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor
-session epoch is a recreate boundary, including epoch 36. Landscape epoch 30
+session epoch is a recreate boundary, including epoch 37. Landscape epoch 30
 is the current release boundary, so a Landscape database left at epoch 29 is
 stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
 the schema owner; the runtime role remains DML-only.
@@ -57,9 +61,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-37 release forward,
+unsupported: keep the service drained, repair the epoch-38 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-37/Landscape-epoch-30 record when binding candidate and rollback
+session-epoch-38/Landscape-epoch-30 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
@@ -530,10 +534,10 @@ After health checks pass, prove the recreated session store carries the current
 hard-cut sentinel before creating any session:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 37 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 38 (== SESSION_SCHEMA_EPOCH)
 ```
 
-An epoch-35 or epoch-36 result is not repairable in place: keep the service drained,
+An epoch-35, epoch-36, or epoch-37 result is not repairable in place: keep the service drained,
 recreate the session database with the current release, and rerun the probe.
 Then create a new session through the API or UI and confirm no
 `SessionSchemaError` appears in the service journal.

@@ -5,6 +5,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
+
 ROOT = Path(__file__).resolve().parents[3]
 CURRENT_VERSION = "0.7.2"
 
@@ -73,7 +75,7 @@ def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
 
     sharing = _text("docs/guides/sharing-pipelines.md")
     assert "For 0.7.2" in sharing
-    assert "SESSION_SCHEMA_EPOCH=37" in sharing
+    assert f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}" in sharing
     assert "SQLITE_SCHEMA_EPOCH=30" in sharing
 
     aws = _text("docs/runbooks/aws-ecs-deployment.md")

@@ -172,7 +172,10 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #   37 -> ``guided_operations`` completed-plan result CHECKs gain the
 #        ``declined`` result kind and its state-only locator. Epoch 36 cannot
 #        represent an ordinary guided planner decline and is rejected outright.
-SESSION_SCHEMA_EPOCH = 37
+#   38 -> completed guided-plan declines also retain the exact assistant
+#        message ID used for replay. Epoch 37 cannot distinguish the original
+#        decline from later assistant messages sharing an unchanged state.
+SESSION_SCHEMA_EPOCH = 38
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -698,6 +701,7 @@ guided_operations_table = Table(
     Column("proposal_id", String(128), nullable=True),
     Column("result_kind", String(32), nullable=True),
     Column("result_state_id", String(128), nullable=True),
+    Column("result_message_id", String(128), nullable=True),
     Column("result_session_id", String(128), nullable=True),
     Column("response_hash", String(64), nullable=True),
     Column("failure_code", String(128), nullable=True),
@@ -730,6 +734,12 @@ guided_operations_table = Table(
         name="fk_guided_operations_result_state_session",
         ondelete="RESTRICT",
     ),
+    ForeignKeyConstraint(
+        ["result_message_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        name="fk_guided_operations_result_message_session",
+        ondelete="RESTRICT",
+    ),
     ForeignKeyConstraint(["result_session_id"], ["sessions.id"], name="fk_guided_operations_result_session", ondelete="RESTRICT"),
     CheckConstraint("length(operation_id) >= 1 AND length(operation_id) <= 128", name="ck_guided_operations_operation_id_bounded"),
     CheckConstraint(
@@ -743,6 +753,10 @@ guided_operations_table = Table(
     CheckConstraint(
         "result_state_id IS NULL OR (length(result_state_id) >= 1 AND length(result_state_id) <= 128)",
         name="ck_guided_operations_result_state_id_bounded",
+    ),
+    CheckConstraint(
+        "result_message_id IS NULL OR (length(result_message_id) >= 1 AND length(result_message_id) <= 128)",
+        name="ck_guided_operations_result_message_id_bounded",
     ),
     CheckConstraint(
         "result_session_id IS NULL OR (length(result_session_id) >= 1 AND length(result_session_id) <= 128)",
@@ -779,12 +793,13 @@ guided_operations_table = Table(
     CheckConstraint(
         "(status = 'in_progress' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL "
         "AND settled_at IS NULL AND result_kind IS NULL "
-        "AND response_hash IS NULL AND failure_code IS NULL) OR "
+        "AND result_message_id IS NULL AND response_hash IS NULL AND failure_code IS NULL) OR "
         "(status = 'completed' AND lease_token IS NULL AND lease_expires_at IS NULL "
         "AND settled_at IS NOT NULL AND result_kind IS NOT NULL AND response_hash IS NOT NULL AND failure_code IS NULL) OR "
         "(status = 'failed' AND lease_token IS NULL AND lease_expires_at IS NULL "
         "AND settled_at IS NOT NULL AND result_kind IS NULL AND result_state_id IS NULL "
-        "AND result_session_id IS NULL AND proposal_id IS NULL AND response_hash IS NULL AND failure_code IS NOT NULL)",
+        "AND result_message_id IS NULL AND result_session_id IS NULL AND proposal_id IS NULL "
+        "AND response_hash IS NULL AND failure_code IS NOT NULL)",
         name="ck_guided_operations_status_bundle",
     ),
     CheckConstraint(
@@ -794,16 +809,18 @@ guided_operations_table = Table(
         "(proposal_id IS NULL OR kind IN ('guided_respond', 'guided_chat'))) OR "
         "(status = 'completed' AND ("
         "(kind = 'session_fork' AND result_kind = 'session' AND result_session_id IS NOT NULL "
-        "AND result_state_id IS NULL AND proposal_id IS NULL) OR "
+        "AND result_state_id IS NULL AND result_message_id IS NULL AND proposal_id IS NULL) OR "
         "(kind = 'guided_plan' AND result_kind = 'pipeline_proposal' "
-        "AND result_state_id IS NOT NULL AND result_session_id IS NULL AND proposal_id IS NOT NULL) OR "
+        "AND result_state_id IS NOT NULL AND result_message_id IS NULL "
+        "AND result_session_id IS NULL AND proposal_id IS NOT NULL) OR "
         "(kind = 'guided_plan' AND result_kind = 'declined' "
-        "AND result_state_id IS NOT NULL AND result_session_id IS NULL AND proposal_id IS NULL) OR "
+        "AND result_state_id IS NOT NULL AND result_message_id IS NOT NULL "
+        "AND result_session_id IS NULL AND proposal_id IS NULL) OR "
         "(kind NOT IN ('session_fork', 'guided_plan') AND result_kind = 'composition_state' "
-        "AND result_state_id IS NOT NULL AND result_session_id IS NULL "
+        "AND result_state_id IS NOT NULL AND result_message_id IS NULL AND result_session_id IS NULL "
         "AND (proposal_id IS NULL OR kind IN ('guided_respond', 'guided_chat'))))) OR "
         "(status = 'failed' AND result_kind IS NULL AND result_state_id IS NULL "
-        "AND result_session_id IS NULL AND proposal_id IS NULL)",
+        "AND result_message_id IS NULL AND result_session_id IS NULL AND proposal_id IS NULL)",
         name="ck_guided_operations_result_locator",
     ),
     CheckConstraint(

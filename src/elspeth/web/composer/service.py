@@ -3070,7 +3070,11 @@ class ComposerServiceImpl:
         provider_tool_calls = assistant_message.tool_calls or ()
         from elspeth.web.composer.tool_batch import _admit_tool_batch
 
-        admitted_batch = _admit_tool_batch(provider_tool_calls)
+        try:
+            admitted_batch = _admit_tool_batch(provider_tool_calls)
+        except BaseException as exc:
+            attach_llm_calls(exc, recorder)
+            raise
         assistant_tool_calls = admitted_batch.calls
         if len(assistant_tool_calls) > self._max_tool_calls_per_turn:
             self._telemetry.tool_call_cap_exceeded_total.add(1)
