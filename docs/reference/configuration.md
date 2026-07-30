@@ -661,6 +661,90 @@ transforms:
         mode: observed
 ```
 
+### Custom OpenAI-compatible endpoints
+
+The `llm` transform's OpenRouter provider is a plain OpenAI Chat Completions
+client. Overriding its `base_url` points it at any other endpoint that speaks the
+same shape — a self-hosted proxy, an agency translation layer, an ELSPETH LLM
+compatibility gateway, or a local development server. No gateway-specific
+option is involved.
+
+```yaml
+transforms:
+  - name: classify
+    plugin: llm
+    input: classify_in
+    on_success: output
+    on_error: discard
+    options:
+      provider: openrouter
+      base_url: https://gateway.internal.example.gov.au/v1
+      api_key: ${LLM_GATEWAY_BEARER}
+      model: openai/gpt-4o
+      prompt_template: "Classify: {{ row.text }}"
+      required_input_fields: [text]
+      schema:
+        mode: observed
+```
+
+`base_url` must be HTTPS, carry no embedded user information, and default to
+`https://openrouter.ai/api/v1` when omitted. HTTP is permitted only for a
+loopback host, so the shipped local ChaosLLM example
+(`http://127.0.0.1:8199/v1`) validates; the bearer never leaves the machine
+in that case.
+
+The `model` value is interpreted by whichever endpoint you configured. When
+`base_url` is left at the OpenRouter default, `model` is checked against the
+OpenRouter catalogue; when you override `base_url`, that check is dropped,
+because the endpoint — not OpenRouter — owns the model identifiers.
+
+### The `gateway` provider
+
+`provider: gateway` targets the ELSPETH LLM compatibility gateway
+specifically. It adds startup capability preflight and exact envelope error
+codes on top of what `base_url` pointing gives you.
+
+```yaml
+transforms:
+  - name: classify
+    plugin: llm
+    input: classify_in
+    on_success: output
+    on_error: discard
+    options:
+      provider: gateway
+      endpoint: https://gateway.internal.example.gov.au/v1
+      api_key: ${LLM_GATEWAY_BEARER}
+      model: standard
+      contract_major: 1
+      required_capabilities: [text, json_schema, usage]
+      prompt_template: "Classify: {{ row.text }}"
+      required_input_fields: [text]
+      schema:
+        mode: observed
+```
+
+| Option | Notes |
+|--------|-------|
+| `endpoint` | Gateway base URL; must end with `/v1`. HTTPS, or HTTP against the literal `127.0.0.1` loopback host only. No query string or fragment. |
+| `api_key` | Static inbound bearer the gateway expects. |
+| `model` | A **logical alias** the gateway resolves server-side, not a raw upstream model id. There is no local catalogue to check it against; the gateway's readiness document is the authority. |
+| `contract_major` | Wire contract major version this configuration expects. Only `1` is supported. |
+| `required_capabilities` | Closed set: `text`, `tools`, `json_object`, `json_schema`, `seed`, `usage`. Checked at startup against what the gateway declares. |
+
+At startup the provider reads `/readyz` and verifies the contract major, the
+adapter identity, the model alias, and every required capability, then runs
+one bounded real completion — a readiness document alone is not accepted as
+health. A gateway whose adapter cannot do JSON Schema therefore fails the run
+at boot rather than per row. Gateway error codes (`invalid_request`,
+`contract_mismatch`, `model_not_allowed`, `capability_unsupported`,
+`upstream_unauthorized`, and the rest) map to definite retryable or
+non-retryable outcomes instead of being inferred from an HTTP status.
+
+Before pointing a pipeline at any endpoint you do not operate, read
+[Custom LLM Endpoints](environment-variables.md#custom-llm-endpoints) — it
+sets out what ELSPETH can and cannot tell you about the endpoint you chose.
+
 ### AWS Bedrock Guardrail shields
 
 CLI and batch pipelines use an explicit trained-operator binding. The Guardrail

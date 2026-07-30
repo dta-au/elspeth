@@ -161,6 +161,43 @@ If a profile requires `usage`, absent usage is a non-retryable invalid-response 
 
 ## Composer integration
 
+> **SUPERSEDED 2026-07-31.** Everything in this section — the injected
+> `ComposerCompletionClient` boundary, its direct and gateway implementations,
+> the migration of the nine Composer LLM call sites onto it, and the
+> `composer_profile` / `composer_advisor_profile` profile selectors — is
+> replaced by the endpoint-affordance approach in
+> `docs/superpowers/plans/2026-07-31-llm-gateway-phase3-endpoint-affordance.md`.
+>
+> **Reason.** ELSPETH already speaks to any OpenAI-compatible endpoint at an
+> arbitrary base URL, through LiteLLM and through its own OpenRouter provider.
+> The gateway is one such endpoint. Teaching ELSPETH to speak *to the gateway*
+> put the boundary in the wrong place: it belongs at the operator's endpoint,
+> not inside ELSPETH. What the Composer needed was a settable base URL and a
+> paired credential, not an abstraction layer — delivered as
+> `composer_endpoint_base_url` / `composer_endpoint_api_key` and
+> `composer_advisor_endpoint_base_url` / `composer_advisor_endpoint_api_key`
+> (`src/elspeth/web/config.py`), configuration surface only. See
+> `docs/reference/environment-variables.md` ("Custom LLM Endpoints") for the
+> operator-facing form, including the risk this transfers to the operator.
+>
+> **Custody amendment 2 is discharged.** It required a disposition for
+> `src/elspeth/web/_aws_ecs_acceptance/bedrock.py`, which calls
+> `_litellm_acompletion` directly. With no boundary to migrate onto, that
+> acceptance lane keeps calling `_litellm_acompletion` directly, and correctly
+> so: it exists to exercise Bedrock specifically, not to be provider-agnostic.
+>
+> **Custody amendment 3 is narrowed.** The rule that a configured seed implies
+> the `seed` capability applies only to the gateway-*provider* path (the
+> pipeline `llm` transform's `provider: gateway` and its
+> `required_capabilities`). The base-URL path has no capability negotiation,
+> and the pipeline has no seed concept, so the rule is today vacuous outside
+> that path. It is restated here so it is not lost if `seed` is added to the
+> pipeline.
+>
+> The rest of this document — the pipeline provider integration, the shared
+> LLM profile contract, error/retry/cancellation behaviour, audit surfaces,
+> and AWS Scenario C — stands as written.
+
 Introduce an injected `ComposerCompletionClient` boundary with two implementations:
 
 - a direct implementation preserving the current LiteLLM behavior; and

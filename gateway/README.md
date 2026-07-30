@@ -37,6 +37,22 @@ now accepted too. The static bearer is not optional — every `/v1/*` request
 still requires a valid `Authorization: Bearer <token>` regardless of what
 contract header, if any, it sends.
 
+Two ways to point ELSPETH itself at this gateway, both documented in the main
+repository's `docs/reference/environment-variables.md` ("Custom LLM
+Endpoints"):
+
+- **By base URL** — the `llm` transform's `base_url` for pipelines, and the
+  `ELSPETH_WEB__COMPOSER_*ENDPOINT_*` settings for the Composer. Nothing
+  ELSPETH-side knows this is a gateway.
+- **The `gateway` pipeline provider** — additionally verifies contract major,
+  adapter identity, model alias, and declared capabilities against `/readyz`
+  at startup, and maps this gateway's stable error codes to definite
+  retry decisions.
+
+That section also states plainly what ELSPETH can and cannot tell an operator
+about an endpoint they chose to put in front of a model. Read it before
+putting this gateway, or any other, into a deployment.
+
 ### The accepted request subset
 
 The inbound body is a strict *subset* of Chat Completions: `model`,

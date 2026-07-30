@@ -12,6 +12,7 @@ Reference for ELSPETH environment variables and `.env` configuration.
 - [LLM Provider Variables](#llm-provider-variables)
 - [Web Deployment Variables](#web-deployment-variables)
 - [Web LLM Configuration](#web-llm-configuration)
+- [Custom LLM Endpoints](#custom-llm-endpoints)
 - [AWS Service Variables](#aws-service-variables)
 - [Azure Service Variables](#azure-service-variables)
 - [Telemetry Variables](#telemetry-variables)
@@ -218,6 +219,72 @@ startup, because that is a fixable operator configuration error. Transient
 provider, auth, or network failures do not block boot; the Composer is
 exercised again at first use.
 
+### Pointing Composer at your own OpenAI-compatible endpoint
+
+Each Composer role can be pointed at any endpoint that speaks the OpenAI
+Chat Completions shape — a self-hosted proxy, an agency translation layer,
+the ELSPETH LLM compatibility gateway, or a local development server —
+instead of the provider LiteLLM would otherwise infer from the model prefix.
+The two roles are configured independently.
+
+| Variable | Purpose |
+| --- | --- |
+| `ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL` | Base URL for the **primary** Composer role, normally ending in `/v1`. |
+| `ELSPETH_WEB__COMPOSER_ENDPOINT_API_KEY` | Bearer credential presented to that endpoint. |
+| `ELSPETH_WEB__COMPOSER_ADVISOR_ENDPOINT_BASE_URL` | Base URL for the **advisor** role. |
+| `ELSPETH_WEB__COMPOSER_ADVISOR_ENDPOINT_API_KEY` | Bearer credential presented to that endpoint. |
+
+All four are unset by default. With a role's endpoint unset, no base URL and
+no API key are added to that role's provider calls at all, and the deployment
+behaves exactly as it did before these settings existed.
+
+**An endpoint and its credential must be configured together.** Setting a
+base URL without its key — or a key without its base URL — fails startup.
+This is a credential-containment rule, not tidiness: when no API key is
+supplied, LiteLLM resolves one from the web process environment. An endpoint
+configured without a paired credential would therefore take whichever ambient
+provider key happened to be set (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and
+so on) and send it to the endpoint you configured. Startup fails closed
+rather than disclose one provider's credential to another party.
+
+**Neither role inherits the other's endpoint.** The advisor is the
+independent reviewer of the primary Composer's work, and the two-model
+independence rule exists to keep their failure modes separate. An operator
+may legitimately run the advisor direct against its provider while the
+primary goes through a gateway, or the reverse. There is no shared default.
+
+**Setting an endpoint does not rewrite the model identifier.** LiteLLM shapes
+the request from the model prefix, not from the base URL, so an endpoint that
+expects OpenAI-shaped requests normally wants an `openai/`-prefixed or bare
+OpenAI-name value in `ELSPETH_WEB__COMPOSER_MODEL`. That remains the
+operator's lever and is deliberately not automated.
+
+**URL rules.** The base URL must be HTTPS, carry no embedded user
+information, and carry no query string or fragment. A path is allowed and
+expected — `/v1` is the normal OpenAI-compatible mount point. HTTP is
+permitted only for a **numeric** loopback address:
+
+```bash
+ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL=https://gateway.internal.example.gov.au/v1
+ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL=http://127.0.0.1:8787/v1      # accepted
+ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL=http://[::1]:8787/v1          # accepted
+ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL=http://localhost:8787/v1      # REJECTED
+```
+
+`http://localhost` is rejected deliberately. The URL carries an operator
+bearer credential in cleartext, and the name `localhost` is not proof that
+the connection stays on the box: `/etc/hosts`, NSS, and container DNS can all
+resolve it elsewhere. Only a literal `127.0.0.0/8` or `::1` address
+establishes on-box egress, so only the numeric form is accepted.
+
+The startup boot probe covers whichever endpoint is configured for each role,
+so a misconfigured endpoint fails at startup rather than at a user's first
+turn.
+
+Before configuring either role this way, read
+[Custom LLM Endpoints](#custom-llm-endpoints) — it sets out what ELSPETH can
+and cannot tell you about an endpoint you chose.
+
 ### Operator LLM profiles (`ELSPETH_WEB__LLM_PROFILES`)
 
 Web authors never choose a provider, model, endpoint, or credential for an
@@ -405,6 +472,141 @@ sets `ELSPETH_WEB__COMPOSER_MODEL` and `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`
 `ELSPETH_WEB__DEFAULT_LLM_PROFILE` together, alongside
 `ELSPETH_FINGERPRINT_KEY` so server-scoped credentials resolve. See the
 [Ansible Ubuntu deployment runbook](../runbooks/ansible-ubuntu-deployment.md).
+
+---
+
+## Custom LLM Endpoints
+
+ELSPETH speaks the OpenAI Chat Completions shape, so it can be pointed at any
+endpoint that speaks it too. There are two configuration paths, and they are
+not competing options: one is the minimum configuration, the other adds
+startup checking that the minimum cannot provide.
+
+### The simple path: a base URL and a bearer
+
+No ELSPETH code knows anything about the endpoint. You supply the address and
+the credential, and the ordinary provider does the rest.
+
+**Pipeline (CLI, batch, and YAML-authored web pipelines).** The `llm`
+transform's OpenRouter provider already takes a `base_url`. Set it, with the
+matching `api_key`, and the transform talks to your endpoint instead of
+OpenRouter. See
+[Configuration Reference → Custom OpenAI-compatible endpoints](configuration.md#custom-openai-compatible-endpoints).
+
+**Composer.** Use the four `ELSPETH_WEB__COMPOSER_*ENDPOINT_*` settings
+documented in
+[Pointing Composer at your own OpenAI-compatible endpoint](#pointing-composer-at-your-own-openai-compatible-endpoint).
+
+Use this path when the endpoint is one you already operate and trust, when
+you want the smallest possible configuration, or when you are developing
+against a local mock. What it does not give you: nothing verifies at startup
+that the endpoint can do what your pipeline will ask of it. A pipeline that
+requests a JSON Schema response format from an endpoint that cannot produce
+one discovers that per row, as rows fail. Errors arrive as whatever the
+endpoint returns, classified by HTTP status.
+
+### The richer path: the `gateway` pipeline provider
+
+The `llm` transform also has a `gateway` provider, which targets the ELSPETH
+LLM compatibility gateway specifically (see
+[Configuration Reference → The `gateway` provider](configuration.md#the-gateway-provider)).
+It buys two things base-URL pointing cannot:
+
+- **Startup capability preflight.** The provider reads the gateway's
+  `/readyz` document and checks the contract major version, the adapter
+  identity, the model alias, and every capability the profile declares in
+  `required_capabilities` (from the closed set `text`, `tools`,
+  `json_object`, `json_schema`, `seed`, `usage`). It then runs one bounded
+  real completion, because a readiness document alone is not health. An
+  adapter that cannot do JSON Schema fails the run at boot, rather than on
+  row 4,000.
+- **Exact error codes.** The gateway returns a stable error envelope with a
+  defined code (`invalid_request`, `contract_mismatch`, `model_not_allowed`,
+  `capability_unsupported`, `upstream_unauthorized`, and the rest), and
+  ELSPETH maps each code to a definite retryable or non-retryable decision
+  instead of inferring intent from an HTTP status.
+
+Use this path when the endpoint is an ELSPETH compatibility gateway —
+including the sidecar in AWS Terraform Scenario C — and when a run is long
+enough or costly enough that finding a capability gap at boot rather than
+mid-run matters.
+
+The Composer has no `gateway` provider path and does not need one: a gateway
+is a plain OpenAI-compatible endpoint, so the Composer settings above reach
+it. The Composer therefore gets the simple path's properties, not the
+preflight.
+
+### What ELSPETH can and cannot tell you about the endpoint you chose
+
+**ELSPETH is not separate from the model you put behind it.** The pipeline,
+the validation, and the audit trail are apparatus *around* a model. They make
+what the model did reviewable, explainable, and reproducible. They do not
+make it correct. ELSPETH's guarantees are about faithful recording and
+reproduction, not about the quality or honesty of the thing being recorded.
+A pipeline is only as trustworthy as its weakest link, and the endpoint is a
+link the operator chooses.
+
+That is the reason this affordance is documented rather than hidden. Pointing
+ELSPETH at an endpoint you control is a legitimate and supported deployment.
+Pointing it at an endpoint you have not assured moves a load-bearing part of
+the system outside the boundary the rest of ELSPETH defends.
+
+Concretely, an endpoint between ELSPETH and a model can:
+
+- serve a cheaper or smaller model than the one requested;
+- truncate, drop, or reorder tool calls, so the pipeline acts on a partial
+  instruction set;
+- return a well-formed, schema-valid response whose content is fabricated;
+- log or retain prompts and completions that the operator believed were
+  private, or use them for training;
+- degrade quietly under load — longer, shallower, or more repetitive answers
+  with no error and no signal.
+
+#### What ELSPETH does detect
+
+**The model that answered is recorded as reported, and is never backfilled
+from the request.** On the pipeline path, a response whose `model` field is
+missing, non-string, or blank is rejected at the external boundary as
+malformed rather than defaulted to the requested model; the value that
+survives is what reaches the row's audit metadata. On the Composer path,
+every call record carries `model_requested` and `model_returned` as two
+separate fields, and `model_returned` is recorded as absent when the endpoint
+reported nothing. A substitution is therefore visible in the audit trail by
+comparing the two. It is not *prevented*, and an endpoint that substitutes
+the model **and** reports the requested name is not detectable from the
+response.
+
+**Token usage is recorded as unavailable, never invented.** When an endpoint
+omits or malforms usage data, the counts are recorded as unknown rather than
+as zero, on both paths. A run whose costs cannot be accounted for says so.
+
+**Finish reasons are not silently normalised to `stop`.** On the pipeline
+path, a recognised finish reason is recorded as itself and an unrecognised
+one is preserved verbatim, so a truncation or filter signal from the endpoint
+cannot arrive at review looking like a clean completion. The Composer call
+record carries no finish reason at all, so this protection does not extend to
+the Composer path.
+
+**Every call is recorded with request and response hashes.** Each audited
+call row carries a stable hash of the request payload and, on success, of the
+response payload, so a specific answer can be correlated back to the exact
+request that produced it. Composer calls hash the message history and the
+tool specification on the same basis.
+
+#### What ELSPETH does not detect
+
+- **Content fidelity.** Nothing checks that the text is true, complete, or
+  responsive to the prompt. Schema validation confirms shape, not substance.
+- **Upstream retention or training use.** What an endpoint does with a prompt
+  after answering is invisible from the response. This is a contractual and
+  assurance question about the endpoint, and it cannot be answered from
+  inside ELSPETH.
+- **Silent quality degradation.** A slow drift toward worse answers, with no
+  error, no changed model identity, and no changed finish reason, produces a
+  clean audit trail.
+
+The audit trail will faithfully record a bad answer as a bad answer. It
+cannot tell you the answer was bad.
 
 ---
 
