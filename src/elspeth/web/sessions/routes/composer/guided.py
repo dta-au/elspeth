@@ -2574,8 +2574,8 @@ async def post_guided_respond(
                     user_id=user.user_id,
                     step=observed_guided.step.value,
                     turn_type=current_turn["type"],
+                    rejection_code="invalid_guided_response",
                     exc_class=type(exc).__name__,
-                    error_detail=str(exc)[:500],
                 )
             raise HTTPException(
                 status_code=400,

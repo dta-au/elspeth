@@ -249,6 +249,7 @@ transfer_work=$(mktemp -d -p /tmp elspeth-ghcr-to-ecr.XXXXXX)
 chmod 700 "$transfer_work"
 mkdir -m 700 "$transfer_work/docker-config"
 (
+  set -e
   export DOCKER_CONFIG="$transfer_work/docker-config"
   trap 'docker logout ghcr.io >/dev/null 2>&1 || true; docker logout "$ECR_REGISTRY" >/dev/null 2>&1 || true; rm -rf -- "$transfer_work"' EXIT
 

@@ -23,7 +23,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
-from typing import Any, Final, TypedDict, cast
+from typing import Any, Final, Literal, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
@@ -31,7 +31,7 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.plugins.infrastructure.validation import get_sink_config_model
+from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError, get_sink_config_model
 from elspeth.web.blobs.protocol import ALLOWED_MIME_TYPES, AllowedMimeType
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
@@ -1902,7 +1902,16 @@ def _parse_step_2_sink_tool_arguments(arguments: str) -> tuple[SinkResolved, str
     return SinkResolved(outputs=(output,)), assistant_message
 
 
-def resolved_sink_config_error(sink: SinkResolved) -> str | None:
+@dataclass(frozen=True, slots=True)
+class ResolvedSinkConfigRejection:
+    """Repair feedback plus closed operator-safe classification."""
+
+    rejection_code: Literal["unknown_sink_plugin", "invalid_sink_configuration"]
+    exception_class: str
+    repair_message: str
+
+
+def resolved_sink_config_error(sink: SinkResolved) -> ResolvedSinkConfigRejection | None:
     """Return the plugin config-model rejection for a resolved sink, if any.
 
     LLM-resolved options that satisfy ``resolve_sink``'s shape contract can
@@ -1914,7 +1923,14 @@ def resolved_sink_config_error(sink: SinkResolved) -> str | None:
     client.
     """
     (output,) = sink.outputs
-    config_model = get_sink_config_model(output.plugin)
+    try:
+        config_model = get_sink_config_model(output.plugin)
+    except UnknownPluginTypeError as exc:
+        return ResolvedSinkConfigRejection(
+            rejection_code="unknown_sink_plugin",
+            exception_class=type(exc).__name__,
+            repair_message=str(exc),
+        )
     if config_model is None:
         return None
     # Mirror the respond-time authority check: thaw the frozen snapshot for
@@ -1925,7 +1941,11 @@ def resolved_sink_config_error(sink: SinkResolved) -> str | None:
     try:
         config_model.from_dict(plugin_options, plugin_name=output.plugin)
     except PluginConfigError as exc:
-        return str(exc)
+        return ResolvedSinkConfigRejection(
+            rejection_code="invalid_sink_configuration",
+            exception_class=type(exc).__name__,
+            repair_message=str(exc),
+        )
     return None
 
 
@@ -2134,8 +2154,8 @@ async def maybe_resolve_step_2_sink_chat(
                         f"{function.name} function.arguments must be a JSON string; got {type(arguments).__name__}"
                     )
                 sink, assistant = _parse_step_2_sink_tool_arguments(arguments)
-                config_error = resolved_sink_config_error(sink)
-                if config_error is None:
+                config_rejection = resolved_sink_config_error(sink)
+                if config_rejection is None:
                     status = ComposerLLMCallStatus.SUCCESS
                     return Step2SinkResolvedOutcome(sink=sink, assistant_message=assistant)
                 # Config-invalid resolution: thread the rejection back as the
@@ -2150,7 +2170,7 @@ async def maybe_resolve_step_2_sink_chat(
                         "tool_call_id": terminal_calls[0].id,
                         "content": (
                             f"resolve_sink rejected: the options do not satisfy the {sink.outputs[0].plugin!r} "
-                            f"sink's configuration contract: {config_error} "
+                            f"sink's configuration contract: {config_rejection.repair_message} "
                             "Correct the options and call resolve_sink again."
                         ),
                     }

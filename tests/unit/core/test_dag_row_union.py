@@ -315,6 +315,71 @@ row_unions:
         assert "variant_union" in message
         assert "nested fork" in message.lower()
 
+    def test_union_rejects_branches_produced_by_ancestor_and_nested_forks(self, tmp_path: Path) -> None:
+        """A require-all union cannot span mutually exclusive fork generations."""
+        nested_fork = """
+  - name: nested_fork
+    input: control_staged
+    condition: "True"
+    routes:
+      'true': fork
+      'false': control_ready
+    fork_to: [inner_left, inner_right]
+"""
+        branch_transforms = """
+transforms:
+  - name: stage_control
+    plugin: passthrough
+    input: control_branch
+    on_success: control_staged
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: stage_treatment
+    plugin: passthrough
+    input: treatment_branch
+    on_success: treatment_ready
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: after_union
+    plugin: passthrough
+    input: union_out
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+"""
+        row_union = """
+row_unions:
+  - name: variant_union
+    branches:
+      control_branch: control_ready
+      treatment_branch: treatment_ready
+      inner_left: inner_left
+      inner_right: inner_right
+    on_success: union_out
+"""
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            _build_graph(
+                _yaml(
+                    tmp_path,
+                    row_unions=row_union,
+                    branch_transforms=branch_transforms,
+                    tail="",
+                    extra_gates=nested_fork,
+                )
+            )
+
+        message = str(exc_info.value)
+        assert "variant_fork" in message
+        assert "nested_fork" in message
+        assert "ancestor" in message.lower()
+
     def test_coalesce_downstream_of_row_union_rejected(self, tmp_path: Path) -> None:
         # row_union -> transform -> gate(fork_to) -> coalesce used to BUILD and
         # RUN, silently discarding half of every union group: the coalesce

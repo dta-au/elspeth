@@ -509,7 +509,10 @@ resource "aws_cloudwatch_dashboard" "operator" {
                 ["ELSPETH/Operator", metric.name],
                 identity_dimensions,
                 flatten([
-                  for key in sort(keys(metric.dimensions)) : [key, metric.dimensions[key]]
+                  for key in sort(keys(metric.dimensions)) : [
+                    key,
+                    metric.dimensions[key],
+                  ]
                 ]),
               )
             ]
