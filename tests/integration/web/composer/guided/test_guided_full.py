@@ -240,7 +240,9 @@ def test_guided_full_escape_hatch_decline_is_an_ordinary_assistant_message_not_a
             conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
         )
         assistant_rows = conn.execute(
-            select(chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(chat_messages_table.c.role == "assistant")
+            select(chat_messages_table.c.id, chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(
+                chat_messages_table.c.role == "assistant"
+            )
         ).all()
         user_rows = conn.execute(
             select(chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(chat_messages_table.c.role == "user")
@@ -254,16 +256,35 @@ def test_guided_full_escape_hatch_decline_is_an_ordinary_assistant_message_not_a
     assert operation.result_kind == "declined"
     assert operation.proposal_id is None
     assert operation.result_state_id is not None
-    assert assistant_rows == [(decline_text, "compose_loop")]
+    assert len(assistant_rows) == 1
+    decline_message_id = assistant_rows[0].id
+    assert assistant_rows[0].content == decline_text
+    assert assistant_rows[0].writer_principal == "compose_loop"
     assert user_rows == [("Build a pipeline from an unsupported format.", "route_user_message")]
 
-    # Replay is exact.
+    # A later assistant turn may legitimately retain the same unchanged
+    # composition-state association. Replay must use the immutable decline
+    # message locator, not scan by that non-unique state.
+    asyncio.run(
+        composer_test_client.app.state.session_service.add_message(
+            UUID(session["id"]),
+            "assistant",
+            "Later assistant turn with unchanged composition.",
+            writer_principal="compose_loop",
+            composition_state_id=UUID(operation.result_state_id),
+        )
+    )
     replay = composer_test_client.post(
         f"/api/sessions/{session['id']}/guided/plan",
         json={"operation_id": operation_id, "intent": "Build a pipeline from an unsupported format."},
     )
     assert replay.status_code == 200
     assert replay.json() == payload
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        replay_operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert replay_operation.result_message_id == decline_message_id
 
 
 def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkpoint(

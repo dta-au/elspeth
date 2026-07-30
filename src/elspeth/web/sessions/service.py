@@ -3665,7 +3665,7 @@ class SessionServiceImpl:
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
             raise AuditIntegrityError("Tier 1: guided operation attempt is invalid")
 
-        for field in ("originating_message_id", "proposal_id", "result_state_id", "result_session_id"):
+        for field in ("originating_message_id", "proposal_id", "result_state_id", "result_message_id", "result_session_id"):
             value = row[field]
             if value is None:
                 continue
@@ -3761,7 +3761,7 @@ class SessionServiceImpl:
         lease_expires_at = row["lease_expires_at"]
         if not isinstance(lease_token, str) or not 1 <= len(lease_token) <= 256 or not isinstance(lease_expires_at, datetime):
             raise AuditIntegrityError("Tier 1: in-progress guided operation has an invalid lease bundle")
-        if any(row[field] is not None for field in ("settled_at", "result_kind", "response_hash", "failure_code")):
+        if any(row[field] is not None for field in ("settled_at", "result_kind", "result_message_id", "response_hash", "failure_code")):
             raise AuditIntegrityError("Tier 1: in-progress guided operation retained terminal residue")
         kind = row["kind"]
         if row["result_session_id"] is not None and kind != "session_fork":
@@ -3786,6 +3786,7 @@ class SessionServiceImpl:
                     "lease_expires_at",
                     "result_kind",
                     "result_state_id",
+                    "result_message_id",
                     "result_session_id",
                     "proposal_id",
                     "response_hash",
@@ -3810,7 +3811,7 @@ class SessionServiceImpl:
             if result_kind == "composition_state":
                 if row["kind"] in {"session_fork", "guided_plan"}:
                     raise AuditIntegrityError("Tier 1: guided operation kind does not match its result locator")
-                if row["result_session_id"] is not None:
+                if row["result_message_id"] is not None or row["result_session_id"] is not None:
                     raise AuditIntegrityError("Tier 1: state result retained a session locator")
                 if row["proposal_id"] is not None and row["kind"] not in {"guided_respond", "guided_chat"}:
                     raise AuditIntegrityError("Tier 1: state result retained an unsupported proposal locator")
@@ -3821,6 +3822,7 @@ class SessionServiceImpl:
                 if (
                     row["kind"] != "guided_plan"
                     or row["result_state_id"] is None
+                    or row["result_message_id"] is not None
                     or row["proposal_id"] is None
                     or row["result_session_id"] is not None
                 ):
@@ -3828,18 +3830,25 @@ class SessionServiceImpl:
                 UUID(row["result_state_id"])
                 UUID(row["proposal_id"])
             elif result_kind == "session":
-                if row["kind"] != "session_fork" or row["result_state_id"] is not None or row["proposal_id"] is not None:
+                if (
+                    row["kind"] != "session_fork"
+                    or row["result_state_id"] is not None
+                    or row["result_message_id"] is not None
+                    or row["proposal_id"] is not None
+                ):
                     raise AuditIntegrityError("Tier 1: guided operation kind does not match its result locator")
                 UUID(row["result_session_id"])
             elif result_kind == "declined":
                 if (
                     row["kind"] != "guided_plan"
                     or row["result_state_id"] is None
+                    or row["result_message_id"] is None
                     or row["proposal_id"] is not None
                     or row["result_session_id"] is not None
                 ):
                     raise AuditIntegrityError("Tier 1: guided plan operation has a malformed decline locator")
                 UUID(row["result_state_id"])
+                UUID(row["result_message_id"])
             else:
                 raise AuditIntegrityError("Tier 1: completed guided operation has an invalid result kind")
         except (TypeError, ValueError) as exc:
@@ -3865,7 +3874,10 @@ class SessionServiceImpl:
         elif result_kind == "session":
             result = GuidedSessionResult(session_id=UUID(row["result_session_id"]))
         elif result_kind == "declined":
-            result = GuidedDeclinedResult(checkpoint_state_id=UUID(row["result_state_id"]))
+            result = GuidedDeclinedResult(
+                checkpoint_state_id=UUID(row["result_state_id"]),
+                decline_message_id=UUID(row["result_message_id"]),
+            )
         else:
             raise AuditIntegrityError("Tier 1: completed guided operation has an invalid result kind")
         return GuidedOperationCompleted(result=result, response_hash=response_hash)
@@ -4147,6 +4159,7 @@ class SessionServiceImpl:
                         proposal_id=None,
                         result_kind=None,
                         result_state_id=None,
+                        result_message_id=None,
                         result_session_id=None,
                         response_hash=None,
                         failure_code="request_cancelled",
@@ -4357,6 +4370,7 @@ class SessionServiceImpl:
                 {
                     "result_kind": "composition_state",
                     "result_state_id": state_id,
+                    "result_message_id": None,
                     "result_session_id": None,
                     "proposal_id": proposal_id,
                 },
@@ -4382,6 +4396,7 @@ class SessionServiceImpl:
                 {
                     "result_kind": "pipeline_proposal",
                     "result_state_id": checkpoint_state_id,
+                    "result_message_id": None,
                     "result_session_id": None,
                     "proposal_id": proposal_id,
                 },
@@ -4400,6 +4415,7 @@ class SessionServiceImpl:
                 {
                     "result_kind": "session",
                     "result_state_id": None,
+                    "result_message_id": None,
                     "result_session_id": session_id,
                     "proposal_id": None,
                 },
@@ -4411,17 +4427,24 @@ class SessionServiceImpl:
             checkpoint_state_id = SessionServiceImpl._merge_guided_binding(
                 current=row["result_state_id"], requested=result.checkpoint_state_id, label="checkpoint state"
             )
+            decline_message_id = SessionServiceImpl._merge_guided_binding(
+                current=row["result_message_id"], requested=result.decline_message_id, label="decline message"
+            )
             if row["result_session_id"] is not None or row["proposal_id"] is not None:
                 raise AuditIntegrityError("Guided plan decline has a conflicting session/proposal binding")
-            assert checkpoint_state_id is not None
+            assert checkpoint_state_id is not None and decline_message_id is not None
             return (
                 {
                     "result_kind": "declined",
                     "result_state_id": checkpoint_state_id,
+                    "result_message_id": decline_message_id,
                     "result_session_id": None,
                     "proposal_id": None,
                 },
-                GuidedDeclinedResult(checkpoint_state_id=UUID(checkpoint_state_id)),
+                GuidedDeclinedResult(
+                    checkpoint_state_id=UUID(checkpoint_state_id),
+                    decline_message_id=UUID(decline_message_id),
+                ),
             )
         raise TypeError("unsupported guided operation result locator")
 
@@ -4560,6 +4583,7 @@ class SessionServiceImpl:
                 proposal_id=None,
                 result_kind=None,
                 result_state_id=None,
+                result_message_id=None,
                 result_session_id=None,
                 response_hash=None,
                 failure_code=failure_code,
@@ -10070,7 +10094,10 @@ class SessionServiceImpl:
                 self.complete_guided_operation_on_connection(
                     conn,
                     command.fence,
-                    result=GuidedDeclinedResult(checkpoint_state_id=checkpoint.id),
+                    result=GuidedDeclinedResult(
+                        checkpoint_state_id=checkpoint.id,
+                        decline_message_id=decline_message.id,
+                    ),
                     response_hash=response_hash,
                     actor=command.actor,
                 )
@@ -12469,6 +12496,7 @@ class SessionServiceImpl:
                             proposal_id=None,
                             result_kind="composition_state",
                             result_state_id=str(final_state_id),
+                            result_message_id=None,
                             result_session_id=None,
                             response_hash=child_response_hash,
                             failure_code=None,

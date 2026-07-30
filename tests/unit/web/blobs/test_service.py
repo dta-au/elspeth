@@ -4279,6 +4279,38 @@ class TestReadBlobContentPrefixVerifiedStreaming:
             await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=8)
 
     @pytest.mark.asyncio
+    async def test_translates_file_deleted_between_exists_check_and_open(
+        self,
+        blob_service,
+        session_id,
+        monkeypatch,
+    ) -> None:
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="raced-delete.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+        )
+        target = Path(record.storage_path)
+        real_open = Path.open
+        deleted = False
+
+        def delete_then_open(self: Path, *args: object, **kwargs: object) -> object:
+            nonlocal deleted
+            if self == target and not deleted:
+                deleted = True
+                self.unlink()
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", delete_then_open)
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=8)
+
+    @pytest.mark.asyncio
     async def test_detects_content_hash_mismatch_fail_closed(self, blob_service, session_id) -> None:
         """Same Tier 1 fail-closed guarantee as read_blob_content: a tampered
         file must never be served, even for a bounded preview."""

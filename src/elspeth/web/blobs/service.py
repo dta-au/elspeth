@@ -1825,7 +1825,14 @@ class BlobServiceImpl:
                 digest = hashlib.sha256()
                 prefix = bytearray()
                 total_bytes = 0
-                with storage.open("rb") as handle:
+                try:
+                    handle = storage.open("rb")
+                except FileNotFoundError:
+                    # The file may be deleted after the existence guard but
+                    # before the descriptor is acquired. Preserve the blob
+                    # lifecycle error contract for that raced deletion.
+                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
+                with handle:
                     while True:
                         chunk = handle.read(_STREAM_CHUNK_BYTES)
                         if not chunk:

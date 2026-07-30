@@ -101,14 +101,25 @@ def transaction_root(allowlist_dir: Path) -> Path:
     return allowlist_dir.resolve().parent / TRANSACTION_DIRNAME
 
 
+def _validate_transaction_root(root: Path) -> None:
+    """Require the transaction root itself to be a real directory."""
+    try:
+        details = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        raise SignBundleTransactionError(f"sign-bundle transaction root is missing: {root}") from None
+    except OSError as exc:
+        raise SignBundleTransactionError(f"cannot stat sign-bundle transaction root {root}: {exc}") from exc
+    if not stat.S_ISDIR(details.st_mode):
+        raise SignBundleTransactionError(f"sign-bundle transaction root is not a directory: {root}")
+
+
 @contextmanager
 def transaction_lock(allowlist_dir: Path, *, create: bool) -> Iterator[None]:
     """Serialize transaction creation/resume/publication for one allowlist parent."""
     root = transaction_root(allowlist_dir)
     if create:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if not root.is_dir():
-        raise SignBundleTransactionError(f"sign-bundle transaction root is missing: {root}")
+    _validate_transaction_root(root)
     lock_path = root / ".lock"
     with lock_path.open("a+b") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -138,6 +149,7 @@ def create_transaction(
 
     tx_root = transaction_root(active)
     tx_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _validate_transaction_root(tx_root)
     _fsync_directory(active.parent)
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", bundle_id).strip(".-") or "bundle"
     tx_path = Path(tempfile.mkdtemp(prefix=f"{safe_id}-", dir=tx_root))
@@ -474,9 +486,21 @@ def publish_candidate(tx_path: Path, manifest: dict[str, Any]) -> None:
         current_active = tree_snapshot(active)
         current_candidate = tree_snapshot(candidate)
         if current_active == candidate_snapshot and current_candidate == base_snapshot:
-            return
+            if (
+                directory_identity(active) == manifest["candidate_directory_identity"]
+                and directory_identity(candidate) == manifest["base_directory_identity"]
+            ):
+                return
+            raise SignBundleTransactionError("publish precondition failed: recorded directory identity does not match the exchanged state")
         if current_active != base_snapshot or current_candidate != candidate_snapshot:
             raise SignBundleTransactionError("publish precondition failed: active or candidate bytes changed")
+        if (
+            directory_identity(active) != manifest["base_directory_identity"]
+            or directory_identity(candidate) != manifest["candidate_directory_identity"]
+        ):
+            raise SignBundleTransactionError(
+                "publish precondition failed: recorded directory identity does not match the pre-exchange state"
+            )
 
         _fsync_tree(candidate)
         _rename_exchange(active, candidate)
@@ -487,7 +511,12 @@ def publish_candidate(tx_path: Path, manifest: dict[str, Any]) -> None:
             finally:
                 os.close(parent_descriptor)
 
-        if tree_snapshot(active) != candidate_snapshot or tree_snapshot(candidate) != base_snapshot:
+        if (
+            directory_identity(active) != manifest["candidate_directory_identity"]
+            or directory_identity(candidate) != manifest["base_directory_identity"]
+            or tree_snapshot(active) != candidate_snapshot
+            or tree_snapshot(candidate) != base_snapshot
+        ):
             raise SignBundleTransactionError("atomic exchange completed with unexpected directory content")
 
 

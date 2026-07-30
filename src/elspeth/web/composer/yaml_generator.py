@@ -402,7 +402,7 @@ def _recursive_public_option_projection(
     if isinstance(value, Mapping):
         projected: dict[str, Any] = {}
         for key, nested in value.items():
-            if key in _PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS or key.endswith("_blob_id"):
+            if key in _PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS or (custody_subtree and key.endswith("_blob_id")):
                 continue
             if (strip_storage_here or custody_subtree) and key in _PUBLIC_STORAGE_OPTION_KEYS:
                 continue

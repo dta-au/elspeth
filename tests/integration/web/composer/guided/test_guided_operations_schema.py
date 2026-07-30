@@ -127,6 +127,7 @@ def _operation(**overrides: object) -> dict[str, object]:
         "proposal_id": None,
         "result_kind": None,
         "result_state_id": None,
+        "result_message_id": None,
         "result_session_id": None,
         "response_hash": None,
         "failure_code": None,

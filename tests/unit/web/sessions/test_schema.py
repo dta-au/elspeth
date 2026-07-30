@@ -290,7 +290,7 @@ def test_initialize_session_schema_rejects_epoch_35_database() -> None:
     assert probe_current_schema(eng) is False
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=37.*Delete the session DB file and restart",
+        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=38.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
 
@@ -308,7 +308,8 @@ def test_epoch_36_database_without_declined_result_contract_fails_at_sentinel(tm
         prior_result_kind = "'composition_state', 'pipeline_proposal', 'session'"
         declined_result_locator = (
             "(kind = 'guided_plan' AND result_kind = 'declined' "
-            "AND result_state_id IS NOT NULL AND result_session_id IS NULL AND proposal_id IS NULL) OR "
+            "AND result_state_id IS NOT NULL AND result_message_id IS NOT NULL "
+            "AND result_session_id IS NULL AND proposal_id IS NULL) OR "
         )
         epoch_36_sql = guided_operations_sql.replace(declined_result_kind, prior_result_kind).replace(
             declined_result_locator,
@@ -338,7 +339,7 @@ def test_epoch_36_database_without_declined_result_contract_fails_at_sentinel(tm
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=37.*"
+        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=38.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)
@@ -379,7 +380,7 @@ def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=37.*"
+        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=38.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)

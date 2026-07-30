@@ -240,11 +240,13 @@ class GuidedDeclinedResult:
 
     No proposal is created. ``checkpoint_state_id`` names the (content-
     unchanged) checkpoint composition_states row inserted alongside the
-    persisted decline message, mirroring GuidedPipelineProposalResult's
-    checkpoint semantics minus the proposal binding.
+    persisted decline message. ``decline_message_id`` is the immutable replay
+    locator; the checkpoint association is intentionally not unique across
+    later conversational turns.
     """
 
     checkpoint_state_id: UUID
+    decline_message_id: UUID
 
 
 type GuidedOperationResult = GuidedCompositionStateResult | GuidedPipelineProposalResult | GuidedSessionResult | GuidedDeclinedResult

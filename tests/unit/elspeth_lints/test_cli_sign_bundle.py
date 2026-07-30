@@ -991,6 +991,70 @@ def test_publication_disposition_rejects_preexchange_writer_and_base_mimic(
         sign_bundle_transaction.publication_disposition(manifest)
 
 
+def test_publish_rejects_byte_identical_active_directory_replacement(
+    tmp_path: Path,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    active = _build_allowlist_dir(tmp_path)
+    tx_path = tmp_path / "tx"
+    candidate = tx_path / "candidate" / active.name
+    candidate.parent.mkdir(parents=True)
+    shutil.copytree(active, candidate)
+    (candidate / "_defaults.yaml").write_text(
+        (candidate / "_defaults.yaml").read_text(encoding="utf-8") + "# candidate\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "allowlist_dir": str(active),
+        "candidate_dir": str(candidate),
+        "base_snapshot": sign_bundle_transaction.tree_snapshot(active),
+        "candidate_snapshot": sign_bundle_transaction.tree_snapshot(candidate),
+        "base_directory_identity": sign_bundle_transaction.directory_identity(active),
+        "candidate_directory_identity": sign_bundle_transaction.directory_identity(candidate),
+    }
+
+    displaced = tmp_path / "displaced-active"
+    active.rename(displaced)
+    shutil.copytree(displaced, active)
+    assert sign_bundle_transaction.tree_snapshot(active) == manifest["base_snapshot"]
+    assert sign_bundle_transaction.directory_identity(active) != manifest["base_directory_identity"]
+
+    with pytest.raises(sign_bundle_transaction.SignBundleTransactionError, match="directory identity"):
+        sign_bundle_transaction.publish_candidate(tx_path, manifest)
+
+
+def test_transaction_lock_rejects_symlinked_transaction_root(tmp_path: Path) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    external = tmp_path / "external-transaction-storage"
+    external.mkdir()
+    sign_bundle_transaction.transaction_root(allowlist_dir).symlink_to(external, target_is_directory=True)
+
+    with (
+        pytest.raises(sign_bundle_transaction.SignBundleTransactionError, match="not a directory"),
+        sign_bundle_transaction.transaction_lock(allowlist_dir, create=True),
+    ):
+        pytest.fail("symlinked transaction root must not be entered")
+
+    assert list(external.iterdir()) == []
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(sign_bundle_transaction.SignBundleTransactionError, match="not a directory"):
+        sign_bundle_transaction.create_transaction(
+            bundle_path=bundle_path,
+            verified_bundle_sha256=sign_bundle_transaction.file_sha256(bundle_path),
+            bundle_id="symlink-root",
+            root=root,
+            allowlist_dir=allowlist_dir,
+            rotation_log=tmp_path / "rotations.log",
+            signing_policy={"operator_override": False},
+        )
+    assert list(external.iterdir()) == []
+
+
 def test_create_transaction_fsyncs_each_new_parent_directory_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
