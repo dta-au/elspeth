@@ -298,8 +298,25 @@ def _serialize_branches(branches: CoalesceBranches) -> list[str] | dict[str, str
 
 
 def _timeout_seconds_is_invalid(value: object) -> bool:
-    """Return whether a structural barrier timeout violates runtime bounds."""
-    return isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0
+    """Return whether a structural barrier timeout violates runtime bounds.
+
+    Persisted session payloads reach this helper through ``NodeSpec.from_dict``
+    without crossing the Pydantic ``_StrictTimeoutSeconds`` tool boundary, and
+    JSON has no integer ceiling — so an arbitrary-precision int can arrive
+    here. ``float()`` raises ``OverflowError`` on those, which would abort
+    ``validate()`` instead of producing a rejection, so the conversion is
+    guarded and an unrepresentable magnitude is classified INVALID. Mirrors
+    ``yaml_importer._finite_positive_timeout``. The isinstance guard above
+    leaves ``int`` as the only value ``float()`` can reject, so OverflowError
+    is the only reachable failure.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return True
+    try:
+        normalized = float(value)
+    except OverflowError:
+        return True
+    return not isfinite(normalized) or normalized <= 0
 
 
 def queue_node_contract_error(node: NodeSpec) -> str | None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import Any
 
@@ -1010,7 +1011,14 @@ class TestStage1Validation:
         assert restored == state
         assert next(node for node in restored.nodes if node.node_type == "coalesce").timeout_seconds == 5.0
 
-    @pytest.mark.parametrize("timeout_seconds", [True, float("nan"), float("inf"), 0.0, -1.0])
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        # 10**400 and its negation are only reachable from a persisted session
+        # payload (JSON has no integer ceiling and NodeSpec.from_dict does not
+        # cross the Pydantic tool boundary). float() overflows on them, which
+        # used to abort validate() with OverflowError instead of rejecting.
+        [True, float("nan"), float("inf"), 0.0, -1.0, 10**400, -(10**400)],
+    )
     def test_coalesce_rejects_invalid_timeout(self, timeout_seconds: object) -> None:
         state = self._coalesce_route_state(on_success="main")
         coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
@@ -6927,9 +6935,45 @@ class TestCompositionStateRowUnion:
 
         assert any(error.error_code == "row_union_config_invalid" and field in error.message for error in result.errors), result.errors
 
-    @pytest.mark.parametrize("timeout_seconds", [True, False, float("nan"), float("inf"), 0.0, -1.0])
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        # The two oversized ints are unrepresentable as float; classifying them
+        # INVALID must not regress the bool / NaN / inf / non-positive verdicts.
+        [True, False, float("nan"), float("inf"), 0.0, -1.0, 10**400, -(10**400)],
+    )
     def test_row_union_rejects_invalid_timeout(self, timeout_seconds: object) -> None:
         result = self._state(row_union=self._row_union(timeout_seconds=timeout_seconds)).validate()
+
+        assert any(error.error_code == "row_union_timeout_invalid" for error in result.errors)
+
+    def test_oversized_persisted_timeout_rejects_instead_of_overflowing(self) -> None:
+        """An oversized int from a restored session must reject, not crash.
+
+        ``timeout_seconds`` reaches ``NodeSpec.from_dict`` straight from the
+        persisted session payload, bypassing the Pydantic
+        ``_StrictTimeoutSeconds`` tool boundary. JSON has no integer ceiling,
+        so ``10**400`` survives the round trip as an ``int`` that ``float()``
+        cannot represent — ``math.isfinite`` used to raise ``OverflowError``
+        out of ``validate()`` instead of producing a rejection.
+        """
+        payload = json.loads(
+            json.dumps(
+                {
+                    "id": "variant_union",
+                    "node_type": "row_union",
+                    "plugin": None,
+                    "input": "control_done",
+                    "on_success": "union_out",
+                    "on_error": None,
+                    "options": {},
+                    "branches": {"control_branch": "control_done", "treatment_branch": "treatment_done"},
+                    "timeout_seconds": 10**400,
+                }
+            )
+        )
+        assert isinstance(payload["timeout_seconds"], int)
+
+        result = self._state(row_union=NodeSpec.from_dict(payload)).validate()
 
         assert any(error.error_code == "row_union_timeout_invalid" for error in result.errors)
 
