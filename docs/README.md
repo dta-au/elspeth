@@ -17,6 +17,7 @@ history.
 | You are... | Read this first |
 |------------|----------------|
 | New to ELSPETH | [Your First Pipeline](guides/your-first-pipeline.md) then [User Manual](guides/user-manual.md) |
+| Deploying a new AWS stack | [AWS ECS Cold Install](runbooks/aws-ecs-cold-install.md), then the [Terraform package reference](../deploy/aws-ecs/terraform/README.md) |
 | Building or operating pipelines | [Configuration Reference](reference/configuration.md), [Runbooks](runbooks/index.md), and [Troubleshooting](guides/troubleshooting.md) |
 | Investigating audit data | [Landscape MCP Analysis](guides/landscape-mcp-analysis.md) and [Architecture Overview](../ARCHITECTURE.md) |
 | Developing plugins | [Data Trust and Error Handling](guides/data-trust-and-error-handling.md), [Plugin Development Guide](../PLUGIN.md), then [Plugin Protocol](contracts/plugin-protocol.md) |
@@ -95,6 +96,7 @@ Runbooks and production procedures.
 - [Configure Key Vault Secrets](runbooks/configure-keyvault-secrets.md)
 - [Ansible Ubuntu Deployment](runbooks/ansible-ubuntu-deployment.md)
 - [Caddy Development Install Refresh](runbooks/caddy-development-refresh.md)
+- [AWS ECS Cold Install](runbooks/aws-ecs-cold-install.md)
 - [AWS ECS Existing-Service Redeploy](runbooks/aws-ecs-existing-service-redeploy.md)
 - [AWS ECS Full Disposable Acceptance](runbooks/aws-ecs-deployment.md)
 

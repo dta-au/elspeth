@@ -10,8 +10,10 @@ All notable changes to ELSPETH are documented here.
 
 Release-candidate documentation now states the cross-platform deployment contract:
 Docker Compose, AWS ECS, native Linux, one Azure Ubuntu VM, and Kubernetes BYO.
-AWS uses operator-supplied task-definition ARNs; Azure Container Apps remains
-deferred pending cross-instance fencing.
+A new AWS stack comes from the tracked AWS ECS Terraform cold-install package,
+while the separate release acceptance controller and the existing-service
+redeploy path use operator-supplied task-definition ARNs; Azure Container Apps
+remains deferred pending cross-instance fencing.
 
 ## 0.7.2 - Release candidate (Release hardening and recovery correctness)
 
