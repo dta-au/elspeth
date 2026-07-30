@@ -521,16 +521,25 @@ def _validate_projected_token_parent_graph(
     if any(not children_by_token[token_key] for token_key in fork_parent_keys):
         raise ValueError("transient fork_parent token must parent a projected child token")
 
-    terminal_reachable = {disposition.token_key for disposition in dispositions if disposition.outcome in ("success", "failure")}
-    terminal_reachable.update(
+    terminal_keys = {disposition.token_key for disposition in dispositions if disposition.outcome in ("success", "failure")}
+    if tokens and not terminal_keys:
+        raise ValueError("non-empty projection must contain a terminal success or failure outcome")
+
+    disposition_by_token = {disposition.token_key: disposition for disposition in dispositions}
+    validated_completed_batch_members = {
         member.token_key
         for batch in batches
         if batch.status == "completed"
         for member in batch.members
         if member.token_key in parents_by_token
-    )
-    if tokens and not terminal_reachable:
-        raise ValueError("non-empty projection must contain a terminal success or failure outcome")
+        and (
+            disposition_by_token[member.token_key].outcome,
+            disposition_by_token[member.token_key].path,
+            disposition_by_token[member.token_key].sink_name,
+        )
+        == ("transient", "batch_consumed", None)
+    }
+    terminal_reachable = terminal_keys | validated_completed_batch_members
     pending = sorted(terminal_reachable, reverse=True)
     while pending:
         token_key = pending.pop()

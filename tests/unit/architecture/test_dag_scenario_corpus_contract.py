@@ -2214,6 +2214,33 @@ def test_b3_stable_projection_rejects_batch_and_expansion_cross_reference_drift(
         corpus_schema.StableRunProjection.model_validate(values)
 
 
+def test_stable_projection_rejects_completed_batch_without_real_terminal_outcome() -> None:
+    values = _exact_runtime_projection_values()
+    values["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "batch_consumed",
+            "sink_name": None,
+        },
+    )
+    values["batches"] = (
+        {
+            "key": "aggregation:eof_sum@stable|0",
+            "aggregation_node_key": "aggregation:eof_sum@stable",
+            "attempt": 0,
+            "status": "completed",
+            "trigger_type": "end_of_source",
+            "trigger_reason": "source_exhausted",
+            "members": ({"ordinal": 0, "token_key": "primary:0#0"},),
+        },
+    )
+
+    with pytest.raises(ValidationError, match="non-empty projection must contain a terminal success or failure outcome"):
+        corpus_schema.StableRunProjection.model_validate(values)
+
+
 def test_b3_scheduler_event_ordering_accepts_one_exact_reentered_status_chain() -> None:
     events: list[dict[str, Any]] = [
         {"event_type": "mark_pending_sink_terminal", "from_status": "leased", "to_status": "terminal"},
