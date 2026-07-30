@@ -604,7 +604,7 @@ aws ecs describe-tasks \
   --query 'tasks[0].containers[].[name,lastStatus,healthStatus]' \
   --output table
 
-NAMESPACE=${ECS_CLUSTER%-cluster}
+NAMESPACE=$(terraform -chdir=scenario-a output -raw namespace)
 aws logs describe-log-groups \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --log-group-name-prefix "/aws/ecs/${NAMESPACE}" \

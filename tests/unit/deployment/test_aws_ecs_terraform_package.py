@@ -1733,6 +1733,58 @@ def test_explicit_aws_profile_is_bound_across_provider_backend_and_local_cli() -
     assert "--region ${jsonencode(var.aws_region)}" in module_outputs
 
 
+COLD_INSTALL_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-cold-install.md"
+
+
+def test_cold_install_runbook_reads_the_namespace_from_terraform() -> None:
+    """The runbook must ask Terraform for the namespace, not re-derive it.
+
+    `NAMESPACE=${ECS_CLUSTER%-cluster}` stripped only the suffix, but
+    `cluster_name` is `acceptance-<namespace>-cluster` — prefixed as well. The
+    log-group, dashboard, and X-Ray names are NOT prefixed, so on a perfectly
+    healthy install the verification queries looked for `acceptance-<ns>-...`
+    resources that do not exist, and the canonical cold-install procedure
+    reported a false failure.
+
+    String surgery on one name to recover another re-encodes the naming
+    convention in a second place, which is the defect itself. The namespace is
+    an output; the runbook reads it. This test pins that, and pins the
+    per-resource suffixes the runbook still spells out against the module that
+    actually builds them.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+    runbook = COLD_INSTALL_RUNBOOK.read_text(encoding="utf-8")
+
+    # The relationship the string surgery got wrong: the cluster is the one
+    # name carrying an `acceptance-` prefix on top of the namespace.
+    assert re.search(r'cluster_name\s+=\s+"acceptance-\$\{local\.namespace\}-cluster"', locals_text)
+
+    for name in ("namespace", "cluster_name"):
+        for relative in ("modules/scenario/outputs.tf", "scenario-a/outputs.tf", "scenario-b/outputs.tf"):
+            assert f'output "{name}"' in _text(relative), f"{relative} must expose the {name} output"
+
+    assert "NAMESPACE=$(terraform -chdir=scenario-a output -raw namespace)" in runbook
+    assert "%-cluster" not in runbook, "the runbook must not re-derive the namespace from the cluster name"
+
+    # Every namespace-derived literal the runbook still spells out has to match
+    # the local that builds the real resource. The log-group query is a
+    # deliberate prefix (it sweeps -web, -doctor and -operator-metrics in one
+    # call); the dashboard and X-Ray queries name one resource exactly.
+    for local_name, queried, exact in (
+        ("web_log_group", "/aws/ecs/${NAMESPACE}", False),
+        ("dashboard_name", "${NAMESPACE}-elspeth-aws-operator-v1", True),
+        ("xray_group_name", "${NAMESPACE}-xray", True),
+    ):
+        declaration = re.search(rf'{local_name}\s+=\s+"(?P<template>[^"]+)"', locals_text)
+        assert declaration is not None, f"{local_name} is no longer a simple template"
+        built = declaration.group("template").replace("${local.namespace}", "${NAMESPACE}")
+        if exact:
+            assert built == queried, f"the runbook queries {queried!r} but the module builds {built!r}"
+        else:
+            assert built.startswith(queried), f"the runbook uses prefix {queried!r}, which no longer matches the built name {built!r}"
+        assert queried in runbook
+
+
 def test_certificate_limit_and_code_blind_outputs_are_explicit() -> None:
     module_outputs = _text("modules/scenario/outputs.tf")
     scenario_a_outputs = _text("scenario-a/outputs.tf")

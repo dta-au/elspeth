@@ -13,6 +13,11 @@ output "public_url" {
   value = module.scenario.public_url
 }
 
+output "namespace" {
+  description = "Run-scoped name prefix every resource of this scenario is built from; read it instead of re-deriving it from another name."
+  value       = module.scenario.namespace
+}
+
 output "cluster_name" {
   value = module.scenario.cluster_name
 }

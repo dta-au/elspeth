@@ -186,6 +186,11 @@ output "public_url" {
   value       = "https://${aws_lb.web.dns_name}"
 }
 
+output "namespace" {
+  description = "Run-scoped name prefix every resource of this scenario is built from (log groups, dashboard, X-Ray group, task families, alarms). Read it here; do not re-derive it from another name."
+  value       = local.namespace
+}
+
 output "cluster_name" {
   value = aws_ecs_cluster.scenario.name
 }
