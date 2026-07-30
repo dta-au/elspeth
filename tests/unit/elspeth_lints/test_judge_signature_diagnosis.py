@@ -253,7 +253,10 @@ def test_cli_diagnose_loads_authoritative_hmac_from_env_file(
         assert _HMAC_KEY not in captured.out
         assert "UNRELATED_SECRET" not in os.environ
     finally:
-        monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+        # The CLI (not monkeypatch) set this key, so remove it directly:
+        # monkeypatch.delenv here would snapshot the loaded key and restore
+        # it at teardown, leaking it to other tests on this xdist worker.
+        os.environ.pop("ELSPETH_JUDGE_METADATA_HMAC_KEY", None)
 
 
 def test_standalone_diagnose_loads_authoritative_hmac_from_env_file(
@@ -279,7 +282,10 @@ def test_standalone_diagnose_loads_authoritative_hmac_from_env_file(
         assert key in captured.out
         assert _HMAC_KEY not in captured.out
     finally:
-        monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+        # The CLI (not monkeypatch) set this key, so remove it directly:
+        # monkeypatch.delenv here would snapshot the loaded key and restore
+        # it at teardown, leaking it to other tests on this xdist worker.
+        os.environ.pop("ELSPETH_JUDGE_METADATA_HMAC_KEY", None)
 
 
 def test_cli_diagnose_rejects_missing_env_file(
