@@ -2249,16 +2249,28 @@ def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -
     to write a lowered value back onto validated settings).
 
     Structural checks (unknown alias; ``profile`` supplied together with
-    ``provider``) always run and fail closed immediately — they require no
-    secret material. The rewrite itself — which injects a secret REFERENCE
-    marker for the profile's credential — only runs when ``materialize`` is
-    set, because only then will the ``${VAR}`` template it writes actually be
-    resolved by the ``_expand_env_vars`` pass that follows. This is not a new
-    secret mechanism: it hands the SAME ``${VAR}`` syntax an operator would
-    write by hand on an explicit Azure/OpenRouter node to the SAME
-    env-var-expansion pass that already resolves it, so a missing server
-    secret fails closed at config-load time with the existing "Required
-    environment variable ... is not set" error.
+    ``provider``; a non-``server`` ``credential_scope``) run whenever a
+    profile-selecting node is found and require no secret material — but the
+    ENTIRE lowering, not just the credential step, is gated on
+    ``materialize``: when it is ``False`` these checks still run (an unknown
+    alias or ambiguous node is rejected immediately regardless), but a node
+    naming a VALID alias is left completely un-lowered — ``options`` still
+    has ``"profile"`` and no ``"provider"``. That is not itself an error at
+    this layer; both real callers (below) only ever pass ``materialize=True``
+    for a caller trusted to expand host environment variables, so the
+    un-lowered state is unreachable in production. It is not silently
+    swallowed either: an un-lowered node still fails closed later, at
+    ``LLMTransform.__init__``'s "missing required 'provider' key" check, when
+    the pipeline is actually built.
+
+    When ``materialize`` IS set, the rewrite injects a secret REFERENCE
+    marker for the profile's credential, then converts it to a ``${VAR}``
+    template so it actually gets resolved by the ``_expand_env_vars`` pass
+    that follows. This is not a new secret mechanism: it hands the SAME
+    ``${VAR}`` syntax an operator would write by hand on an explicit
+    Azure/OpenRouter node to the SAME env-var-expansion pass that already
+    resolves it, so a missing server secret fails closed at config-load time
+    with the existing "Required environment variable ... is not set" error.
 
     Batch/CLI has no per-user secret store — only ``credential_scope:
     server`` profiles (or scope-less ones, e.g. Bedrock's keyless AWS
@@ -2316,6 +2328,19 @@ def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -
             # explicitly-authored `api_key: ${VAR}` node always has, via the
             # existing _expand_env_vars pass run right after this one.
             executable["api_key"] = f"${{{api_key['secret_ref']}}}"
+        # Retain the ALIAS ONLY (never endpoint/credential_ref) in the
+        # executable options so it survives into ElspethSettings and is
+        # therefore recoverable from the run's audit trail — both
+        # resolve_config()'s settings_json snapshot (core/config.py) and the
+        # DAG's per-node audit config (core/landscape/data_flow/graph.py's
+        # sanitize_node_config_for_audit) derive from exactly this dict via
+        # BaseTransform.config. Web's parallel answer to "which profile did
+        # this node use" lives in run_web_plugin_policy.selected_profile_aliases_json
+        # (a web-only Landscape table); batch has no such table, so the
+        # alias must travel inside the node's own options. `profile` is a
+        # provenance-only key no provider config model declares —
+        # LLMTransform.__init__ strips it before provider construction.
+        executable["profile"] = alias
         node["options"] = executable
     return raw_config
 

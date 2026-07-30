@@ -1326,12 +1326,22 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             raise ValueError(f"Unknown LLM provider '{provider_name}'. Valid providers: {sorted(_PROVIDERS)}")
         config_cls, _ = _PROVIDERS[provider_name]
 
+        # `profile` is a provenance-only marker the batch/CLI operator profile
+        # catalog lowering pass (core.config._lower_llm_profile_nodes) leaves
+        # in `self.config` (set by BaseTransform.__init__ above, from the SAME
+        # `config` dict) purely so the DAG's per-node audit config and the
+        # run's settings_json snapshot can answer "which llm_profiles alias
+        # did this node use" — no provider config model declares this field,
+        # and every provider config class forbids extra fields, so it must be
+        # excluded before validation rather than declared on LLMConfig itself.
+        provider_config = {key: value for key, value in config.items() if key != "profile"} if "profile" in config else config
+
         # Parse config with provider-specific model.
         # config_cls is one of the registered provider config classes at runtime;
         # from_dict() returns Self on the subclass, but mypy sees type[LLMConfig].
         self._config = cast(
             "AzureOpenAIConfig | OpenRouterConfig | BedrockConfig | GatewayConfig",
-            config_cls.from_dict(config, plugin_name=self.name),
+            config_cls.from_dict(provider_config, plugin_name=self.name),
         )
         self._initialize_declared_input_fields(self._config)
 

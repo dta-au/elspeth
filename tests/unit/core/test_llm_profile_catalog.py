@@ -22,9 +22,17 @@ projections — both surfaces call the single shared
   store);
 - a profile-selecting node lowers to the same private executable options
   (materialized end to end) and the shared lowering step's output is
-  BYTE-IDENTICAL to what the web resolver produces for the same profile; and
+  BYTE-IDENTICAL to what the web resolver produces for the same profile;
 - existing explicit provider (azure/openrouter/bedrock) `llm` node configs
-  are unaffected by a populated `llm_profiles` catalog.
+  are unaffected by a populated `llm_profiles` catalog;
+- a `materialize=False` pass (the trusted-host-env-expansion gate closed)
+  leaves a valid-alias node completely un-lowered rather than partially
+  rewritten — pinned so it stays an explicit, tested contract rather than an
+  incidental side effect of the gate; and
+- a profile-selecting BATCH node's alias is recoverable from the run's own
+  audit trail (`resolve_config()`'s settings_json snapshot), matching what
+  `run_web_plugin_policy.selected_profile_aliases_json` already gives web —
+  and that the alias value is never the profile's endpoint or credential_ref.
 """
 
 from __future__ import annotations
@@ -34,8 +42,9 @@ from typing import Any, ClassVar
 import pytest
 from pydantic import ValidationError
 
-from elspeth.core.config import ElspethSettings, _lower_llm_profile_node_options, load_settings_from_config_dict
+from elspeth.core.config import ElspethSettings, _lower_llm_profile_node_options, load_settings_from_config_dict, resolve_config
 from elspeth.core.llm_profiles import LLMProfileSettings, RuntimeLLMProfile
+from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.web.plugin_policy.profiles import _LLMProfileResolver
 
 _GATEWAY_PROFILE: dict[str, object] = {
@@ -170,7 +179,11 @@ class TestBatchProfileNodeLowering:
         assert options["contract_major"] == 1
         assert options["required_capabilities"] == ("text", "tools", "usage")
         assert options["api_key"] == "sk-test-value"
-        assert "profile" not in options
+        # The alias is RETAINED (not stripped) in the executable options —
+        # a provenance-only marker so it is recoverable from the run's own
+        # audit trail (see TestBatchRunAuditRecordsAlias below).
+        # LLMTransform.__init__ excludes it before provider construction.
+        assert options["profile"] == "gw-primary"
         assert options["prompt_template"] == "{{ row }}"
 
     def test_unknown_alias_fails_closed(self) -> None:
@@ -240,6 +253,29 @@ class TestBatchProfileNodeLowering:
         with pytest.raises(ValueError, match="unknown llm profile"):
             load_settings_from_config_dict(cfg, expand_env_vars=False)
 
+    def test_valid_alias_is_left_completely_un_lowered_when_materialize_is_false(self) -> None:
+        """Pin the `materialize=False` pass-through contract explicitly.
+
+        Only the credential-materializing REWRITE is gated on `materialize`;
+        a node naming a VALID, unambiguous alias is not partially rewritten
+        when the gate is closed — it is left exactly as authored (`options`
+        still has `profile`, no `provider`). This state is unreachable in
+        production (both real callers below only ever pass
+        `materialize=True` for a trusted-env-expansion caller), but pin it
+        so the pass-through is a tested contract rather than incidental
+        behavior a future edit could quietly change.
+        """
+        cfg = _config(
+            transforms=[_llm_node({"profile": "gw-primary", "prompt_template": "{{ row }}", "schema": {"mode": "observed"}})],
+            llm_profiles={"gw-primary": _GATEWAY_PROFILE},
+        )
+        settings = load_settings_from_config_dict(cfg, expand_env_vars=False)
+        options = settings.transforms[0].options
+        assert options["profile"] == "gw-primary"
+        assert "provider" not in options
+        assert "endpoint" not in options
+        assert "api_key" not in options
+
 
 # ---------------------------------------------------------------------------
 # Existing explicit provider configs are unaffected by a populated catalog
@@ -304,6 +340,15 @@ class TestWebBatchLoweringEquality:
     ``_lower_llm_profile_node_options`` — rather than calling the shared
     ``lower_llm_profile_options`` twice directly, which would only prove the
     shared function equals itself.
+
+    ``_SAFE_OPTIONS`` deliberately has no ``"queries"`` key, so web's
+    post-delegation ``max_capacity_retry_seconds`` default (applied AFTER
+    the shared lowering step, in ``_LLMProfileResolver.lower_options`` only —
+    a web-execution-worker safety policy with no batch equivalent, see that
+    method's own comment) never fires here. Equality is demonstrated for the
+    shared lowering step itself, not for multi-query profile nodes with that
+    web-only default applied — a future reader should not assume the latter
+    from this test.
     """
 
     _SAFE_OPTIONS: ClassVar[dict[str, object]] = {"prompt_template": "{{ row }}", "schema": {"mode": "observed"}}
@@ -341,3 +386,67 @@ class TestWebBatchLoweringEquality:
         )
         settings = load_settings_from_config_dict(cfg, expand_env_vars=True)
         assert settings.transforms[0].options["api_key"] == "sk-test-value"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: the alias must be recoverable from the batch RUN's own audit
+# trail — not just present in the in-memory lowered options.
+# ---------------------------------------------------------------------------
+
+
+class TestBatchRunAuditRecordsAlias:
+    """A profile-selecting batch node's alias is recoverable from the run record.
+
+    Web already answers "which operator profile did this node use?" via
+    ``run_web_plugin_policy.selected_profile_aliases_json`` (a web-only
+    Landscape table — its NOT-NULL web-policy-hash columns make it unusable
+    for batch/CLI, which has no operator-profile-policy/HMAC-binding
+    machinery to fill them honestly). Batch has no equivalent table, so the
+    alias must survive into ``ElspethSettings`` itself: it travels inside the
+    node's own (already free-form) ``options`` dict, which is exactly what
+    ``resolve_config()`` dumps into the run's ``settings_json`` audit
+    snapshot (``core/landscape/run_lifecycle_repository.py``) — no new
+    column or table. ``LLMTransform.__init__`` excludes the marker before
+    provider construction (no provider config model declares it), so real
+    execution is unaffected.
+    """
+
+    _SAFE_OPTIONS: ClassVar[dict[str, object]] = {"prompt_template": "{{ row }}", "schema": {"mode": "observed"}}
+
+    def test_resolved_run_config_contains_the_alias(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-test-value")
+        cfg = _config(
+            transforms=[_llm_node({"profile": "gw-primary", **self._SAFE_OPTIONS})],
+            llm_profiles={"gw-primary": _GATEWAY_PROFILE},
+        )
+        settings = load_settings_from_config_dict(cfg, expand_env_vars=True)
+        resolved = resolve_config(settings)
+        node_options = resolved["transforms"][0]["options"]
+
+        assert node_options["profile"] == "gw-primary"
+        # ALIAS ONLY: the recorded value is the opaque alias, never the
+        # profile's private endpoint or its credential reference name.
+        assert node_options["profile"] != _GATEWAY_PROFILE["endpoint"]
+        assert node_options["profile"] != _GATEWAY_PROFILE["credential_ref"]
+        assert _GATEWAY_PROFILE["endpoint"] not in node_options["profile"]
+        assert _GATEWAY_PROFILE["credential_ref"] not in node_options["profile"]
+
+    def test_llm_transform_constructs_and_retains_the_alias_for_audit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Prove the DAG's per-node audit path (which reads the live plugin's
+        ``.config`` — the same raw dict, per ``BaseTransform.__init__`` —
+        rather than ``resolve_config()``'s settings-level dump) also carries
+        the alias, and that provider construction still succeeds despite the
+        extra key (``LLMTransform.__init__`` excludes it before
+        ``config_cls.from_dict()``, which forbids unknown fields).
+        """
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-test-value")
+        cfg = _config(
+            transforms=[_llm_node({"profile": "gw-primary", **self._SAFE_OPTIONS})],
+            llm_profiles={"gw-primary": _GATEWAY_PROFILE},
+        )
+        settings = load_settings_from_config_dict(cfg, expand_env_vars=True)
+        transform = LLMTransform(dict(settings.transforms[0].options))
+
+        assert transform.config["profile"] == "gw-primary"
+        assert transform._config.provider == "gateway"
+        assert transform._config.model == "standard"
