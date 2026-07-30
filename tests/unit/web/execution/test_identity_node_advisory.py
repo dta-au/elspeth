@@ -321,6 +321,36 @@ def test_passthrough_downstream_of_queue_is_not_flagged() -> None:
     assert findings == [], "Passthrough consuming a declared queue is legitimate structural fan-in and must not be flagged."
 
 
+def test_passthrough_downstream_of_row_union_is_not_flagged() -> None:
+    """A row_union is an observed structural boundary, not dead-weight input."""
+    union = NodeSpec(
+        id="variant_union",
+        node_type="row_union",
+        plugin=None,
+        input="control_done",
+        on_success="unioned_rows",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={"control": "control_done", "treatment": "treatment_done"},
+        policy=None,
+        merge=None,
+    )
+    passthrough = _make_passthrough_node(
+        node_id="forward_union",
+        input_field="unioned_rows",
+        on_success="json_out",
+    )
+    state = _make_state_with(
+        nodes=(union, passthrough),
+        outputs=(_make_observed_sink(),),
+    )
+
+    assert _find_identity_node_advisories(state) == []
+
+
 def test_identity_passthrough_to_fixed_sink_is_flagged() -> None:
     """Sink schema mode is irrelevant — passthrough still adds no contract benefit."""
     fixed_sink = OutputSpec(

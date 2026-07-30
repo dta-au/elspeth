@@ -14929,6 +14929,88 @@ class TestUpsertNodeQueue:
         assert all(n.id != "inbound" for n in result.updated_state.nodes)
 
 
+_ROW_UNION_UPSERT_ARGS: dict[str, Any] = {
+    "id": "variant_union",
+    "node_type": "row_union",
+    "plugin": None,
+    "input": "control_done",
+    "on_success": "unioned_rows",
+    "on_error": None,
+    "options": {},
+    "branches": {
+        "control": "control_done",
+        "treatment": "treatment_done",
+    },
+    "timeout_seconds": 45.0,
+}
+
+
+class TestUpsertNodeRowUnion:
+    def test_generic_tool_schema_advertises_row_union_and_structural_timeout(self) -> None:
+        definitions = get_tool_definitions()
+        names = {definition["name"] for definition in definitions}
+        assert "upsert_row_union" not in names
+
+        upsert = _upsert_node_definition()
+        assert "row_union" in upsert["parameters"]["properties"]["node_type"]["enum"]
+        timeout = upsert["parameters"]["properties"]["timeout_seconds"]
+        assert timeout["type"] == ["number", "null"]
+        assert timeout["exclusiveMinimum"] == 0
+        assert "finite" in timeout["description"]
+
+    def test_upsert_persists_canonical_row_union_and_timeout(self) -> None:
+        result = execute_tool("upsert_node", dict(_ROW_UNION_UPSERT_ARGS), _empty_state(), _mock_catalog())
+
+        assert result.success is True, result.to_dict()
+        union = next(node for node in result.updated_state.nodes if node.id == "variant_union")
+        assert union.node_type == "row_union"
+        assert union.plugin is None
+        assert union.input == "control_done"
+        assert dict(union.branches or {}) == {
+            "control": "control_done",
+            "treatment": "treatment_done",
+        }
+        assert union.on_success == "unioned_rows"
+        assert union.timeout_seconds == 45.0
+
+        inspected = execute_tool(
+            "get_pipeline_state",
+            {"component": "variant_union"},
+            result.updated_state,
+            _mock_catalog(),
+        )
+        assert inspected.success is True
+        assert inspected.data["node"]["timeout_seconds"] == 45.0
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"plugin": "passthrough"},
+            {"input": "not_the_first_branch"},
+            {"on_success": None},
+            {"on_error": "errors"},
+            {"options": {"schema": {"mode": "observed"}}},
+            {"branches": {"only": "control_done"}},
+            {"policy": "require_all"},
+            {"merge": "union"},
+            {"timeout_seconds": 0},
+            {"timeout_seconds": float("inf")},
+        ],
+    )
+    def test_intrinsically_malformed_row_union_is_rejected_atomically(self, override: dict[str, Any]) -> None:
+        state = _empty_state()
+        result = execute_tool(
+            "upsert_node",
+            {**_ROW_UNION_UPSERT_ARGS, **override},
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+
+
 class TestQueueBoundaryFieldEvidenceAbstains:
     """A queue exposes observed/unknown schema — field/numeric evidence must
     abstain at that boundary and MUST NOT synthesise a union of the

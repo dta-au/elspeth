@@ -719,6 +719,43 @@ class TestForkCoalesceExemplar:
         thresholds = safety["options"]["thresholds"]
         assert any(value < 6 for value in thresholds.values())
 
+
+class TestForkRowUnionExemplar:
+    def test_exemplar_validates_and_teaches_the_row_union_contract(self, tmp_path: Path) -> None:
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _trained_view()
+        args = planner_authoring_aids.fork_row_union_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"fork/row_union exemplar rejected: {rejection}"
+        nodes = {node["id"]: node for node in args["nodes"]}
+        gate = next(node for node in nodes.values() if node["node_type"] == "gate")
+        union = next(node for node in nodes.values() if node["node_type"] == "row_union")
+        branch_nodes = [node for node in nodes.values() if node.get("input") in gate["fork_to"]]
+        assert set(union["branches"]) == set(gate["fork_to"])
+        assert set(union["branches"].values()) == {node["on_success"] for node in branch_nodes}
+        assert union["input"] == next(iter(union["branches"].values()))
+        assert union["on_success"] == "unioned_rows"
+        assert union["timeout_seconds"] > 0
+        assert "plugin" not in union
+        assert "policy" not in union
+        assert "merge" not in union
+
+    def test_authoring_aids_publish_row_union_rules_and_exemplar(self) -> None:
+        view, _snapshot = _trained_view()
+        payload = build_planner_authoring_aids(view)
+
+        assert payload["fork_row_union"]["set_pipeline_exemplar"] == planner_authoring_aids.fork_row_union_exemplar_args(view)
+        rendered = " ".join(payload["fork_row_union"]["rules"])
+        assert "require_all" in rendered
+        assert "N-to-N" in rendered
+        assert "first branch" in rendered
+
     def test_alias_less_control_exemplar_validates_through_the_real_candidate_builder(self, tmp_path: Path) -> None:
         """The exact alias-less control exemplar bytes must build."""
         (tmp_path / "outputs").mkdir(exist_ok=True)

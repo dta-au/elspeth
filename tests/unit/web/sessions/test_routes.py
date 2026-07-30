@@ -6447,6 +6447,7 @@ sinks:
                 {"id": "aggregation_node", "node_type": "aggregation", "plugin": "missing_aggregation"},
                 {"id": "gate_node", "node_type": "gate", "plugin": None},
                 {"id": "coalesce_node", "node_type": "coalesce", "plugin": None},
+                {"id": "row_union_node", "node_type": "row_union", "plugin": None},
                 {"id": "queue_node", "node_type": "queue", "plugin": None},
             ],
             edges=None,

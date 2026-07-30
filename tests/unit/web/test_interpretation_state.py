@@ -690,6 +690,28 @@ def _queue(queue_id: str = "inbound") -> NodeSpec:
     )
 
 
+def _row_union(
+    *,
+    branches: dict[str, str],
+    on_success: str = "inbound",
+) -> NodeSpec:
+    return NodeSpec(
+        id="variant_union",
+        node_type="row_union",
+        plugin=None,
+        input=next(iter(branches.values())),
+        on_success=on_success,
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=branches,
+        policy=None,
+        merge=None,
+    )
+
+
 def _web_scrape(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec:
     return NodeSpec(
         id=node_id,
@@ -928,6 +950,64 @@ def test_queue_fan_in_shield_authorized_only_when_all_predecessors_shielded() ->
     )
 
     assert prompt_shield_recommendation_warning_pairs(fully_shielded) == ()
+
+
+def test_row_union_requires_every_branch_to_be_prompt_shielded() -> None:
+    branches = {"control": "control_done", "treatment": "treatment_done"}
+    partially_shielded = _state(
+        (
+            _web_scrape("control_scrape", input_stream="control_url", on_success="control_raw"),
+            _shield("control_shield", input_stream="control_raw", on_success="control_done"),
+            _web_scrape("treatment_scrape", input_stream="treatment_url", on_success="treatment_done"),
+            _row_union(branches=branches),
+            _llm(),
+        )
+    )
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(partially_shielded)
+
+    assert warning_pairs
+    assert "web_scrape upstream" in next(message for component, message in warning_pairs if component == "node:classify")
+
+    fully_shielded = _state(
+        (
+            _web_scrape("control_scrape", input_stream="control_url", on_success="control_raw"),
+            _shield("control_shield", input_stream="control_raw", on_success="control_done"),
+            _web_scrape("treatment_scrape", input_stream="treatment_url", on_success="treatment_raw"),
+            _shield("treatment_shield", input_stream="treatment_raw", on_success="treatment_done"),
+            _row_union(branches=branches),
+            _llm(),
+        )
+    )
+
+    assert prompt_shield_recommendation_warning_pairs(fully_shielded) == ()
+
+
+def test_row_union_artifact_hash_covers_every_branch_path() -> None:
+    def build(treatment_id: str) -> CompositionState:
+        return _state(
+            (
+                _web_scrape("control_scrape", input_stream="control_url", on_success="control_done"),
+                _web_scrape(treatment_id, input_stream="treatment_url", on_success="treatment_done"),
+                _row_union(branches={"control": "control_done", "treatment": "treatment_done"}),
+                _llm(),
+            )
+        )
+
+    baseline = build("treatment_scrape")
+    changed = build("treatment_scrape_changed")
+    baseline_llm = next(node for node in baseline.nodes if node.plugin == "llm")
+    changed_llm = next(node for node in changed.nodes if node.plugin == "llm")
+
+    assert pipeline_decision_artifact_hash(
+        baseline_llm,
+        baseline.nodes,
+        user_term=PROMPT_SHIELD_USER_TERM,
+    ) != pipeline_decision_artifact_hash(
+        changed_llm,
+        changed.nodes,
+        user_term=PROMPT_SHIELD_USER_TERM,
+    )
 
 
 def test_queue_fan_in_one_unknown_predecessor_emits_conservative_warning() -> None:

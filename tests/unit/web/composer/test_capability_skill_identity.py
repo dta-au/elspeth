@@ -190,6 +190,7 @@ def test_capability_coverage_is_exactly_derived_from_canonical_authorities() -> 
     assert set(CAPABILITY_CORE_NODE_GUIDANCE) == set(COMPOSER_NODE_TYPES)
     core = load_pipeline_capability_core()
     assert all(core.count(anchor) == 1 for anchor in CAPABILITY_CORE_NODE_GUIDANCE.values())
+    assert "timeout_seconds" in actual_fields["node"]
 
 
 def test_capability_field_extraction_detects_new_structural_field() -> None:

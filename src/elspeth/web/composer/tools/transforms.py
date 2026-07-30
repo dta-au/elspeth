@@ -44,6 +44,7 @@ from elspeth.web.composer.tools._common import (
     _plugin_policy_failure,
     _prevalidate_transform_for_context,
     _reserved_connection_names,
+    _row_union_node_contract_error,
     _runtime_owned_llm_option_error,
     _validate_aggregation_trigger,
     _validate_mutation_arguments,
@@ -81,6 +82,7 @@ class _UpsertNodeArgumentsModel(BaseModel):
     trigger: dict[str, Any] | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
+    timeout_seconds: float | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -156,11 +158,11 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "id": {"type": "string", "description": "Unique node identifier."},
         "node_type": {
             "type": "string",
-            "enum": ["transform", "gate", "aggregation", "coalesce", "queue"],
+            "enum": ["transform", "gate", "aggregation", "coalesce", "row_union", "queue"],
         },
         "plugin": {
             "type": ["string", "null"],
-            "description": "Plugin name. Required for transform/aggregation. Null for gate/coalesce.",
+            "description": "Plugin name. Required for transform/aggregation. Null for gate/coalesce/row_union/queue.",
         },
         "input": {
             "type": "string",
@@ -240,6 +242,13 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "type": ["integer", "null"],
             "description": "Expected number of output rows from aggregation (aggregation only). Optional; omit when output count depends on group_by distinct values.",
         },
+        "timeout_seconds": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "description": (
+                "Optional finite positive structural-barrier timeout in seconds (coalesce/row_union only). Omit for every other node type."
+            ),
+        },
     },
     "required": ["id", "node_type", "input"],
     "additionalProperties": False,
@@ -289,6 +298,10 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "transform/aggregation use plugin+options; "
         "gate uses condition+routes (or fork_to); "
         "coalesce uses branches+policy+merge; "
+        "row_union is a plugin-free require_all N-to-N barrier: provide at least "
+        "two ordered branches, set input to the first branch connection, set "
+        "on_success to a processing connection (never a sink), omit policy/merge/"
+        "options/routing fields, and optionally set a finite positive timeout_seconds; "
         "queue is a structural fan-in point — set id == input to the shared "
         "connection name, omit plugin and every routing field (on_success/"
         "on_error/routes/fork_to), and options accepts only an optional "
@@ -462,6 +475,7 @@ def _execute_upsert_queue_node(
         trigger=validated.trigger,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
+        timeout_seconds=validated.timeout_seconds,
     )
     contract_error = queue_node_contract_error(node)
     if contract_error is not None:
@@ -607,7 +621,16 @@ def _execute_upsert_node(
         trigger=validated.trigger,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
+        timeout_seconds=validated.timeout_seconds,
     )
+
+    row_union_contract_error = _row_union_node_contract_error(
+        node,
+        output_names=frozenset(output.name for output in state.outputs),
+    )
+    if row_union_contract_error is not None:
+        message, error_code = row_union_contract_error
+        return _failure_result(state, message, error_code=error_code)
 
     proposed_state = state.with_node(node)
     try:

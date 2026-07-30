@@ -1770,6 +1770,7 @@ class _PipelineNodeModel(BaseModel):
     trigger: _NodeTriggerModel | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
+    timeout_seconds: float | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3424,6 +3425,7 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "trigger",
                     "output_mode",
                     "expected_output_count",
+                    "timeout_seconds",
                 ),
                 sensitive_argument_keys=("options", "routes", "trigger"),
                 argument_summarizers={

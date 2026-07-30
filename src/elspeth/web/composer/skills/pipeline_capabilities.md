@@ -109,7 +109,7 @@ The terminal schema is authoritative. Its covered structural families are:
 | source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `inline_blob` |
 | named_source | `plugin`, `options`, `on_success`, `on_validation_failure` |
 | inline_blob | `filename`, `mime_type`, `content`, `description` |
-| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count` |
+| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds` |
 | trigger | `count`, `timeout_seconds`, `condition` |
 | edge | `id`, `from_node`, `to_node`, `edge_type`, `label` |
 | output | `sink_name`, `plugin`, `options`, `on_write_failure` |

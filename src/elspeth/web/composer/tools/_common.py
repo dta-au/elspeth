@@ -1196,6 +1196,7 @@ def _serialize_node(node: NodeSpec) -> dict[str, Any]:
         "trigger": deep_thaw(node.trigger) if node.trigger else None,
         "output_mode": node.output_mode,
         "expected_output_count": node.expected_output_count,
+        "timeout_seconds": node.timeout_seconds,
     }
 
 
@@ -2579,6 +2580,7 @@ class _SetPipelineNodePayload(TypedDict):
     trigger: dict[str, JsonValue] | None
     output_mode: str | None
     expected_output_count: int | None
+    timeout_seconds: float | None
 
 
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:
@@ -2603,6 +2605,56 @@ def _serialize_set_pipeline_node(node: NodeSpec) -> _SetPipelineNodePayload:
     payload = cast(_SetPipelineNodePayload, _serialize_node(node))
     payload["options"] = _serialize_authoring_options(node.options)
     return payload
+
+
+_ROW_UNION_INTRINSIC_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "row_union_config_invalid",
+        "row_union_branches_invalid",
+        "row_union_branch_invalid",
+        "row_union_input_mismatch",
+        "row_union_on_success_invalid",
+        "row_union_timeout_invalid",
+    }
+)
+
+
+def _row_union_node_contract_error(
+    node: NodeSpec,
+    *,
+    output_names: frozenset[str] = frozenset(),
+) -> tuple[str, str] | None:
+    """Return the first intrinsic row-union authoring failure.
+
+    Reuse ``CompositionState.validate`` as the contract authority rather than
+    maintaining a second structural validator in the tool layer. Topology
+    findings (unreachable branches and a not-yet-consumed output connection)
+    remain incremental-authoring telemetry. A configured sink target is
+    rejected here because row_union v1 may release only to processing.
+    """
+    if node.node_type != "row_union":
+        return None
+    if node.on_success in output_names:
+        return (
+            (
+                f"row_union '{node.id}' on_success '{node.on_success}' names a sink. "
+                "A released group must continue on a processing connection."
+            ),
+            "row_union_on_success_must_be_connection",
+        )
+    probe = CompositionState(
+        source=None,
+        nodes=(node,),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    for entry in probe.validate().errors:
+        if entry.component == f"node:{node.id}" and entry.error_code in _ROW_UNION_INTRINSIC_ERROR_CODES:
+            assert entry.error_code is not None
+            return entry.message, entry.error_code
+    return None
 
 
 def _serialize_set_pipeline_source(

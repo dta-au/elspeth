@@ -13,7 +13,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
-from elspeth.web.composer.state import CompositionState, NodeSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, _coalesce_branch_connections
 
 _NON_PRODUCED_ROUTE_TARGETS = frozenset({"discard", "fork", "stop"})
 
@@ -288,10 +288,8 @@ def _node_output_streams(node: NodeSpec) -> tuple[str, ...]:
 def _node_input_streams(node: NodeSpec) -> tuple[str, ...]:
     if node.node_type == "queue":
         return ()
-    if node.node_type == "coalesce":
-        if isinstance(node.branches, Mapping):
-            return tuple(node.branches.values())
-        return node.branches or ()
+    if node.node_type in ("coalesce", "row_union"):
+        return _coalesce_branch_connections(node.branches)
     return (node.input,) if node.input else ()
 
 
@@ -450,6 +448,18 @@ def _producer_proves_input_control(
                 protected_fields=protected_fields,
             )
             for predecessor in predecessors
+        )
+    if producer.node_type == "row_union":
+        branches = _coalesce_branch_connections(producer.branches)
+        return bool(branches) and all(
+            _stream_proves_input_control(
+                branch,
+                graph,
+                source_streams=source_streams,
+                visited=visited,
+                protected_fields=protected_fields,
+            )
+            for branch in branches
         )
     if producer.node_type == "gate" and producer.plugin is None:
         # Config gates route and fork rows without modifying them (GateExecutor

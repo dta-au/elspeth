@@ -60,6 +60,23 @@ _BASE_PIPELINE: dict[str, Any] = {
             ],
         ),
         (
+            ("nodes",),
+            [
+                {
+                    "id": "variant_union",
+                    "node_type": "row_union",
+                    "input": "control_done",
+                    "plugin": None,
+                    "on_success": "unioned_rows",
+                    "branches": {
+                        "control": "control_done",
+                        "treatment": "treatment_done",
+                    },
+                    "timeout_seconds": 30.0,
+                }
+            ],
+        ),
+        (
             ("edges",),
             [{"id": "edge", "from_node": "source", "to_node": "sink", "edge_type": "on_success", "label": None}],
         ),
@@ -206,6 +223,7 @@ def test_registered_schema_lookup_rejects_missing_internal_definition_name(monke
         (("properties", "source", "properties", "inline_blob", "properties", "description"), "string"),
         (("properties", "sources", "additionalProperties", "properties", "on_validation_failure"), "string"),
         (("properties", "nodes", "items", "properties", "trigger", "properties", "timeout_seconds"), "number"),
+        (("properties", "nodes", "items", "properties", "timeout_seconds"), "number"),
         (("properties", "edges", "items", "properties", "label"), "string"),
         (("properties", "outputs", "items", "properties", "on_write_failure"), "string"),
     ],

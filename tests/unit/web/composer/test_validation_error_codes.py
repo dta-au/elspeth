@@ -296,6 +296,16 @@ class TestClosedCodeCatalogueInvariants:
             "aggregation_missing_on_error",
             "coalesce_branch_unreachable",
             "coalesce_schema_mode_mixed",
+            "row_union_config_invalid",
+            "row_union_branches_invalid",
+            "row_union_branch_invalid",
+            "row_union_input_mismatch",
+            "row_union_on_success_invalid",
+            "row_union_timeout_invalid",
+            "row_union_branch_alias_unreachable",
+            "row_union_branch_unreachable",
+            "row_union_on_success_must_be_connection",
+            "row_union_on_success_dangling",
         ):
             assert code in _CLOSED_VALIDATION_ERROR_CODES, code
             guidance = explain_validation_code(code)

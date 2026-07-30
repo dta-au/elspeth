@@ -20,7 +20,7 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
-from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
 from elspeth.web.plugin_policy.coverage import (
     OutputStreamGraph as _OutputStreamGraph,
 )
@@ -416,6 +416,11 @@ def _producer_reaches_untrusted(producer: NodeSpec, graph: _OutputStreamGraph, v
         for predecessor in graph.queue_predecessors.get(producer.id, ()):
             reached |= _producer_reaches_untrusted(predecessor, graph, visited)
         return frozenset(reached)
+    if producer.node_type == "row_union":
+        reached = set()
+        for branch in _coalesce_branch_connections(producer.branches):
+            reached |= set(_stream_reaches_untrusted(branch, graph, visited))
+        return frozenset(reached)
     return _stream_reaches_untrusted(producer.input, graph, visited)
 
 
@@ -458,6 +463,9 @@ def _producer_proves_shield(producer: NodeSpec, graph: _OutputStreamGraph, visit
         if not predecessors:
             return False  # queue with no known predecessor → unknown → fail-safe
         return all(_producer_proves_shield(predecessor, graph, visited) for predecessor in predecessors)
+    if producer.node_type == "row_union":
+        branches = _coalesce_branch_connections(producer.branches)
+        return bool(branches) and all(_stream_proves_shield(branch, graph, visited) for branch in branches)
     return _stream_proves_shield(producer.input, graph, visited)
 
 
@@ -1318,6 +1326,11 @@ def _prompt_shield_producer_paths(producer: NodeSpec, graph: _OutputStreamGraph,
         if not predecessors:
             return [(head,)]
         return [(head, *sub) for predecessor in predecessors for sub in _prompt_shield_producer_paths(predecessor, graph, visited)]
+    if producer.node_type == "row_union":
+        branches = _coalesce_branch_connections(producer.branches)
+        if not branches:
+            return [(head,)]
+        return [(head, *sub) for branch in branches for sub in _prompt_shield_upstream_paths(branch, graph, visited)]
     return [(head, *sub) for sub in _prompt_shield_upstream_paths(producer.input, graph, visited)]
 
 

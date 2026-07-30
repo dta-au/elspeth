@@ -1553,3 +1553,81 @@ class TestSetPipelineQueue:
         # Atomic: the exact prior state/version is untouched.
         assert result.updated_state.version == state.version
         assert result.updated_state.nodes == state.nodes
+
+
+_ROW_UNION_NODE_ENTRY: dict[str, Any] = {
+    "id": "variant_union",
+    "node_type": "row_union",
+    "plugin": None,
+    "input": "control_done",
+    "on_success": "unioned_rows",
+    "options": {},
+    "branches": {
+        "control": "control_done",
+        "treatment": "treatment_done",
+    },
+    "timeout_seconds": 30.0,
+}
+
+
+def _valid_args_with_row_union(override: dict[str, Any] | None = None) -> dict[str, Any]:
+    node = dict(_ROW_UNION_NODE_ENTRY)
+    if override is not None:
+        node.update(override)
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "control_done",
+            "options": {"path": "in.csv", "schema": {"mode": "observed"}},
+        },
+        "nodes": [node],
+        "edges": [],
+        "outputs": [],
+    }
+
+
+class TestSetPipelineRowUnion:
+    def test_pipeline_node_transport_remains_open_and_accepts_timeout(self) -> None:
+        from elspeth.web.composer.redaction import _PipelineNodeModel
+
+        assert _PipelineNodeModel.model_fields["node_type"].annotation is str
+        model = _PipelineNodeModel.model_validate(_ROW_UNION_NODE_ENTRY)
+        assert model.node_type == "row_union"
+        assert model.timeout_seconds == 30.0
+
+    def test_set_pipeline_persists_canonical_row_union(self) -> None:
+        result = _execute_set_pipeline(
+            _valid_args_with_row_union(),
+            _empty_state(),
+            ToolContext(catalog=_mock_catalog()),
+        )
+
+        assert result.success is True, result.to_dict()
+        union = result.updated_state.nodes[0]
+        assert union.node_type == "row_union"
+        assert union.timeout_seconds == 30.0
+        assert dict(union.branches or {}) == {
+            "control": "control_done",
+            "treatment": "treatment_done",
+        }
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"plugin": "passthrough"},
+            {"input": "not_the_first_branch"},
+            {"on_success": None},
+            {"branches": {"only": "control_done"}},
+            {"timeout_seconds": -1},
+        ],
+    )
+    def test_set_pipeline_rejects_malformed_row_union_atomically(self, override: dict[str, Any]) -> None:
+        state = _empty_state()
+        result = _execute_set_pipeline(
+            _valid_args_with_row_union(override),
+            state,
+            ToolContext(catalog=_mock_catalog()),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state

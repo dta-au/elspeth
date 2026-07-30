@@ -245,10 +245,11 @@ class _EdgePatchTarget:
 
 
 def _node_schema_patch_target(component_id: str, component_type: str | None) -> _EdgePatchTarget:
+    display_name = f"node '{component_id}' (row_union)" if component_type == "row_union" else f"{component_type or 'node'} '{component_id}'"
     return _EdgePatchTarget(
         component_id=component_id,
         component_type=component_type,
-        display_name=f"{component_type or 'node'} '{component_id}'",
+        display_name=display_name,
         schema_patch_tool_call=f"patch_node_options(node_id='{component_id}', patch={{'schema': {{...}}}})",
     )
 
@@ -337,6 +338,12 @@ def _edge_patch_targets_by_dag_id(state: CompositionState, graph: Any) -> dict[s
     for coalesce_name, dag_node_id in coalesce_id_map.items():
         component_id = str(coalesce_name)
         node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "coalesce"
+        targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
+
+    row_union_id_map = graph.get_row_union_id_map()
+    for row_union_name, dag_node_id in row_union_id_map.items():
+        component_id = str(row_union_name)
+        node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "row_union"
         targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
 
     sink_id_map = graph.get_sink_id_map()
@@ -580,8 +587,9 @@ def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFin
     4. The node has no fork machinery (``fork_to``, ``routes`` empty).
     5. ``options["schema"]["fields"]`` is missing or empty (not Concept-5
        schema-anchoring per ``pipeline_composer.md:758-768``).
-    6. The upstream node is NOT a ``gate`` (per ``pipeline_composer.md:1517-1518``,
-       per-fork-branch passthrough is the documented legitimate pattern).
+    6. The upstream node is NOT a structural ``gate``, ``queue``, or
+       ``row_union``. These boundaries make a downstream passthrough
+       structurally meaningful even when it leaves row fields unchanged.
 
     Returns:
         List of :class:`_IdentityFinding`, one per detected node.  Empty when
@@ -643,13 +651,14 @@ def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFin
         if node.input not in producer_by_target:
             continue
         upstream_id = producer_by_target[node.input]
-        # Rule 6: upstream is not a gate or a queue. A gate-fork's per-branch
+        # Rule 6: upstream is not a gate, queue, or row union. A gate-fork's per-branch
         # passthrough is the documented legitimate pattern (skill lines
         # 1517-1518); a queue interleaves fan-in with an observed/unknown schema,
         # so a downstream passthrough is doing real structural work, not dead
-        # weight (elspeth-a5b86149d4). ``upstream_id == "source"`` is not in
+        # weight (elspeth-a5b86149d4). A row union is likewise a real correlated
+        # barrier. ``upstream_id == "source"`` is not in
         # nodes_by_id; the source is neither, so falling through is correct.
-        if upstream_id in nodes_by_id and nodes_by_id[upstream_id].node_type in ("gate", "queue"):
+        if upstream_id in nodes_by_id and nodes_by_id[upstream_id].node_type in ("gate", "queue", "row_union"):
             continue
         # Rule 5: passthrough has no schema.fields anchor (Concept-5 exemption
         # per skill lines 758-768).  ``options`` values are Tier-3 (LLM- or

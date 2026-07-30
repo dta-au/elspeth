@@ -47,6 +47,17 @@ def _queue(queue_id: str) -> NodeSpec:
     return _node(queue_id, None, queue_id, None, node_type="queue")
 
 
+def _row_union(
+    *,
+    branches: dict[str, str],
+    on_success: str = "unioned_rows",
+) -> NodeSpec:
+    return replace(
+        _node("variant_union", None, next(iter(branches.values())), on_success, node_type="row_union"),
+        branches=branches,
+    )
+
+
 def _state(*nodes: NodeSpec, source_target: str = "llm_in", sinks: tuple[str, ...] = ("main",)) -> CompositionState:
     return CompositionState(
         source=SourceSpec(
@@ -754,6 +765,41 @@ def test_content_safety_post_dominates_valid_coalesce_chain() -> None:
         _node("right_path", "passthrough", "right", "right_done"),
         coalesce,
         _safety("safety", "join", "main"),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+
+
+def test_prompt_shield_must_dominate_every_row_union_branch() -> None:
+    union = _row_union(branches={"left": "left_done", "right": "right_done"})
+    state = _state(
+        _shield("left_shield", "raw", "left_done"),
+        _node("right_path", "passthrough", "raw", "right_done"),
+        union,
+        _llm(input_stream="unioned_rows"),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+
+def test_content_safety_post_dominates_row_union_release() -> None:
+    union = _row_union(branches={"left": "left_done", "right": "right_done"})
+    state = _state(
+        _llm(on_success="fanout_in"),
+        _node(
+            "fanout",
+            None,
+            "fanout_in",
+            None,
+            node_type="gate",
+            routes={"all": "fork"},
+            fork_to=("left", "right"),
+        ),
+        _node("left_path", "passthrough", "left", "left_done"),
+        _node("right_path", "passthrough", "right", "right_done"),
+        union,
+        _safety("safety", "unioned_rows", "main"),
     )
 
     assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
