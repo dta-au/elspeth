@@ -15508,7 +15508,7 @@ class TestExplainStructuralNodeShapeCodes:
 
 
 class TestStructuralNodeTypeProbedAsPlugin:
-    """gate/coalesce/queue are built-in node_types, not plugins. A model that
+    """gate/coalesce/row_union/queue are built-in node_types, not plugins. A model that
     probes the plugin registry for them must be taught the wiring, not told
     "not installed" — live regression: the composer honestly declined an A/B
     request on the false premise that coalesce "is not installed in this
@@ -15526,6 +15526,10 @@ class TestStructuralNodeTypeProbedAsPlugin:
         [
             ("coalesce", ("node_type", "branches", "policy", "queries")),
             ("gate", ("node_type", "fork_to", "routes")),
+            (
+                "row_union",
+                ("node_type", "branches", "input", "on_success", "require_all", "N-to-N", "timeout_seconds"),
+            ),
             ("queue", ("node_type", "fan-in")),
         ],
     )

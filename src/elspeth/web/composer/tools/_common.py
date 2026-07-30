@@ -1399,10 +1399,11 @@ def _plugin_unavailable_message(plugin_type: PluginKind, reason: PluginUnavailab
     return f"{plugin_type} plugin selection is unavailable ({reason.value}): {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}"
 
 
-# gate/coalesce/queue are built-in node_types wired with plugin=null — they do
-# not exist in the plugin registry, and answering a registry probe for them
-# with "not installed" invites a false honest decline ("this deployment cannot
-# merge branches"). These names are closed composer vocabulary, safe to echo.
+# gate/coalesce/row_union/queue are built-in node_types wired with plugin=null —
+# they do not exist in the plugin registry, and answering a registry probe for
+# them with "not installed" invites a false honest decline ("this deployment
+# cannot merge branches"). These names are closed composer vocabulary, safe to
+# echo.
 _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
     "coalesce": (
         "'coalesce' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
@@ -1415,6 +1416,15 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
         "'gate' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a node "
         "with node_type='gate', plugin=null, a `condition` row expression and routes={'true': ..., "
         "'false': ...}; route to 'fork' with fork_to=[...] to fan a row out to several branches."
+    ),
+    "row_union": (
+        "'row_union' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
+        "node with node_type='row_union', plugin=null, at least two ordered `branches` mapping each "
+        "fork branch alias to its incoming connection, `input` equal to the first mapped connection "
+        "as a serialization placeholder, and `on_success` naming a downstream processing connection. "
+        "It has fixed require_all N-to-N semantics: it waits for every branch, then releases every "
+        "original row unchanged in declared branch order; an optional finite positive "
+        "`timeout_seconds` is supported."
     ),
     "queue": (
         "'queue' is not a plugin — it is a built-in node_type that needs no plugin, used for fan-in: "
