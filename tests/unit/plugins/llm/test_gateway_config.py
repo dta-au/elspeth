@@ -32,6 +32,7 @@ import pytest
 from pydantic import ValidationError
 
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS as _LLM_PRIVATE_OPTIONS
+from elspeth.core.rate_limit.registry import RateLimitRegistry
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, GatewayLLMProvider
 from elspeth.plugins.transforms.llm.transform import _PROVIDERS, LLMTransform
 
@@ -266,7 +267,7 @@ class TestGatewayLimiterDispatch:
     def test_gateway_provider_gets_gateway_limiter_not_openrouters(self) -> None:
         transform = LLMTransform(_make_gateway_transform_config())
 
-        mock_registry = Mock()
+        mock_registry = Mock(spec=RateLimitRegistry)
         mock_registry.get_limiter.return_value = object()
 
         ctx = _make_ctx()
