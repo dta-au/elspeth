@@ -894,6 +894,53 @@ describe("GraphView", () => {
       ).toBe(false);
     });
 
+    it("preserves canonical explicit row_union branch labels without inferred duplicates", () => {
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "control-to-union",
+          from_node: "control_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "control",
+        }),
+        makeEdge({
+          id: "treatment-to-union",
+          from_node: "treatment_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "treatment",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByTestId("edge-e-control_score-variant_union-0"),
+      ).toHaveTextContent("control");
+      expect(
+        screen.getByTestId("edge-e-treatment_score-variant_union-1"),
+      ).toHaveTextContent("treatment");
+
+      const ids = renderedEdgeIds();
+      expect(
+        ids.filter((id) => id.includes("-control_score-variant_union")),
+      ).toEqual(["edge-e-control_score-variant_union-0"]);
+      expect(
+        ids.filter((id) => id.includes("-treatment_score-variant_union")),
+      ).toEqual(["edge-e-treatment_score-variant_union-1"]);
+      expect(ids).not.toContain(
+        "edge-inferred-conn-control_score-variant_union",
+      );
+      expect(ids.filter((id) => id.endsWith("-compare"))).toEqual([
+        "edge-inferred-row-union-out-variant_union-compare",
+      ]);
+      expect(
+        ids.some((id) => id.includes("variant_union-variant_union")),
+      ).toBe(false);
+    });
+
     it("preserves every alias when two branches name the same producer connection", () => {
       const state = rowUnionState();
       const union = state.nodes.find((node) => node.id === "variant_union");

@@ -659,7 +659,7 @@ export function GraphView() {
       id: `e-${edge.from_node}-${edge.to_node}-${i}`,
       source: toGraphNodeId(edge.from_node),
       target: toGraphNodeId(edge.to_node),
-      label: EDGE_LABEL_MAP[edge.edge_type] ?? edge.edge_type,
+      label: edge.label ?? EDGE_LABEL_MAP[edge.edge_type] ?? edge.edge_type,
       animated: edge.edge_type === "on_error",
       style: {
         stroke: edge.edge_type === "on_error" ? EDGE_COLORS.error : EDGE_COLORS.normal,
