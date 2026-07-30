@@ -14,7 +14,7 @@
         "required": true
       },
       {
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "kind": "json-value",
         "label": "Schema",
         "name": "schema",
@@ -420,7 +420,7 @@
         }
       },
       {
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "kind": "json-value",
         "label": "Schema",
         "name": "schema",
@@ -814,7 +814,7 @@
         }
       },
       {
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "kind": "json-value",
         "label": "Schema",
         "name": "schema",

@@ -215,6 +215,58 @@ class TestRuntimeAttributeLayering:
         assert [fc.normalized_name for fc in merged.fields] == ["alpha", "bravo", "yankee", "zeta"]
 
 
+class TestOriginalNameCollision:
+    """Two branches rename one upstream field to different names (P9).
+
+    Naively carrying each branch's original_name would give two merged fields
+    one original_name, violating SchemaContract's bijection invariant. The
+    merge breaks the ambiguous lineage deterministically — colliding fields
+    get identity original_name — while cross-branch provenance stays in the
+    union audit metadata (union_field_origins), not the contract.
+    """
+
+    def _branches(self) -> dict[str, SchemaContract]:
+        # Upstream 'amount' renamed to 'amount_aud' (branch a) / 'amount_usd'
+        # (branch b); 'currency' is non-colliding with a real upstream name.
+        a = _contract(
+            _field("id", original="id"),
+            _field("amount_aud", original="amount"),
+            _field("currency", str, original="Currency-Label"),
+        )
+        b = _contract(
+            _field("id", original="id"),
+            _field("amount_usd", original="amount"),
+        )
+        return {"a": a, "b": b}
+
+    @pytest.mark.parametrize("require_all", [True, False])
+    def test_colliding_renames_merge_with_identity_original_names(self, require_all: bool) -> None:
+        merged = merge_union_contracts(self._branches(), require_all=require_all, branch_order=("a", "b"))
+        assert merged.get_field("amount_aud").original_name == "amount_aud"
+        assert merged.get_field("amount_usd").original_name == "amount_usd"
+
+    def test_non_colliding_fields_keep_upstream_original_name(self) -> None:
+        merged = merge_union_contracts(self._branches(), require_all=True, branch_order=("a", "b"))
+        assert merged.get_field("id").original_name == "id"
+        assert merged.get_field("currency").original_name == "Currency-Label"
+
+    def test_all_branch_fields_present(self) -> None:
+        merged = merge_union_contracts(self._branches(), require_all=True, branch_order=("a", "b"))
+        assert {fc.normalized_name for fc in merged.fields} == {"id", "amount_aud", "amount_usd", "currency"}
+
+    def test_cascaded_collision_still_produces_bijection(self) -> None:
+        """Identity reassignment can create a new collision; it must cascade."""
+        a = _contract(_field("amount", original="amount"))
+        b = _contract(
+            _field("amount_aud", original="amount"),
+            _field("amount_x", original="amount_aud"),
+        )
+        merged = merge_union_contracts({"a": a, "b": b}, require_all=True, branch_order=("a", "b"))
+        assert merged.get_field("amount").original_name == "amount"
+        assert merged.get_field("amount_aud").original_name == "amount_aud"
+        assert merged.get_field("amount_x").original_name == "amount_x"
+
+
 class TestEdgeCases:
     def test_empty_field_contract_still_forces_exclusives(self) -> None:
         """An arrived branch with zero fields counts as contributing (old fold parity).

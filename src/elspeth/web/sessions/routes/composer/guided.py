@@ -68,6 +68,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationConflictError,
     GuidedOperationFailed,
     GuidedOriginatingUserMessageDraft,
+    GuidedPendingProposalInvalidation,
     GuidedReplayTurn,
     GuidedResponseDescriptor,
     GuidedStateOperationCommand,
@@ -785,7 +786,10 @@ async def get_guided(
                         )
                         raise HTTPException(
                             status_code=500,
-                            detail="Server invariant violated. See application audit log for diagnostic detail.",
+                            detail={
+                                "error_type": "server_invariant_violated",
+                                "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                            },
                         ) from exc
                     if turn is not None:
                         turn = _finalize_guided_turn(
@@ -1203,7 +1207,10 @@ async def post_guided_reenter(
                 )
                 raise HTTPException(
                     status_code=500,
-                    detail="Server invariant violated. See application audit log for diagnostic detail.",
+                    detail={
+                        "error_type": "server_invariant_violated",
+                        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                    },
                 ) from exc
 
             existing_meta.pop(_COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY)
@@ -2181,6 +2188,13 @@ def _schema8_answer_and_project_next(
                 reason=TerminalReason.USER_PRESSED_EXIT,
                 pipeline_yaml=None,
             ),
+            # Exit is the binding-exempt universal escape: it fires from any
+            # step, including Step 3/4 with an active proposal, so it must
+            # clear proposal custody itself or GuidedSession's frozen
+            # revalidation ("terminal state must clear active_proposal and
+            # active_edit_target") turns the escape into a 500.
+            active_proposal=None,
+            active_edit_target=None,
             transition_consumed=True,
         )
     else:
@@ -2605,7 +2619,10 @@ async def post_guided_respond(
                 )
             raise HTTPException(
                 status_code=500,
-                detail="Server invariant violated. See application audit log for diagnostic detail.",
+                detail={
+                    "error_type": "server_invariant_violated",
+                    "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                },
             ) from exc
 
     pending = await reserve_or_replay_guided_operation(
@@ -2837,6 +2854,11 @@ async def post_guided_respond(
                         )
                         return _response_from_record(decline_settlement.result_state)
 
+                    # Mirror the preflight dispatch: an active exit bypasses
+                    # the Step 3/4 proposal-action branches (exit is the
+                    # binding-exempt universal escape) and settles through
+                    # the generic answer-and-project path below.
+                    is_active_exit = body.control_signal == ControlSignal.EXIT_TO_FREEFORM.value
                     if guided.terminal is not None:
                         if not (
                             guided.terminal.kind is TerminalKind.COMPLETED
@@ -2864,7 +2886,7 @@ async def post_guided_respond(
                             "composition_hash": composition_content_hash(state),
                         }
                         new_state = _replace(state, guided_session=guided)
-                    elif guided.step is GuidedStep.STEP_3_TRANSFORMS:
+                    elif not is_active_exit and guided.step is GuidedStep.STEP_3_TRANSFORMS:
                         if state_record is None or guided.active_proposal is None:
                             raise AuditIntegrityError("guided proposal action requires a persisted active proposal")
                         prospective, current_turn, _planned_current = _schema8_prospective_occurrence(
@@ -3408,7 +3430,7 @@ async def post_guided_respond(
                             payload_store=payload_store,
                         )
                         return _response_from_record(settlement.result_state)
-                    elif guided.step is GuidedStep.STEP_4_WIRE:
+                    elif not is_active_exit and guided.step is GuidedStep.STEP_4_WIRE:
                         if state_record is None or guided.active_proposal is None:
                             raise AuditIntegrityError("guided wire action requires a persisted active proposal")
                         prospective, current_turn, _planned_current = _schema8_prospective_occurrence(
@@ -4208,6 +4230,18 @@ async def post_guided_respond(
                     settlement_guided = new_state.guided_session
                     if settlement_guided is None:  # pragma: no cover
                         raise AuditIntegrityError("Guided RESPOND settlement has no checkpoint")
+                    invalidated_pending_proposal = None
+                    if guided.active_proposal is not None and settlement_guided.active_proposal is None:
+                        # Exit-to-freeform is the only generic transition that
+                        # clears proposal custody: surface the exact pending
+                        # authority so the settlement verifies the clear and
+                        # terminalizes the now-unreferenced proposal row
+                        # atomically instead of stranding it pending.
+                        invalidated_pending_proposal = GuidedPendingProposalInvalidation(
+                            proposal_id=guided.active_proposal.proposal_id,
+                            draft_hash=guided.active_proposal.draft_hash,
+                            reviewed_facts=guided_private_reviewed_facts(guided),
+                        )
                     existing_meta["guided_session"] = settlement_guided.to_dict()
                     state_dict = new_state.to_dict()
                     is_valid, validation_errors = _guided_persisted_validity(new_state, catalog=catalog)
@@ -4246,6 +4280,7 @@ async def post_guided_respond(
                         ),
                         payloads=tuple(prepared_payloads),
                         audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
+                        invalidated_pending_proposal=invalidated_pending_proposal,
                     )
                     # CHAT and other current writers do not all carry an
                     # expected-head CAS yet, so settlement remains mutually

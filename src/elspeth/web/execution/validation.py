@@ -235,6 +235,26 @@ _PLUGIN_POLICY_CHECKS: tuple[tuple[PolicyValidationStage, ValidationCheckName], 
     ("required_control_coverage", _CHECK_REQUIRED_CONTROL_COVERAGE),
 )
 
+# The four policy stages shared one suggestion, and for coverage failures the
+# "choose an available plugin" half was simply wrong advice — the plugin IS
+# available; the graph routes around it. Coverage gets its own remediation.
+_DEFAULT_PLUGIN_POLICY_SUGGESTION = "Choose an available plugin or repair the required control path, then validate again."
+
+_PLUGIN_POLICY_STAGE_SUGGESTIONS: dict[PolicyValidationStage, str] = {
+    "required_control_coverage": (
+        "Wire the required control transform so it sits on every path that carries the named "
+        "node's output before any sink. An on_error route is a separate write path and no "
+        "control can sit on it (on_error may only name a sink or 'discard'), so set the named "
+        "node's on_error to 'discard'. Then validate again. If failed rows must be kept in a "
+        "quarantine sink, ask the operator to relax the control mode to 'recommend' — it is not "
+        "an authoring change."
+    ),
+}
+
+
+def _plugin_policy_suggestion(stage: PolicyValidationStage) -> str:
+    return _PLUGIN_POLICY_STAGE_SUGGESTIONS.get(stage, _DEFAULT_PLUGIN_POLICY_SUGGESTION)
+
 
 @dataclass(frozen=True, slots=True)
 class _EdgePatchTarget:
@@ -957,7 +977,7 @@ def validate_pipeline(
                     component_id=item.component_id,
                     component_type=item.component_type,
                     message=item.message,
-                    suggestion="Choose an available plugin or repair the required control path, then validate again.",
+                    suggestion=_plugin_policy_suggestion(stage),
                     error_code=item.error_code,
                 )
                 for item in stage_findings

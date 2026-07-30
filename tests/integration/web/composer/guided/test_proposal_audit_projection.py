@@ -324,7 +324,14 @@ def test_planner_context_is_redacted_but_private_anchor_keeps_exact_reviewed_fac
                 "name": "primary",
                 "plugin": "csv",
                 "observed_columns": ["name", "score"],
+                # Schema facts are stated, not omitted: an observed schema
+                # declares no fields, which is a different fact from "no schema
+                # facts were projected". Same for custody — this fixture's
+                # inline source is genuinely not blob-bound.
+                "schema_mode": "observed",
+                "declared_fields": [],
                 "option_keys": ["credentials", "inline_blob", "schema"],
+                "server_storage_bound": False,
                 "on_validation_failure": "discard",
             }
         ],

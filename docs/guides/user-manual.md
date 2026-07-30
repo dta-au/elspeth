@@ -157,6 +157,7 @@ elspeth plugins list
 Output:
 ```
 SOURCES:
+  aws_s3               - Load bounded CSV, JSON-array, or JSONL rows from one immutable S3 object.
   azure_blob           - Load rows from Azure Blob Storage.
   csv                  - Load rows from a CSV file.
   dataverse            - Load rows from Microsoft Dataverse via OData v4 REST API.
@@ -165,32 +166,48 @@ SOURCES:
   text                 - Load one output row per text line into a configured column.
 
 TRANSFORMS:
-  azure_document_intelligence - Enrich rows with Azure AI Document Intelligence extraction.
-  blob_csv_expand     - Expand a payload-store CSV blob into rows.
-  blob_fetch          - Fetch an operator-authorised remote document into the payload store.
+  batch_classifier_metrics - Compute classifier confusion matrix and F-score metrics over a batch.
+  batch_data_quality_report - Report field-level batch quality counts and rates.
+  batch_distribution_profile - Compute distribution summaries over aggregation batches.
+  batch_drift_compare  - Compare baseline and current cohort distributions over a batch.
+  batch_effect_size    - Compute Cohen's d and Hedges' g for batch variant comparisons.
+  batch_experiment_compare - Compare experiment variants over a batch using mean deltas.
+  batch_outlier_annotator - Annotate batch rows with z-score and robust-z outlier signals.
+  batch_paired_preference - Compare paired variant scores over an aggregation batch.
   batch_replicate      - Replicate rows based on a copies field.
-  batch_stats          - Compute aggregate statistics over a batch, optionally per group_by value.
+  batch_stats          - Compute aggregate statistics over a batch of rows.
+  batch_threshold_summary - Report threshold match counts and rates for finite numeric batch values.
+  batch_top_k          - Report most frequent scalar values over a batch.
+  blob_csv_expand      - Parse a CSV blob and emit one output row per CSV data row.
+  blob_fetch           - Fetch an HTTP(S) URL into the run payload store and emit a blob reference.
   field_mapper         - Map, rename, and select row fields.
   json_explode         - Explode a JSON array field into multiple rows.
   keyword_filter       - Filter rows containing blocked content patterns.
+  line_explode         - Explode a string field into one output row per line.
   passthrough          - Pass rows through unchanged.
-  report_assemble      - Assemble a batch of text rows into one report row with pagination metadata.
+  report_assemble      - Assemble a paginated report from a flushed batch of text rows.
   truncate             - Truncate string fields to specified maximum lengths.
   type_coerce          - Perform explicit, strict, per-field type normalization.
   value_transform      - Apply expressions to compute new or modified field values.
   web_scrape           - Fetch webpages, extract content, generate fingerprints.
+  aws_bedrock_content_safety - Block configured harmful-content categories through Bedrock Guardrails.
+  aws_bedrock_prompt_shield - Block prompt attacks identified by an operator-owned Guardrail.
+  aws_textract_document_analysis - Enrich S3 document references through asynchronous Amazon Textract analysis.
   azure_content_safety - Analyze content using Azure Content Safety API.
+  azure_document_intelligence - Enrich rows with Azure Document Intelligence extraction (async analyze LRO).
   azure_prompt_shield  - Detect jailbreak attempts and prompt injection using Azure Prompt Shield.
   llm                  - Unified LLM transform with provider dispatch and strategy selection.
   rag_retrieval        - Enriches rows with retrieval-augmented context from search providers.
 
 SINKS:
+  aws_s3               - Write bounded cumulative CSV, JSON, or JSONL objects to AWS S3.
   azure_blob           - Write rows to Azure Blob Storage.
-  chroma_sink          - Write rows to a Chroma vector database.
+  chroma_sink          - Write pipeline rows into a ChromaDB collection.
   csv                  - Write rows to a CSV file.
   database             - Write rows to a database table.
   dataverse            - Write rows to Microsoft Dataverse via OData v4 REST API.
   json                 - Write rows to a JSON file.
+  text                 - Write one configured string field per canonical LF-delimited record.
 ```
 
 ### Filter by Type
@@ -537,11 +554,27 @@ planner, produce the same canonical pipeline draft, and are checked by the same
 runtime validators, the same graph contracts, and the same audit trail.
 
 The choice of mode changes the conversation, not the pipeline language: the same
-canonical structures are available on both surfaces. Switching modes never
-discards pipeline state — only the authoring surface changes. (The staged guided
-conversation has two known, tracked exceptions, described under Known
-limitations below; those are specific defects being fixed, not a capability
-boundary.)
+canonical structures are available on both surfaces.
+
+### Switching between guided and freeform
+
+What a mode switch carries is **not symmetric**, and the asymmetry is a property
+of the wizard, not a capability boundary:
+
+- **Guided → freeform** carries the graph exactly. Dropping to freeform hands
+  the completed or in-progress pipeline to the freeform surface unchanged.
+- **Freeform → guided, re-entering after a guided exit** resumes the wizard you
+  left, with its reviewed stages intact.
+- **Freeform → guided for the first time**, or after a YAML import, starts a
+  **fresh wizard as a new version**. The existing draft is not adopted into the
+  wizard's stages: it stays in the session's version history and remains
+  reachable there, but the guided conversation begins from the source stage
+  rather than from your draft.
+
+So the safe reading is: guided → freeform loses nothing, and going back the way
+you came loses nothing. Turning guided on over freeform work for the first time
+is a new start — park anything you still want to edit in freeform before you do
+it.
 
 ### What guided mode is for
 
@@ -595,9 +628,13 @@ Because capability is identical, pick the interaction that fits how you think:
 - **Freeform** suits describing the whole pipeline at once, or refining a draft
   when you already know which plugins you want to wire together.
 
-Neither choice limits what you can build. Switch whenever the other interaction
-would be more convenient; the chat history and the pipeline draft carry over
-unchanged.
+Neither choice limits what you can build. Switching guided → freeform is
+lossless, and re-entering guided from that exit resumes the same wizard. Turning
+guided *on* for the first time — or after a YAML import — starts a fresh wizard
+instead of adopting the current draft, so finish or park freeform work you want
+to keep editing before you switch that direction. See
+[Switching between guided and freeform](#switching-between-guided-and-freeform)
+for the exact contract.
 
 ### Wrong-stage mentions are retained, not rejected
 

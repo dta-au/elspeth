@@ -711,7 +711,10 @@ class TestGetGuidedFullStateRebuild:
         response = composer_test_client.get(f"/api/sessions/{session_id}/guided")
 
         assert response.status_code == 500
-        assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+        assert response.json()["detail"] == {
+            "error_type": "server_invariant_violated",
+            "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+        }
 
     # ------------------------------------------------------------------
     # M4: Step 2 intra-step rebuild (Codex #10)

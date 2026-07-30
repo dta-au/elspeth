@@ -5029,3 +5029,29 @@ class TestEdgeContractFailureFormatting:
         assert err.message == "some other graph problem"
         # No suggestion synthesized (we don't have structured fields to use).
         assert err.suggestion is None
+
+
+class TestPluginPolicySuggestions:
+    """Each policy stage's suggestion must describe a repair for THAT stage.
+
+    All four stages shared "Choose an available plugin or repair the required
+    control path". For a coverage failure the first half is wrong advice — the
+    control plugin IS available and selected; the graph routes around it — and
+    "repair the required control path" names no action.
+    """
+
+    def test_required_control_coverage_has_its_own_remediation(self) -> None:
+        from elspeth.web.execution.validation import _plugin_policy_suggestion
+
+        coverage = _plugin_policy_suggestion("required_control_coverage")
+
+        assert coverage != _plugin_policy_suggestion("plugin_enablement")
+        assert "on_error" in coverage
+        assert "'discard'" in coverage
+        assert "Choose an available plugin" not in coverage
+
+    def test_other_policy_stages_keep_the_shared_remediation(self) -> None:
+        from elspeth.web.execution.validation import _DEFAULT_PLUGIN_POLICY_SUGGESTION, _plugin_policy_suggestion
+
+        for stage in ("plugin_enablement", "operator_profile_options", "required_control_availability"):
+            assert _plugin_policy_suggestion(stage) == _DEFAULT_PLUGIN_POLICY_SUGGESTION  # type: ignore[arg-type]

@@ -30,6 +30,7 @@ from elspeth.web.composer.guided.resolved import (
     freeze_guided_str_sequence,
 )
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession, SinkIntent, SourceIntent
+from elspeth.web.composer.guided_blob_refs import reviewed_schema_declared_field_names
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_from_dict, facts_to_dict
 from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
@@ -934,11 +935,19 @@ def transition_source_schema_form(
 
     _require_no_other_pending(session.pending_source_intents, stable_id, "source")
     reviewed = dict(session.reviewed_sources)
+    # No inspection facts were attached, so no blob was read and there are no
+    # observed headers to record. An explicit (fixed/flexible) schema is then
+    # the only field inventory the source has, and it is authoritative: the
+    # operator declared exactly those fields, and a declared field is
+    # implicitly guaranteed. Seeding it keeps the downstream field surfaces
+    # (the Step-2 output field picker, the chat and planner projections) from
+    # presenting an empty inventory as the fact that the source has no fields.
+    # Observed schemas declare none and still resolve with no columns.
     reviewed[stable_id] = SourceResolved(
         name=intent.name,
         plugin=intent.plugin,
         options=options,
-        observed_columns=(),
+        observed_columns=reviewed_schema_declared_field_names(options.get("schema")),
         sample_rows=(),
         on_validation_failure=structural["on_validation_failure"],
     )

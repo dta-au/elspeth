@@ -14,7 +14,7 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
-from elspeth.web.plugin_policy.coverage import control_coverage_findings
+from elspeth.web.plugin_policy.coverage import ControlCoverageFinding, control_coverage_findings
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
 
@@ -126,20 +126,62 @@ def validate_plugin_policy(
 
     for capability in required:
         for coverage in control_coverage_findings(state, capability):
-            findings.append(
-                PluginPolicyFinding(
-                    stage="required_control_coverage",
-                    component_id=coverage.component_id,
-                    component_type="transform",
-                    error_code="required_control_coverage",
-                    message=(
-                        f"Node '{coverage.component_id}' is not covered by the required "
-                        f"'{coverage.capability.value}' {coverage.role.value} control."
-                    ),
-                )
-            )
+            findings.append(_control_coverage_finding(coverage))
 
     return PluginPolicyValidationResult(executable_state=executable_state, findings=tuple(findings))
+
+
+def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyFinding:
+    """Name the on_error conflict and its one authorable repair.
+
+    The bare "not covered" message told authors nothing about WHY an
+    otherwise-correct pipeline was rejected, and the on_error case is the one
+    that reads as a contradiction: the planner is taught to route failures to a
+    quarantine sink, then a required output control rejects the pipeline for
+    doing exactly that. The conflict is real and the rejection is correct — an
+    on_error edge writes rows to a sink without passing the control, so it is
+    an independent output path.
+
+    There is exactly ONE authoring repair. A transform's ``on_error`` may only
+    name a sink or the literal ``discard`` (``core/dag/builder.py:1108``,
+    mirrored at ``web/composer/state.py:1060``), and ``on_error`` is mandatory
+    (``transform_missing_on_error``) — so no control transform can sit on an
+    error branch. Do NOT offer interposing the control on the error branch: the
+    graph rejects that edge (``transform_on_error_unknown_sink`` at the composer
+    surface, ``No producer for connection`` when built), so a planner that
+    followed the advice would ping-pong between two rejections.
+
+    Preserving the failed rows is a real need with a real answer, but it lives
+    with the operator, not the author: ``on_error: <quarantine sink>`` builds
+    and runs fine, and only the *required* control mode rejects it. Naming that
+    escape hatch keeps the author from concluding the requirement is a bug. See
+    ``docs/reference/configuration.md`` — "Required controls and error routing".
+    """
+    if coverage.reason == "output_error_route_not_post_dominated" and coverage.uncovered_stream is not None:
+        message = (
+            f"Node '{coverage.component_id}' routes its on_error rows to the "
+            f"'{coverage.uncovered_stream}' sink, which is an independent output path: those rows "
+            f"are written without passing the required '{coverage.capability.value}' "
+            f"{coverage.role.value} control, so this node is not covered. A transform's on_error "
+            "may only name a sink or 'discard', so no control can be interposed on an error "
+            "branch — set this node's on_error to 'discard'. That drops the failed row's content "
+            "(nothing reaches a sink to inspect later) while the audit trail still records its "
+            "terminal outcome and content hash. Preserving failed rows in a quarantine sink is an "
+            f"operator decision, not an authoring workaround: it needs the "
+            f"'{coverage.capability.value}' control mode relaxed to 'recommend', or the pipeline "
+            "run under the CLI/batch runtime where web plugin policy does not apply."
+        )
+    else:
+        message = (
+            f"Node '{coverage.component_id}' is not covered by the required '{coverage.capability.value}' {coverage.role.value} control."
+        )
+    return PluginPolicyFinding(
+        stage="required_control_coverage",
+        component_id=coverage.component_id,
+        component_type="transform",
+        error_code="required_control_coverage",
+        message=message,
+    )
 
 
 def _plugin_id(kind: Literal["source", "transform", "sink"], name: str) -> PluginId | None:

@@ -10216,13 +10216,41 @@ class SessionServiceImpl:
             from elspeth.web.composer.guided.emitters import build_step_4_wire_turn
 
             candidate = guided_candidate_state(proposal)
-            validation_summary = candidate.validate()
+            # Independent re-derivation (staging asserts; settlement
+            # verifies): rebuild the wire review from the immutable proposal,
+            # never from route-supplied state. The rebuild must lower
+            # operator-profile options through the session principal's
+            # snapshot exactly like the route side does
+            # (routes/composer/guided.py review-advance and correction:
+            # validation_state is the executable view unless authored
+            # validation already errs) — validating the authored candidate
+            # crashed profile-bound wire corrections and mis-compared
+            # authored-vs-lowered projections into false integrity conflicts.
+            if self._plugin_snapshot_factory is None:
+                validation_state = candidate
+                validation_summary = candidate.validate()
+            else:
+                plugin_snapshot = await self._plugin_snapshot_for_session(str(command.fence.session_id))
+                if plugin_snapshot is None:
+                    raise AuditIntegrityError("Profile-aware guided proposal settlement has no principal snapshot")
+                from elspeth.web.plugin_policy.validation import validate_authored_composition_state
+
+                assert self._operator_profile_registry is not None
+                assert self._catalog is not None
+                policy = validate_authored_composition_state(
+                    candidate,
+                    snapshot=plugin_snapshot,
+                    profile_registry=self._operator_profile_registry,
+                    catalog=self._catalog,
+                )
+                validation_state = candidate if policy.validation.errors else policy.executable_state
+                validation_summary = policy.validation
             expected_wire = build_step_4_wire_turn(
                 candidate,
                 proposal_projection=cast("Any", proposal_projection_json),
                 guided=guided,
                 catalog=None,
-                validation_state=candidate,
+                validation_state=validation_state,
                 validation_summary=validation_summary,
             )
             try:

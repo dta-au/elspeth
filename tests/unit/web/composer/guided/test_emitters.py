@@ -5,6 +5,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.emitters import (
     _step_index,
     build_component_review_turn,
@@ -26,6 +28,12 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.config import WebSettings
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 
 
 class _Catalog:
@@ -521,6 +529,111 @@ class TestStep4WireEmitter:
             "expected_output_count": "1",
         }
 
+    def test_profile_bound_authored_fallback_renders_degraded_cardinality_without_raising(self) -> None:
+        # inv-f6 F6 hardening: an authored-only validation_state (operator
+        # profile options never lowered because authored validation already
+        # errs) must render a degraded wire review — the row-cardinality
+        # probe must not crash on the plugin's runtime config rejection.
+        state = CompositionState(
+            source=None,
+            sources={
+                "rows": SourceSpec(
+                    plugin="csv",
+                    on_success="summarize",
+                    options={"schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            nodes=(
+                NodeSpec(
+                    id="summarize",
+                    node_type="transform",
+                    plugin="llm",
+                    input="summarize",
+                    on_success="results",
+                    on_error="discard",
+                    options={
+                        "schema": {"mode": "observed"},
+                        "profile": "task-role",
+                        "prompt_template": "Summarise this row in one short sentence.",
+                        "response_field": "summary",
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="results",
+                    plugin="json",
+                    options={"schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(name="Profile-bound wire review", description=""),
+            version=1,
+        )
+
+        turn = _wire_turn(state)
+
+        assert turn["type"] == TurnType.CONFIRM_WIRING.value
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+        llm = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "llm")
+        assert llm["row_cardinality"] == {
+            "input": "one",
+            "output": "zero_or_many",
+            "expected_output_count": None,
+        }
+
+
+def _policy_catalog(*, plugin_allowlist: tuple[str, ...] = ()) -> PolicyCatalogView:
+    """One request's real catalog projection, built from a real snapshot."""
+
+    class _NoSecrets:
+        def has_server_ref(self, name: str) -> bool:
+            return False
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def server_generation(self, name: str) -> str | None:
+            return None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    settings = WebSettings.model_validate(
+        {
+            "composer_max_composition_turns": 4,
+            "composer_max_discovery_turns": 4,
+            "composer_timeout_seconds": 60,
+            "composer_rate_limit_per_minute": 20,
+            "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+            "plugin_allowlist": plugin_allowlist,
+        }
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    catalog = create_catalog_service()
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=catalog,
+        profiles=profiles,
+        principal_scope="local:alice",
+        secret_inventory=_NoSecrets(),
+        generation_key=b"emitter-test-generation-key",
+    )
+    return PolicyCatalogView(catalog, snapshot, profiles)
+
 
 class _SourceCatalog:
     """Catalog stub exposing list_sources for the step-1 single_select path."""
@@ -542,6 +655,32 @@ class TestStep1SourcePicker:
         assert "null" not in option_ids
         assert option_ids == ["csv", "json"]
         assert turn["payload"]["source_blob_compatible_option_ids"] == ["csv", "json"]
+
+    def test_picker_never_offers_a_source_the_web_surface_prohibits(self) -> None:
+        """The first step must not offer a guaranteed dead end.
+
+        The picker lists whatever its catalog projection lists, so the exclusion
+        has to come from the request's availability snapshot rather than a
+        second hardcoded hide-list. With ``source:aws_s3`` authorized for the
+        deployment, a restricted (web) session must not see it, while the local
+        trained-operator projection still does.
+        """
+        restricted = _policy_catalog(plugin_allowlist=("source:aws_s3", "sink:aws_s3"))
+
+        turn = build_initial_step_1_turn(_empty_state(), blob_inspection=None, catalog=restricted)
+
+        option_ids = [opt["id"] for opt in turn["payload"]["options"]]
+        assert "aws_s3" not in option_ids
+        assert "csv" in option_ids
+        assert "aws_s3" not in turn["payload"]["source_blob_compatible_option_ids"]
+
+        catalog = create_catalog_service()
+        trained_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        trained = PolicyCatalogView.for_trained_operator(catalog, trained_snapshot)
+
+        trained_turn = build_initial_step_1_turn(_empty_state(), blob_inspection=None, catalog=trained)
+
+        assert "aws_s3" in [opt["id"] for opt in trained_turn["payload"]["options"]]
 
 
 class _SinkCatalog:

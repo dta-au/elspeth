@@ -69,6 +69,7 @@ from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
     RAW_HTML_CLEANUP_USER_TERM,
 )
+from elspeth.web.provider_config_policy import AWS_S3_SOURCE_POLICY_ERROR
 
 _AUTHORING_VALIDATION_COUNTER = metrics.get_meter("elspeth.web.composer.tools").create_counter(
     "composer.authoring_validation.total",
@@ -705,6 +706,18 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Ask the operator for the deployment's abuse contact email and scraping reason, or leave the http block for the operator "
         "to fill — never invent an email or domain.",
     ),
+    # Deployment security policy, not a wiring mistake: no repair to the
+    # candidate can make an aws_s3 SOURCE acceptable on the web surface, so the
+    # explanation must say so outright or the planner burns its whole repair
+    # budget re-authoring the same rejected source. Explanation and fix are the
+    # SAME pair the authoritative gate emits (``AWS_S3_SOURCE_POLICY_ERROR`` and
+    # the suggestion in ``web.execution.validation``); the constant is imported
+    # rather than restated so the copy cannot drift from the policy it explains.
+    (
+        r"aws_s3_source_not_allowed|Web-authored aws_s3 sources are disabled",
+        AWS_S3_SOURCE_POLICY_ERROR,
+        "Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads.",
+    ),
 )
 
 
@@ -782,6 +795,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # A revision candidate netting zero transform nodes drew one coded nudge
     # instead of silently shipping a passthrough with aspirational metadata.
     "proposal_missing_requested_transforms",
+    # ── Deployment policy refusal (F14b, 2026-07-31) ───────────────────────
+    # Reaches planner feedback from the authoritative source gate; the planner
+    # must learn the refusal is categorical rather than repair around it.
+    "aws_s3_source_not_allowed",
 )
 
 

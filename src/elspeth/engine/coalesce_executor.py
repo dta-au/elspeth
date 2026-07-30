@@ -30,7 +30,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
-from elspeth.contracts.union_merge import merge_union_contracts
+from elspeth.contracts.union_merge import merge_union_contracts, resolve_original_name_collisions
 from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
@@ -224,7 +224,7 @@ def _merge_with_original_names(
 
     return SchemaContract(
         mode=precomputed.mode,
-        fields=tuple(merged_fields),
+        fields=resolve_original_name_collisions(merged_fields),
         locked=precomputed.locked,
     )
 

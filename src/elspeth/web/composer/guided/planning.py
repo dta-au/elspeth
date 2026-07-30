@@ -39,6 +39,11 @@ from elspeth.web.composer.guided.stage_subjects import (
     SubjectPresenceConstraint,
 )
 from elspeth.web.composer.guided.state_machine import ComponentTarget, DeferredStageIntent, GuidedSession
+from elspeth.web.composer.guided_blob_refs import (
+    reviewed_schema_declared_field_names,
+    reviewed_schema_mode,
+    reviewed_source_is_blob_bound,
+)
 from elspeth.web.composer.pipeline_proposal import PipelineProposal
 from elspeth.web.composer.state import CompositionState, NodeSpec
 
@@ -418,11 +423,27 @@ def guided_redacted_planner_context(guided: GuidedSession) -> dict[str, object]:
                 "name": source.name,
                 "plugin": source.plugin,
                 "observed_columns": list(source.observed_columns),
+                # A reviewed source's schema mode and declared field names are
+                # the same class of fact as an output's schema_mode /
+                # required_fields below, and the planner needs them for the
+                # same reason: without them a form-authored explicit schema
+                # arrives as option_keys alone, so the planner cannot see which
+                # fields exist and proposes topology that reads none of them
+                # (or none at all). Names and modes only — never a declared
+                # type, a path, or any other option value.
+                "schema_mode": reviewed_schema_mode(schema),
+                "declared_fields": list(reviewed_schema_declared_field_names(schema)),
                 "option_keys": sorted(source.options),
+                # Boolean only: the reference, path, and blob id stay server-side
+                # (elspeth-0762539db5). Absence of the fact is not the same as an
+                # unbound source, and the planner reads inline-data proposals
+                # differently from storage-backed ones.
+                "server_storage_bound": reviewed_source_is_blob_bound(source.options),
                 "on_validation_failure": source.on_validation_failure,
             }
             for stable_id in guided.source_order
             for source in (guided.reviewed_sources[stable_id],)
+            for schema in (source.options.get("schema"),)
         ],
         "outputs": [
             {

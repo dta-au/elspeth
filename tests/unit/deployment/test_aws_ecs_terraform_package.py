@@ -15,6 +15,7 @@ import pytest
 import yaml
 
 from elspeth.web._aws_ecs_acceptance import scenario_inventory, task_definition
+from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE = REPO_ROOT / "deploy" / "aws-ecs" / "terraform"
@@ -290,6 +291,35 @@ def test_scenario_web_plugin_allowlist_exposes_textract_to_composer() -> None:
 
     assert allowlist_match is not None
     assert '"transform:aws_textract_document_analysis"' in allowlist_match.group("body")
+
+
+def test_scenario_allowlist_keeps_the_s3_source_authorization_the_web_surface_declines() -> None:
+    """``source:aws_s3`` stays in the default allowlist deliberately.
+
+    The deployment authorizes S3 reads for its own runtime (batch/CLI, local
+    trained-operator sessions). The web authoring surface refuses them, and
+    ``build_plugin_snapshot`` now declines that authorization with
+    ``WEB_SURFACE_PROHIBITED`` — so the declared entry surfaces as a visible
+    declined authorization instead of a selectable plugin, and deleting the
+    line would silently narrow the runtime posture to fix a web-surface
+    problem the code already fixes.
+
+    The pairing is what matters: if the code-side ban ever goes away, this
+    allowlist entry becomes a live web-surface exposure and the decision must
+    be revisited rather than inherited.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+    allowlist_match = re.search(
+        r"default_plugin_allowlist\s*=\s*\[(?P<body>.*?)\]",
+        locals_text,
+        re.DOTALL,
+    )
+
+    assert allowlist_match is not None
+    body = allowlist_match.group("body")
+    assert '"source:aws_s3"' in body
+    assert '"sink:aws_s3"' in body
+    assert web_aws_s3_source_policy_error("aws_s3") is not None
 
 
 def test_web_plugin_policy_is_operator_configurable() -> None:

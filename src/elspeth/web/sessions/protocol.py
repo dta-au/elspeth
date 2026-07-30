@@ -1457,7 +1457,15 @@ class GuidedStateOperationCommand:
         ):
             raise AuditIntegrityError("GuidedStateOperationCommand.invalidated_pending_proposal must be exact or None")
         if self.invalidated_pending_proposal is not None and self.deferred_intent_action is None:
-            raise AuditIntegrityError("Pending proposal invalidation requires an exact deferred intent action")
+            # Closed producer set for clearing pending proposal authority:
+            # deferred-intent management (rewind) or a terminal checkpoint
+            # (exit-to-freeform, the binding-exempt universal escape). The
+            # settlement re-verifies the exact transition either way.
+            composer_meta = self.state.composer_meta
+            guided_meta = composer_meta.get("guided_session") if isinstance(composer_meta, Mapping) else None
+            terminal = guided_meta.get("terminal") if isinstance(guided_meta, Mapping) else None
+            if terminal is None:
+                raise AuditIntegrityError("Pending proposal invalidation requires a deferred intent action or a terminal exit checkpoint")
 
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:

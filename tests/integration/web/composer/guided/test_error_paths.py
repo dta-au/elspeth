@@ -321,7 +321,10 @@ def test_completed_exit_reentry_fails_closed_on_corrupt_marker(
     response = _reenter_raw(composer_test_client, session_id)
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     after_record, _state = _current_state(composer_test_client, session_id)
     after_meta = dict(deep_thaw(after_record.composer_meta))
     assert after_meta["guided_completed_terminal_before_user_exit"] == corrupt_marker

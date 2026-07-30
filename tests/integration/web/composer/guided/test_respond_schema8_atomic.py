@@ -149,12 +149,23 @@ def _payload_file_count(client: TestClient) -> int:
     return sum(path.is_file() for path in client.app.state.payload_store.base_path.rglob("*"))
 
 
-def _enable_aws_s3_source(client: TestClient) -> None:
+_NON_FILE_SOURCE = "azure_blob"
+
+
+def _enable_non_file_source(client: TestClient) -> None:
+    """Authorize one blob-inspection-INCOMPATIBLE source for this deployment.
+
+    These tests only need a source that cannot be schema-inspected from an
+    uploaded file. ``aws_s3`` used to play that role, but the web authoring
+    surface now declines it categorically (``WEB_SURFACE_PROHIBITED``), so it is
+    never offered or selectable in a web session — the subject here is the
+    non-file selection path, not the S3 policy.
+    """
     settings = client.app.state.settings.model_copy(
         update={
             "plugin_allowlist": (
                 *client.app.state.settings.plugin_allowlist,
-                "source:aws_s3",
+                f"source:{_NON_FILE_SOURCE}",
             )
         }
     )
@@ -555,7 +566,7 @@ def test_source_selection_without_blob_identity_does_not_fall_back_to_latest_upl
 def test_non_file_source_without_blob_identity_ignores_one_unrelated_ready_blob(
     composer_test_client: TestClient,
 ) -> None:
-    _enable_aws_s3_source(composer_test_client)
+    _enable_non_file_source(composer_test_client)
     session_id = _create_session(composer_test_client)
     uploaded = composer_test_client.post(
         f"/api/sessions/{session_id}/blobs/inline",
@@ -563,15 +574,15 @@ def test_non_file_source_without_blob_identity_ignores_one_unrelated_ready_blob(
     )
     assert uploaded.status_code == 201, uploaded.json()
     turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
-    assert "aws_s3" in {option["id"] for option in turn["payload"]["options"]}
+    assert _NON_FILE_SOURCE in {option["id"] for option in turn["payload"]["options"]}
 
     response = composer_test_client.post(
         f"/api/sessions/{session_id}/guided/respond",
-        json=_live_body(turn, chosen=["aws_s3"]),
+        json=_live_body(turn, chosen=[_NON_FILE_SOURCE]),
     )
 
     assert response.status_code == 200, response.json()
-    assert response.json()["next_turn"]["payload"]["plugin"] == "aws_s3"
+    assert response.json()["next_turn"]["payload"]["plugin"] == _NON_FILE_SOURCE
     intents = response.json()["composition_state"]["composer_meta"]["guided_session"]["pending_source_intents"]
     assert next(iter(intents.values()))["inspection_facts"] is None
 
@@ -579,7 +590,7 @@ def test_non_file_source_without_blob_identity_ignores_one_unrelated_ready_blob(
 def test_non_file_source_rejects_explicit_incompatible_blob_before_reservation(
     composer_test_client: TestClient,
 ) -> None:
-    _enable_aws_s3_source(composer_test_client)
+    _enable_non_file_source(composer_test_client)
     session_id = _create_session(composer_test_client)
     uploaded = composer_test_client.post(
         f"/api/sessions/{session_id}/blobs/inline",
@@ -587,13 +598,13 @@ def test_non_file_source_rejects_explicit_incompatible_blob_before_reservation(
     )
     assert uploaded.status_code == 201, uploaded.json()
     turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
-    assert "aws_s3" in {option["id"] for option in turn["payload"]["options"]}
+    assert _NON_FILE_SOURCE in {option["id"] for option in turn["payload"]["options"]}
 
     response = composer_test_client.post(
         f"/api/sessions/{session_id}/guided/respond",
         json=_live_body(
             turn,
-            chosen=["aws_s3"],
+            chosen=[_NON_FILE_SOURCE],
             source_blob_id=uploaded.json()["id"],
         ),
     )
@@ -694,7 +705,10 @@ def test_source_selection_fails_closed_when_read_bytes_do_not_match_fetched_hash
         composer_test_client.app.state.blob_service = original_blob_service
 
     assert response.status_code == 500, response.json()
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert _respond_operation_count(composer_test_client, session_id) == 0
 
 
@@ -948,7 +962,10 @@ def test_step3_matching_proposal_binding_requires_durable_payload_before_reserva
     )
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert _respond_operation_count(composer_test_client, session_id) == 0
 
 
@@ -1177,7 +1194,10 @@ def test_preflight_invariant_is_sanitized_without_reservation_or_mutation(
         response = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert secret_canary not in response.text
     entry = next(log for log in logs if log["event"] == "guided.invariant_violated")
     assert entry["exc_class"] == "InvariantError"
@@ -1239,7 +1259,10 @@ def test_orphan_wire_occurrence_fails_closed_before_reservation_or_mutation(
     response = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert _respond_operation_count(composer_test_client, session_id) == 0
     assert asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id))) == versions_before
     assert asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None)) == messages_before

@@ -17,24 +17,28 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Callable, Coroutine, Mapping
+import traceback
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from uuid import UUID
 
 import structlog
 from opentelemetry import metrics
 from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.cli import ProgressEvent
-from elspeth.contracts.enums import RunStatus
+from elspeth.contracts.enums import NodeStateStatus, RunStatus
 from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
@@ -47,6 +51,7 @@ from elspeth.core.blobs_inline import (
 from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.core.events import EventBus
 from elspeth.core.landscape.run_lifecycle_repository import is_valid_sha256_hex
+from elspeth.core.landscape.schema import node_states_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.core.secrets import SecretResolutionError
 from elspeth.engine.orchestrator.core import Orchestrator
@@ -188,12 +193,155 @@ def _sanitize_error_for_client(exc: BaseException) -> str:
     details. Broad built-ins such as ValueError, TypeError, and KeyError
     are reduced to a generic class-name message because their str() output
     can carry validation structure, function signatures, and internal keys.
-    The full exception is recorded in runs.error by _run_pipeline's
-    except-BaseException block.
+
+    This is the *live-stream* surface only — it is the ``detail`` on the
+    ``failed`` SSE event. The operator-facing detail is assembled separately
+    by :func:`_operator_failure_diagnostic` and persisted to ``runs.error``
+    by _run_pipeline's except-BaseException block.
     """
     if isinstance(exc, SecretResolutionError):
         return "One or more secret references could not be resolved. Check the Secrets panel."
     return f"Pipeline execution failed ({type(exc).__name__})"
+
+
+# Bound on the scrubbed ``str(exc)`` that reaches ``runs.error``. It is the
+# only unbounded component of the operator diagnostic — a Pydantic
+# validation error or a provider response body can run to many kilobytes,
+# and ``runs.error`` is a single text column rendered inline in the runs view.
+_MAX_OPERATOR_EXC_MESSAGE_CHARS = 500
+# Structural frames kept from the traceback tail. The fault surfaces at the
+# *end* of the stack, so the tail is the informative slice.
+_MAX_OPERATOR_TRACEBACK_FRAMES = 10
+# Bound on the ``__cause__`` / ``__context__`` walk.
+_MAX_EXC_CLASS_CHAIN = 5
+# Package directory that anchors a repo-relative frame path.
+_FRAME_PACKAGE_ROOT = "elspeth"
+# Hard cap on path components in a rendered frame. The anchor below is a
+# readability preference; this cap is the actual disclosure guarantee.
+_MAX_FRAME_PATH_PARTS = 4
+
+
+def _exception_class_chain(exc: BaseException, *, limit: int = _MAX_EXC_CLASS_CHAIN) -> list[str]:
+    """Return ``exc``'s class-name chain, following ``__cause__`` / ``__context__``.
+
+    Class names carry the fault topology (what wrapped what) with none of
+    the payload: an exception's ``str()`` may embed SQLAlchemy ``[SQL: ...]``
+    / ``[parameters: ...]`` fragments, Tier-3 sanitizer output, or rendered
+    source via a chained cause. The walk is bounded on both length and
+    object identity — ``__context__`` cycles are rare but possible.
+
+    Shared by the ``_run_pipeline`` except-block diagnostic and
+    ``_on_pipeline_done``'s last-resort safety-net log so the two channels
+    describe the same failure the same way.
+    """
+    chain: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and len(chain) < limit:
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        chain.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _structural_frame_path(filename: str) -> str:
+    """Reduce an absolute traceback filename to a bounded relative code path.
+
+    ``traceback.extract_tb`` reports absolute paths, which disclose the
+    deployment layout (home directory, checkout location, virtualenv path)
+    to every reader of ``runs.error``. Frames inside the package render from
+    the package root for readability (``elspeth/web/execution/service.py``);
+    everything else degrades to the bare filename.
+
+    The trailing-component cap, not the anchor, is what makes this safe:
+    the anchor is a *preference* and can over-match (a checkout directory
+    may itself be named ``elspeth``), so the result is unconditionally
+    truncated to its last ``_MAX_FRAME_PATH_PARTS`` components. No absolute
+    path and no unbounded prefix can survive that.
+    """
+    parts = PurePath(filename).parts
+    if _FRAME_PACKAGE_ROOT in parts:
+        # Last occurrence: for ``/home/x/elspeth/src/elspeth/web/...`` it is
+        # the package directory, not the checkout, that names the module.
+        start = len(parts) - 1 - parts[::-1].index(_FRAME_PACKAGE_ROOT)
+        parts = parts[start:]
+    else:
+        parts = (PurePath(filename).name,)
+    return "/".join(parts[-_MAX_FRAME_PATH_PARTS:])
+
+
+def _structural_traceback_frames(exc: BaseException, *, limit: int = _MAX_OPERATOR_TRACEBACK_FRAMES) -> list[str]:
+    """Return the tail of ``exc``'s traceback as ``file:line:function`` strings.
+
+    Code structure only. ``FrameSummary.line`` (the rendered source text) and
+    frame locals are deliberately dropped: source text and locals can carry
+    literals, credentials, and row payloads — exactly the material the audit
+    trail keeps out of the run-level error column. A file/line/function
+    triple names *where* the fault surfaced without quoting anything.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    return [f"{_structural_frame_path(frame.filename)}:{frame.lineno}:{frame.name}" for frame in frames[-limit:]]
+
+
+def _scrubbed_exception_message(exc: BaseException) -> str:
+    """Return ``str(exc)`` secret-scrubbed and length-bounded.
+
+    ``scrub_text_for_audit`` replaces the whole string when it matches a
+    candidate-secret pattern (partial redaction leaks structure), so a
+    message carrying a token becomes the redaction marker rather than a
+    truncated token. Truncation is applied after scrubbing — it is a bound,
+    never a redaction mechanism.
+    """
+    scrubbed = scrub_text_for_audit(str(exc)).strip()
+    if len(scrubbed) > _MAX_OPERATOR_EXC_MESSAGE_CHARS:
+        return scrubbed[: _MAX_OPERATOR_EXC_MESSAGE_CHARS - 1].rstrip() + "…"
+    return scrubbed
+
+
+def _operator_failure_diagnostic(
+    *,
+    class_chain: Sequence[str],
+    exc_message: str,
+    node_id: str | None,
+    frames: Sequence[str],
+) -> str:
+    """Assemble the operator-facing text persisted to ``runs.error``.
+
+    Sibling of :func:`_sanitize_error_for_client` and deliberately NOT the
+    same string. Before this split both surfaces carried the bare
+    ``"Pipeline execution failed (ValueError)"`` message, so a web run
+    failure recorded the fault's *class* and nothing else — while the engine
+    had already written the full exception, its type, and the failing node to
+    the Landscape ``node_states`` row. An operator reading the runs view got
+    39 characters; the evidence existed but never reached them.
+
+    ``runs.error`` is the operator surface, so it carries what an operator
+    needs to act: which class chain fired, what it said, which node died,
+    and where in the code it surfaced. Precedent for richer text in this
+    column is :func:`_structural_failure_message`, which inlines per-row
+    failure samples read back from Landscape; the REST diagnostics
+    projection makes the same call for raw operation error text (see
+    ``diagnostics.llm_safe_diagnostics_snapshot``, which re-scrubs at the
+    LLM boundary rather than starving the operator UI).
+
+    Every component is bounded and secret-scrubbed by its producer, and none
+    of them echoes a row payload. The live SSE ``detail`` stays sanitized.
+    """
+    lines = [f"Pipeline execution failed ({class_chain[0]})"]
+    if len(class_chain) > 1:
+        lines.append(f"Exception chain (outermost first): {' <- '.join(class_chain)}")
+    if exc_message:
+        lines.append(f"Message: {exc_message}")
+    if node_id is not None:
+        lines.append(f"Failing node: {node_id}")
+    else:
+        lines.append("Failing node: not recorded (failure occurred before any node reached a FAILED state)")
+    if frames:
+        lines.append("Structural traceback (most recent call last):")
+        lines.extend(f"  • {frame}" for frame in frames)
+    return "\n".join(lines)
 
 
 def _schema_contract_violation_errors(exc: PydanticValidationError) -> list[dict[str, str]]:
@@ -1859,6 +2007,36 @@ class ExecutionServiceImpl:
                     schema_errors=_schema_contract_violation_errors(exc),
                 )
 
+            # Operator-diagnostic split.  ``client_msg`` above is the
+            # live-stream surface and stays sanitized; the audit row and the
+            # operator log get the detail the engine already holds.
+            #
+            # Signals (KeyboardInterrupt / SystemExit) are excluded from the
+            # whole block for the same reason the status update below skips
+            # them: the event loop is shutting down, so this is not the moment
+            # to open an audit read or do avoidable work.  A signal-killed run
+            # therefore reports ``node_id=None``, which is honest — the run
+            # was interrupted, not failed at a node.
+            exc_is_signal = isinstance(exc, (KeyboardInterrupt, SystemExit))
+            failed_node_id: str | None = None
+            if not exc_is_signal:
+                failed_node_id = self._lookup_failed_node_id(landscape_db, run_id=run_id)
+                # Unconditional (both terminality branches below): this is the
+                # only channel carrying the scrubbed message, the failing node,
+                # and the frame list.  It is NOT a duplicate of
+                # ``_on_pipeline_done``'s safety net — that callback fires from
+                # the Future with no run_id, no node id, and no Landscape
+                # handle, so it can only ever emit the class chain.
+                slog.error(
+                    "run_pipeline_failed",
+                    run_id=run_id,
+                    exc_class=type(exc).__name__,
+                    exc_class_chain=_exception_class_chain(exc),
+                    exc_message=_scrubbed_exception_message(exc),
+                    failed_node_id=failed_node_id,
+                    traceback_frames=_structural_traceback_frames(exc),
+                )
+
             # elspeth-879f6de6bd: when an exception fires AFTER the success
             # path has already committed a terminal status (post-completion
             # broadcast crash, audit-write failure, telemetry exhaustion,
@@ -1900,7 +2078,7 @@ class ExecutionServiceImpl:
             # narrower fix for that asymmetry is tracked separately if
             # observed in the wild.
             run_already_terminal = False
-            if not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            if not exc_is_signal:
                 probe_outcome = self._probe_run_already_terminal(
                     run_uuid,
                     run_id=run_id,
@@ -1916,31 +2094,39 @@ class ExecutionServiceImpl:
                     # operator-visible outcome and there is nothing more to
                     # record on the audit side.
                     #
-                    # We deliberately do NOT slog here.  Per
+                    # We deliberately do NOT add a slog *at this site*.  Per
                     # ``logging-telemetry-policy`` the logger is not for
                     # post-audit operational signal — the SRE-discoverable
-                    # surface for this scenario is already two existing
-                    # channels:
+                    # surface for this scenario is already three channels:
                     #   1. The audit ``runs`` row (queryable by run_id) —
                     #      carries the truthful terminal status the run
                     #      reached before the post-audit exception.
-                    #   2. ``_on_pipeline_done``'s safety-net slog
+                    #   2. ``run_pipeline_failed`` — emitted unconditionally
+                    #      at the top of this handler for every non-signal
+                    #      failure, so the class chain, the scrubbed message,
+                    #      the failing node, and the structural frames are
+                    #      already recorded against this run_id even though
+                    #      the audit row cannot legally be updated.
+                    #   3. ``_on_pipeline_done``'s safety-net slog
                     #      (``pipeline_done_callback_exception``) — fires
                     #      against the re-raised ``exc`` once the Future
-                    #      completes, with the same class-name chain we
-                    #      would otherwise have walked here.
+                    #      completes, with the same class-name chain.
                     # Together these give an SRE the post-audit signal
-                    # (correlate the two by run_id) without violating
-                    # audit primacy at this site.  Adding a third slog
-                    # at this site would be operational noise that
-                    # duplicates the safety-net log without contributing
-                    # signal beyond the audit row.
+                    # (correlate them by run_id) without violating audit
+                    # primacy at this site.  A fourth log here would be
+                    # operational noise contributing nothing beyond the
+                    # three above.
                     pass
                 else:
                     try:
                         status_update_exc_class = self._persist_failed_run_status(
                             run_uuid,
-                            error=client_msg,
+                            error=_operator_failure_diagnostic(
+                                class_chain=_exception_class_chain(exc),
+                                exc_message=_scrubbed_exception_message(exc),
+                                node_id=failed_node_id,
+                                frames=_structural_traceback_frames(exc),
+                            ),
                         )
                     except IllegalRunTransitionError as irte:
                         # elspeth-879f6de6bd recovery branch 3 (probe-failed
@@ -1999,8 +2185,11 @@ class ExecutionServiceImpl:
                         # that transient over the original pipeline exception.
                         if status_update_exc_class is not None:
                             # Class names only: ``str(status_err)`` can surface
-                            # SQL + bound parameters + ``__cause__`` credentials,
-                            # and ``client_msg`` is already sanitized.
+                            # SQL + bound parameters + ``__cause__`` credentials.
+                            # The original exception's own detail is already
+                            # recorded by ``run_pipeline_failed`` above (scrubbed
+                            # and bounded); this record is about the *status
+                            # update* failing, so it adds only its own class.
                             slog.error(
                                 "run_status_update_failed_in_except",
                                 run_id=run_id,
@@ -2020,6 +2209,13 @@ class ExecutionServiceImpl:
             # and violate the audit-primacy constraint in CLAUDE.md.
             # Re-emitting the *correct* terminal SSE event for consumer
             # continuity is a separate UX improvement.
+            #
+            # ``detail`` stays ``client_msg`` — this is the live client
+            # surface, and the operator detail belongs on ``runs.error``.
+            # ``node_id`` is the exception: naming which node died is
+            # structural (a graph node the author wrote), carries no payload,
+            # and is what lets the run panel highlight the failing step
+            # instead of only reporting that the run failed.
             if not run_already_terminal:
                 self._persist_and_broadcast_run_event(
                     run_id,
@@ -2027,7 +2223,7 @@ class ExecutionServiceImpl:
                         run_id=run_id,
                         timestamp=datetime.now(tz=UTC),
                         event_type="failed",
-                        data=FailedData(detail=client_msg, node_id=None),
+                        data=FailedData(detail=client_msg, node_id=failed_node_id),
                     ),
                 )
             raise
@@ -2092,6 +2288,60 @@ class ExecutionServiceImpl:
                 exc_info=True,
             )
             return _FailureSampleEnrichmentOutcome(samples_text="", failed=True)
+
+    def _lookup_failed_node_id(self, landscape_db: LandscapeDB | None, *, run_id: str) -> str | None:
+        """Return the node_id of the run's most recent FAILED node state.
+
+        The engine already records failures against the node that died — the
+        coalesce and transform executors write a FAILED ``node_states`` row
+        carrying the exception, its type, and the phase. Reading the node_id
+        back here is what lets ``runs.error`` and the ``failed`` SSE event
+        name *where* the run died rather than only *that* it did.
+
+        The web run_id IS the Landscape run_id (``orchestrator.run`` is called
+        with ``run_id=run_id``, and ``update_run_status`` records the same
+        value as ``landscape_run_id``), so no second identifier is threaded.
+
+        Returns ``None`` — never raises — when the answer is unavailable:
+        the run failed before Landscape was opened, no node reached a FAILED
+        state (a setup or pre-ingest failure), or the audit DB is degraded.
+        This runs inside ``_run_pipeline``'s exception recovery, where anything
+        escaping would replace the original pipeline exception; the narrow
+        ``(SQLAlchemyError, OSError)`` catch mirrors ``_enrich_failure_samples``
+        and ``_probe_run_already_terminal`` on the same recovery path.
+        """
+        if landscape_db is None:
+            return None
+        stmt = (
+            select(node_states_table.c.node_id)
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.status == NodeStateStatus.FAILED,
+            )
+            .order_by(
+                node_states_table.c.completed_at.desc(),
+                node_states_table.c.state_id.desc(),
+            )
+            .limit(1)
+        )
+        try:
+            with landscape_db.read_only_connection() as conn:
+                # Row iteration over a LIMIT-1 select, mirroring
+                # ``load_top_failure_samples``: an empty result simply yields
+                # nothing and falls through to the ``None`` return, so
+                # "no FAILED node" needs no separate branch.
+                for (node_id,) in conn.execute(stmt):
+                    return str(node_id)
+        except (SQLAlchemyError, OSError):
+            # Audit-system degradation — the slog exemption applies (see
+            # ``_enrich_failure_samples``). The diagnostic degrades to a
+            # node-less error message; the run still records as failed.
+            slog.warning(
+                "failed_node_id_lookup_failed",
+                run_id=run_id,
+                exc_info=True,
+            )
+        return None
 
     def _probe_run_already_terminal(
         self,
@@ -2239,13 +2489,26 @@ class ExecutionServiceImpl:
         Fires when the Future completes. Retrieves (and suppresses) any
         exception so the thread pool doesn't log it to stderr.
 
-        Normal case: _run_pipeline() already recorded the error to the
-        audit trail (runs.error) — no duplicate logging needed.
+        Normal case: _run_pipeline() already recorded the operator diagnostic
+        (class chain, scrubbed message, failing node, structural frames) to
+        both ``runs.error`` and the ``run_pipeline_failed`` log — this
+        callback adds only the class chain on top.
 
         Edge case: if _run_pipeline's own except-BaseException handler
         failed (e.g. update_run_status raised), the audit trail write
         never completed. In that case this callback is the ONLY place
         the failure surfaces, so we log as a last-resort safety net.
+
+        Class names only, deliberately. This callback runs off the Future
+        with no run_id, no Landscape handle, and no failing-node context, so
+        it cannot correlate a message to a run; and pipeline exceptions may
+        chain SQLAlchemyError (``[SQL: ...]`` / ``[parameters: ...]``),
+        Tier-3 sanitizer output, or source-rendering fragments through
+        ``__cause__`` / ``__context__``. Censor-by-length (``[:200]``) is not
+        redaction — the prefix still carries Tier-3 material. Where a message
+        IS wanted it is scrubbed through ``scrub_text_for_audit`` at the
+        ``run_pipeline_failed`` site, which is a redaction mechanism rather
+        than a truncation; this site keeps the class chain alone.
         """
         exc = future.exception()
         if exc is not None and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -2254,29 +2517,10 @@ class ExecutionServiceImpl:
             # it means _run_pipeline re-raised — the slog call may or
             # may not have succeeded.  One extra last-resort log line is
             # acceptable to ensure the failure is never invisible.
-            #
-            # Class names only (no ``str(exc)``): pipeline exceptions may
-            # chain SQLAlchemyError ([SQL: ...] / [parameters: ...]),
-            # Tier-3 sanitizer output, or source-rendering fragments via
-            # ``__cause__`` / ``__context__``. Censor-by-length (``[:200]``)
-            # is not redaction — the prefix still carries Tier-3 material.
-            # The chain walk preserves the diagnostic signal (fault
-            # topology) without the payload.
-            exc_class_chain: list[str] = []
-            current: BaseException | None = exc
-            seen: set[int] = set()
-            while current is not None and len(exc_class_chain) < 5:
-                if id(current) in seen:
-                    # ``__context__`` cycles are rare but possible;
-                    # bound the walk defensively.
-                    break
-                seen.add(id(current))
-                exc_class_chain.append(type(current).__name__)
-                current = current.__cause__ or current.__context__
             slog.error(
                 "pipeline_done_callback_exception",
                 exc_type=type(exc).__name__,
-                exc_class_chain=exc_class_chain,
+                exc_class_chain=_exception_class_chain(exc),
             )
 
     def _to_run_event(self, run_id: str, progress: ProgressEvent) -> RunEvent:
