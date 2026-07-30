@@ -1754,7 +1754,13 @@ class BlobServiceImpl:
                 if not storage.exists():
                     raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path)
 
-                data = storage.read_bytes()
+                try:
+                    data = storage.read_bytes()
+                except FileNotFoundError:
+                    # The file may be deleted after the existence guard but
+                    # before the descriptor is acquired. Preserve the blob
+                    # lifecycle error contract for that raced deletion.
+                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
 
                 # Integrity verification — Tier 1: our data must be pristine.
                 # A ready blob must always have a content_hash — it is set
@@ -1878,7 +1884,14 @@ class BlobServiceImpl:
                 if not storage.exists():
                     raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path)
 
-                with storage.open("rb") as handle:
+                try:
+                    handle = storage.open("rb")
+                except FileNotFoundError:
+                    # The file may be deleted after the existence guard but
+                    # before the descriptor is acquired. Preserve the blob
+                    # lifecycle error contract for that raced deletion.
+                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
+                with handle:
                     data = handle.read(limit_bytes + 1)
                 return data[:limit_bytes], len(data) > limit_bytes
 
@@ -2180,7 +2193,13 @@ class BlobServiceImpl:
                 storage = Path(storage_path)
                 if not storage.exists():
                     raise BlobContentMissingError(str(source_blob_id), storage_path=storage_path)
-                return storage.read_bytes()
+                try:
+                    return storage.read_bytes()
+                except FileNotFoundError:
+                    # The file may be deleted after the existence guard but
+                    # before the descriptor is acquired. Preserve the blob
+                    # lifecycle error contract for that raced deletion.
+                    raise BlobContentMissingError(str(source_blob_id), storage_path=storage_path) from None
 
             content = await _await_fork_copy_io_with_checkpoints(
                 self._run_sync(_read_frozen_source),

@@ -211,7 +211,9 @@ def _transaction_manifest_key() -> bytes:
 
 def _manifest_hmac(manifest: dict[str, Any]) -> str:
     unsigned = {key: value for key, value in manifest.items() if key != _MANIFEST_HMAC_FIELD}
-    canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    # allow_nan=False leaves finite manifests byte-identical; it refuses to
+    # authenticate a journal whose bytes strict_json_loads would then reject.
+    canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
     return hmac.new(_transaction_manifest_key(), canonical, hashlib.sha256).hexdigest()
 
 

@@ -135,7 +135,14 @@ _ROLLBACK_BASELINE_SESSION_EPOCH = 35
 
 _ROLLBACK_BASELINE_LANDSCAPE_EPOCH = 29
 
-_SCENARIO_B_STRUCTURAL_CHANGES = "session_epoch_35_to_37_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier"
+# Derived from the live epoch constants: a schema bump must rotate the label a
+# compatibility receipt attests, otherwise a stale receipt keeps validating
+# against a transition the candidate no longer performs.
+_SCENARIO_B_STRUCTURAL_CHANGES = (
+    f"session_epoch_{_ROLLBACK_BASELINE_SESSION_EPOCH}_to_{SESSION_SCHEMA_EPOCH}"
+    f"_landscape_epoch_{_ROLLBACK_BASELINE_LANDSCAPE_EPOCH}_to_{SQLITE_SCHEMA_EPOCH}"
+    "_blob_cleanup_guided_decline_and_row_union_barrier"
+)
 
 
 def _expected_schema_facts(scenario_id: str) -> dict[str, object]:

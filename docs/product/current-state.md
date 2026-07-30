@@ -20,9 +20,9 @@ not remain folded into the historical 0.7.1 notes.
 - Current release labels, container examples, website footers, and release
   documentation indexes identify the 0.7.2 line.
 - `CHANGELOG.md` preserves the 0.7.1 session cutover at epoch 35 and assigns
-  epoch-36 blob-deletion cleanup and the epoch-37 guided-plan decline contract
-  to 0.7.2.
-- `SESSION_SCHEMA_EPOCH` is 37, guided checkpoint schema is 10, and
+  epoch-36 blob-deletion cleanup, the epoch-37 guided-plan decline contract,
+  and the epoch-38 decline replay message locator to 0.7.2.
+- `SESSION_SCHEMA_EPOCH` is 38, guided checkpoint schema is 10, and
   `SQLITE_SCHEMA_EPOCH` is 30. An upgrade from 0.7.1 recreates both a stale
   session store and a Landscape store left at epoch 29.
 - No 0.7.2 tag or final release candidate has been published.

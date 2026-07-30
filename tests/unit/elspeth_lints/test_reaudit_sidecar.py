@@ -4,15 +4,29 @@ Covers ``_entry_to_dict`` / ``_entry_from_dict`` — the AllowlistEntry
 serialization boundary used to persist reaudit sidecars. v1 entries bind via
 ``file_fingerprint``; v2 entries bind via ``scope_fingerprint`` and carry a
 ``judge_signature_version``. Both must survive the round trip intact.
+
+Also covers the strict-JSON decoding boundary: the sidecar is Tier-1 audit
+evidence, so the loader must reject the non-JSON numeric constants CPython's
+``json`` accepts by default rather than coerce them into ``float('nan')``.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from elspeth_lints.core.allowlist import AllowlistEntry, JudgeVerdict
-from elspeth_lints.core.reaudit_sidecar import _entry_from_dict, _entry_to_dict
+from elspeth_lints.core.reaudit_sidecar import (
+    SidecarCorruptError,
+    SidecarHeader,
+    _entry_from_dict,
+    _entry_to_dict,
+    _header_to_dict,
+    load_sidecar,
+)
 
 
 def _roundtrip(entry: AllowlistEntry) -> AllowlistEntry:
@@ -114,3 +128,58 @@ def test_sidecar_round_trips_judge_transport() -> None:
 
     restored = _roundtrip(entry)
     assert restored.judge_transport == "claude_agent_sdk"
+
+
+def _write_sidecar(path: Path, *lines: str) -> None:
+    path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+
+
+def _valid_header_line() -> str:
+    header = SidecarHeader(
+        run_id="a" * 32,
+        started_at=datetime(2026, 7, 31, tzinfo=UTC),
+        total_entries=1,
+        allowlist_path="allowlist",
+        allowlist_hash="c" * 64,
+        judge_transport="agent",
+        rule_filter="trust_tier.tier_model",
+        since_iso=None,
+        limit=None,
+        include_pre_judge=False,
+    )
+    return json.dumps(_header_to_dict(header), sort_keys=True)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_load_sidecar_rejects_non_json_numeric_constants(tmp_path: Path, constant: str) -> None:
+    """A durable sidecar line carrying NaN/Infinity is corruption, not data.
+
+    The line is newline-terminated, so the T6c truncated-final-line
+    recovery does not apply: the loader must crash rather than admit a
+    non-finite judge_confidence into the audit reconstruction.
+    """
+    sidecar = tmp_path / "sweep.jsonl"
+    _write_sidecar(
+        sidecar,
+        _valid_header_line(),
+        '{"type": "outcome", "judge_confidence": ' + constant + "}",
+    )
+
+    with pytest.raises(SidecarCorruptError) as exc_info:
+        load_sidecar(sidecar)
+    assert "line 2" in str(exc_info.value)
+    assert "non-JSON numeric constant" in str(exc_info.value)
+
+
+def test_load_sidecar_rejects_duplicate_object_keys(tmp_path: Path) -> None:
+    """Duplicate keys are ambiguous evidence; last-wins coercion is not allowed."""
+    sidecar = tmp_path / "sweep.jsonl"
+    _write_sidecar(
+        sidecar,
+        _valid_header_line(),
+        '{"type": "outcome", "key": "a", "key": "b"}',
+    )
+
+    with pytest.raises(SidecarCorruptError) as exc_info:
+        load_sidecar(sidecar)
+    assert "duplicate JSON object key" in str(exc_info.value)

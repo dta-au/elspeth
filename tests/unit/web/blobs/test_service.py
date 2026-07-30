@@ -3114,6 +3114,43 @@ class TestCopyBlobsForFork:
         assert late.id not in copied
 
     @pytest.mark.asyncio
+    async def test_translates_source_deleted_between_exists_check_and_read(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        monkeypatch,
+    ) -> None:
+        """A source blob deleted mid-copy keeps the blob lifecycle error contract."""
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        write_fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+
+        target = Path(source.storage_path)
+        real_open = Path.open
+        deleted = False
+
+        def delete_then_open(self: Path, *args: object, **kwargs: object) -> object:
+            nonlocal deleted
+            if self == target and not deleted:
+                deleted = True
+                self.unlink()
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", delete_then_open)
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.copy_blobs_for_fork(
+                session_id,
+                target_session_id,
+                plan,
+                write_fence,
+                checkpoint=self._checkpoint,
+            )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("fork_status", ["in_progress", "completed", "failed"])
     async def test_delete_enforces_session_fork_retention_lifecycle(
         self,
@@ -4131,6 +4168,43 @@ class TestReadBlobContentLifecycleGuard:
             await blob_service.read_blob_content(record.id)
 
     @pytest.mark.asyncio
+    async def test_translates_file_deleted_between_exists_check_and_read(
+        self,
+        blob_service,
+        session_id,
+        monkeypatch,
+    ) -> None:
+        """Raced deletion after the existence guard keeps the lifecycle contract.
+
+        Parity with read_blob_content_prefix_verified, whose docstring
+        claims it mirrors this method's guards exactly.
+        """
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="raced-delete.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+        )
+        target = Path(record.storage_path)
+        real_open = Path.open
+        deleted = False
+
+        def delete_then_open(self: Path, *args: object, **kwargs: object) -> object:
+            nonlocal deleted
+            if self == target and not deleted:
+                deleted = True
+                self.unlink()
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", delete_then_open)
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_content(record.id)
+
+    @pytest.mark.asyncio
     async def test_rejects_pending_blob_without_file(self, blob_service, session_id) -> None:
         """Pending blob with no file must raise BlobStateError, not BlobNotFoundError.
 
@@ -4346,6 +4420,73 @@ class TestReadBlobContentPrefixVerifiedStreaming:
         assert prefix == content[: 8 * 1024]
         assert total_size == len(content)
         assert verified_hash == content_hash(content)
+
+
+class TestReadBlobPreviewLifecycleGuard:
+    """The bounded preview shares read_blob_content's missing-file contract."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_ready_blob_with_missing_backing_file(self, blob_service, session_id) -> None:
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="missing.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+        )
+        Path(record.storage_path).unlink()
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_preview(record.id, limit_bytes=8)
+
+    @pytest.mark.asyncio
+    async def test_translates_file_deleted_between_exists_check_and_open(
+        self,
+        blob_service,
+        session_id,
+        monkeypatch,
+    ) -> None:
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="raced-delete.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+        )
+        target = Path(record.storage_path)
+        real_open = Path.open
+        deleted = False
+
+        def delete_then_open(self: Path, *args: object, **kwargs: object) -> object:
+            nonlocal deleted
+            if self == target and not deleted:
+                deleted = True
+                self.unlink()
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", delete_then_open)
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_preview(record.id, limit_bytes=8)
+
+    @pytest.mark.asyncio
+    async def test_previews_bounded_prefix_and_flags_truncation(self, blob_service, session_id) -> None:
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="preview.csv",
+            content=b"0123456789",
+            mime_type="text/csv",
+            created_by="user",
+        )
+
+        data, truncated = await blob_service.read_blob_preview(record.id, limit_bytes=4)
+
+        assert data == b"0123"
+        assert truncated is True
 
 
 # ---------------------------------------------------------------------------
