@@ -81,3 +81,25 @@ async def test_tool_call_and_tool_result_round_trip(gateway_client, chat_headers
     second_choice = second.json()["choices"][0]
     assert second_choice["finish_reason"] == "stop"
     assert second_choice["message"]["content"] == "MOCK:3 widgets in stock"
+
+
+async def test_malformed_tool_call_arguments_rejected_before_upstream(gateway_client, chat_headers, model_alias):
+    """A tool call whose ``arguments`` string is not valid JSON must be
+    rejected as ``invalid_request`` at request-validation time -- before
+    the capability check, the adapter, or the upstream ever run -- so this
+    holds regardless of whether the target adapter declares ``tools``."""
+    body = {
+        "model": model_alias,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "search_catalog", "arguments": "NOT JSON"}}],
+            }
+        ],
+        "tools": [_TOOL_DEF],
+    }
+    response = await gateway_client.post(_CHAT_URL, json=body, headers=chat_headers)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"

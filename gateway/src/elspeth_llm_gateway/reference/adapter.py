@@ -34,7 +34,7 @@ Request body POSTed to ``v1/invoke``::
             "mode": "auto" | "none" | "required" | "named",
             "operation": "<name>"?
         }?,
-        "format": {"kind": "object"} | {"kind": "schema", "schema": {...}}?
+        "format": {"kind": "object"} | {"kind": "schema", "schema": {...}, "strict": <bool>?}?
     }
 
 A conversation entry carries ``text`` when the canonical message has
@@ -44,7 +44,11 @@ prior call. ``directives`` is present only when the request declares tools;
 ``directive_policy`` is present only when the request sets ``tool_choice``
 (``mode`` mirrors it verbatim; ``operation`` is added, from
 ``tool_choice_function``, only when ``mode`` is ``"named"``); ``format`` is
-present only when the request declares a response format.
+present only when the request declares a response format. ``format.strict``
+is present, mirroring ``response_format.strict`` verbatim, only when the
+caller's ``response_format.json_schema.strict`` was set (``true`` or
+``false``); it is omitted entirely (never sent as ``null``) when the caller
+did not set it, and is never present at all for ``{"kind": "object"}``.
 
 Success response body::
 
@@ -207,7 +211,10 @@ class ReferenceV1InvokeAdapter:
             if request.response_format.kind == "json_object":
                 body["format"] = {"kind": "object"}
             else:
-                body["format"] = {"kind": "schema", "schema": request.response_format.json_schema}
+                format_body: dict = {"kind": "schema", "schema": request.response_format.json_schema}
+                if request.response_format.strict is not None:
+                    format_body["strict"] = request.response_format.strict
+                body["format"] = format_body
 
         return InvokePlan(path="v1/invoke", body=body)
 

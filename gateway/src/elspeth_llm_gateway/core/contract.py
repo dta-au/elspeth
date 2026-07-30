@@ -24,9 +24,22 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from elspeth_llm_gateway.core.errors import GatewayError, GatewayErrorCode
+from elspeth_llm_gateway.core.parsing import StrictJsonError, parse_strict_json
 from elspeth_llm_gateway.sdk.types import CanonicalResponse
 
 _VALID_STRING_TOOL_CHOICES = frozenset({"auto", "none", "required"})
+
+# Mirrors GatewayConfig.max_body_bytes's own default (core/config.py). A
+# pydantic field validator has no access to the runtime-configured bound (it
+# runs at model construction, before a GatewayConfig even exists), and a tool
+# call's arguments string can never be larger than the whole request body it
+# is embedded in -- ``_read_capped_body`` already enforces the real,
+# operator-configured ``max_body_bytes`` on the raw body before this model is
+# ever constructed. This fixed constant is therefore a coherent, always-safe
+# pre-bound purely for the JSON-parseability check below; the deployment's
+# own ``max_string_chars`` bound is enforced separately, after construction,
+# by ``bounds_check``.
+_TOOL_CALL_ARGUMENTS_JSON_MAX_BYTES = 1_048_576
 
 
 class ChatFunctionDef(BaseModel):
@@ -49,12 +62,29 @@ class ChatTool(BaseModel):
 
 
 class ChatToolCallFunction(BaseModel):
-    """The function name and JSON-encoded arguments of a requested tool call."""
+    """The function name and JSON-encoded arguments of a requested tool call.
+
+    ``arguments`` must itself parse as strict JSON (the same strictness
+    ``parse_strict_json`` applies to the request body: no duplicate keys, no
+    non-finite numbers, bounded nesting depth) -- an adapter's
+    ``build_invoke`` is entitled to assume it can ``json.loads`` this string
+    unconditionally, so an unparseable value must be rejected here, at the
+    request-validation boundary, rather than surfacing as an adapter crash
+    the core service can only map to a generic internal error.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     name: str
     arguments: str
+
+    @model_validator(mode="after")
+    def _check_arguments_is_strict_json(self) -> Self:
+        try:
+            parse_strict_json(self.arguments.encode("utf-8"), max_bytes=_TOOL_CALL_ARGUMENTS_JSON_MAX_BYTES)
+        except StrictJsonError as exc:
+            raise ValueError(f"arguments must be valid JSON: {exc.reason}") from exc
+        return self
 
 
 class ChatToolCall(BaseModel):

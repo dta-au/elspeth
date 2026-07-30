@@ -181,6 +181,44 @@ async def test_oversized_body_returns_400_invalid_request():
     assert response.json()["error"]["code"] == "invalid_request"
 
 
+def _tool_call_body(arguments: str) -> dict:
+    return {
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": arguments}}],
+            }
+        ],
+    }
+
+
+@respx.mock
+async def test_malformed_tool_call_arguments_returns_400_invalid_request():
+    """A tool call whose ``arguments`` string is not valid JSON must be
+    rejected as a 400 before the adapter (and therefore the upstream) is
+    ever reached -- previously this reached the reference adapter's own
+    ``json.loads(call.arguments_json)`` inside ``build_invoke`` and
+    surfaced as a 500 ``internal_error``."""
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", json=_tool_call_body("NOT JSON"), headers=_headers())
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+@respx.mock
+async def test_valid_tool_call_arguments_returns_200():
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "hello"}, "halt": "complete"}))
+
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", json=_tool_call_body('{"a": 1}'), headers=_headers())
+
+    assert response.status_code == 200
+
+
 # --- capability check ------------------------------------------------------------
 
 

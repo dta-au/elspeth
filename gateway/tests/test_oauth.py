@@ -363,6 +363,25 @@ async def test_non_json_body_raises_oauth_token_unavailable(client):
 
 
 @respx.mock
+async def test_deeply_nested_token_body_raises_oauth_token_unavailable_not_500(client):
+    """A token body that is deeply nested but individually tiny (well under
+    max_response_bytes) must be classified oauth_token_unavailable, not
+    escape as a raw RecursionError -- which the outermost middleware would
+    otherwise turn into a 500 internal_error with retryable=False, inverting
+    this failure's real (retryable) classification. See parse_strict_json's
+    own depth guard in core/parsing.py."""
+    deeply_nested = "[" * 2000 + "]" * 2000
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, text=deeply_nested))
+    config = _config()
+    manager = TokenManager(config, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await manager.get_token()
+
+    _assert_leak_free(exc_info.value)
+
+
+@respx.mock
 async def test_non_object_json_body_raises_oauth_token_unavailable(client):
     respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=["not", "an", "object", BODY_SENTINEL]))
     config = _config()

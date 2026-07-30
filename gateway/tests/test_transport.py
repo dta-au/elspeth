@@ -396,6 +396,25 @@ async def test_2xx_body_that_fails_strict_parse_raises_upstream_response_invalid
 
 
 @respx.mock
+async def test_deeply_nested_2xx_body_raises_upstream_response_invalid_not_500(client):
+    """A 2xx body that is deeply nested but individually tiny (well under
+    max_response_bytes) must be classified upstream_response_invalid, not
+    escape as a raw RecursionError that the outermost middleware would
+    otherwise turn into a 500 internal_error -- see parse_strict_json's own
+    depth guard in core/parsing.py."""
+    _mock_tokens("tok-1")
+    deeply_nested = "[" * 2000 + "]" * 2000
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, text=deeply_nested))
+    config = _config()
+    transport = _transport(config, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await transport.invoke(_plan())
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+
+
+@respx.mock
 async def test_oversized_2xx_body_raises_response_invalid_without_full_buffering(client):
     """Response body exceeding max_response_bytes (here 2x the cap) must never
     be fully buffered: the custom stream raises if more bytes than a small

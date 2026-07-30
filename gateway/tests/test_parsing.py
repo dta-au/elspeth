@@ -42,3 +42,25 @@ def test_overflow_float_in_array_rejected():
 
 def test_normal_float_still_parses():
     assert parse_strict_json(b'{"t": 1.5}', max_bytes=100) == {"t": 1.5}
+
+
+def test_deeply_nested_but_small_body_rejected_as_too_deep_not_recursion_error():
+    """A deeply-nested-but-individually-tiny payload (well under max_bytes)
+    must be rejected with StrictJsonError(reason="too_deep") -- never let a
+    raw RecursionError escape parse_strict_json, since every caller in this
+    codebase only catches StrictJsonError."""
+    deeply_nested = b"[" * 2000 + b"]" * 2000
+    with pytest.raises(StrictJsonError) as exc:
+        parse_strict_json(deeply_nested, max_bytes=1_000_000)
+    assert exc.value.reason == "too_deep"
+
+
+def test_shallow_nesting_still_parses():
+    shallow = b"[" * 10 + b"1" + b"]" * 10
+    result = parse_strict_json(shallow, max_bytes=1000)
+    depth = 0
+    node = result
+    while isinstance(node, list):
+        depth += 1
+        node = node[0]
+    assert depth == 10

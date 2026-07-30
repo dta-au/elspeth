@@ -7,11 +7,13 @@ tracebacks, and internal identifiers from ever reaching a caller through an
 error path — callers only ever see one of the 14 codes and its matching
 operator-safe sentence.
 
-The module-level assertion at the bottom binds this table to the SDK's
+The module-level check at the bottom binds this table to the SDK's
 adapter-facing vocabulary: ``elspeth_llm_gateway.sdk.protocol.CLASSIFIABLE_CODES``
 must always be a subset of the codes defined here, so an adapter can never
 classify a failure into a code the core does not know how to render. Core is
-allowed to import sdk (never the reverse), so the check lives here.
+allowed to import sdk (never the reverse), so the check lives here. It is a
+plain ``if``/``raise RuntimeError`` rather than an ``assert`` specifically
+because ``assert`` is compiled out entirely under ``python -O``.
 """
 
 from enum import StrEnum
@@ -117,6 +119,11 @@ def error_envelope(error: GatewayError, request_id: str) -> dict:
     }
 
 
-assert {code.value for code in GatewayErrorCode} >= CLASSIFIABLE_CODES, (
-    "sdk.protocol.CLASSIFIABLE_CODES must be a subset of GatewayErrorCode"
-)
+if not ({code.value for code in GatewayErrorCode} >= CLASSIFIABLE_CODES):
+    # Deliberately not a bare `assert`: an `assert` statement is stripped
+    # entirely under `python -O` / `PYTHONOPTIMIZE`, which would silently
+    # drop this binding check in an optimized deployment -- exactly the
+    # environment where a real drift between the two vocabularies would go
+    # unnoticed until an adapter tried to classify into a code core doesn't
+    # know how to render.
+    raise RuntimeError("sdk.protocol.CLASSIFIABLE_CODES must be a subset of GatewayErrorCode")

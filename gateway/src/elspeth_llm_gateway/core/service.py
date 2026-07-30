@@ -72,7 +72,7 @@ def _canonicalize_response_format(response_format: ResponseFormat | None) -> Res
     if response_format.type == "json_object":
         return ResponseFormatSpec(kind="json_object")
     schema = response_format.json_schema
-    return ResponseFormatSpec(kind="json_schema", schema_name=schema.name, json_schema=schema.schema_definition)
+    return ResponseFormatSpec(kind="json_schema", schema_name=schema.name, json_schema=schema.schema_definition, strict=schema.strict)
 
 
 def _canonicalize_tool_choice(request: ChatRequest) -> tuple[str | None, str | None]:

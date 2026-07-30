@@ -8,7 +8,7 @@ from elspeth_llm_gateway.core.config import load_config
 from elspeth_llm_gateway.core.contract import ChatRequest
 from elspeth_llm_gateway.core.errors import GatewayError, GatewayErrorCode
 from elspeth_llm_gateway.core.oauth import TokenManager
-from elspeth_llm_gateway.core.service import CompletionService
+from elspeth_llm_gateway.core.service import CompletionService, to_canonical_request
 from elspeth_llm_gateway.core.transport import UpstreamClient
 from elspeth_llm_gateway.sdk.protocol import (
     AdapterDescriptor,
@@ -119,6 +119,37 @@ def _service(config, adapter, client) -> CompletionService:
 async def client():
     async with httpx.AsyncClient() as http_client:
         yield http_client
+
+
+# --- to_canonical_request: response_format.strict passthrough (I3 fix) --------
+
+
+def test_to_canonical_request_carries_json_schema_strict_true_through():
+    request = _chat_request(
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "s", "schema": {"type": "object"}, "strict": True},
+        }
+    )
+    canonical = to_canonical_request(request, {"target": "backend-a"})
+    assert canonical.response_format.strict is True
+
+
+def test_to_canonical_request_leaves_strict_none_when_absent():
+    request = _chat_request(
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "s", "schema": {"type": "object"}},
+        }
+    )
+    canonical = to_canonical_request(request, {"target": "backend-a"})
+    assert canonical.response_format.strict is None
+
+
+def test_to_canonical_request_json_object_format_has_no_strict():
+    request = _chat_request(response_format={"type": "json_object"})
+    canonical = to_canonical_request(request, {"target": "backend-a"})
+    assert canonical.response_format.strict is None
 
 
 # --- happy path ---------------------------------------------------------------

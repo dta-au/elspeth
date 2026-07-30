@@ -121,6 +121,40 @@ def test_build_invoke_minimal_request_omits_optional_fields():
     assert "format" not in plan.body
 
 
+def test_build_invoke_json_schema_format_forwards_strict_true():
+    adapter = ReferenceV1InvokeAdapter()
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(CanonicalMessage(role="user", content="hi"),),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+        response_format=ResponseFormatSpec(kind="json_schema", schema_name="Answer", json_schema={"type": "object"}, strict=True),
+    )
+
+    plan = adapter.build_invoke(request)
+
+    assert plan.body["format"] == {"kind": "schema", "schema": {"type": "object"}, "strict": True}
+
+
+def test_build_invoke_json_schema_format_omits_strict_key_when_absent():
+    adapter = ReferenceV1InvokeAdapter()
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(CanonicalMessage(role="user", content="hi"),),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+        response_format=ResponseFormatSpec(kind="json_schema", schema_name="Answer", json_schema={"type": "object"}),
+    )
+
+    plan = adapter.build_invoke(request)
+
+    assert "strict" not in plan.body["format"]
+
+
 def test_build_invoke_json_object_format():
     adapter = ReferenceV1InvokeAdapter()
     request = CanonicalRequest(

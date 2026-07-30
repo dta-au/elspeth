@@ -314,11 +314,15 @@ def load_config(environ: Mapping[str, str]) -> GatewayConfig:
     if inbound_bearer is not None and len(inbound_bearer) < _MIN_BEARER_LENGTH:
         errors.append("bearer_too_short")
 
-    # ADAPTER / OAUTH_TOKEN_URL / OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET have no
-    # structural check of their own (unlike bearer/origin/auth_method/mappings,
-    # which reject an empty value transitively); an env var present-but-set-to-
-    # "" must still fail closed instead of silently loading a blank credential.
-    for empty_check_key in (_ADAPTER, _OAUTH_TOKEN_URL, _OAUTH_CLIENT_ID, _OAUTH_CLIENT_SECRET):
+    # ADAPTER / OAUTH_TOKEN_URL / OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET /
+    # INBOUND_BEARER have no structural check of their own (unlike
+    # origin/auth_method/mappings, which reject an empty value transitively);
+    # an env var present-but-blank must still fail closed instead of silently
+    # loading a blank credential. INBOUND_BEARER's own length check above
+    # only rejects a value that is too short -- a bearer of nothing but
+    # spaces is exactly ``_MIN_BEARER_LENGTH`` characters long and would
+    # otherwise pass it while being empty in every way that matters.
+    for empty_check_key in (_ADAPTER, _OAUTH_TOKEN_URL, _OAUTH_CLIENT_ID, _OAUTH_CLIENT_SECRET, _INBOUND_BEARER):
         raw_value = _read(environ, empty_check_key)
         if raw_value is not None and raw_value.strip() == "":
             errors.append(f"empty_env:{empty_check_key}")

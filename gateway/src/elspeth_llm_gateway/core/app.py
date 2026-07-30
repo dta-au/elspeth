@@ -241,10 +241,14 @@ def create_app(
 
         try:
             parsed = parse_strict_json(raw_body, max_bytes=config.max_body_bytes)
-        except (StrictJsonError, RecursionError):
-            # A deeply-nested-but-individually-tiny body can blow the json
-            # module's own recursion limit before StrictJsonError's size
-            # check ever gets a chance to reject it on max_bytes alone.
+        except StrictJsonError:
+            # parse_strict_json's own iterative depth pre-scan rejects a
+            # deeply-nested-but-individually-tiny body with
+            # StrictJsonError(reason="too_deep") before ever handing it to
+            # json.loads, so a bare RecursionError can no longer escape this
+            # call -- see core/parsing.py's module-level comment for why the
+            # underlying json.loads call cannot be trusted to fail safely on
+            # its own.
             raise GatewayError(GatewayErrorCode.INVALID_REQUEST) from None
 
         try:

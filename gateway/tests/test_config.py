@@ -186,6 +186,15 @@ def test_bearer_exactly_32_chars_accepted():
     assert config.inbound_bearer.get_secret_value() == "b" * 32
 
 
+def test_bearer_all_whitespace_rejected():
+    """A bearer of 32 spaces passes the length check but is empty in every
+    way that matters; it must fail closed the same way the other four
+    required strings do (see the ``empty_env`` sweep below)."""
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(_env(ELSPETH_LLM_GATEWAY_INBOUND_BEARER=" " * 32))
+    assert f"empty_env:{ENV_PREFIX}INBOUND_BEARER" in exc_info.value.errors
+
+
 # --- model mappings --------------------------------------------------------------
 
 
@@ -204,6 +213,17 @@ def test_model_mappings_not_json_object_rejected():
 def test_model_mappings_invalid_json_rejected():
     with pytest.raises(ConfigError) as exc_info:
         load_config(_env(ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS="not json"))
+    assert "invalid_model_mappings_json" in exc_info.value.errors
+
+
+def test_deeply_nested_model_mappings_rejected_as_config_error_not_recursion_error():
+    """A MODEL_MAPPINGS value that is deeply nested but individually tiny
+    (well under the model-mappings byte cap) must raise a clean ConfigError,
+    not a raw RecursionError escaping load_config -- see
+    parse_strict_json's own depth guard in core/parsing.py."""
+    deeply_nested = "[" * 2000 + "]" * 2000
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(_env(ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS=deeply_nested))
     assert "invalid_model_mappings_json" in exc_info.value.errors
 
 

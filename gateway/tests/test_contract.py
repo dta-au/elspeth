@@ -243,6 +243,43 @@ def test_named_tool_choice_function_forbids_extra():
         NamedToolChoiceFunction(name="f", extra_field=1)
 
 
+# --- ChatToolCallFunction: arguments must be strict-JSON-parseable ----------
+
+
+def test_chat_tool_call_function_rejects_non_json_arguments():
+    with pytest.raises(ValidationError):
+        ChatToolCallFunction(name="f", arguments="NOT JSON")
+
+
+def test_chat_tool_call_function_accepts_valid_json_arguments():
+    function = ChatToolCallFunction(name="f", arguments='{"a": 1}')
+    assert function.arguments == '{"a": 1}'
+
+
+def test_chat_tool_call_function_rejects_duplicate_key_arguments():
+    with pytest.raises(ValidationError):
+        ChatToolCallFunction(name="f", arguments='{"a":1,"a":2}')
+
+
+def test_chat_tool_call_function_rejects_non_finite_number_arguments():
+    with pytest.raises(ValidationError):
+        ChatToolCallFunction(name="f", arguments='{"a": Infinity}')
+
+
+def test_chat_request_with_malformed_tool_call_arguments_rejected():
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            model="m",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "NOT JSON"}}],
+                }
+            ],
+        )
+
+
 # --- build_completion_response: golden tests ---------------------------------
 
 

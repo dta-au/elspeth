@@ -67,13 +67,22 @@ class CanonicalMessage(BaseModel):
 
 
 class ResponseFormatSpec(BaseModel):
-    """A requested structured-output format."""
+    """A requested structured-output format.
+
+    ``strict`` mirrors the inbound ``response_format.json_schema.strict``
+    flag (``core.contract.JsonSchemaFormat``): ``None`` when the caller did
+    not set it, otherwise the caller's own ``True``/``False``. Only
+    meaningful when ``kind`` is ``"json_schema"`` -- adapters that support
+    strict schema adherence use it to request that behavior from upstream;
+    it is never populated for ``"json_object"``.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: Literal["json_object", "json_schema"]
     schema_name: str | None = None
     json_schema: dict | None = None
+    strict: bool | None = None
 
 
 class CanonicalRequest(BaseModel):
