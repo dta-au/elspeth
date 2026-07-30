@@ -126,9 +126,15 @@ def _finite_positive_timeout(entry: Mapping[str, Any], path: str) -> float | Non
     value = entry.get("timeout_seconds")
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RuntimeYamlImportError(f"{path}.timeout_seconds must be a finite positive number")
-    return float(value)
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise RuntimeYamlImportError(f"{path}.timeout_seconds must be a finite positive number") from exc
+    if not isfinite(normalized) or normalized <= 0:
+        raise RuntimeYamlImportError(f"{path}.timeout_seconds must be a finite positive number")
+    return normalized
 
 
 def _route_label(value: Any) -> str:

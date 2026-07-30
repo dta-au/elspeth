@@ -258,6 +258,24 @@ row_unions:
         )
 
 
+def test_composition_state_from_runtime_yaml_maps_oversized_row_union_timeout_to_import_error() -> None:
+    oversized_integer = "9" * 400
+
+    with pytest.raises(
+        RuntimeYamlImportError,
+        match=r"row_unions\[0\]\.timeout_seconds must be a finite positive number",
+    ):
+        composition_state_from_runtime_yaml(
+            f"""
+row_unions:
+  - name: variants
+    branches: [control, treatment]
+    on_success: compared
+    timeout_seconds: {oversized_integer}
+"""
+        )
+
+
 @pytest.mark.parametrize("field", ["plugin", "options", "policy", "merge", "condition", "unexpected"])
 def test_composition_state_from_runtime_yaml_rejects_extra_or_inapplicable_row_union_fields(field: str) -> None:
     with pytest.raises(RuntimeYamlImportError, match=rf"row_unions\[0\] contains unknown or inapplicable field\(s\): \['{field}'\]"):
@@ -470,6 +488,25 @@ coalesce:
 
     assert state.nodes[0].node_type == "coalesce"
     assert state.nodes[0].timeout_seconds == 4.25
+
+
+def test_composition_state_from_runtime_yaml_maps_oversized_coalesce_timeout_to_import_error() -> None:
+    oversized_integer = "9" * 400
+
+    with pytest.raises(
+        RuntimeYamlImportError,
+        match=r"coalesce\[0\]\.timeout_seconds must be a finite positive number",
+    ):
+        composition_state_from_runtime_yaml(
+            f"""
+coalesce:
+  - name: joined
+    branches: [a, b]
+    policy: require_all
+    merge: nested
+    timeout_seconds: {oversized_integer}
+"""
+        )
 
 
 def test_composition_state_from_runtime_yaml_round_trips_runtime_sections() -> None:
