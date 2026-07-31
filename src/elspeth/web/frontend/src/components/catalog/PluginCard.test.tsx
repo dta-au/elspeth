@@ -705,6 +705,41 @@ describe("PluginCard — Phase 7B reshape", () => {
     expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
   });
 
+  it("does not restore stale details state after switching away and back", async () => {
+    const user = userEvent.setup();
+    const csvPlugin = makePlugin({
+      name: "csv",
+      usage_when_to_use: "When the input is a bounded CSV file.",
+    });
+    const jsonPlugin = makePlugin({
+      name: "json",
+      usage_when_to_use: "When the input is structured JSON.",
+    });
+    const { container, rerender } = render(
+      <PluginCard plugin={csvPlugin} schema={null} onExpand={() => {}} />,
+    );
+    await user.click(screen.getByRole("button", { name: /reference details for csv/i }));
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={jsonPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const jsonDetails = screen.getByRole("button", {
+      name: /reference details for json/i,
+    });
+    expect(jsonDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={csvPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const returningCsvDetails = screen.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+    expect(returningCsvDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
   it("does NOT render a 'Use in pipeline' button (toolkit affordance removed)", () => {
     render(<PluginCard plugin={makePlugin()} schema={null} onExpand={() => {}} />);
     expect(screen.queryByRole("button", { name: /use in pipeline/i })).not.toBeInTheDocument();

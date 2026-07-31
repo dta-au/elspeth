@@ -23,7 +23,7 @@
 // for its prefill action, and ChatInput.tsx remains the receiver.
 // ============================================================================
 
-import { useState, type MouseEvent } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { AuditCharacteristicIcon } from "./AuditCharacteristicIcon";
@@ -132,11 +132,18 @@ export function PluginCard({
   const hasExample = hasCatalogText(exampleText);
   const hasDetails = hasWhen || hasAvoid || hasExample;
   const [expanded, setExpanded] = useState(initialExpanded);
-  const [detailsOpenForCardId, setDetailsOpenForCardId] = useState<string | null>(null);
-  const detailsOpen = hasDetails && detailsOpenForCardId === cardId;
+  const [detailsState, setDetailsState] = useState({ cardId, open: false });
+  const detailsOpen = hasDetails && detailsState.cardId === cardId && detailsState.open;
   const nameId = `plugin-card-name-${cardId}`;
   const detailsPanelId = `plugin-card-details-panel-${cardId}`;
   const schemaPanelId = `plugin-card-schema-panel-${cardId}`;
+
+  useEffect(() => {
+    setDetailsState((current) => {
+      if (current.cardId === cardId && (hasDetails || !current.open)) return current;
+      return { cardId, open: false };
+    });
+  }, [cardId, hasDetails]);
 
   function handleDisclosureClick(e: MouseEvent<HTMLButtonElement>) {
     e.preventDefault();
@@ -195,9 +202,10 @@ export function PluginCard({
             type="button"
             className="btn btn-small plugin-card-detail-toggle"
             onClick={() =>
-              setDetailsOpenForCardId((openCardId) =>
-                openCardId === cardId ? null : cardId,
-              )
+              setDetailsState((current) => ({
+                cardId,
+                open: current.cardId === cardId ? !current.open : true,
+              }))
             }
             aria-expanded={detailsOpen}
             aria-controls={detailsPanelId}
