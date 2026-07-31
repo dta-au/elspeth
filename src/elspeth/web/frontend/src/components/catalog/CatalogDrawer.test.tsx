@@ -619,3 +619,82 @@ describe("CatalogDrawer — Alt+1-3 tab shortcuts", () => {
     fireEvent.keyDown(document, { key: "1", altKey: true });
   });
 });
+
+// elspeth-06566208b3: the resume-only `null` source is internal machinery,
+// not a capability an operator can browse toward. It was surfacing on the
+// Sources tab as "Resume Placeholder" with code `null` and the description
+// "A source that yields no rows". Filtering happens where the arrays enter
+// the drawer so the tab COUNT and the rendered cards can never disagree.
+describe("CatalogDrawer — internal plugins", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    usePluginCatalogStore.getState().clear();
+    useAuthStore.setState({
+      token: "catalog-test-token",
+      user: {
+        user_id: "alice",
+        username: "alice",
+        display_name: "Alice",
+        email: null,
+        groups: [],
+      },
+      isLoading: false,
+    });
+    useSessionStore.setState({ compositionState: null } as never);
+    vi.mocked(listSources).mockResolvedValue({
+      data: [
+        {
+          name: "csv",
+          plugin_type: "source",
+          description: "CSV file source",
+          config_fields: [],
+          usage_when_to_use: null,
+          usage_when_not_to_use: null,
+          example_use: null,
+          capability_tags: [],
+          audit_characteristics: [],
+        },
+        {
+          name: "null",
+          plugin_type: "source",
+          description: "A source that yields no rows.",
+          config_fields: [],
+          usage_when_to_use: null,
+          usage_when_not_to_use: null,
+          example_use: null,
+          capability_tags: [],
+          audit_characteristics: [],
+        },
+      ],
+      snapshotFingerprint: "catalog-test-snapshot",
+    } as never);
+  });
+
+  it("omits the internal resume placeholder from the Sources list", async () => {
+    render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
+    await screen.findByText("CSV file source");
+    expect(
+      screen.queryByText("A source that yields no rows."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Resume Placeholder")).not.toBeInTheDocument();
+  });
+
+  it("excludes it from the Sources tab count too", async () => {
+    render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
+    await screen.findByText("CSV file source");
+    expect(
+      screen.getByRole("tab", { name: /^Sources/ }).textContent,
+    ).toContain("1");
+  });
+
+  it("does not surface it via search either", async () => {
+    render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
+    await screen.findByText("CSV file source");
+    await userEvent.type(screen.getByLabelText("Search plugins"), "null");
+    await waitFor(() => {
+      expect(
+        screen.queryByText("A source that yields no rows."),
+      ).not.toBeInTheDocument();
+    });
+  });
+});

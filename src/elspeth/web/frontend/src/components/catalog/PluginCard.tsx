@@ -27,7 +27,7 @@ import { useState, type MouseEvent } from "react";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { AuditCharacteristicIcon } from "./AuditCharacteristicIcon";
-import { isInternalPlugin, pluginDisplayName } from "./pluginDisplayName";
+import { pluginDisplayName } from "./pluginDisplayName";
 
 /** Event name dispatched by InlineChatSourceEntry and consumed by
  *  ChatInput.tsx. Re-exported here for backwards compatibility with
@@ -158,9 +158,6 @@ export function PluginCard({
         <span className="plugin-card-title-group">
           <span id={nameId} className="plugin-card-name">{displayName}</span>
           <code className="plugin-card-id">{plugin.name}</code>
-          {isInternalPlugin(plugin.name) && (
-            <span className="plugin-card-internal-badge">internal</span>
-          )}
         </span>
         <span className="plugin-card-kind">{plugin.plugin_type}</span>
       </div>

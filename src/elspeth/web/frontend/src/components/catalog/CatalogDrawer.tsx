@@ -41,7 +41,19 @@ import {
   confidenceFromScore,
   fuzzyMatch,
 } from "@/utils/fuzzyScore";
-import { pluginDisplayName } from "./pluginDisplayName";
+import { isInternalPlugin, pluginDisplayName } from "./pluginDisplayName";
+
+/**
+ * Drop internal-machinery plugins from a catalog tab's list, preserving the
+ * `null` "not loaded yet" state so loading checks keep working.
+ */
+function hideInternal(
+  plugins: PluginSummary[] | null,
+): PluginSummary[] | null {
+  return plugins === null
+    ? null
+    : plugins.filter((plugin) => !isInternalPlugin(plugin.name));
+}
 import { useAuthStore } from "@/stores/authStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -154,9 +166,9 @@ interface CatalogDrawerProps {
 export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
   const [activeTab, setActiveTab] = useState<CatalogTab>("sources");
   const principal = useAuthStore((state) => state.user?.user_id ?? null);
-  const sources = usePluginCatalogStore((state) => state.sources);
-  const transforms = usePluginCatalogStore((state) => state.transforms);
-  const sinks = usePluginCatalogStore((state) => state.sinks);
+  const rawSources = usePluginCatalogStore((state) => state.sources);
+  const rawTransforms = usePluginCatalogStore((state) => state.transforms);
+  const rawSinks = usePluginCatalogStore((state) => state.sinks);
   const schemaCache = usePluginCatalogStore((state) => state.schemas);
   const schemaErrors = usePluginCatalogStore((state) => state.schemaErrors);
   const fetchError = usePluginCatalogStore((state) => state.error);
@@ -167,6 +179,24 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
   const storedPolicyFindings = useSessionStore(
     (state) => state.compositionState?.plugin_policy_findings ?? EMPTY_POLICY_FINDINGS,
   );
+  // elspeth-06566208b3: internal machinery — today the resume-only `null`
+  // source — is not part of the user-facing reference catalog. Browsing
+  // Sources is a "what can I read data from?" question, and a source whose
+  // whole contract is "yields no rows" answers it wrongly; its own plugin
+  // assistance tells agents never to pick it for ingestion.
+  //
+  // Filtered HERE, where the arrays enter the drawer, so the rendered cards,
+  // the search results, the filter chips and the per-tab counts all derive
+  // from the same set. Filtering at the render path alone would leave the tab
+  // count one ahead of the cards.
+  //
+  // Frontend-only by design: CatalogServiceImpl.list_sources also feeds
+  // composer and MCP discovery, where `null` must stay resolvable for resume.
+  // `null` is preserved (not []) so the loading-state checks below still read.
+  const sources = useMemo(() => hideInternal(rawSources), [rawSources]);
+  const transforms = useMemo(() => hideInternal(rawTransforms), [rawTransforms]);
+  const sinks = useMemo(() => hideInternal(rawSinks), [rawSinks]);
+
   const policyFindings = useMemo(
     () =>
       catalogFingerprint === null
