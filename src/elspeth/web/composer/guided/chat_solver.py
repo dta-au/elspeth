@@ -62,6 +62,7 @@ from elspeth.web.composer.guided.resolved import (
     freeze_guided_str_sequence,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent
+from elspeth.web.composer.guided_blob_refs import reviewed_schema_declared_field_names, reviewed_source_is_blob_bound
 from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
     attach_llm_calls,
@@ -856,6 +857,15 @@ def _validate_field_aliases(
 
 
 def _source_field_labels(current_source: SourceResolved) -> tuple[str, ...]:
+    """Collect every uploaded field label this source can name.
+
+    The registry must be complete, because an alias is only assigned to a label
+    that appears here: a label this misses is silently unnameable in every
+    provider projection. A form-authored explicit schema declares its fields
+    under ``schema.fields`` and may have no observed columns and no sample rows
+    at all, so declared names belong in the set alongside observed columns,
+    ``guaranteed_fields``, and sample-row keys.
+    """
     labels: list[str] = list(current_source.observed_columns)
 
     options = current_source.options if isinstance(current_source.options, Mapping) else {}
@@ -866,6 +876,7 @@ def _source_field_labels(current_source: SourceResolved) -> tuple[str, ...]:
             for label in guaranteed_fields:
                 if isinstance(label, str):
                     labels.append(label)
+    labels.extend(reviewed_schema_declared_field_names(schema))
 
     for row in current_source.sample_rows:
         if isinstance(row, Mapping):
@@ -926,8 +937,9 @@ def _untrusted_source_field_context(
     source_param="schema",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns None for a non-mapping schema; extracts only string mode and aliases for "
-        "string-list guaranteed_fields; raw labels and malformed members are dropped, never raised on"
+        "returns None for a non-mapping schema; extracts only the string mode and aliases for "
+        "string-list guaranteed_fields plus the declared fields of an explicit (fixed/flexible) "
+        "schema; raw labels and malformed members are dropped, never raised on"
     ),
     non_raising=True,
 )
@@ -947,6 +959,13 @@ def _llm_safe_schema_option(
         safe_guaranteed_fields = [field_aliases[field] for field in guaranteed_fields if isinstance(field, str) and field in field_aliases]
         if safe_guaranteed_fields:
             safe["guaranteed_fields"] = safe_guaranteed_fields
+    # An explicit schema's declared fields are its field inventory (and are
+    # implicitly guaranteed); without them a fixed-schema source reaches the
+    # provider as a mode with no fields, which reads as "this source has no
+    # known columns" and invites invented ones.
+    safe_declared_fields = [field_aliases[field] for field in reviewed_schema_declared_field_names(schema) if field in field_aliases]
+    if safe_declared_fields:
+        safe["declared_fields"] = safe_declared_fields
     return safe or {"shape": "object"}
 
 
@@ -957,7 +976,8 @@ def _llm_safe_schema_option(
     suppresses=("R1", "R5"),
     invariant=(
         "builds the LLM revision-context payload from well-formed option values only; "
-        "non-mapping options degrade to empty, malformed rows/schema are dropped, never raised on"
+        "non-mapping options degrade to empty, malformed rows/schema are dropped, never raised on; "
+        "blob binding is projected as a bare boolean, never as a reference, path, or blob id"
     ),
     non_raising=True,
 )
@@ -981,7 +1001,7 @@ def _source_revision_context_for_llm(
     schema = _llm_safe_schema_option(options.get("schema"), field_aliases=aliases)
     if schema is not None:
         payload["schema"] = schema
-    if "blob_ref" in options:
+    if reviewed_source_is_blob_bound(options):
         payload["server_storage_bound"] = True
     return payload
 

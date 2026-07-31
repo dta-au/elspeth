@@ -661,6 +661,26 @@ def test_guided_full_planner_failure_mapping_is_closed(
     assert _guided_full_failure_code(PipelinePlannerError("safe", code=code)) == expected
 
 
+@pytest.mark.parametrize("code", ("VALIDATION_FAILED", "REPAIR_EXHAUSTED", "COMPOSITION_EXHAUSTED"))
+@pytest.mark.parametrize("policy_code", ("aws_s3_source_not_allowed", "plugin_not_allowed_on_web"))
+def test_guided_full_policy_refusal_outranks_the_planner_code(code: str, policy_code: str) -> None:
+    """A categorical policy refusal is permanent, whatever code it exhausted under.
+
+    The same refusal arrives as VALIDATION_FAILED from the server-derived
+    pass-through gate and as REPAIR_EXHAUSTED once the model has burnt its repair
+    budget re-authoring the prohibited component. Both are permanent, so the
+    classification is keyed on the rejection's closed detail codes rather than the
+    planner code — otherwise the user is told to retry a request that can never
+    succeed (guided S3, 2026-07-31).
+    """
+    exc = PipelinePlannerError("safe", code=code, detail_codes=(policy_code,))
+
+    assert _guided_full_failure_code(exc) == "policy_blocked"
+    # Without the policy code the same planner code stays a retryable provider
+    # fault — the split must not swallow ordinary exhaustion.
+    assert _guided_full_failure_code(PipelinePlannerError("safe", code=code)) == "invalid_provider_response"
+
+
 @pytest.mark.parametrize(
     "fault_point",
     ("checkpoint", "origin", "proposal_event", "proposal", "operation_complete"),

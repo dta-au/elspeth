@@ -83,7 +83,21 @@ async def bounded_admission_guard(lock: asyncio.Lock) -> AsyncIterator[None]:
 _SAFE_FAILURES: dict[str, tuple[int, str]] = {
     "provider_unavailable": (503, "The provider is unavailable. Retry with a new operation id."),
     "provider_timeout": (504, "The operation timed out. Retry with a new operation id."),
-    "invalid_provider_response": (502, "The provider returned an invalid response. Retry with a new operation id."),
+    # "Retry the request." rather than "Retry with a new operation id.": the
+    # client already mints a fresh operation id on every re-click, so naming the
+    # id taught the reader an internal protocol detail they cannot act on.
+    "invalid_provider_response": (502, "The provider returned an invalid response. Retry the request."),
+    # PERMANENT by construction — a deployment policy refused this pipeline, so
+    # the copy must not offer a retry and must not blame the provider. Kept in
+    # lockstep with the freeform mirror
+    # (``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP``) up to one word:
+    # "highlighted" is guided-only, because only the guided review UI pins the
+    # blocked component; freeform has no component highlight.
+    "policy_blocked": (
+        422,
+        "This pipeline is blocked by a deployment policy and cannot be built as configured. "
+        "Change the highlighted component — retrying will fail the same way.",
+    ),
     "stale_conflict": (409, "The guided state changed before settlement. Reload the authoritative state."),
     "integrity_error": (500, "The operation failed an integrity check."),
     "custody_error": (500, "The operation could not establish result custody."),

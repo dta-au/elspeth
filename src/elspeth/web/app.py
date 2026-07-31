@@ -936,29 +936,51 @@ def _create_app(
     app.state.deployment_state_mode = resolved_state_mode
 
     @app.exception_handler(AuditIntegrityError)
-    async def _audit_integrity_error_handler(_request: Request, exc: AuditIntegrityError) -> JSONResponse:
+    async def _audit_integrity_error_handler(request: Request, exc: AuditIntegrityError) -> JSONResponse:
+        # ~40 raise sites produce byte-identical fail-closed 500s through
+        # this handler; before the structured log below the server recorded
+        # NOTHING for any of them, so operators diagnosed Tier-1 refusals
+        # from the browser banner alone. ``message=str(exc)`` is safe to
+        # log server-side: AuditIntegrityError messages are server-authored
+        # literals that name their raise site verbatim (no user or provider
+        # content). The HTTP ``detail`` stays static per the redaction
+        # convention shared with the secret/DB handlers below — the copy
+        # must be honest: a READ-side verification refused to proceed;
+        # persistence of the caller's message did not fail.
         failed_turn = exc.failed_turn
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_audit_integrity_error",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+            message=str(exc),
+            failed_turn_present=failed_turn is not None,
+        )
         if failed_turn is None:
             return JSONResponse(
                 status_code=500,
                 content={
                     "error_type": "audit_integrity_error",
-                    "detail": "Audit persistence failed; no audit-grade data returned.",
+                    "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
                     "diagnostic": "no_failed_turn_metadata",
                     "reason": "originated outside compose-loop annotation scope",
+                    "request_id": request_id,
                 },
             )
         return JSONResponse(
             status_code=500,
             content={
                 "error_type": "audit_integrity_error",
-                "detail": "Audit persistence failed; no audit-grade data returned.",
+                "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
                 "failed_turn": {
                     "assistant_message_id": failed_turn.assistant_message_id,
                     "tool_calls_attempted": failed_turn.tool_calls_attempted,
                     "tool_responses_persisted": failed_turn.tool_responses_persisted or 0,
                     "transcript_url": None,
                 },
+                "request_id": request_id,
             },
         )
 

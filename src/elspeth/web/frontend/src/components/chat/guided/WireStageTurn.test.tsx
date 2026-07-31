@@ -172,7 +172,12 @@ describe("WireStageTurn", () => {
         plugin: null,
         behavior: {
           kind: "gate",
+          condition: "row['classification'] == 'unsafe'",
           route_aliases: ["route-1", "route-2"],
+          routes: [
+            { alias: "route-1", key: "safe" },
+            { alias: "route-2", key: "unsafe" },
+          ],
           fork_branches: [{ routes: ["route-2"], branch: "branch-1" }],
         },
         required_fields: ["classification"],
@@ -235,6 +240,12 @@ describe("WireStageTurn", () => {
     expect(screen.getAllByText("Required fields: body")).toHaveLength(1);
     expect(screen.getByText("Guaranteed fields: summary")).toBeInTheDocument();
     expect(screen.getByText("classification (str) from classify; values: safe, unsafe")).toBeInTheDocument();
+    // F11: the gate details lead with the authored predicate verbatim and
+    // name each author-visible route key; with no gate connection present in
+    // this fixture the per-route lines carry no destination.
+    expect(screen.getByText("When row['classification'] == 'unsafe'")).toBeInTheDocument();
+    expect(screen.getByText("When safe (route-1)")).toBeInTheDocument();
+    expect(screen.getByText("When unsafe (route-2)")).toBeInTheDocument();
     expect(screen.getByText("Routes: route-1, route-2")).toBeInTheDocument();
     expect(screen.getByText("Fork branch branch-1: route-2")).toBeInTheDocument();
     expect(screen.getByText("Triggers: count, timeout")).toBeInTheDocument();
@@ -252,18 +263,42 @@ describe("WireStageTurn", () => {
   });
 
   it("renders detailed success, route, branch, and failure semantics with stable connection ids", () => {
+    const GATE_ID = "00000000-0000-4000-8000-000000000024";
+    const nodes: WireStageData["nodes"] = [
+      ...canonicalData().nodes,
+      {
+        stable_id: GATE_ID,
+        label: "triage",
+        node_type: "gate",
+        plugin: null,
+        behavior: {
+          kind: "gate",
+          condition: "row['temperature'] > 40",
+          route_aliases: ["route-1", "route-2"],
+          routes: [
+            { alias: "route-1", key: "hot" },
+            { alias: "route-2", key: "cold" },
+          ],
+          fork_branches: [{ routes: ["route-2"], branch: "branch-1" }],
+        },
+        required_fields: [],
+        guaranteed_fields: [],
+        row_cardinality: { input: "one", output: "one", expected_output_count: null },
+        structured_output_fields: [],
+      },
+    ];
     const connections: WireStageData["connections"] = [
       ...canonicalData().connections,
       {
         stable_id: "00000000-0000-4000-8000-000000000042",
-        from_endpoint: { kind: "node", stable_id: NODE_ID },
+        from_endpoint: { kind: "node", stable_id: GATE_ID },
         to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
         flow: { kind: "gate_route", route: "route-1", branch: null },
         schema_contract: null,
       },
       {
         stable_id: "00000000-0000-4000-8000-000000000043",
-        from_endpoint: { kind: "node", stable_id: NODE_ID },
+        from_endpoint: { kind: "node", stable_id: GATE_ID },
         to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
         flow: { kind: "gate_fork", routes: ["route-2"], branch: "branch-1" },
         schema_contract: null,
@@ -284,13 +319,18 @@ describe("WireStageTurn", () => {
       },
     ];
 
-    render(<WireStageTurn data={canonicalData({ connections })} onConfirm={vi.fn()} confirmDisabled={false} />);
+    render(<WireStageTurn data={canonicalData({ nodes, connections })} onConfirm={vi.fn()} confirmDisabled={false} />);
 
     // Flow semantics stay per-row; status moved out of the prose into chips
     // (operator-reported "— not yet checked" dump) with a single count line.
     expect(screen.getByText("Source success")).toBeInTheDocument();
-    expect(screen.getByText("Gate route route-1")).toBeInTheDocument();
-    expect(screen.getByText("Gate fork route-2 as branch-1")).toBeInTheDocument();
+    // F11: route rows resolve the ordinal to its author-visible key.
+    expect(screen.getByText("Gate route route-1 (when hot)")).toBeInTheDocument();
+    expect(screen.getByText("Gate fork route-2 (when cold) as branch-1")).toBeInTheDocument();
+    // F11: the gate's own details name the condition and each route's target.
+    expect(screen.getByText("When row['temperature'] > 40")).toBeInTheDocument();
+    expect(screen.getByText("When hot → output-1 (route-1)")).toBeInTheDocument();
+    expect(screen.getByText("When cold → output-1 (route-2)")).toBeInTheDocument();
     expect(screen.getByText("Node failure")).toBeInTheDocument();
     expect(screen.getByText("Output write failure")).toBeInTheDocument();
     expect(screen.getByText("6 routes — 1 connected, 5 not yet checked")).toBeInTheDocument();

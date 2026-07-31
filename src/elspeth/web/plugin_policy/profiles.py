@@ -171,7 +171,10 @@ class _LLMProfileResolver:
                 "name": name,
                 "type": "string" if name == "profile" else str(schema.get("type", "object")),
                 "required": name in public_json_schema["required"],
-                "description": schema.get("description"),
+                # The composer-surface help text substitutes the CLI/YAML
+                # description on web knobs (mirrors
+                # web/catalog/knob_schema._composer_description).
+                "description": schema.get("composer_description") or schema.get("description"),
                 **({"choices": list(available_aliases)} if name == "profile" else {}),
             }
             for name, schema in safe_properties.items()
@@ -338,7 +341,9 @@ class _BedrockGuardrailProfileResolver:
                 "name": name,
                 "type": "string" if name == "profile" else str(schema.get("type", "object")),
                 "required": name in required,
-                "description": schema.get("description"),
+                # Mirrors the LLM profile lowering above: composer-surface help
+                # text substitutes the CLI/YAML description on web knobs.
+                "description": schema.get("composer_description") or schema.get("description"),
                 **({"choices": list(available_aliases)} if name == "profile" else {}),
             }
             for name, schema in safe_properties.items()

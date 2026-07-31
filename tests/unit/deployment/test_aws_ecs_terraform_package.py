@@ -15,6 +15,7 @@ import pytest
 import yaml
 
 from elspeth.web._aws_ecs_acceptance import scenario_inventory, task_definition
+from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE = REPO_ROOT / "deploy" / "aws-ecs" / "terraform"
@@ -290,6 +291,35 @@ def test_scenario_web_plugin_allowlist_exposes_textract_to_composer() -> None:
 
     assert allowlist_match is not None
     assert '"transform:aws_textract_document_analysis"' in allowlist_match.group("body")
+
+
+def test_scenario_allowlist_keeps_the_s3_source_authorization_the_web_surface_declines() -> None:
+    """``source:aws_s3`` stays in the default allowlist deliberately.
+
+    The deployment authorizes S3 reads for its own runtime (batch/CLI, local
+    trained-operator sessions). The web authoring surface refuses them, and
+    ``build_plugin_snapshot`` now declines that authorization with
+    ``WEB_SURFACE_PROHIBITED`` — so the declared entry surfaces as a visible
+    declined authorization instead of a selectable plugin, and deleting the
+    line would silently narrow the runtime posture to fix a web-surface
+    problem the code already fixes.
+
+    The pairing is what matters: if the code-side ban ever goes away, this
+    allowlist entry becomes a live web-surface exposure and the decision must
+    be revisited rather than inherited.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+    allowlist_match = re.search(
+        r"default_plugin_allowlist\s*=\s*\[(?P<body>.*?)\]",
+        locals_text,
+        re.DOTALL,
+    )
+
+    assert allowlist_match is not None
+    body = allowlist_match.group("body")
+    assert '"source:aws_s3"' in body
+    assert '"sink:aws_s3"' in body
+    assert web_aws_s3_source_policy_error("aws_s3") is not None
 
 
 def test_web_plugin_policy_is_operator_configurable() -> None:
@@ -999,6 +1029,56 @@ def test_fresh_machine_pulls_the_candidate_before_local_inspection() -> None:
 
     assert 'docker pull "$CANDIDATE_IMAGE"' in section
     assert section.index('docker pull "$CANDIDATE_IMAGE"') < section.index("docker inspect")
+
+
+def test_private_candidate_pulls_use_isolated_ecr_credentials_for_registry_commands() -> None:
+    readme = _text("README.md")
+    acceptance_start = readme.index("### Source-free post-enable acceptance")
+    inspection_start = readme.index("Before promoting a candidate")
+    auth_blocks = (
+        (
+            readme[acceptance_start : readme.index("## Immutable RDS trust-root admission", acceptance_start)],
+            "candidate_pull_work",
+            ('docker pull "$CANDIDATE_IMAGE"',),
+        ),
+        (
+            readme[inspection_start : readme.index("### Upgrading an existing install", inspection_start)],
+            "candidate_inspection_work",
+            (
+                'docker pull "$CANDIDATE_IMAGE"',
+                'docker buildx imagetools inspect "$CANDIDATE_IMAGE"',
+            ),
+        ),
+    )
+
+    for section, work_variable, registry_commands in auth_blocks:
+        registry = "CANDIDATE_ECR_REGISTRY=${CANDIDATE_IMAGE%%/*}"
+        work_create = f"{work_variable}=$(mktemp -d -p /tmp "
+        docker_config = f'export DOCKER_CONFIG="${work_variable}/docker-config"'
+        cleanup = (
+            f"""trap 'docker logout "$CANDIDATE_ECR_REGISTRY" >/dev/null 2>&1 || true; """
+            f"""rm -rf -- "${work_variable}"' EXIT"""
+        )
+        login = 'docker login --username AWS --password-stdin "$CANDIDATE_ECR_REGISTRY"'
+
+        assert registry in section
+        assert work_create in section
+        subshell_start = section.index("(\n", section.index(work_create))
+        subshell_end = section.index("\n)", subshell_start)
+        block = section[subshell_start:subshell_end]
+
+        assert re.match(r"\(\n\s+set -e\n", block)
+        assert f'mkdir -m 700 "${work_variable}/docker-config"' in section
+        assert docker_config in block
+        assert cleanup in block
+        assert block.count("docker logout") == 1
+        assert "aws ecr get-login-password" in block
+        assert login in block
+        assert block.index(docker_config) < block.index(cleanup) < block.index("aws ecr get-login-password")
+        assert block.index("aws ecr get-login-password") < block.index(login)
+        for command in registry_commands:
+            assert command in block
+            assert block.index(login) < block.index(command)
 
 
 def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:

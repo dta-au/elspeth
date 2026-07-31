@@ -55,6 +55,7 @@ class KnobField(TypedDict):
     name: str
     label: str
     description: NotRequired[str]
+    placeholder: NotRequired[str]
     kind: FieldKind
     tier: NotRequired[FieldTier]
     required: bool
@@ -167,8 +168,20 @@ def _base_field(
         "required": info.is_required(),
         "nullable": nullable,
     }
-    if info.description:
+    # ``description`` is the CLI/YAML truth for the field and must stay accurate
+    # for a hand-authored settings file. The composer form is a different
+    # audience: the same knob is often narrower on the web (a source ``path`` is
+    # confined to this session's uploads) and the form has no surrounding
+    # document to explain a nested shape. ``composer_description`` therefore
+    # *replaces* ``description`` on this surface rather than appending to it.
+    composer_description = _composer_description(info)
+    if composer_description is not None:
+        field["description"] = composer_description
+    elif info.description:
         field["description"] = info.description
+    placeholder = _composer_placeholder(info)
+    if placeholder is not None:
+        field["placeholder"] = placeholder
     _attach_default(field, info)
     _attach_tier(field, info)
     return field
@@ -378,6 +391,42 @@ def _is_composer_hidden(info: FieldInfo) -> bool:
     if "composer_hidden" not in extra:
         return False
     return bool(extra["composer_hidden"])
+
+
+def _composer_str_extra(info: FieldInfo, key: str) -> str | None:
+    """Return the exact string a field declares under ``json_schema_extra[key]``.
+
+    Absence is the no-op: the caller keeps whatever it would have written
+    without the extra. A present-but-non-string value is a mistake in a
+    plugin model we author (``KnobSchema`` is Tier 1), so it raises at
+    catalog load rather than degrading to the CLI text and shipping a
+    composer surface nobody notices is wrong.
+    """
+    extra = info.json_schema_extra
+    if type(extra) is not dict:
+        return None
+    if key not in extra:
+        return None
+    value = extra[key]
+    if type(value) is not str or not value:
+        raise TypeError(f"json_schema_extra[{key!r}] must be a non-empty str, got {value!r}")
+    return value
+
+
+def _composer_description(info: FieldInfo) -> str | None:
+    """Return the composer-facing description override, if the field declares one."""
+    return _composer_str_extra(info, "composer_description")
+
+
+def _composer_placeholder(info: FieldInfo) -> str | None:
+    """Return the composer-facing input placeholder, if the field declares one.
+
+    A placeholder is a shape hint for a free-text knob whose value has
+    internal structure the label cannot carry (a JSON schema block, a
+    connection string). It is never a default: nothing is submitted unless
+    the user types it.
+    """
+    return _composer_str_extra(info, "composer_placeholder")
 
 
 _SLOT_TYPE_TO_KIND: dict[str, FieldKind] = {

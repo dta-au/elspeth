@@ -58,6 +58,7 @@ from .._helpers import (
     _verify_session_ownership,
     get_current_user,
     get_rate_limiter,
+    planner_failure_is_policy_blocked,
 )
 from ..guided_operations import (
     GuidedOperationExpired,
@@ -97,6 +98,16 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
     if isinstance(exc, ComposerServiceError):
         return "provider_unavailable"
     if isinstance(exc, PipelinePlannerError):
+        # Detail codes FIRST: a categorical deployment-policy refusal is
+        # permanent and arrives under whichever planner code exhausted
+        # (VALIDATION_FAILED from the server-derived gate, REPAIR_EXHAUSTED when
+        # the model kept re-authoring the prohibited component). Collapsing it
+        # into ``invalid_provider_response`` blamed the provider for a policy
+        # decision and told the user to retry an operation that can never
+        # succeed. Shared predicate with the freeform mirror so the two
+        # surfaces cannot drift.
+        if planner_failure_is_policy_blocked(exc):
+            return "policy_blocked"
         if exc.code == "TIMEOUT":
             return "provider_timeout"
         if exc.code == "PROVIDER_ERROR":

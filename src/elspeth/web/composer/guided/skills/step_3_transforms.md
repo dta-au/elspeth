@@ -37,6 +37,20 @@ server's redacted sample shape markers to identify a likely mismatch. Do not
 repeat, infer, or expose sample values. Propose a schema-authorized normalization
 step when a reviewed shape is incompatible.
 
+## Gate conditions
+
+A gate's `condition` and `routes` are product decisions, presented like any
+other. Use the user's stated thresholds and comparison values verbatim; never
+invent a category literal the user or a reviewed schema fact did not state;
+never invert a stated route — each route must lead to the destination the user
+named for that criterion. State the condition and every route's destination in
+the stage reply. If you had to choose a threshold, cutoff, or category
+yourself, stage a pending `pipeline_decision` interpretation requirement on
+that gate node and call
+`request_interpretation_review(kind="pipeline_decision", ...)` — a gate is not
+an `llm` node, so every other review kind (including `vague_term`) is dropped
+there and never surfaces.
+
 ## LLM node field declarations
 
 An `llm` node's field contract is explicit and two-way: every `row.*` field its

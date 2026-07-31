@@ -238,12 +238,18 @@ export function MessageBubble({
             <span className="message-failed-text">
               {message.local_error ?? "Failed to send message. Please try again."}
             </span>
-            <button
-              onClick={() => onRetry(message.id)}
-              className="message-retry-btn"
-            >
-              Retry
-            </button>
+            {/* S1: ``policy_blocked`` is permanent by construction — a
+                deployment policy refused the pipeline (see the F13-D guided
+                precedent in sessionStore.ts) — so keep the failed text but
+                never render a retry invitation for it. */}
+            {message.local_failure_code !== "policy_blocked" && (
+              <button
+                onClick={() => onRetry(message.id)}
+                className="message-retry-btn"
+              >
+                Retry
+              </button>
+            )}
           </div>
         )}
 

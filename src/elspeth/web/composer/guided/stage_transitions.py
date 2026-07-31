@@ -30,8 +30,10 @@ from elspeth.web.composer.guided.resolved import (
     freeze_guided_str_sequence,
 )
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession, SinkIntent, SourceIntent
+from elspeth.web.composer.guided_blob_refs import reviewed_schema_declared_field_names
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_from_dict, facts_to_dict
 from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS
+from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 _PATH_OPTION_NAMES: Final = frozenset({"path", "file"})
@@ -279,6 +281,55 @@ def _selected_plugin(response: PluginSelectionResponse, permitted_plugins: Seque
     if plugin not in _validated_permitted_plugins(permitted_plugins):
         raise ValueError(f"plugin {plugin!r} is not in the server-emitted permitted set")
     return plugin
+
+
+class WebSurfacePolicyRejectedError(ValueError):
+    """Deployment-policy refusal of a guided selection, safe for operator logs.
+
+    A ``ValueError`` subclass so every existing client-fault catch admits it
+    unchanged, but distinguishable at the guided 400 handler: its message is
+    server-composed end to end — the plugin name comes from the persisted
+    turn's own permitted set (membership is validated before the policy check
+    fires) and the explanation from the policy predicate — so, unlike the
+    generic selection ``ValueError`` whose message echoes the raw
+    client-supplied choice, its text may reach the operator log.
+    """
+
+    rejection_code = "web_surface_policy_rejected"
+
+
+def _require_web_authorable_source_plugin(plugin: str) -> None:
+    """Reject a source plugin the web authoring surface prohibits categorically.
+
+    ``permitted_plugins`` is NOT sufficient authority here. A wizard respond
+    replays the PERSISTED turn's option list (``_schema8_permitted_plugins``),
+    and a persisted turn is immutable: a session that was emitted before the
+    deployment banned a source still offers it, and a stale tab or a resumed
+    session can answer with it long after the live catalog stopped listing it.
+    Without this check the selection is admitted at Step 1, carried through
+    options/inspection/review, and only refused at the far end of the flow by
+    the authoritative gate — the "first option of the first step is a guaranteed
+    dead end" failure this fixes.
+
+    Policy authority is ``web_aws_s3_source_policy_error`` — the SAME predicate
+    ``build_plugin_snapshot`` uses to mark a plugin
+    ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED``, so this pure module needs
+    no catalog to agree with the snapshot. If a second producer of
+    WEB_SURFACE_PROHIBITED ever appears, this check must consult the snapshot
+    reason instead of the single predicate (the reason enum's one-producer note
+    in ``composer/tools/_common.py`` is the tripwire).
+
+    Raises :class:`WebSurfacePolicyRejectedError` — the guided plane's
+    client-fault ``ValueError`` idiom, subtyped so the guided 400 handler can
+    log the policy explanation under its distinct rejection code (the generic
+    contract-rejection branch logs the class only, because generic messages
+    echo raw client input). The route still answers its closed generic 400,
+    so no policy text egresses to the client.
+    """
+
+    policy_error = web_aws_s3_source_policy_error(plugin)
+    if policy_error is not None:
+        raise WebSurfacePolicyRejectedError(f"source plugin {plugin!r} is prohibited on the web authoring surface: {policy_error}")
 
 
 def _next_component_name(base: str, existing_names: Sequence[str]) -> str:
@@ -802,6 +853,7 @@ def transition_source_plugin_selection(
         expected_turn_type=TurnType.SINGLE_SELECT,
     )
     plugin = _selected_plugin(response, permitted_plugins)
+    _require_web_authorable_source_plugin(plugin)
     facts = _validated_inspection_facts(inspection_facts) if inspection_facts is not None else None
     if facts is not None:
         _require_inspection_plugin_match(plugin, facts)
@@ -842,6 +894,7 @@ def transition_source_plugin_reselection(
     )
     stable_id, intent = _require_source_intent(session, target_id, "plugin_options")
     selected = _selected_plugin(PluginSelectionResponse(chosen=(plugin,)), permitted_plugins)
+    _require_web_authorable_source_plugin(selected)
     if selected == intent.plugin:
         raise ValueError("source plugin reselection must change the server-held plugin")
     facts = _validated_inspection_facts(inspection_facts) if inspection_facts is not None else None
@@ -934,11 +987,19 @@ def transition_source_schema_form(
 
     _require_no_other_pending(session.pending_source_intents, stable_id, "source")
     reviewed = dict(session.reviewed_sources)
+    # No inspection facts were attached, so no blob was read and there are no
+    # observed headers to record. An explicit (fixed/flexible) schema is then
+    # the only field inventory the source has, and it is authoritative: the
+    # operator declared exactly those fields, and a declared field is
+    # implicitly guaranteed. Seeding it keeps the downstream field surfaces
+    # (the Step-2 output field picker, the chat and planner projections) from
+    # presenting an empty inventory as the fact that the source has no fields.
+    # Observed schemas declare none and still resolve with no columns.
     reviewed[stable_id] = SourceResolved(
         name=intent.name,
         plugin=intent.plugin,
         options=options,
-        observed_columns=(),
+        observed_columns=reviewed_schema_declared_field_names(options.get("schema")),
         sample_rows=(),
         on_validation_failure=structural["on_validation_failure"],
     )

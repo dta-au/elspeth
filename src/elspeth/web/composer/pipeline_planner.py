@@ -1417,7 +1417,18 @@ async def prepare_pipeline_plan(
             provider=provider,
         )
     except _PipelineCandidateRejected as exc:
-        raise PipelinePlannerError("server-derived pipeline failed candidate validation", code="VALIDATION_FAILED") from exc
+        # Carry the rejection's closed codes exactly as the model-driven
+        # exhaustion path does (``_rejection_exhausted``). Discarding them here
+        # made the server-derived path structurally undiagnosable: the route
+        # recorded VALIDATION_FAILED with rejection_codes=[] while a coded
+        # rejection existed, so the durable disposition named no cause at all
+        # and a policy refusal was indistinguishable from a wiring mistake
+        # (guided S3 investigation, 2026-07-31).
+        raise PipelinePlannerError(
+            "server-derived pipeline failed candidate validation",
+            code="VALIDATION_FAILED",
+            detail_codes=_candidate_rejection_codes(exc.result),
+        ) from exc
 
 
 async def plan_pipeline(
