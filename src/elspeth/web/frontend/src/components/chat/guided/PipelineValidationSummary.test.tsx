@@ -540,11 +540,13 @@ describe("PipelineValidationSummary", () => {
     });
     render(<PipelineValidationSummary />);
     const status = screen.getByRole("status");
-    // "Summarise" is the SAME label the acknowledgement card renders for the
-    // llm plugin (stepLabelForPlugin) — the strip and the card must agree.
-    expect(status.textContent).toMatch(/The Summarise step is waiting for your review\./);
+    // "rater" is a user-meaningful node id, so stepLabelForNodeId title-cases
+    // it to "Rater" — the SAME resolution the acknowledgement card uses
+    // (R2-F8b) — rather than the generic "Summarise" plugin verb; the strip
+    // and the card must agree either way.
+    expect(status.textContent).toMatch(/The Rater step is waiting for your review\./);
     expect(status.textContent).not.toMatch(/pipeline_decision/);
-    expect(status.textContent).not.toMatch(/rater/);
+    expect(status.textContent).not.toMatch(/'rater'/);
     // The verbatim dump survives behind the expander for the operator read.
     expect(screen.getByText("Technical details")).toBeInTheDocument();
     expect(screen.getByText(rawDump)).toBeInTheDocument();
