@@ -12,9 +12,10 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, TypedDict
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
-from elspeth.web.composer.guided_blob_refs import GUIDED_REVIEWED_BLOB_PATH_KEYS
+from elspeth.web.composer.guided_blob_refs import GUIDED_REVIEWED_BLOB_PATH_KEYS, validate_guided_reviewed_blob_ref
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
 
@@ -56,9 +57,11 @@ _ROUTING_ALTERNATIVES = ["discard", "named_sink"]
 _MODEL_PROVIDER_ALTERNATIVES = ["openrouter", "azure_openai"]
 
 # The blob storage-path carriers, shared verbatim with the guided reviewed-source
-# reader and ``redact_source_storage_path``: blob ownership detection and the
-# fork rewrite treat ``path`` and ``file`` equivalently, so one carrier list has
-# to serve every surface or a source authored with the other shape leaks.
+# reader and (as of elspeth-b5180a9630) ``redact_source_storage_path``, which
+# previously kept its own ``("path", "file")`` literal: blob ownership detection
+# and the fork rewrite treat ``path`` and ``file`` equivalently, so one carrier
+# list has to serve every masking surface or the surface holding a stale copy
+# leaks a source authored with the other shape.
 _STORAGE_PATH_CARRIER_KEYS = GUIDED_REVIEWED_BLOB_PATH_KEYS
 
 
@@ -182,15 +185,32 @@ def _blob_storage_path_sentinel(options: Mapping[str, Any]) -> str | None:
     :func:`~elspeth.web.composer.redaction.redact_source_storage_path`.
 
     ``options`` is composer/LLM-authored (Tier 3, ADR-032), so the marker's VALUE
-    is parsed rather than trusted: only a non-empty ``str`` is interpolated into
-    the ``blob:<blob_ref>`` sentinel. Any other shape would let an authored
-    ``blob_ref`` become a second value channel on the very surface this exists
-    to close, so it degrades to the generic redaction sentinel.
+    is parsed rather than trusted: it is interpolated only after
+    :func:`validate_guided_reviewed_blob_ref` proves it is a canonical UUID
+    string — the same shape every other consumer requires (the YAML-export guard
+    in ``routes/composer/state.py``, the guided reviewed-source reader). A
+    ``str`` check alone would not be enough: a *path-shaped* ``blob_ref`` would
+    then ride out through the sentinel itself as
+    ``blob:/var/lib/elspeth/blobs/...``, reopening the leak inside the very
+    value that exists to close it. Anything that fails validation degrades to
+    the generic redaction sentinel.
+
+    Degrade, not escalate — deliberately divergent from ``tools/blobs.py``'s
+    ``AuditIntegrityError`` on the same impossible shape, and the divergence is
+    the point. That function is the write-side custodian: it decides whether a
+    blob may be mutated, so suppressing an anomaly there would defeat a binding
+    guard and it must fail closed. This is a read-side reporter on a disclosure
+    projection whose sole job is to keep a path off the wire; raising here would
+    convert a corrupt-state anomaly into a 500 on every state read, denying the
+    operator the very report that would let them see the corruption. Both
+    postures are fail-closed for their own surface: refuse the mutation there,
+    refuse to echo the value here.
     """
     if "blob_ref" not in options:
         return None
-    blob_ref = options["blob_ref"]
-    if type(blob_ref) is not str or not blob_ref:
+    try:
+        blob_ref = validate_guided_reviewed_blob_ref(options["blob_ref"])
+    except AuditIntegrityError:
         return REDACTED_BLOB_SOURCE_PATH
     return f"{BLOB_REF_PATH_PREFIX}{blob_ref}"
 
@@ -205,10 +225,19 @@ def _flatten_options(
 
     When ``storage_path_sentinel`` is set, the TOP-LEVEL blob storage-path
     carriers are recorded as that sentinel instead of their filesystem value, so
-    an internal ``/var/lib/elspeth/blobs/...`` path never enters
-    ``composer_meta`` in the first place (elspeth-b5180a9630). Redacting at the
-    write boundary rather than in each outbound serializer is what makes this
-    can't-regress: there is no raw path left downstream to forget to mask.
+    for a ``blob_ref``-bearing source an internal ``/var/lib/elspeth/blobs/...``
+    path never enters ``composer_meta`` in the first place
+    (elspeth-b5180a9630). Redacting at the write boundary rather than in each
+    outbound serializer is what makes THAT class can't-regress: for those
+    sources there is no raw path left downstream to forget to mask.
+
+    The claim is scoped to blob_ref-bearing sources on purpose. A guided commit
+    strips ``blob_ref`` from the executable source (it cannot prove
+    ``path == storage_path``), so its raw path DOES still enter
+    ``composer_meta`` and remains protected by the outbound projection in
+    ``redact_guided_snapshot_storage_paths`` (``redaction.py``, the
+    ``private_path_projections`` block). Two mechanisms, two populations —
+    neither subsumes the other, and removing either reopens a leak.
 
     Only ``prefix == ""`` keys are substituted. A nested ``<group>.path`` is an
     unrelated plugin option, not a blob binding — the same top-level-only scope

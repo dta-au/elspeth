@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
@@ -116,16 +118,35 @@ def test_nested_path_option_is_not_masked() -> None:
     assert by_path["source.archive.path"]["value"] == "relative/inner.csv"
 
 
-def test_non_string_blob_ref_falls_back_to_the_generic_sentinel() -> None:
-    """``options`` is composer/LLM-authored (Tier 3): never stringify it blind.
+@pytest.mark.parametrize(
+    "blob_ref",
+    [
+        pytest.param({"nested": "surprise"}, id="mapping"),
+        pytest.param(17, id="int"),
+        pytest.param("", id="empty-string"),
+        pytest.param("not-a-uuid", id="non-uuid-string"),
+        pytest.param(_STORAGE_PATH, id="path-shaped-string"),
+        pytest.param(f"../../{_BLOB_REF}", id="traversal-shaped-string"),
+        pytest.param(_BLOB_REF.upper(), id="non-canonical-uuid-casing"),
+    ],
+)
+def test_blob_ref_that_is_not_a_canonical_uuid_degrades_to_the_generic_sentinel(blob_ref: object) -> None:
+    """``options`` is composer/LLM-authored (Tier 3): validate, then degrade.
 
-    A structurally present but non-string ``blob_ref`` must not become a second
-    value channel in the entry; the generic redaction sentinel is used instead,
-    and the raw path still never appears.
+    A ``str`` check alone is NOT sufficient. Every other consumer of this marker
+    requires a canonical UUID (the YAML-export guard, the guided reviewed-source
+    reader), and a path-shaped ``blob_ref`` passed through a bare ``str`` check
+    would ride out as ``blob:/var/lib/elspeth/blobs/...`` — the leak reopened
+    inside the sentinel that exists to close it. Anything failing validation
+    must degrade to the generic sentinel rather than be interpolated.
     """
-    by_path = _entries_by_path(_state_with_source_options({"blob_ref": {"nested": "surprise"}, "path": _STORAGE_PATH}))
+    by_path = _entries_by_path(_state_with_source_options({"blob_ref": blob_ref, "path": _STORAGE_PATH}))
 
     assert by_path["source.path"]["value"] == REDACTED_BLOB_SOURCE_PATH
+    # Degrade, never escalate: a read-side disclosure projection must not turn a
+    # corrupt-state anomaly into a 500 on every state read (contrast the
+    # write-side custodian in tools/blobs.py, which raises on the same shape).
+    assert "/var/lib/elspeth/blobs/" not in json.dumps(by_path["source.path"]["value"])
 
 
 def test_named_sources_each_project_their_own_blob_ref() -> None:

@@ -3940,7 +3940,10 @@ def redact_source_storage_path(state_dict: dict[str, Any]) -> dict[str, Any]:
         # (web/sessions/routes/sessions.py) treat them equivalently. Mask both so a
         # blob-backed source authored with the "file" option shape cannot leak the
         # internal storage_path through this redaction surface (elspeth-a7aa07b7ce).
-        for storage_path_key in ("path", "file"):
+        # The carrier list is the shared ``GUIDED_REVIEWED_BLOB_PATH_KEYS`` constant
+        # rather than a local literal: a third carrier added there must reach every
+        # masking surface at once, or the surface that kept its own copy leaks.
+        for storage_path_key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
             if storage_path_key in redacted_options:
                 redacted_options[storage_path_key] = REDACTED_BLOB_SOURCE_PATH
         redacted_source["options"] = redacted_options
@@ -4063,7 +4066,9 @@ def redact_guided_snapshot_storage_paths(
         for live_name, live_source in tuple(rebuilt_sources.items()):
             live_options = live_source_options[live_name]
             live_reviewed_paths = {
-                value for key in ("path", "file") if type(value := live_options.get(key)) is str and value in all_reviewed_paths
+                value
+                for key in GUIDED_REVIEWED_BLOB_PATH_KEYS
+                if type(value := live_options.get(key)) is str and value in all_reviewed_paths
             }
             if not live_reviewed_paths:
                 continue
@@ -4073,7 +4078,7 @@ def redact_guided_snapshot_storage_paths(
             if len(candidates) != 1:
                 raise AuditIntegrityError("guided blob source mapping is inconsistent")
             options_redacted = dict(live_options)
-            for key in ("path", "file"):
+            for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
                 if type(value := live_options.get(key)) is str and value in live_reviewed_paths:
                     private_path_projections[value] = REDACTED_BLOB_SOURCE_PATH
                     options_redacted[key] = REDACTED_BLOB_SOURCE_PATH
@@ -4120,7 +4125,7 @@ def redact_guided_snapshot_storage_paths(
             pending_out[stable_id] = intent
             continue
         options_redacted = dict(intent_options)
-        for key in ("path", "file"):
+        for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
             if key in options_redacted:
                 options_redacted[key] = REDACTED_BLOB_SOURCE_PATH
         intent_redacted = dict(intent)
