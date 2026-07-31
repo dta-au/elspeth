@@ -114,19 +114,9 @@
   color: var(--color-text);
 }
 
-/* Panel name outside the expanded header (loading / error / collapsed states)
-   — the destination the graduation copy points at must exist by name in every
-   state (elspeth-4f69b267dd). */
+/* Panel name outside the expanded header (loading / error states). */
 .audit-readiness-title--standalone {
   margin-bottom: var(--space-2xs);
-}
-
-/* The collapsed pill has no section padding (the summary button carries its
-   own), so the standalone title needs matching padding or it sits flush
-   against the panel edge. The button's own top padding provides the gap. */
-.audit-readiness--collapsed .audit-readiness-title--standalone {
-  margin-bottom: 0;
-  padding: var(--space-sm) var(--space-md) 0;
 }
 
 .audit-readiness-freshness {

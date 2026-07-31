@@ -212,20 +212,17 @@ describe("AuditReadinessPanel", () => {
     expect(screen.getByText("Retention")).toBeInTheDocument();
   });
 
-  it("names the panel 'Audit' with a visible heading in collapsed AND expanded states (elspeth-4f69b267dd)", async () => {
-    // The graduation card directs users to "the Audit panel" — the destination
-    // must exist by that name in every rendered state, not only when expanded.
+  it("uses the compact ready status as the collapsed label and keeps the Audit heading when expanded", async () => {
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
     );
     const user = userEvent.setup();
     render(<AuditReadinessPanel />);
-    // Collapsed (all-green) state: heading present above the summary button.
+    // Collapsed (all-green) state: the status is the visible label, without a
+    // redundant heading consuming a third line in the compact card.
     await screen.findByRole("button", { name: /Audit ready/i });
-    expect(
-      screen.getByRole("heading", { name: "Audit" }),
-    ).toBeInTheDocument();
-    // Expanded state: same visible name.
+    expect(screen.queryByRole("heading", { name: "Audit" })).not.toBeInTheDocument();
+    // Expanded state keeps the heading to name the detailed panel.
     await user.click(screen.getByRole("button", { name: /Audit ready/i }));
     expect(
       screen.getByRole("heading", { name: "Audit" }),

@@ -336,10 +336,9 @@ export function AuditReadinessPanel() {
     throw new Error("compositionState missing after audit-readiness content guard");
   }
 
-  // Visible panel name, rendered in EVERY state (elspeth-4f69b267dd): the
-  // graduation card sends users to "the Audit panel", so the destination must
-  // exist by that name even while loading, collapsed, or errored — not only in
-  // the expanded view.
+  // Visible panel name for non-ready standalone states. The collapsed ready
+  // card uses its "Audit ready" status as the compact visible label; the
+  // expanded panel renders its own heading below.
   const panelHeading = <h2 className="audit-readiness-title audit-readiness-title--standalone">Audit</h2>;
 
   if (isLoading && !snapshot) {
@@ -413,7 +412,6 @@ export function AuditReadinessPanel() {
         className="audit-readiness audit-readiness--collapsed"
         aria-busy={isLoading ? "true" : undefined}
       >
-        {panelHeading}
         <button
           type="button"
           className="audit-readiness-summary"
