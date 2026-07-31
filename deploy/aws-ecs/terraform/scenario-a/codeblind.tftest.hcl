@@ -120,6 +120,41 @@ run "reject_noncanonical_world_open_https_ingress" {
   expect_failures = [var.alb_https_ingress_cidrs]
 }
 
+# A raw-suffix check on "/0" missed these: the prefix parses as zero regardless
+# of how many leading zeros it is written with, and EC2 canonicalises the rule
+# straight back to 0.0.0.0/0. The guard must read the parsed prefix.
+run "reject_leading_zero_world_open_https_ingress" {
+  command = plan
+
+  variables {
+    alb_https_ingress_cidrs = ["0.0.0.0/00"]
+  }
+
+  expect_failures = [var.alb_https_ingress_cidrs]
+}
+
+run "reject_padded_world_open_https_ingress" {
+  command = plan
+
+  variables {
+    alb_https_ingress_cidrs = ["10.0.0.0/000"]
+  }
+
+  expect_failures = [var.alb_https_ingress_cidrs]
+}
+
+# Both entries build the same 10.0.0.0/8 rule, so the second is a duplicate
+# that `distinct()` over the raw strings does not see.
+run "reject_duplicate_https_ingress_networks" {
+  command = plan
+
+  variables {
+    alb_https_ingress_cidrs = ["10.0.0.5/8", "10.0.0.6/8"]
+  }
+
+  expect_failures = [var.alb_https_ingress_cidrs]
+}
+
 run "reject_unsafe_database_identifier" {
   command = plan
 
