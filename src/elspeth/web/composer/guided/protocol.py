@@ -1018,8 +1018,15 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
     assert fields is not None
     seen_names: set[str] = set()
     visibility_gated: set[str] = set()
+    # ``required_when`` targets may be declared LATER in the field list, so the
+    # whole name set is collected up front rather than accumulated as we go
+    # (``collision_policy`` lives on ``LocalFileSinkConfig`` while its target
+    # ``mode`` lives on the concrete sink subclass and therefore lowers after
+    # it). Malformed entries are dropped here and rejected by the per-field
+    # checks below.
+    all_names = {item["name"] for item in fields if isinstance(item, Mapping) and type(item.get("name")) is str}
     required = frozenset({"name", "label", "kind", "required", "nullable"})
-    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder"})
+    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder", "required_when"})
     for index, item in enumerate(fields):
         field_path = f"{path}.fields[{index}]"
         if not isinstance(item, Mapping):
@@ -1075,6 +1082,21 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
             if (error := _public_json_error(predicate["equals"], f"{field_path}.visible_when.equals")) is not None:
                 return error
             visibility_gated.add(name)
+        if "required_when" in item:
+            predicate = item["required_when"]
+            if (error := _exact_nested_keys(predicate, frozenset({"field", "equals"}), f"{field_path}.required_when")) is not None:
+                return error
+            assert isinstance(predicate, Mapping)
+            target = predicate["field"]
+            # Deliberately weaker than the visible_when rule above: no
+            # earlier-field and no ungated requirement. required_when never
+            # gates RENDERING — the field is always drawn and the form reads
+            # sibling state — so declaration order carries no meaning here, and
+            # enforcing it would reject the only shape this key exists for.
+            if type(target) is not str or target not in all_names or target == name:
+                return f"{field_path}.required_when.field must reference another field on this schema"
+            if (error := _public_json_error(predicate["equals"], f"{field_path}.required_when.equals")) is not None:
+                return error
         seen_names.add(name)
     return None
 

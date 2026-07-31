@@ -650,6 +650,53 @@ class TestPayloadValidation:
         assert err is not None
         assert "placeholder" in err
 
+    def test_schema_form_knob_required_when_is_in_the_closed_vocabulary(self) -> None:
+        # R2-F2: ``required_when`` carries the composer's own conditional
+        # requiredness rule (file-sink collision_policy under mode='write') to
+        # the form. Every local file sink emits it, so the schema_form turn is
+        # rejected outright unless the key is inside the closed vocabulary.
+        #
+        # Unlike ``visible_when``, the target may be declared LATER: ``mode``
+        # lives on the concrete sink subclass and lowers after
+        # ``collision_policy`` on LocalFileSinkConfig. required_when only reads
+        # sibling form state — every field renders — so the ordering rule must
+        # not be ported.
+        from elspeth.web.composer.guided.protocol import validate_payload
+
+        def payload(predicate: object) -> dict[str, object]:
+            return {
+                "mode": "plugin_options",
+                "plugin": "json",
+                "knobs": {
+                    "fields": [
+                        {
+                            "name": "collision_policy",
+                            "label": "Collision Policy",
+                            "kind": "enum",
+                            "enum": ["fail_if_exists", "auto_increment", "append_or_create"],
+                            "required": False,
+                            "nullable": True,
+                            "required_when": predicate,
+                        },
+                        {
+                            "name": "mode",
+                            "label": "Mode",
+                            "kind": "enum",
+                            "enum": ["write", "append"],
+                            "required": False,
+                            "nullable": False,
+                        },
+                    ]
+                },
+                "prefilled": {},
+            }
+
+        assert validate_payload(TurnType.SCHEMA_FORM, payload({"field": "mode", "equals": "write"})) is None
+        for malformed in ({"field": "nonexistent", "equals": "write"}, {"field": "mode"}, 42):
+            err = validate_payload(TurnType.SCHEMA_FORM, payload(malformed))
+            assert err is not None
+            assert "required_when" in err
+
     def test_confirm_wiring_minimal_wire_payload_validates(self) -> None:
         payload = {
             "proposal_id": "00000000-0000-4000-8000-000000000001",

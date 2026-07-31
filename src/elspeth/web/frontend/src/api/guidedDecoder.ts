@@ -1111,7 +1111,7 @@ function decodeSchemaPayload(value: unknown, path: string): SchemaFormPayload {
       item,
       fieldPath,
       ["name", "label", "kind", "required", "nullable"],
-      ["description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder"],
+      ["description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder", "required_when"],
     );
     const tier = field.tier === undefined ? undefined : stringValue(field.tier, `${fieldPath}.tier`);
     if (tier !== undefined && tier !== "essential" && tier !== "common" && tier !== "advanced") {
@@ -1126,6 +1126,12 @@ function decodeSchemaPayload(value: unknown, path: string): SchemaFormPayload {
     const visibleWhen = field.visible_when === undefined
       ? undefined
       : exactRecord(field.visible_when, `${fieldPath}.visible_when`, ["field", "equals"]);
+    // Conditional requiredness (R2-F2). Same predicate shape as visible_when,
+    // but the target may name a LATER field — it gates whether an
+    // always-rendered knob must be filled, not whether it renders.
+    const requiredWhen = field.required_when === undefined
+      ? undefined
+      : exactRecord(field.required_when, `${fieldPath}.required_when`, ["field", "equals"]);
     return {
       name: stringValue(field.name, `${fieldPath}.name`),
       label: stringValue(field.label, `${fieldPath}.label`),
@@ -1148,6 +1154,14 @@ function decodeSchemaPayload(value: unknown, path: string): SchemaFormPayload {
             visible_when: {
               field: stringValue(visibleWhen.field, `${fieldPath}.visible_when.field`),
               equals: jsonValue(visibleWhen.equals, `${fieldPath}.visible_when.equals`),
+            },
+          }),
+      ...(requiredWhen === undefined
+        ? {}
+        : {
+            required_when: {
+              field: stringValue(requiredWhen.field, `${fieldPath}.required_when.field`),
+              equals: jsonValue(requiredWhen.equals, `${fieldPath}.required_when.equals`),
             },
           }),
     };

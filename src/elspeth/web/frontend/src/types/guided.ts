@@ -491,6 +491,12 @@ export interface KnobField {
   enum?: string[];
   item_kind?: "text" | "number-int" | "number-float";
   visible_when?: VisibilityPredicate;
+  /** Conditional requiredness the plugin model itself cannot express: the field
+   *  is required when `required` is true OR this predicate holds against
+   *  current form state. Carries composer-owned rules such as "a local file
+   *  sink must choose a collision_policy under mode='write'" (R2-F2). Unlike
+   *  `visible_when` the target may appear LATER in `fields`. */
+  required_when?: VisibilityPredicate;
 }
 
 export interface KnobSchema {

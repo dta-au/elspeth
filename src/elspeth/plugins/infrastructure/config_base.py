@@ -521,14 +521,29 @@ class LocalFileSinkConfig(PathConfig):
 
     _plugin_component_type: ClassVar[str | None] = "sink"
 
+    # Conditionally required, not optional. YAML may omit it (the runtime
+    # resolves a default), but the composer refuses a runnable file sink that
+    # does not choose explicitly — see
+    # ``validate_composer_file_sink_collision_policy``. The old "Optional …"
+    # text contradicted that on every surface, and the correct guidance existed
+    # only as an LLM-facing hint on the sink plugins, so a form user was told
+    # the knob was optional and then rejected for omitting it (R2-F2).
     collision_policy: OutputCollisionPolicy | None = Field(
         default=None,
         description=(
-            "Optional local output collision policy. "
+            "Required when mode='write': "
             "'fail_if_exists' refuses an existing write target; "
             "'auto_increment' picks a free sibling path; "
-            "'append_or_create' is valid with append mode."
+            "'append_or_create' only with mode='append'."
         ),
+        json_schema_extra={
+            "composer_description": (
+                "Required when mode is 'write'. 'auto_increment' is the safe default — it picks a free sibling path. "
+                "'fail_if_exists' refuses an existing write target. "
+                "'append_or_create' only with mode='append'."
+            ),
+            "composer_required_when": {"field": "mode", "equals": "write"},
+        },
     )
 
 
