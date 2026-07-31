@@ -599,10 +599,13 @@ def guided_unproducible_output_fields(guided: GuidedSession) -> tuple[dict[str, 
     transform. Candidate validation cannot be the guard here (R2-F4): before
     ``guided_reviewed_sink_options`` the sink carried no ``required_fields`` at
     all, so the sink-contract check skipped outright and sealed the sketch
-    green; with them merged it now fires, but only as an opaque
-    ``sink_contract_violation`` the planner burns its whole repair budget on.
-    The guided seam holds both halves of the fact BEFORE any pipeline is built,
-    so it names the gap here and lets the caller act on it.
+    green. Merging them helps only when the producer PARTICIPATES in
+    propagation — a blob-inspected source resolves an explicit ``flexible``
+    schema and does, but a source whose schema stays ``observed`` abstains
+    under ADR-007 and the check emits no contract at all — and even when it
+    does fire it is an opaque ``sink_contract_violation`` the planner burns its
+    repair budget on. The guided seam holds both halves of the fact BEFORE any
+    pipeline is built, so it names the gap here and lets the caller act on it.
 
     Advisory shape only — this reports; the caller decides. The returned
     projection is provider-safe: every value is already in
@@ -625,6 +628,28 @@ def guided_unproducible_output_fields(guided: GuidedSession) -> tuple[dict[str, 
         if missing:
             gaps.append({"stable_id": stable_id, "fields": cast(JsonValue, missing)})
     return tuple(gaps)
+
+
+def guided_unproducible_output_field_names(guided: GuidedSession) -> tuple[str, ...]:
+    """Flatten :func:`guided_unproducible_output_fields` to sorted field names.
+
+    The planner loop and the operator-visible failure both want "which fields
+    is nothing producing", not "which sink declared them" — a zero-transform
+    candidate is wrong for the union, and the repair is the same whichever sink
+    asked. Derived from the per-output projection rather than recomputed so the
+    two can never disagree about what the gap is.
+
+    Every name here is a field the OPERATOR typed. Step-2 field review admits
+    ``chosen`` only from ``_candidate_fields`` (the reviewed sources' observed
+    columns) and forbids ``custom_inputs`` from overlapping them, so a name
+    that survives the set difference came from ``custom_inputs`` verbatim.
+    """
+    names: set[str] = set()
+    for gap in guided_unproducible_output_fields(guided):
+        fields = gap["fields"]
+        assert type(fields) is list  # built above as list[str]
+        names.update(cast(list[str], fields))
+    return tuple(sorted(names))
 
 
 def bind_guided_reviewed_components(
@@ -1389,6 +1414,7 @@ __all__ = [
     "guided_redacted_current_state_context",
     "guided_redacted_planner_context",
     "guided_reviewed_sink_options",
+    "guided_unproducible_output_field_names",
     "guided_unproducible_output_fields",
     "require_guided_correction_target_changed",
     "resolve_guided_correction_target",

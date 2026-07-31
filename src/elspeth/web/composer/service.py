@@ -2417,6 +2417,10 @@ class ComposerServiceImpl:
             intent=intent,
             current_state=current_state,
             provider_current_state=current_state.to_dict(),
+            # No reviewed guided source or output exists on the guided-FULL
+            # surface (reviewed_facts is empty by construction), so there is no
+            # declared output contract a gap could be computed against.
+            unproducible_output_fields=(),
             reviewed_facts={},
             reviewed_planner_context={},
             eligible_deferred_intent_ids=(),
@@ -2523,6 +2527,7 @@ class ComposerServiceImpl:
             guided_redacted_current_state_context,
             guided_redacted_planner_context,
             guided_reviewed_sink_options,
+            guided_unproducible_output_field_names,
             guided_unproducible_output_fields,
         )
         from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
@@ -2595,31 +2600,43 @@ class ComposerServiceImpl:
             and len(guided.source_order) == 1
             and len(guided.output_order) == 1
         )
-        # A zero-transform sketch emits exactly what the reviewed source
-        # carries, so a declared sink field no source can supply makes the
-        # sketch unbuildable. Validation cannot be the guard (R2-F4): without
-        # the declared-contract merge below the sink had no required_fields at
-        # all, so the contract check skipped and the sketch sealed GREEN; with
-        # the merge it fires, but only as an opaque sink_contract_violation the
-        # planner cannot repair away. Decide it here, before the sketch is
-        # built. Scoped to the sketch branch on purpose: on any other guided
-        # plan a transform may legitimately produce the field, so this is not a
-        # general satisfiability gate.
-        unproducible_output_fields = guided_unproducible_output_fields(guided) if passthrough_sketch_shape else ()
-        if unproducible_output_fields:
-            # Name the gap to the provider planner instead of presenting an
-            # unsatisfiable sketch as complete. Zero new egress: the source
+        # A zero-transform pipeline emits exactly what the reviewed source
+        # carries, so a declared sink field no source can supply makes it
+        # unbuildable. Validation cannot be the guard (R2-F4): without the
+        # declared-contract merge below the sink had no required_fields at all,
+        # so the contract check skipped and the sketch sealed GREEN; with the
+        # merge it fires only when the producer participates in propagation
+        # (an observed-schema source abstains under ADR-007), and even then as
+        # an opaque sink_contract_violation the planner cannot repair away.
+        #
+        # The gap is computed for EVERY guided plan, not just the sketch:
+        # ``passthrough_sketch_shape`` only decides whether the server-built
+        # sketch is safe to seal, while the planner loop refuses any
+        # zero-transform candidate carrying the gap. That is not a general
+        # satisfiability gate — with a transform present a field may
+        # legitimately be produced, and the loop's guard says nothing.
+        output_field_gaps = guided_unproducible_output_fields(guided)
+        unproducible_output_fields = guided_unproducible_output_field_names(guided)
+        if output_field_gaps:
+            # Name the gap to the provider planner rather than letting it
+            # rediscover the wall by rejection. Zero new egress: the source
             # observed/declared field names and the output's required_fields
             # are already members of guided_redacted_planner_context.
             reviewed_context = {
                 **reviewed_context,
-                "unproducible_output_fields": [dict(gap) for gap in unproducible_output_fields],
+                "unproducible_output_fields": [dict(gap) for gap in output_field_gaps],
+                # States only what is KNOWN. An earlier draft asserted the
+                # pipeline "will fail at runtime" — ELSPETH cannot know that
+                # (a source with no observed columns and an observed-mode
+                # schema has an unknown, not an empty, inventory), and the
+                # over-claim pushes the planner toward fabricating transforms
+                # to satisfy a prediction rather than closing a named gap.
                 "unproducible_output_fields_usage": (
-                    "These reviewed sink fields appear in no reviewed source. A direct pass-through cannot "
-                    "produce them — propose the transform(s) that do, or the pipeline will fail at runtime."
+                    "No reviewed source declares or observes these fields; a pass-through has nothing to "
+                    "produce them from. Propose the transform(s) that do."
                 ),
             }
-        if passthrough_sketch_shape and not unproducible_output_fields:
+        if passthrough_sketch_shape and not output_field_gaps:
             # The rootless step-2→3 starting sketch is ALWAYS the same
             # pass-through (reviewed source → reviewed output, zero nodes),
             # withheld from acceptance (supersedes_draft_hash null) and
@@ -2725,6 +2742,7 @@ class ComposerServiceImpl:
             provider_current_state=guided_redacted_current_state_context(current_state),
             reviewed_facts=reviewed_facts,
             reviewed_planner_context=reviewed_context,
+            unproducible_output_fields=unproducible_output_fields,
             eligible_deferred_intent_ids=tuple(item.intent_id for item in guided.deferred_intents),
             claim_evaluator=evaluate_claims,
             supersedes_draft_hash=supersedes_draft_hash,
@@ -3011,6 +3029,10 @@ class ComposerServiceImpl:
                     provider_current_state=state.to_dict(),
                     reviewed_facts={},
                     reviewed_planner_context={},
+                    # Freeform has no reviewed guided output, so no operator
+                    # has declared a sink field contract a gap could exist
+                    # against.
+                    unproducible_output_fields=(),
                     eligible_deferred_intent_ids=(),
                     claim_evaluator=None,
                     supersedes_draft_hash=None,

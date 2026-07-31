@@ -740,11 +740,18 @@ class TestStep2IntraStep:
 
         Both parameters assert the same two invariants — no server-synthesized
         pass-through proposal is sealed, and the gap reaches the planner. They
-        differ in what the provider does with the named gap, which exercises
-        the second line of defence: because the reviewed sink's declared fields
-        are now materialized into ``options.schema.required_fields``, a planner
-        that IGNORES the gap and re-proposes the bare pass-through is rejected
-        by the sink-contract check instead of sealing green.
+        differ in what the provider does with the named gap:
+
+        - ``True``: the planner adds a transform, and an ordinary provider
+          proposal is sealed.
+        - ``False``: the planner ignores the gap and re-proposes the same bare
+          zero-transform pass-through. The diversion alone would not save this
+          — the candidate is provider-authored, so it would seal as a COMPLETE
+          normal proposal and re-open R2-F4 one layer down. The planner loop
+          must therefore refuse every zero-transform candidate while the gap
+          stands (``passthrough_cannot_produce_declared_fields``), and the
+          resulting exhaustion must hand the operator the missing field names
+          rather than a bare "retry the request".
         """
         import elspeth.web.composer.service as service_module
 
@@ -876,23 +883,40 @@ class TestStep2IntraStep:
 
         monkeypatch.setattr(service_module, "_litellm_acompletion", terminal_completion)
 
-        settled = _post_current_response(
-            composer_test_client,
-            session_id,
-            component_action={"action": "finish", "component_kind": "output"},
-        )
+        from structlog.testing import capture_logs
+
+        with capture_logs() as planner_logs:
+            settled = _post_current_response(
+                composer_test_client,
+                session_id,
+                component_action={"action": "finish", "component_kind": "output"},
+            )
 
         if provider_heeds_gap:
             assert settled.status_code == 200, settled.json()
             assert settled.json()["next_turn"]["type"] == "propose_pipeline"
         else:
-            # The reviewed sink now carries required_fields, so the bare
-            # pass-through the provider re-proposed is rejected on contract
-            # rather than sealed green. The 502 is the planner loop's rejection
-            # SURFACE (repair budget exhausted, then the escape hatch), not the
-            # contract under test — the invariants asserted below are.
+            # Every zero-transform candidate is refused while the gap stands,
+            # so the planner burns its budget and the request terminates. The
+            # 502 is the planner loop's exhaustion SURFACE, not the contract
+            # under test; what is pinned is that the operator is handed the
+            # missing field names instead of a bare retry instruction.
             assert settled.status_code == 502, settled.json()
-            assert settled.json()["detail"]["failure_code"] == "invalid_provider_response"
+            failure_detail = settled.json()["detail"]
+            assert failure_detail["failure_code"] == "invalid_provider_response"
+            assert failure_detail["unproducible_output_fields"] == ["amount_aud", "client"]
+            assert "amount_aud" in failure_detail["detail"] and "client" in failure_detail["detail"]
+            # The guided surface records its planner disposition as a
+            # structured log rather than a durable audit row
+            # (``_log_guided_planner_failure``), so that is where the closed
+            # rejection code the loop actually hit is observable.
+            rejection_codes = {
+                code
+                for entry in planner_logs
+                if entry.get("event") == "composer.guided_planner_failure"
+                for code in entry.get("rejection_codes", ())
+            }
+            assert "passthrough_cannot_produce_declared_fields" in rejection_codes, planner_logs
         with app.state.session_engine.connect() as conn:
             proposals = conn.execute(
                 select(

@@ -107,12 +107,29 @@ class PipelinePlannerError(RuntimeError):
     exhaustion — the discriminant a live 5xx investigation needs, recorded on
     the durable failure disposition so it never requires a temp diagnostic.
     Empty for non-rejection failures (timeout, provider error, ...).
+
+    ``unproducible_output_fields`` carries the reviewed output fields no
+    reviewed source declares or observes, when the request was planned with a
+    known gap (R2-F4). Without it an exhausted guided plan answers the operator
+    with only "the provider returned an invalid response" while the server
+    holds the exact, actionable cause. The names are the operator's own
+    ``custom_inputs`` from step-2 field review (see
+    ``guided_unproducible_output_field_names``), so returning them to that same
+    operator discloses nothing new.
     """
 
-    def __init__(self, message: str, *, code: str, detail_codes: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        detail_codes: tuple[str, ...] = (),
+        unproducible_output_fields: tuple[str, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.detail_codes = detail_codes
+        self.unproducible_output_fields = unproducible_output_fields
 
 
 class PlannerDeclined(PipelinePlannerError):
@@ -874,6 +891,51 @@ def _stated_threshold_ignored_rejection(state: CompositionState, *, node_id: str
     )
 
 
+_UNPRODUCIBLE_OUTPUT_FIELDS_CODE: Final[str] = "passthrough_cannot_produce_declared_fields"
+
+
+def _unproducible_output_fields_rejection(state: CompositionState, *, fields: tuple[str, ...]) -> ToolResult:
+    """Synthesize the coded rejection for a zero-transform candidate with a gap.
+
+    R2-F4 (elspeth-6e311df389). Step-2 field review let the operator declare
+    output fields no reviewed source declares or observes; a candidate with no
+    transform or aggregation node has nothing that could produce them, so it is
+    unbuildable no matter how it is wired. Structural validation cannot answer
+    it: the sink-contract check emits no contract at all when the source
+    abstains from propagation (ADR-007), which is exactly the observed-schema
+    case. Only the planner loop sees both the reviewed gap and the candidate's
+    node count, so the rejection lives here.
+
+    Deliberately NOT one-shot with an omit-valve, unlike the nodeless-revision
+    and stated-threshold nudges: those infer intent from PROSE ELSPETH cannot
+    prove, so re-emitting is a legitimate "I meant it". This is a mechanical set
+    difference over reviewed facts, and adding ANY transform clears the guard in
+    one turn — so it fires on every attempt, including the escape hatch, rather
+    than letting the second identical candidate through. Repeated identical
+    rejections draw the ordinary repeat notice via the shared fingerprint path.
+
+    The message names the missing fields. They are the operator's own
+    ``custom_inputs`` strings, already verbatim in the planner's
+    ``reviewed_planner_context`` (``outputs[].required_fields``) — the same
+    custody judgment ``gate_condition_ignores_stated_threshold`` rides on.
+    """
+    entry = ValidationEntry(
+        component="pipeline",
+        message=(
+            "This candidate has no transform or aggregation nodes, so it can only emit what the source "
+            f"carries, but no reviewed source declares or observes these reviewed output fields: {', '.join(fields)}."
+        ),
+        severity="high",
+        error_code=_UNPRODUCIBLE_OUTPUT_FIELDS_CODE,
+    )
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
+        affected_nodes=(),
+    )
+
+
 def _nodeless_revision_rejection(state: CompositionState) -> ToolResult:
     """Synthesize the coded rejection for a nodeless revision candidate.
 
@@ -1033,11 +1095,12 @@ def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint:
         guidance = explain_validation_code(code)
         if guidance is not None:
             projected["explanation"], projected["suggested_fix"] = guidance
-        if code in ("plugin_options_invalid", "gate_condition_ignores_stated_threshold"):
-            # Same custody judgment for both: the message quotes only content
-            # the planner itself already holds verbatim — the options of the
-            # candidate it just authored, or the comparison span from the
-            # instruction its own prompt was built from.
+        if code in ("plugin_options_invalid", "gate_condition_ignores_stated_threshold", _UNPRODUCIBLE_OUTPUT_FIELDS_CODE):
+            # Same custody judgment for all three: the message quotes only
+            # content the planner itself already holds verbatim — the options
+            # of the candidate it just authored, the comparison span from the
+            # instruction its own prompt was built from, or the reviewed output
+            # field names already in its ``reviewed_planner_context``.
             projected["detail"] = entry.message
         if code in _ROUTE_DESTINATION_FACT_CODES:
             # Instance wiring facts derived from the REJECTED candidate state
@@ -1618,6 +1681,7 @@ async def plan_pipeline(
     provider_current_state: Mapping[str, Any],
     reviewed_facts: Mapping[str, Any],
     reviewed_planner_context: Mapping[str, Any],
+    unproducible_output_fields: tuple[str, ...],
     eligible_deferred_intent_ids: tuple[str, ...],
     claim_evaluator: PipelineClaimEvaluator | None,
     supersedes_draft_hash: str | None,
@@ -1650,6 +1714,8 @@ async def plan_pipeline(
     canonical_json(provider_current_state)
     if not callable(candidate_finalizer):
         raise TypeError("candidate_finalizer must be callable")
+    if type(unproducible_output_fields) is not tuple or any(type(field) is not str for field in unproducible_output_fields):
+        raise TypeError("unproducible_output_fields must be an exact string tuple")
     if type(eligible_deferred_intent_ids) is not tuple or any(type(intent_id) is not str for intent_id in eligible_deferred_intent_ids):
         raise TypeError("eligible_deferred_intent_ids must be an exact string tuple")
     if len(set(eligible_deferred_intent_ids)) != len(eligible_deferred_intent_ids):
@@ -1684,6 +1750,7 @@ async def plan_pipeline(
                 provider_current_state=provider_current_state,
                 reviewed_facts=reviewed_facts,
                 reviewed_planner_context=reviewed_planner_context,
+                unproducible_output_fields=unproducible_output_fields,
                 eligible_deferred_intent_ids=eligible_deferred_intent_ids,
                 claim_evaluator=claim_evaluator,
                 supersedes_draft_hash=supersedes_draft_hash,
@@ -1736,6 +1803,7 @@ async def _plan_pipeline_inner(
     provider_current_state: Mapping[str, Any],
     reviewed_facts: Mapping[str, Any],
     reviewed_planner_context: Mapping[str, Any],
+    unproducible_output_fields: tuple[str, ...],
     eligible_deferred_intent_ids: tuple[str, ...],
     claim_evaluator: PipelineClaimEvaluator | None,
     supersedes_draft_hash: str | None,
@@ -2124,6 +2192,11 @@ async def _plan_pipeline_inner(
             "planner repair budget exhausted",
             code="REPAIR_EXHAUSTED",
             detail_codes=last_rejection_codes,
+            # Carried whenever the request HAD a gap, not only when the final
+            # rejection named it: the planner was asked to close this gap and
+            # did not, so it is the actionable cause of the exhaustion whatever
+            # code the last candidate happened to trip (R2-F4).
+            unproducible_output_fields=unproducible_output_fields,
         )
 
     def _hatch_available() -> bool:
@@ -2375,6 +2448,27 @@ async def _plan_pipeline_inner(
                     # there guarantees failure.
                     nodeless_nudge_given = True
                     raise _PipelineCandidateRejected(_nodeless_revision_rejection(current_state))
+                if unproducible_output_fields and _transform_node_count(finalized_pipeline) == 0:
+                    # R2-F4 (elspeth-6e311df389). The reviewed outputs declare
+                    # fields no reviewed source declares or observes, and this
+                    # candidate has nothing that could produce them. The
+                    # server-synthesized sketch is diverted here before it is
+                    # ever built (ComposerServiceImpl.plan_guided_pipeline);
+                    # without this guard a planner that answers the diverted
+                    # request with the same bare pass-through re-opens the
+                    # identical defect, provider-authored and sealed as a
+                    # COMPLETE proposal.
+                    #
+                    # Unlike the two nudges around it this fires on EVERY
+                    # attempt including the hatch, and has no omit-valve: the
+                    # claim is a mechanical set difference over reviewed facts,
+                    # not an inference from prose, and adding any transform
+                    # clears it in one turn. An identical re-emit draws the
+                    # ordinary repeat notice through the shared fingerprint
+                    # path rather than being waved through.
+                    raise _PipelineCandidateRejected(
+                        _unproducible_output_fields_rejection(current_state, fields=unproducible_output_fields)
+                    )
                 if not is_hatch_turn and not threshold_nudge_given and stated_threshold is not None:
                     # Stated-threshold fidelity (R2-F17, elspeth-5c0c09db31).
                     # The instruction named a comparison and no gate in the

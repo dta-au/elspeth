@@ -4561,7 +4561,16 @@ async def post_guided_respond(
                         )
                     raise AuditIntegrityError("Guided RESPOND could not record its terminal failure") from None
                 else:
-                    raise_guided_operation_failure(failed)
+                    # R2-F4: when the planner exhausted its budget on a request
+                    # that carried a known unproducible-output-field gap, name
+                    # the gap instead of handing back a bare retry instruction.
+                    # Read off the escaping planner error rather than
+                    # recomputed from the guided session, which may not be
+                    # bound yet at this generic handler.
+                    raise_guided_operation_failure(
+                        failed,
+                        unproducible_output_fields=(exc.unproducible_output_fields if isinstance(exc, _PlannerFailureExc) else ()),
+                    )
 
         if rejoin_after_lock:
             joined = await reserve_or_replay_guided_operation(

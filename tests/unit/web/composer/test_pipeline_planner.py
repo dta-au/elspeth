@@ -618,6 +618,7 @@ async def _plan(
         ),
         reviewed_facts={"request": "Build the requested pipeline."},
         reviewed_planner_context={"request": "Build the requested pipeline."},
+        unproducible_output_fields=(),
         eligible_deferred_intent_ids=eligible_deferred_intent_ids,
         claim_evaluator=claim_evaluator,
         supersedes_draft_hash=supersedes_draft_hash,
