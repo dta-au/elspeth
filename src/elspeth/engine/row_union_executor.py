@@ -201,11 +201,14 @@ class RowUnionExecutor:
     ) -> tuple[RowUnionOutcome, ...]:
         """Restore adopted pending groups from durable scheduler and audit rows.
 
-        Validation completes before executor memory is replaced. Fully
-        adopted groups are released immediately; groups with a durable branch
-        loss fail through point reads without preloading historical losses.
-        The caller must commit returned outcomes through the scheduler
-        barrier-completion seam.
+        Validation completes before executor memory is replaced. Entries whose
+        key already closed in the Landscape are begin-window late-arrival
+        residuals (elspeth-6d37341e45: _fail_late_arrival crashed between
+        begin_node_state and complete_node_state, stranding an OPEN hold) and
+        fail immediately with the key's true closure reason; groups with a
+        durable branch loss fail through point reads without preloading
+        historical losses; fully adopted groups are released. The caller must
+        commit returned outcomes through the scheduler barrier-completion seam.
         """
         if self._pending:
             raise OrchestrationInvariantError("row_union restore requires an empty executor pending map")
@@ -238,9 +241,20 @@ class RowUnionExecutor:
                 state_id=entry.state_id,
             )
 
+        # A restored entry at a Landscape-closed key is a begin-window
+        # late-arrival residual: every closure writer (release, _fail_pending,
+        # _fail_late_arrival) completes held states before the key closes, so
+        # an OPEN hold surviving at a closed key can only be the crash prefix
+        # of _fail_late_arrival — which records its terminal outcome AFTER
+        # completing the state, so the residual owes both writes. Classifying
+        # closed keys ahead of the release arm also keeps a residual-only
+        # group that happens to cover every branch from replaying the release.
+        closed_keys: dict[tuple[str, str], str] = {}
         durable_loss_keys: list[tuple[str, str]] = []
         for key in restored:
-            if key in self._recorded_loss_groups or self._barrier_restore_reads.has_branch_loss_for_group(
+            if key in self._completed_keys or self._check_landscape_for_completion(key[0], key[1]):
+                closed_keys[key] = self._completed_keys.get(key, _CLOSED_BY_RELEASE)
+            elif key in self._recorded_loss_groups or self._barrier_restore_reads.has_branch_loss_for_group(
                 run_id=self._run_id,
                 barrier_name=key[0],
                 row_id=key[1],
@@ -249,6 +263,12 @@ class RowUnionExecutor:
 
         self._pending = restored
         outcomes: list[RowUnionOutcome] = []
+        for key, closed_reason in closed_keys.items():
+            failure_reason = "late_arrival_after_release" if closed_reason == _CLOSED_BY_RELEASE else closed_reason
+            outcomes.append(self._fail_pending(self._settings[key[0]], key, failure_reason))
+            # _fail_pending recaches the key under the residual's failure
+            # reason; the GROUP's closure predates the residual — keep it.
+            self._mark_completed(key, closed_reason)
         for key in durable_loss_keys:
             outcomes.append(self._fail_pending(self._settings[key[0]], key, "row_union_branch_lost"))
         for key in tuple(self._pending):

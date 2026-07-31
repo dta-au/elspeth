@@ -69,10 +69,39 @@ def warn_divert_row_union_interactions(
     if not divert_transforms:
         return []
 
+    # Fork gates by node id, with the branch names their fork_to declares.
+    # Gate node configs carry fork_to from the builder; after
+    # finalize_node_configs the config is a deep-frozen mapping and the list
+    # a tuple, so access stays Mapping-safe.
+    fork_gate_branches: dict[NodeID, frozenset[str]] = {}
+    for node in graph.get_nodes():
+        if node.node_type != NodeType.GATE:
+            continue
+        fork_to = node.config.get("fork_to")
+        if fork_to:
+            fork_gate_branches[node.node_id] = frozenset(str(branch) for branch in fork_to)
+
     warnings: list[GraphValidationWarning] = []
 
     for union_nid, union_config in row_union_configs.items():
         declared_branches = ", ".join(f"'{branch}'" for branch in union_config.branches)
+
+        # The walk below runs BACKWARD and MUST stop at THIS union's
+        # originating fork gate(s) — the gate(s) whose fork_to declares any of
+        # the union's branches. Fork -> branch is a COPY edge only for an
+        # identity branch; a transform-chain branch is wired gate -> first
+        # transform as MOVE, so an unbounded backward walk would cross into
+        # pre-fork topology and charge every branch with a DIVERT that sits
+        # before the fork — a false positive, because a row diverted upstream
+        # of the fork never forked and strands no sibling group. A fork for
+        # another barrier is not a boundary: stopping there would hide genuine
+        # branch-local diverts deeper in the current chain. Intermediate
+        # non-fork routing gates are still crossed (same doctrine as the
+        # builder's branch-internal aggregation guard).
+        union_branch_names = frozenset(union_config.branches)
+        origin_fork_gates = frozenset(
+            gate_nid for gate_nid, forked_branches in fork_gate_branches.items() if forked_branches & union_branch_names
+        )
 
         for edge in graph.get_incoming_edges(str(union_nid)):
             # Identity branches (COPY from gate straight to the barrier) have
@@ -80,7 +109,12 @@ def warn_divert_row_union_interactions(
             if edge.mode != RoutingMode.MOVE:
                 continue
 
-            chain_diverts = find_divert_transforms_in_chain(graph, edge.from_node, divert_transforms)
+            chain_diverts = find_divert_transforms_in_chain(
+                graph,
+                edge.from_node,
+                divert_transforms,
+                stop_nodes=origin_fork_gates,
+            )
             if not chain_diverts:
                 continue
 

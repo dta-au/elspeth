@@ -33,7 +33,7 @@ import pytest
 
 from elspeth.contracts import TokenInfo, TransformProtocol
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath, TriggerType
+from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.results import RowResult
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
@@ -538,6 +538,8 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 0}
         reads.get_open_node_state_ids.return_value = {}
+        # Adoption crash: accept() never ran, so no terminal outcome exists.
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset()
         reads.get_released_row_ids_for_nodes.return_value = frozenset()
         row_union = Mock(spec=RowUnionExecutor)
         row_union.restore_from_journal.return_value = ()
@@ -570,9 +572,12 @@ class TestRowUnionRecovery:
 
     def test_failed_closure_holdless_group_resets_to_intake_instead_of_release_reconcile(self) -> None:
         # Crash window: _fail_pending committed FAILED node states (which have
-        # completed_at) but the BLOCKED scheduler rows were never terminalized.
-        # These holdless rows must NOT classify as a released group —
-        # reconcile_released_group would refuse them and wedge the resume.
+        # completed_at) but the BLOCKED scheduler rows were never terminalized
+        # AND no terminal outcomes were recorded yet. These holdless rows must
+        # NOT classify as a released group — reconcile_released_group would
+        # refuse them and wedge the resume. With no recorded outcome, the safe
+        # disposition is reset-to-intake so the live arm replays state +
+        # outcome + release on re-accept.
         rows = [
             _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
             _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
@@ -585,6 +590,7 @@ class TestRowUnionRecovery:
         reads.find_duplicate_live_buffered_acceptances.return_value = []
         reads.get_max_node_state_attempts.return_value = {row.token_id: 1 for row in rows}
         reads.get_open_node_state_ids.return_value = {}
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset()
         # FAILED closures are completed_at-stamped but not released.
         reads.get_released_row_ids_for_nodes.return_value = frozenset()
         row_union = Mock(spec=RowUnionExecutor)
@@ -613,6 +619,110 @@ class TestRowUnionRecovery:
         row_union.reconcile_released_group.assert_not_called()
         scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
             work_item_ids=[row.work_item_id for row in rows],
+            run_id="run-1",
+        )
+        row_union.restore_from_journal.assert_called_once_with(entries=[])
+
+    def test_already_terminal_holdless_rows_journal_release_instead_of_reset(self) -> None:
+        # elspeth-e18928f7cb: _fail_pending committed FAILED node states AND
+        # terminal (FAILURE, UNROUTED) outcomes, but the process died before
+        # mark_blocked_barrier_terminal released the BLOCKED journal rows.
+        # Resetting these already-terminal holds re-drives accept() at the
+        # closed key, whose late-arrival arm records a SECOND terminal outcome
+        # — an ix_token_outcomes_terminal_unique IntegrityError on every
+        # resume attempt. They must be journal-released here instead.
+        rows = [
+            _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
+            _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
+        ]
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.mark_blocked_barrier_terminal.return_value = 1
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 1 for row in rows}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        scheduler.reset_adoption_marker_to_pending.assert_not_called()
+        row_union.reconcile_released_group.assert_not_called()
+        released_calls = scheduler.mark_blocked_barrier_terminal.call_args_list
+        assert [call.kwargs["token_ids"] for call in released_calls] == [("tok-control",), ("tok-treatment",)]
+        for call in released_calls:
+            assert call.kwargs["barrier_key"] == "variant_union"
+            assert call.kwargs["release_context"]["restore_reconcile"] is True
+        row_union.restore_from_journal.assert_called_once_with(entries=[])
+
+    def test_mixed_terminal_and_unrecorded_holdless_rows_split_release_and_reset(self) -> None:
+        # Crash inside _fail_pending's per-entry loop: the first entry's
+        # complete_node_state + record_token_outcome both committed; the crash
+        # hit before the second entry recorded. The terminal row is
+        # journal-released; only the unrecorded row is reset for the live
+        # replay path.
+        rows = [
+            _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
+            _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
+        ]
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.mark_blocked_barrier_terminal.return_value = 1
+        scheduler.reset_adoption_marker_to_pending.return_value = 1
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 1 for row in rows}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-control"})
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        released_calls = scheduler.mark_blocked_barrier_terminal.call_args_list
+        assert [call.kwargs["token_ids"] for call in released_calls] == [("tok-control",)]
+        scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
+            work_item_ids=["wi-tok-treatment"],
             run_id="run-1",
         )
         row_union.restore_from_journal.assert_called_once_with(entries=[])
@@ -1027,6 +1137,10 @@ class TestRowUnionRecovery:
         reads.get_max_node_state_attempts.return_value = {row.token_id: 0}
         reads.get_open_node_state_ids.return_value = {row.token_id: "state-1"}
         reads.has_branch_loss_for_group.return_value = True
+        # The group never closed: no completed rows exist at the union node,
+        # so restore's closed-key classification must fall through to the
+        # durable-loss point read.
+        reads.has_completed_row_for_node.return_value = False
         execution = Mock(spec=ExecutionRepository)
         data_flow = Mock(spec=DataFlowRepository)
         row_union = RowUnionExecutor(
@@ -1075,6 +1189,76 @@ class TestRowUnionRecovery:
         )
         assert len(completions) == 1
         assert emitted == [(row.token_id, TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
+
+    def test_open_state_late_arrival_residual_fails_at_restore_with_release_reason(self) -> None:
+        # elspeth-6d37341e45: _fail_late_arrival crashed between
+        # begin_node_state and complete_node_state. The residual still holds an
+        # OPEN hold state, so it is NOT holdless and the released-group
+        # residual partition (elspeth-d9e244a5cb) cannot classify it. The
+        # executor restore must fail it against the durable closure instead of
+        # reopening the released key as a pending group that later dies by
+        # timeout/EOF flush under an untruthful reason.
+        row = _blocked_row(barrier_key="variant_union", branch_name="control", adopted_epoch=1)
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0}
+        reads.get_open_node_state_ids.return_value = {row.token_id: "state-1"}
+        reads.has_branch_loss_for_group.return_value = False
+        reads.has_completed_row_for_node.return_value = True
+        reads.has_released_row_for_node.return_value = True
+        execution = Mock(spec=ExecutionRepository)
+        data_flow = Mock(spec=DataFlowRepository)
+        row_union = RowUnionExecutor(
+            execution,
+            object(),
+            "run-1",
+            step_resolver=lambda node_id: 5,
+            clock=MockClock(start=100.0),
+            data_flow=data_flow,
+            barrier_restore_reads=reads,
+        )
+        row_union.register_row_union(
+            RowUnionSettings(name="variant_union", branches=["control", "treatment"], on_success="union_out"),
+            NodeID("row_union::variant_union"),
+        )
+        completions: list[dict[str, object]] = []
+        emitted: list[tuple[str, TerminalOutcome | None, TerminalPath]] = []
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=execution,
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+            complete_row_union_fire=lambda **kwargs: completions.append(dict(kwargs)),
+            emit_token_completed=lambda token, *, outcome, path: emitted.append((token.token_id, outcome, path)),
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        # The residual's hold is completed FAILED with the true closure reason,
+        # its terminal outcome is recorded exactly once (the begin-crash window
+        # never recorded one), and its journal row is committed through the
+        # completion seam — not reset to intake, not reopened as pending.
+        assert len(completions) == 1
+        assert emitted == [(row.token_id, TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
+        assert execution.complete_node_state.call_args.kwargs["state_id"] == "state-1"
+        assert execution.complete_node_state.call_args.kwargs["status"] is NodeStateStatus.FAILED
+        assert execution.complete_node_state.call_args.kwargs["error"].failure_reason == "late_arrival_after_release"
+        data_flow.record_token_outcome.assert_called_once()
+        scheduler.reset_adoption_marker_to_pending.assert_not_called()
 
     def test_adopted_partial_group_restores_executor_memory(self) -> None:
         row = _blocked_row(

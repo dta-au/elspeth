@@ -505,6 +505,131 @@ class TestResumeFinalizesAsFailed:
         assert loop_ctx.counters.rows_succeeded == 1
         assert len(loop_ctx.pending_tokens["default"]) == 1
 
+    def test_resume_loop_sweeps_restored_row_union_timeouts_before_scheduler_drain(self) -> None:
+        # elspeth-0bffbd1af1: restored groups carry backdated arrival anchors,
+        # so a group whose timeout expired during downtime is already stale
+        # when replay starts. The sweep must run BEFORE scheduler drain —
+        # otherwise a drained arrival can supply the missing branch and
+        # release the expired group.
+        call_order: list[str] = []
+        processor = _mock_processor()
+        processor.has_scheduled_work.return_value = True
+        processor.active_scheduled_row_ids.return_value = frozenset()
+
+        def _drain(ctx: object) -> list[object]:
+            call_order.append("drain")
+            return []
+
+        processor.drain_scheduled_work.side_effect = _drain
+        processor.has_unresolved_scheduler_work.return_value = False
+        processor.count_unquiesced_scheduler_work.return_value = 0
+        processor.run_barrier_intake.return_value = []
+        processor.has_blocked_barrier_work.return_value = False
+        row_union_executor = MagicMock(spec=RowUnionExecutor)
+        row_union_executor.get_registered_names.return_value = ["variant_union"]
+        row_union_executor.flush_pending.return_value = []
+
+        def _sweep(row_union_name: str) -> list[object]:
+            call_order.append("sweep")
+            return []
+
+        row_union_executor.check_timeouts.side_effect = _sweep
+        processor.row_union_executor = row_union_executor
+        config = PipelineConfig(
+            sources={"primary": _specced_source()},
+            transforms=(),
+            sinks={"default": _specced_sink()},
+        )
+        loop_ctx = LoopContext(
+            counters=ExecutionCounters(),
+            pending_tokens={"default": []},
+            processor=processor,
+            ctx=MagicMock(spec=PluginContext),
+            config=config,
+            agg_transform_lookup={},
+            coalesce_executor=None,
+            coalesce_node_map={},
+        )
+
+        run_resume_processing_loop(
+            loop_ctx,
+            unprocessed_rows=(),
+            incomplete_by_row={},
+            recovery_manager=MagicMock(spec=RecoveryManager),
+            payload_store=MockPayloadStore(),
+            run_id="run-sweep-before-drain",
+            resume_checkpoint_id="checkpoint-sweep-before-drain",
+            schema_contracts_by_source={NodeID("source"): MagicMock(spec=SchemaContract)},
+        )
+
+        assert call_order, "neither the sweep nor the drain ran"
+        assert call_order[0] == "sweep", call_order
+        assert "drain" in call_order
+
+    def test_resume_loop_sweeps_restored_row_union_timeouts_before_row_replay(self) -> None:
+        # Same ordering contract for the source-replay path: the first
+        # replayed row must not be able to complete an expired restored group.
+        call_order: list[str] = []
+        processor = _mock_processor()
+        processor.has_scheduled_work.return_value = False
+
+        def _replay(**kwargs: object) -> list[object]:
+            call_order.append("replay")
+            return []
+
+        processor.process_existing_row.side_effect = _replay
+        processor.has_unresolved_scheduler_work.return_value = False
+        processor.count_unquiesced_scheduler_work.return_value = 0
+        processor.run_barrier_intake.return_value = []
+        processor.has_blocked_barrier_work.return_value = False
+        row_union_executor = MagicMock(spec=RowUnionExecutor)
+        row_union_executor.get_registered_names.return_value = ["variant_union"]
+        row_union_executor.flush_pending.return_value = []
+
+        def _sweep(row_union_name: str) -> list[object]:
+            call_order.append("sweep")
+            return []
+
+        row_union_executor.check_timeouts.side_effect = _sweep
+        processor.row_union_executor = row_union_executor
+        config = PipelineConfig(
+            sources={"primary": _specced_source()},
+            transforms=(),
+            sinks={"default": _specced_sink()},
+        )
+        loop_ctx = LoopContext(
+            counters=ExecutionCounters(),
+            pending_tokens={"default": []},
+            processor=processor,
+            ctx=MagicMock(spec=PluginContext),
+            config=config,
+            agg_transform_lookup={},
+            coalesce_executor=None,
+            coalesce_node_map={},
+        )
+
+        run_resume_processing_loop(
+            loop_ctx,
+            unprocessed_rows=(
+                ResumedRow(
+                    row_id="row-1",
+                    row_index=0,
+                    source_node_id=NodeID("source"),
+                    row_data={"value": 1},
+                ),
+            ),
+            incomplete_by_row={},
+            recovery_manager=MagicMock(spec=RecoveryManager),
+            payload_store=MockPayloadStore(),
+            run_id="run-sweep-before-replay",
+            resume_checkpoint_id="checkpoint-sweep-before-replay",
+            schema_contracts_by_source={NodeID("source"): MagicMock(spec=SchemaContract)},
+            source_on_success_by_source={NodeID("source"): "default"},
+        )
+
+        assert "replay" in call_order
+        assert call_order[0] == "sweep", call_order
+
     def test_resume_loop_fails_closed_when_scheduler_does_not_cover_all_recovered_rows(self) -> None:
         """Run-level scheduler presence must not suppress uncovered recovery rows."""
         from elspeth.contracts.errors import AuditIntegrityError
@@ -1051,7 +1176,10 @@ class TestResumeFinalizesAsFailed:
         )
 
         assert interrupted is True
-        row_union_executor.check_timeouts.assert_called_once_with("variant_union")
+        # One sweep BEFORE any replay (elspeth-0bffbd1af1) plus the per-row
+        # boundary sweep — the same boundary discipline as a fresh run.
+        assert row_union_executor.check_timeouts.call_count == 2
+        row_union_executor.check_timeouts.assert_called_with("variant_union")
 
     def test_source_exhaustion_is_recorded_before_eof_flush_failure(self) -> None:
         """A crash in EOF engine work must not look like an incomplete source load."""

@@ -1233,6 +1233,53 @@ class BarrierRecoveryCoordinator:
                     if item.token_id in row_union_state_ids and (str(item.barrier_key), item.row_id) not in member_keys
                 ]
 
+            if row_union_holdless_items:
+                # ---- ADR-030 §E.3a row_union failed-closure reconcile -------
+                # (elspeth-e18928f7cb) A holdless row whose token already
+                # carries a terminal (FAILURE, UNROUTED) outcome is the crash
+                # suffix of a committed group failure: _fail_pending wrote the
+                # FAILED state and the terminal outcome, and the process died
+                # before mark_blocked_barrier_terminal released the BLOCKED
+                # journal row. Resetting it to intake-pending would re-drive
+                # accept() at the closed key, whose late-arrival arm records a
+                # SECOND terminal outcome — an ix_token_outcomes_terminal_unique
+                # IntegrityError on every subsequent resume attempt. Journal-
+                # release these rows here (aggregation §E.3a mirror); only rows
+                # with no recorded outcome fall through to the intake reset.
+                terminal_ids = self._barrier_restore_reads.find_failed_unrouted_terminal_token_ids(
+                    self._run_id, [item.token_id for item in row_union_holdless_items]
+                )
+                if terminal_ids:
+                    for item in [i for i in row_union_holdless_items if i.token_id in terminal_ids]:
+                        released = self._scheduler.mark_blocked_barrier_terminal(
+                            run_id=self._run_id,
+                            barrier_key=str(item.barrier_key),
+                            token_ids=(item.token_id,),
+                            now=now,
+                            coordination_token=self._coordination_token,
+                            release_context={
+                                "reason": "row_union_failed_closure_crash_reconcile",
+                                "released_by": self._scheduler_lease_owner,
+                                "scope_row_id": item.row_id,
+                                "restore_reconcile": True,
+                            },
+                        )
+                        if released != 1:
+                            raise AuditIntegrityError(
+                                f"Restore §E.3a row_union reconcile: failed-closure release for token "
+                                f"{item.token_id!r} at row_union {item.barrier_key!r} (run {self._run_id!r}) "
+                                f"terminalized {released} rows; expected exactly one."
+                            )
+                        logger.info(
+                            "barrier journal restore: §E.3a reconcile released terminally-failed holdless "
+                            "row_union token %s at %s/%s (run %s)",
+                            item.token_id,
+                            item.barrier_key,
+                            item.row_id,
+                            self._run_id,
+                        )
+                    row_union_holdless_items = [i for i in row_union_holdless_items if i.token_id not in terminal_ids]
+
         # ---- ADR-030 §E.3a/§E.4 crash-window reconcile (findings 1 & 3) -----
         # Adopted coalesce rows with no OPEN state_id are in a crash window:
         # the adoption CAS committed (barrier_adopted_epoch non-NULL) but
