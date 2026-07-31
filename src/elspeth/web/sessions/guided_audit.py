@@ -12,7 +12,7 @@ from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCa
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
-from elspeth.web.composer.audit import chat_turn_audit_envelope, llm_call_audit_envelope
+from elspeth.web.composer.audit import chat_turn_audit_envelope, llm_call_audit_envelope, llm_call_audit_summary
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, TurnType
 from elspeth.web.composer.guided.state_machine import TerminalReason
@@ -182,17 +182,7 @@ def prepare_guided_audit_rows(
             content, envelope = _omitted_success_invocation(invocation)
         rows.append(PreparedGuidedAuditRow(kind="tool", content=content, envelope=envelope))
     for call in llm_calls:
-        content = json.dumps(
-            {
-                "_kind": "llm_call_audit",
-                "status": call.status.value,
-                "model_requested": call.model_requested,
-                "model_returned": call.model_returned,
-                "total_tokens": call.total_tokens,
-                "reasoning_tokens": call.reasoning_tokens,
-                "provider_cost": call.provider_cost,
-            }
-        )
+        content = llm_call_audit_summary(call)
         envelope = llm_call_audit_envelope(call)
         if call.status is not ComposerLLMCallStatus.SUCCESS:
             public_call = deep_thaw(envelope["call"])

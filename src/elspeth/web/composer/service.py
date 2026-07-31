@@ -78,6 +78,7 @@ from elspeth.web.composer.audit import (
     finish_arg_error,
     finish_success,
     llm_call_audit_envelope,
+    llm_call_audit_summary,
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.availability import ComposerAvailability as ComposerAvailability  # re-export; genuine home is availability.py
@@ -2766,17 +2767,7 @@ class ComposerServiceImpl:
         sessions = self._require_sessions_service()
         try:
             for call in llm_calls:
-                content = json.dumps(
-                    {
-                        "_kind": "llm_call_audit",
-                        "status": call.status.value,
-                        "model_requested": call.model_requested,
-                        "model_returned": call.model_returned,
-                        "total_tokens": call.total_tokens,
-                        "reasoning_tokens": call.reasoning_tokens,
-                        "provider_cost": call.provider_cost,
-                    }
-                )
+                content = llm_call_audit_summary(call)
                 await sessions.add_message(
                     session_id,
                     "audit",
