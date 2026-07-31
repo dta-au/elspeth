@@ -1,0 +1,224 @@
+{
+  "blockers": [],
+  "component_counts": {
+    "edges": 7,
+    "nodes": 2,
+    "outputs": 1,
+    "sources": 1
+  },
+  "draft_hash": "d460476f70139b11abe80639d5177ecede411cd6f05d412a7d31f7b8bbc1f94d",
+  "edit_targets": [
+    {
+      "kind": "source",
+      "stable_id": "00000000-0000-4000-8000-000000000301"
+    },
+    {
+      "kind": "node",
+      "stable_id": "00000000-0000-4000-8000-000000000400"
+    },
+    {
+      "kind": "node",
+      "stable_id": "00000000-0000-4000-8000-000000000401"
+    },
+    {
+      "kind": "edge",
+      "stable_id": "00000000-0000-4000-8000-000000000402"
+    },
+    {
+      "kind": "edge",
+      "stable_id": "00000000-0000-4000-8000-000000000403"
+    },
+    {
+      "kind": "edge",
+      "stable_id": "00000000-0000-4000-8000-000000000404"
+    },
+    {
+      "kind": "edge",
+      "stable_id": "00000000-0000-4000-8000-000000000405"
+    },
+    {
+      "kind": "edge",
+      "stable_id": "00000000-0000-4000-8000-000000000406"
+    },
+    {
+      "kind": "edge",
+      "stable_id": "00000000-0000-4000-8000-000000000407"
+    },
+    {
+      "kind": "edge",
+      "stable_id": "00000000-0000-4000-8000-000000000408"
+    },
+    {
+      "kind": "output",
+      "stable_id": "00000000-0000-4000-8000-000000000302"
+    }
+  ],
+  "graph": {
+    "edges": [
+      {
+        "flow": {
+          "branch": null,
+          "kind": "source_success"
+        },
+        "from_endpoint": {
+          "kind": "source",
+          "stable_id": "00000000-0000-4000-8000-000000000301"
+        },
+        "stable_id": "00000000-0000-4000-8000-000000000402",
+        "to_endpoint": {
+          "kind": "node",
+          "stable_id": "00000000-0000-4000-8000-000000000400"
+        }
+      },
+      {
+        "flow": {
+          "kind": "source_validation_failure"
+        },
+        "from_endpoint": {
+          "kind": "source",
+          "stable_id": "00000000-0000-4000-8000-000000000301"
+        },
+        "stable_id": "00000000-0000-4000-8000-000000000403",
+        "to_endpoint": {
+          "kind": "discard"
+        }
+      },
+      {
+        "flow": {
+          "branch": null,
+          "kind": "gate_route",
+          "route": "route-1"
+        },
+        "from_endpoint": {
+          "kind": "node",
+          "stable_id": "00000000-0000-4000-8000-000000000400"
+        },
+        "stable_id": "00000000-0000-4000-8000-000000000404",
+        "to_endpoint": {
+          "kind": "output",
+          "stable_id": "00000000-0000-4000-8000-000000000302"
+        }
+      },
+      {
+        "flow": {
+          "branch": null,
+          "kind": "gate_route",
+          "route": "route-2"
+        },
+        "from_endpoint": {
+          "kind": "node",
+          "stable_id": "00000000-0000-4000-8000-000000000400"
+        },
+        "stable_id": "00000000-0000-4000-8000-000000000405",
+        "to_endpoint": {
+          "kind": "node",
+          "stable_id": "00000000-0000-4000-8000-000000000401"
+        }
+      },
+      {
+        "flow": {
+          "branch": null,
+          "kind": "node_success"
+        },
+        "from_endpoint": {
+          "kind": "node",
+          "stable_id": "00000000-0000-4000-8000-000000000401"
+        },
+        "stable_id": "00000000-0000-4000-8000-000000000406",
+        "to_endpoint": {
+          "kind": "output",
+          "stable_id": "00000000-0000-4000-8000-000000000302"
+        }
+      },
+      {
+        "flow": {
+          "kind": "node_error"
+        },
+        "from_endpoint": {
+          "kind": "node",
+          "stable_id": "00000000-0000-4000-8000-000000000401"
+        },
+        "stable_id": "00000000-0000-4000-8000-000000000407",
+        "to_endpoint": {
+          "kind": "discard"
+        }
+      },
+      {
+        "flow": {
+          "kind": "output_write_failure"
+        },
+        "from_endpoint": {
+          "kind": "output",
+          "stable_id": "00000000-0000-4000-8000-000000000302"
+        },
+        "stable_id": "00000000-0000-4000-8000-000000000408",
+        "to_endpoint": {
+          "kind": "discard"
+        }
+      }
+    ],
+    "sources": [
+      {
+        "label": "source-1",
+        "plugin": {
+          "id": "csv",
+          "kind": "source"
+        },
+        "stable_id": "00000000-0000-4000-8000-000000000301"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "behavior": {
+        "condition": "row['amount'] > 500",
+        "fork_branches": [],
+        "kind": "gate",
+        "route_aliases": [
+          "route-1",
+          "route-2"
+        ],
+        "routes": [
+          {
+            "alias": "route-1",
+            "key": "false"
+          },
+          {
+            "alias": "route-2",
+            "key": "true"
+          }
+        ]
+      },
+      "label": "node-1",
+      "node_type": "gate",
+      "plugin": null,
+      "stable_id": "00000000-0000-4000-8000-000000000400"
+    },
+    {
+      "behavior": {
+        "kind": "transform"
+      },
+      "label": "node-2",
+      "node_type": "transform",
+      "plugin": {
+        "id": "passthrough",
+        "kind": "transform"
+      },
+      "stable_id": "00000000-0000-4000-8000-000000000401"
+    }
+  ],
+  "outputs": [
+    {
+      "label": "output-1",
+      "plugin": {
+        "id": "json",
+        "kind": "sink"
+      },
+      "stable_id": "00000000-0000-4000-8000-000000000302"
+    }
+  ],
+  "proposal_id": "00000000-0000-4000-8000-000000000303",
+  "rationale": "guided.proposal.rationale.review_required.v1",
+  "summary": "guided.proposal.summary.full_graph.v1",
+  "supersedes_draft_hash": null
+}

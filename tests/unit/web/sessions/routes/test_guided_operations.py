@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.sessions.protocol import (
+    GUIDED_OPERATION_FAILURE_CODE_VALUES,
     GuidedCompositionStateResult,
     GuidedOperationActive,
     GuidedOperationClaimed,
@@ -20,9 +21,11 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationFence,
 )
 from elspeth.web.sessions.routes.guided_operations import (
+    _SAFE_FAILURES,
     GuidedOperationExpired,
     GuidedOperationLease,
     guided_response_hash,
+    raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
 from elspeth.web.sessions.schemas import ReenterGuidedRequest
@@ -327,3 +330,62 @@ async def _response(value: str) -> _Response:
 
 async def _never() -> _Response:
     raise AssertionError("replay callback must not run")
+
+
+class TestClosedFailureEnvelope:
+    """``_SAFE_FAILURES`` is the HTTP face of the closed failure vocabulary.
+
+    ``raise_guided_operation_failure`` refuses an unmapped code with an
+    ``AuditIntegrityError`` — a raw 500 — so a code added to
+    ``GuidedOperationFailureCode`` without an entry here turns a well-classified
+    failure back into the generic crash it was classified out of.
+    """
+
+    def test_every_closed_failure_code_has_an_http_envelope(self) -> None:
+        assert set(_SAFE_FAILURES) == GUIDED_OPERATION_FAILURE_CODE_VALUES
+
+    def test_policy_blocked_answers_422_without_provider_blame_or_a_retry_offer(self) -> None:
+        """The permanent half of the split must not read as a transient fault.
+
+        The observed failure (guided S3, 2026-07-31) reached the user as
+        "The provider returned an invalid response. Retry with a new operation
+        id." for a refusal that had ZERO provider calls and could never succeed
+        on retry. The replacement copy must blame neither the provider nor the
+        client's operation id, and must not invite a retry.
+        """
+        with pytest.raises(HTTPException) as caught:
+            raise_guided_operation_failure(GuidedOperationFailed(failure_code="policy_blocked"))
+
+        assert caught.value.status_code == 422
+        detail = caught.value.detail
+        assert isinstance(detail, dict)
+        assert detail["error_type"] == "guided_operation_terminal_failure"
+        assert detail["failure_code"] == "policy_blocked"
+        copy = str(detail["detail"])
+        lowered = copy.lower()
+        assert "provider" not in lowered
+        assert "operation id" not in lowered
+        assert "deployment policy" in lowered
+        # Names the permanence explicitly rather than offering a retry.
+        assert "retrying will fail the same way" in lowered
+
+    def test_permanent_and_transient_codes_are_partitioned_by_status_class(self) -> None:
+        """A 5xx says "our side broke, try again"; a policy refusal is neither."""
+        transient = ("provider_unavailable", "provider_timeout", "invalid_provider_response")
+        for code in transient:
+            status, copy = _SAFE_FAILURES[code]
+            assert status >= 500, code
+            assert "retry" in copy.lower(), code
+        status, _copy = _SAFE_FAILURES["policy_blocked"]
+        assert 400 <= status < 500
+
+    def test_invalid_provider_response_copy_drops_the_operation_id_jargon(self) -> None:
+        """The client mints a fresh operation id on every re-click by itself.
+
+        Naming the id taught the reader an internal protocol detail they cannot
+        act on; "Retry the request." is the whole actionable instruction.
+        """
+        _status, copy = _SAFE_FAILURES["invalid_provider_response"]
+
+        assert copy.endswith("Retry the request.")
+        assert "operation id" not in copy.lower()

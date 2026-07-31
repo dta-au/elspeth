@@ -89,6 +89,11 @@ export interface ChatMessage {
   created_at: string;
   local_status?: "pending" | "failed";
   local_error?: string;
+  /** Closed failure code from the ApiError that failed this local send
+   *  (e.g. "policy_blocked", which is permanent by construction — retry
+   *  affordances must not invite a retry for it). Set only when the error
+   *  carried one; cleared wherever local_status is cleared. */
+  local_failure_code?: string;
   composition_state_id?: string | null;
   tool_call_id?: string | null;
   parent_assistant_id?: string | null;
@@ -961,6 +966,13 @@ export interface ApiError {
   status: number;
   detail: string;
   error_type?: string;
+  /** Server correlation id (RequestIdMiddleware). Present on fail-closed
+   *  audit-integrity 500s so the banner can name a support reference. */
+  request_id?: string;
+  /** Closed guided-operation failure code (guided_operation_terminal_failure
+   *  envelopes). "policy_blocked" is permanent by construction — retry
+   *  affordances must not invite a retry for it. */
+  failure_code?: string;
   component_id?: string;
   plugin_id?: string;
   partial_state?: CompositionState | null;

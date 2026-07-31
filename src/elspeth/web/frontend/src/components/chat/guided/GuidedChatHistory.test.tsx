@@ -364,6 +364,41 @@ describe("GuidedChatHistory synthetic-failure turns", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
+  it("suppresses Retry for a deterministic not_applied failure (inv-f1 D4)", () => {
+    // "not_applied" means the user's input was processed and its application
+    // rejected (config invalid, upload mismatch, transition rejected):
+    // re-sending the SAME message is a guaranteed dead end, and the turn's
+    // copy already directs the real next step.
+    const notApplied: ChatTurn = {
+      ...TURN_SYNTHETIC_FAILURE,
+      content: "I couldn't apply that configuration, so I didn't change your pipeline.",
+      synthetic_failure_reason: "not_applied",
+    };
+    render(
+      <GuidedChatHistory
+        chatHistory={[notApplied]}
+        onRetrySyntheticFailure={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it.each(["unavailable", "quality_guard", "model_defect"] as const)(
+    "keeps Retry for a %s failure — retry is the designed remedy",
+    (reason) => {
+      const turn: ChatTurn = {
+        ...TURN_SYNTHETIC_FAILURE,
+        synthetic_failure_reason: reason,
+      };
+      render(
+        <GuidedChatHistory chatHistory={[turn]} onRetrySyntheticFailure={vi.fn()} />,
+      );
+
+      expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    },
+  );
+
   it("disables Retry while retryDisabled is set (no race with an in-flight resend)", () => {
     render(
       <GuidedChatHistory

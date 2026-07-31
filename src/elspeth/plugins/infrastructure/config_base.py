@@ -14,15 +14,64 @@ Example usage:
     path = cfg.path  # Direct access, fails fast if missing
 """
 
+import json
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Self
+from typing import Any, ClassVar, Final, Literal, Self
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.header_modes import HeaderMode, parse_header_mode
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FIELD_TYPE_MAP, SchemaConfig
 
 OutputCollisionPolicy = Literal["fail_if_exists", "auto_increment", "append_or_create"]
+
+# --- Composer-surface help text -------------------------------------------
+#
+# ``Field(description=...)`` is the CLI/YAML truth and stays as-is: it
+# describes what the field means in a hand-authored settings file. The web
+# composer renders these fields as a bare form with no surrounding document,
+# and the web surface is *narrower* than YAML for paths. Those fields carry a
+# ``composer_description`` (and, where the value has internal structure, a
+# ``composer_placeholder``) in ``json_schema_extra``; the catalog's knob
+# lowering substitutes it for ``description`` on that surface only. See
+# ``elspeth.web.catalog.knob_schema._composer_description``.
+
+# The worked example rendered into COMPOSER_SCHEMA_DESCRIPTION. It is data, not
+# prose, so a test can feed this exact object through ``SchemaConfig.from_dict``
+# and prove the help text advertises a shape the parser actually accepts.
+COMPOSER_SCHEMA_EXAMPLE: Final[dict[str, Any]] = {
+    "mode": "fixed",
+    "fields": ["doc_id: str", "page_count: int", "note: str?"],
+}
+
+# The compact form used as the form-input placeholder.
+COMPOSER_SCHEMA_PLACEHOLDER: Final[str] = json.dumps({"mode": "fixed", "fields": ["doc_id: str", "note: str?"]})
+
+# Field types come from the authoritative grammar (FIELD_TYPE_MAP, which
+# FIELD_PATTERN's alternation mirrors) so a new legal type cannot appear in the
+# parser while the help text still lists the old five.
+COMPOSER_SCHEMA_DESCRIPTION: Final[str] = (
+    f"Enter one JSON object. Worked example: {json.dumps(COMPOSER_SCHEMA_EXAMPLE)}. "
+    f'Every entry in "fields" is the string "name: type", where type is one of '
+    f'{", ".join(FIELD_TYPE_MAP)}, and a trailing "?" marks the field optional '
+    f'("note: str?" is an optional string). Field names must be valid Python '
+    f'identifiers — write "doc_id", not "doc-id" or "doc.id". '
+    f'Modes: "fixed" accepts exactly these fields, "flexible" accepts these plus '
+    f'any extras the data carries, and "observed" infers every field from the '
+    f'data — with "observed" leave "fields" out entirely ({{"mode": "observed"}}).'
+)
+
+COMPOSER_PATH_DESCRIPTION: Final[str] = (
+    "On the web surface this field takes one of exactly two values: the sentinel "
+    '"blob:<uuid>" naming a file uploaded to this session — normally prefilled for '
+    "you, so leave it as it is — or a plain path that resolves inside this "
+    "session's own subtree (a source reads from <data_dir>/blobs/<session_id>/; an "
+    "output writes to <data_dir>/outputs/<session_id>/ or "
+    "<data_dir>/blobs/<session_id>/). Every other path is rejected, including "
+    "another session's subtree, a shared or deployment-level directory, and any "
+    "absolute path outside those trees. Hand-authored YAML runs are not confined "
+    "this way."
+)
 
 
 def _plugin_config_field_title(field_name: str, _field_info: Any) -> str:
@@ -328,6 +377,10 @@ class DataPluginConfig(PluginConfig):
             "Use 'schema: {mode: observed}' to infer types from data, or "
             "provide explicit field definitions with mode (fixed/flexible)."
         ),
+        json_schema_extra={
+            "composer_description": COMPOSER_SCHEMA_DESCRIPTION,
+            "composer_placeholder": COMPOSER_SCHEMA_PLACEHOLDER,
+        },
     )
 
 
@@ -342,7 +395,10 @@ class PathConfig(DataPluginConfig):
 
     _component_type_exempt: ClassVar[bool] = True
 
-    path: str = Field(description="Filesystem path for the source input or sink output, resolved relative to the run data directory.")
+    path: str = Field(
+        description="Filesystem path for the source input or sink output, resolved relative to the run data directory.",
+        json_schema_extra={"composer_description": COMPOSER_PATH_DESCRIPTION},
+    )
 
     @field_validator("path")
     @classmethod

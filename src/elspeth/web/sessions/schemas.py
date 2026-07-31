@@ -482,7 +482,7 @@ class ChatTurnResponse(_StrictResponse):
     step: str
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None
-    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied"] | None
+    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None
 
 
 class WorkflowProfileResponse(_StrictResponse):

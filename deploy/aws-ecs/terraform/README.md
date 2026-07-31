@@ -504,7 +504,22 @@ umask 077
   printf 'SSL_CERT_FILE=/acceptance/ca.pem\n'
 } >"$acceptance_dir/acceptance.env"
 
-docker pull "$CANDIDATE_IMAGE"
+CANDIDATE_ECR_REGISTRY=${CANDIDATE_IMAGE%%/*}
+candidate_pull_work=$(mktemp -d -p /tmp elspeth-candidate-pull.XXXXXX)
+chmod 700 "$candidate_pull_work"
+mkdir -m 700 "$candidate_pull_work/docker-config"
+(
+  set -e
+  export DOCKER_CONFIG="$candidate_pull_work/docker-config"
+  trap 'docker logout "$CANDIDATE_ECR_REGISTRY" >/dev/null 2>&1 || true; rm -rf -- "$candidate_pull_work"' EXIT
+
+  aws ecr get-login-password \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    >"$candidate_pull_work/ecr-password"
+  docker login --username AWS --password-stdin "$CANDIDATE_ECR_REGISTRY" \
+    <"$candidate_pull_work/ecr-password"
+  docker pull "$CANDIDATE_IMAGE"
+)
 docker run --rm --entrypoint python \
   --env-file "$acceptance_dir/acceptance.env" \
   --mount "type=bind,src=$acceptance_dir,dst=/acceptance" \
@@ -746,8 +761,23 @@ Before promoting a candidate, verify the baked bundle, the OCI CA labels, the
 live Aurora CA identifier, and the `readonlyRootFilesystem` split:
 
 ```sh
-docker pull "$CANDIDATE_IMAGE"
-docker buildx imagetools inspect "$CANDIDATE_IMAGE"
+CANDIDATE_ECR_REGISTRY=${CANDIDATE_IMAGE%%/*}
+candidate_inspection_work=$(mktemp -d -p /tmp elspeth-candidate-inspection.XXXXXX)
+chmod 700 "$candidate_inspection_work"
+mkdir -m 700 "$candidate_inspection_work/docker-config"
+(
+  set -e
+  export DOCKER_CONFIG="$candidate_inspection_work/docker-config"
+  trap 'docker logout "$CANDIDATE_ECR_REGISTRY" >/dev/null 2>&1 || true; rm -rf -- "$candidate_inspection_work"' EXIT
+
+  aws ecr get-login-password \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    >"$candidate_inspection_work/ecr-password"
+  docker login --username AWS --password-stdin "$CANDIDATE_ECR_REGISTRY" \
+    <"$candidate_inspection_work/ecr-password"
+  docker pull "$CANDIDATE_IMAGE"
+  docker buildx imagetools inspect "$CANDIDATE_IMAGE"
+)
 test "$(docker inspect --format \
   '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
   "$CANDIDATE_IMAGE")" = \

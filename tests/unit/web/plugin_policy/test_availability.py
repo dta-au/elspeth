@@ -9,7 +9,12 @@ from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
-from elspeth.web.plugin_policy.models import PluginId
+from elspeth.web.plugin_policy.models import (
+    PluginAvailabilitySnapshot,
+    PluginId,
+    PluginUnavailableReason,
+    WebPluginPolicy,
+)
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 
 
@@ -52,12 +57,17 @@ def _settings(**overrides: object) -> WebSettings:
     return WebSettings.model_validate(values)
 
 
-def _build(settings: WebSettings, *, principal: str = "local:alice", inventory: _Inventory | None = None):
+def _build_with_policy(
+    settings: WebSettings,
+    *,
+    principal: str = "local:alice",
+    inventory: _Inventory | None = None,
+) -> tuple[WebPluginPolicy, PluginAvailabilitySnapshot]:
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     manager = get_shared_plugin_manager()
     policy = compile_web_plugin_policy(registry=manager, settings=runtime)
     profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
-    return build_plugin_snapshot(
+    snapshot = build_plugin_snapshot(
         policy=policy,
         catalog=create_catalog_service(),
         profiles=profiles,
@@ -65,6 +75,55 @@ def _build(settings: WebSettings, *, principal: str = "local:alice", inventory: 
         secret_inventory=inventory or _Inventory(),
         generation_key=b"deterministic-test-generation-key",
     )
+    return policy, snapshot
+
+
+def _build(settings: WebSettings, *, principal: str = "local:alice", inventory: _Inventory | None = None):
+    _policy, snapshot = _build_with_policy(settings, principal=principal, inventory=inventory)
+    return snapshot
+
+
+_AWS_S3_ALLOWLIST = ("source:aws_s3", "sink:aws_s3")
+
+
+def test_web_prohibited_source_is_a_declined_authorization_not_an_offer() -> None:
+    """A runtime-authorized aws_s3 SOURCE must be declined, never offered.
+
+    A deployment can legitimately authorize S3 for its own runtime (the AWS
+    scenario module's ``default_plugin_allowlist`` does). The web authoring
+    surface refuses author-controlled S3 reads categorically, so the snapshot
+    has to carry that authorization as a *declined* one: without it, every
+    reader of ``available`` (discovery listings, the guided step-1 picker,
+    prompts, tool validation) offers the plugin and only the far end of
+    authoring refuses it — an unrepairable dead end (F13/F14, 2026-07-31).
+    """
+    policy, snapshot = _build_with_policy(_settings(plugin_allowlist=_AWS_S3_ALLOWLIST))
+    baseline = _build(_settings())
+    source_id = PluginId("source", "aws_s3")
+
+    assert source_id in policy.authorized
+    assert source_id not in snapshot.available
+    # Declared exactly once, and with the reason that names a policy no
+    # operator setting can clear — not a repairable credential/profile gap.
+    assert [item.reason for item in snapshot.unavailable if item.plugin_id == source_id] == [PluginUnavailableReason.WEB_SURFACE_PROHIBITED]
+    # The SINK is untouched: kind-qualified identity keeps S3 writes usable.
+    assert PluginId("sink", "aws_s3") in snapshot.available
+    # available never exceeds authorized, and a prohibition cannot silently
+    # re-point a capability selection.
+    assert snapshot.available <= policy.authorized
+    assert snapshot.selected == baseline.selected
+
+
+def test_trained_operator_snapshot_keeps_the_web_prohibited_source() -> None:
+    """The local trained-operator (CLI/MCP) exemption is unchanged.
+
+    ``for_trained_operator`` is a separate constructor that never consults the
+    web policy, so the prohibition cannot leak into the local surface.
+    """
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+
+    assert PluginId("source", "aws_s3") in snapshot.available
+    assert snapshot.unavailable == ()
 
 
 def test_operator_profiled_llm_is_unavailable_without_usable_alias() -> None:

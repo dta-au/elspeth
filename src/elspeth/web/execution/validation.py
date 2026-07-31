@@ -235,6 +235,17 @@ _PLUGIN_POLICY_CHECKS: tuple[tuple[PolicyValidationStage, ValidationCheckName], 
     ("required_control_coverage", _CHECK_REQUIRED_CONTROL_COVERAGE),
 )
 
+# The four policy stages shared one suggestion, and for coverage failures the
+# "choose an available plugin" half was simply wrong advice — the plugin IS
+# available; the graph routes around it. Coverage findings therefore carry a
+# per-finding ``suggestion`` composed where the diagnosis lives
+# (``plugin_policy.validation._control_coverage_finding``, keyed on the
+# finding's reason/role, never the stage): the error-route repair ("set
+# on_error to 'discard'") is wrong advice for an input-domination
+# (prompt_shield) finding, whose repair is interposing the shield upstream.
+# This default remains for findings that carry no per-finding suggestion.
+_DEFAULT_PLUGIN_POLICY_SUGGESTION = "Choose an available plugin or repair the required control path, then validate again."
+
 
 @dataclass(frozen=True, slots=True)
 class _EdgePatchTarget:
@@ -957,7 +968,7 @@ def validate_pipeline(
                     component_id=item.component_id,
                     component_type=item.component_type,
                     message=item.message,
-                    suggestion="Choose an available plugin or repair the required control path, then validate again.",
+                    suggestion=(item.suggestion if item.suggestion is not None else _DEFAULT_PLUGIN_POLICY_SUGGESTION),
                     error_code=item.error_code,
                 )
                 for item in stage_findings
