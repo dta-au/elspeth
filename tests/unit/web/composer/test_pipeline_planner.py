@@ -5236,3 +5236,161 @@ async def test_planner_summary_on_exhaustion_carries_the_full_code_history(
     # BOTH rounds' codes survive — the blindspot this trail exists to close.
     assert [entry["attempt"] for entry in summary["rejection_history"]] == [1, 2]
     assert all(entry["codes"] for entry in summary["rejection_history"])
+
+
+# ── Stated-threshold fidelity guard (R2-F17, elspeth-5c0c09db31) ────────────
+
+
+def _pipeline_with_constant_gate(data_dir: Path) -> dict[str, Any]:
+    """A VALID fan-out plan: one constant-condition gate forking to two sinks.
+
+    This is the shape acceptance run 2 got when it asked for ``amount > 500``
+    routing — and it is also the shape ``pipeline_composer.md`` teaches for
+    genuine dual outputs. Only the instruction tells the two apart.
+    """
+    pipeline = _pipeline(data_dir)
+    pipeline["nodes"] = [
+        {
+            "id": "split",
+            "node_type": "gate",
+            "input": "rows",
+            "condition": "True",
+            "routes": {"true": "fork", "false": "fork"},
+            "fork_to": ["high_value", "standard"],
+        }
+    ]
+    pipeline["outputs"] = [
+        {
+            "sink_name": name,
+            "plugin": "json",
+            "options": {
+                "path": f"outputs/{name}.jsonl",
+                "schema": {"mode": "observed"},
+                "format": "jsonl",
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            "on_write_failure": "discard",
+        }
+        for name in ("high_value", "standard")
+    ]
+    return pipeline
+
+
+def _pipeline_with_conditional_gate(data_dir: Path) -> dict[str, Any]:
+    pipeline = _pipeline_with_constant_gate(data_dir)
+    pipeline["nodes"][0]["condition"] = "row['amount'] > 500"
+    pipeline["nodes"][0]["routes"] = {"true": "high_value", "false": "standard"}
+    del pipeline["nodes"][0]["fork_to"]
+    return pipeline
+
+
+class TestStatedThresholdDetector:
+    """False-positive posture: the detector fires only on a real comparison."""
+
+    @pytest.mark.parametrize(
+        ("instruction", "expected"),
+        [
+            ("Route rows with amount > 500 to high_value.", "amount > 500"),
+            ("Send rows where score>=0.85 to the review sink.", "score>=0.85"),
+            ("Anything greater than 500 goes to high_value.", "greater than 500"),
+            ("Rows at least 10 dollars go to paid.", "at least 10"),
+            ("Split on amount below 100.", "below 100"),
+        ],
+    )
+    def test_comparison_language_is_detected(self, instruction: str, expected: str) -> None:
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
+
+        assert _stated_threshold_in(instruction) == expected
+
+    @pytest.mark.parametrize(
+        "instruction",
+        [
+            "Fan out every row to both sinks.",
+            "Wire the source -> summarise -> json sink.",
+            "Add the transform above the gate.",
+            "Summarise each row and write the result.",
+            "",
+        ],
+    )
+    def test_prose_without_a_threshold_is_not_detected(self, instruction: str) -> None:
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
+
+        assert _stated_threshold_in(instruction) is None
+
+
+@pytest.mark.asyncio
+async def test_constant_gate_against_a_stated_threshold_gets_one_coded_nudge_then_valve(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """AWS acceptance run 2, R2-F17: the stated threshold never reached the gate.
+
+    Asked to route on ``amount > 500``, the planner authored a constant-condition
+    fan-out that would write every row to BOTH sinks. The shape is legal, so it
+    draws ONE coded repair naming the comparison verbatim; re-emitting the same
+    pipeline is the valve for a genuinely intended fan-out.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Add a gate that routes rows with amount > 500 to high_value and every other row to standard.",
+    )
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert feedback["success"] is False
+    codes = [error["error_code"] for error in feedback["validation"]["errors"]]
+    assert codes == ["gate_condition_ignores_stated_threshold"]
+    error = feedback["validation"]["errors"][0]
+    assert error["explanation"]
+    assert error["suggested_fix"]
+    # The comparison the operator stated, verbatim — without it the planner
+    # cannot author the condition it dropped.
+    assert "amount > 500" in error["detail"]
+
+
+@pytest.mark.asyncio
+async def test_fan_out_instruction_without_a_threshold_is_never_nudged(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The documented fan-out macro must pass untouched — both halves must hold."""
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Fan every row out to both the high_value and standard sinks.",
+    )
+
+    assert proposal.proposal.repair_count == 0
+
+
+@pytest.mark.asyncio
+async def test_authored_condition_satisfies_the_stated_threshold(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A candidate that DID author the condition is accepted first time."""
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_conditional_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Add a gate that routes rows with amount > 500 to high_value and every other row to standard.",
+    )
+
+    assert proposal.proposal.repair_count == 0

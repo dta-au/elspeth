@@ -1005,3 +1005,112 @@ def test_llm_error_route_reason_stays_general_when_another_path_is_also_uncovere
     assert [(finding.reason, finding.uncovered_stream) for finding in findings] == [
         ("output_not_post_dominated", None),
     ]
+
+
+# ── prompt-field provability (R2-F17 compounding half, elspeth-5c0c09db31) ───
+
+
+def _llm_with_template(template: str, *, input_stream: str = "llm_in", on_success: str = "main") -> NodeSpec:
+    """An LLM node whose prompt template is authored verbatim.
+
+    ``_llm`` synthesises ``{{ row.<field> }}`` accesses; these cases turn on
+    templates that carry NO provable ``row.*`` access at all.
+    """
+    return _node(
+        "judge",
+        "llm",
+        input_stream,
+        on_success,
+        options={"prompt_template": template, "response_field": "llm_response"},
+    )
+
+
+def _all_fields_shield(node_id: str, input_stream: str, on_success: str) -> NodeSpec:
+    """A shield configured with the string scope ``fields: all``."""
+    return _node(
+        node_id,
+        "azure_prompt_shield",
+        input_stream,
+        on_success,
+        options={"detect_only": False, "fields": "all"},
+    )
+
+
+def test_all_fields_shield_is_credited_when_prompt_fields_are_unprovable() -> None:
+    """AWS acceptance run 2 (R2-F17): a correctly placed shield was rejected.
+
+    ``Classify: {{ text }}`` has no ``row.*`` access, so the provable prompt
+    field set is empty — and the empty-set bail-out ran BEFORE the
+    ``fields: all`` shortcut, so a control that scans every field was never
+    credited and ``input_not_dominated`` fired on a conforming pipeline.
+    ``all`` is a superset of every protected set, provable or not.
+    """
+    state = _state(
+        _all_fields_shield("shield", "raw", "llm_in"),
+        _llm_with_template("Classify: {{ text }}"),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_unprovable_prompt_fields_are_a_distinct_diagnosis_naming_both_field_sets() -> None:
+    """A field-scoped shield still fails closed — but says why, not "not covered".
+
+    An empty extraction is not proof that no row field reaches the prompt (a
+    dynamic ``row[key]`` access extracts nothing either), so a control scanning
+    a specific list cannot be credited. The author needs the distinct
+    diagnosis, not the generic domination message which points at a topology
+    that is in fact correct.
+    """
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("prompt",)),
+        _llm_with_template("Classify: {{ text }}"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_fields_unprovable"),
+    ]
+    assert findings[0].protected_fields == ()
+    assert findings[0].scanned_fields == ("prompt",)
+
+
+def test_missing_shield_keeps_the_domination_diagnosis_when_prompt_fields_are_unprovable() -> None:
+    """No upstream control at all is a topology failure, not a scope failure."""
+    state = _state(_llm_with_template("Classify: {{ text }}"))
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+
+
+def test_mismatched_shield_still_fires_and_carries_both_field_sets() -> None:
+    """The real finding must survive the credit fix, with both sets named."""
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("benign_label",)),
+        _llm(prompt_fields=("untrusted_prompt",)),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+    assert findings[0].protected_fields == ("untrusted_prompt",)
+    assert findings[0].scanned_fields == ("benign_label",)
+
+
+def test_all_fields_control_is_credited_for_output_coverage_too() -> None:
+    """The ``all`` shortcut is role-agnostic: it dominates any protected set."""
+    state = _authorable_state(
+        _llm(on_success="safe_in"),
+        _node("safety", "azure_content_safety", "safe_in", "main", options={"detect_only": False, "fields": "all"}),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()

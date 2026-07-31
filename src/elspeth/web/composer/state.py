@@ -1442,6 +1442,42 @@ def _validate_gate_expression(condition: str) -> str | None:
     return None
 
 
+def gate_condition_is_constant(condition: str) -> bool:
+    """Return whether a gate condition is a bare literal that reads no row data.
+
+    Diagnosis only — a constant condition is legal and is the documented
+    fan-out idiom. Syntactically invalid or forbidden conditions answer False;
+    ``_validate_gate_expression`` is the check that rejects those.
+    """
+    from elspeth.core.expression_parser import (
+        ExpressionParser,
+        ExpressionSecurityError,
+        ExpressionSyntaxError,
+    )
+
+    try:
+        return ExpressionParser(condition).is_constant_expression()
+    except (ExpressionSyntaxError, ExpressionSecurityError):
+        return False
+
+
+def gate_route_destinations(node: NodeSpec, route_target: str) -> frozenset[str]:
+    """Resolve one gate route target to the destinations it delivers rows to.
+
+    Mirrors the engine's gate route vocabulary (``core/config.py:768-770``,
+    whose composition-time counterpart is the fork-branch destination rule in
+    :func:`_validate_runtime_route_destinations`): ``discard`` delivers
+    nowhere, ``fork`` delivers to every ``fork_to`` branch, and any other value
+    is one named destination. Callers must not re-derive this — the reserved
+    keywords are not connection names.
+    """
+    if route_target == _DISCARD_ROUTE_TARGET:
+        return frozenset()
+    if route_target == _FORK_ROUTE_TARGET:
+        return frozenset(node.fork_to or ())
+    return frozenset({route_target})
+
+
 def _validate_gate_route_parity(condition: str, routes: Mapping[str, str] | None) -> str | None:
     """Validate gate route labels match the condition's static return type.
 

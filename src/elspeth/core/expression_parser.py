@@ -791,6 +791,22 @@ class ExpressionParser:
         # Everything else (field access, arithmetic, etc.) is not guaranteed boolean
         return False
 
+    def is_constant_expression(self) -> bool:
+        """Check if the expression is a bare literal, so it reads no row data.
+
+        A gate condition that is a literal (``True``, ``False``, a string, a
+        number) takes the same branch for every row: it encodes no decision.
+        Used for diagnosis — a fan-out advisory and the planner's
+        stated-threshold fidelity guard — and NEVER as a security control or a
+        blocking gate: the constant-condition fork is ELSPETH's documented
+        fan-out idiom (``pipeline_composer.md``, "Dual independent outputs").
+        """
+        body = self._ast.body
+        # ``True``/``False``/``None`` parse to ast.Constant on every supported
+        # Python; the Name arm is a belt-and-braces carry-over from the same
+        # pairing in ``_is_boolean_node``.
+        return isinstance(body, ast.Constant) or (isinstance(body, ast.Name) and body.id in ("True", "False", "None"))
+
     def is_provably_non_routable(self) -> bool:
         """Check if the expression's result is statically guaranteed to be neither bool nor str.
 

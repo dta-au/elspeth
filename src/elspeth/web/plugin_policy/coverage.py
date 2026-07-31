@@ -52,6 +52,16 @@ class ControlCoverageFinding:
     authorable repair instead of a generic "not covered". ``uncovered_stream``
     is populated only for that case and carries the offending ``on_error``
     target.
+
+    ``input_fields_unprovable`` is the second fully-diagnosable case: the
+    topology IS correct — a blocking control dominates the node's input — but
+    the node's protected field set could not be proven, so a control scoped to
+    a specific field list cannot be credited (only ``fields: all`` can).
+    Reporting that as ``input_not_dominated`` sent authors to repair a wiring
+    layout that was already right (AWS acceptance run 2, R2-F17).
+    ``protected_fields`` and ``scanned_fields`` carry the two sets the message
+    must name; ``scanned_fields`` is diagnosis-only and is never a credit
+    decision.
     """
 
     component_id: str
@@ -59,10 +69,13 @@ class ControlCoverageFinding:
     role: ControlRole
     reason: Literal[
         "input_not_dominated",
+        "input_fields_unprovable",
         "output_not_post_dominated",
         "output_error_route_not_post_dominated",
     ]
     uncovered_stream: str | None = None
+    protected_fields: tuple[str, ...] = ()
+    scanned_fields: tuple[str, ...] = ()
 
 
 def build_output_stream_graph(nodes: Sequence[NodeSpec]) -> OutputStreamGraph:
@@ -125,12 +138,23 @@ def node_has_blocking_control(
 
 
 def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> bool:
-    """Return whether a control scans every field whose content it protects."""
-    if not protected_fields:
-        return False
+    """Return whether a control scans every field whose content it protects.
+
+    ``fields: all`` is decided FIRST because it is a superset of every
+    protected set — provable or not — so it covers the empty set too. The
+    empty-set bail-out below is the fail-closed rule for every OTHER scope: an
+    empty protected set is not proof that no field needs protecting (a dynamic
+    ``row[key]`` prompt access and a prompt with no row access at all both
+    extract to the empty set — see ``extract_jinja2_field_usage``), so a
+    control scoped to a specific field list cannot be credited against it.
+    Ordering these the other way round rejected correctly-shielded pipelines
+    outright (AWS acceptance run 2, R2-F17 / elspeth-5c0c09db31).
+    """
     configured = node.options.get("fields")
     if configured == "all":
         return True
+    if not protected_fields:
+        return False
     if isinstance(configured, str):
         scanned_fields = frozenset({configured}) if configured.strip() else frozenset()
     elif isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
@@ -252,12 +276,19 @@ def control_coverage_findings(
                 protected_fields=protected_fields,
             )
             if not covered:
+                # Diagnosis is decided HERE, where both field sets are in
+                # hand — never threaded through the recursion, which stays a
+                # pure predicate over coverage.
+                scanned_fields = _upstream_control_scan_scopes(node, graph, capability)
+                scope_failure_only = not protected_fields and scanned_fields is not None
                 findings.append(
                     ControlCoverageFinding(
                         component_id=node.id,
                         capability=capability,
                         role=ControlRole.INPUT,
-                        reason="input_not_dominated",
+                        reason=("input_fields_unprovable" if scope_failure_only else "input_not_dominated"),
+                        protected_fields=tuple(sorted(protected_fields)),
+                        scanned_fields=scanned_fields or (),
                     )
                 )
         else:
@@ -301,6 +332,49 @@ def control_coverage_findings(
                     )
                 )
     return tuple(findings)
+
+
+def _upstream_producers(node: NodeSpec, graph: OutputStreamGraph) -> tuple[NodeSpec, ...]:
+    """Return the nodes producing this node's inputs, queue predecessors included."""
+    if node.node_type == "queue":
+        return graph.queue_predecessors.get(node.id, ())
+    return tuple(producer for stream in _node_input_streams(node) for producer in graph.producers_by_stream.get(stream, ()))
+
+
+def _upstream_control_scan_scopes(
+    node: NodeSpec,
+    graph: OutputStreamGraph,
+    capability: PluginCapability,
+) -> tuple[str, ...] | None:
+    """Return the field scopes of the nearest upstream blocking controls.
+
+    DIAGNOSIS ONLY. This never decides coverage — ``_stream_proves_input_control``
+    is the sole credit authority and this walk deliberately ignores the
+    field-scope, mapper-translation and overwrite rules that make coverage
+    sound. It answers exactly one question for the message: is there a blocking
+    control upstream at all, and what does it scan? ``None`` means none was
+    found on any path, which keeps "no control anywhere" reported as a topology
+    failure rather than a field-scope failure.
+    """
+    seen = {node.id}
+    frontier = list(_upstream_producers(node, graph))
+    scopes: set[str] = set()
+    found = False
+    while frontier:
+        producer = frontier.pop()
+        if producer.id in seen:
+            continue
+        seen.add(producer.id)
+        if node_has_blocking_control(producer, capability, ControlRole.INPUT):
+            found = True
+            configured = producer.options.get("fields")
+            if isinstance(configured, str):
+                scopes.add(configured)
+            elif isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
+                scopes.update(str(field) for field in configured)
+            continue
+        frontier.extend(_upstream_producers(producer, graph))
+    return tuple(sorted(scopes)) if found else None
 
 
 def _node_output_streams(node: NodeSpec) -> tuple[str, ...]:
