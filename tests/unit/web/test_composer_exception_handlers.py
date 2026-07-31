@@ -425,11 +425,13 @@ class TestHTTPExceptionRequestIdEnvelope:
         async def _probe_string_detail() -> None:
             raise HTTPException(status_code=409, detail="a plain-language message")
 
-        # ``create_app`` mounts the built SPA (``web/frontend/dist``) as a
-        # StaticFiles Mount at "", which matches EVERY path — so a route
-        # appended after it never runs and these probes would 404 instead of
-        # exercising the boundary. The mount is absent under the current test
-        # conftest, which is exactly why this needs pinning rather than luck.
+        # ``create_app`` mounts the built SPA as a StaticFiles Mount at "",
+        # which matches EVERY path — so a route appended after it never runs
+        # and these probes would 404 instead of exercising the boundary. The
+        # mount is conditional on a built ``web/frontend/dist`` existing
+        # (app.py's ``if frontend_dist.is_dir():``), so whether it is there
+        # depends on whether the checkout has been built — which is exactly
+        # why this needs pinning rather than luck.
         # Move the probes to the front of the table.
         app.router.routes.insert(0, app.router.routes.pop())
         app.router.routes.insert(0, app.router.routes.pop())
