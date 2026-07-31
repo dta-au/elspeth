@@ -17,6 +17,7 @@ from elspeth.web.composer.guided.planning import bind_guided_reviewed_components
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.pipeline_planner import _CANDIDATE_SHAPE_INTEGRITY_PREFIX
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 OUTPUT_ID = "33333333-3333-4333-8333-333333333333"
@@ -66,8 +67,13 @@ def test_bind_still_refuses_a_candidate_that_names_no_source() -> None:
         ],
     }
 
-    with pytest.raises(AuditIntegrityError, match="does not identify reviewed sources"):
+    with pytest.raises(AuditIntegrityError, match="does not identify reviewed sources") as raised:
         bind_guided_reviewed_components(pipeline, _guided())
+
+    # The planner loop reclassifies binder candidate-shape complaints by this
+    # message prefix; pin the real message against the real constant so the
+    # two sides cannot drift into a terminal 500 again.
+    assert str(raised.value).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX)
 
 
 def test_bind_rewrites_invented_output_name_in_edges_and_routing() -> None:
