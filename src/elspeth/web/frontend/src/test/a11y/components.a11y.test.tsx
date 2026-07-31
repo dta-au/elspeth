@@ -365,6 +365,12 @@ function resetAllStores() {
       edges: [],
       outputs: [],
     } as never,
+    // R2-F5 (elspeth-139a345050): compositionState alone is ambiguous
+    // between "still loading" and "loaded, empty" — GraphMiniView now
+    // renders a "Loading pipeline…" skeleton instead of the populated
+    // graph unless this is set, which would have silently dropped the
+    // GraphMiniView a11y audit down to auditing a bare <span>.
+    compositionStateLoaded: true,
     stateVersions: [],
     isLoadingVersions: false,
   } as never);
@@ -682,6 +688,14 @@ describe("SideRail", () => {
 describe("GraphMiniView", () => {
   it("has no axe violations", async () => {
     const { container } = render(<GraphMiniView />);
+    // Guard against the fixture silently regressing to the "Loading
+    // pipeline…" skeleton (a bare <span> with no interactive markup, which
+    // would trivially pass axe without covering the real button/SVG/label
+    // this test exists to audit) — assert the populated graph actually
+    // rendered.
+    expect(
+      screen.getByRole("button", { name: /pipeline graph/i }),
+    ).toBeInTheDocument();
     expect(await axe(container)).toHaveNoViolations();
   });
 });
