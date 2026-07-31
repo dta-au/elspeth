@@ -775,7 +775,6 @@ class RegisteredAuditExportContent:
             raise TypeError("descriptor must be AuditExportContentDescriptor")
 
 
-@runtime_checkable
 class BoundAuditExportContentReader(Protocol):
     """No-arbitrary-ref reader returned only for registered content."""
 

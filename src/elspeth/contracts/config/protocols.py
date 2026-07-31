@@ -220,7 +220,6 @@ class RuntimeRetryProtocol(Protocol):
         ...
 
 
-@runtime_checkable
 class ServiceRateLimitProtocol(Protocol):
     """Minimal service-level rate limit interface used by RateLimitRegistry."""
 
