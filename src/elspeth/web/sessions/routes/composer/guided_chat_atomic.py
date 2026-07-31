@@ -1585,6 +1585,11 @@ async def post_guided_chat_schema8(
                         exc_class=type(exc).__name__,
                         site="post_guided_chat",
                         frames=_safe_frame_strings(exc),
+                        # See ``guided.py``'s post_guided_start site (R2-F16b):
+                        # correlates this log line to the response's
+                        # X-Request-ID; lenient read so a missing middleware
+                        # cannot break the error path.
+                        request_id=getattr(request.state, "request_id", None),
                     )
                 try:
                     failed = await service.fail_guided_operation_with_audit(

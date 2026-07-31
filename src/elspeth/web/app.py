@@ -19,7 +19,8 @@ from uuid import UUID
 
 import httpx
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler as fastapi_http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -30,6 +31,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
@@ -1529,6 +1531,45 @@ def _create_app(
     ) -> JSONResponse:
         safe_errors = [{k: v for k, v in error.items() if k in _SAFE_VALIDATION_ERROR_KEYS} for error in exc.errors()]
         return JSONResponse(status_code=422, content={"detail": safe_errors})
+
+    # --- request_id on every structured error envelope (all routes) ---
+    # ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every response and
+    # the named-exception handlers above put the same id in their bodies —
+    # but the guided routes consume their terminal exception in-route
+    # (settling the operation first) and re-raise a CLOSED ``HTTPException``
+    # via ``raise_guided_operation_failure``. Those envelopes reached the
+    # client through FastAPI's default renderer, which knows nothing about
+    # the correlation id, so the header a user could quote back correlated
+    # to nothing (R2-F16b).
+    #
+    # Fixing that at the ~40 dict-detail raise sites would regress the first
+    # time a new one is added, so the injection lives at the ONE boundary
+    # every ``HTTPException`` already passes through. It is registered
+    # against ``starlette.exceptions.HTTPException`` — the same key FastAPI's
+    # ``setup()`` uses — so this REPLACES the default renderer rather than
+    # forking the boundary in two; registering against ``fastapi``'s
+    # subclass instead would leave router-raised 404s on the old path.
+    # Rendering itself is still delegated to FastAPI's handler, which owns
+    # the bodiless-status (204/304) and ``headers`` behaviour.
+    #
+    # Only dict details are touched. A bare ``detail="..."`` string is a
+    # plain-language message, not an envelope; wrapping it would change the
+    # response contract of every string raise site in the app.
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+        # Starlette narrows ``detail`` to ``str``; FastAPI's subclass widens it
+        # to ``Any`` and every structured envelope in this app is a dict raised
+        # through that subclass. Read it as ``object`` so the discrimination
+        # below is a real runtime check rather than statically dead code.
+        detail: object = exc.detail
+        if not isinstance(detail, dict) or "request_id" in detail:
+            return await fastapi_http_exception_handler(request, exc)
+        correlated = HTTPException(
+            status_code=exc.status_code,
+            detail={**detail, "request_id": _request_id(request)},
+            headers=exc.headers,
+        )
+        return await fastapi_http_exception_handler(request, correlated)
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:

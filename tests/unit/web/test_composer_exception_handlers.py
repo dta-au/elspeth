@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from structlog.testing import capture_logs
 
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
@@ -16,7 +17,9 @@ from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
 from elspeth.web.preferences.service import CorruptPreferencesError
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
-from elspeth.web.sessions.protocol import AuditAccessLogWriteError, StaleComposeStateError
+from elspeth.web.sessions.protocol import AuditAccessLogWriteError, GuidedOperationFailed, StaleComposeStateError
+from elspeth.web.sessions.routes.guided_operations import raise_guided_operation_failure
+from tests.unit.web._sync_asgi_client import SyncASGITestClient
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -269,3 +272,160 @@ async def test_audit_story_not_recorded_error_handler_returns_structured_404(tmp
     body = json.loads(response.body)
     assert body["error_type"] == "audit_story_not_recorded"
     assert "abc-123" not in response.body.decode()
+
+
+class TestHTTPExceptionRequestIdEnvelope:
+    """Every dict-shaped error envelope carries the response's correlation id.
+
+    R2-F16b: ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every
+    response, and ``_audit_integrity_error_handler`` puts the same id in
+    its body — but the guided routes consume their terminal exception
+    in-route and re-raise a *closed* ``HTTPException``
+    (``raise_guided_operation_failure``). That envelope never passed
+    through an app-level handler, so the header correlated to nothing a
+    user could quote back.
+
+    The fix is ONE boundary rather than N routes: an app-level
+    ``HTTPException`` handler injects ``request.state.request_id`` into
+    any dict detail that does not already carry one, then delegates to
+    FastAPI's default rendering. String details are untouched — a bare
+    ``detail="..."`` is a plain-language message, not an envelope, and
+    wrapping it would change the client contract of ~200 raise sites.
+    """
+
+    def test_exactly_one_http_exception_handler_registered_on_the_starlette_class(self, tmp_path: Path) -> None:
+        """Compose with FastAPI's default handler; do not fork the boundary.
+
+        FastAPI's ``setup()`` registers its default renderer against
+        ``starlette.exceptions.HTTPException``. Registering ours against
+        ``fastapi.HTTPException`` instead would create a SECOND key:
+        MRO lookup would send route-raised ``fastapi.HTTPException``s to
+        ours and router-raised 404s to FastAPI's, so half the envelopes
+        would silently miss the id.
+        """
+        app = create_app(_settings(tmp_path))
+
+        http_exception_keys = [key for key in app.exception_handlers if key in (StarletteHTTPException, HTTPException)]
+        assert http_exception_keys == [StarletteHTTPException]
+
+    @pytest.mark.asyncio
+    async def test_dict_detail_gains_the_request_id(self, tmp_path: Path) -> None:
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        response = await handler(
+            _audit_request("req-dict-1"),
+            HTTPException(status_code=500, detail={"error_type": "guided_operation_terminal_failure"}),
+        )
+
+        assert response.status_code == 500
+        assert json.loads(response.body)["detail"] == {
+            "error_type": "guided_operation_terminal_failure",
+            "request_id": "req-dict-1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_string_detail_is_left_exactly_as_raised(self, tmp_path: Path) -> None:
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        response = await handler(
+            _audit_request("req-str-1"),
+            HTTPException(status_code=400, detail="proposal_id must be a canonical UUID"),
+        )
+
+        assert response.status_code == 400
+        assert json.loads(response.body) == {"detail": "proposal_id must be a canonical UUID"}
+        assert "req-str-1" not in response.body.decode()
+
+    @pytest.mark.asyncio
+    async def test_an_envelope_that_already_carries_a_request_id_is_not_overwritten(self, tmp_path: Path) -> None:
+        """A route that sourced its own id keeps it — the boundary only fills gaps."""
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        response = await handler(
+            _audit_request("req-from-middleware"),
+            HTTPException(status_code=500, detail={"error_type": "x", "request_id": "req-from-route"}),
+        )
+
+        assert json.loads(response.body)["detail"]["request_id"] == "req-from-route"
+
+    @pytest.mark.asyncio
+    async def test_response_headers_survive_the_rewrap(self, tmp_path: Path) -> None:
+        """``HTTPException.headers`` is load-bearing for 401/429 — do not drop it."""
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        response = await handler(
+            _audit_request("req-hdr-1"),
+            HTTPException(
+                status_code=429,
+                detail={"error_type": "rate_limited"},
+                headers={"Retry-After": "30"},
+            ),
+        )
+
+        assert response.headers["Retry-After"] == "30"
+        assert json.loads(response.body)["detail"]["request_id"] == "req-hdr-1"
+
+    @pytest.mark.asyncio
+    async def test_the_guided_terminal_failure_envelope_is_covered_by_the_boundary(self, tmp_path: Path) -> None:
+        """The exact envelope ``raise_guided_operation_failure`` closes over.
+
+        The guided routes never reach an app-level handler for their own
+        exception class — they catch it, settle the operation, and raise
+        this. Pinning the composed result here is what makes the boundary
+        (rather than four route edits) the fix.
+        """
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        with pytest.raises(HTTPException) as caught:
+            raise_guided_operation_failure(GuidedOperationFailed(failure_code="integrity_error"))
+        response = await handler(_audit_request("req-guided-1"), caught.value)
+
+        assert response.status_code == 500
+        assert json.loads(response.body)["detail"] == {
+            "error_type": "guided_operation_terminal_failure",
+            "failure_code": "integrity_error",
+            "detail": "The operation failed an integrity check.",
+            "request_id": "req-guided-1",
+        }
+
+    def test_the_body_request_id_equals_the_response_header_end_to_end(self, tmp_path: Path) -> None:
+        """The finding, stated as a test: the header must correlate to something.
+
+        Handler-level tests never exercise registration, middleware
+        ordering, or dispatch. This one drives a real request through
+        ``create_app``'s full middleware stack so the id in the body is
+        provably the SAME id the operator reads off ``X-Request-ID``.
+        """
+        app = create_app(_settings(tmp_path))
+
+        @app.get("/api/_probe/guided-terminal-failure")
+        async def _probe_guided_terminal_failure() -> None:
+            raise_guided_operation_failure(GuidedOperationFailed(failure_code="integrity_error"))
+
+        @app.get("/api/_probe/string-detail")
+        async def _probe_string_detail() -> None:
+            raise HTTPException(status_code=409, detail="a plain-language message")
+
+        client = SyncASGITestClient(app)
+
+        response = client.get("/api/_probe/guided-terminal-failure")
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert detail["failure_code"] == "integrity_error"
+        assert detail["request_id"] == response.headers["X-Request-ID"]
+        assert detail["request_id"]
+
+        # An inbound id is honoured, so the correlation works for a caller
+        # that already owns a trace id.
+        supplied = client.get("/api/_probe/guided-terminal-failure", headers={"X-Request-ID": "trace-abc-123"})
+        assert supplied.json()["detail"]["request_id"] == "trace-abc-123"
+
+        # ... and the string-detail contract is unchanged end to end.
+        plain = client.get("/api/_probe/string-detail")
+        assert plain.status_code == 409
+        assert plain.json() == {"detail": "a plain-language message"}

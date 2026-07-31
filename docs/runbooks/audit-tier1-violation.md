@@ -44,6 +44,28 @@ sqlite3 data/sessions.db ".backup '/tmp/elspeth-sessions-incident-$(date +%Y%m%d
 Adjust the database path for the deployment. For staging, inspect
 `deploy/elspeth-web.env` without printing secret values.
 
+## Correlating a Reported Error to Its Server Log
+
+A user can only quote what the browser showed them. Two fields make that
+quotable value sufficient to find the server-side record:
+
+- The `X-Request-ID` response header, stamped on every response by
+  `RequestIdMiddleware`.
+- The `request_id` field, present in every structured (object-shaped) error
+  body. An app-level `HTTPException` handler injects it at one boundary, so
+  the value is identical to the header. Errors whose `detail` is a plain
+  string carry no `request_id` — the header is the only handle for those.
+
+Search the structured server log for that id. The terminal-error events are:
+
+| Event | Emitted by | Meaning |
+|-------|-----------|---------|
+| `http_audit_integrity_error` | app-level `AuditIntegrityError` handler | A Tier-1 read-side verification refused to proceed. `message` carries the server-authored raise-site text, which is the only discriminator between the byte-identical 500 bodies. |
+| `guided.operation_terminal_failure` | the guided routes (`site` names which one: `post_guided_start`, `post_guided_respond`, `post_guided_convert`, `post_guided_chat`) | A guided operation was settled as failed and re-raised as a closed HTTP envelope. `exc_class` and `frames` carry the diagnostic; the user-visible body never does. |
+
+Both event names are stable identifiers. Do not rename them — dashboards and
+this runbook key off them.
+
 ## Triage Queries
 
 Run these against the session database copy or under a maintenance window.
