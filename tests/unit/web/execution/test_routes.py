@@ -229,9 +229,14 @@ def _create_test_app(
 
     @app.exception_handler(RunAlreadyActiveError)
     async def handle_run_already_active(request: FastAPIRequest, exc: RunAlreadyActiveError) -> JSONResponse:
+        # Mirrors ``create_app``'s handler, including ``request_id``.
         return JSONResponse(
             status_code=409,
-            content={"detail": str(exc), "error_type": "run_already_active"},
+            content={
+                "detail": str(exc),
+                "error_type": "run_already_active",
+                "request_id": getattr(getattr(request, "state", None), "request_id", None),
+            },
         )
 
     return app
@@ -494,6 +499,8 @@ class TestExecuteEndpoint:
             # Seam Contract D: flat envelope, not nested
             assert body["error_type"] == "run_already_active"
             assert "detail" in body
+            # R2-F16b: the envelope correlates to the response's X-Request-ID.
+            assert "request_id" in body
 
     @pytest.mark.asyncio
     async def test_execute_returns_canonical_blob_source_path_error(self) -> None:

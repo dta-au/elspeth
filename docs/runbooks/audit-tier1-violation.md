@@ -51,20 +51,26 @@ quotable value sufficient to find the server-side record:
 
 - The `X-Request-ID` response header, stamped on **every** response by
   `RequestIdMiddleware`. This is the handle that always works.
-- The `request_id` field in the error body, when present. It is always equal to
-  the header.
+- The `request_id` field in the error body. It is always equal to the header.
 
-Which bodies carry `request_id`:
+`request_id` sits in one of two positions, and which one depends on how the
+error was rendered:
 
-| Carries it | Does not |
-|---|---|
-| Any dict-shaped `HTTPException` detail — all guided terminal-failure envelopes, freeform convergence 422s, execution and interpretation envelopes. An app-level handler injects it at one boundary. | `HTTPException`s whose `detail` is a plain string. |
-| `audit_integrity_error`, `fingerprint_key_missing`, `secret_decryption_failed`, `database_unavailable`, `storage_unavailable` — these handlers source it themselves. | `corrupt_preferences`, `audit_story_integrity_error`, `audit_story_not_recorded`, `stale_compose_state`, `audit_access_log_write_failed`, `run_already_active` — these handlers build their `JSONResponse` directly and do not yet source it. |
+- **Under `detail`** (`{"detail": {"error_type": ..., "request_id": ...}}`) for
+  anything raised as an `HTTPException` with a dict detail — all guided
+  terminal-failure envelopes, freeform convergence 422s, execution and
+  interpretation envelopes. A single app-level handler injects it there.
+- **Top level** (`{"error_type": ..., "request_id": ...}`) for the named-
+  exception handlers that render their `JSONResponse` directly:
+  `audit_integrity_error`, `corrupt_preferences`, `audit_story_integrity_error`,
+  `audit_story_not_recorded`, `stale_compose_state`,
+  `audit_access_log_write_failed`, `run_already_active`,
+  `fingerprint_key_missing`, `secret_decryption_failed`, `database_unavailable`
+  and `storage_unavailable`.
 
-For anything in the right-hand column — including
-`audit_access_log_write_failed`, whose counter is in the Signals table above —
-use the `X-Request-ID` header. Request-body validation failures (HTTP 422 with
-a list-shaped `detail`) carry no `request_id` either.
+Two shapes carry no `request_id` — fall back to the `X-Request-ID` header:
+`HTTPException`s whose `detail` is a plain string, and request-body validation
+failures (HTTP 422 with a list-shaped `detail`).
 
 Search the structured server log for that id. The terminal-error events are:
 
@@ -72,6 +78,14 @@ Search the structured server log for that id. The terminal-error events are:
 |-------|-----------|---------|
 | `http_audit_integrity_error` | app-level `AuditIntegrityError` handler | A Tier-1 read-side verification refused to proceed. `message` carries the server-authored raise-site text, which is the only discriminator between the byte-identical 500 bodies. |
 | `guided.operation_terminal_failure` | the guided routes (`site` names which one: `post_guided_start`, `post_guided_respond`, `post_guided_convert`, `post_guided_chat`) | A guided operation was settled as failed and re-raised as a closed HTTP envelope. `exc_class` and `frames` carry the diagnostic; the user-visible body never does. |
+
+The guided event is **not** emitted for every guided 500. `post_guided_start`
+and `post_guided_convert` emit it only when the failure was an
+`AuditIntegrityError`; `post_guided_respond` and `post_guided_chat` emit it for
+every terminal failure. So an absent log line on a start/convert 500 means the
+failure was classified as `operation_failed` or `stale_conflict`, not that
+logging was lost — check the `guided_operations` table for the operation's
+recorded `failure_code`.
 
 Both event names are stable identifiers. Do not rename them — dashboards and
 this runbook key off them.

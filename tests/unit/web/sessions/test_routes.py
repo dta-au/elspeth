@@ -8644,9 +8644,14 @@ class TestRunAlreadyActiveError:
             request,
             exc: RunAlreadyActiveError,
         ) -> JSONResponse:
+            # Mirrors ``create_app``'s handler, including ``request_id``.
             return JSONResponse(
                 status_code=409,
-                content={"detail": str(exc), "error_type": "run_already_active"},
+                content={
+                    "detail": str(exc),
+                    "error_type": "run_already_active",
+                    "request_id": getattr(getattr(request, "state", None), "request_id", None),
+                },
             )
 
         # Add a test endpoint that triggers the error
@@ -8660,6 +8665,8 @@ class TestRunAlreadyActiveError:
         body = resp.json()
         assert body["error_type"] == "run_already_active"
         assert "detail" in body
+        # R2-F16b: the envelope correlates to the response's X-Request-ID.
+        assert "request_id" in body
 
 
 class TestNewStateHasNoLineage:
