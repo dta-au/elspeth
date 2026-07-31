@@ -209,9 +209,35 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e68bc38e85f1a1f6"
+    source_file_hash: str | None = "sha256:a39447b9012dcf95"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
+
+    usage_when_to_use: str = (
+        "Use for an operator-approved, known Microsoft Dataverse deployment when a paginated, audited read should use an "
+        "entity/OData query or FetchXML."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for Dataverse writes, webhooks, local files, or when the environment URL, entity, query, or authentication "
+        "facts would have to be invented."
+    )
+    example_use: str = """sources:
+  contacts:
+    plugin: dataverse
+    on_success: output
+    options:
+      environment_url: https://tenant.crm.dynamics.com
+      auth:
+        method: managed_identity
+      entity: contacts
+      select:
+        - contactid
+        - fullname
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("microsoft", "dataverse", "odata", "fetchxml", "batch")
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)

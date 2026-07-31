@@ -48,12 +48,26 @@ class NullSource(BaseSource):
 
     name = "null"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:544844ea2814665e"
+    source_file_hash: str | None = "sha256:d61ea8afcf3b3466"
     config_model = None  # NullSource requires no config (resume-only)
     determinism = Determinism.DETERMINISTIC
     output_schema: type[PluginSchema] = NullSourceSchema
     # NullSource yields no rows, so it never quarantines - but set to satisfy protocol
     _on_validation_failure: str = "discard"
+
+    usage_when_to_use: str = (
+        "Use only while reconstructing a graph for resume: this placeholder emits zero rows, while the original run's audit "
+        "trail supplies the schema and stored payloads supply row data."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for new ingestion or placeholder data. Guided Web Composer hides this internal resume-only source."
+    )
+    example_use: str = """sources:
+  resume_placeholder:
+    plugin: "null"
+    on_success: output
+"""
+    capability_tags: tuple[str, ...] = ("internal", "resume", "placeholder")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

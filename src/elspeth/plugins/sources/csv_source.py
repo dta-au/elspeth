@@ -85,38 +85,28 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:da40c7c68226f54a"
+    source_file_hash: str | None = "sha256:543438de65eb3ce8"
     config_model = CSVSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
 
-    # ── Reference content (Phase 7A canonical example) ──────────────────
-    # This block is the canonical pattern for future plugin authors.
-    # Copy this shape; replace the prose with your plugin's specifics.
-    # The catalog drawer renders these fields as a persona-facing
-    # reference card. Empty / None entries fall back to "see the technical
-    # description" rather than blocking display — but the goal for every
-    # plugin is to have these filled in eventually so the catalog is
-    # useful as orientation material (per docs/composer/ux-redesign-2026-05/
-    # 08-catalog-reshape.md).
-
-    usage_when_to_use: str | None = (
-        "A reasonably large dataset (more than ~20 rows) that already "
-        "exists as a CSV file. The source validates and coerces types "
-        "at the boundary and quarantines malformed rows to a sink so the "
-        "rest of the pipeline keeps running on the clean rows."
+    usage_when_to_use: str = (
+        "Use for a finite tabular file that should be read incrementally, with type coercion at the source boundary and "
+        "optional quarantine routing for invalid records."
     )
-
-    usage_when_not_to_use: str | None = (
-        "Small inline data — type it into chat instead (the composer "
-        "creates a one-row source from your message). Streaming data — "
-        "CSV is batch-only; no row is emitted until the full file is "
-        "read. Data that arrives over HTTP — fetch it first, then point "
-        "the CSV source at the downloaded file."
+    usage_when_not_to_use: str = (
+        "Do not use for inline records, live or unbounded streams, or direct HTTP input; materialize a bounded CSV file first."
     )
-
-    example_use: str | None = "source:\n  plugin: csv\n  options:\n    path: data/input.csv\n    on_validation_failure: quarantine"
-
+    example_use: str = """sources:
+  primary:
+    plugin: csv
+    on_success: output
+    options:
+      path: data/input.csv
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
     capability_tags: tuple[str, ...] = ("csv", "file", "batch", "tabular")
 
     audit_characteristics: DeclaredAuditCharacteristics = frozenset({AuditCharacteristic.COERCE, AuditCharacteristic.QUARANTINE})

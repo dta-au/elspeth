@@ -150,10 +150,30 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:dfb31604c97ebab8"
+    source_file_hash: str | None = "sha256:f5a1ea710f3762b0"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
+
+    usage_when_to_use: str = (
+        "Use for a bounded JSON array or JSONL file; prefer JSONL for large or naturally line-oriented input, and use data_key "
+        "only to select a wrapped array in a JSON document."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for plain text or CSV, JSON arrays too large to load as one document, or JSONL combined with data_key."
+    )
+    example_use: str = """sources:
+  json_input:
+    plugin: json
+    on_success: output
+    options:
+      path: data/input.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("json", "jsonl", "file", "batch")
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
