@@ -387,7 +387,15 @@ class TelemetryManager:
         # lifecycle policy must not enable content-bearing FULL spans merely to
         # retain aggregate external-call metrics.
         for observer in self._event_observers:
-            observer(event)
+            try:
+                observer(event)
+            except Exception as exc:
+                logger.error(
+                    "Telemetry event observer failed",
+                    observer_type=type(observer).__name__,
+                    event_type=type(event).__name__,
+                    error_type=type(exc).__name__,
+                )
 
         # Skip if telemetry was disabled due to repeated failures
         if self._disabled:
