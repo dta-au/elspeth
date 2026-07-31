@@ -870,6 +870,81 @@ def _error_sink(tmp_path: Path) -> str:
 """
 
 
+_PRE_FORK_DIVERT_TRANSFORM = """
+  - name: pre_fork_tag
+    plugin: passthrough
+    input: routed
+    on_success: pre_forked
+    on_error: errors
+    options:
+      schema:
+        mode: observed
+"""
+
+
+def _with_pre_fork_divert(yaml_text: str) -> str:
+    """Reroute the fork gate's input through the DIVERT-bearing pre-fork transform.
+
+    source on_success 'routed' -> pre_fork_tag (on_error DIVERTs to 'errors')
+    -> on_success 'pre_forked' -> variant_fork input. The replace targets the
+    gate block's ``input: routed`` by anchoring on the adjacent ``condition:``
+    line (same idiom as test_aggregation_upstream_of_the_fork_is_not_rejected).
+    """
+    return yaml_text.replace(
+        "    input: routed\n    condition:",
+        "    input: pre_forked\n    condition:",
+    )
+
+
+# Branch chain with a branch-local NON-fork routing gate in the middle:
+# variant_fork -> tag_control (DIVERT) -> mid_gate -> polish_control -> union.
+# The second transform is named so it shares no substring with 'tag_control'.
+_MID_GATE = """
+  - name: mid_gate
+    input: control_mid
+    condition: "True"
+    routes:
+      'true': control_gated
+      'false': output
+"""
+
+_MID_GATE_BRANCH_TRANSFORMS = """
+transforms:
+  - name: tag_control
+    plugin: passthrough
+    input: control_branch
+    on_success: control_mid
+    on_error: errors
+    options:
+      schema:
+        mode: observed
+  - name: polish_control
+    plugin: passthrough
+    input: control_gated
+    on_success: control_scored
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: tag_treatment
+    plugin: passthrough
+    input: treatment_branch
+    on_success: treatment_scored
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: after_union
+    plugin: passthrough
+    input: union_out
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+"""
+
+
 class TestRowUnionDivertWarnings:
     """DIVERT_ROW_UNION_GROUP_LOSS parity with the coalesce divert warnings.
 
@@ -961,6 +1036,84 @@ coalesce:
         codes = {w.code for w in graph.validation_warnings}
         assert "DIVERT_ROW_UNION_GROUP_LOSS" in codes
         assert "DIVERT_COALESCE_REQUIRE_ALL" in codes
+
+    def test_divert_upstream_of_the_fork_emits_no_group_loss_warning(self, tmp_path: Path) -> None:
+        """A DIVERT before the fork strands no sibling group (elspeth-94d68e7aca).
+
+        A row diverted upstream of the fork never forked, so there is no
+        correlated group to lose. A transform-chain branch is wired
+        gate -> first transform as a MOVE edge, so an unbounded backward MOVE
+        walk runs straight through the union's originating fork gate into
+        pre-fork topology and charges EVERY branch with the pre-fork
+        transform — one false warning per branch.
+        """
+        graph = _build_graph(
+            _with_pre_fork_divert(
+                _yaml(
+                    tmp_path,
+                    row_unions=_CHAIN_UNION,
+                    branch_transforms=_chain_branch_transforms(control_on_error="discard", treatment_on_error="discard")
+                    + _PRE_FORK_DIVERT_TRANSFORM,
+                    tail="",
+                    extra_sinks=_error_sink(tmp_path),
+                )
+            )
+        )
+        matching = [w for w in graph.validation_warnings if w.code == "DIVERT_ROW_UNION_GROUP_LOSS"]
+        assert matching == [], [w.message for w in matching]
+
+    def test_pre_fork_divert_not_collected_alongside_branch_local_divert(self, tmp_path: Path) -> None:
+        """The boundary must not mask genuine in-branch diverts — or name pre-fork ones.
+
+        tag_control diverts INSIDE the control branch: that warning is real and
+        must survive, naming tag_control only. The pre-fork transform must not
+        be swept into it, and the treatment branch (whose only reachable DIVERT
+        sits upstream of the fork) must not warn at all.
+        """
+        graph = _build_graph(
+            _with_pre_fork_divert(
+                _yaml(
+                    tmp_path,
+                    row_unions=_CHAIN_UNION,
+                    branch_transforms=_chain_branch_transforms(control_on_error="errors", treatment_on_error="discard")
+                    + _PRE_FORK_DIVERT_TRANSFORM,
+                    tail="",
+                    extra_sinks=_error_sink(tmp_path),
+                )
+            )
+        )
+        matching = [w for w in graph.validation_warnings if w.code == "DIVERT_ROW_UNION_GROUP_LOSS"]
+        assert len(matching) == 1, [w.message for w in matching]
+        warning = matching[0]
+        assert "tag_control" in warning.message
+        assert "pre_fork_tag" not in warning.message
+        assert any("tag_control" in nid for nid in warning.node_ids)
+        assert not any("pre_fork_tag" in nid for nid in warning.node_ids)
+
+    def test_intermediate_gate_branch_preserves_group_loss_warning(self, tmp_path: Path) -> None:
+        """Branch-local NON-fork routing gates are still crossed by the walk.
+
+        The scan boundary is the union's ORIGINATING fork gate, not 'any gate':
+        a routing gate between two branch transforms must not hide a DIVERT on
+        the transform upstream of it (mirror of the coalesce-side
+        test_intermediate_gate_branch_preserves_require_all_warning).
+        """
+        graph = _build_graph(
+            _yaml(
+                tmp_path,
+                row_unions=_CHAIN_UNION,
+                branch_transforms=_MID_GATE_BRANCH_TRANSFORMS,
+                tail="",
+                extra_gates=_MID_GATE,
+                extra_sinks=_error_sink(tmp_path),
+            )
+        )
+        matching = [w for w in graph.validation_warnings if w.code == "DIVERT_ROW_UNION_GROUP_LOSS"]
+        assert len(matching) == 1, [w.message for w in matching]
+        warning = matching[0]
+        assert "tag_control" in warning.message
+        assert "polish_control" not in warning.message
+        assert any("tag_control" in nid for nid in warning.node_ids)
 
 
 # ===== BRANCH-INTERNAL AGGREGATION GUARD =====

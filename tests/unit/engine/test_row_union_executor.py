@@ -578,6 +578,91 @@ class TestRestoreFromJournal:
         assert outcomes[0].released_tokens == (tok_a, tok_b)
         assert [call.kwargs["state_id"] for call in execution.complete_node_state.call_args_list] == ["state-a", "state-b"]
 
+    def test_restored_entry_at_released_key_fails_as_late_arrival_instead_of_reopening(self) -> None:
+        # elspeth-6d37341e45 crash window: _fail_late_arrival died between
+        # begin_node_state and complete_node_state, leaving an OPEN hold at a
+        # key that already released. Restore must fail it with the true
+        # late-arrival reason, not reopen the closed group to die by
+        # timeout/EOF flush under an untruthful reason.
+        executor, execution, data_flow, _clock = _make_executor()
+        _register(executor)
+        execution.has_completed_row_for_node.return_value = True
+        execution.has_released_row_for_node.return_value = True
+        residual = _make_token(token_id="tok_late", branch_name="branch_a")
+
+        outcomes = executor.restore_from_journal(entries=(RowUnionRestoreEntry(residual, "variant_union", "state-late", 90.0),))
+
+        assert len(outcomes) == 1
+        assert outcomes[0].failure_reason == "late_arrival_after_release"
+        assert outcomes[0].consumed_tokens == (residual,)
+        assert outcomes[0].outcomes_recorded is True
+        assert execution.complete_node_state.call_args.kwargs["state_id"] == "state-late"
+        assert execution.complete_node_state.call_args.kwargs["status"] is NodeStateStatus.FAILED
+        # The begin-crash residual never recorded an outcome (record follows
+        # complete_node_state in _fail_late_arrival), so restore records it
+        # exactly once.
+        data_flow.record_token_outcome.assert_called_once()
+        assert data_flow.record_token_outcome.call_args.kwargs["outcome"] is TerminalOutcome.FAILURE
+        assert executor._pending == {}
+        assert executor.is_group_released("variant_union", "row_1") is True
+
+    def test_restored_entry_at_failed_closed_key_carries_conservative_failure_reason(self) -> None:
+        # The key closed by _fail_pending (timeout / EOF flush); the original
+        # reason is not cheaply recoverable from the Landscape point read, so
+        # the residual carries the conservative group-failed closure, exactly
+        # like the live late-arrival arm's cache-miss path.
+        executor, execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        execution.has_completed_row_for_node.return_value = True
+        execution.has_released_row_for_node.return_value = False
+
+        outcomes = executor.restore_from_journal(
+            entries=(RowUnionRestoreEntry(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union", "state-late", 90.0),)
+        )
+
+        assert len(outcomes) == 1
+        assert outcomes[0].failure_reason == "row_union_group_failed"
+        assert executor._pending == {}
+
+    def test_restored_entry_at_loss_closed_key_fails_once_with_branch_loss_reason(self) -> None:
+        # A loss-closed key satisfies BOTH the closed-key classification and
+        # the durable-loss point read; the restored entry must fail exactly
+        # once, with the loss reason.
+        executor, execution, data_flow, _clock = _make_executor()
+        _register(executor)
+        execution.has_completed_row_for_node.return_value = True
+        execution.has_released_row_for_node.return_value = False
+        executor._barrier_restore_reads.has_branch_loss_for_group.return_value = True
+
+        outcomes = executor.restore_from_journal(
+            entries=(RowUnionRestoreEntry(_make_token(token_id="tok_late", branch_name="branch_a"), "variant_union", "state-late", 90.0),)
+        )
+
+        assert len(outcomes) == 1
+        assert outcomes[0].failure_reason == "row_union_branch_lost"
+        data_flow.record_token_outcome.assert_called_once()
+
+    def test_closed_key_failure_leaves_sibling_open_key_pending(self) -> None:
+        # Closure is a per-key classification: a residual at a closed key must
+        # not disturb a genuinely-open group restored in the same call.
+        executor, execution, _data_flow, _clock = _make_executor()
+        _register(executor)
+        execution.has_completed_row_for_node.side_effect = lambda *, run_id, node_id, row_id: row_id == "row_1"
+        execution.has_released_row_for_node.return_value = True
+        residual = _make_token(row_id="row_1", token_id="tok_late", branch_name="branch_a")
+        open_hold = _make_token(row_id="row_2", token_id="tok_open", branch_name="branch_a")
+
+        outcomes = executor.restore_from_journal(
+            entries=(
+                RowUnionRestoreEntry(residual, "variant_union", "state-late", 90.0),
+                RowUnionRestoreEntry(open_hold, "variant_union", "state-open", 91.0),
+            )
+        )
+
+        assert [outcome.failure_reason for outcome in outcomes] == ["late_arrival_after_release"]
+        assert outcomes[0].consumed_tokens == (residual,)
+        assert ("variant_union", "row_2") in executor._pending
+
 
 class TestOutcomeInvariants:
     def test_held_with_released_tokens_rejected(self) -> None:

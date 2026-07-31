@@ -243,6 +243,20 @@ def run_resume_processing_loop(
     # checkpointed again instead of being flushed to sinks.
     interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
 
+    # elspeth-0bffbd1af1: restored pending groups carry backdated arrival
+    # anchors, so a group whose timeout expired during downtime is already
+    # stale HERE — sweep it closed before the scheduler drain or the source
+    # replay can supply its missing branch and release it. Skipped on an
+    # already-requested shutdown so restored barrier state stays pending for
+    # the next checkpoint instead of being failed by the sweep.
+    if not interrupted_by_shutdown and row_union_executor is not None:
+        handle_row_union_timeouts(
+            row_union_executor=row_union_executor,
+            processor=processor,
+            ctx=ctx,
+            counters=counters,
+        )
+
     if not interrupted_by_shutdown and processor.has_scheduled_work():
         recovered_row_ids = frozenset(row.row_id for row in unprocessed_rows)
         scheduled_row_ids = processor.active_scheduled_row_ids()

@@ -663,6 +663,19 @@ class SourceIterationDriver:
                                 loop_ctx,
                                 active_source=active_source,
                             )
+                            # elspeth-c6d083d150: a continuously ready stream of
+                            # quarantined rows never reaches the per-row sweep
+                            # below and keeps the source non-idle (no idle
+                            # pump), so a pending group's deadline would starve
+                            # until EOF and be misclassified there. Sweep at
+                            # this boundary too.
+                            if row_union_executor is not None:
+                                handle_row_union_timeouts(
+                                    row_union_executor=row_union_executor,
+                                    processor=processor,
+                                    ctx=ctx,
+                                    counters=counters,
+                                )
                             last_progress_time = self.maybe_emit_progress(
                                 counters,
                                 start_time,
