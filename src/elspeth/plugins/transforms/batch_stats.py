@@ -124,9 +124,34 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1e2bb450d2ce2c35"
+    source_file_hash: str | None = "sha256:1298d8d835eb99e2"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
+    usage_when_to_use: str = (
+        "Use to replace a window of rows with count, sum, and optional mean statistics over one numeric field. "
+        "When configured, group_by partitions one flushed batch and never accumulates a group across windows."
+    )
+    usage_when_not_to_use: str = (
+        "Not for pass-through enrichment or whole-run totals: original rows are replaced, and every trigger starts "
+        "a new aggregation window."
+    )
+    example_use: str = """aggregations:
+  - name: category_totals
+    plugin: batch_stats
+    input: sales_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      value_field: amount
+      group_by: category
+      compute_mean: true
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "aggregation", "statistics")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

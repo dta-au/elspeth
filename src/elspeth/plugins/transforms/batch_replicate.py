@@ -98,9 +98,35 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:afce27221f965067"
+    source_file_hash: str | None = "sha256:2779baa8c538ca5f"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
+    usage_when_to_use: str = (
+        "Use for bounded per-row copy expansion when each input row supplies a validated copy count and optional "
+        "copy indexes are useful downstream."
+    )
+    usage_when_not_to_use: str = (
+        "Not for random sampling or unbounded fan-out; max_copies limits each row and invalid copy counts are "
+        "quarantined rather than expanded."
+    )
+    example_use: str = """aggregations:
+  - name: replicate_rows
+    plugin: batch_replicate
+    input: counted_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 50
+    output_mode: transform
+    options:
+      copies_field: copies
+      default_copies: 1
+      max_copies: 5
+      include_copy_index: true
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "deaggregation", "row-expansion")
 
     # Every emitted row deep-copies its originating input before adding
     # copy_index. Mixed-validity batches may quarantine inputs, but the

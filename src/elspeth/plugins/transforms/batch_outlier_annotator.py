@@ -145,9 +145,35 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:63d7304ef9ab7f6e"
+    source_file_hash: str | None = "sha256:28b8b8345242dd43"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
+    usage_when_to_use: str = (
+        "Use for window-local z-score and robust-z annotations on finite numeric rows, preserving each valid "
+        "source row with added outlier fields."
+    )
+    usage_when_not_to_use: str = (
+        "Not for a durable anomaly model or tolerant pass-through of bad values; invalid numeric rows are "
+        "reported but not emitted in the successful output."
+    )
+    example_use: str = """aggregations:
+  - name: latency_outliers
+    plugin: batch_outlier_annotator
+    input: latency_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      value_field: latency_ms
+      output_prefix: outlier
+      z_threshold: 3.0
+      robust_z_threshold: 3.5
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "outlier", "annotation")
     passes_through_input = False
 
     @classmethod

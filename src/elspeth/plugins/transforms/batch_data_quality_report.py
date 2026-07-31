@@ -113,9 +113,35 @@ class BatchDataQualityReport(BaseTransform):
     name = "batch_data_quality_report"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d0144b9403678253"
+    source_file_hash: str | None = "sha256:11a4f2132affc147"
     config_model = BatchDataQualityReportConfig
     is_batch_aware = True
+    usage_when_to_use: str = (
+        "Use to emit one quality row per configured existing field in a flushed batch; a present None is missing, "
+        "while absent columns are errors rather than missing observations."
+    )
+    usage_when_not_to_use: str = (
+        "Not for row repair, schema migration, or automatic imputation; route or transform invalid input before "
+        "using this profiling report."
+    )
+    example_use: str = """aggregations:
+  - name: quality_report
+    plugin: batch_data_quality_report
+    input: quality_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      inspect_fields:
+        - source
+        - score
+        - label
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "data-quality", "profiling")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

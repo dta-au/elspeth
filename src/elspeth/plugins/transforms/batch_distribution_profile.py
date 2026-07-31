@@ -108,10 +108,33 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ab7f9cf9f4524cd0"
+    source_file_hash: str | None = "sha256:7c94c90a777de0b3"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
-    capability_tags: tuple[str, ...] = ("narrative-summary",)
+    usage_when_to_use: str = (
+        "Use for numeric descriptive statistics and optional group profiles within each window. When configured, "
+        "group_by partitions one flushed batch and never accumulates a group across windows."
+    )
+    usage_when_not_to_use: str = (
+        "Not for categorical frequency counts or durable population profiles; use batch_top_k for scalar "
+        "frequencies and persist window outputs for longitudinal analysis."
+    )
+    example_use: str = """aggregations:
+  - name: latency_profile
+    plugin: batch_distribution_profile
+    input: scored_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      value_field: latency_ms
+      group_by: variant
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "distribution", "narrative-summary")
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
