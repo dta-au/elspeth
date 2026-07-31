@@ -1643,6 +1643,73 @@ class TestDataverseSourceLoadFetchXML:
             assert auth_value.startswith("<fingerprint:")
         assert audit_call["error"]["reason"] == "ssrf_rejected"
 
+    @pytest.mark.parametrize(
+        ("guard", "expected_reason", "expected_success_calls"),
+        [
+            ("odata_empty_guard", "empty_page_guard", 4),
+            ("fetchxml_missing_morerecords", "protocol_violation", 2),
+            ("fetchxml_missing_cookie", "protocol_violation", 2),
+        ],
+    )
+    def test_post_response_pagination_guard_audits_causal_page_context(
+        self,
+        guard: str,
+        expected_reason: str,
+        expected_success_calls: int,
+    ) -> None:
+        metadata_body = {"value": [{"LogicalName": "contact", "EntitySetName": "contacts"}]}
+        if guard == "odata_empty_guard":
+            config = _base_config()
+            data_bodies = [
+                {"value": [], "@odata.nextLink": f"{VALID_ENV_URL}/api/data/v9.2/contacts?page=2"},
+                {"value": [], "@odata.nextLink": f"{VALID_ENV_URL}/api/data/v9.2/contacts?page=3"},
+                {"value": [], "@odata.nextLink": f"{VALID_ENV_URL}/api/data/v9.2/contacts?page=4"},
+            ]
+        elif guard == "fetchxml_missing_morerecords":
+            config = _fetchxml_config()
+            data_bodies = [{"value": []}]
+        else:
+            config = _fetchxml_config()
+            data_bodies = [{"value": [], "@Microsoft.Dynamics.CRM.morerecords": True}]
+
+        response_bodies = iter([metadata_body, *data_bodies])
+
+        def handle_request(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=200, json=next(response_bodies))
+
+        source = _make_source(config)
+        client = DataverseClient(
+            environment_url=VALID_ENV_URL,
+            credential=_CredentialFake(),  # type: ignore[arg-type]  # test fake
+        )
+        client._client.close()
+        client._client = httpx.Client(transport=httpx.MockTransport(handle_request), timeout=30.0)
+        source._client = client
+        ctx = _mock_source_context()
+
+        try:
+            with (
+                patch(
+                    "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
+                    side_effect=lambda url, **_kwargs: _make_ssrf_safe(url),
+                ),
+                pytest.raises(DataverseClientError),
+            ):
+                next(source.load(ctx))
+        finally:
+            client.close()
+
+        assert ctx.record_call.call_count == expected_success_calls + 1
+        causal_page_audit = ctx.record_call.call_args_list[-2].kwargs
+        error_audit = ctx.record_call.call_args_list[-1].kwargs
+        assert causal_page_audit["status"] == CallStatus.SUCCESS
+        assert causal_page_audit["response_data"]["row_count"] == 0
+        assert error_audit["status"] == CallStatus.ERROR
+        assert error_audit["request_data"] == causal_page_audit["request_data"]
+        assert error_audit["error"]["reason"] == expected_reason
+        assert error_audit["error"]["status_code"] == causal_page_audit["response_data"]["status_code"]
+        assert error_audit["latency_ms"] == causal_page_audit["latency_ms"]
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Schema contract locking tests

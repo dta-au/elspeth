@@ -748,14 +748,24 @@ class TestEmptyPageGuard:
         transport.add_response(_make_json_response({"value": [], "@odata.nextLink": next2}))
         transport.add_response(_make_json_response({"value": [], "@odata.nextLink": next3}))
 
-        with (
-            patch(
-                "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
-                side_effect=lambda url, **kw: _make_ssrf_safe(url),
-            ),
-            pytest.raises(DataverseClientError, match="3 consecutive empty pages"),
+        with patch(
+            "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
+            side_effect=lambda url, **kw: _make_ssrf_safe(url),
         ):
-            list(client.paginate_odata(f"{ENV_URL}/api/data/v9.2/accounts"))
+            pages = client.paginate_odata(f"{ENV_URL}/api/data/v9.2/accounts")
+            current_page = next(pages)
+            current_page = next(pages)
+            current_page = next(pages)
+            with pytest.raises(DataverseClientError, match="3 consecutive empty pages") as exc_info:
+                next(pages)
+
+        error = exc_info.value
+        assert not current_page.rows
+        assert error.error_category == "empty_page_guard"
+        assert error.request_url == current_page.request_url
+        assert error.request_headers == current_page.request_headers
+        assert error.status_code == current_page.status_code
+        assert error.latency_ms == current_page.latency_ms
 
     def test_non_empty_page_resets_counter(self, client: DataverseClient, transport: MockTransport) -> None:
         """A non-empty page resets the consecutive empty counter."""
@@ -905,7 +915,7 @@ class TestPaginateFetchxml:
         transport.add_response(
             _make_json_response(
                 {
-                    "value": [{"id": 1}],
+                    "value": [],
                     # No @Microsoft.Dynamics.CRM.morerecords — anomaly
                     "@Microsoft.Dynamics.CRM.fetchxmlpagingcookie": urllib.parse.quote("<cookie/>"),
                 }
@@ -913,8 +923,46 @@ class TestPaginateFetchxml:
         )
 
         fetch_xml = '<fetch count="50"><entity name="account"/></fetch>'
-        with pytest.raises(DataverseClientError, match=r"missing.*morerecords"):
-            list(client.paginate_fetchxml("accounts", fetch_xml))
+        pages = client.paginate_fetchxml("accounts", fetch_xml)
+        current_page = next(pages)
+        with pytest.raises(DataverseClientError, match=r"missing.*morerecords") as exc_info:
+            next(pages)
+
+        error = exc_info.value
+        assert not current_page.rows
+        assert error.error_category == "protocol_violation"
+        assert error.request_url == current_page.request_url
+        assert error.request_headers == current_page.request_headers
+        assert error.status_code == current_page.status_code
+        assert error.latency_ms == current_page.latency_ms
+
+    def test_more_records_without_paging_cookie_preserves_page_context(
+        self,
+        client: DataverseClient,
+        transport: MockTransport,
+    ) -> None:
+        transport.add_response(
+            _make_json_response(
+                {
+                    "value": [],
+                    "@Microsoft.Dynamics.CRM.morerecords": True,
+                }
+            )
+        )
+
+        fetch_xml = '<fetch count="50"><entity name="account"/></fetch>'
+        pages = client.paginate_fetchxml("accounts", fetch_xml)
+        current_page = next(pages)
+        with pytest.raises(DataverseClientError, match="no paging cookie") as exc_info:
+            next(pages)
+
+        error = exc_info.value
+        assert not current_page.rows
+        assert error.error_category == "protocol_violation"
+        assert error.request_url == current_page.request_url
+        assert error.request_headers == current_page.request_headers
+        assert error.status_code == current_page.status_code
+        assert error.latency_ms == current_page.latency_ms
 
 
 # ---------------------------------------------------------------------------

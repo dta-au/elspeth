@@ -797,6 +797,10 @@ class DataverseClient:
                         f"edge condition producing nextLink URLs with no data.",
                         retryable=False,
                         error_category="empty_page_guard",
+                        status_code=page.status_code,
+                        latency_ms=page.latency_ms,
+                        request_url=page.request_url,
+                        request_headers=page.request_headers,
                     )
             else:
                 consecutive_empty = 0
@@ -866,6 +870,10 @@ class DataverseClient:
                     "but FetchXML pagination requires this field.",
                     retryable=False,
                     error_category="protocol_violation",
+                    status_code=page.status_code,
+                    latency_ms=page.latency_ms,
+                    request_url=page.request_url,
+                    request_headers=page.request_headers,
                 )
             if not page.more_records:
                 break
@@ -880,6 +888,10 @@ class DataverseClient:
                     "Cannot retrieve remaining pages — refusing to silently truncate results.",
                     retryable=False,
                     error_category="protocol_violation",
+                    status_code=page.status_code,
+                    latency_ms=page.latency_ms,
+                    request_url=page.request_url,
+                    request_headers=page.request_headers,
                 )
 
             # Inject paging cookie into the existing ET root.
