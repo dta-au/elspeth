@@ -2454,10 +2454,12 @@ export function ChatPanel({
         ) : (
           <span aria-hidden="true" />
         )}
-        <div
-          className="chat-panel-header-actions"
-          style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
-        >
+        {/* Layout lives in chat.css, NOT in a style prop (elspeth-0b70269ccc).
+            As an inline style this row was `inline-flex` with no wrap and no
+            min-width, which no stylesheet rule and therefore no breakpoint
+            could override — the row stayed one line at every width and the
+            ModeSwitchButton clipped to "Sw" at 390px. */}
+        <div className="chat-panel-header-actions">
           {/* Persistent composer-model identity (elspeth-e9f7678de8): an
               auditability product should name the model doing the composing
               in the authoring chrome, not only in run records. */}
