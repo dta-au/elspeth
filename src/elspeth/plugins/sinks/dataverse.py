@@ -71,12 +71,26 @@ from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribu
 # Unprocessable-Entity response is about this row's payload.
 _DIVERTABLE_STATUS_CODES: frozenset[int] = frozenset({400, 404, 409, 412, 422})
 _ROW_ATTRIBUTABLE_ERROR_CATEGORIES: frozenset[str] = frozenset({"row_data_error"})
+_DATAVERSE_ENTITY_SET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _is_row_attributable_write_error(error: DataverseClientError) -> bool:
     return (
         not error.retryable and error.status_code in _DIVERTABLE_STATUS_CODES and error.error_category in _ROW_ATTRIBUTABLE_ERROR_CATEGORIES
     )
+
+
+def _validate_dataverse_entity_set_name(value: object, *, field_name: str) -> str:
+    """Require a case-preserving Dataverse EntitySetName with no URI delimiters."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string containing a valid ASCII identifier")
+    reject_operator_required_placeholder_value(value, field_name=field_name)
+    if _DATAVERSE_ENTITY_SET_NAME_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"{field_name} must be an ASCII identifier beginning with a letter or underscore "
+            "and containing only letters, digits, and underscores"
+        )
+    return value
 
 
 # An @odata.bind value sits in the UNQUOTED entity-key position of the bind
@@ -103,9 +117,7 @@ class LookupConfig(BaseModel):
     @field_validator("target_entity")
     @classmethod
     def validate_target_entity_not_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("target_entity cannot be empty")
-        return reject_operator_required_placeholder_value(v.strip(), field_name="target_entity")
+        return _validate_dataverse_entity_set_name(v, field_name="target_entity")
 
     @field_validator("target_field")
     @classmethod
@@ -186,9 +198,7 @@ class DataverseSinkConfig(DataPluginConfig):
     @field_validator("entity")
     @classmethod
     def validate_entity_not_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("entity cannot be empty")
-        return reject_operator_required_placeholder_value(v.strip(), field_name="entity")
+        return _validate_dataverse_entity_set_name(v, field_name="entity")
 
     @field_validator("alternate_key")
     @classmethod
@@ -273,7 +283,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8008b19c3d7e5aeb"
+    source_file_hash: str | None = "sha256:034b82b4ebab232d"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)

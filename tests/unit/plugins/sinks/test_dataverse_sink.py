@@ -59,6 +59,27 @@ _BASE_CONFIG: dict[str, Any] = {
     "schema": DYNAMIC_SCHEMA,
 }
 
+INVALID_ENTITY_SET_NAMES = (
+    "accounts/systemusers",
+    "accounts?query=true",
+    "accounts#fragment",
+    "accounts(record)",
+    "accounts systemusers",
+    "accounts\x00systemusers",
+    " accounts",
+    "accounts ",
+)
+INVALID_ENTITY_SET_NAME_IDS = (
+    "path",
+    "query",
+    "fragment",
+    "parenthesis",
+    "space",
+    "control",
+    "leading-space",
+    "trailing-space",
+)
+
 
 class FakeDataverseRowSchema(PluginSchema):
     """Schema factory return value for tests that do not exercise schema coercion."""
@@ -167,17 +188,23 @@ class TestDataverseSinkConfig:
         with pytest.raises(PluginConfigError, match="entity"):
             DataverseSinkConfig.from_dict(_config(entity="  "))
 
-    def test_entity_stripped(self) -> None:
-        cfg = DataverseSinkConfig.from_dict(_config(entity="  contacts  "))
-        assert cfg.entity == "contacts"
+    @pytest.mark.parametrize("entity", INVALID_ENTITY_SET_NAMES, ids=INVALID_ENTITY_SET_NAME_IDS)
+    def test_entity_rejects_values_outside_entity_set_name_grammar(self, entity: str) -> None:
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            DataverseSinkConfig.from_dict(_config(entity=entity))
 
     @pytest.mark.parametrize("entity", ["<OPERATOR_REQUIRED>", "operator required", "operator_required"])
     def test_entity_placeholder_rejected(self, entity: str) -> None:
         with pytest.raises(PluginConfigError, match="placeholder"):
             DataverseSinkConfig.from_dict(_config(entity=entity))
 
-    @pytest.mark.parametrize("entity", ["todo", "unknown", "unset", "required", "<literal>"])
+    @pytest.mark.parametrize("entity", ["todo", "unknown", "unset", "required"])
     def test_plain_placeholder_words_can_be_entity_names(self, entity: str) -> None:
+        cfg = DataverseSinkConfig.from_dict(_config(entity=entity))
+        assert cfg.entity == entity
+
+    @pytest.mark.parametrize("entity", ["Contacts", "Custom_EntitySet2", "_PrivateSet"])
+    def test_entity_set_name_preserves_valid_custom_case_and_spelling(self, entity: str) -> None:
         cfg = DataverseSinkConfig.from_dict(_config(entity=entity))
         assert cfg.entity == entity
 
@@ -251,7 +278,7 @@ class TestDataverseSinkConfig:
                 )
             )
 
-    @pytest.mark.parametrize("target_entity", ["todo", "unknown", "unset", "required", "<literal>"])
+    @pytest.mark.parametrize("target_entity", ["todo", "unknown", "unset", "required"])
     def test_plain_placeholder_words_can_be_lookup_target_entities(self, target_entity: str) -> None:
         cfg = DataverseSinkConfig.from_dict(
             _config(
@@ -292,12 +319,27 @@ class TestDataverseSinkConfig:
                 )
             )
 
-    def test_lookup_target_entity_stripped(self) -> None:
+    @pytest.mark.parametrize("target_entity", INVALID_ENTITY_SET_NAMES, ids=INVALID_ENTITY_SET_NAME_IDS)
+    def test_lookup_target_entity_rejects_values_outside_entity_set_name_grammar(self, target_entity: str) -> None:
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            DataverseSinkConfig.from_dict(
+                _config(
+                    lookups={
+                        "account_id": {
+                            "target_entity": target_entity,
+                            "target_field": "parentcustomerid",
+                        }
+                    }
+                )
+            )
+
+    @pytest.mark.parametrize("target_entity", ["Accounts", "Custom_EntitySet2", "_PrivateSet"])
+    def test_lookup_entity_set_name_preserves_valid_custom_case_and_spelling(self, target_entity: str) -> None:
         cfg = DataverseSinkConfig.from_dict(
             _config(
                 lookups={
                     "account_id": {
-                        "target_entity": "  accounts  ",
+                        "target_entity": target_entity,
                         "target_field": "parentcustomerid",
                     }
                 }
@@ -305,7 +347,7 @@ class TestDataverseSinkConfig:
         )
 
         assert cfg.lookups is not None
-        assert cfg.lookups["account_id"].target_entity == "accounts"
+        assert cfg.lookups["account_id"].target_entity == target_entity
 
     def test_lookup_target_field_required(self) -> None:
         with pytest.raises(PluginConfigError, match="target_field"):
@@ -515,6 +557,41 @@ class TestFieldMappingAndLookups:
         assert payload["parentcustomerid@odata.bind"] == "/accounts(some-guid-123)"
         # The mapped column name should NOT appear -- it's replaced by the bind key
         assert "ignored_column" not in payload
+
+    @pytest.mark.parametrize("target_entity", INVALID_ENTITY_SET_NAMES, ids=INVALID_ENTITY_SET_NAME_IDS)
+    def test_invalid_lookup_entity_set_cannot_reach_payload_generation(self, target_entity: str) -> None:
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            sink = self._make_sink(
+                field_mapping={
+                    "email": "emailaddress1",
+                    "account_id": "ignored_column",
+                },
+                lookups={
+                    "account_id": {
+                        "target_entity": target_entity,
+                        "target_field": "parentcustomerid",
+                    }
+                },
+            )
+            sink._map_row({"email": "a@b.com", "account_id": "some-guid-123"})
+
+    def test_lookup_bind_preserves_valid_custom_entity_set_case(self) -> None:
+        sink = self._make_sink(
+            field_mapping={
+                "email": "emailaddress1",
+                "account_id": "ignored_column",
+            },
+            lookups={
+                "account_id": {
+                    "target_entity": "Custom_Accounts2",
+                    "target_field": "parentcustomerid",
+                }
+            },
+        )
+
+        payload = sink._map_row({"email": "a@b.com", "account_id": "some-guid-123"})
+
+        assert payload["parentcustomerid@odata.bind"] == "/Custom_Accounts2(some-guid-123)"
 
     def test_lookup_bind_value_rejects_odata_injection(self) -> None:
         """Lookup values with OData/URI structural chars are rejected (elspeth-e7d31117df).

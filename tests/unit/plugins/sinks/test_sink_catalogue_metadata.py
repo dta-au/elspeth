@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from elspeth.contracts.sink_effects import ResolvedSinkEffectMode, SinkEffectExecutionPurpose
 from elspeth.core.config import load_bounded_pipeline_yaml
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from tests.fixtures.catalog_reference import (
     BuiltinReference,
@@ -97,6 +100,17 @@ def _assert_plugin_specific_example_contract(reference: BuiltinReference) -> Non
         assert "EntitySetName" in config_schema["properties"]["entity"]["description"]
         lookup_schema = config_schema["$defs"]["LookupConfig"]
         assert "EntitySetName" in lookup_schema["properties"]["target_entity"]["description"]
+
+        unsafe_options = deepcopy(dict(options))
+        unsafe_options["field_mapping"]["account_id"] = "ignored_column"
+        unsafe_options["lookups"] = {
+            "account_id": {
+                "target_entity": "accounts(record)/systemusers",
+                "target_field": "parentcustomerid",
+            }
+        }
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            reference.plugin_cls.config_model.from_dict(unsafe_options, plugin_name="dataverse")
     elif name == "json":
         assert options["format"] == "jsonl"
         assert options["mode"] == "write"
@@ -114,16 +128,22 @@ def _assert_plugin_specific_example_contract(reference: BuiltinReference) -> Non
 
 
 def _assert_constructor_is_side_effect_free(reference: BuiltinReference, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    if reference.plugin_cls.name == "database":
-        # The catalogue preserves the database URL as a deferred secret reference;
-        # construction belongs after normal runtime secret resolution.
-        return
     monkeypatch.chdir(tmp_path)
+    options = dict(_options(reference))
+    if reference.plugin_cls.name == "database":
+        assert options["url"] == {"secret_ref": "PROVISIONED_SQLITE_URL"}
+        options["url"] = f"sqlite:///{tmp_path / 'catalogue.sqlite3'}"
     before = tuple(tmp_path.rglob("*"))
     with plugin_preflight_mode(True):
-        sink = reference.plugin_cls(dict(_options(reference)))
+        sink = reference.plugin_cls(options)
     try:
         assert tuple(tmp_path.rglob("*")) == before
+        if reference.plugin_cls.name == "database":
+            mode = reference.plugin_cls._resolve_sink_effect_mode(
+                options,
+                purpose=SinkEffectExecutionPurpose.FRESH,
+            )
+            assert mode == ResolvedSinkEffectMode("append")
     finally:
         sink.close()
     assert tuple(tmp_path.rglob("*")) == before
