@@ -23,7 +23,12 @@ own test suite.
    `# TRANSLATION POINT` and every `NotImplementedError`:
    - `descriptor.py` — your adapter's name, version, and declared
      `Capability` set (only what your upstream genuinely supports).
-   - `config.py` — any deployment-specific configuration options.
+   - `config.py` — any deployment-specific configuration options, **and**
+     `validate_model_target`, which `/readyz` calls once per configured
+     model mapping. This one is not optional in practice: leave it
+     unimplemented and a deployment mapped to a target your adapter cannot
+     read passes readiness and then fails every completion. The conformance
+     kit checks for it, so a derived image without it does not qualify.
    - `request.py` — `CanonicalRequest` → your upstream's real invoke shape.
    - `response.py` — your upstream's real success body → `CanonicalResponse`.
    - `errors.py` — your upstream's real failure body →

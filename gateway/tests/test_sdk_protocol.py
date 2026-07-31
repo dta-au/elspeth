@@ -5,6 +5,7 @@ from elspeth_llm_gateway.sdk.protocol import (
     AdapterProtocol,
     ErrorClassification,
     InvokePlan,
+    ModelTargetValidator,
     UpstreamFailure,
 )
 from elspeth_llm_gateway.sdk.types import CanonicalRequest, CanonicalResponse, Capability
@@ -280,3 +281,51 @@ def test_adapter_protocol_rejects_non_conforming_object():
         pass
 
     assert not isinstance(NotAnAdapter(), AdapterProtocol)
+
+
+# --- ModelTargetValidator -----------------------------------------------------
+
+
+def test_adapter_protocol_membership_is_unchanged_by_model_target_validation():
+    """The compatibility property that let ``validate_model_target`` be added
+    without an ``ADAPTER_API_MAJOR`` bump.
+
+    ``AdapterProtocol`` is ``runtime_checkable``, so putting the new method in
+    its body would have changed what ``isinstance(adapter, AdapterProtocol)``
+    returns for an already-shipped agency adapter -- a silent break at the
+    same adapter API major. Keeping the method in a separate optional
+    protocol means an adapter that predates it is still, exactly as before, an
+    ``AdapterProtocol``.
+    """
+
+    class AdapterWithoutTargetValidation:
+        def descriptor(self) -> AdapterDescriptor:
+            return AdapterDescriptor(name="legacy", version="1.0.0", adapter_api_major=1, capabilities=frozenset({Capability.TEXT}))
+
+        def validate_configuration(self, options: dict) -> None:
+            return None
+
+        def build_invoke(self, request: CanonicalRequest) -> InvokePlan:
+            return InvokePlan(path="v1/chat", headers={}, body={})
+
+        def parse_success(self, body: dict) -> CanonicalResponse:
+            raise NotImplementedError
+
+        def classify_error(self, failure: UpstreamFailure) -> ErrorClassification:
+            return ErrorClassification(code="upstream_timeout", retryable=True)
+
+    assert isinstance(AdapterWithoutTargetValidation(), AdapterProtocol)
+    assert not hasattr(AdapterWithoutTargetValidation(), "validate_model_target")
+
+
+def test_model_target_validator_is_not_runtime_checkable():
+    """Nothing guards on it structurally -- core probes for the method by
+    name instead (``getattr``/``callable``), per this repo's rule that a
+    ``runtime_checkable`` Protocol is not a check worth having unless a guard
+    actually depends on it."""
+
+    class Anything:
+        pass
+
+    with pytest.raises(TypeError):
+        isinstance(Anything(), ModelTargetValidator)

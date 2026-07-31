@@ -11,6 +11,7 @@ from elspeth_llm_gateway.sdk.protocol import (
     AdapterProtocol,
     ErrorClassification,
     InvokePlan,
+    ModelTargetValidator,
     UpstreamFailure,
 )
 from elspeth_llm_gateway.sdk.types import (
@@ -39,6 +40,7 @@ __all__ = [
     "ErrorClassification",
     "FinishReason",
     "InvokePlan",
+    "ModelTargetValidator",
     "ResponseFormatSpec",
     "UpstreamFailure",
 ]

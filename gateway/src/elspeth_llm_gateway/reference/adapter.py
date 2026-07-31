@@ -37,6 +37,14 @@ Request body POSTed to ``v1/invoke``::
         "format": {"kind": "object"} | {"kind": "schema", "schema": {...}, "strict": <bool>?}?
     }
 
+The configured model target — one value from
+``ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS``, opaque to the gateway core — is, for
+this fictional upstream, exactly ``{"target": "<non-empty string>"}``.
+``validate_model_target`` below is what tells ``/readyz`` whether each
+configured target actually has that shape, so a deployment mapped to
+something this adapter cannot read is refused at admission instead of
+failing every completion.
+
 A conversation entry carries ``text`` when the canonical message has
 content, ``operations`` when it is an assistant message requesting tool
 calls, and ``operation_ref`` when it is a tool-result message answering a
@@ -167,6 +175,33 @@ class ReferenceV1InvokeAdapter:
         # This reference adapter accepts none.
         if options:
             raise ValueError(f"reference_v1_invoke accepts no configuration options, got: {sorted(options)}")
+
+    def validate_model_target(self, target: dict) -> None:
+        """Implements ``sdk.protocol.ModelTargetValidator``.
+
+        Purely computational, as that protocol requires: it reads the target
+        and nothing else. Every rule here mirrors exactly what
+        ``build_invoke`` below goes on to read out of ``request.model_target``
+        (``target["target"]``, used as the fictional upstream's generation
+        target) -- which is the whole point. A rule that drifts from
+        ``build_invoke`` turns readiness back into a check that passes while
+        completions fail.
+
+        Keys this adapter does not read are deliberately *not* rejected
+        (``{"target": "backend-a", "provider": "agency"}`` is a legitimate
+        mapping value here): an operator may carry deployment metadata
+        alongside the target, and ``build_invoke`` ignores it. Rejecting it
+        would refuse admission to a deployment that works -- readiness must
+        only fail what a completion would fail.
+        """
+        # TRANSLATION POINT: a real agency's model-target shape will differ
+        # from this fictional single-``target``-string shape -- assert
+        # whatever keys your own build_invoke reads, and only those.
+        if "target" not in target:
+            raise ValueError("reference_v1_invoke: model target missing 'target'")
+        value = target["target"]
+        if not isinstance(value, str) or value.strip() == "":
+            raise ValueError("reference_v1_invoke: model target 'target' must be a non-empty string")
 
     def build_invoke(self, request: CanonicalRequest) -> InvokePlan:
         conversation = [_conversation_entry(message) for message in request.messages]

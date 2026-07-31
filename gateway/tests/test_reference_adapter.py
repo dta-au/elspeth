@@ -46,6 +46,72 @@ def test_validate_configuration_rejects_unknown_keys():
         adapter.validate_configuration({"unexpected": "value"})
 
 
+# --- validate_model_target() ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"target": "backend-a"},
+        # Keys this adapter does not read are tolerated: build_invoke ignores
+        # them, so readiness must not refuse a deployment that would work.
+        {"target": "backend-a", "provider": "agency"},
+    ],
+)
+def test_validate_model_target_accepts_usable_targets(target):
+    ReferenceV1InvokeAdapter().validate_model_target(target)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {},
+        {"nottarget": "backend-a"},
+        {"target": None},
+        {"target": ""},
+        {"target": "   "},
+        {"target": 7},
+        {"target": ["backend-a"]},
+    ],
+)
+def test_validate_model_target_rejects_targets_build_invoke_could_not_use(target):
+    with pytest.raises(ValueError):
+        ReferenceV1InvokeAdapter().validate_model_target(target)
+
+
+def _minimal_request(target: dict) -> CanonicalRequest:
+    return CanonicalRequest(
+        model_target=target,
+        model_alias="alias",
+        messages=(CanonicalMessage(role="user", content="hi"),),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+    )
+
+
+@pytest.mark.parametrize("target", [{"target": "backend-a"}, {"target": "backend-a", "provider": "agency"}])
+def test_every_target_validate_model_target_accepts_is_one_build_invoke_can_read(target):
+    """The direction that matters for admission: readiness must not pass a
+    target the request pipeline then chokes on. Anything accepted here has to
+    survive ``build_invoke``, which is the call that raised ``KeyError`` (and
+    so ``internal_error``) on a mapping readiness used to wave through."""
+    adapter = ReferenceV1InvokeAdapter()
+    adapter.validate_model_target(target)
+    plan = adapter.build_invoke(_minimal_request(target))
+    assert plan.body["generation"]["target"] == target["target"]
+
+
+def test_missing_target_key_is_rejected_at_validation_and_breaks_build_invoke():
+    """The exact reproduction from the readiness gap: a mapping value with no
+    ``target`` key crashes ``build_invoke``, so it must not pass validation."""
+    adapter = ReferenceV1InvokeAdapter()
+    with pytest.raises(ValueError):
+        adapter.validate_model_target({"nottarget": "backend-a"})
+    with pytest.raises(KeyError):
+        adapter.build_invoke(_minimal_request({"nottarget": "backend-a"}))
+
+
 # --- build_invoke(): golden full-request mapping -----------------------------
 
 

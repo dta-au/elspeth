@@ -10,6 +10,7 @@ header and an ``X-Request-ID``; every error response is the same
 ``GatewayError`` envelope regardless of which layer produced it.
 """
 
+import copy
 import hashlib
 import importlib.metadata
 import inspect
@@ -45,6 +46,7 @@ REQUEST_ID_HEADER = "X-Request-ID"
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _ADAPTER_ENTRY_POINT_GROUP = "elspeth_llm_gateway.adapters"
 _REFERENCE_ADAPTER_NAME = "reference_v1_invoke"
+_MAX_MODEL_TARGET_ERRORS = 10
 
 logger = logging.getLogger("elspeth_llm_gateway")
 
@@ -196,6 +198,53 @@ def _compute_adapter_fingerprint(adapter: AdapterProtocol) -> str:
         return hashlib.sha256(handle.read()).hexdigest()[:16]
 
 
+def _model_target_validator(adapter: AdapterProtocol) -> Callable[[dict], None] | None:
+    """The adapter's ``validate_model_target``, or ``None`` if it has none.
+
+    Probed by name rather than with ``isinstance`` against
+    ``ModelTargetValidator``: the hook is optional (see that protocol's
+    docstring for why it is not a member of ``AdapterProtocol``), and a
+    structural ``isinstance`` check would be no stronger here anyway — the
+    call below is wrapped in ``try/except Exception`` regardless, exactly as
+    every other call into third-party adapter code is.
+    """
+    candidate = getattr(adapter, "validate_model_target", None)
+    return candidate if callable(candidate) else None
+
+
+def _model_target_errors(validate: Callable[[dict], None], model_mappings: dict[str, dict]) -> list[str]:
+    """Ask the adapter about every configured target; collect safe error codes.
+
+    Two properties this deliberately holds:
+
+    - **Nothing the adapter raises is published.** The exception is swallowed
+      whole; only ``model_target_invalid:<alias>`` is emitted. The alias is
+      operator configuration already published verbatim in the same payload's
+      ``model_aliases``, and has already passed ``config``'s alias charset
+      rule, so it is safe to echo — an adapter's exception message, which may
+      quote the target, is not.
+    - **The list is bounded.** The readiness document is a bounded response
+      by design; a mapping with hundreds of bad aliases must not turn
+      ``errors`` into an unbounded list, so entries past
+      ``_MAX_MODEL_TARGET_ERRORS`` collapse into one ``:truncated`` marker.
+
+    Each target is deep-copied before it is handed over: the adapter is
+    third-party code and must not be able to mutate the live configuration
+    the request pipeline later reads its model targets from.
+    """
+    failed: list[str] = []
+    for alias in sorted(model_mappings):
+        try:
+            validate(copy.deepcopy(model_mappings[alias]))
+        except Exception:
+            failed.append(alias)
+
+    errors = [f"model_target_invalid:{alias}" for alias in failed[:_MAX_MODEL_TARGET_ERRORS]]
+    if len(failed) > _MAX_MODEL_TARGET_ERRORS:
+        errors.append("model_target_invalid:truncated")
+    return errors
+
+
 async def _read_capped_body(request: Request, max_bytes: int) -> bytes:
     """Read the request body, streamed, rejecting anything over ``max_bytes``.
 
@@ -279,6 +328,21 @@ def create_app(
 
     @app.get("/readyz")
     async def readyz() -> JSONResponse:
+        """Static readiness: configuration, adapter, and model mappings.
+
+        Makes no OAuth call and no upstream call -- everything checked here
+        is answerable from process configuration plus purely computational
+        calls into the adapter (``validate_configuration``, ``descriptor``,
+        and, when the adapter implements it, ``validate_model_target`` for
+        every configured target).
+
+        That last check is what makes readiness a real admission gate for
+        model mappings rather than a presence test: the mapping *value* is
+        opaque to the core, so only the adapter can say whether it is one its
+        own ``build_invoke`` can consume. Without it a deployment whose
+        targets the adapter cannot read passed admission and then failed
+        every completion with ``internal_error``.
+        """
         errors: list[str] = []
         capabilities: list[str] = []
         descriptor = None
@@ -300,6 +364,15 @@ def create_app(
         if not config.model_mappings:
             errors.append("empty_model_mappings")
 
+        # An adapter without the (optional) hook is not an error: it was
+        # written against this same adapter API major before the hook
+        # existed. Its targets simply cannot be checked, and the payload says
+        # so via ``validates_model_targets`` -- the conformance kit, not the
+        # runtime, is what makes the hook mandatory for image qualification.
+        validate_target = _model_target_validator(resolved_adapter)
+        if validate_target is not None:
+            errors.extend(_model_target_errors(validate_target, config.model_mappings))
+
         ready = not errors
         payload = {
             "ready": ready,
@@ -309,6 +382,7 @@ def create_app(
                 "version": descriptor.version if descriptor is not None else "unknown",
                 "adapter_api_major": descriptor.adapter_api_major if descriptor is not None else 0,
                 "fingerprint": adapter_fingerprint,
+                "validates_model_targets": validate_target is not None,
             },
             "capabilities": capabilities,
             "model_aliases": sorted(config.model_mappings),

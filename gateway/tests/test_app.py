@@ -370,7 +370,7 @@ async def test_readyz_exact_key_set_and_no_secret_material():
         "oauth_fixed_lifetime",
         "errors",
     }
-    assert set(body["adapter"].keys()) == {"name", "version", "adapter_api_major", "fingerprint"}
+    assert set(body["adapter"].keys()) == {"name", "version", "adapter_api_major", "fingerprint", "validates_model_targets"}
     assert body["ready"] is True
     assert body["errors"] == []
     assert body["adapter"]["name"] == "reference_v1_invoke"
@@ -457,10 +457,159 @@ async def test_readyz_reports_adapter_configuration_invalid():
 async def test_readyz_never_calls_oauth_or_upstream():
     # No routes are mocked at all: if readyz ever called the token endpoint or
     # the upstream origin, respx would raise (no matching mock) rather than
-    # this test's assertions ever running.
+    # this test's assertions ever running. This also covers the model-target
+    # validation pass below: an adapter's validate_model_target must be
+    # purely computational, so adding that call to readyz must not introduce
+    # any network traffic here either.
     async with _client_for(_config()) as client:
         response = await client.get("/readyz")
     assert response.status_code == 200
+
+
+# --- readyz: model-target validation ------------------------------------------------
+
+
+_UNUSABLE_MAPPINGS = '{"gpt-4o": {"nottarget": "backend-a"}}'
+
+
+@respx.mock
+async def test_readyz_reports_model_target_the_adapter_cannot_use():
+    """The gap this closes: a mapping whose value the adapter cannot consume
+    used to leave readyz reporting ``ready: true`` while every subsequent
+    completion failed with ``internal_error``."""
+    config = _config(ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS=_UNUSABLE_MAPPINGS)
+    async with _client_for(config) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["ready"] is False
+    assert "model_target_invalid:gpt-4o" in body["errors"]
+
+
+@respx.mock
+async def test_readyz_stays_ready_for_a_usable_model_target():
+    async with _client_for(_config()) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    assert body["errors"] == []
+    assert body["adapter"]["validates_model_targets"] is True
+
+
+@respx.mock
+async def test_unusable_model_target_is_caught_at_readiness_not_at_first_completion():
+    """Both halves of the gap in one test: the deployment that would fail
+    every completion is now refused admission by readiness. No respx routes
+    are registered -- the completion fails inside ``build_invoke`` before any
+    token or upstream call, so respx raising would itself be a regression."""
+    config = _config(ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS=_UNUSABLE_MAPPINGS)
+    async with _client_for(config) as client:
+        readiness = await client.get("/readyz")
+        completion = await client.post("/v1/chat/completions", json=CHAT_BODY, headers=_headers())
+
+    # The admission gate refuses it...
+    assert readiness.status_code == 503
+    assert "model_target_invalid:gpt-4o" in readiness.json()["errors"]
+    # ...for exactly the failure a request would otherwise have hit first.
+    assert completion.status_code == 500
+    assert completion.json()["error"]["code"] == "internal_error"
+
+
+class _NoTargetValidationAdapter:
+    """An adapter written against adapter API major 1 before
+    ``validate_model_target`` existed: it does not implement the optional
+    method at all."""
+
+    def descriptor(self) -> AdapterDescriptor:
+        return AdapterDescriptor(name="legacy_adapter", version="0.0.1", adapter_api_major=1, capabilities=frozenset({Capability.TEXT}))
+
+    def validate_configuration(self, options: dict) -> None:
+        return None
+
+    def build_invoke(self, request):
+        raise NotImplementedError
+
+    def parse_success(self, body):
+        raise NotImplementedError
+
+    def classify_error(self, failure):
+        raise NotImplementedError
+
+
+@respx.mock
+async def test_readyz_stays_ready_for_an_adapter_that_does_not_implement_target_validation():
+    """Additive compatibility: an adapter package built against this SDK
+    before ``validate_model_target`` existed must keep passing readiness at
+    the same adapter API major. Its inability to be checked is *reported*
+    (``validates_model_targets: false``), never treated as an error --
+    the conformance kit is what makes the method mandatory for a derived
+    image's qualification."""
+    config = _config(ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS=_UNUSABLE_MAPPINGS)
+    async with _client_for(config, adapter=_NoTargetValidationAdapter()) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    assert body["errors"] == []
+    assert body["adapter"]["validates_model_targets"] is False
+
+
+@respx.mock
+async def test_readyz_never_echoes_a_target_validation_exception_message():
+    """``validate_model_target`` is third-party code: whatever it raises may
+    quote the target it was handed. Only the fixed error code and the (already
+    published) alias may appear in the readiness payload."""
+    marker = "TARGET-EXCEPTION-MARKER-4b71ce"
+
+    class _LeakyAdapter(_NoTargetValidationAdapter):
+        def validate_model_target(self, target: dict) -> None:
+            raise ValueError(marker)
+
+    config = _config(ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS=_UNUSABLE_MAPPINGS)
+    async with _client_for(config, adapter=_LeakyAdapter()) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+    assert "model_target_invalid:gpt-4o" in response.json()["errors"]
+    assert marker not in response.text
+
+
+@respx.mock
+async def test_readyz_bounds_the_number_of_model_target_errors():
+    """The readiness document is bounded by design: a mapping with many bad
+    aliases must not turn ``errors`` into an unbounded list."""
+    mappings = json.dumps({f"alias-{index:02d}": {"nottarget": "x"} for index in range(30)})
+    config = _config(ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS=mappings)
+    async with _client_for(config) as client:
+        response = await client.get("/readyz")
+
+    errors = response.json()["errors"]
+    assert response.status_code == 503
+    assert len(errors) == 11
+    assert errors[:10] == [f"model_target_invalid:alias-{index:02d}" for index in range(10)]
+    assert errors[10] == "model_target_invalid:truncated"
+
+
+@respx.mock
+async def test_readyz_hands_the_adapter_a_copy_of_the_model_target():
+    """An adapter must not be able to mutate the live operator configuration
+    the request pipeline later reads from."""
+
+    class _MutatingAdapter(_NoTargetValidationAdapter):
+        def validate_model_target(self, target: dict) -> None:
+            target["target"] = "hijacked"
+            target.setdefault("nested", {})["injected"] = True
+
+    config = _config()
+    async with _client_for(config, adapter=_MutatingAdapter()) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 200
+    assert config.model_mappings == {"gpt-4o": {"target": "backend-a"}}
 
 
 # --- unhandled exception -----------------------------------------------------------

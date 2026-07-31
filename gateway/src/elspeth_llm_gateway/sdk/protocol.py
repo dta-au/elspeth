@@ -12,6 +12,16 @@ Host, Cookie, X-Forwarded-For) are rejected case-insensitively.
 not import anything from ``elspeth_llm_gateway.core`` so that the SDK ships
 independently to adapter authors. ``core`` is responsible for asserting, at
 its own import time, that this set is a subset of its own error-code enum.
+
+``ModelTargetValidator`` is a deliberately *separate*, optional protocol
+rather than a sixth member of ``AdapterProtocol``. ``AdapterProtocol`` is
+``runtime_checkable``, so adding a member to its body would change what
+``isinstance(adapter, AdapterProtocol)`` returns for an already-shipped
+agency adapter — a silent break of the adapter API at the same
+``ADAPTER_API_MAJOR``. Keeping it separate makes model-target validation
+purely additive: existing adapters stay conformant and keep passing
+readiness, while the conformance kit requires the method of any adapter
+seeking image qualification.
 """
 
 import re
@@ -151,3 +161,36 @@ class AdapterProtocol(Protocol):
     def parse_success(self, body: dict) -> CanonicalResponse: ...
 
     def classify_error(self, failure: UpstreamFailure) -> ErrorClassification: ...
+
+
+class ModelTargetValidator(Protocol):
+    """Optional adapter extension: "can I actually use this model target?".
+
+    A model mapping's value (``model_target``) is opaque to the gateway core
+    — only the adapter knows what shape its own ``build_invoke`` will read out
+    of it. Without this hook the core can only check that mappings *exist*,
+    so a deployment configured with a target the adapter cannot consume passes
+    readiness and then fails every completion. An adapter that implements
+    this method gets each configured target handed to it once, at readiness,
+    before the deployment is admitted.
+
+    Contract:
+
+    - ``target`` is a deep copy of one configured mapping value; mutating it
+      has no effect on the live configuration.
+    - Return ``None`` if the target is usable. Raise **any** exception if it
+      is not — the core catches it and records a fixed readiness error code.
+      The exception's message is never rendered into the readiness payload
+      or any log line, so it may quote the target freely for local debugging;
+      it will not be published.
+    - The call must be purely computational: no I/O, no filesystem or network
+      access, no credential or token lookup. ``/readyz`` makes no OAuth call
+      and no upstream call, and this hook must not be what changes that.
+
+    Not part of ``AdapterProtocol`` on purpose (see the module docstring):
+    it is probed for by name, so omitting it is compatible, not fatal. The
+    conformance kit nonetheless requires it — a derived image whose adapter
+    cannot validate its own targets does not qualify.
+    """
+
+    def validate_model_target(self, target: dict) -> None: ...

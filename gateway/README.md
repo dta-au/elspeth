@@ -163,6 +163,38 @@ gateway:
 No stage requires ELSPETH maintainers to receive your agency's live
 credentials or proprietary payloads.
 
+### The adapter contract
+
+Five methods are required — `descriptor`, `validate_configuration`,
+`build_invoke`, `parse_success`, `classify_error` — and are what
+`elspeth_llm_gateway.sdk.protocol.AdapterProtocol` declares.
+
+A sixth, `validate_model_target(target: dict) -> None`, lives in a separate
+optional protocol (`ModelTargetValidator`) and is what `/readyz` calls once
+per configured `ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS` value. Implement it.
+The mapping *value* is opaque to the gateway core — only your adapter knows
+what shape its own `build_invoke` reads out of it — so without this hook a
+deployment mapped to a target your adapter cannot consume passes readiness
+and then fails every completion with `internal_error`. Assert exactly the
+keys `build_invoke` reads and no more: readiness must only refuse what a
+completion would actually have failed on. The call must be purely
+computational (no I/O, no network, no credential lookup — `/readyz` makes no
+OAuth call and no upstream call). Raise any exception to reject a target;
+your exception message is never published, only the fixed readiness code
+`model_target_invalid:<alias>`.
+
+Why optional in the protocol but mandatory in practice: `AdapterProtocol` is
+`runtime_checkable`, so adding a sixth member to it would change what
+`isinstance(adapter, AdapterProtocol)` returns for an already-shipped adapter
+package — a silent break of the adapter API at the same `ADAPTER_API_MAJOR`.
+Keeping it separate makes the addition purely additive: **no
+`ADAPTER_API_MAJOR` bump, and an existing adapter keeps passing readiness**
+(its `/readyz` payload simply reports
+`adapter.validates_model_targets: false`). The conformance kit is where the
+method becomes mandatory — `conformance/test_identity.py` asserts
+`validates_model_targets` is true, so a derived image whose adapter cannot
+validate its own targets does not qualify.
+
 ## The container image
 
 `gateway/Dockerfile` is a multi-stage build:

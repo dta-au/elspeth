@@ -114,6 +114,9 @@ class _TextOnlyAdapter:
     def validate_configuration(self, options: dict) -> None:
         return self._delegate.validate_configuration(options)
 
+    def validate_model_target(self, target: dict) -> None:
+        return self._delegate.validate_model_target(target)
+
     def build_invoke(self, request):
         return self._delegate.build_invoke(request)
 

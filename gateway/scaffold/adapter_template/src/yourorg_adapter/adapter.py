@@ -7,7 +7,8 @@ class is what ``pyproject.toml``'s
 gateway at, keyed by ``descriptor.ADAPTER_NAME`` -- and what
 ``ELSPETH_LLM_GATEWAY_ADAPTER`` is set to at deploy time. Nothing in this
 file itself is a translation point; it only wires the five modules above
-together to satisfy ``elspeth_llm_gateway.sdk.protocol.AdapterProtocol``.
+together to satisfy ``elspeth_llm_gateway.sdk.protocol.AdapterProtocol``
+plus the optional ``ModelTargetValidator`` (see ``config.py``).
 """
 
 from elspeth_llm_gateway.sdk.protocol import AdapterDescriptor, ErrorClassification, InvokePlan, UpstreamFailure
@@ -24,6 +25,12 @@ class YourOrgAdapter:
 
     def validate_configuration(self, options: dict) -> None:
         config.validate_configuration(options)
+
+    def validate_model_target(self, target: dict) -> None:
+        # Implements the optional ``sdk.protocol.ModelTargetValidator``, which
+        # is what makes /readyz a real admission gate for this deployment's
+        # model mappings. Optional to the runtime, mandatory for conformance.
+        config.validate_model_target(target)
 
     def build_invoke(self, canonical_request: CanonicalRequest) -> InvokePlan:
         return request.build_invoke(canonical_request)
