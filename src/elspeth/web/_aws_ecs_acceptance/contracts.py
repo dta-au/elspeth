@@ -6,12 +6,17 @@ import contextlib
 import hashlib
 import json
 import re
+import typing
 import uuid
 from collections.abc import Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
+
+from pydantic import BaseModel
+
+from elspeth.web.config import WebSettings
 
 _MAX_IDENTITY_CHARS = 128
 _EVIDENCE_KINDS = (
@@ -272,6 +277,61 @@ class AcceptanceCheckError(RuntimeError):
 
 
 _CAUSE_FIELD_TOKEN = re.compile(r"\bELSPETH_[A-Z0-9_]*[A-Z0-9]\b")
+_REDACTED_LOC_SEGMENT = "<redacted>"
+
+
+def _nested_models(annotation: object) -> Iterator[type[BaseModel]]:
+    """Yield every ``BaseModel`` subclass reachable in a field's type args.
+
+    Walks ``Mapping[str, X]``, ``X | None``, ``tuple[X, ...]``, etc. down to
+    their type arguments so a nested settings model (e.g. ``LLMProfileSettings``
+    inside ``Mapping[str, LLMProfileSettings]``) is found regardless of the
+    generic container it sits behind.
+    """
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        yield annotation
+        return
+    for arg in typing.get_args(annotation):
+        yield from _nested_models(arg)
+
+
+def _static_schema_field_names(model: type[BaseModel], *, _seen: frozenset[type[BaseModel]] = frozenset()) -> frozenset[str]:
+    """Recursively collect every field name declared by ``model`` and its nested models.
+
+    A ``Mapping[str, X]``-typed field (e.g. ``WebSettings.llm_profiles``) puts
+    the operator-chosen dict KEY in the same ``loc`` tuple position as a
+    static field name — pydantic's ``errors()`` does not distinguish the two.
+    This set is the whitelist of identifiers ELSPETH's own schema declares;
+    anything at a ``loc`` position that is not in it is parsed data (a
+    mapping key), never a name ELSPETH owns, and must be redacted before
+    reaching operator-visible evidence.
+    """
+    if model in _seen:
+        return frozenset()
+    seen = _seen | {model}
+    names: set[str] = set()
+    for field_name, field_info in model.model_fields.items():
+        names.add(field_name)
+        for nested in _nested_models(field_info.annotation):
+            names |= _static_schema_field_names(nested, _seen=seen)
+    return frozenset(names)
+
+
+_STATIC_SCHEMA_FIELD_NAMES: typing.Final[frozenset[str]] = _static_schema_field_names(WebSettings)
+
+
+def _safe_loc_segment(part: object) -> str:
+    """Render one pydantic ``loc`` element, redacting anything not a declared field name.
+
+    Integer indices (list/tuple positions) are structural, not data, and pass
+    through unredacted. String segments are checked against the static
+    schema whitelist so an operator-controlled mapping key (a profile alias,
+    for example) can never reach the envelope verbatim.
+    """
+    if isinstance(part, int):
+        return str(part)
+    text = str(part)
+    return text if text in _STATIC_SCHEMA_FIELD_NAMES else _REDACTED_LOC_SEGMENT
 
 
 def check_error_with_cause(check: str, exc: BaseException) -> AcceptanceCheckError:
@@ -284,7 +344,9 @@ def check_error_with_cause(check: str, exc: BaseException) -> AcceptanceCheckErr
     it emits the underlying exception CLASS name plus static identifiers
     only: pydantic field locations when the exception exposes ``errors()``,
     otherwise ``ELSPETH_*`` environment-variable tokens found in the message.
-    Message text and values are never emitted.
+    Message text and values are never emitted. Field-location segments that
+    are not themselves a declared schema field name (a mapping key, e.g. an
+    ``llm_profiles`` alias) are redacted rather than emitted verbatim.
     """
     fields: tuple[str, ...] = ()
     errors = getattr(exc, "errors", None)
@@ -295,7 +357,7 @@ def check_error_with_cause(check: str, exc: BaseException) -> AcceptanceCheckErr
                     location
                     for error in errors()
                     if isinstance(error, Mapping)
-                    for location in (".".join(str(part) for part in error.get("loc", ())),)
+                    for location in (".".join(_safe_loc_segment(part) for part in error.get("loc", ())),)
                     if location
                 )
             )

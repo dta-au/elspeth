@@ -62,11 +62,11 @@ PROMPT_SHIELD_WARNING_DRAFT: Final[str] = (
     "[user_term: prompt_injection_shield_recommendation]"
 )
 PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
-    "An authorized prompt-injection shield (azure_prompt_shield) IS available in "
-    "this deployment. Wire it between the external-content fetch step and this LLM: "
-    "untrusted remote text routed straight into the LLM is a prompt-injection "
-    "exposure, and the shield is configured and ready to use. Wiring it in is "
-    "strongly recommended, but you may proceed without it. "
+    "An authorized prompt-injection shield IS available in this deployment. Wire "
+    "it between the external-content fetch step and this LLM: untrusted remote "
+    "text routed straight into the LLM is a prompt-injection exposure, and the "
+    "shield is configured and ready to use. Wiring it in is strongly recommended, "
+    "but you may proceed without it. "
     "[user_term: prompt_injection_shield_recommendation]"
 )
 

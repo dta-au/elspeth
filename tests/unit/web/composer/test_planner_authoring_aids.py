@@ -1190,6 +1190,20 @@ class TestPromptShieldRules:
         for producer in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
             assert producer in rendered
 
+    def test_recommend_mode_draft_names_the_selected_shield_not_azure(self) -> None:
+        """A selected non-Azure shield's audit card must not claim azure_prompt_shield.
+
+        ``PROMPT_SHIELD_AVAILABLE_DRAFT`` used to hardcode "azure_prompt_shield"
+        in its text, and the planner is told to copy that draft verbatim into
+        the authored review row — so a deployment that selected a different
+        shield implementation got a review card recording the wrong control.
+        """
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        rendered = "\n".join(_prompt_shield_rules(shield_plugin="aws_bedrock_prompt_shield", untrusted_producers=("web_scrape",)))
+        assert "azure_prompt_shield" not in rendered
+        assert "aws_bedrock_prompt_shield" in rendered
+
     def test_section_renders_under_the_live_profile_posture(self, tmp_path: Path) -> None:
         # The failing surface is the tutorial/guided walk under the operator-
         # profile posture — pin that the section actually reaches it (web_scrape

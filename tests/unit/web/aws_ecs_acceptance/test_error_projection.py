@@ -337,6 +337,29 @@ def test_check_error_with_cause_projects_pydantic_field_locations() -> None:
     assert envelope["cause_fields"] == ["composer_max_discovery_turns"]
 
 
+def test_check_error_with_cause_redacts_operator_controlled_mapping_keys() -> None:
+    """A malformed llm_profiles alias must never reach the envelope verbatim.
+
+    ``llm_profiles`` is ``Mapping[str, LLMProfileSettings]`` — the dict key is
+    an operator-chosen alias, not schema identity, but pydantic's ``loc``
+    tuple places it in the same position as a static field name
+    (``llm_profiles.<alias>.credential_ref``). Only declared field names may
+    survive into stderr/retained evidence; the alias itself must be redacted.
+    """
+    import pydantic
+
+    from elspeth.web.config import WebSettings
+
+    try:
+        WebSettings.model_validate({"llm_profiles": {"MALICIOUS_SECRET_ALIAS": {}}})
+    except pydantic.ValidationError as exc:
+        error = contracts.check_error_with_cause("settings_load", exc)
+    envelope = contracts.acceptance_error_envelope(error)
+    flattened = json.dumps(envelope)
+    assert "MALICIOUS_SECRET_ALIAS" not in flattened
+    assert any(field.startswith("llm_profiles.<redacted>.") for field in envelope["cause_fields"])
+
+
 def test_check_error_without_cause_keeps_prior_envelope_shape() -> None:
     envelope = contracts.acceptance_error_envelope(contracts.AcceptanceCheckError("storage_identity"))
     assert "cause_class" not in envelope

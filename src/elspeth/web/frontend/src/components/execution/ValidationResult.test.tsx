@@ -95,6 +95,31 @@ describe("ValidationResultBanner", () => {
     ).toBeNull();
   });
 
+  it("auto-expands when a passed check carries identity_node_advisory guidance and offers no Collapse", () => {
+    render(
+      <ValidationResultBanner
+        result={makePassResult({
+          warnings: [],
+          checks: [
+            {
+              name: "identity_node_advisory",
+              passed: true,
+              detail:
+                "Node 'passthrough_1' is an identity-shaped passthrough between 'scrape' and sink 'csv_out'. Consider removing it and wiring 'scrape'.on_success directly to 'csv_out'.",
+              affected_nodes: ["passthrough_1"],
+              outcome_code: null,
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/Consider removing it/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /collapse validation details/i }),
+    ).toBeNull();
+  });
+
   it("renders failures expanded with per-component errors, unchanged", () => {
     render(
       <ValidationResultBanner

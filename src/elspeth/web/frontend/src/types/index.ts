@@ -434,6 +434,15 @@ export const VALIDATION_CHECK_OUTCOME_CODE_VALUES = [
 
 export type ValidationCheckOutcomeCode = (typeof VALIDATION_CHECK_OUTCOME_CODE_VALUES)[number];
 
+/**
+ * Check names that report a self-correction hint rather than a blocking gate.
+ * Mirrors the complement of VALIDATION_BLOCKING_CHECK_NAMES in schemas.py:
+ * these checks can appear with passed=true and still carry actionable
+ * removal/repair guidance in `detail` that the UI must not hide behind a
+ * collapsed "Validation passed" banner.
+ */
+export const VALIDATION_ADVISORY_CHECK_NAMES = ["identity_node_advisory"] as const;
+
 export interface ValidationCheck {
   name: string;
   passed: boolean;
