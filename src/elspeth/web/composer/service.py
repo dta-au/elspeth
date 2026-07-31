@@ -2522,6 +2522,8 @@ class ComposerServiceImpl:
             guided_private_reviewed_facts,
             guided_redacted_current_state_context,
             guided_redacted_planner_context,
+            guided_reviewed_sink_options,
+            guided_unproducible_output_fields,
         )
         from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
         from elspeth.web.composer.guided.prompts import load_step_planner_skill
@@ -2585,14 +2587,39 @@ class ComposerServiceImpl:
             ),
         )
 
-        if (
+        passthrough_sketch_shape = (
             correction_target is None
             and supersedes_draft_hash is None
             and guided.root_intent_message_id is None
             and not guided.deferred_intents
             and len(guided.source_order) == 1
             and len(guided.output_order) == 1
-        ):
+        )
+        # A zero-transform sketch emits exactly what the reviewed source
+        # carries, so a declared sink field no source can supply makes the
+        # sketch unbuildable. Validation cannot be the guard (R2-F4): without
+        # the declared-contract merge below the sink had no required_fields at
+        # all, so the contract check skipped and the sketch sealed GREEN; with
+        # the merge it fires, but only as an opaque sink_contract_violation the
+        # planner cannot repair away. Decide it here, before the sketch is
+        # built. Scoped to the sketch branch on purpose: on any other guided
+        # plan a transform may legitimately produce the field, so this is not a
+        # general satisfiability gate.
+        unproducible_output_fields = guided_unproducible_output_fields(guided) if passthrough_sketch_shape else ()
+        if unproducible_output_fields:
+            # Name the gap to the provider planner instead of presenting an
+            # unsatisfiable sketch as complete. Zero new egress: the source
+            # observed/declared field names and the output's required_fields
+            # are already members of guided_redacted_planner_context.
+            reviewed_context = {
+                **reviewed_context,
+                "unproducible_output_fields": [dict(gap) for gap in unproducible_output_fields],
+                "unproducible_output_fields_usage": (
+                    "These reviewed sink fields appear in no reviewed source. A direct pass-through cannot "
+                    "produce them — propose the transform(s) that do, or the pipeline will fail at runtime."
+                ),
+            }
+        if passthrough_sketch_shape and not unproducible_output_fields:
             # The rootless step-2→3 starting sketch is ALWAYS the same
             # pass-through (reviewed source → reviewed output, zero nodes),
             # withheld from acceptance (supersedes_draft_hash null) and
@@ -2620,7 +2647,12 @@ class ComposerServiceImpl:
                     {
                         "sink_name": reviewed_output.name,
                         "plugin": reviewed_output.plugin,
-                        "options": deep_thaw(reviewed_output.options),
+                        # Same seam as the planner-authored binder
+                        # (bind_guided_reviewed_components): step-2's declared
+                        # output fields must reach options.schema.required_fields
+                        # here too, or the sink contract this sketch commits to
+                        # is display-only (R2-F4).
+                        "options": guided_reviewed_sink_options(reviewed_output),
                         "on_write_failure": reviewed_output.on_write_failure,
                     }
                 ],

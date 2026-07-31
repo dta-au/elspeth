@@ -717,6 +717,195 @@ class TestStep2IntraStep:
         ]
         assert llm_audits == []
 
+    @pytest.mark.parametrize("provider_heeds_gap", (True, False))
+    def test_rootless_step_3_entry_with_unproducible_output_fields_never_seals_the_sketch(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        provider_heeds_gap: bool,
+    ) -> None:
+        """R2-F4: an unsatisfiable zero-transform sketch is never a complete answer.
+
+        The reviewed source observes ``order_id, region``; step-2 field review
+        declares ``client`` and ``amount_aud`` on top of them. The
+        server-synthesized pass-through has zero transforms, so nothing in it
+        can ever produce those two fields, yet the sketch was sealed as a green
+        "Starting sketch" — an unbuildable pipeline presented as complete,
+        because the sketch never merged the declared fields into the sink's
+        ``schema.required_fields`` and the sink-contract check therefore
+        skipped. The guided seam holds both facts (source observed/declared
+        fields, output required fields), so it must skip the sketch and route
+        to the provider planner with the gap named in the reviewed planner
+        context.
+
+        Both parameters assert the same two invariants — no server-synthesized
+        pass-through proposal is sealed, and the gap reaches the planner. They
+        differ in what the provider does with the named gap, which exercises
+        the second line of defence: because the reviewed sink's declared fields
+        are now materialized into ``options.schema.required_fields``, a planner
+        that IGNORES the gap and re-proposes the bare pass-through is rejected
+        by the sink-contract check instead of sealing green.
+        """
+        import elspeth.web.composer.service as service_module
+
+        app = composer_test_client.app
+        session_id = _create_session(composer_test_client)
+        _seed_blob(composer_test_client, session_id, content="order_id,region\n1,north\n2,south\n")
+        _get_guided(composer_test_client, session_id)
+        selected = _respond(composer_test_client, session_id, chosen=["csv"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={"plugin": "csv", "options": selected["next_turn"]["payload"]["prefilled"]},
+        )
+        _respond(composer_test_client, session_id, edited_values={"columns": ["order_id", "region"]})
+        _finish_review(composer_test_client, session_id, "source")
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "unproducible.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        reviewed = _respond(
+            composer_test_client,
+            session_id,
+            chosen=["order_id", "region"],
+            custom_inputs=["client", "amount_aud"],
+        )
+        guided_facts = _full_guided_session(reviewed)
+        source_name = next(iter(guided_facts["reviewed_sources"].values()))["name"]
+        assert next(iter(guided_facts["reviewed_outputs"].values()))["required_fields"] == [
+            "order_id",
+            "region",
+            "client",
+            "amount_aud",
+        ]
+
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(
+                available=True,
+                provider="test",
+                model="test/guided-planner",
+                reason=None,
+            ),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings.model_copy(update={"composer_model": "test/guided-planner"}),
+            sessions_service=app.state.session_service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+
+        planner_contexts: list[Mapping[str, Any]] = []
+        real_plan_pipeline = service_module.plan_pipeline
+
+        def recording_plan_pipeline(**kwargs: Any):
+            planner_contexts.append(kwargs["reviewed_planner_context"])
+            return real_plan_pipeline(**kwargs)
+
+        monkeypatch.setattr(service_module, "plan_pipeline", recording_plan_pipeline)
+
+        gap_closing_nodes = [
+            {
+                "id": "derive_missing_fields",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "planner_rows",
+                "on_success": "planned_sink",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "mapping": {"order_id": "client", "region": "amount_aud"},
+                },
+            }
+        ]
+        planner_pipeline = {
+            "sources": {
+                source_name: {
+                    "plugin": "csv",
+                    "options": {},
+                    "on_success": "planner_rows" if provider_heeds_gap else "planned_sink",
+                    "on_validation_failure": "discard",
+                }
+            },
+            "nodes": gap_closing_nodes if provider_heeds_gap else [],
+            "edges": [],
+            "outputs": [
+                {
+                    "sink_name": "planned_sink",
+                    "plugin": "json",
+                    "options": {},
+                    "on_write_failure": "abort",
+                }
+            ],
+        }
+
+        async def terminal_completion(**_kwargs: Any) -> _PlannerResponse:
+            return _PlannerResponse(
+                choices=[
+                    _PlannerChoice(
+                        message=_PlannerMessage(
+                            content=None,
+                            tool_calls=[
+                                _PlannerToolCall(
+                                    id="guided-terminal",
+                                    function=_PlannerFunction(
+                                        name="emit_pipeline_proposal",
+                                        arguments=json.dumps({"pipeline": planner_pipeline}),
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+            )
+
+        monkeypatch.setattr(service_module, "_litellm_acompletion", terminal_completion)
+
+        settled = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        if provider_heeds_gap:
+            assert settled.status_code == 200, settled.json()
+            assert settled.json()["next_turn"]["type"] == "propose_pipeline"
+        else:
+            # The reviewed sink now carries required_fields, so the bare
+            # pass-through the provider re-proposed is rejected on contract
+            # rather than sealed green.
+            assert settled.status_code == 502, settled.json()
+            assert settled.json()["detail"]["failure_code"] == "invalid_provider_response"
+        with app.state.session_engine.connect() as conn:
+            proposals = conn.execute(
+                select(
+                    composition_proposals_table.c.composer_model_identifier,
+                    composition_proposals_table.c.composer_provider,
+                ).where(composition_proposals_table.c.session_id == session_id)
+            ).all()
+        assert all(row.composer_model_identifier != "composer-guided-passthrough-synthesis" for row in proposals), (
+            "an unsatisfiable pass-through sketch must never be sealed as the answer"
+        )
+        assert all(row.composer_provider != "server" for row in proposals)
+        assert len(planner_contexts) == 1, "the unsatisfiable sketch must route to the provider planner"
+        gap = planner_contexts[0]["unproducible_output_fields"]
+        assert [entry["fields"] for entry in gap] == [["amount_aud", "client"]]
+
     @pytest.mark.parametrize(
         ("profile", "expected_surface"),
         (("live", "guided_staged"),),
