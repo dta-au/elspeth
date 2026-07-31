@@ -392,6 +392,8 @@ async def resolve_step_1_source_chat_with_auto_drop(
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
     allow_plugin_reselection: bool = False,
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> Step1SourceChatResult:
     """Wrap Step-1 ``resolve_source`` chat with the guided-chat fallback contract.
 
@@ -399,7 +401,8 @@ async def resolve_step_1_source_chat_with_auto_drop(
     :func:`maybe_resolve_step_1_source_chat` so a declined-to-prose reply
     (returned as ``GuidedStepChatOnlyResult``) is grounded in the same
     "current build" context a second, tool-less call would otherwise have
-    supplied.
+    supplied. ``api_base``/``api_key`` are the PRIMARY-role endpoint
+    affordance (Phase 3 Task 2); guided solvers never use the advisor's.
     """
     started = time.perf_counter()
     try:
@@ -415,6 +418,8 @@ async def resolve_step_1_source_chat_with_auto_drop(
             timeout_seconds=timeout_seconds,
             context_block=context_block,
             allow_plugin_reselection=allow_plugin_reselection,
+            api_base=api_base,
+            api_key=api_key,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         if type(outcome) is Step1SourceResolvedOutcome:
@@ -587,6 +592,8 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     context_block: StepChatContextInput | None = None,
     progress: ComposerProgressSink | None = None,
     revision_target_index: int | None = None,
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> Step2SinkChatResult:
     """Wrap Step-2 ``resolve_sink`` chat with the guided-chat fallback contract.
 
@@ -600,6 +607,8 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     reply (returned as
     ``GuidedStepChatOnlyResult``) is grounded in the same "current build"
     context a second, tool-less call would otherwise have supplied.
+    ``api_base``/``api_key`` are the PRIMARY-role endpoint affordance
+    (Phase 3 Task 2); guided solvers never use the advisor's.
     """
     started = time.perf_counter()
     try:
@@ -621,6 +630,8 @@ async def resolve_step_2_sink_chat_with_auto_drop(
             context_block=context_block,
             progress=progress,
             revision_target_index=revision_target_index,
+            api_base=api_base,
+            api_key=api_key,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         if type(outcome) is Step2SinkResolvedOutcome:
@@ -772,6 +783,8 @@ async def solve_step_chat_with_auto_drop(
     recorder: BufferingRecorder | None = None,
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> StepChatResult:
     """Wrap ``solve_step_chat`` with the synthetic-message-on-transient contract.
 
@@ -849,6 +862,8 @@ async def solve_step_chat_with_auto_drop(
             recorder=recorder,
             timeout_seconds=timeout_seconds,
             context_block=context_block,
+            api_base=api_base,
+            api_key=api_key,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         return StepChatResult(

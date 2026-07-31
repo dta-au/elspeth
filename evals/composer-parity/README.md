@@ -7,10 +7,10 @@ adapters in later tasks and must derive equivalent committed graphs.
 
 ## What is here
 
-- `fixtures/*.json` — nine canonical topology fixtures, one per capability
+- `fixtures/*.json` — ten canonical topology fixtures, one per capability
   class (linear transform, conditional gate, multi-output, fork/coalesce,
-  multi-source queue, aggregation, row expansion, error routing, structured
-  LLM). Each fixture records:
+  correlated row union, multi-source queue, aggregation, row expansion, error
+  routing, structured LLM). Each fixture records:
   - `intent` — a plain-language outcome request (no composer tool-call order).
   - `canonical_arguments` — a VALID `set_pipeline` payload that validates against
     `SetPipelineArgumentsModel` (`src/elspeth/web/composer/redaction.py`) and
@@ -67,9 +67,10 @@ authoring-form requirements beyond the Task 2 argument shape:
 
 ### Guided-staged coverage (Task 3)
 
-The guided-staged column drives all nine fixtures. Queue fan-in, require-all
-coalesce, and cross-sink write-failure fallback remain explicit real-path
-regressions for their repaired stage-protocol boundaries.
+The guided-staged column drives all ten fixtures. Queue fan-in, require-all
+coalesce, correlated require-all row union, and cross-sink write-failure
+fallback remain explicit real-path regressions for their repaired
+stage-protocol boundaries.
 
 ## Byte canonicalization (Ruling C)
 

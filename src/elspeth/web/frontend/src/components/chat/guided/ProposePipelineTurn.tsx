@@ -80,6 +80,10 @@ function flowLabel(flow: ProposalFlow, routeKeys: ReadonlyMap<string, string>): 
       return flow.branch === null ? "queue continues" : `queue continues in ${flow.branch}`;
     case "coalesce_success":
       return flow.branch === null ? "after join" : `after join in ${flow.branch}`;
+    case "row_union_success":
+      return flow.branch === null
+        ? "after row union"
+        : `after row union in ${flow.branch}`;
     case "output_write_failure":
       return "on write failure";
   }
@@ -138,8 +142,18 @@ function behaviorSummary(behavior: Exclude<ProposalNodeBehavior, { kind: "gate" 
     }
     case "queue":
       return "Queue continues in sequence without correlating records.";
-    case "coalesce":
-      return `Joins ${behavior.branch_aliases.join(", ")} using ${behavior.policy} / ${behavior.merge}.`;
+    case "coalesce": {
+      const timeout = behavior.timeout_seconds === null
+        ? ""
+        : `; timeout ${behavior.timeout_seconds}s`;
+      return `Joins ${behavior.branch_aliases.join(", ")} using ${behavior.policy} / ${behavior.merge}${timeout}.`;
+    }
+    case "row_union": {
+      const timeout = behavior.timeout_seconds === null
+        ? ""
+        : `; timeout ${behavior.timeout_seconds}s`;
+      return `Waits for ${behavior.branch_aliases.join(", ")}, then forwards every row without merging records${timeout}.`;
+    }
   }
 }
 
@@ -274,7 +288,7 @@ export function ProposePipelineTurn({
     const to = edge.to_endpoint.kind === "discard"
       ? "discard"
       : (labelById.get(edge.to_endpoint.stable_id) ?? "component");
-    return `route from ${from} to ${to}`;
+    return `route from ${from} to ${to}: ${flowLabel(edge.flow, routeKeyByAlias)}`;
   };
 
   return (

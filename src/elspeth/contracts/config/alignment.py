@@ -103,6 +103,15 @@ EXEMPT_SETTINGS: Final[frozenset[str]] = frozenset(
         "ServiceRateLimit",
         # Nested in TelemetrySettings - no Runtime counterpart
         "ExporterSettings",
+        # Nested value type of ElspethSettings.llm_profiles / WebSettings.llm_profiles
+        # (a Mapping, not a singleton subsystem setting). It DOES have a
+        # frozen runtime counterpart (RuntimeLLMProfile.from_settings), but
+        # that conversion packs several fields into an opaque
+        # provider_options tuple rather than the 1:1 (or FIELD_MAPPINGS-renamed)
+        # field correspondence SETTINGS_TO_RUNTIME's other entries document,
+        # so it is exempted here rather than asserting a contract it doesn't
+        # literally satisfy.
+        "LLMProfileSettings",
         # Top-level container
         "ElspethSettings",
     }

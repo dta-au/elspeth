@@ -1174,3 +1174,12 @@ class TestQueueExposure:
         )
         assert result["success"] is False
         assert result["state"] == state.to_dict()
+
+
+class TestRowUnionExposure:
+    def test_tools_list_uses_generic_upsert_for_row_union(self) -> None:
+        definitions = _build_tool_defs()
+        assert all(tool["name"] != "upsert_row_union" for tool in definitions)
+        upsert = next(tool for tool in definitions if tool["name"] == "upsert_node")
+        assert "row_union" in upsert["parameters"]["properties"]["node_type"]["enum"]
+        assert upsert["parameters"]["properties"]["timeout_seconds"]["exclusiveMinimum"] == 0

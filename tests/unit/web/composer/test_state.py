@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import Any
 
@@ -999,6 +1000,129 @@ class TestStage1Validation:
         result = state.validate()
 
         assert result.is_valid, result.errors
+
+    def test_coalesce_timeout_survives_serialization_round_trip(self) -> None:
+        state = self._coalesce_route_state(on_success="main")
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        state = state.with_node(replace(coalesce, timeout_seconds=5.0))
+
+        restored = CompositionState.from_dict(state.to_dict())
+
+        assert restored == state
+        assert next(node for node in restored.nodes if node.node_type == "coalesce").timeout_seconds == 5.0
+
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        # 10**400 and its negation are only reachable from a persisted session
+        # payload (JSON has no integer ceiling and NodeSpec.from_dict does not
+        # cross the Pydantic tool boundary). float() overflows on them, which
+        # used to abort validate() with OverflowError instead of rejecting.
+        [True, float("nan"), float("inf"), 0.0, -1.0, 10**400, -(10**400)],
+    )
+    def test_coalesce_rejects_invalid_timeout(self, timeout_seconds: object) -> None:
+        state = self._coalesce_route_state(on_success="main")
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        state = state.with_node(replace(coalesce, timeout_seconds=timeout_seconds))
+
+        result = state.validate()
+
+        assert any(error.error_code == "coalesce_timeout_invalid" for error in result.errors)
+
+    @pytest.mark.parametrize(
+        ("node", "error_code"),
+        [
+            pytest.param(
+                NodeSpec(
+                    id="transform_1",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="transform_1",
+                    on_success="main",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="transform",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="gate_1",
+                    node_type="gate",
+                    plugin=None,
+                    input="gate_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "main", "false": "main"},
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="gate",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="aggregation_1",
+                    node_type="aggregation",
+                    plugin="batch_counter",
+                    input="aggregation_1",
+                    on_success="main",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    trigger={"count": 100, "timeout_seconds": 5.0},
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="aggregation",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="queue_1",
+                    node_type="queue",
+                    plugin=None,
+                    input="queue_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "queue_config_invalid",
+                id="queue",
+            ),
+        ],
+    )
+    def test_only_barrier_nodes_accept_top_level_timeout(self, node: NodeSpec, error_code: str) -> None:
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success=node.input))
+        state = state.with_node(node)
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert any(error.error_code == error_code and "timeout_seconds" in error.message for error in result.errors), result.errors
 
     def test_multiple_fork_gates_do_not_collide_on_fork_route_keyword(self) -> None:
         """Two gates routing to the reserved 'fork' keyword are not duplicate producers.
@@ -2232,8 +2356,8 @@ class TestStage1Validation:
         assert not result.is_valid
         assert any("output_mode" in e.message and "agg1" in e.message for e in result.errors)
 
-    def test_validate_aggregation_with_trigger_passes(self) -> None:
-        """Aggregation with all required fields passes validation."""
+    def test_validate_aggregation_with_trigger_timeout_passes(self) -> None:
+        """Aggregation keeps its nested trigger timeout when top-level timeout is forbidden."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="agg1"))
         node = NodeSpec(
@@ -2250,7 +2374,7 @@ class TestStage1Validation:
             branches=None,
             policy=None,
             merge=None,
-            trigger={"count": 100},
+            trigger={"count": 100, "timeout_seconds": 5.0},
         )
         state = state.with_node(node)
         state = state.with_output(self._make_output("main"))
@@ -6195,6 +6319,7 @@ class TestCompositionStateQueue:
             ("trigger", {"kind": "count"}),
             ("output_mode", "passthrough"),
             ("expected_output_count", 2),
+            ("timeout_seconds", 5.0),
         ):
             error = queue_node_contract_error(self._queue(**{field: value}))
             assert error is not None and field in error, f"{field} not rejected: {error}"
@@ -6411,6 +6536,18 @@ def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
                 policy="require_all",
                 merge="union",
             ),
+            _node(
+                id="row_union",
+                node_type="row_union",
+                plugin=None,
+                input="tone_out",
+                on_success="union_out",
+                on_error=None,
+                branches={"branch_a": "tone_out", "other_branch": "usage_out"},
+                policy=None,
+                merge=None,
+            ),
+            _node(id="after_union", input="union_out", on_success="out"),
             _node(id="finalize", input="reconcile", on_success="out"),
         ),
         edges=(),
@@ -6422,6 +6559,962 @@ def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
     result = state.validate()
     entries = [(e.component, e.error_code) for e in result.errors]
     assert ("node:fork_rows", "fork_branch_no_destination") in entries, entries
-    offending = next(e for e in result.errors if e.error_code == "fork_branch_no_destination")
-    assert "branch_a" in offending.message
-    assert "tone_out" in offending.message
+    offending = [e for e in result.errors if e.error_code == "fork_branch_no_destination"]
+    assert len(offending) == 1, offending
+    assert "branch_b" in offending[0].message
+    assert "fork branch 'branch_a'" not in offending[0].message
+    assert "tone_out" in offending[0].message
+
+
+class TestCompositionStateRowUnion:
+    """Composer parity for the plugin-free correlated row_union barrier."""
+
+    def _source(self, on_success: str = "fork_in", *, schema: dict[str, Any] | None = None) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success=on_success,
+            options={"schema": schema or {"mode": "observed"}},
+            on_validation_failure="discard",
+        )
+
+    def _gate(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "fork_rows",
+            "node_type": "gate",
+            "plugin": None,
+            "input": "fork_in",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": "True",
+            "routes": {"true": "fork", "false": "fork"},
+            "fork_to": ("control_branch", "treatment_branch"),
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _transform(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options=options or {"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _aggregation(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        output_mode: str | None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="aggregation",
+            plugin="batch_stats",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "value_field": "value",
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={},
+            output_mode=output_mode,
+        )
+
+    def _row_union(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "variant_union",
+            "node_type": "row_union",
+            "plugin": None,
+            # Serialized adapter placeholder: the first branch connection.
+            "input": "control_done",
+            "on_success": "union_out",
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": {
+                "control_branch": "control_done",
+                "treatment_branch": "treatment_done",
+            },
+            "policy": None,
+            "merge": None,
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _output(self, name: str = "output") -> OutputSpec:
+        return OutputSpec(
+            name=name,
+            plugin="json",
+            options={"schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    def _state(
+        self,
+        *,
+        row_union: NodeSpec | None = None,
+        gate: NodeSpec | None = None,
+        extra_nodes: tuple[NodeSpec, ...] = (),
+        tail_options: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        return CompositionState(
+            source=self._source(),
+            nodes=(
+                gate or self._gate(),
+                self._transform("control", "control_branch", "control_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                row_union or self._row_union(),
+                self._transform("after_union", "union_out", "output", options=tail_options),
+                *extra_nodes,
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_row_union_survives_serialization_round_trip(self) -> None:
+        state = self._state(row_union=self._row_union(timeout_seconds=2.5))
+
+        payload = state.to_dict()
+        restored = CompositionState.from_dict(payload)
+
+        assert payload["nodes"][3]["timeout_seconds"] == 2.5
+        assert restored == state
+        assert restored.nodes[3].timeout_seconds == 2.5
+
+    def test_from_dict_normalizes_row_union_branch_list_to_identity_mapping(self) -> None:
+        node = NodeSpec.from_dict(
+            {
+                "id": "variant_union",
+                "node_type": "row_union",
+                "plugin": None,
+                "input": "control_branch",
+                "on_success": "union_out",
+                "on_error": None,
+                "options": {},
+                "branches": ["control_branch", "treatment_branch"],
+            }
+        )
+
+        assert node.branches == {
+            "control_branch": "control_branch",
+            "treatment_branch": "treatment_branch",
+        }
+
+    def test_direct_row_union_branch_list_normalizes_before_round_trip(self) -> None:
+        row_union = self._row_union(
+            input="control_branch",
+            branches=("control_branch", "treatment_branch"),
+        )
+        state = self._state(row_union=row_union)
+
+        assert row_union.branches == {
+            "control_branch": "control_branch",
+            "treatment_branch": "treatment_branch",
+        }
+        assert CompositionState.from_dict(state.to_dict()) == state
+
+    def test_from_dict_does_not_hide_duplicate_row_union_branch_aliases(self) -> None:
+        row_union = NodeSpec.from_dict(
+            {
+                "id": "variant_union",
+                "node_type": "row_union",
+                "plugin": None,
+                "input": "control_branch",
+                "on_success": "union_out",
+                "on_error": None,
+                "options": {},
+                "branches": ["control_branch", "treatment_branch", "control_branch"],
+            }
+        )
+
+        result = self._state(row_union=row_union).validate()
+
+        assert any(error.error_code == "row_union_branches_invalid" for error in result.errors)
+
+    def test_valid_row_union_topology(self) -> None:
+        result = self._state().validate()
+
+        assert result.is_valid, result.errors
+
+    @pytest.mark.parametrize("output_mode", [None, "transform"])
+    def test_row_union_rejects_transform_mode_aggregation_inside_branch(self, output_mode: str | None) -> None:
+        state = self._state()
+        branch_aggregation = self._aggregation(
+            "control",
+            "control_branch",
+            "control_done",
+            output_mode=output_mode,
+        )
+        state = replace(
+            state,
+            nodes=tuple(branch_aggregation if node.id == "control" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_branch_aggregation_invalid")
+        assert error.component == "node:variant_union"
+        assert "control" in error.message
+        assert "row_id" in error.message
+        assert "passthrough" in error.message
+
+    def test_row_union_accepts_passthrough_aggregation_inside_branch(self) -> None:
+        state = self._state()
+        branch_aggregation = self._aggregation(
+            "control",
+            "control_branch",
+            "control_done",
+            output_mode="passthrough",
+        )
+        state = replace(
+            state,
+            nodes=tuple(branch_aggregation if node.id == "control" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_accepts_transform_mode_aggregation_before_fork(self) -> None:
+        state = self._state()
+        pre_fork_aggregation = self._aggregation(
+            "pre_fork_batch",
+            "pre_fork_in",
+            "fork_in",
+            output_mode="transform",
+        )
+        state = replace(
+            state,
+            sources={"source": self._source(on_success="pre_fork_in")},
+            nodes=(pre_fork_aggregation, *state.nodes),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_rejects_nested_fork_inside_branch(self) -> None:
+        nested_gate = self._gate(
+            id="nested_fork",
+            input="control_branch",
+            fork_to=("nested_a", "nested_b"),
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._gate(),
+                nested_gate,
+                self._transform("control", "nested_a", "control_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                self._row_union(),
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(self._output(), self._output("nested_b")),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_nested_fork_invalid")
+        assert error.component == "node:variant_union"
+        assert "nested_fork" in error.message
+        assert "control_branch" in error.message
+
+    def test_gate_fork_aliases_must_be_unique_before_row_union_origin_resolution(self) -> None:
+        state = self._state(
+            gate=self._gate(
+                fork_to=("control_branch", "control_branch", "treatment_branch"),
+            )
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "gate_duplicate_fork_branch")
+        assert error.component == "node:fork_rows"
+        assert "control_branch" in error.message
+
+    @pytest.mark.parametrize(
+        "node_id",
+        [
+            "bad name",
+            "a" * 39,
+            "fork",
+            "__private",
+            " variant_union ",
+        ],
+    )
+    def test_row_union_name_matches_runtime_identifier_contract(self, node_id: str) -> None:
+        result = self._state(row_union=self._row_union(id=node_id)).validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_name_invalid")
+        assert error.component == f"node:{node_id}"
+
+    def test_malformed_row_union_branch_values_return_errors_without_sorting_type_error(self) -> None:
+        payload = json.loads(json.dumps(self._state().to_dict()))
+        row_union = next(node for node in payload["nodes"] if node["node_type"] == "row_union")
+        row_union["branches"] = {
+            "control_branch": 123,
+            "treatment_branch": "missing",
+        }
+        row_union["input"] = 123
+
+        result = CompositionState.from_dict(payload).validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "row_union_branch_invalid" for error in result.errors)
+
+    def test_row_union_rejects_branch_aliases_from_multiple_fork_gates(self) -> None:
+        second_gate = self._gate(
+            id="fork_treatment",
+            input="second_fork_in",
+            fork_to=("treatment_branch", "treatment_overflow"),
+        )
+        state = CompositionState(
+            sources={
+                "control_source": self._source(on_success="fork_in"),
+                "treatment_source": self._source(on_success="second_fork_in"),
+            },
+            nodes=(
+                self._gate(fork_to=("control_branch", "control_overflow")),
+                second_gate,
+                self._transform("control", "control_branch", "control_done"),
+                self._transform("control_overflow", "control_overflow", "control_overflow_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                self._transform("treatment_overflow", "treatment_overflow", "treatment_overflow_done"),
+                self._row_union(),
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(
+                self._output(),
+                self._output("control_overflow_done"),
+                self._output("treatment_overflow_done"),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        origin_error = next(error for error in result.errors if error.error_code == "row_union_branch_origin_invalid")
+        assert "one common gate fork_to" in origin_error.message
+        assert "fork_rows" in origin_error.message
+        assert "fork_treatment" in origin_error.message
+        # A step-8 topology finding, not the intrinsic node-shape code the
+        # mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
+
+    def test_row_union_rejects_branch_connection_from_a_different_alias(self) -> None:
+        row_union = self._row_union(
+            input="treatment_done",
+            branches={
+                "control_branch": "treatment_done",
+                "treatment_branch": "control_done",
+            },
+        )
+
+        result = self._state(row_union=row_union).validate()
+
+        mapping_error = next(error for error in result.errors if error.error_code == "row_union_branch_not_downstream")
+        assert "control_branch" in mapping_error.message
+        assert "treatment_done" in mapping_error.message
+        assert "not downstream" in mapping_error.message
+        # A step-8 topology finding, not the intrinsic node-shape code the
+        # mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
+
+    def test_row_union_rejects_queue_branch_with_unrelated_producer(self) -> None:
+        queue = NodeSpec(
+            id="control_done",
+            node_type="queue",
+            plugin=None,
+            input="control_done",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(extra_nodes=(queue,))
+        state = replace(
+            state,
+            sources={
+                "primary": self._source(),
+                "contaminant": self._source(on_success="control_done"),
+            },
+        )
+
+        result = state.validate()
+
+        lineage_error = next(error for error in result.errors if error.error_code == "row_union_branch_not_downstream")
+        assert "control_branch" in lineage_error.message
+        assert "control_done" in lineage_error.message
+
+    @pytest.mark.parametrize(
+        ("control_fields", "treatment_fields", "is_compatible"),
+        [
+            (["id: str", "score: float"], ["id: str", "score: float"], True),
+            (["id: str", "score: float"], ["id: str", "label: str"], False),
+        ],
+    )
+    def test_row_union_requires_compatible_known_fixed_branch_schemas(
+        self,
+        control_fields: list[str],
+        treatment_fields: list[str],
+        is_compatible: bool,
+    ) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": control_fields}},
+            )
+            if node.id == "control"
+            else replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": treatment_fields}},
+            )
+            if node.id == "treatment"
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+        schema_errors = [
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_schema_incompatible"
+            and "incompatible" in error.message
+        ]
+
+        assert bool(schema_errors) is not is_compatible, result.errors
+        if not is_compatible:
+            detail = schema_errors[0].row_union_schema
+            assert detail is not None
+            assert detail.conflicting_fields == ("label", "score")
+            assert tuple(branch.branch for branch in detail.branches) == (
+                "control_branch",
+                "treatment_branch",
+            )
+
+    def test_row_union_observed_branch_abstains_against_fixed_branch(self) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": ["id: str", "score: float"]}},
+            )
+            if node.id == "treatment"
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not any(
+            error.component == "node:variant_union"
+            and error.error_code == "row_union_schema_incompatible"
+            and "incompatible" in error.message
+            for error in result.errors
+        ), result.errors
+
+    def test_row_union_accepts_disjoint_flexible_branch_declarations(self) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["score: float"] if node.id == "control" else ["label: str"],
+                    }
+                },
+            )
+            if node.id in {"control", "treatment"}
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not any(error.error_code == "row_union_schema_incompatible" for error in result.errors), result.errors
+
+    def test_row_union_flexible_shared_type_conflict_carries_repair_facts(self) -> None:
+        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+        from elspeth.web.composer.tools import ToolResult
+
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["id: str"] if node.id == "control" else ["id: int"],
+                    }
+                },
+            )
+            if node.id in {"control", "treatment"}
+            else node
+            for node in state.nodes
+        )
+        candidate = replace(state, nodes=nodes)
+
+        result = candidate.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "row_union_schema_incompatible")
+        detail = entry.row_union_schema
+        assert detail is not None
+        assert detail.conflicting_fields == ("id",)
+        assert [
+            {
+                "branch": branch.branch,
+                "mode": branch.mode,
+                "fields": tuple((field.name, field.field_type) for field in branch.fields),
+            }
+            for branch in detail.branches
+        ] == [
+            {
+                "branch": "control_branch",
+                "mode": "flexible",
+                "fields": (("id", "str"),),
+            },
+            {
+                "branch": "treatment_branch",
+                "mode": "flexible",
+                "fields": (("id", "int"),),
+            },
+        ]
+
+        tool_result = ToolResult(
+            success=False,
+            updated_state=candidate,
+            validation=result,
+            affected_nodes=(),
+        )
+        projected = next(
+            error
+            for error in _allowlisted_candidate_feedback(tool_result)["validation"]["errors"]
+            if error["error_code"] == "row_union_schema_incompatible"
+        )
+        assert "message" not in projected
+        assert projected["row_union_schema"] == detail.to_dict()
+        assert projected["suggested_fix"]
+
+    def _coalesce(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "dup_merge",
+            "node_type": "coalesce",
+            "plugin": None,
+            "input": "join",
+            "on_success": "output",
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            # Identity branches: direct gate->barrier COPY edges that claim no
+            # ordinary connection consumer, so the duplicate-consumer check
+            # cannot mask the barrier-ownership conflict under test.
+            "branches": ("control_branch", "treatment_branch"),
+            "policy": "require_all",
+            "merge": "nested",
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def test_fork_branch_claimed_by_a_coalesce_and_a_row_union_is_rejected(self) -> None:
+        """Composer/runtime parity for the engine's one-barrier-per-branch rule.
+
+        The DAG builder raises ``GraphValidationError`` ("Each fork branch can
+        only join at one barrier") when a coalesce and a row_union both declare
+        the same branch, because the branch's arrival is delivered to exactly
+        one barrier's pending map. validate() used to pass this composition, so
+        generate_yaml handed the runtime a graph it refuses to build.
+        """
+        result = self._state(extra_nodes=(self._coalesce(),)).validate()
+
+        codes = {error.error_code for error in result.errors}
+        assert "fork_branch_multiple_barriers" in codes, result.errors
+        # composer_mcp.server gates generate_yaml on is_valid, so a red
+        # validate() is what stops the runtime-invalid YAML being exported.
+        assert not result.is_valid
+        conflict = next(error for error in result.errors if error.error_code == "fork_branch_multiple_barriers")
+        assert "control_branch" in conflict.message
+        assert "variant_union" in conflict.message
+        assert "dup_merge" in conflict.message
+        # A cross-node topology finding, not either barrier's intrinsic
+        # node-shape code the mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in codes
+
+    def test_fork_branch_claimed_by_two_coalesces_is_rejected(self) -> None:
+        """The same engine rule covers coalesce/coalesce claims."""
+        result = self._state(
+            extra_nodes=(self._coalesce(), self._coalesce(id="second_merge")),
+        ).validate()
+
+        assert any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors), result.errors
+
+    def test_fork_branch_claimed_by_two_row_unions_is_rejected(self) -> None:
+        """And row_union/row_union claims, which the engine rejects too."""
+        second_union = self._row_union(id="second_union", on_success="second_union_out")
+        result = self._state(
+            extra_nodes=(second_union, self._transform("after_second", "second_union_out", "output")),
+        ).validate()
+
+        assert any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors), result.errors
+
+    def test_valid_topology_does_not_report_a_barrier_conflict(self) -> None:
+        """A single barrier per branch stays clean — the rule is not a blanket ban."""
+        result = self._state().validate()
+
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors)
+
+    def test_row_union_output_feeds_ordinary_node_without_placeholder_consumer(self) -> None:
+        state = self._state()
+
+        result = state.validate()
+
+        assert any(node.id == "after_union" and node.input == "union_out" for node in state.nodes)
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_queue_output_feeds_row_union_branch_without_placeholder_consumer(self) -> None:
+        queue = NodeSpec(
+            id="control_done",
+            node_type="queue",
+            plugin=None,
+            input="control_done",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(extra_nodes=(queue,))
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_identity_row_union_branch_does_not_consume_same_named_queue(self) -> None:
+        queue = NodeSpec(
+            id="control_branch",
+            node_type="queue",
+            plugin=None,
+            input="control_branch",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        row_union = self._row_union(
+            input="control_branch",
+            branches={
+                "control_branch": "control_branch",
+                "treatment_branch": "treatment_branch",
+            },
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._gate(),
+                queue,
+                row_union,
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "queue_no_consumer" and error.component == "node:control_branch" for error in result.errors)
+
+    def test_row_union_rejects_downstream_aggregation_with_early_trigger(self) -> None:
+        aggregation = NodeSpec(
+            id="after_union",
+            node_type="aggregation",
+            plugin="batch_stats",
+            input="union_out",
+            on_success="output",
+            on_error="discard",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={"count": 2},
+            output_mode="transform",
+        )
+        state = self._state()
+        state = replace(
+            state,
+            nodes=tuple(aggregation if node.id == "after_union" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        group_error = next(
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "indivisible" in error.message
+        )
+        assert "count/timeout/condition trigger" in group_error.message
+
+    @pytest.mark.parametrize("barrier_type", ["coalesce", "row_union"])
+    def test_row_union_rejects_downstream_correlated_barrier(self, barrier_type: str) -> None:
+        post_union_gate = self._gate(
+            id="post_union_fork",
+            input="union_out",
+            fork_to=("downstream_a", "downstream_b"),
+        )
+        if barrier_type == "coalesce":
+            downstream_barrier = self._coalesce(
+                id="downstream_barrier",
+                input="downstream_a",
+                branches=("downstream_a", "downstream_b"),
+            )
+            tail: tuple[NodeSpec, ...] = ()
+        else:
+            downstream_barrier = self._row_union(
+                id="downstream_barrier",
+                input="downstream_a",
+                branches={
+                    "downstream_a": "downstream_a",
+                    "downstream_b": "downstream_b",
+                },
+                on_success="downstream_out",
+            )
+            tail = (self._transform("after_downstream", "downstream_out", "output"),)
+
+        state = self._state()
+        state = replace(
+            state,
+            nodes=(
+                *(node for node in state.nodes if node.id != "after_union"),
+                post_union_gate,
+                downstream_barrier,
+                *tail,
+            ),
+        )
+
+        result = state.validate()
+
+        group_error = next(
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "correlated barrier" in error.message
+        )
+        assert barrier_type in group_error.message
+        assert "downstream_barrier" in group_error.message
+
+    @pytest.mark.parametrize("branches", [None, (), ("only_branch",), {"only_branch": "control_done"}])
+    def test_row_union_requires_at_least_two_branches(self, branches: object) -> None:
+        result = self._state(row_union=self._row_union(branches=branches)).validate()
+
+        assert any(error.error_code == "row_union_branches_invalid" for error in result.errors)
+
+    @pytest.mark.parametrize("on_success", [None, "", "   "])
+    def test_row_union_requires_non_empty_on_success(self, on_success: object) -> None:
+        result = self._state(row_union=self._row_union(on_success=on_success)).validate()
+
+        assert any(error.error_code == "row_union_on_success_invalid" for error in result.errors)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("plugin", "passthrough"),
+            ("options", {"schema": {"mode": "observed"}}),
+            ("on_error", "discard"),
+            ("condition", "True"),
+            ("routes", {"true": "union_out"}),
+            ("fork_to", ("branch",)),
+            ("policy", "require_all"),
+            ("merge", "union"),
+            ("trigger", {"kind": "count"}),
+            ("output_mode", "passthrough"),
+            ("expected_output_count", 2),
+        ],
+    )
+    def test_row_union_rejects_fields_owned_by_other_node_kinds(self, field: str, value: object) -> None:
+        result = self._state(row_union=self._row_union(**{field: value})).validate()
+
+        assert any(error.error_code == "row_union_config_invalid" and field in error.message for error in result.errors), result.errors
+
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        # The two oversized ints are unrepresentable as float; classifying them
+        # INVALID must not regress the bool / NaN / inf / non-positive verdicts.
+        [True, False, float("nan"), float("inf"), 0.0, -1.0, 10**400, -(10**400)],
+    )
+    def test_row_union_rejects_invalid_timeout(self, timeout_seconds: object) -> None:
+        result = self._state(row_union=self._row_union(timeout_seconds=timeout_seconds)).validate()
+
+        assert any(error.error_code == "row_union_timeout_invalid" for error in result.errors)
+
+    def test_oversized_persisted_timeout_rejects_instead_of_overflowing(self) -> None:
+        """An oversized int from a restored session must reject, not crash.
+
+        ``timeout_seconds`` reaches ``NodeSpec.from_dict`` straight from the
+        persisted session payload, bypassing the Pydantic
+        ``_StrictTimeoutSeconds`` tool boundary. JSON has no integer ceiling,
+        so ``10**400`` survives the round trip as an ``int`` that ``float()``
+        cannot represent — ``math.isfinite`` used to raise ``OverflowError``
+        out of ``validate()`` instead of producing a rejection.
+        """
+        payload = json.loads(
+            json.dumps(
+                {
+                    "id": "variant_union",
+                    "node_type": "row_union",
+                    "plugin": None,
+                    "input": "control_done",
+                    "on_success": "union_out",
+                    "on_error": None,
+                    "options": {},
+                    "branches": {"control_branch": "control_done", "treatment_branch": "treatment_done"},
+                    "timeout_seconds": 10**400,
+                }
+            )
+        )
+        assert isinstance(payload["timeout_seconds"], int)
+
+        result = self._state(row_union=NodeSpec.from_dict(payload)).validate()
+
+        assert any(error.error_code == "row_union_timeout_invalid" for error in result.errors)
+
+    def test_row_union_input_is_only_first_branch_placeholder(self) -> None:
+        result = self._state(row_union=self._row_union(input="treatment_done")).validate()
+
+        assert any(error.error_code == "row_union_input_mismatch" for error in result.errors)
+
+    @pytest.mark.parametrize(
+        "branches",
+        [
+            {"__control": "control_done", "treatment_branch": "treatment_done"},
+            {"control_branch": "__control_done", "treatment_branch": "treatment_done"},
+        ],
+    )
+    def test_row_union_branch_aliases_and_connections_obey_connection_name_rules(
+        self,
+        branches: dict[str, str],
+    ) -> None:
+        row_union = self._row_union(input=next(iter(branches.values())), branches=branches)
+        result = self._state(row_union=row_union).validate()
+
+        assert any(error.error_code == "row_union_branch_invalid" for error in result.errors)
+
+    def test_row_union_requires_each_branch_alias_and_value_to_be_reachable(self) -> None:
+        row_union = self._row_union(
+            branches={
+                "control_branch": "control_done",
+                "unforked_branch": "missing_connection",
+            }
+        )
+        result = self._state(row_union=row_union).validate()
+        codes = {error.error_code for error in result.errors}
+
+        assert "row_union_branch_alias_unreachable" in codes
+        assert "row_union_branch_unreachable" in codes
+
+    def test_row_union_claims_every_branch_value_as_a_consumer(self) -> None:
+        competing = self._transform("competing", "treatment_done", "unused")
+        state = self._state(
+            extra_nodes=(competing,),
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_row_union_on_success_must_feed_a_processing_node(self) -> None:
+        row_union = self._row_union(on_success="output")
+        result = self._state(row_union=row_union).validate()
+
+        assert any(error.error_code == "row_union_on_success_must_be_connection" for error in result.errors)
+
+    def test_row_union_output_schema_is_observed_and_abstains_from_guarantee_propagation(self) -> None:
+        state = self._state(
+            tail_options={
+                "required_input_fields": ["id"],
+                "schema": {"mode": "observed"},
+            }
+        )
+        state = replace(
+            state,
+            sources={
+                "source": self._source(
+                    schema={
+                        "mode": "fixed",
+                        "fields": ["id: str"],
+                        "guaranteed_fields": ["id"],
+                    }
+                )
+            },
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        assert not any(contract.to_id == "after_union" for contract in result.edge_contracts)
+        assert any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)

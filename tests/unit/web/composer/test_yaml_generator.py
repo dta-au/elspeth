@@ -184,6 +184,76 @@ def _make_fork_coalesce_pipeline() -> CompositionState:
     )
 
 
+def _make_row_union_pipeline() -> CompositionState:
+    """Source -> fork gate -> two ordered row unions -> sink."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="fork_in",
+            options={"schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="fork_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "discard"},
+                fork_to=("control_branch", "treatment_branch"),
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="variants",
+                node_type="row_union",
+                plugin=None,
+                input="control_scored",
+                on_success="compared",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={
+                    "control_branch": "control_scored",
+                    "treatment_branch": "treatment_scored",
+                },
+                policy=None,
+                merge=None,
+                timeout_seconds=3.5,
+            ),
+            NodeSpec(
+                id="audit_variants",
+                node_type="row_union",
+                plugin=None,
+                input="audit_control",
+                on_success="output",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={
+                    "audit_control_branch": "audit_control",
+                    "audit_treatment_branch": "audit_treatment",
+                },
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(OutputSpec(name="output", plugin="json", options={}, on_write_failure="discard"),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
 def _make_named_sources_pipeline() -> CompositionState:
     return CompositionState(
         source=None,
@@ -1288,6 +1358,94 @@ class TestGenerateYaml:
         parsed = yaml.safe_load(yaml_str)
         # Empty state should produce an empty YAML doc (no source, no sinks)
         assert parsed is None or parsed == {}
+
+
+class TestGenerateRowUnionYaml:
+    def test_row_unions_emit_exact_runtime_shape_in_declared_order(self) -> None:
+        pipeline_dict = generate_pipeline_dict(_make_row_union_pipeline())
+
+        assert pipeline_dict["row_unions"] == [
+            {
+                "name": "variants",
+                "branches": {
+                    "control_branch": "control_scored",
+                    "treatment_branch": "treatment_scored",
+                },
+                "on_success": "compared",
+                "timeout_seconds": 3.5,
+            },
+            {
+                "name": "audit_variants",
+                "branches": {
+                    "audit_control_branch": "audit_control",
+                    "audit_treatment_branch": "audit_treatment",
+                },
+                "on_success": "output",
+            },
+        ]
+
+    def test_row_union_never_emits_synthetic_input_or_inapplicable_fields(self) -> None:
+        row_union = generate_pipeline_dict(_make_row_union_pipeline())["row_unions"][0]
+
+        assert set(row_union) == {"name", "branches", "on_success", "timeout_seconds"}
+        assert not {"plugin", "options", "input", "policy", "merge"} & row_union.keys()
+
+    def test_row_unions_are_in_canonical_section_order(self) -> None:
+        keys = list(generate_pipeline_dict(_make_row_union_pipeline()))
+
+        assert keys.index("sources") < keys.index("gates") < keys.index("row_unions") < keys.index("sinks")
+
+    def test_coalesce_timeout_is_preserved(self) -> None:
+        state = _make_fork_coalesce_pipeline()
+        coalesce = replace(state.nodes[1], timeout_seconds=6.25)
+
+        generated = generate_pipeline_dict(state.with_node(coalesce))
+
+        assert generated["coalesce"][0]["timeout_seconds"] == 6.25
+
+    def test_generated_row_union_yaml_reimports_to_equivalent_composer_state(self) -> None:
+        original = _make_row_union_pipeline()
+
+        reimported = composition_state_from_runtime_yaml(generate_yaml(original))
+
+        assert reimported.to_dict() == original.to_dict()
+
+    def test_imported_row_union_yaml_regenerates_equivalently(self) -> None:
+        imported = composition_state_from_runtime_yaml(
+            """
+row_unions:
+  - name: variants
+    branches:
+      control_branch: control_scored
+      treatment_branch: treatment_scored
+    on_success: compared
+    timeout_seconds: 8.5
+"""
+        )
+
+        assert yaml.safe_load(generate_yaml(imported))["row_unions"] == [
+            {
+                "name": "variants",
+                "branches": {
+                    "control_branch": "control_scored",
+                    "treatment_branch": "treatment_scored",
+                },
+                "on_success": "compared",
+                "timeout_seconds": 8.5,
+            }
+        ]
+
+    def test_generator_fails_closed_when_supported_node_lowering_drifts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.web.composer import yaml_generator
+
+        monkeypatch.setattr(
+            yaml_generator,
+            "_YAML_LOWERED_NODE_TYPES",
+            yaml_generator._YAML_LOWERED_NODE_TYPES | {"future_structural_node"},
+        )
+
+        with pytest.raises(RuntimeError, match="Composer node type lowering drift"):
+            generate_pipeline_dict(_make_linear_pipeline())
 
 
 def _queue_node(*, description: str | None = None) -> NodeSpec:

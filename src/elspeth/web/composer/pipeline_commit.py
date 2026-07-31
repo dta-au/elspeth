@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 from uuid import UUID
 
+from pydantic import JsonValue
 from sqlalchemy import Engine
 
 from elspeth.contracts.composer_audit import (
@@ -27,6 +28,11 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
+from elspeth.web.composer.authority_hashing import (
+    composer_authority_hash,
+    project_composer_authority_payload,
+    restore_composer_authority_payload,
+)
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import CompositionState
@@ -48,10 +54,39 @@ def _reject_duplicate_json_object_keys(pairs: list[tuple[str, object]]) -> dict[
     return restored
 
 
-def _validate_exact_canonical_json(payload: str) -> None:
+def _validate_exact_canonical_json(payload: str) -> dict[str, JsonValue]:
     restored = json.loads(payload, object_pairs_hook=_reject_duplicate_json_object_keys)
+    if type(restored) is not dict:
+        raise AuditIntegrityError("persisted pipeline dispatch canonical payload must be a JSON object")
     if primitive_canonical_json(restored) != payload:
         raise AuditIntegrityError("persisted pipeline dispatch canonical payload is not the exact canonical representation")
+    return cast(dict[str, JsonValue], restored)
+
+
+def _validate_pipeline_authority_binding(
+    *,
+    arguments_canonical: str,
+    arguments_hash: str,
+    authority_arguments_canonical: object,
+    authority_arguments_hash: object,
+) -> str:
+    _validate_exact_canonical_json(arguments_canonical)
+    if hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest() != arguments_hash:
+        raise AuditIntegrityError("pipeline dispatch generic arguments hash is malformed")
+    if type(authority_arguments_canonical) is not str or type(authority_arguments_hash) is not str:
+        raise AuditIntegrityError("pipeline dispatch authority arguments binding is missing")
+    authority = _validate_exact_canonical_json(authority_arguments_canonical)
+    if hashlib.sha256(authority_arguments_canonical.encode("utf-8")).hexdigest() != authority_arguments_hash:
+        raise AuditIntegrityError("pipeline dispatch authority arguments hash is malformed")
+    try:
+        restored = restore_composer_authority_payload(authority)
+    except ValueError as exc:
+        raise AuditIntegrityError("pipeline dispatch authority projection is malformed") from exc
+    if primitive_canonical_json(restored) != arguments_canonical:
+        raise AuditIntegrityError("pipeline dispatch authority projection differs from generic arguments")
+    if primitive_canonical_json(project_composer_authority_payload(restored)) != authority_arguments_canonical:
+        raise AuditIntegrityError("pipeline dispatch authority projection is not reversible")
+    return authority_arguments_hash
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,13 +115,22 @@ class PipelineDispatchAuditBinding:
     def from_invocation(cls, invocation: ComposerToolInvocation) -> PipelineDispatchAuditBinding:
         if type(invocation) is not ComposerToolInvocation:
             raise TypeError("invocation must be an exact ComposerToolInvocation")
-        if invocation.result_hash is None:
+        if invocation.result_canonical is None or invocation.result_hash is None:
             raise AuditIntegrityError("successful pipeline dispatch is missing result_hash")
+        arguments_hash = _validate_pipeline_authority_binding(
+            arguments_canonical=invocation.arguments_canonical,
+            arguments_hash=invocation.arguments_hash,
+            authority_arguments_canonical=invocation.authority_arguments_canonical,
+            authority_arguments_hash=invocation.authority_arguments_hash,
+        )
+        _validate_exact_canonical_json(invocation.result_canonical)
+        if hashlib.sha256(invocation.result_canonical.encode("utf-8")).hexdigest() != invocation.result_hash:
+            raise AuditIntegrityError("pipeline dispatch result hash is malformed")
         return cls(
             tool_call_id=invocation.tool_call_id,
             tool_name=invocation.tool_name,
             status=invocation.status,
-            arguments_hash=invocation.arguments_hash,
+            arguments_hash=arguments_hash,
             result_hash=invocation.result_hash,
         )
 
@@ -99,29 +143,36 @@ class PipelineDispatchAuditBinding:
         if type(invocation) is not dict:
             raise AuditIntegrityError("persisted pipeline dispatch invocation is malformed")
         arguments_canonical = invocation.get("arguments_canonical")
+        arguments_hash = invocation.get("arguments_hash")
+        authority_arguments_canonical = invocation.get("authority_arguments_canonical")
+        authority_arguments_hash = invocation.get("authority_arguments_hash")
         result_canonical = invocation.get("result_canonical")
         raw_status = invocation.get("status")
         tool_call_id = invocation.get("tool_call_id")
         tool_name = invocation.get("tool_name")
-        if type(arguments_canonical) is not str or type(result_canonical) is not str:
+        if type(arguments_canonical) is not str or type(arguments_hash) is not str or type(result_canonical) is not str:
             raise AuditIntegrityError("persisted successful pipeline dispatch canonical payloads are malformed")
         if type(raw_status) is not str or type(tool_call_id) is not str or type(tool_name) is not str:
             raise AuditIntegrityError("persisted pipeline dispatch scalar fields are malformed")
         try:
-            _validate_exact_canonical_json(arguments_canonical)
+            validated_authority_hash = _validate_pipeline_authority_binding(
+                arguments_canonical=arguments_canonical,
+                arguments_hash=arguments_hash,
+                authority_arguments_canonical=authority_arguments_canonical,
+                authority_arguments_hash=authority_arguments_hash,
+            )
             _validate_exact_canonical_json(result_canonical)
-            arguments_hash = hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest()
             result_hash = hashlib.sha256(result_canonical.encode("utf-8")).hexdigest()
             status = ComposerToolStatus(raw_status)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AuditIntegrityError("persisted pipeline dispatch payload is malformed") from exc
-        if invocation.get("arguments_hash") != arguments_hash or invocation.get("result_hash") != result_hash:
+        if invocation.get("result_hash") != result_hash:
             raise AuditIntegrityError("persisted pipeline dispatch canonical hashes are malformed")
         return cls(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             status=status,
-            arguments_hash=arguments_hash,
+            arguments_hash=validated_authority_hash,
             result_hash=result_hash,
         )
 
@@ -291,7 +342,7 @@ async def prepare_pipeline_proposal_commit(
     pipeline_arguments = deep_thaw(authority.proposal.pipeline)
     if type(pipeline_arguments) is not dict:
         raise AuditIntegrityError("authoritative pipeline arguments must thaw to an exact mapping")
-    if stable_hash(pipeline_arguments) != authority.row.tool_arguments_hash:
+    if composer_authority_hash(pipeline_arguments) != authority.row.tool_arguments_hash:
         raise AuditIntegrityError("authoritative pipeline arguments do not match the proposal row")
 
     deadline = asyncio.get_running_loop().time() + float(config.timeout_seconds)
@@ -418,7 +469,7 @@ async def prepare_pipeline_proposal_commit(
     if len(captured) != 1:
         raise AuditIntegrityError("pipeline commit dispatch must produce exactly one audit invocation")
     invocation = captured[0]
-    if invocation.tool_call_id != authority.row.tool_call_id or invocation.arguments_hash != authority.row.tool_arguments_hash:
+    if invocation.tool_call_id != authority.row.tool_call_id or invocation.authority_arguments_hash != authority.row.tool_arguments_hash:
         raise AuditIntegrityError("pipeline commit dispatch audit does not bind exact proposal arguments")
     executor_hash = composition_content_hash(result.updated_state)
     invocation = _bind_executor_content_hash(invocation, executor_content_hash=executor_hash)

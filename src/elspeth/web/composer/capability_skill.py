@@ -45,6 +45,7 @@ CAPABILITY_CORE_NODE_GUIDANCE: Final[Mapping[str, str]] = MappingProxyType(
         "coalesce": "[capability-node:coalesce]",
         "gate": "[capability-node:gate]",
         "queue": "[capability-node:queue]",
+        "row_union": "[capability-node:row_union]",
         "transform": "[capability-node:transform]",
     }
 )

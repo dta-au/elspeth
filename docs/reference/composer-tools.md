@@ -219,23 +219,25 @@ Set or replace the pipeline source.
 
 ### `upsert_node`
 
-Add or update a pipeline node — transforms, gates, aggregations, or coalesces.
+Add or update a pipeline node — transforms, gates, aggregations, coalesces,
+row unions, or queues.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | **Yes** | Unique node identifier (e.g. `"classifier"`, `"quality_gate"`) |
-| `node_type` | string | **Yes** | `"transform"`, `"gate"`, `"aggregation"`, or `"coalesce"` |
+| `node_type` | string | **Yes** | `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, or `queue` |
 | `input` | string | **Yes** | Input connection name (must match an upstream `on_success`) |
-| `plugin` | string | No | Plugin name. Required for transforms and aggregations. Null for gates and coalesces. |
-| `on_success` | string | No | Output connection name. Required for transforms. Null for gates (which use routes). |
+| `plugin` | string | No | Plugin name. Required for transforms and aggregations. Null for gates, coalesces, row unions, and queues. |
+| `on_success` | string | No | Output connection name. Required for transforms and row unions. Null for gates and queues. |
 | `on_error` | string | No | Error output — a sink name or `"discard"` |
 | `options` | object | No | Plugin-specific configuration |
 | `condition` | string | No | Gate expression (gates only) |
 | `routes` | object | No | Gate route mapping to a sink name, downstream connection name, `"fork"`, or virtual `"discard"` target, e.g. `{"true": "sink_name", "false": "discard"}` (gates only) |
 | `fork_to` | array | No | Fork destination connection names (fork gates only) |
-| `branches` | array | No | Branch input connection names (coalesce only, min 2) |
+| `branches` | array or object | No | Ordered branch inputs for coalesces and row unions (min 2). List form is shorthand for an identity mapping; object form maps each branch name to its input connection. |
 | `policy` | string | No | Coalesce policy: `"require_all"`, `"quorum"`, `"best_effort"`, `"first"` |
 | `merge` | string | No | Coalesce merge strategy: `"union"`, `"nested"`, `"select"` |
+| `timeout_seconds` | number | No | Optional finite positive structural-barrier timeout for `coalesce` or `row_union`; this is a top-level node field, not `trigger.timeout_seconds`. |
 
 **Behaviour:** If a node with the given `id` already exists, it is replaced. The `id` must be unique across all node types.
 
@@ -243,21 +245,31 @@ Add or update a pipeline node — transforms, gates, aggregations, or coalesces.
 
 | Type | Required fields | Key behaviour |
 |------|----------------|---------------|
-| `transform` | `plugin`, `on_success` | Processes rows, emits to on_success |
+| `transform` | `plugin`, `on_success` | Processes rows, emits to `on_success` |
 | `gate` | `condition`, `routes` | Evaluates condition, routes by result |
 | `aggregation` | `plugin` | Batches rows until trigger fires |
-| `coalesce` | `branches` | Merges tokens from parallel fork paths |
+| `coalesce` | `branches`, `policy` | Waits according to `policy`, then merges correlated branch payloads according to `merge` |
+| `row_union` | `branches`, `on_success` | A plugin-free, fixed `require_all` N-to-N barrier that releases every original row unchanged in declared branch order |
+| `queue` | `id == input` | Declares a shared pass-through connection for multiple producers; omit plugin and routing fields, and use only an optional `options.description` |
 
-**Not yet representable: queue fan-in.** The runtime supports multi-producer
-fan-in through pass-through queue nodes — a top-level `queues:` section in
-settings YAML (see [ADR-025](../architecture/adr/025-multi-source-ingestion.md)
-and [Queue Settings](configuration.md#queue-settings)) — but composer state has
-no `queue` node type. `upsert_node` and `set_pipeline` cannot create one, and
-YAML import drops a `queues:` section before validation, which then reports the
-fan-in as a duplicate-producer error. Until composer queue support lands
-(tracked as elspeth-a5b86149d4 and elspeth-6421ffa028), fan-in inside the
-composer is limited to sinks; cross-branch statistics need the wide-row pattern
-instead (fork → coalesce or multi-query LLM → per-field aggregations).
+For `row_union`, branch order is significant. Mapping keys must match the
+upstream gate's `fork_to` names and mapping values name the connection published
+by each branch's final transform. `input` must equal the first branch connection
+(it is a serialization placeholder), and `on_success` must name a downstream
+processing connection, never a sink. A row union does not accept `policy`,
+`merge`, `options`, or routing fields.
+
+**Structural fan-in choices.** Composer represents all three:
+
+- A `queue` is a pass-through coordination point for multiple producers feeding
+  one shared connection. It does not wait for correlated fork branches or merge
+  their payloads. Set the queue's `id` and `input` to that connection name; see
+  [Queue Settings](configuration.md#queue-settings).
+- A `row_union` reconverges correlated fork branches N-to-N: it waits for every
+  branch in the group, then releases all original rows to downstream processing.
+- A `coalesce` reconverges correlated fork branches N-to-1: its `policy` controls
+  which arrivals are sufficient and its `merge` strategy combines them into one
+  payload. See [Coalesce Settings](configuration.md#coalesce-settings).
 
 ---
 
@@ -387,7 +399,7 @@ Atomically replace the entire pipeline in one call.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `source` | object | **Yes** | `{plugin, options, on_success, on_validation_failure?}` |
-| `nodes` | array | **Yes** | Array of node specs: `[{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, routes?, fork_to?, branches?, policy?, merge?}]` |
+| `nodes` | array | **Yes** | Array of `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, or `queue` node specs: `[{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, routes?, fork_to?, branches?, policy?, merge?, timeout_seconds?}]` |
 | `edges` | array | **Yes** | Array of edge specs: `[{id, from_node, to_node, edge_type}]` |
 | `outputs` | array | **Yes** | Array of output specs: `[{name, plugin, options, on_write_failure?}]` |
 | `metadata` | object | No | `{name?, description?}` |

@@ -459,7 +459,12 @@ def test_tool_mode_builds_streaming_hook_guarded_options(monkeypatch: pytest.Mon
 
 
 def test_static_policy_hash_is_pinned() -> None:
-    assert JUDGE_POLICY_HASH == "sha256:9596c10b1b731a89f37ec4cd2bcc4c3ce6e19f6c66cf9568dc74683536df522b"
+    # Rotated 2026-07-31 by ADR-032 (validate by trust domain): the policy's
+    # attribute-presence-probing section withdrew the runtime-checkable-Protocol
+    # option and added the external-boundary parse-don't-validate branch.
+    # Recorded per-entry ``judge_policy_hash`` values are historical and are not
+    # compared against this constant, so no allowlist entry or signature moves.
+    assert JUDGE_POLICY_HASH == "sha256:3d1331ac24efb27419e00d8385fd4dd4889a76e148efa37fa125348e31cdc1d4"
 
 
 def test_tool_mode_turn_budget_exhaustion_is_classified(monkeypatch: pytest.MonkeyPatch, scope: AgentToolScope) -> None:

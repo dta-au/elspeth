@@ -179,6 +179,38 @@ def test_declarative_nested_tool_result_envelopes_scrub_external_scalars() -> No
     assert _EXTERNAL_SCALAR_CANARY not in serialized
 
 
+def test_type_driven_tool_result_accepts_and_scrubs_row_union_schema_facts() -> None:
+    response = _tool_result_canary_response(success=False)
+    response["validation"]["errors"][0]["row_union_schema"] = {
+        "branches": [
+            {
+                "branch": _EXTERNAL_SCALAR_CANARY,
+                "mode": "flexible",
+                "fields": [
+                    {
+                        "name": _EXTERNAL_SCALAR_CANARY,
+                        "field_type": "str",
+                        "required": True,
+                        "nullable": False,
+                    }
+                ],
+            }
+        ],
+        "conflicting_fields": [_EXTERNAL_SCALAR_CANARY],
+    }
+
+    result = redact_tool_call_response(
+        "set_source",
+        response,
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    schema_facts = result["validation"]["errors"][0]["row_union_schema"]
+    assert schema_facts["branches"][0]["fields"][0]["required"] is True
+    assert schema_facts["branches"][0]["fields"][0]["nullable"] is False
+    assert _EXTERNAL_SCALAR_CANARY not in json.dumps(schema_facts, sort_keys=True)
+
+
 @pytest.mark.parametrize("tool_name", ["set_source", "upsert_node"])
 def test_repair_argument_summary_never_exposes_arbitrary_key_names(tool_name: str) -> None:
     key_canary = "RAW_KEY_CANARY_/private/operator/path_sk-secret"

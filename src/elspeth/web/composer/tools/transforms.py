@@ -13,6 +13,7 @@ from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchNodeOptionsArgumentsModel,
     SpliceTransformArgumentsModel,
+    _StrictTimeoutSeconds,
 )
 from elspeth.web.composer.state import (
     CoalesceBranches,
@@ -42,8 +43,10 @@ from elspeth.web.composer.tools._common import (
     _mutation_result,
     _options_with_default_llm_reviews,
     _plugin_policy_failure,
+    _post_mutation_invariant_error,
     _prevalidate_transform_for_context,
     _reserved_connection_names,
+    _row_union_node_contract_error,
     _runtime_owned_llm_option_error,
     _validate_aggregation_trigger,
     _validate_mutation_arguments,
@@ -81,6 +84,7 @@ class _UpsertNodeArgumentsModel(BaseModel):
     trigger: dict[str, Any] | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
+    timeout_seconds: _StrictTimeoutSeconds | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -156,11 +160,11 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "id": {"type": "string", "description": "Unique node identifier."},
         "node_type": {
             "type": "string",
-            "enum": ["transform", "gate", "aggregation", "coalesce", "queue"],
+            "enum": ["transform", "gate", "aggregation", "coalesce", "row_union", "queue"],
         },
         "plugin": {
             "type": ["string", "null"],
-            "description": "Plugin name. Required for transform/aggregation. Null for gate/coalesce.",
+            "description": "Plugin name. Required for transform/aggregation. Null for gate/coalesce/row_union/queue.",
         },
         "input": {
             "type": "string",
@@ -175,10 +179,12 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "on_success": {
             "type": ["string", "null"],
             "description": (
-                "Output connection. Required for transform/aggregation/coalesce. Null for "
-                "gates (routing is via condition/routes). When set, this is the connection-name "
-                "string the node PUBLISHES — some downstream input/sink_name MUST equal this "
-                "value. The runtime matches strings, not topology."
+                "Output connection. Required for transform/aggregation/row_union. Null for gates "
+                "(routing is via condition/routes). A row_union MUST publish to a downstream "
+                "processing connection, never directly to a sink. A coalesce normally publishes "
+                "under its own node id; its optional on_success may name only a sink. For ordinary "
+                "nodes this connection-name string is consumed by some downstream input/sink_name. "
+                "The runtime matches strings, not topology."
             ),
             "examples": ["fetched_text", "scored_rows", "lines_out"],
         },
@@ -203,9 +209,10 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "additionalProperties": {"type": "string"},
             "description": (
-                "Branches to merge (coalesce only). Use list form when branch identity and input "
-                "connection are the same, or object form {branch_name: input_connection} when a "
-                "branch flows through transforms before coalescing."
+                "Branch inputs for coalesce or row_union. Use list form when branch identity and "
+                "input connection are the same, or object form {branch_name: input_connection} "
+                "when a branch flows through transforms. A row_union consumes EVERY branches "
+                "value as a real input and releases the original rows without merging fields."
             ),
         },
         "policy": {"type": ["string", "null"], "description": "Merge trigger policy (coalesce only)."},
@@ -239,6 +246,13 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "expected_output_count": {
             "type": ["integer", "null"],
             "description": "Expected number of output rows from aggregation (aggregation only). Optional; omit when output count depends on group_by distinct values.",
+        },
+        "timeout_seconds": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "description": (
+                "Optional finite positive structural-barrier timeout in seconds (coalesce/row_union only). Omit for every other node type."
+            ),
         },
     },
     "required": ["id", "node_type", "input"],
@@ -289,6 +303,10 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "transform/aggregation use plugin+options; "
         "gate uses condition+routes (or fork_to); "
         "coalesce uses branches+policy+merge; "
+        "row_union is a plugin-free require_all N-to-N barrier: provide at least "
+        "two ordered branches, set input to the first branch connection, set "
+        "on_success to a processing connection (never a sink), omit policy/merge/"
+        "options/routing fields, and optionally set a finite positive timeout_seconds; "
         "queue is a structural fan-in point — set id == input to the shared "
         "connection name, omit plugin and every routing field (on_success/"
         "on_error/routes/fork_to), and options accepts only an optional "
@@ -462,6 +480,7 @@ def _execute_upsert_queue_node(
         trigger=validated.trigger,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
+        timeout_seconds=validated.timeout_seconds,
     )
     contract_error = queue_node_contract_error(node)
     if contract_error is not None:
@@ -607,9 +626,22 @@ def _execute_upsert_node(
         trigger=validated.trigger,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
+        timeout_seconds=validated.timeout_seconds,
     )
 
+    row_union_contract_error = _row_union_node_contract_error(
+        node,
+        output_names=frozenset(output.name for output in state.outputs),
+    )
+    if row_union_contract_error is not None:
+        message, error_code = row_union_contract_error
+        return _failure_result(state, message, error_code=error_code)
+
     proposed_state = state.with_node(node)
+    invariant_error = _post_mutation_invariant_error(proposed_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError):
@@ -1073,6 +1105,10 @@ def _execute_upsert_edge(
                     if node.fork_to != fork_targets:
                         new_state = new_state.with_node(replace(node, fork_to=fork_targets))
 
+    invariant_error = _post_mutation_invariant_error(new_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     return _mutation_result(new_state, (from_node, to_node))
 
 
@@ -1282,6 +1318,10 @@ def _execute_patch_node_options(
     if queue_contract_error is not None:
         return _failure_result(state, queue_contract_error)
     proposed_state = state.with_node(new_node)
+    invariant_error = _post_mutation_invariant_error(proposed_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
     except (KeyError, TypeError, ValueError):

@@ -4,7 +4,16 @@ import dagre from "@dagrejs/dagre";
 export interface ReadOnlyPipelineGraphNode {
   id: string;
   label: string;
-  kind: "source" | "transform" | "gate" | "aggregation" | "queue" | "coalesce" | "output" | "discard";
+  kind:
+    | "source"
+    | "transform"
+    | "gate"
+    | "aggregation"
+    | "queue"
+    | "coalesce"
+    | "row_union"
+    | "output"
+    | "discard";
   subtitle: string | null;
 }
 
@@ -26,6 +35,8 @@ interface ReadOnlyPipelineGraphProps {
 const NODE_WIDTH = 168;
 const NODE_HEIGHT = 62;
 const GRAPH_PADDING = 32;
+const EDGE_LABEL_VERTICAL_PADDING = 12;
+const EDGE_LABEL_DY = -5;
 
 interface PositionedNode extends ReadOnlyPipelineGraphNode {
   x: number;
@@ -56,11 +67,80 @@ function layoutGraph(
   };
 }
 
-function edgePath(source: PositionedNode, target: PositionedNode): string {
+function edgePath(
+  source: PositionedNode,
+  target: PositionedNode,
+  laneOffset: number,
+): string {
   const startX = source.x + NODE_WIDTH / 2;
   const endX = target.x - NODE_WIDTH / 2;
   const bend = Math.max(24, (endX - startX) / 2);
-  return `M ${startX} ${source.y} C ${startX + bend} ${source.y}, ${endX - bend} ${target.y}, ${endX} ${target.y}`;
+  return (
+    `M ${startX} ${source.y} `
+    + `C ${startX + bend} ${source.y + laneOffset}, `
+    + `${endX - bend} ${target.y + laneOffset}, ${endX} ${target.y}`
+  );
+}
+
+function edgeLaneOffsets(
+  edges: ReadOnlyPipelineGraphEdge[],
+): Map<string, number> {
+  const edgeIdsByEndpoints = new Map<string, string[]>();
+  for (const edge of edges) {
+    const key = `${edge.source.length}:${edge.source}|${edge.target.length}:${edge.target}`;
+    const ids = edgeIdsByEndpoints.get(key) ?? [];
+    ids.push(edge.id);
+    edgeIdsByEndpoints.set(key, ids);
+  }
+  const offsets = new Map<string, number>();
+  for (const ids of edgeIdsByEndpoints.values()) {
+    ids.forEach((id, index) => {
+      offsets.set(id, (index - (ids.length - 1) / 2) * 22);
+    });
+  }
+  return offsets;
+}
+
+function edgeMidpointY(
+  source: PositionedNode,
+  target: PositionedNode,
+  laneOffset: number,
+): number {
+  // At t=0.5, the cubic weights are 1/8, 3/8, 3/8, 1/8.
+  // Only the two control points carry laneOffset, so the path midpoint carries
+  // three quarters of that offset.
+  return (source.y + target.y) / 2 + laneOffset * 0.75;
+}
+
+function graphVerticalBounds(
+  layoutHeight: number,
+  edges: ReadOnlyPipelineGraphEdge[],
+  nodesById: ReadonlyMap<string, PositionedNode>,
+  laneOffsetByEdgeId: ReadonlyMap<string, number>,
+): { minY: number; height: number } {
+  let minY = 0;
+  let maxY = layoutHeight;
+  for (const edge of edges) {
+    const source = nodesById.get(edge.source);
+    const target = nodesById.get(edge.target);
+    if (source === undefined || target === undefined) continue;
+
+    const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
+    const labelY = edgeMidpointY(source, target, laneOffset) + EDGE_LABEL_DY;
+    minY = Math.min(
+      minY,
+      source.y + laneOffset,
+      target.y + laneOffset,
+      labelY - EDGE_LABEL_VERTICAL_PADDING,
+    );
+    maxY = Math.max(
+      maxY,
+      source.y + laneOffset,
+      target.y + laneOffset,
+      labelY + EDGE_LABEL_VERTICAL_PADDING,
+    );
+  }
+  return { minY, height: maxY - minY };
 }
 
 /**
@@ -78,12 +158,26 @@ export function ReadOnlyPipelineGraph({
     () => new Map(layout.nodes.map((node) => [node.id, node])),
     [layout.nodes],
   );
+  const laneOffsetByEdgeId = useMemo(
+    () => edgeLaneOffsets(edges),
+    [edges],
+  );
+  const verticalBounds = useMemo(
+    () =>
+      graphVerticalBounds(
+        layout.height,
+        edges,
+        byId,
+        laneOffsetByEdgeId,
+      ),
+    [layout.height, edges, byId, laneOffsetByEdgeId],
+  );
 
   return (
     <div className="guided-readonly-graph">
       <svg
         className="guided-readonly-graph__canvas"
-        viewBox={`0 0 ${layout.width} ${layout.height}`}
+        viewBox={`0 ${verticalBounds.minY} ${layout.width} ${verticalBounds.height}`}
         role="img"
         aria-labelledby={titleId}
       >
@@ -95,17 +189,31 @@ export function ReadOnlyPipelineGraph({
             if (source === undefined || target === undefined) {
               throw new Error(`ReadOnlyPipelineGraph edge ${edge.id} has an unresolved endpoint`);
             }
+            const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
+            const labelX = (source.x + target.x) / 2;
+            const labelY = edgeMidpointY(source, target, laneOffset);
             return (
-              <path
-                key={edge.id}
-                data-edge-id={edge.id}
-                className={
-                  edge.isError
-                    ? "guided-readonly-graph__edge guided-readonly-graph__edge--error"
-                    : "guided-readonly-graph__edge"
-                }
-                d={edgePath(source, target)}
-              />
+              <g key={edge.id}>
+                <path
+                  data-edge-id={edge.id}
+                  className={
+                    edge.isError
+                      ? "guided-readonly-graph__edge guided-readonly-graph__edge--error"
+                      : "guided-readonly-graph__edge"
+                  }
+                  d={edgePath(source, target, laneOffset)}
+                />
+                <text
+                  data-edge-id={edge.id}
+                  className="guided-readonly-graph__edge-label"
+                  x={labelX}
+                  y={labelY}
+                  dy={EDGE_LABEL_DY}
+                  textAnchor="middle"
+                >
+                  {edge.label}
+                </text>
+              </g>
             );
           })}
         </g>

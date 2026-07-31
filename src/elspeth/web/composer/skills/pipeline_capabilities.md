@@ -89,11 +89,23 @@ are the routing contract: a producer's `on_success`, `on_error`, `routes`, or
   ONLY the connections named in its `branches` values; its own `input` field
   is schema-required but is not a consuming binding — set it to the first
   branch's arriving connection by convention.
+- [capability-node:row_union] A `row_union` is a plugin-free, correlated
+  barrier that waits for every declared fork branch, then releases the
+  original branch rows in declared order without merging fields. Declare at
+  least two ordered `branches` as `{branch_name: input_connection}`; list form
+  normalizes to an identity mapping. Every branch value is a consuming
+  binding. The schema-required `input` is only an adapter placeholder and must
+  equal the first branch value. Set required `on_success` to a downstream
+  processing connection, never a sink. Optional top-level `timeout_seconds`
+  must be finite and positive. A row union publishes an observed schema and
+  does not invent field guarantees from its branches. Omit `plugin`, `options`,
+  error/routing, aggregation, and coalesce-only fields.
 
 Use `fork_to` for genuine fan-out and named branches for independent paths.
 Preserve multiple sources, multiple outputs, gates, queues, aggregations,
-forks, coalesces, row expansion, and failure paths whenever the request needs
-them. Never simplify a requested DAG into a single spine merely to converge.
+forks, coalesces, row unions, row expansion, and failure paths whenever the
+request needs them. Never simplify a requested DAG into a single spine merely
+to converge.
 
 ## Canonical structural fields
 
@@ -108,7 +120,7 @@ The terminal schema is authoritative. Its covered structural families are:
 | source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `inline_blob` |
 | named_source | `plugin`, `options`, `on_success`, `on_validation_failure` |
 | inline_blob | `filename`, `mime_type`, `content`, `description` |
-| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count` |
+| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds` |
 | trigger | `count`, `timeout_seconds`, `condition` |
 | edge | `id`, `from_node`, `to_node`, `edge_type`, `label` |
 | output | `sink_name`, `plugin`, `options`, `on_write_failure` |

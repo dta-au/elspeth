@@ -21,10 +21,18 @@ not remain folded into the historical 0.7.1 notes.
   documentation indexes identify the 0.7.2 line.
 - `CHANGELOG.md` preserves the 0.7.1 session cutover at epoch 35 and assigns
   epoch-36 blob-deletion cleanup, the epoch-37 guided-plan decline contract,
-  and the epoch-38 decline replay message locator to 0.7.2.
-- `SESSION_SCHEMA_EPOCH` is 38, guided checkpoint schema is 10, and
+  the epoch-38 decline replay message locator, the epoch-39 policy refusal
+  code, and the epoch-40 coalesce timeout payload cutover to 0.7.2.
+- `SESSION_SCHEMA_EPOCH` is 40, guided checkpoint schema is 10, and
   `SQLITE_SCHEMA_EPOCH` is 30. An upgrade from 0.7.1 recreates both a stale
   session store and a Landscape store left at epoch 29.
+- Web Composer freeform and guided authoring, Composer tools, YAML
+  import/export, validation, and graph views support first-class, correlated
+  `row_union` barriers for declared-order long-format processing.
+- The row-union umbrella issue `elspeth-a5b86149d4` remains open: canonical
+  configuration, build, contract, runtime, and guided evidence is present, but
+  audit, recovery, concurrency, browser-backed round-trip, and scale acceptance
+  remains deferred.
 - No 0.7.2 tag or final release candidate has been published.
 
 ## Release Gates

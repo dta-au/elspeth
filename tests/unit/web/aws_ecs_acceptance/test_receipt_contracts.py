@@ -691,7 +691,9 @@ def test_compatibility_schema_facts_track_current_epochs() -> None:
         f"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
         "_blob_cleanup_guided_decline_and_row_union_barrier"
     )
+    assert facts["semantics_only_changes"] == "guided_coalesce_timeout_seconds_required"
     facts_a = acceptance._expected_schema_facts("A")
     assert facts_a["previous"] is None
     assert facts_a["structural_changes"] == "initial_create"
+    assert facts_a["semantics_only_changes"] == "none"
     assert facts_a["archive_export_decision"] == "not_applicable"

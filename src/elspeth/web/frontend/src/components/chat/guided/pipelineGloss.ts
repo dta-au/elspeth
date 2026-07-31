@@ -59,6 +59,10 @@ export const WRITE_JSON_PHRASE = "write a JSON file";
 export const WRITE_RESULTS_PHRASE = "write the results";
 export const SCRAPE_PAGE_PHRASE = "scrape each page";
 export const PROCESS_ROW_PHRASE = "process each row";
+export const COALESCE_PHRASE = "merge the branches";
+export const ROW_UNION_PHRASE =
+  "wait for every branch, then preserve every branch row";
+export const QUEUE_PHRASE = "interleave the incoming rows";
 
 function sourcePhrase(source: SourceSpec): string {
   const plugin = (source.plugin ?? "").toLowerCase();
@@ -76,11 +80,15 @@ function transformPhrase(node: NodeSpec): string {
     return condition ? `filter the rows (when ${condition})` : "filter the rows";
   }
   if (node.node_type === "aggregation") return "summarise the rows";
-  if (node.node_type === "coalesce") return "merge the branches";
+  if (node.node_type === "coalesce") return COALESCE_PHRASE;
+  // A row_union is correlated N-to-N fan-in: it waits for the complete
+  // branch set and then forwards each row. It neither merges branch records
+  // into one coalesced result nor interleaves uncorrelated arrivals.
+  if (node.node_type === "row_union") return ROW_UNION_PHRASE;
   // A queue is uncorrelated fan-in: many producers publish one connection name
   // and the queue interleaves those rows. NEVER merge/join/union language — it
   // does not correlate or combine schemas (contrast with coalesce above).
-  if (node.node_type === "queue") return "interleave the incoming rows";
+  if (node.node_type === "queue") return QUEUE_PHRASE;
   const plugin = (node.plugin ?? "").toLowerCase();
   if (/llm|rate|score|classif|grade/.test(plugin)) return "rate each row";
   if (/scrape|fetch|http|web/.test(plugin)) return SCRAPE_PAGE_PHRASE;

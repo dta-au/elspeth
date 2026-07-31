@@ -19,7 +19,7 @@ from pydantic import JsonValue
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
-from elspeth.web.composer.guided.connection_consumers import ConsumerIdentity, canonical_connection_consumers
+from elspeth.web.composer.guided.connection_consumers import canonical_connection_consumers
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError, evaluate_deferred_intent_coverage
 from elspeth.web.composer.guided.protocol import (
     PROPOSAL_RATIONALE_TEMPLATE,
@@ -829,7 +829,7 @@ def _node_behavior(
     *,
     route_aliases: Mapping[str, str],
     branch_aliases: Mapping[str, str],
-    coalesce_incoming_aliases: Sequence[str] | None = None,
+    barrier_incoming_aliases: Sequence[str] | None = None,
 ) -> dict[str, object]:
     if node.node_type == "transform":
         return {"kind": "transform"}
@@ -851,8 +851,8 @@ def _node_behavior(
             "output_mode": node.output_mode,
             "expected_output_count": (str(node.expected_output_count) if node.expected_output_count is not None else None),
         }
-    if node.node_type == "coalesce":
-        # A coalesce's branch aliases must EQUAL, in order, the branch aliases on
+    if node.node_type in ("coalesce", "row_union"):
+        # A correlated barrier's branch aliases must EQUAL, in order, the branch aliases on
         # its incoming flows (validate_payload, protocol.py). Those incoming edges
         # are emitted in edge_specs order — the branch-producer node order — which
         # the planner authors nondeterministically and independently of the
@@ -864,17 +864,25 @@ def _node_behavior(
         # branches.keys() only when no incoming aliases are supplied (a degenerate
         # coalesce with no branch producers, which candidate validation rejects
         # upstream anyway).
-        if coalesce_incoming_aliases is not None:
-            aliases = list(coalesce_incoming_aliases)
+        if barrier_incoming_aliases is not None:
+            aliases = list(barrier_incoming_aliases)
         else:
             branches = node.branches
             names = list(branches.keys()) if isinstance(branches, Mapping) else list(branches or ())
             aliases = [branch_aliases[name] for name in names]
+        if node.node_type == "row_union":
+            return {
+                "kind": "row_union",
+                "branch_aliases": aliases,
+                "policy": "require_all",
+                "timeout_seconds": node.timeout_seconds,
+            }
         return {
             "kind": "coalesce",
             "branch_aliases": aliases,
             "policy": node.policy,
             "merge": node.merge,
+            "timeout_seconds": node.timeout_seconds,
         }
     assert node.node_type == "gate"
     routes = _ordered_gate_routes(node)
@@ -968,20 +976,20 @@ def _build_projection(
     route_aliases = {key: proposal_structural_label("route", index) for index, key in enumerate(route_keys)}
     branch_aliases = {name: proposal_structural_label("branch", index) for index, name in enumerate(branch_names)}
 
-    # An edge INTO a coalesce arrives on a branch VALUE connection but must carry
+    # An edge INTO a correlated barrier arrives on a branch VALUE connection but must carry
     # the branch KEY's alias — validate_payload matches a coalesce's incoming
     # branch aliases against its behavior branch_aliases (keyed by the fork branch
     # name). Map each (coalesce id, value connection) to the key's alias so
     # add_targets can stamp the branch when routing a producer into the fan-in.
-    coalesce_branch_alias: dict[tuple[str, str], str] = {}
+    barrier_branch_alias: dict[tuple[str, str], str] = {}
     for node in state.nodes:
-        if node.node_type != "coalesce":
+        if node.node_type not in ("coalesce", "row_union"):
             continue
         raw_branches = node.branches
         branch_pairs = raw_branches.items() if isinstance(raw_branches, Mapping) else ((name, name) for name in (raw_branches or ()))
         for branch_key, branch_value in branch_pairs:
             if type(branch_value) is str and branch_value and branch_key in branch_aliases:
-                coalesce_branch_alias[(node_ids[node.id], branch_value)] = branch_aliases[branch_key]
+                barrier_branch_alias[(node_ids[node.id], branch_value)] = branch_aliases[branch_key]
 
     def gate_route_aliases(node: NodeSpec) -> dict[str, str]:
         assert node.node_type == "gate"
@@ -995,28 +1003,6 @@ def _build_projection(
         )
     except ValueError as exc:  # pragma: no cover - validated state and exact IDs own this invariant
         raise AuditIntegrityError("guided proposal canonical consumer identities are malformed") from exc
-
-    # ``canonical_connection_consumers`` keys consumers off ``node.input`` and
-    # ``output.name`` only. A coalesce ALSO consumes each of its branch
-    # connections (``branches`` values) — a fan-in whose branch producers publish
-    # those connections. Without registering the coalesce as their consumer, a
-    # branch output reached only through ``branches`` (e.g. the B variant's
-    # ``on_success`` in a fork/coalesce A/B) has "no canonical consumer" and the
-    # projection raises. Register the coalesce as a consumer of every branch
-    # connection it does not already consume through its own ``input``.
-    consumers = dict(consumers)
-    for coalesce_node in state.nodes:
-        if coalesce_node.node_type != "coalesce":
-            continue
-        raw_branches = coalesce_node.branches
-        branch_connections = list(raw_branches.values()) if isinstance(raw_branches, Mapping) else list(raw_branches or ())
-        identity: ConsumerIdentity = ("node", node_ids[coalesce_node.id])
-        for connection in branch_connections:
-            if type(connection) is not str or not connection:
-                continue
-            existing = consumers.get(connection, ())
-            if identity not in existing:
-                consumers[connection] = (*existing, identity)
 
     edge_specs: list[tuple[dict[str, str], dict[str, str], dict[str, object]]] = []
 
@@ -1048,12 +1034,12 @@ def _build_projection(
             raise AuditIntegrityError("guided proposal connection has no canonical consumer")
         for kind, stable_id in destinations:
             edge_flow = flow
-            # An edge into a coalesce via one of its branch connections must
+            # An edge into a correlated barrier via one of its branch connections must
             # carry that branch's alias (validate_payload rejects a branch-less
             # flow into a coalesce). The producer emitting the flow does not know
             # its consumer is a fan-in, so stamp the alias here per destination.
             if kind == "node":
-                branch_alias = coalesce_branch_alias.get((stable_id, connection))
+                branch_alias = barrier_branch_alias.get((stable_id, connection))
                 if branch_alias is not None:
                     edge_flow = {**flow, "branch": branch_alias}
             edge_specs.append((origin, _endpoint(kind, stable_id), edge_flow))
@@ -1099,6 +1085,8 @@ def _build_projection(
             if node.id in consumers:
                 add_targets(origin, node.id, {"kind": "coalesce_success", "branch": None})
             add_targets(origin, node.on_success, {"kind": "coalesce_success", "branch": None})
+        elif node.node_type == "row_union":
+            add_targets(origin, node.on_success, {"kind": "row_union_success", "branch": None})
         else:
             add_targets(origin, node.on_success, {"kind": "node_success", "branch": None})
             add_targets(origin, node.on_error, {"kind": "node_error"})
@@ -1109,6 +1097,23 @@ def _build_projection(
             output.on_write_failure,
             {"kind": "output_write_failure"},
         )
+
+    # Row-union release order is the authored ``branches`` mapping order, not
+    # the incidental order of its producer nodes. Keep the projection's incoming
+    # flows in that exact order so the public behavior and protocol validation
+    # preserve the runtime N-to-N release contract.
+    for node in state.nodes:
+        if node.node_type != "row_union" or not isinstance(node.branches, Mapping):
+            continue
+        stable_id = node_ids[node.id]
+        alias_rank = {branch_aliases[branch_name]: index for index, branch_name in enumerate(node.branches)}
+        positions = [index for index, (_origin, destination, _flow) in enumerate(edge_specs) if destination.get("stable_id") == stable_id]
+        ordered = sorted(
+            (edge_specs[index] for index in positions),
+            key=lambda spec: alias_rank[cast(str, spec[2]["branch"])],
+        )
+        for index, spec in zip(positions, ordered, strict=True):
+            edge_specs[index] = spec
 
     resolved_edge_ids = list(edge_stable_ids or (str(uuid4()) for _ in edge_specs))
     if len(resolved_edge_ids) != len(edge_specs):
@@ -1122,17 +1127,17 @@ def _build_projection(
         }
         for index, (origin, destination, flow) in enumerate(edge_specs)
     ]
-    # Branch aliases carried by each coalesce's incoming edges, in edge_specs
-    # (= wire-edge = validator ``incoming_edges``) order. A coalesce's behavior
+    # Branch aliases carried by each correlated barrier's incoming edges, in edge_specs
+    # (= wire-edge = validator ``incoming_edges``) order. A barrier's behavior
     # branch_aliases is derived from THIS so it equals its incoming flows by
     # construction, regardless of the planner's authored branch/node ordering.
-    coalesce_stable_ids = {node_ids[node.id] for node in state.nodes if node.node_type == "coalesce"}
-    coalesce_incoming_branch_aliases: dict[str, list[str]] = {}
+    barrier_stable_ids = {node_ids[node.id] for node in state.nodes if node.node_type in ("coalesce", "row_union")}
+    barrier_incoming_branch_aliases: dict[str, list[str]] = {}
     for _edge_origin, edge_destination, edge_flow in edge_specs:
         destination_id = edge_destination.get("stable_id")
         branch_alias = edge_flow.get("branch")
-        if destination_id in coalesce_stable_ids and isinstance(branch_alias, str) and branch_alias:
-            coalesce_incoming_branch_aliases.setdefault(destination_id, []).append(branch_alias)
+        if destination_id in barrier_stable_ids and isinstance(branch_alias, str) and branch_alias:
+            barrier_incoming_branch_aliases.setdefault(destination_id, []).append(branch_alias)
     nodes: list[dict[str, Any]] = [
         {
             "stable_id": node_ids[node.id],
@@ -1143,8 +1148,8 @@ def _build_projection(
                 node,
                 route_aliases=gate_route_aliases(node) if node.node_type == "gate" else {},
                 branch_aliases=branch_aliases,
-                coalesce_incoming_aliases=(
-                    coalesce_incoming_branch_aliases.get(node_ids[node.id]) if node.node_type == "coalesce" else None
+                barrier_incoming_aliases=(
+                    barrier_incoming_branch_aliases.get(node_ids[node.id]) if node.node_type in ("coalesce", "row_union") else None
                 ),
             ),
         }
@@ -1238,7 +1243,7 @@ def _projection_kind_summary(payload: Mapping[str, Any]) -> _ProjectionKindSumma
             "behavior": node["behavior"].get("kind") if isinstance(node.get("behavior"), Mapping) else None,
             "branch_aliases": (
                 node["behavior"].get("branch_aliases")
-                if isinstance(node.get("behavior"), Mapping) and node["behavior"].get("kind") == "coalesce"
+                if isinstance(node.get("behavior"), Mapping) and node["behavior"].get("kind") in ("coalesce", "row_union")
                 else None
             ),
         }

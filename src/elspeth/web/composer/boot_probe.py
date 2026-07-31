@@ -10,20 +10,35 @@ from __future__ import annotations
 
 import httpx
 
-from elspeth.web.composer.service import _litellm_acompletion
+from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 
 
 class ComposerBootConfigError(RuntimeError):
     """The configured composer sampling was rejected by the provider at boot."""
 
 
-async def probe_composer_config(*, model: str, temperature: float | None, seed: int | None) -> bool:
+async def probe_composer_config(
+    *,
+    model: str,
+    temperature: float | None,
+    seed: int | None,
+    api_base: str | None = None,
+    api_key: str | None = None,
+) -> bool:
     """Return True on successful probe, False on transient failure.
 
     Raise :class:`ComposerBootConfigError` for LiteLLM bad-request responses.
     The discriminator is the exception class, not message prose: this probe sends
     a fixed trivial prompt, so a 400 on that payload is a config rejection for
     the requested model/temperature/seed tuple.
+
+    ``api_base``/``api_key`` are the endpoint affordance (Phase 3 Task 2):
+    when the operator has pointed this role at a custom OpenAI-compatible
+    endpoint, the probe must hit that same endpoint — a probe that silently
+    validated against the provider's default endpoint while the real calls
+    go to a misconfigured custom one would defeat the entire point of
+    probing at boot. Both default to ``None`` so unconfigured deployments
+    keep sending the exact same request as before this affordance existed.
     """
     from litellm.exceptions import APIError as LiteLLMAPIError
     from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
@@ -43,6 +58,7 @@ async def probe_composer_config(*, model: str, temperature: float | None, seed: 
         kwargs["temperature"] = temperature
     if seed is not None:
         kwargs["seed"] = seed
+    _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
 
     try:
         await _litellm_acompletion(**kwargs)

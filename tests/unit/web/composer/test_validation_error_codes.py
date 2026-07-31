@@ -284,6 +284,15 @@ class TestStructuralRejectionCodes:
 
 
 class TestClosedCodeCatalogueInvariants:
+    def test_unknown_node_type_guidance_includes_row_union_n_to_n_reconvergence(self) -> None:
+        guidance = explain_validation_code("unknown_node_type")
+
+        assert guidance is not None
+        explanation, fix = guidance
+        assert "row_union" in explanation
+        assert "row_union" in fix
+        assert "N-to-N" in fix
+
     def test_schema_contract_codes_are_registered_and_explainable(self) -> None:
         for code in (
             "schema_contract_violation",
@@ -299,12 +308,90 @@ class TestClosedCodeCatalogueInvariants:
             "aggregation_missing_on_error",
             "coalesce_branch_unreachable",
             "coalesce_schema_mode_mixed",
+            "row_union_config_invalid",
+            "row_union_name_invalid",
+            "row_union_branches_invalid",
+            "row_union_branch_invalid",
+            "row_union_input_mismatch",
+            "row_union_on_success_invalid",
+            "row_union_timeout_invalid",
+            "row_union_branch_alias_unreachable",
+            "row_union_branch_unreachable",
+            "row_union_branch_origin_invalid",
+            "row_union_branch_not_downstream",
+            "row_union_branch_aggregation_invalid",
+            "row_union_nested_fork_invalid",
+            "row_union_downstream_group_invalid",
+            "row_union_schema_incompatible",
+            "row_union_on_success_must_be_connection",
+            "row_union_on_success_dangling",
+            "fork_branch_multiple_barriers",
+            "gate_duplicate_fork_branch",
         ):
             assert code in _CLOSED_VALIDATION_ERROR_CODES, code
             guidance = explain_validation_code(code)
             assert guidance is not None, f"{code} does not resolve to catalogue guidance"
             explanation, fix = guidance
             assert explanation and fix
+
+    def test_row_union_topology_codes_resolve_to_topology_guidance(self) -> None:
+        """The new codes must not fall through to the intrinsic entry.
+
+        ``explain_validation_code`` returns the first matching pattern, so a
+        mis-ordered catalogue entry would silently route a topology code to
+        the node-shape guidance ("give every branch a non-empty unique
+        alias") — the exact mis-advice the code split removes.
+        """
+        intrinsic = explain_validation_code("row_union_branch_invalid")
+        assert intrinsic is not None
+
+        origin = explain_validation_code("row_union_branch_origin_invalid")
+        assert origin is not None
+        assert origin != intrinsic
+        assert "gate" in origin[0] or "gate" in origin[1]
+
+        downstream = explain_validation_code("row_union_branch_not_downstream")
+        assert downstream is not None
+        assert downstream != intrinsic
+        assert downstream != origin
+        assert "downstream" in downstream[0] or "downstream" in downstream[1]
+
+        branch_aggregation = explain_validation_code("row_union_branch_aggregation_invalid")
+        assert branch_aggregation is not None
+        assert branch_aggregation not in (intrinsic, origin, downstream)
+        assert "passthrough" in branch_aggregation[1]
+        assert "trigger" not in branch_aggregation[1]
+
+        nested_fork = explain_validation_code("row_union_nested_fork_invalid")
+        assert nested_fork is not None
+        assert nested_fork not in (intrinsic, origin, downstream, branch_aggregation)
+        assert "nested fork" in nested_fork[0].lower()
+        assert "before" in nested_fork[1] or "terminate" in nested_fork[1]
+
+        invalid_name = explain_validation_code("row_union_name_invalid")
+        assert invalid_name is not None
+        assert "name" in invalid_name[0].lower()
+        assert "letters" in invalid_name[1].lower()
+
+        downstream_group = explain_validation_code("row_union_downstream_group_invalid")
+        assert downstream_group is not None
+        assert downstream_group not in (intrinsic, origin, downstream, branch_aggregation, nested_fork)
+        assert "indivisible" in downstream_group[0] or "indivisible" in downstream_group[1]
+        assert "end_of_source" in downstream_group[1]
+        assert "branches" not in downstream_group[1]
+
+        schema_incompatible = explain_validation_code("row_union_schema_incompatible")
+        assert schema_incompatible is not None
+        assert schema_incompatible not in (intrinsic, origin, downstream, downstream_group)
+        assert "long-format" in schema_incompatible[0]
+        assert "row_union_schema" in schema_incompatible[1]
+
+        # The cross-node barrier-ownership code sits in the same cluster and
+        # must not fall through to any row_union node-shape entry either.
+        multiple_barriers = explain_validation_code("fork_branch_multiple_barriers")
+        assert multiple_barriers is not None
+        assert multiple_barriers not in (intrinsic, origin, downstream)
+        assert "barrier" in multiple_barriers[0]
 
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.

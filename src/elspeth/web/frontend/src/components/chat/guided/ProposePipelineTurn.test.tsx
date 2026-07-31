@@ -179,6 +179,7 @@ function payload(): ProposePipelinePayload {
           branch_aliases: ["branch-1", "branch-2"],
           policy: "quorum",
           merge: "nested",
+          timeout_seconds: 12.5,
         },
       },
     ],
@@ -235,7 +236,11 @@ describe("ProposePipelineTurn", () => {
     ).toBeVisible();
     expect(screen.getByText(/queue continues in sequence/i)).toBeVisible();
     expect(screen.getByText(/count 50 or timeout 10s/i)).toBeVisible();
-    expect(screen.getByText(/joins branch-1, branch-2/i)).toBeVisible();
+    expect(
+      screen.getByText(
+        /joins branch-1, branch-2 using quorum \/ nested; timeout 12.5s/i,
+      ),
+    ).toBeVisible();
     // F11: edge labels resolve route ordinals to "when <key>" while keeping
     // the ordinal alias visible.
     expect(screen.getAllByText(/when true \(route-1\) forks to branch-1/i).length).toBeGreaterThan(0);
@@ -243,6 +248,103 @@ describe("ProposePipelineTurn", () => {
     expect(screen.getAllByText(/on error → discard/i).length).toBeGreaterThan(0);
     expect(screen.getByText("source-2 · json")).toBeVisible();
     expect(screen.getByText("output-2 · csv")).toBeVisible();
+  });
+
+  it("renders row_union as a distinct N-to-N barrier with its own success flow and honest copy", () => {
+    const rowUnionPayload = payload();
+    rowUnionPayload.nodes[3] = {
+      ...rowUnionPayload.nodes[3],
+      node_type: "row_union",
+      behavior: {
+        kind: "row_union",
+        branch_aliases: ["branch-1", "branch-2"],
+        policy: "require_all",
+        timeout_seconds: 12.5,
+      },
+    };
+    rowUnionPayload.graph.edges[10] = {
+      ...rowUnionPayload.graph.edges[10],
+      flow: { kind: "row_union_success", branch: null },
+    };
+
+    const { container } = render(
+      <ProposePipelineTurn
+        payload={rowUnionPayload}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(
+      container.querySelector('[data-node-kind="row_union"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector(
+        ".guided-readonly-graph__node--row_union",
+      ),
+    ).not.toBeNull();
+    expect(
+      screen.getByText(
+        /waits for branch-1, branch-2, then forwards every row without merging records; timeout 12.5s/i,
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getAllByText(/after row union → output-1/i).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("distinguishes parallel row-union revision controls by gate-fork flow", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const rowUnionPayload = payload();
+    rowUnionPayload.nodes[3] = {
+      ...rowUnionPayload.nodes[3],
+      node_type: "row_union",
+      behavior: {
+        kind: "row_union",
+        branch_aliases: ["branch-1", "branch-2"],
+        policy: "require_all",
+        timeout_seconds: null,
+      },
+    };
+    rowUnionPayload.graph.edges[5] = {
+      ...rowUnionPayload.graph.edges[5],
+      to_endpoint: { kind: "node", stable_id: IDS.coalesce },
+    };
+    rowUnionPayload.graph.edges[6] = {
+      ...rowUnionPayload.graph.edges[6],
+      to_endpoint: { kind: "node", stable_id: IDS.coalesce },
+    };
+    rowUnionPayload.edit_targets = [
+      { kind: "edge", stable_id: edgeId(6) },
+      { kind: "edge", stable_id: edgeId(7) },
+    ];
+
+    render(
+      <ProposePipelineTurn
+        payload={rowUnionPayload}
+        reviewState={activeReview()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    const control = screen.getByRole("button", {
+      name: "Revise route from node-1 to node-4: when true (route-1) forks to branch-1",
+    });
+    const treatment = screen.getByRole("button", {
+      name: "Revise route from node-1 to node-4: when true (route-1) forks to branch-2",
+    });
+    expect(control).toHaveTextContent(
+      "Revise route from node-1 to node-4: when true (route-1) forks to branch-1",
+    );
+    expect(treatment).toHaveTextContent(
+      "Revise route from node-1 to node-4: when true (route-1) forks to branch-2",
+    );
+
+    await user.click(treatment);
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      edit_target: { kind: "edge", stable_id: edgeId(7) },
+    }));
   });
 
   it("uses fixed local copy for server template ids and never renders template ids as rationale", () => {

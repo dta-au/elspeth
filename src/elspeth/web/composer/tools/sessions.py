@@ -69,10 +69,12 @@ from elspeth.web.composer.tools._common import (
     _normalize_trusted_legacy_interpretation_requirements,
     _options_with_default_llm_reviews,
     _plugin_policy_failure,
+    _post_mutation_invariant_error,
     _prevalidate_sink,
     _prevalidate_source,
     _prevalidate_transform_for_context,
     _resolver_owned_interpretation_requirement_error,
+    _row_union_node_contract_error,
     _runtime_owned_llm_option_error,
     _semantic_contracts_payload,
     _serialize_full_pipeline_state,
@@ -1103,6 +1105,7 @@ def build_set_pipeline_candidate(
             trigger=n.trigger.model_dump() if n.trigger is not None else None,
             output_mode=n.output_mode,
             expected_output_count=n.expected_output_count,
+            timeout_seconds=n.timeout_seconds,
         )
         # Validate every queue's intrinsic shape via the single shared guard
         # BEFORE the new state is assembled/assigned below, so a malformed
@@ -1112,6 +1115,13 @@ def build_set_pipeline_candidate(
         queue_contract_error = queue_node_contract_error(node_spec)
         if queue_contract_error is not None:
             return _failure_result(state, queue_contract_error)
+        row_union_contract_error = _row_union_node_contract_error(
+            node_spec,
+            output_names=frozenset(output.sink_name for output in validated.outputs),
+        )
+        if row_union_contract_error is not None:
+            message, error_code = row_union_contract_error
+            return _failure_result(state, message, error_code=error_code)
         node_specs.append(node_spec)
 
     edge_specs = []
@@ -1158,6 +1168,10 @@ def build_set_pipeline_candidate(
         metadata=metadata_spec,
         version=state.version + 1,
     )
+    invariant_error = _post_mutation_invariant_error(new_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, new_state)
     except TypeError as exc:
@@ -1535,7 +1549,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                                 "publishes its merged rows under its own node id — a downstream "
                                 "consumer sets input='<coalesce id>' — and its on_success, when set, "
                                 "may ONLY name a sink; pointing a coalesce on_success at another "
-                                "node's input is rejected."
+                                "node's input is rejected. ROW_UNION EXCEPTION: row_union requires "
+                                "on_success to name a downstream processing connection, never a sink."
                             ),
                             "examples": ["fetched_text", "scored_rows", "lines_out"],
                         },
@@ -1554,6 +1569,11 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "type": ["array", "object", "null"],
                             "items": {"type": "string"},
                             "additionalProperties": {"type": "string"},
+                            "description": (
+                                "Branch inputs for coalesce or row_union. For row_union, every "
+                                "branches value is a real consumed input connection; input must "
+                                "repeat the first value only as an adapter placeholder."
+                            ),
                         },
                         "policy": {"type": ["string", "null"]},
                         "merge": {"type": ["string", "null"]},
@@ -1568,15 +1588,24 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                         "output_mode": {"type": ["string", "null"]},
                         "expected_output_count": {"type": ["integer", "null"]},
+                        "timeout_seconds": {
+                            "type": ["number", "null"],
+                            "exclusiveMinimum": 0,
+                            "description": ("Optional finite positive timeout for structural barrier nodes (coalesce or row_union)."),
+                        },
                     },
                     "required": ["id", "node_type", "input"],
                 },
                 "description": (
                     "Array of node specs: [{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, "
-                    "routes?, fork_to?, branches?, policy?, merge?, trigger?, output_mode?, expected_output_count?}]. "
+                    "routes?, fork_to?, branches?, policy?, merge?, trigger?, output_mode?, expected_output_count?, "
+                    "timeout_seconds?}]. "
                     "A queue node is a structural fan-in point: node_type='queue', id == input to the shared connection "
                     "name, plugin and every routing field omitted, options accepts only an optional description. "
-                    "Multiple producers may publish that connection name precisely because the queue is declared."
+                    "Multiple producers may publish that connection name precisely because the queue is declared. "
+                    "A row_union is plugin-free require_all N-to-N fork reconvergence: declare at least two ordered "
+                    "branches, set input to the first branch connection, publish on_success to downstream processing "
+                    "(not a sink), omit options/routing/policy/merge fields, and optionally set timeout_seconds."
                 ),
             },
             "edges": {

@@ -167,6 +167,10 @@ function flowText(flow: ProposalFlow, routeKeys: ReadonlyMap<string, string>): s
       return flow.branch === null ? "Queue continuation" : `Queue continuation on ${flow.branch}`;
     case "coalesce_success":
       return flow.branch === null ? "Coalesce success" : `Coalesce success on ${flow.branch}`;
+    case "row_union_success":
+      return flow.branch === null
+        ? "Row union success"
+        : `Row union success on ${flow.branch}`;
     case "output_write_failure":
       return "Output write failure";
   }
@@ -208,6 +212,15 @@ function behaviorDetails(
         `Branches: ${behavior.branch_aliases.join(", ")}`,
         `Policy: ${humanToken(behavior.policy)}`,
         `Merge: ${humanToken(behavior.merge)}`,
+        ...(behavior.timeout_seconds === null ? [] : [`Timeout: ${behavior.timeout_seconds} seconds`]),
+      ];
+    case "row_union":
+      return [
+        `Branches preserved: ${behavior.branch_aliases.join(", ")}`,
+        "Policy: wait for every branch, then forward each row",
+        ...(behavior.timeout_seconds === null
+          ? []
+          : [`Timeout: ${behavior.timeout_seconds} seconds`]),
       ];
   }
 }
@@ -270,9 +283,15 @@ export function WireStageTurn({
   const correctionTargets: Array<{ target: GuidedEditTarget; label: string }> = [
     ...data.sources.map((source) => ({ target: { kind: "source" as const, stable_id: source.stable_id }, label: source.label })),
     ...data.nodes.map((node) => ({ target: { kind: "node" as const, stable_id: node.stable_id }, label: node.label })),
-    ...data.connections.map((connection, index) => ({
+    ...data.connections.map((connection) => ({
       target: { kind: "edge" as const, stable_id: connection.stable_id },
-      label: `Route ${index + 1}`,
+      label: `${nameFor(connection.from_endpoint.stable_id)} → ${
+        nameFor(
+          connection.to_endpoint.kind === "discard"
+            ? "discard"
+            : connection.to_endpoint.stable_id,
+        )
+      } — ${flowText(connection.flow, routeKeys)}`,
     })),
     ...data.outputs.map((output) => ({ target: { kind: "output" as const, stable_id: output.stable_id }, label: output.label })),
   ];
@@ -459,7 +478,7 @@ export function WireStageTurn({
             className="wire-stage__edges"
             ariaLabel="Wiring routes"
             items={edges.map((edge) => ({
-              id: `${edge.from}\u0000${edge.label}\u0000${edge.to}`,
+              id: edge.stable_id,
               from: nameFor(edge.from),
               to: nameFor(edge.to),
               summary: flowText(edge.flow, routeKeys),
@@ -468,7 +487,7 @@ export function WireStageTurn({
                 edge.missing_fields.length > 0
                   ? `Missing fields: ${edge.missing_fields.join(", ")}`
                   : null,
-              ariaLabel: `${nameFor(edge.from)} to ${nameFor(edge.to)} — ${edgeStatus(edge)}`,
+              ariaLabel: `${nameFor(edge.from)} to ${nameFor(edge.to)} — ${flowText(edge.flow, routeKeys)} — ${edgeStatus(edge)}`,
             }))}
           />
           <details className="wire-stage__raw">

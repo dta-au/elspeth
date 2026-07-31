@@ -148,13 +148,115 @@ def test_scenario_a_https_ingress_is_explicit_and_never_world_open() -> None:
     )
 
     assert 'variable "alb_https_ingress_cidrs"' in module_variables
-    assert '!endswith(cidr, "/0")' in module_variables
+    assert 'cidrnetmask(cidr) != "0.0.0.0"' in module_variables
     assert alb_ingress is not None
     assert re.search(r"for_each\s*=\s*toset\(var\.alb_https_ingress_cidrs\)", alb_ingress.group("body"))
     assert re.search(r"cidr_ipv4\s*=\s*each\.value", alb_ingress.group("body"))
     assert '"0.0.0.0/0"' not in alb_ingress.group("body")
     assert re.search(r"alb_https_ingress_cidrs\s*=\s*var\.alb_https_ingress_cidrs", scenario_a)
     assert 'alb_https_ingress_cidrs = ["REPLACE_WITH_OPERATOR_CIDR"]' in example
+
+
+_ALB_INGRESS_ROOTS = (
+    "modules/scenario/variables.tf",
+    "scenario-a/variables.tf",
+    "scenario-b/variables.tf",
+)
+
+# (candidate value, must terraform accept it)
+_ALB_INGRESS_CASES: tuple[tuple[str, bool], ...] = (
+    ('["203.0.113.5/32"]', True),
+    ('["203.0.113.0/24", "198.51.100.0/24"]', True),
+    ("[]", False),
+    ('["nonsense"]', False),
+    ('["203.0.113.5/32", "203.0.113.5/32"]', False),
+    # Semantically identical networks written differently: both render the same
+    # EC2 rule, so the second is a duplicate `distinct()` on raw strings misses.
+    ('["10.0.0.5/8", "10.0.0.6/8"]', False),
+    ('["0.0.0.0/0"]', False),
+    # Leading zeros in the prefix. `cidrnetmask` parses these as /0 and EC2
+    # canonicalises them back to 0.0.0.0/0, so a raw-suffix check on "/0" lets
+    # them through and the fail-closed allowlist opens HTTPS to the internet.
+    ('["0.0.0.0/00"]', False),
+    ('["0.0.0.0/000"]', False),
+    ('["10.0.0.0/0"]', False),
+    ('["10.0.0.0/00"]', False),
+    # IPv4-only is the enforced contract: `cidrnetmask` errors on IPv6, so
+    # every IPv6 CIDR is rejected. Fail-closed, and the message says so.
+    ('["::/0"]', False),
+    ('["2001:db8::/32"]', False),
+)
+
+
+def test_alb_ingress_guard_rejects_every_spelling_of_a_world_open_cidr(tmp_path: Path) -> None:
+    """The `/0` guard must test the PARSED prefix, not the raw string suffix.
+
+    `!endswith(cidr, "/0")` accepted `0.0.0.0/00` and `0.0.0.0/000`:
+    `cidrnetmask` parses the leading zeros and EC2 canonicalises the rule back
+    to `0.0.0.0/0`, so the explicit operator allowlist silently became a
+    world-open HTTPS ingress rule. Uniqueness had the same shape of hole —
+    `distinct()` over raw strings let `10.0.0.5/8` and `10.0.0.6/8` both
+    through, though they build one and the same network.
+
+    The condition is duplicated across the module and both scenario roots
+    (each root validates the operator's own tfvars before the module sees
+    them), so this asserts the three blocks are byte-identical and then
+    exercises the one shared block for real: re-encoding the rule in three
+    places is exactly how the drift starts.
+    """
+    blocks = {}
+    for relative in _ALB_INGRESS_ROOTS:
+        match = re.search(
+            r'variable "alb_https_ingress_cidrs" \{.*?\n\}\n',
+            _text(relative),
+            re.DOTALL,
+        )
+        assert match is not None, f"{relative} no longer declares alb_https_ingress_cidrs"
+        blocks[relative] = match.group(0)
+    assert len(set(blocks.values())) == 1, (
+        "the alb_https_ingress_cidrs guard has drifted between "
+        + ", ".join(_ALB_INGRESS_ROOTS)
+        + "; every root must reject exactly what the module rejects"
+    )
+
+    if shutil.which("terraform") is None:
+        pytest.skip("terraform is not installed, so the ingress guard cannot be exercised")
+
+    (tmp_path / "main.tf").write_text(next(iter(blocks.values())), encoding="utf-8")
+    init = subprocess.run(
+        ["terraform", f"-chdir={tmp_path}", "init", "-backend=false", "-input=false", "-no-color"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert init.returncode == 0, "terraform init failed:\n" + init.stdout + init.stderr
+
+    for value, should_accept in _ALB_INGRESS_CASES:
+        result = subprocess.run(
+            [
+                "terraform",
+                f"-chdir={tmp_path}",
+                "plan",
+                "-input=false",
+                "-no-color",
+                f"-var=alb_https_ingress_cidrs={value}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        accepted = result.returncode == 0
+        assert accepted == should_accept, (
+            f"alb_https_ingress_cidrs={value} was "
+            + ("accepted" if accepted else "rejected")
+            + "; expected it to be "
+            + ("accepted" if should_accept else "rejected")
+            + "\n"
+            + result.stdout
+            + result.stderr
+        )
 
 
 def test_service_enable_command_pins_the_validated_task_revision() -> None:
@@ -1709,6 +1811,65 @@ def test_explicit_aws_profile_is_bound_across_provider_backend_and_local_cli() -
     assert 'aws --profile "$AWS_PROFILE" --region "$AWS_REGION"' in readme
     assert "--profile ${jsonencode(var.aws_profile)}" in module_outputs
     assert "--region ${jsonencode(var.aws_region)}" in module_outputs
+
+
+COLD_INSTALL_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-cold-install.md"
+
+
+def test_cold_install_runbook_does_not_re_derive_the_namespace() -> None:
+    """The runbook must reuse the namespace, not recover it by string surgery.
+
+    `NAMESPACE=${ECS_CLUSTER%-cluster}` stripped only the suffix, but
+    `cluster_name` is `acceptance-<namespace>-cluster` — prefixed as well. The
+    log-group, dashboard, and X-Ray names are NOT prefixed, so on a perfectly
+    healthy install the verification queries looked for `acceptance-<ns>-...`
+    resources that do not exist, and the canonical cold-install procedure
+    reported a false failure.
+
+    String surgery on one name to recover another re-encodes the naming
+    convention in a second place, which is the defect itself. This test pins
+    that the surgery is gone, that the namespace is derived exactly once, and
+    that the per-resource suffixes the runbook still spells out match the module
+    that actually builds them.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+    runbook = COLD_INSTALL_RUNBOOK.read_text(encoding="utf-8")
+
+    # The relationship the string surgery got wrong: the cluster is the one
+    # name carrying an `acceptance-` prefix on top of the namespace.
+    assert re.search(r'cluster_name\s+=\s+"acceptance-\$\{local\.namespace\}-cluster"', locals_text)
+
+    for name in ("namespace", "cluster_name"):
+        for relative in ("modules/scenario/outputs.tf", "scenario-a/outputs.tf", "scenario-b/outputs.tf"):
+            assert f'output "{name}"' in _text(relative), f"{relative} must expose the {name} output"
+
+    # The runbook reuses the namespace it already had to compute at install
+    # time. `scenario_a_namespace` is exported before apply because it feeds the
+    # tfvars, so there is no state to read an output from at that point; reusing
+    # it here introduces no derivation the procedure did not already require.
+    # (A `terraform output -raw namespace` read is drift-proof but only resolves
+    # post-apply, which would add a second mechanism alongside a mandatory one.)
+    assert 'NAMESPACE="$scenario_a_namespace"' in runbook
+    assert runbook.count("export scenario_a_namespace=") == 1, "the namespace must be derived exactly once"
+    assert "%-cluster" not in runbook, "the runbook must not re-derive the namespace from the cluster name"
+
+    # Every namespace-derived literal the runbook still spells out has to match
+    # the local that builds the real resource. The log-group query is a
+    # deliberate prefix (it sweeps -web, -doctor and -operator-metrics in one
+    # call); the dashboard and X-Ray queries name one resource exactly.
+    for local_name, queried, exact in (
+        ("web_log_group", "/aws/ecs/${NAMESPACE}", False),
+        ("dashboard_name", "${NAMESPACE}-elspeth-aws-operator-v1", True),
+        ("xray_group_name", "${NAMESPACE}-xray", True),
+    ):
+        declaration = re.search(rf'{local_name}\s+=\s+"(?P<template>[^"]+)"', locals_text)
+        assert declaration is not None, f"{local_name} is no longer a simple template"
+        built = declaration.group("template").replace("${local.namespace}", "${NAMESPACE}")
+        if exact:
+            assert built == queried, f"the runbook queries {queried!r} but the module builds {built!r}"
+        else:
+            assert built.startswith(queried), f"the runbook uses prefix {queried!r}, which no longer matches the built name {built!r}"
+        assert queried in runbook
 
 
 def test_certificate_limit_and_code_blind_outputs_are_explicit() -> None:

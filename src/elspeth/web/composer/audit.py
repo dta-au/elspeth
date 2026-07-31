@@ -41,6 +41,7 @@ Layer: L3 (application). Imports L0 (contracts.composer_audit), L1
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import threading
 import time
@@ -64,6 +65,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCallRecorder,
 )
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 
 __all__ = [
@@ -81,6 +83,7 @@ __all__ = [
     "finish_plugin_crash",
     "finish_success",
     "llm_call_audit_envelope",
+    "llm_call_audit_summary",
     "rebind_dispatch_arguments",
 ]
 
@@ -289,6 +292,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "model_requested",
     "model_returned",
     "status",
+    "finish_reason",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
@@ -330,6 +334,72 @@ def llm_call_audit_envelope(call: ComposerLLMCall) -> dict[str, object]:
     """
 
     return {"_kind": "llm_call_audit", "call": _public_llm_call_audit_payload(call)}
+
+
+# Terminal states that are simply "the turn ended normally". ``stop`` is a
+# completed answer; ``tool_calls`` is the ordinary terminal state of every
+# healthy iteration of a tool-using loop. Rendering either on the summary
+# line would put a badge on every row and train the reader to ignore it.
+_ROUTINE_FINISH_REASONS: Final[frozenset[str]] = frozenset({"stop", "tool_calls"})
+
+
+def llm_call_audit_summary(call: ComposerLLMCall) -> str:
+    """Build the human-facing ``content`` summary for an LLM-call audit row.
+
+    Sibling of :func:`llm_call_audit_envelope`. The envelope is the forensic
+    record — complete, but only visible to someone who opens the
+    ``tool_calls`` JSON column. This string is what the message-list view
+    actually renders, so it carries the short projection an operator reads
+    without digging.
+
+    Every drain site that persists an LLM-call audit row
+    (``sessions/routes/_helpers._persist_llm_calls``,
+    ``composer/service._persist_pipeline_planner_audit``,
+    ``sessions/guided_audit.prepare_guided_audit_rows``) builds its
+    ``content`` here, so the three rows are the same projection by
+    construction rather than by three hand-copies staying in sync.
+
+    Abnormal finish reasons
+    -----------------------
+    ``finish_reason`` is included **only** when it is present and is not a
+    routine terminal state. The gap this closes is operator-facing: a turn
+    truncated at the token ceiling (``length``) renders as a half-finished
+    answer with nothing saying so, which reads as model flakiness — an
+    operator tunes prompts or swaps models when the fix was raising
+    ``max_tokens``. ``content_filter`` has the same shape: a provider
+    refusal looks like an ELSPETH bug.
+
+    - ``stop`` / ``tool_calls`` are omitted — see
+      :data:`_ROUTINE_FINISH_REASONS`.
+    - Everything else surfaces, including values we do not recognise:
+      unknown is fail-visible, not fail-quiet, because an unrecognised
+      provider term is precisely the case nobody has triaged yet.
+    - The value is rendered verbatim as recorded — no normalisation, no
+      mapping onto a house vocabulary, so the summary and the envelope
+      never disagree about what the provider said.
+    - ``None`` omits the key entirely rather than emitting ``null``; the
+      envelope is where absence is recorded explicitly.
+
+    The key is appended last so a call with no finish reason — and one that
+    finished routinely — serialises byte-for-byte as it did before this
+    projection carried the field at all.
+
+    This is presentation only. An abnormal finish reason is now *visible*;
+    it is never fatal, and no control flow keys off it.
+    """
+    summary: dict[str, object] = {
+        "_kind": "llm_call_audit",
+        "status": call.status.value,
+        "model_requested": call.model_requested,
+        "model_returned": call.model_returned,
+        "total_tokens": call.total_tokens,
+        "reasoning_tokens": call.reasoning_tokens,
+        "provider_cost": call.provider_cost,
+    }
+    finish_reason = call.finish_reason
+    if finish_reason is not None and finish_reason not in _ROUTINE_FINISH_REASONS:
+        summary["finish_reason"] = finish_reason
+    return json.dumps(summary)
 
 
 def chat_turn_audit_envelope(turn: ComposerChatTurn) -> dict[str, object]:
@@ -377,6 +447,13 @@ class DispatchAudit:
     started_at: datetime
     started_ns: int
     actor: str
+    authority_arguments_canonical: str | None = None
+    authority_arguments_hash: str | None = None
+
+    @property
+    def binding_arguments_hash(self) -> str:
+        """Return the semantic binding when this dispatch defines one."""
+        return self.authority_arguments_hash or self.arguments_hash
 
 
 def begin_dispatch(
@@ -405,9 +482,13 @@ def begin_dispatch(
         truncated = arguments[:4096]
         canon = canonical_json({"_unparseable_arguments": truncated, "_truncated": len(arguments) > 4096})
         h = stable_hash({"_unparseable_arguments": truncated, "_truncated": len(arguments) > 4096})
+        authority_canon = None
+        authority_hash = None
     else:
         canon = canonical_json(arguments)
         h = stable_hash(arguments)
+        authority_canon = composer_authority_canonical_json(arguments) if tool_name == "set_pipeline" else None
+        authority_hash = composer_authority_hash(arguments) if tool_name == "set_pipeline" else None
     return DispatchAudit(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
@@ -417,6 +498,8 @@ def begin_dispatch(
         started_at=datetime.now(UTC),
         started_ns=time.monotonic_ns(),
         actor=actor,
+        authority_arguments_canonical=authority_canon,
+        authority_arguments_hash=authority_hash,
     )
 
 
@@ -487,6 +570,8 @@ def rebind_dispatch_arguments(
         audit,
         arguments_canonical=canonical_json(arguments),
         arguments_hash=stable_hash(arguments),
+        authority_arguments_canonical=(composer_authority_canonical_json(arguments) if audit.tool_name == "set_pipeline" else None),
+        authority_arguments_hash=composer_authority_hash(arguments) if audit.tool_name == "set_pipeline" else None,
     )
 
 
@@ -566,6 +651,8 @@ def finish_success(
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
         cache_hit=cache_hit,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 
@@ -610,6 +697,8 @@ def finish_arg_error(
         finished_at=datetime.now(UTC),
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 
@@ -644,6 +733,8 @@ def finish_cancelled(
         finished_at=datetime.now(UTC),
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 
@@ -686,6 +777,8 @@ def finish_plugin_crash(
         finished_at=datetime.now(UTC),
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 

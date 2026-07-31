@@ -9,8 +9,10 @@ import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
 // Mock @xyflow/react — jsdom cannot do DOM measurements required by React Flow.
-// Render nodes and edges as simple divs so we can assert on their presence.
+// Render ordinary elements directly and invoke custom node/edge renderers with
+// deterministic coordinates so geometry and handle placement stay testable.
 vi.mock("@xyflow/react", () => ({
+  MarkerType: { ArrowClosed: "arrowclosed" },
   // Provider shares the flow store so Controls/MiniMap can render OUTSIDE
   // <ReactFlow> (they are siblings of the role="img" diagram scope —
   // elspeth-37f6f13132). The mock just passes children through.
@@ -20,6 +22,8 @@ vi.mock("@xyflow/react", () => ({
   ReactFlow: ({
     nodes,
     edges,
+    edgeTypes,
+    nodeTypes,
     children,
     colorMode,
     fitView,
@@ -38,24 +42,88 @@ vi.mock("@xyflow/react", () => ({
       data-has-on-init={String(typeof onInit === "function")}
       data-fit-view-options={fitViewOptions ? JSON.stringify(fitViewOptions) : ""}
     >
-      {nodes?.map((n: any) => (
-        <div
-          key={n.id}
-          data-testid={`node-${n.id}`}
-          style={n.style}
-          onClick={(event) => onNodeClick?.(event, n)}
-        >
-          {typeof n.data?.label === "string" ? n.data.label : n.data?.label}
-        </div>
-      ))}
-      {edges?.map((e: any) => (
-        <div key={e.id} data-testid={`edge-${e.id}`}>
-          {e.label}
-        </div>
-      ))}
+      {nodes?.map((n: any) => {
+        const NodeRenderer = nodeTypes?.[n.type];
+        return (
+          <div
+            key={n.id}
+            data-testid={`node-${n.id}`}
+            style={n.style}
+            onClick={(event) => onNodeClick?.(event, n)}
+          >
+            {NodeRenderer
+              ? <NodeRenderer id={n.id} data={n.data} />
+              : typeof n.data?.label === "string"
+                ? n.data.label
+                : n.data?.label}
+          </div>
+        );
+      })}
+      {edges?.map((e: any) => {
+        const EdgeRenderer = edgeTypes?.[e.type];
+        if (EdgeRenderer) {
+          return (
+            <svg
+              key={e.id}
+              data-testid={`edge-${e.id}`}
+              data-edge-source={e.source}
+              data-edge-target={e.target}
+              data-source-handle={e.sourceHandle}
+              data-target-handle={e.targetHandle}
+            >
+              <EdgeRenderer
+                {...e}
+                sourceX={100 + (e.data?.laneOffset ?? 0)}
+                sourceY={80}
+                targetX={100 + (e.data?.laneOffset ?? 0)}
+                targetY={260}
+                sourcePosition="bottom"
+                targetPosition="top"
+                markerEnd={`url(#marker-${e.id})`}
+              />
+            </svg>
+          );
+        }
+        return (
+          <div
+            key={e.id}
+            data-testid={`edge-${e.id}`}
+            data-edge-source={e.source}
+            data-edge-target={e.target}
+          >
+            {e.label}
+          </div>
+        );
+      })}
       {children}
     </div>
   ),
+  BaseEdge: ({
+    id,
+    path,
+    label,
+    labelX,
+    labelY,
+    markerEnd,
+  }: any) => (
+    <g>
+      <path
+        data-edge-path-id={id}
+        d={path}
+        markerEnd={markerEnd}
+      />
+      <text x={labelX} y={labelY}>{label}</text>
+    </g>
+  ),
+  Handle: ({ id, type, position, style }: any) => (
+    <span
+      data-handle-id={id}
+      data-handle-type={type}
+      data-handle-position={position}
+      style={style}
+    />
+  ),
+  Position: { Top: "top", Bottom: "bottom" },
   Background: ({ color, gap, size }: any) => (
     <div
       data-testid="react-flow-background"
@@ -82,6 +150,7 @@ vi.mock("@xyflow/react", () => ({
       // own --color-badge-queue token (Task 6 minimap recognition). Harmless
       // for compositions without such a node — it resolves to the fallback.
       data-queue-color={nodeColor?.({ id: "inbound" })}
+      data-row-union-color={nodeColor?.({ id: "variant_union" })}
       data-unknown-color={nodeColor?.({ id: "unknown" })}
       data-stroke-color={nodeStrokeColor?.({ id: "source" })}
     />
@@ -780,6 +849,1007 @@ describe("GraphView", () => {
       expect(screen.getByTestId("minimap")).toHaveAttribute(
         "data-queue-color",
         "#ff91c8",
+      );
+    });
+  });
+
+  describe("row_union correlated branch fan-in", () => {
+    function rowUnionState(): CompositionState {
+      return makeState({
+        sources: {
+          experiments: {
+            plugin: "csv",
+            options: {},
+            on_success: "routed",
+          },
+        },
+        nodes: [
+          makeNode({
+            id: "experiment_gate",
+            node_type: "gate",
+            plugin: null,
+            input: "routed",
+            on_success: null,
+            routes: {
+              split: "fork",
+            },
+            fork_to: ["control_raw", "treatment_raw"],
+          }),
+          makeNode({
+            id: "control_score",
+            input: "control_raw",
+            on_success: "control_done",
+          }),
+          makeNode({
+            id: "treatment_score",
+            input: "treatment_raw",
+            on_success: "treatment_done",
+          }),
+          {
+            id: "variant_union",
+            node_type: "row_union",
+            plugin: null,
+            // Backend compatibility placeholder only. It must not invent an
+            // extra scalar input edge in the graph.
+            input: "control_done",
+            on_success: "experiment_rows",
+            on_error: null,
+            options: {},
+            branches: {
+              control: "control_done",
+              treatment: "treatment_done",
+            },
+            timeout_seconds: 12.5,
+          },
+          makeNode({
+            id: "compare",
+            node_type: "aggregation",
+            plugin: "batch_experiment_compare",
+            input: "experiment_rows",
+            on_success: "results",
+          }),
+        ],
+        outputs: [{ name: "results", plugin: "json", options: {} }],
+        edges: [],
+      });
+    }
+
+    function renderedEdgeIds(): string[] {
+      return Array.from(document.querySelectorAll('[data-testid^="edge-"]'))
+        .map((el) => el.getAttribute("data-testid") ?? "")
+        .sort();
+    }
+
+    it("draws every branch producer into row_union by alias and one success edge without placeholder bypasses", () => {
+      useSessionStore.setState({ compositionState: rowUnionState() });
+      render(<GraphView />);
+
+      const ids = renderedEdgeIds();
+      expect(ids).toContain(
+        "edge-inferred-row-union-in-control_score-variant_union-control",
+      );
+      expect(ids).toContain(
+        "edge-inferred-row-union-in-treatment_score-variant_union-treatment",
+      );
+      expect(
+        screen.getByTestId(
+          "edge-inferred-row-union-in-control_score-variant_union-control",
+        ),
+      ).toHaveTextContent("control");
+      expect(
+        screen.getByTestId(
+          "edge-inferred-row-union-in-treatment_score-variant_union-treatment",
+        ),
+      ).toHaveTextContent("treatment");
+      expect(
+        screen.getByTestId(
+          "edge-inferred-conn-experiment_gate-control_score",
+        ),
+      ).toHaveTextContent("control_raw");
+      expect(
+        screen.getByTestId(
+          "edge-inferred-conn-experiment_gate-treatment_score",
+        ),
+      ).toHaveTextContent("treatment_raw");
+      expect(ids).toContain(
+        "edge-inferred-row-union-out-variant_union-compare",
+      );
+
+      // The scalar placeholder input is the first branch's connection for
+      // backend compatibility. Rendering it through ordinary input inference
+      // would create a duplicate, unlabelled edge.
+      expect(ids).not.toContain(
+        "edge-inferred-conn-control_score-variant_union",
+      );
+      // Every route into compare comes from the union itself: no branch
+      // producer bypass and no union self-loop.
+      expect(ids.filter((id) => id.endsWith("-compare"))).toEqual([
+        "edge-inferred-row-union-out-variant_union-compare",
+      ]);
+      expect(
+        ids.some((id) => id.includes("variant_union-variant_union")),
+      ).toBe(false);
+    });
+
+    it("draws identity fork branches directly from their owning gate to row union", () => {
+      const state = rowUnionState();
+      state.nodes = state.nodes.filter(
+        (node) => !["control_score", "treatment_score"].includes(node.id),
+      );
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.input = "control_raw";
+      union!.branches = {
+        control: "control_raw",
+        treatment: "treatment_raw",
+      };
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      const identityEdges = Array.from(
+        document.querySelectorAll(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+        ),
+      );
+      expect(identityEdges).toHaveLength(2);
+      expect(identityEdges.map((edge) => edge.textContent).sort()).toEqual([
+        "control",
+        "treatment",
+      ]);
+    });
+
+    it("routes parallel identity-fork aliases through distinct visible edge geometry", () => {
+      const state = rowUnionState();
+      state.nodes = state.nodes.filter(
+        (node) => !["control_score", "treatment_score"].includes(node.id),
+      );
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.input = "control_raw";
+      union!.branches = {
+        control: "control_raw",
+        treatment: "treatment_raw",
+      };
+      useSessionStore.setState({ compositionState: state });
+
+      const { container } = render(<GraphView />);
+
+      const paths = Array.from(
+        container.querySelectorAll(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"] path[data-edge-path-id]',
+        ),
+      );
+      expect(paths).toHaveLength(2);
+      expect(paths[0]?.getAttribute("d")).not.toBe(paths[1]?.getAttribute("d"));
+
+      const visualEdges = Array.from(
+        container.querySelectorAll(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+        ),
+      );
+      const sourceHandleIds = visualEdges.map(
+        (edge) => edge.getAttribute("data-source-handle"),
+      );
+      const targetHandleIds = visualEdges.map(
+        (edge) => edge.getAttribute("data-target-handle"),
+      );
+      expect(new Set(sourceHandleIds).size).toBe(2);
+      expect(new Set(targetHandleIds).size).toBe(2);
+      const sourceHandleOffsets: string[] = [];
+      for (const handleId of sourceHandleIds) {
+        const handle = screen.getByTestId("node-experiment_gate").querySelector(
+          `[data-handle-type="source"][data-handle-id="${handleId}"]`,
+        );
+        expect(handle).not.toBeNull();
+        sourceHandleOffsets.push((handle as HTMLElement).style.left);
+      }
+      const targetHandleOffsets: string[] = [];
+      for (const handleId of targetHandleIds) {
+        const handle = screen.getByTestId("node-variant_union").querySelector(
+          `[data-handle-type="target"][data-handle-id="${handleId}"]`,
+        );
+        expect(handle).not.toBeNull();
+        targetHandleOffsets.push((handle as HTMLElement).style.left);
+      }
+      expect(new Set(sourceHandleOffsets).size).toBe(2);
+      expect(new Set(targetHandleOffsets).size).toBe(2);
+      for (const offset of [...sourceHandleOffsets, ...targetHandleOffsets]) {
+        expect(Number.parseFloat(offset)).toBeGreaterThan(0);
+        expect(Number.parseFloat(offset)).toBeLessThan(100);
+      }
+
+      const pathEndpoints = paths.map((path) => {
+        const coordinates = path.getAttribute("d")?.match(
+          /M ([\d.-]+) ([\d.-]+).* ([\d.-]+) ([\d.-]+)$/,
+        );
+        expect(coordinates).not.toBeNull();
+        return coordinates?.slice(1);
+      });
+      expect(new Set(pathEndpoints.map((point) => point?.join(","))).size).toBe(2);
+      expect(paths.every((path) => path.getAttribute("marker-end"))).toBe(true);
+
+      const connectionList = screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      });
+      expect(within(connectionList).getByText(
+        "experiment_gate to variant_union: control (success)",
+      )).toBeInTheDocument();
+      expect(within(connectionList).getByText(
+        "experiment_gate to variant_union: treatment (success)",
+      )).toBeInTheDocument();
+    });
+
+    it.each([
+      ["a partial branch set", ["control"]],
+      ["one null-labelled identity edge", [null]],
+      ["two null-labelled identity edges", [null, null]],
+      ["a labelled edge after a null-labelled edge", [null, "control"]],
+    ])(
+      "preserves every identity-fork alias with %s",
+      (_caseName, explicitLabels) => {
+        const state = rowUnionState();
+        state.nodes = state.nodes.filter(
+          (node) => !["control_score", "treatment_score"].includes(node.id),
+        );
+        const union = state.nodes.find((node) => node.id === "variant_union");
+        expect(union).toBeDefined();
+        union!.input = "control_raw";
+        union!.branches = {
+          control: "control_raw",
+          treatment: "treatment_raw",
+        };
+        state.edges = explicitLabels.map((label, index) =>
+          makeEdge({
+            id: `partial-identity-fork-${index}`,
+            from_node: "experiment_gate",
+            to_node: "variant_union",
+            edge_type: "fork",
+            label,
+          }),
+        );
+        useSessionStore.setState({ compositionState: state });
+
+        render(<GraphView />);
+
+        const identityEdges = Array.from(
+          document.querySelectorAll(
+            '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+          ),
+        );
+        expect(identityEdges).toHaveLength(2);
+        expect(identityEdges.map((edge) => edge.textContent).sort()).toEqual([
+          "control",
+          "treatment",
+        ]);
+      },
+    );
+
+    it("uses a queue as the authoritative row union producer without an upstream bypass", () => {
+      const state = rowUnionState();
+      state.nodes = [
+        makeNode({
+          id: "experiment_gate",
+          node_type: "gate",
+          plugin: null,
+          input: "routed",
+          on_success: null,
+          routes: { split: "fork" },
+          fork_to: ["control_queue", "treatment_raw"],
+        }),
+        makeNode({
+          id: "control_queue",
+          node_type: "queue",
+          plugin: null,
+          input: "control_queue",
+          on_success: null,
+        }),
+        makeNode({
+          id: "treatment_score",
+          input: "treatment_raw",
+          on_success: "treatment_done",
+        }),
+        {
+          id: "variant_union",
+          node_type: "row_union",
+          plugin: null,
+          input: "control_queue",
+          on_success: "experiment_rows",
+          on_error: null,
+          options: {},
+          branches: {
+            control: "control_queue",
+            treatment: "treatment_done",
+          },
+          timeout_seconds: null,
+        },
+        makeNode({
+          id: "compare",
+          node_type: "aggregation",
+          plugin: "batch_experiment_compare",
+          input: "experiment_rows",
+          on_success: "results",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        document.querySelector(
+          '[data-edge-source="experiment_gate"][data-edge-target="control_queue"]',
+        ),
+      ).not.toBeNull();
+      expect(
+        document.querySelector(
+          '[data-edge-source="control_queue"][data-edge-target="variant_union"]',
+        ),
+      ).toHaveTextContent("control");
+      expect(
+        document.querySelector(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+        ),
+      ).toBeNull();
+    });
+
+    it("gives adversarial hyphenated ids and aliases collision-proof inferred edge ids", () => {
+      const state = makeState({
+        nodes: [
+          makeNode({
+            id: "a-b",
+            input: "unused-left",
+            on_success: "left-ready",
+          }),
+          makeNode({
+            id: "a",
+            input: "unused-right",
+            on_success: "right-ready",
+          }),
+          makeNode({
+            id: "c",
+            node_type: "row_union",
+            plugin: null,
+            input: "left-ready",
+            on_success: null,
+            branches: { "d-e": "left-ready" },
+          }),
+          makeNode({
+            id: "b-c",
+            node_type: "row_union",
+            plugin: null,
+            input: "right-ready",
+            on_success: null,
+            branches: { "d-e": "right-ready" },
+          }),
+        ],
+      });
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      const left = document.querySelector(
+        '[data-edge-source="a-b"][data-edge-target="c"]',
+      );
+      const right = document.querySelector(
+        '[data-edge-source="a"][data-edge-target="b-c"]',
+      );
+      expect(left).not.toBeNull();
+      expect(right).not.toBeNull();
+      expect(left?.getAttribute("data-testid")).not.toBe(
+        right?.getAttribute("data-testid"),
+      );
+    });
+
+    it("exposes row union branch ownership in the accessible graph alternative and summary", () => {
+      const state = rowUnionState();
+      state.nodes = state.nodes.filter(
+        (node) => !["control_score", "treatment_score"].includes(node.id),
+      );
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.input = "control_raw";
+      union!.branches = {
+        control: "control_raw",
+        treatment: "treatment_raw",
+      };
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByRole("img", { name: /1 row union/i }),
+      ).toBeInTheDocument();
+      const branchConnections = screen.getByRole("list", {
+        name: /pipeline branch connections/i,
+      });
+      expect(
+        within(branchConnections).getByText(
+          "experiment_gate to variant_union: control (success)",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(branchConnections).getByText(
+          "experiment_gate to variant_union: treatment (success)",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(screen.getByTestId("node-variant_union")).getByText("row union"),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", {
+          name: /row union: variant_union/i,
+        }),
+      ).toBeInTheDocument();
+    });
+
+    it("preserves canonical explicit row_union branch labels without inferred duplicates", () => {
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "control-to-union",
+          from_node: "control_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "control",
+        }),
+        makeEdge({
+          id: "treatment-to-union",
+          from_node: "treatment_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "treatment",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByTestId("edge-e-control_score-variant_union-0"),
+      ).toHaveTextContent("control");
+      expect(
+        screen.getByTestId("edge-e-treatment_score-variant_union-1"),
+      ).toHaveTextContent("treatment");
+
+      const ids = renderedEdgeIds();
+      expect(
+        ids.filter((id) => id.includes("-control_score-variant_union")),
+      ).toEqual(["edge-e-control_score-variant_union-0"]);
+      expect(
+        ids.filter((id) => id.includes("-treatment_score-variant_union")),
+      ).toEqual(["edge-e-treatment_score-variant_union-1"]);
+      expect(ids).not.toContain(
+        "edge-inferred-conn-control_score-variant_union",
+      );
+      expect(ids.filter((id) => id.endsWith("-compare"))).toEqual([
+        "edge-inferred-row-union-out-variant_union-compare",
+      ]);
+      expect(
+        ids.some((id) => id.includes("variant_union-variant_union")),
+      ).toBe(false);
+    });
+
+    it("keeps only the authoritative row union successor after its output is repointed", () => {
+      // Reachable `with_node` state: the union now publishes a new connection,
+      // the old consumer has been rewired, but the materialized explicit edge
+      // still names the old union → consumer topology.
+      const state = rowUnionState();
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      const oldConsumer = state.nodes.find((node) => node.id === "compare");
+      expect(union).toBeDefined();
+      expect(oldConsumer).toBeDefined();
+      union!.on_success = "repointed_rows";
+      oldConsumer!.input = "control_done";
+      state.nodes.push(
+        makeNode({
+          id: "new_compare",
+          node_type: "aggregation",
+          plugin: "batch_experiment_compare",
+          input: "repointed_rows",
+          on_success: "results",
+        }),
+      );
+      state.edges = [
+        makeEdge({
+          id: "stale-union-successor",
+          from_node: "variant_union",
+          to_node: "compare",
+          edge_type: "on_success",
+          label: "success",
+        }),
+        makeEdge({
+          id: "unrelated-explicit-edge",
+          from_node: "control_score",
+          to_node: "compare",
+          edge_type: "on_success",
+          label: "success",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      const { container } = render(<GraphView />);
+
+      const unionOutbound = Array.from(
+        container.querySelectorAll('[data-edge-source="variant_union"]'),
+      );
+      expect(unionOutbound).toHaveLength(1);
+      expect(unionOutbound[0]).toHaveAttribute(
+        "data-edge-target",
+        "new_compare",
+      );
+      expect(unionOutbound[0]).toHaveTextContent("success");
+      expect(unionOutbound[0]).toHaveAttribute(
+        "data-testid",
+        "edge-inferred-row-union-out-variant_union-new_compare",
+      );
+      expect(
+        screen.getByTestId("edge-e-control_score-compare-1"),
+      ).toHaveTextContent("success");
+
+      const connections = screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      });
+      expect(
+        within(connections).queryByText(
+          "variant_union to compare: success (success)",
+        ),
+      ).not.toBeInTheDocument();
+      expect(
+        within(connections).getByText(
+          "variant_union to new_compare: success (success)",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("drops a stale error lane that shares the authoritative row union success endpoint", () => {
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "live-union-success",
+          from_node: "variant_union",
+          to_node: "compare",
+          edge_type: "on_success",
+          label: "success",
+        }),
+        makeEdge({
+          id: "stale-union-error",
+          from_node: "variant_union",
+          to_node: "compare",
+          edge_type: "on_error",
+          label: "error",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      const { container } = render(<GraphView />);
+
+      const unionOutbound = Array.from(
+        container.querySelectorAll(
+          '[data-edge-source="variant_union"][data-edge-target="compare"]',
+        ),
+      );
+      expect(unionOutbound).toHaveLength(1);
+      expect(unionOutbound[0]).toHaveTextContent("success");
+
+      const connections = screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      });
+      expect(
+        within(connections).getByText(
+          "variant_union to compare: success (success)",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(connections).queryByText(
+          "variant_union to compare: error (error)",
+        ),
+      ).not.toBeInTheDocument();
+    });
+
+    it("replaces a stale row union outbound label with authoritative success semantics", () => {
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "stale-union-label",
+          from_node: "variant_union",
+          to_node: "compare",
+          edge_type: "on_success",
+          label: "legacy_success",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByTestId("edge-e-variant_union-compare-0"),
+      ).toHaveTextContent("success");
+      const connections = screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      });
+      expect(
+        within(connections).getByText(
+          "variant_union to compare: success (success)",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(connections).queryByText(/legacy_success/),
+      ).not.toBeInTheDocument();
+    });
+
+    it.each([
+      {
+        caseName: "an explicit queue edge",
+        target: "union_queue",
+        configure: (state: CompositionState) => {
+          const union = state.nodes.find(
+            (node) => node.id === "variant_union",
+          );
+          expect(union).toBeDefined();
+          union!.on_success = "union_queue";
+          state.nodes.push(
+            makeNode({
+              id: "union_queue",
+              node_type: "queue",
+              plugin: null,
+              input: "union_queue",
+              on_success: null,
+              on_error: null,
+            }),
+          );
+          state.edges = [
+            makeEdge({
+              id: "union-to-queue",
+              from_node: "variant_union",
+              to_node: "union_queue",
+              edge_type: "on_success",
+              label: "success",
+            }),
+          ];
+        },
+        expectedConnections: [
+          "variant_union to union_queue: success (success)",
+        ],
+      },
+      {
+        caseName: "an explicit direct-sink edge",
+        target: "results",
+        configure: (state: CompositionState) => {
+          const union = state.nodes.find(
+            (node) => node.id === "variant_union",
+          );
+          expect(union).toBeDefined();
+          union!.on_success = "results";
+          state.edges = [
+            makeEdge({
+              id: "union-to-sink",
+              from_node: "variant_union",
+              to_node: "results",
+              edge_type: "on_success",
+              label: "success",
+            }),
+          ];
+        },
+        expectedConnections: [
+          "variant_union to results: success (success)",
+        ],
+      },
+      {
+        caseName: "parallel explicit success and error lanes",
+        target: "compare",
+        configure: (state: CompositionState) => {
+          const union = state.nodes.find(
+            (node) => node.id === "variant_union",
+          );
+          const consumer = state.nodes.find((node) => node.id === "compare");
+          expect(union).toBeDefined();
+          expect(consumer).toBeDefined();
+          union!.on_success = "shared_rows";
+          union!.on_error = "shared_rows";
+          consumer!.input = "shared_rows";
+          state.edges = [
+            makeEdge({
+              id: "union-success-lane",
+              from_node: "variant_union",
+              to_node: "compare",
+              edge_type: "on_success",
+              label: "success",
+            }),
+            makeEdge({
+              id: "union-error-lane",
+              from_node: "variant_union",
+              to_node: "compare",
+              edge_type: "on_error",
+              label: "error",
+            }),
+          ];
+        },
+        expectedConnections: [
+          "variant_union to compare: success (success)",
+          "variant_union to compare: error (error)",
+        ],
+      },
+    ])(
+      "preserves live row union outbound topology for $caseName",
+      ({ target, configure, expectedConnections }) => {
+        const state = rowUnionState();
+        configure(state);
+        useSessionStore.setState({ compositionState: state });
+
+        render(<GraphView />);
+
+        const connections = screen.getByRole("list", {
+          name: "Pipeline branch connections",
+        });
+        expect(
+          within(connections).getAllByText(
+            new RegExp(`^variant_union to ${target}:`),
+          ),
+        ).toHaveLength(expectedConnections.length);
+        for (const expectedConnection of expectedConnections) {
+          expect(
+            within(connections).getByText(expectedConnection),
+          ).toBeInTheDocument();
+        }
+      },
+    );
+
+    it.each([
+      {
+        authoritativeRoute: "on_success",
+        explicitRoute: "on_error",
+        expectedAccessibleText:
+          "control_score to variant_union: control (success)",
+      },
+      {
+        authoritativeRoute: "on_error",
+        explicitRoute: "on_success",
+        expectedAccessibleText:
+          "control_score to variant_union: control (error)",
+      },
+    ] as const)(
+      "announces a claimed row union alias as its authoritative $authoritativeRoute route",
+      ({
+        authoritativeRoute,
+        explicitRoute,
+        expectedAccessibleText,
+      }) => {
+        const state = rowUnionState();
+        const producer = state.nodes.find(
+          (node) => node.id === "control_score",
+        );
+        expect(producer).toBeDefined();
+        producer!.on_success =
+          authoritativeRoute === "on_success" ? "control_done" : "unused";
+        producer!.on_error =
+          authoritativeRoute === "on_error" ? "control_done" : null;
+        state.edges = [
+          makeEdge({
+            id: "stale-route-type",
+            from_node: "control_score",
+            to_node: "variant_union",
+            edge_type: explicitRoute,
+            label: "control",
+          }),
+        ];
+        useSessionStore.setState({ compositionState: state });
+
+        const { container } = render(<GraphView />);
+
+        const claimedEdges = container.querySelectorAll(
+          '[data-edge-source="control_score"][data-edge-target="variant_union"]',
+        );
+        expect(claimedEdges).toHaveLength(1);
+        expect(claimedEdges[0]).toHaveAttribute(
+          "data-testid",
+          "edge-e-control_score-variant_union-0",
+        );
+        expect(claimedEdges[0]).toHaveTextContent("control");
+
+        const connections = screen.getByRole("list", {
+          name: "Pipeline branch connections",
+        });
+        expect(
+          within(connections).getByText(expectedAccessibleText),
+        ).toBeInTheDocument();
+      },
+    );
+
+    it("drops a stale-label explicit edge into an alias-mapped row union", () => {
+      // Reachable state: `with_node` (upsert_node) replaces a row_union in
+      // place and never reconciles `edges` (contrast `without_node`, which
+      // prunes edges touching the removed node), and validation only checks
+      // that edge endpoints resolve — never that a label names a live branch
+      // alias. So renaming an alias leaves a validation-VALID composition
+      // carrying an edge labelled with the OLD alias.
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "legacy-control-to-union",
+          from_node: "control_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "legacy_control",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      const ids = renderedEdgeIds();
+      expect(
+        ids.filter((id) => id.includes("-control_score-variant_union")),
+      ).toEqual([
+        "edge-inferred-row-union-in-control_score-variant_union-control",
+      ]);
+      expect(
+        Array.from(document.querySelectorAll('[data-testid^="edge-"]')).some(
+          (edge) => edge.textContent?.includes("legacy_control"),
+        ),
+      ).toBe(false);
+    });
+
+    it("drops a stale-source explicit edge into an alias-mapped row union", () => {
+      // Same reachable path, other shape: the branch was repointed at a new
+      // producer, so the surviving edge names a source that no longer feeds
+      // any branch connection. Its label matches a live alias, so a
+      // label-only check would wave it through.
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "stale-gate-to-union",
+          from_node: "experiment_gate",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "control",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      const { container } = render(<GraphView />);
+
+      expect(
+        container.querySelectorAll(
+          '[data-edge-source="experiment_gate"][data-edge-target="variant_union"]',
+        ),
+      ).toHaveLength(0);
+      expect(renderedEdgeIds()).toContain(
+        "edge-inferred-row-union-in-control_score-variant_union-control",
+      );
+    });
+
+    it("drops an explicit edge whose alias names a connection no node publishes", () => {
+      // Deliberate, not an oversight: the alias is live but its connection has
+      // no producer, so the authoritative mapping cannot draw the lane and
+      // nothing replaces the dropped edge. An edge asserting a route the
+      // branches mapping cannot produce is the same phantom this guard exists
+      // to remove — and widening the guard to "alias with a resolvable
+      // producer" would resurrect stale edges every time a producer is
+      // momentarily unwired mid-authoring.
+      const state = rowUnionState();
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.branches = {
+        control: "control_done",
+        treatment: "unpublished_connection",
+      };
+      state.edges = [
+        makeEdge({
+          id: "treatment-to-union",
+          from_node: "treatment_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "treatment",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      const ids = renderedEdgeIds();
+      expect(
+        ids.filter((id) => id.includes("-treatment_score-variant_union")),
+      ).toEqual([]);
+      expect(ids).toContain(
+        "edge-inferred-row-union-in-control_score-variant_union-control",
+      );
+    });
+
+    it("keeps explicit edges into a row union with no alias mapping", () => {
+      // Without a branches mapping there is no authoritative inbound wiring to
+      // be the single source of truth, so the explicit edge is all the
+      // operator has — dropping it would blank the union's inbound routes.
+      const state = rowUnionState();
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.branches = null;
+      state.edges = [
+        makeEdge({
+          id: "control-to-union",
+          from_node: "control_score",
+          to_node: "variant_union",
+          edge_type: "on_success",
+          label: "control",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByTestId("edge-e-control_score-variant_union-0"),
+      ).toHaveTextContent("control");
+    });
+
+    it("preserves every alias when two branches name the same producer connection", () => {
+      const state = rowUnionState();
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      expect(union).toBeDefined();
+      union!.branches = {
+        control: "control_done",
+        treatment: "control_done",
+      };
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByTestId(
+          "edge-inferred-row-union-in-control_score-variant_union-control",
+        ),
+      ).toHaveTextContent("control");
+      expect(
+        screen.getByTestId(
+          "edge-inferred-row-union-in-control_score-variant_union-treatment",
+        ),
+      ).toHaveTextContent("treatment");
+    });
+
+    it("exposes a distinct row union badge in the keyboard inspector", async () => {
+      useSessionStore.setState({
+        selectedNodeId: null,
+        selectNode: (nodeId: string | null) =>
+          useSessionStore.setState({ selectedNodeId: nodeId } as never),
+        compositionState: rowUnionState(),
+      } as never);
+      render(<GraphView />);
+
+      const list = screen.getByRole("list", {
+        name: /pipeline components/i,
+      });
+      await userEvent.click(
+        within(list).getByRole("button", {
+          name: /row union: variant_union/i,
+        }),
+      );
+
+      const panel = screen.getByRole("complementary", {
+        name: /variant_union configuration/i,
+      });
+      expect(within(panel).getByText("row union")).toHaveClass(
+        "type-badge",
+        "type-badge-row_union",
+      );
+      expect(within(panel).getByText("12.5")).toBeInTheDocument();
+    });
+
+    it("colours row_union in the minimap using its dedicated kebab-case token", () => {
+      document.documentElement.style.setProperty(
+        "--color-badge-row-union",
+        "#aeb8ff",
+      );
+      const state = rowUnionState();
+      state.nodes.push(
+        makeNode({ id: "padding-1", input: "unused-1" }),
+        makeNode({ id: "padding-2", input: "unused-2" }),
+      );
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(screen.getByTestId("minimap")).toHaveAttribute(
+        "data-row-union-color",
+        "#aeb8ff",
       );
     });
   });

@@ -1,0 +1,164 @@
+{
+  "class": "row_union",
+  "intent": "Build a pipeline that reads tickets from CSV, forks every row into control and treatment branches, joins both correlated branch rows with a require-all row union, compares the variants as a batch, and writes the statistics to JSON.",
+  "canonical_arguments": {
+    "source": {
+      "plugin": "csv",
+      "on_success": "routed",
+      "options": {"path": "tickets.csv", "schema": {"mode": "observed"}},
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "variant_fork",
+        "node_type": "gate",
+        "input": "routed",
+        "condition": "True",
+        "routes": {"true": "fork", "false": "fork"},
+        "fork_to": ["control_branch", "treatment_branch"]
+      },
+      {
+        "id": "tag_control",
+        "node_type": "transform",
+        "plugin": "value_transform",
+        "input": "control_branch",
+        "on_success": "control_scored",
+        "on_error": "discard",
+        "options": {
+          "schema": {"mode": "observed"},
+          "operations": [
+            {"target": "prompt_variant", "expression": "'control'"},
+            {"target": "score", "expression": "row['baseline_quality'] * 1.0"}
+          ]
+        }
+      },
+      {
+        "id": "tag_treatment",
+        "node_type": "transform",
+        "plugin": "value_transform",
+        "input": "treatment_branch",
+        "on_success": "treatment_scored",
+        "on_error": "discard",
+        "options": {
+          "schema": {"mode": "observed"},
+          "operations": [
+            {"target": "prompt_variant", "expression": "'treatment'"},
+            {"target": "score", "expression": "row['baseline_quality'] * 1.25"}
+          ]
+        }
+      },
+      {
+        "id": "variant_union",
+        "node_type": "row_union",
+        "input": "control_scored",
+        "branches": {
+          "control_branch": "control_scored",
+          "treatment_branch": "treatment_scored"
+        },
+        "on_success": "experiment_rows",
+        "timeout_seconds": 12.5
+      },
+      {
+        "id": "compare_variants",
+        "node_type": "aggregation",
+        "plugin": "batch_experiment_compare",
+        "input": "experiment_rows",
+        "on_success": "experiment_results",
+        "on_error": "discard",
+        "options": {
+          "schema": {"mode": "observed"},
+          "variant_field": "prompt_variant",
+          "score_field": "score",
+          "baseline_variant": "control"
+        },
+        "trigger": {},
+        "output_mode": "transform"
+      }
+    ],
+    "edges": [
+      {"id": "e1", "from_node": "source", "to_node": "variant_fork", "edge_type": "on_success", "label": null},
+      {"id": "e2", "from_node": "variant_fork", "to_node": "tag_control", "edge_type": "fork", "label": "control_branch"},
+      {"id": "e3", "from_node": "variant_fork", "to_node": "tag_treatment", "edge_type": "fork", "label": "treatment_branch"},
+      {"id": "e4", "from_node": "tag_control", "to_node": "variant_union", "edge_type": "on_success", "label": "control_branch"},
+      {"id": "e5", "from_node": "tag_treatment", "to_node": "variant_union", "edge_type": "on_success", "label": "treatment_branch"},
+      {"id": "e6", "from_node": "variant_union", "to_node": "compare_variants", "edge_type": "on_success", "label": null}
+    ],
+    "outputs": [
+      {
+        "sink_name": "experiment_results",
+        "plugin": "json",
+        "options": {
+          "path": "outputs/experiment_results.json",
+          "format": "jsonl",
+          "mode": "write",
+          "schema": {"mode": "observed"},
+          "collision_policy": "auto_increment"
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {
+      "name": "row-union-ab-experiment",
+      "description": "Correlated require-all A/B row union followed by cross-variant statistics."
+    }
+  },
+  "semantic_expectations": {
+    "source": {"plugin": "csv", "on_success": "routed"},
+    "nodes": [
+      {
+        "id": "variant_fork",
+        "node_type": "gate",
+        "input": "routed",
+        "fork_to": ["control_branch", "treatment_branch"]
+      },
+      {
+        "id": "tag_control",
+        "node_type": "transform",
+        "plugin": "value_transform",
+        "input": "control_branch",
+        "on_success": "control_scored"
+      },
+      {
+        "id": "tag_treatment",
+        "node_type": "transform",
+        "plugin": "value_transform",
+        "input": "treatment_branch",
+        "on_success": "treatment_scored"
+      },
+      {
+        "id": "variant_union",
+        "node_type": "row_union",
+        "branches": {
+          "control_branch": "control_scored",
+          "treatment_branch": "treatment_scored"
+        },
+        "on_success": "experiment_rows",
+        "timeout_seconds": 12.5
+      },
+      {
+        "id": "compare_variants",
+        "node_type": "aggregation",
+        "plugin": "batch_experiment_compare",
+        "input": "experiment_rows",
+        "on_success": "experiment_results",
+        "trigger": {}
+      }
+    ],
+    "edges": [
+      {"from_node": "source", "to_node": "variant_fork", "edge_type": "on_success"},
+      {"from_node": "variant_fork", "to_node": "tag_control", "edge_type": "fork", "label": "control_branch"},
+      {"from_node": "variant_fork", "to_node": "tag_treatment", "edge_type": "fork", "label": "treatment_branch"},
+      {"from_node": "tag_control", "to_node": "variant_union", "edge_type": "on_success", "label": "control_branch"},
+      {"from_node": "tag_treatment", "to_node": "variant_union", "edge_type": "on_success", "label": "treatment_branch"},
+      {"from_node": "variant_union", "to_node": "compare_variants", "edge_type": "on_success"}
+    ],
+    "outputs": [{"sink_name": "experiment_results", "plugin": "json"}],
+    "topology": "source -> variant_fork -> (tag_control,tag_treatment) -> variant_union(row_union require_all, N-to-N) -> compare_variants(aggregation) -> experiment_results"
+  },
+  "runtime_assertions": [
+    "Every source row is copied into exactly two independent variant branches.",
+    "The row union correlates both branch results by source row and requires both branches before release.",
+    "Both variant rows survive the barrier in declared control-then-treatment order; they are not merged into one wide row.",
+    "The downstream batch experiment comparison receives long-format variant rows and emits cross-variant statistics."
+  ]
+}

@@ -223,15 +223,24 @@ variable "alarm_actions" {
 
 variable "alb_https_ingress_cidrs" {
   type        = list(string)
-  description = "Explicit operator CIDRs allowed to reach the acceptance ALB over HTTPS."
+  description = "Explicit operator IPv4 CIDRs allowed to reach the acceptance ALB over HTTPS. IPv6 is not supported."
 
   validation {
+    # Read the PARSED prefix, never the raw suffix. `!endswith(cidr, "/0")`
+    # let "0.0.0.0/00" through, and EC2 canonicalised it straight back to
+    # 0.0.0.0/0 — the fail-closed operator allowlist became a world-open
+    # HTTPS rule. Uniqueness is checked on the canonical network for the same
+    # reason: "10.0.0.5/8" and "10.0.0.6/8" build one rule, not two.
     condition = (
       length(var.alb_https_ingress_cidrs) > 0 &&
-      length(distinct(var.alb_https_ingress_cidrs)) == length(var.alb_https_ingress_cidrs) &&
-      alltrue([for cidr in var.alb_https_ingress_cidrs : can(cidrnetmask(cidr)) && !endswith(cidr, "/0")])
+      alltrue([
+        for cidr in var.alb_https_ingress_cidrs : try(cidrnetmask(cidr) != "0.0.0.0", false)
+      ]) &&
+      length(distinct([
+        for cidr in var.alb_https_ingress_cidrs : try(cidrsubnet(cidr, 0, 0), cidr)
+      ])) == length(var.alb_https_ingress_cidrs)
     )
-    error_message = "alb_https_ingress_cidrs must contain unique valid operator CIDRs and must not include 0.0.0.0/0."
+    error_message = "alb_https_ingress_cidrs must be a non-empty list of parseable IPv4 CIDRs (IPv6 is not supported), each covering a distinct network, and none may be a /0 in any spelling because that opens the ALB to the whole internet."
   }
 }
 

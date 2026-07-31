@@ -439,7 +439,10 @@ shape; no ELSPETH contract guarantees it; it is Tier-3 external data per
 the Quick Reference ("Transform on external calls: external response is
 Tier 3"). Shape-guarding or coercing such a value (``.get`` /
 ``isinstance`` on provider-variable or network-sourced fields) may be
-the Tier-3 boundary pattern. ``getattr`` remains banned even here. The
+the Tier-3 boundary pattern. Sentinel-defaulted ``getattr`` extraction
+is permitted here under the parse-don't-validate rule below (ADR-032);
+what remains banned is duck-typed presence probing used to satisfy an
+ELSPETH-internal contract. The
 discriminator is NOT the courier ("what code returned the object") but
 trust-necessity-and-trustworthiness: does this code need to rely on the
 value's shape, and if so, is that shape actually guaranteed (trustworthy)
@@ -466,16 +469,52 @@ suppress errors from nonexistent fields, malformed data, or incorrect
 types under a fixed contract. Access typed dataclass fields directly
 (``obj.field``), not defensively (``obj.get("field")``).
 
-Attribute presence probing is banned absolutely. Do not use ``getattr``,
-``hasattr``, ``inspect.getattr_static``, forwarding ``__getattr__``,
-property-swallowing exception nets, or any duck-typed presence probe.
+Attribute presence probing used to satisfy an ELSPETH-INTERNAL contract
+is banned absolutely. Do not use ``getattr``, ``hasattr``,
+``inspect.getattr_static``, forwarding ``__getattr__``,
+property-swallowing exception nets, or any duck-typed presence probe to
+decide that an ELSPETH-owned object satisfies an ELSPETH contract.
 These let an object pretend to satisfy a different contract and can
 swallow arbitrary property failures. At a genuinely unknown-type
-boundary, use ``isinstance`` discrimination against a declared concrete
-type or runtime-checkable protocol. Under a fixed contract, access the
-declared attribute directly and let breakage raise. Do not use
-``isinstance`` to revalidate Tier 1 or another fixed contract; it is a
-boundary discriminator, not a general defensive recommendation.
+boundary over objects ELSPETH itself constructs, use ``isinstance``
+discrimination against a declared concrete type that ELSPETH defines.
+
+Do NOT use a ``runtime_checkable`` ``Protocol`` for that discrimination
+(ADR-032). A Protocol ``isinstance()`` IS structural typing: it tests
+only that attributes with the right NAMES exist, which is exactly the
+duck typing this rule bans, so an arbitrary impostor declaring those
+names passes it. Since Python 3.12 it also resolves names through
+``inspect.getattr_static``, which bypasses ``__getattr__``, so it
+SILENTLY REJECTS legitimate objects whose fields resolve dynamically
+(``__getattr__`` forwarding; pydantic ``extra='allow'`` values held in
+``__pydantic_extra__``). It is permissive to impostors and strict
+against honest objects, and is never a security control. Consequence
+for tests: ``unittest.mock.Mock`` fails every such check, even with
+``spec=``, so a test passing a Mock exercises the reject branch
+silently and proves nothing about admission.
+
+At an EXTERNAL boundary — a third-party SDK object, an LLM provider
+reply, an HTTP or remote payload — do not authenticate the object's
+type at all. Parse, don't validate: read each needed field ONCE with a
+sentinel-defaulted ``getattr(obj, 'field', _MISSING)``, assert the
+VALUES (non-empty ``str``, parseable JSON, within bounds), construct an
+ELSPETH-owned frozen type from what survived, and propagate only that.
+That extraction is the CORRECT pattern there, not a violation of the
+ban above: the value assertions plus the read-once copy into an owned
+type ARE the boundary. Nominal typing against a vendor class is brittle
+(it breaks across SDK versions and across providers), and structural
+typing is both broken and useless; neither is the control.
+
+``hasattr`` is immune to the ``getattr_static`` hazard specifically —
+it calls the real ``getattr`` and so does see dynamically resolved
+attributes — but it remains banned as a presence probe under an
+internal contract, because it still lets an object pretend to satisfy
+one.
+
+Under a fixed contract, access the declared attribute directly and let
+breakage raise. Do not use ``isinstance`` to revalidate Tier 1 or
+another fixed contract; it is a boundary discriminator, not a general
+defensive recommendation.
 
 Defensive handling IS appropriate at trust boundaries.
 

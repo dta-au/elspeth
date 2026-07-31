@@ -2,7 +2,7 @@
 
 ``PipelineProposal`` wraps the exact canonical ``set_pipeline`` arguments. It
 does not define another pipeline topology model. The draft hash uses the
-``composer.pipeline-proposal-envelope.v2`` domain because it covers every
+``composer.pipeline-proposal-envelope.v3`` domain because it covers every
 authority-bearing envelope field. This intentionally supersedes the older
 design's ``composer.pipeline-proposal.v1`` pipeline-only preimage; accepting
 both would allow two different integrity meanings to share one draft concept.
@@ -21,6 +21,7 @@ from uuid import UUID
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import FrozenJsonArray, deep_thaw, freeze_fields
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
 from elspeth.web.composer.bounded_json import (
     JSON_MAX_ITEMS,
     JSON_MAX_TOTAL_UTF8_BYTES,
@@ -31,7 +32,7 @@ from elspeth.web.composer.bounded_json import (
 if TYPE_CHECKING:
     from elspeth.web.composer.state import CompositionState
 
-_DRAFT_HASH_SCHEMA = "composer.pipeline-proposal-envelope.v2"
+_DRAFT_HASH_SCHEMA = "composer.pipeline-proposal-envelope.v3"
 _REVIEWED_ANCHOR_SCHEMA = "guided.reviewed-anchors.v1"
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _PROPOSAL_FIELDS = frozenset(
@@ -269,7 +270,7 @@ def pipeline_draft_hash(
     covered_deferred_intent_ids: tuple[str, ...],
     supersedes_draft_hash: str | None,
 ) -> str:
-    """Hash the complete authority-bearing proposal envelope under v2."""
+    """Hash the complete authority-bearing proposal envelope under v3."""
     frozen_pipeline = _validate_and_freeze_canonical_mapping(pipeline, "pipeline")
     _require_hash(reviewed_anchor_hash, "reviewed_anchor_hash")
     if type(surface) is not PlannerSurface:
@@ -282,7 +283,7 @@ def pipeline_draft_hash(
 
     preimage = {
         "schema": _DRAFT_HASH_SCHEMA,
-        "pipeline": frozen_pipeline,
+        "pipeline": project_composer_authority_payload(frozen_pipeline),
         "base": _base_to_dict(base),
         "reviewed_anchor_hash": reviewed_anchor_hash,
         "surface": surface.value,
@@ -453,11 +454,11 @@ class PipelineProposal:
 def composition_content_hash(state: CompositionState) -> str:
     """Hash authored composition content, excluding version and guided metadata.
 
-    The preimage is byte-for-byte equivalent to the helper moved from the
-    guided route; changing it would invalidate existing base bindings.
+    Non-row-union content retains the historical preimage. Row-union branches
+    use the Composer authority projection so authored order remains bound.
     """
     state_d = state.to_dict()
-    return stable_hash(
+    return composer_authority_hash(
         {
             "sources": state_d["sources"],
             "nodes": state_d["nodes"],

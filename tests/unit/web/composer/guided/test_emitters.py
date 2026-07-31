@@ -8,6 +8,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.emitters import (
+    _node_cardinality,
     _step_index,
     build_component_review_turn,
     build_initial_step_1_turn,
@@ -571,6 +572,122 @@ class TestStep4WireEmitter:
             "timeout_seconds": 12.5,
             "output_mode": "transform",
             "expected_output_count": "1",
+        }
+
+    def test_coalesce_projection_preserves_material_timeout_deadlines(self) -> None:
+        for policy, timeout_seconds in (
+            ("best_effort", 12.5),
+            ("quorum", 30.0),
+            ("require_all", None),
+        ):
+            node = NodeSpec(
+                id="variants",
+                node_type="coalesce",
+                plugin=None,
+                input="control_done",
+                on_success="primary",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={
+                    "control_branch": "control_done",
+                    "treatment_branch": "treatment_done",
+                },
+                policy=policy,
+                merge="nested",
+                timeout_seconds=timeout_seconds,
+            )
+
+            assert _node_behavior(
+                node,
+                route_aliases={},
+                branch_aliases={
+                    "control_branch": "branch-1",
+                    "treatment_branch": "branch-2",
+                },
+            ) == {
+                "kind": "coalesce",
+                "branch_aliases": ["branch-1", "branch-2"],
+                "policy": policy,
+                "merge": "nested",
+                "timeout_seconds": timeout_seconds,
+            }
+
+    def test_wire_turn_forwards_the_projected_coalesce_timeout_verbatim(self) -> None:
+        node = NodeSpec(
+            id="variants",
+            node_type="coalesce",
+            plugin=None,
+            input="control_done",
+            on_success="primary",
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches={
+                "control_branch": "control_done",
+                "treatment_branch": "treatment_done",
+            },
+            policy="best_effort",
+            merge="nested",
+            timeout_seconds=12.5,
+        )
+        state = CompositionState(
+            source=None,
+            sources={},
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        projection, guided = _wire_authority(state)
+        projected_behavior = {
+            "kind": "coalesce",
+            "branch_aliases": ["branch-1", "branch-2"],
+            "policy": "best_effort",
+            "merge": "nested",
+            "timeout_seconds": 12.5,
+        }
+        projection["nodes"][0]["behavior"] = projected_behavior
+
+        turn = build_step_4_wire_turn(
+            state,
+            proposal_projection=projection,
+            guided=guided,
+        )
+
+        assert turn["payload"]["nodes"][0]["behavior"] == projected_behavior
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
+    def test_row_union_projection_preserves_n_to_n_cardinality(self) -> None:
+        node = NodeSpec(
+            id="variants",
+            node_type="row_union",
+            plugin=None,
+            input="control_done",
+            on_success="experiment_rows",
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches={
+                "control_branch": "control_done",
+                "treatment_branch": "treatment_done",
+            },
+            policy=None,
+            merge=None,
+            timeout_seconds=None,
+        )
+
+        assert _node_cardinality(node, executable_node=SimpleNamespace()) == {
+            "input": "branches",
+            "output": "one_per_branch",
+            "expected_output_count": None,
         }
 
     @staticmethod

@@ -39,6 +39,28 @@ from elspeth.web.composer.state import EdgeType
 REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 _REDACTED_OPTION_VALUE = "<redacted-option-value>"
 
+
+def _reject_coerced_timeout_seconds(value: object) -> object:
+    """Accept only actual JSON numbers at the Tier-3 boundary.
+
+    Pydantic's ordinary float parser coerces booleans and numeric strings.
+    Structural-barrier timeouts are persisted audit facts, so their wire type
+    must be proven before conversion. Integers remain valid JSON numbers and
+    are normalized to float by the annotated field.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("timeout_seconds must be an actual number, not a boolean or string")
+    return value
+
+
+_StrictTimeoutSeconds = Annotated[
+    float,
+    BeforeValidator(_reject_coerced_timeout_seconds),
+    Field(gt=0, allow_inf_nan=False),
+]
+
 # Fixed sentinel for response keys that appear in the input but are not
 # declared in the manifest entry's known_response_keys or
 # sensitive_response_keys sets.  The value is a closed constant — callers
@@ -1770,6 +1792,7 @@ class _PipelineNodeModel(BaseModel):
     trigger: _NodeTriggerModel | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
+    timeout_seconds: _StrictTimeoutSeconds | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2865,6 +2888,36 @@ class _SchemaContractDetailShadowModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _RowUnionFieldSchemaDetailShadowModel(BaseModel):
+    """One declared field in a row-union schema repair fact."""
+
+    name: str
+    field_type: str
+    required: bool
+    nullable: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RowUnionBranchSchemaDetailShadowModel(BaseModel):
+    """One branch declaration in a row-union schema repair fact."""
+
+    branch: str
+    mode: Literal["fixed", "flexible"]
+    fields: list[_RowUnionFieldSchemaDetailShadowModel]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RowUnionSchemaDetailShadowModel(BaseModel):
+    """Typed redaction shadow for safe row-union branch-schema facts."""
+
+    branches: list[_RowUnionBranchSchemaDetailShadowModel]
+    conflicting_fields: list[str]
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class _ValidationEntryShadowModel(BaseModel):
     """Redaction shadow for ``ValidationEntry.to_dict()`` (state.py).
 
@@ -2873,8 +2926,10 @@ class _ValidationEntryShadowModel(BaseModel):
     ``Severity`` literal alias to its string value); ``error_code`` is the
     closed machine-readable discriminant, emitted only when set, and
     ``contract`` the structured schema-contract facts, emitted only for the
-    schema-contract family. The response scalar projection preserves the
-    closed severity value and summarizes all free-form diagnostic text.
+    schema-contract family, and ``row_union_schema`` the branch declarations
+    emitted only for row-union incompatibility. The response scalar projection
+    preserves the closed severity value and summarizes all free-form
+    diagnostic text.
     """
 
     component: str
@@ -2882,6 +2937,7 @@ class _ValidationEntryShadowModel(BaseModel):
     severity: str
     error_code: str | None = None
     contract: _SchemaContractDetailShadowModel | None = None
+    row_union_schema: _RowUnionSchemaDetailShadowModel | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3424,6 +3480,7 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "trigger",
                     "output_mode",
                     "expected_output_count",
+                    "timeout_seconds",
                 ),
                 sensitive_argument_keys=("options", "routes", "trigger"),
                 argument_summarizers={

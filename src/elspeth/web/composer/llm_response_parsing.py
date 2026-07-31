@@ -33,7 +33,8 @@ import re
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from types import MemberDescriptorType
+from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import (
     PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST,
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
 
 __all__ = [
+    "PROVIDER_STRING_TRUNCATION_MARKER",
     "apply_anthropic_cache_markers",
     "attach_llm_calls",
     "build_llm_call_record",
@@ -97,6 +99,50 @@ class _ReasoningMetadata(TypedDict):
     thinking_blocks: Any | None
 
 
+_PYDANTIC_EXTRA_SLOT = "__pydantic_extra__"
+
+
+def _pydantic_extra_fields(value: Any) -> Mapping[str, Any] | None:
+    """Return a pydantic v2 ``extra="allow"`` overflow mapping, or ``None``.
+
+    Pydantic v2 models with ``extra="allow"`` (LiteLLM response objects) store
+    undeclared provider fields in the ``__pydantic_extra__`` slot rather than
+    in ``__dict__``. ``usage`` on a real ``ModelResponse`` lives there, and a
+    real ``litellm.types.utils.ChatCompletionMessageToolCall`` declares no
+    model fields at all — its whole payload (``id``/``type``/``function``) is
+    in that slot and its ``__dict__`` is empty. Any reader that consults
+    ``__dict__`` alone therefore sees a real provider object as field-less
+    (ADR-032; the defect class of elspeth-9ea866438b).
+
+    The slot is resolved through the owning class's ``__mro__`` and read only
+    when it is a genuine ``__slots__`` member descriptor. A provider object
+    that defines ``__pydantic_extra__`` as its own property is treated as
+    having no extras rather than having its descriptor invoked, which keeps
+    this a data-only read: no provider-controlled code runs. That posture is
+    pinned by ``test_provider_reasoning_does_not_invoke_provider_descriptors``.
+    """
+    for klass in type(value).__mro__:
+        descriptor = klass.__dict__.get(_PYDANTIC_EXTRA_SLOT)
+        if descriptor is None:
+            continue
+        if type(descriptor) is not MemberDescriptorType:
+            return None
+        try:
+            extra = descriptor.__get__(value, type(value))
+        except AttributeError:
+            return None
+        return extra if isinstance(extra, dict) and extra else None
+    return None
+
+
+def _merge_pydantic_extra(value: Any, fields: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Overlay an object's own ``__dict__`` fields onto its pydantic extras."""
+    extra = _pydantic_extra_fields(value)
+    if extra is None:
+        return fields
+    return {**extra, **fields}
+
+
 def _provider_field_map(value: Any) -> Mapping[str, Any] | None:
     if isinstance(value, Mapping):
         return value
@@ -108,18 +154,7 @@ def _provider_field_map(value: Any) -> Mapping[str, Any] | None:
         return None
     if not isinstance(fields, Mapping):
         return None
-    # Pydantic v2 models with ``extra="allow"`` (LiteLLM response objects)
-    # store undeclared provider fields in the ``__pydantic_extra__`` slot,
-    # not ``__dict__`` — ``usage`` on a real ModelResponse lives there.
-    # Reading the slot is still a data-only read: no provider-named
-    # property is ever invoked.
-    try:
-        extra = object.__getattribute__(value, "__pydantic_extra__")
-    except AttributeError:
-        return fields
-    if isinstance(extra, dict) and extra:
-        return {**extra, **fields}
-    return fields
+    return _merge_pydantic_extra(value, fields)
 
 
 def _provider_field(value: Any, field: str) -> Any:
@@ -266,22 +301,146 @@ def _validated_provider_cost(
     return cost, source
 
 
+# ---------------------------------------------------------------------------
+# Bounds on provider-authored strings that reach a stored or rendered
+# projection (elspeth: composer endpoint affordance).
+#
+# ELSPETH lets an operator point the composer at any OpenAI-compatible
+# endpoint. The realistic failure mode is not a hostile provider but a
+# malfunctioning one: a buggy proxy, a mis-translated upstream, or an error
+# blob returned where a short token belongs. Those strings land in
+# ``chat_messages.tool_calls`` (stored) and, via ``llm_call_audit_summary``,
+# in the message-list view (rendered), so an unbounded value is unbounded
+# text in a durable, rendered column.
+#
+# The response is graceful degradation, never rejection: truncate, keep the
+# audit row, and make the anomaly legible. Dropping the record because a
+# field is oversized would discard the very evidence that the endpoint
+# misbehaved.
+#
+# Bounding happens HERE, at the single extraction point, so the envelope,
+# the rendered summary, and the sidecar all inherit one already-bounded
+# value and there is one place to reason about the limit. The contract
+# (``ComposerLLMCall``) deliberately does not re-check length: a contract
+# that rejected an oversized value would raise instead of recording, which
+# is exactly the outcome this bound exists to prevent.
+# ---------------------------------------------------------------------------
+
+PROVIDER_STRING_TRUNCATION_MARKER: Final[str] = "<truncated:"
+"""Opening marker of the in-band suffix appended to a truncated provider string.
+
+The full suffix is ``<truncated:{original_length}>``. Readers detect
+truncation with ``PROVIDER_STRING_TRUNCATION_MARKER in value`` rather than
+hardcoding the literal.
+"""
+
+# A closed-vocabulary provider token (``finish_reason``). Real values are
+# short: the longest ones any provider emits are Gemini's
+# ``FINISH_REASON_UNSPECIFIED`` / ``MALFORMED_FUNCTION_CALL`` at ~25
+# characters. 128 is ~5x the longest real value — no legitimate token, even
+# one no provider has invented yet, is ever cut — while anything longer is
+# self-evidently not a termination token.
+_PROVIDER_TOKEN_MAX_CHARS: Final[int] = 128
+
+# A provider routing or correlation identifier (``model_returned``,
+# ``provider_request_id``). These are legitimately long: Bedrock
+# inference-profile ARNs and Vertex resource paths run ~100-140 characters.
+# 256 clears those with room to spare, and both identifiers share it so
+# there is one identifier bound to justify rather than two.
+_PROVIDER_IDENTIFIER_MAX_CHARS: Final[int] = 256
+
+
+def _bounded_provider_string(value: str, *, limit: int) -> str:
+    """Cap one provider-authored string, signalling truncation in band.
+
+    Returns ``value`` unchanged — byte-identical — when it is within
+    ``limit``; a well-behaved endpoint's output is never altered. Beyond the
+    limit the value is cut and an in-band ``<truncated:{original_length}>``
+    suffix is appended.
+
+    Why in-band rather than a companion flag
+    ----------------------------------------
+    Silent truncation is the failure to avoid: it turns "the endpoint sent
+    garbage" into "the value looks fine but short". The signal therefore
+    travels with the value. An in-band suffix propagates through every
+    projection — the ``tool_calls`` envelope, the rendered summary, the
+    sidecar ``to_dict()`` — with no schema change and no risk of a
+    projection carrying the value while dropping its flag. This follows the
+    precedent this module already sets for a scalar provider string in
+    ``_append_llm_error_hash`` (``...[raw_error_hash=…]``); the companion
+    ``_truncated`` dict flag at ``audit.py:475`` works there only because
+    that value is already a dict.
+
+    The original length is included because it is the diagnostic that
+    distinguishes "the endpoint sent 200 characters" from "the endpoint sent
+    two megabytes" — the difference between a sloppy value and a broken one.
+
+    Accepted trade-off: a legitimate provider value that itself ended in
+    ``<truncated:N>`` would be indistinguishable from a truncated one. That
+    is not defended against — the collision is vanishingly unlikely, and
+    guarding it would cost more clarity than the risk is worth.
+
+    Typed ``str -> str``: both call sites assert the value is an exact
+    ``str`` before calling, so a non-string branch here would be dead code.
+    """
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}{PROVIDER_STRING_TRUNCATION_MARKER}{len(value)}>"
+
+
 def safe_response_model(response: Any | None) -> str | None:
+    """Return the provider's own ``response.model`` string, bounded.
+
+    Provider-authored: the endpoint chooses these bytes. Besides the audit
+    row's ``model_returned``, this value is the provenance ``model_version``
+    stored on proposals and interpretation events, so bounding it here
+    covers every stored consumer at once.
+
+    A legitimate identifier — including a Bedrock inference-profile ARN or a
+    Vertex resource path — passes through unchanged; see
+    :func:`_bounded_provider_string` for the truncation signal.
+    """
     if response is None:
         return None
     model = _provider_field(response, "model")
     if isinstance(model, str) and model.strip():
-        return model
+        return _bounded_provider_string(model, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
     return None
 
 
 def _safe_provider_request_id(response: Any | None) -> str | None:
+    """Return the provider's own correlation id (``id``, else ``request_id``), bounded.
+
+    Provider-authored: the endpoint chooses these bytes, and they reach the
+    stored ``provider_request_id`` column and the rendered audit summary, so
+    the same bound applies as to the sibling identifier
+    :func:`safe_response_model` — one identifier limit
+    (:data:`_PROVIDER_IDENTIFIER_MAX_CHARS`) to justify rather than two.
+
+    Selection and bounding are deliberately separate steps. The attribute
+    order is a *preference* — ``id`` is what OpenAI-compatible endpoints
+    populate, ``request_id`` the fallback some proxies use — so the first
+    non-empty string wins and is then capped. Folding the length test back
+    into the acceptance predicate would make an over-long ``id`` fall through
+    to ``request_id``, and the audit row would then record a perfectly clean
+    id from an endpoint that had just emitted a broken one: the anomaly
+    disappears, which is the exact failure this bound exists to prevent.
+
+    A legitimate id passes through unchanged; see
+    :func:`_bounded_provider_string` for the truncation signal.
+
+    A blank id is absence, not a value — matching :func:`safe_response_model`
+    and the contract's own rule that a whitespace string reaching
+    ``_require_non_empty_str`` is a defect in the extraction site. Admitting
+    one on mere truthiness made the contract raise and destroyed the whole
+    audit row, which is precisely what bounding here exists to prevent.
+    """
     if response is None:
         return None
     for attr in ("id", "request_id"):
         value = _provider_field(response, attr)
-        if isinstance(value, str) and value and len(value) <= 256:
-            return value
+        if isinstance(value, str) and value.strip():
+            return _bounded_provider_string(value, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
     return None
 
 
@@ -289,24 +448,77 @@ def _response_field(value: Any, field: str) -> Any:
     return _provider_field(value, field)
 
 
-def _first_response_message(response: Any | None) -> Any | None:
+def _first_response_choice(response: Any | None) -> Any | None:
     if response is None:
         return None
     choices = _response_field(response, "choices")
     if not isinstance(choices, list | tuple) or not choices:
         return None
-    return _response_field(choices[0], "message")
+    return choices[0]
+
+
+def _first_response_message(response: Any | None) -> Any | None:
+    return _response_field(_first_response_choice(response), "message")
+
+
+def _finish_reason_from_response(response: Any | None) -> str | None:
+    """Return the provider's raw ``choices[0].finish_reason`` string, verbatim.
+
+    Tier-3 extraction: the value is read through ``_provider_field`` so the
+    pydantic v2 ``extra="allow"`` overflow slot is merged in — a reader that
+    consulted ``__dict__`` alone would see a real provider object as
+    field-less and silently record ``None`` (ADR-032; the defect class of
+    elspeth-9ea866438b).
+
+    Only the *value* is asserted, never the object's type: a non-``str`` or
+    blank finish reason is treated as absent. The surviving string is stored
+    exactly as received — no mapping onto the pipeline's ``FinishReason``
+    vocabulary (which lives in ``elspeth.plugins`` and must not be imported
+    from ``contracts``), and no normalisation of unrecognised values, so a
+    provider term ELSPETH has never seen still reaches the audit trail.
+
+    "Verbatim" is bounded, not unlimited. Every real termination token is a
+    handful of characters, so a value past
+    :data:`_PROVIDER_TOKEN_MAX_CHARS` is not a token the composer failed to
+    recognise — it is an endpoint returning something else entirely where a
+    token belongs (an error blob, an HTML page). Such a value is truncated
+    with an in-band marker rather than rejected: the audit row survives, and
+    the anomaly is legible in the rendered summary, which is precisely where
+    an operator would otherwise see unbounded provider text. A value within
+    the bound — which is every value a working endpoint produces — is
+    recorded byte-identically as before.
+    """
+    finish_reason = _provider_field(_first_response_choice(response), "finish_reason")
+    if type(finish_reason) is not str or not finish_reason.strip():
+        return None
+    return _bounded_provider_string(finish_reason, limit=_PROVIDER_TOKEN_MAX_CHARS)
 
 
 def _provider_artifact_owned_fields(value: Any) -> Mapping[str, Any] | None:
-    """Return data-only object fields without invoking provider serializers."""
+    """Return data-only object fields without invoking provider serializers.
+
+    Reads the same two data-only stores ``_provider_field_map`` reads —
+    ``__dict__`` plus the pydantic v2 ``extra="allow"`` overflow slot — because
+    a real provider object frequently keeps its entire payload in the latter.
+    Consulting ``__dict__`` alone returned ``None`` here, which raised
+    ``JsonBoundaryError`` and made ``_json_safe_provider_artifact`` store the
+    ``PROVIDER_ARTIFACT_UNAVAILABLE`` sentinel in place of the real artifact,
+    silently (ADR-032).
+
+    This deliberately does NOT delegate to ``_provider_field_map``: that helper
+    short-circuits ``Mapping`` inputs and reads ``__dict__`` via ``vars()``,
+    whereas the artifact walker handles ``dict`` itself and must reach the
+    instance store through ``object.__getattribute__`` so that a provider
+    ``__getattribute__`` override cannot run. An object with no data fields at
+    all also stays ``None`` here so the sentinel fallback is preserved.
+    """
     try:
         raw_fields = object.__getattribute__(value, "__dict__")
     except (AttributeError, TypeError):
         return None
     if type(raw_fields) is not dict:
         return None
-    fields = dict(raw_fields)
+    fields = dict(_merge_pydantic_extra(value, raw_fields))
     return fields or None
 
 
@@ -500,6 +712,7 @@ def build_llm_call_record(
         model_requested=model_requested,
         model_returned=safe_response_model(response),
         status=status,
+        finish_reason=_finish_reason_from_response(response),
         prompt_tokens=usage.prompt_tokens,
         completion_tokens=usage.completion_tokens,
         total_tokens=usage.total_tokens,

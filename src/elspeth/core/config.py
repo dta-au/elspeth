@@ -41,6 +41,13 @@ from elspeth.contracts.security import SecretFingerprintError as SecretFingerpri
 from elspeth.contracts.sink import FAILSINK_ELIGIBLE_PLUGIN_TEXT
 from elspeth.core import dynaconf_normalization, template_materialization
 from elspeth.core.dependency_config import CollectionProbeConfig, CommencementGateConfig, DependencyConfig
+from elspeth.core.llm_profiles import (
+    LLM_PROFILE_PRIVATE_FIELDS,
+    LLMProfileSettings,
+    RuntimeLLMProfile,
+    lower_llm_profile_options,
+    validate_profile_alias,
+)
 from elspeth.core.secrets import is_secret_field
 
 DynaconfKeyNormalizer = dynaconf_normalization.DynaconfKeyNormalizer
@@ -1827,6 +1834,19 @@ class ElspethSettings(BaseModel):
         description="Named pass-through scheduling queues for explicit fan-in.",
     )
 
+    # Optional - operator-owned LLM profile catalog for batch/CLI runs.
+    # Mirrors WebSettings.llm_profiles/default_llm_profile (web/config.py) so
+    # an `llm` transform node can select a profile alias instead of carrying
+    # raw provider config, on both authoring surfaces.
+    llm_profiles: Mapping[str, LLMProfileSettings] = Field(
+        default_factory=dict,
+        description="Operator-owned LLM provider profiles, keyed by opaque alias.",
+    )
+    default_llm_profile: str | None = Field(
+        default=None,
+        description="Preferred LLM profile alias; must name a configured llm_profiles entry.",
+    )
+
     # Run mode configuration
     run_mode: RunMode = Field(
         default=RunMode.LIVE,
@@ -1922,6 +1942,27 @@ class ElspethSettings(BaseModel):
         default_factory=TelemetrySettings,
         description="Telemetry and observability configuration",
     )
+
+    @field_validator("llm_profiles")
+    @classmethod
+    def _validate_llm_profile_aliases(cls, value: Mapping[str, LLMProfileSettings]) -> Mapping[str, LLMProfileSettings]:
+        for alias in value:
+            validate_profile_alias(alias)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_default_llm_profile_alias(self) -> "ElspethSettings":
+        """Validate a designated default without turning its absence into a config error.
+
+        Mirrors WebSettings._validate_default_llm_profile_alias: a missing
+        default is a supported state (explicit provider config on `llm`
+        nodes, or an explicit `profile` reference, remain fully usable).
+        """
+        if self.default_llm_profile is not None:
+            validate_profile_alias(self.default_llm_profile)
+            if self.default_llm_profile not in self.llm_profiles:
+                raise ValueError("default_llm_profile must name a configured llm profile")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -2163,6 +2204,159 @@ def _expand_env_vars(config: dict[str, Any]) -> dict[str, Any]:
             return value
 
     return {k: _expand_value(v) for k, v in config.items()}
+
+
+def _lower_llm_profile_node_options(
+    alias: str,
+    profile_settings: LLMProfileSettings,
+    options: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Return ``(executable_options, audit_safe_options)`` for one ``llm``
+    node's profile selection, BEFORE batch's credential-materialization
+    rewrite (the ``api_key`` value is still the ``{"secret_ref": ...}``
+    marker, exactly as :meth:`_LLMProfileResolver.lower_options` (web)
+    returns it for the same profile+options — both call
+    :func:`elspeth.core.llm_profiles.lower_llm_profile_options`).
+
+    Split out of :func:`_lower_llm_profile_nodes` so the batch/CLI catalog
+    lowering pass and its own unit tests share the exact call this function
+    makes, rather than a test re-deriving the same computation separately.
+    """
+    runtime_profile = RuntimeLLMProfile.from_settings(alias, profile_settings)
+    safe_options = {k: v for k, v in options.items() if k != "profile"}
+    return lower_llm_profile_options(
+        alias,
+        runtime_profile,
+        safe_options,
+        private_fields=LLM_PROFILE_PRIVATE_FIELDS,
+    )
+
+
+def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -> dict[str, Any]:
+    """Rewrite ``llm`` transform nodes that select an operator profile.
+
+    Mirrors the web plugin-policy resolver's ``lower_options`` lowering seam
+    so a batch/CLI ``llm`` node written as ``options: {"profile": "alias",
+    ...}`` (no ``provider`` key) resolves to the SAME private executable
+    options a web author's identical profile selection would produce — both
+    call :func:`elspeth.core.llm_profiles.lower_llm_profile_options` via
+    :func:`_lower_llm_profile_node_options`.
+
+    Runs on the raw config dict, before :func:`_expand_env_vars`, mirroring
+    that function's own placement (a pre-pydantic rewrite of the raw dict,
+    not a ``model_validator`` — ``TransformSettings.options`` is an untyped
+    ``dict[str, Any]`` and ``ElspethSettings`` is frozen, so there is nowhere
+    to write a lowered value back onto validated settings).
+
+    Structural checks (unknown alias; ``profile`` supplied together with
+    ``provider``; a non-``server`` ``credential_scope``) run whenever a
+    profile-selecting node is found and require no secret material — but the
+    ENTIRE lowering, not just the credential step, is gated on
+    ``materialize``: when it is ``False`` these checks still run (an unknown
+    alias or ambiguous node is rejected immediately regardless), but a node
+    naming a VALID alias is left completely un-lowered — ``options`` still
+    has ``"profile"`` and no ``"provider"``. That is not itself an error at
+    this layer; both real callers (below) only ever pass ``materialize=True``
+    for a caller trusted to expand host environment variables, so the
+    un-lowered state is unreachable in production. It is not silently
+    swallowed either: an un-lowered node still fails closed later, at
+    ``LLMTransform.__init__``'s "missing required 'provider' key" check, when
+    the pipeline is actually built.
+
+    When ``materialize`` IS set, the rewrite injects a secret REFERENCE
+    marker for the profile's credential, then converts it to a ``${VAR}``
+    template so it actually gets resolved by the ``_expand_env_vars`` pass
+    that follows. This is not a new secret mechanism: it hands the SAME
+    ``${VAR}`` syntax an operator would write by hand on an explicit
+    Azure/OpenRouter node to the SAME env-var-expansion pass that already
+    resolves it, so a missing server secret fails closed at config-load time
+    with the existing "Required environment variable ... is not set" error.
+
+    Batch/CLI has no per-user secret store — only ``credential_scope:
+    server`` profiles (or scope-less ones, e.g. Bedrock's keyless AWS
+    credential chain) can be materialized from the host environment. A
+    ``user``-scoped profile referenced from a batch node fails closed rather
+    than silently reading a would-be per-user secret out of the shared
+    process environment.
+    """
+    raw_profiles = raw_config.get("llm_profiles")
+    profiles: dict[str, LLMProfileSettings] = {}
+    if isinstance(raw_profiles, dict):
+        for alias, profile_dict in raw_profiles.items():
+            if not isinstance(profile_dict, dict):
+                raise ValueError(f"llm_profiles[{alias!r}] must be a mapping")
+            profiles[alias] = LLMProfileSettings(**profile_dict)
+
+    default_alias = raw_config.get("default_llm_profile")
+    if default_alias is not None and default_alias not in profiles:
+        raise ValueError(f"default_llm_profile {default_alias!r} does not name a configured llm_profiles entry")
+
+    transforms = raw_config.get("transforms")
+    if not isinstance(transforms, list):
+        return raw_config
+    for index, node in enumerate(transforms):
+        if not isinstance(node, dict) or node.get("plugin") != "llm":
+            continue
+        options = node.get("options")
+        if not isinstance(options, dict) or "profile" not in options:
+            continue
+        alias = options["profile"]
+        if not isinstance(alias, str):
+            raise ValueError(f"transforms[{index}] llm node 'profile' option must be a string alias")
+        if "provider" in options:
+            raise ValueError(
+                f"transforms[{index}] llm node specifies both 'profile' and 'provider' — "
+                "choose exactly one: an operator profile alias, or explicit provider config"
+            )
+        try:
+            profile_settings = profiles[alias]
+        except KeyError:
+            raise ValueError(f"transforms[{index}] llm node references unknown llm profile {alias!r}") from None
+        if profile_settings.credential_scope not in (None, "server"):
+            raise ValueError(
+                f"transforms[{index}] llm node references profile {alias!r} with "
+                f"credential_scope {profile_settings.credential_scope!r}; batch/CLI runs have no per-user "
+                "secret store and can only use credential_scope 'server' (or scope-less, e.g. Bedrock) profiles"
+            )
+        if not materialize:
+            continue
+        executable, _audit_safe = _lower_llm_profile_node_options(alias, profile_settings, options)
+        api_key = executable.get("api_key")
+        if isinstance(api_key, dict) and "secret_ref" in api_key:
+            # Batch/CLI never gains the web secret-store resolver; it
+            # materializes the profile's credential the same way an
+            # explicitly-authored `api_key: ${VAR}` node always has, via the
+            # existing _expand_env_vars pass run right after this one.
+            executable["api_key"] = f"${{{api_key['secret_ref']}}}"
+        # Retain the ALIAS ONLY (never endpoint/credential_ref) in the
+        # executable options so it survives into ElspethSettings and is
+        # therefore recoverable from the run's audit trail — both
+        # resolve_config()'s settings_json snapshot (core/config.py) and the
+        # DAG's per-node audit config (core/landscape/data_flow/graph.py's
+        # sanitize_node_config_for_audit) derive from exactly this dict via
+        # BaseTransform.config. Web's parallel answer to "which profile did
+        # this node use" lives in run_web_plugin_policy.selected_profile_aliases_json
+        # (a web-only Landscape table); batch has no such table, so the
+        # alias must travel inside the node's own options.
+        #
+        # Deliberately NOT keyed as "profile" (the authored selector key):
+        # this same dict is what a second pass through this function would
+        # see if a lowered run's settings were ever re-loaded (persisted-run
+        # replay, run cloning — no such caller exists today, but nothing
+        # prevents one being added later). If the alias rode under "profile"
+        # ALONGSIDE the now-also-present "provider" key, that re-load would
+        # look identical to a genuinely ambiguous authored node and trip the
+        # "specifies both 'profile' and 'provider'" rejection above — an
+        # accidental self-collision, not a real conflict. "profile_alias" is
+        # a distinct key the ambiguity check never inspects and no provider
+        # config model or authoring surface uses, so this pass is safe to
+        # run twice over its own output (round-trip safe by construction, not
+        # by relying on the two checks never being fed the same dict twice).
+        # `LLMTransform.__init__` strips this key before provider
+        # construction — no provider config model declares it.
+        executable["profile_alias"] = alias
+        node["options"] = executable
+    return raw_config
 
 
 def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mapping[str, object]) -> None:
@@ -2663,6 +2857,11 @@ def load_settings(config_path: Path) -> ElspethSettings:
     raw_config = {k: v for k, v in raw_config.items() if k in known_fields}
     _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
 
+    # Lower `llm` transform nodes that select an operator profile alias into
+    # their private executable provider config, mirroring the web
+    # plugin-policy lowering seam (see _lower_llm_profile_nodes docstring).
+    raw_config = _lower_llm_profile_nodes(raw_config, materialize=True)
+
     # Expand ${VAR} and ${VAR:-default} patterns in config values
     raw_config = _expand_env_vars(raw_config)
 
@@ -2708,6 +2907,13 @@ def load_settings_from_config_dict(config_dict: Mapping[str, object], *, expand_
     raw_config = {k: v for k, v in raw_config.items() if k in known_fields}
     _reject_file_backed_template_options_for_in_memory_loader(raw_config)
     _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+    # Structural profile-selector checks (unknown alias, ambiguous
+    # profile+provider) always run; the credential-materializing rewrite only
+    # runs when the caller opted into host environment expansion (see
+    # _lower_llm_profile_nodes docstring) — otherwise the ${VAR} template it
+    # writes would never be resolved and would reach plugin construction
+    # as literal, unexpanded text instead of failing closed at load time.
+    raw_config = _lower_llm_profile_nodes(raw_config, materialize=expand_env_vars)
     if expand_env_vars:
         raw_config = _expand_env_vars(raw_config)
     return ElspethSettings(**raw_config)

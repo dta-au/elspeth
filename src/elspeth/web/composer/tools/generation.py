@@ -394,6 +394,112 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Update the coalesce node with upsert_node, providing the missing field.",
     ),
     (
+        r"row_union_config_invalid",
+        "A row_union contains plugin, options, routing, aggregation, or coalesce-only configuration that the structural barrier forbids.",
+        "Keep only id, node_type='row_union', input, branches, on_success, and an optional finite positive timeout_seconds.",
+    ),
+    (
+        r"row_union_name_invalid",
+        "The row_union name does not satisfy the runtime identifier contract.",
+        "Choose a name of 1-38 characters that starts with a letter and contains only letters, digits, underscores, "
+        "and hyphens; do not use a reserved label or a name beginning with '__'.",
+    ),
+    (
+        r"row_union_branches_invalid",
+        "A row_union needs at least two declared fork branches.",
+        "Provide an ordered branches mapping with at least two unique branch names and input connections.",
+    ),
+    (
+        r"row_union_branch_invalid",
+        "A row_union branch name or connection is empty, duplicated, or otherwise invalid.",
+        "Give every branch a non-empty unique alias and a non-empty unique incoming connection.",
+    ),
+    (
+        r"row_union_input_mismatch",
+        "The row_union adapter input does not equal the first declared branch connection.",
+        "Set input to the first value in the ordered branches mapping.",
+    ),
+    (
+        r"row_union_on_success_invalid",
+        "A row_union must publish released rows through a non-empty on_success connection.",
+        "Set on_success to a downstream processing connection.",
+    ),
+    (
+        r"row_union_timeout_invalid",
+        "The row_union timeout is not a finite positive number.",
+        "Omit timeout_seconds or set it to a finite number greater than zero.",
+    ),
+    (
+        r"row_union_branch_alias_unreachable",
+        "A row_union branch alias does not match a fork branch declared upstream.",
+        "Use the upstream gate's fork_to branch names as the row_union branches keys.",
+    ),
+    (
+        r"row_union_branch_unreachable",
+        "A row_union branch connection is not produced by the corresponding fork branch.",
+        "Wire each branch transform's on_success to the matching row_union branches value.",
+    ),
+    (
+        r"row_union_branch_origin_invalid",
+        "The row_union branch aliases come from more than one gate, so the reconverged rows have no single correlation origin.",
+        "Pick every branches key from one gate's fork_to, or add a separate row_union for each fork.",
+    ),
+    (
+        r"row_union_branch_not_downstream",
+        "A row_union branch alias maps to a connection that is not downstream of that alias's own fork edge.",
+        "Wire each branches[alias] value through processing that starts at the matching gate fork branch.",
+    ),
+    (
+        r"row_union_branch_aggregation_invalid",
+        "A transform-mode aggregation inside a fork branch loses the per-row identity required to satisfy the row_union group.",
+        "Set that aggregation's output_mode to passthrough so each row keeps its identity, or move the aggregation "
+        "upstream of the fork that feeds the row_union.",
+    ),
+    (
+        r"row_union_nested_fork_invalid",
+        "A nested fork inside a row_union branch replaces the enclosing branch identity, so the require-all group cannot complete.",
+        "Move the nested fork before the fork that feeds the row_union, or terminate the nested branch at a sink.",
+    ),
+    (
+        r"row_union_downstream_group_invalid",
+        "A row_union release reaches a downstream early-trigger aggregation or correlated barrier that can split, "
+        "drop, or duplicate members of the indivisible N-to-N group.",
+        "For an aggregation, omit trigger or use trigger: {} so only end_of_source flushes, or move it upstream of "
+        "the fork. For a downstream coalesce or row_union, move that barrier upstream of the fork or terminate the "
+        "released group at a sink.",
+    ),
+    (
+        r"row_union_schema_incompatible",
+        "The row_union branch declarations cannot safely feed one long-format output stream. Fixed schemas must have "
+        "the same complete declared shape; flexible schemas may add branch-only fields but shared fields cannot "
+        "declare conflicting types.",
+        "Use the row_union_schema facts: align the complete declared field sets and types for fixed branches; for "
+        "flexible branches, change only the listed conflicting shared fields to compatible types. Keep disjoint "
+        "flexible-only fields; they do not need to be deleted.",
+    ),
+    (
+        r"fork_branch_multiple_barriers",
+        "One fork branch is declared by two barriers (coalesce and/or row_union). A fork branch delivers its arrival to "
+        "exactly one barrier, so the engine rejects the second claim at graph build time.",
+        "Keep the branch on a single barrier: delete it from the other barrier's branches, or give each barrier its own "
+        "fork branch name in the gate's fork_to and wire that branch to it.",
+    ),
+    (
+        r"gate_duplicate_fork_branch",
+        "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
+        "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",
+    ),
+    (
+        r"row_union_on_success_must_be_connection",
+        "A row_union release target names a sink, but the barrier may only release into downstream processing.",
+        "Set row_union.on_success to a connection consumed by a downstream node, then route that node to the sink.",
+    ),
+    (
+        r"row_union_on_success_dangling",
+        "No downstream node consumes the row_union release connection.",
+        "Add a downstream processing node whose input equals row_union.on_success.",
+    ),
+    (
         r"aggregation_missing_plugin|Aggregation '(.+)' is missing required field 'plugin'",
         "An aggregation node needs a plugin to define its aggregation behaviour.",
         "Update the aggregation with upsert_node, specifying the plugin name.",
@@ -514,8 +620,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     # the only signal it carries, so each must be explainable here.
     (
         r"unknown[ _]node_type",
-        "The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, transform. There is no 'fork' node_type.",
-        "Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node — node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input, and branches rejoin at a COALESCE node (branches + policy + merge). A node after the coalesce consumes it by setting input='<coalesce id>' — the coalesce's own on_success may only name a sink.",
+        "The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.",
+        "Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node — "
+        "node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, "
+        "fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. "
+        "Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. "
+        "Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases "
+        "to arriving connections, input repeats the first branch value, and on_success names downstream processing.",
     ),
     (
         r"coalesce_on_success_must_be_sink|coalesce_on_success_unknown_sink|Coalesce on_success must point to a sink|Coalesce '(.+)' on_success references unknown sink",
@@ -789,6 +900,28 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "coalesce_missing_branches",
     "coalesce_policy_invalid",
     "coalesce_merge_invalid",
+    "row_union_config_invalid",
+    "row_union_name_invalid",
+    "row_union_branches_invalid",
+    "row_union_branch_invalid",
+    "row_union_input_mismatch",
+    "row_union_on_success_invalid",
+    "row_union_timeout_invalid",
+    "row_union_branch_alias_unreachable",
+    "row_union_branch_unreachable",
+    "row_union_branch_origin_invalid",
+    "row_union_branch_not_downstream",
+    "row_union_branch_aggregation_invalid",
+    "row_union_nested_fork_invalid",
+    "row_union_downstream_group_invalid",
+    "row_union_schema_incompatible",
+    "row_union_on_success_must_be_connection",
+    "row_union_on_success_dangling",
+    # Cross-node barrier topology: mirrors the engine's "each fork branch can
+    # only join at one barrier" rule for coalesce/coalesce, coalesce/row_union
+    # and row_union/row_union claims.
+    "fork_branch_multiple_barriers",
+    "gate_duplicate_fork_branch",
     "transform_missing_on_success",
     "transform_missing_on_error",
     "transform_on_success_dangling",

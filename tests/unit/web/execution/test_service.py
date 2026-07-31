@@ -1219,6 +1219,30 @@ def _coalesce_node(
     )
 
 
+def _row_union_node(
+    *,
+    branches: dict[str, str],
+    on_success: str = "unioned_rows",
+) -> Any:
+    from elspeth.web.composer.state import NodeSpec
+
+    return NodeSpec(
+        id="variant_union",
+        node_type="row_union",
+        plugin=None,
+        input=next(iter(branches.values())),
+        on_success=on_success,
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=branches,
+        policy=None,
+        merge=None,
+    )
+
+
 def _queue_fan_in_state(*, sources: dict[str, Any], extra_nodes: tuple[Any, ...] = ()) -> Any:
     """CompositionState: ``sources`` fan into queue ``inbound`` feeding an LLM."""
     from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -1530,6 +1554,44 @@ class TestExecutionFanoutGuard:
         risk = guard.risks[0]
         assert risk.estimated_provider_calls == 101
         assert risk.upstream_fanout == ("source:rows:text:estimated_rows=101",)
+
+    def test_row_union_traverses_every_branch_for_provider_cost(self, tmp_path: Path) -> None:
+        """A downstream LLM sees the summed cardinality of every released branch."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        control = tmp_path / "control.txt"
+        treatment = tmp_path / "treatment.txt"
+        control.write_text("\n".join(f"control-{i}" for i in range(60)) + "\n", encoding="utf-8")
+        treatment.write_text("\n".join(f"treatment-{i}" for i in range(60)) + "\n", encoding="utf-8")
+        state = CompositionState(
+            sources={
+                "control": _text_source(control, "control_done"),
+                "treatment": _text_source(treatment, "treatment_done"),
+            },
+            nodes=(
+                _row_union_node(
+                    branches={
+                        "control": "control_done",
+                        "treatment": "treatment_done",
+                    }
+                ),
+                _fanout_llm_node("unioned_rows"),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None
+        assert guard.risks[0].estimated_provider_calls == 120
+        assert set(guard.risks[0].upstream_fanout) == {
+            "source:control:text:estimated_rows=60",
+            "source:treatment:text:estimated_rows=60",
+        }
 
     # ── Queue fan-in provider-cost guard (elspeth-6421ffa028) ───────────
     # A declared queue fans multiple upstream sources into one LLM. The

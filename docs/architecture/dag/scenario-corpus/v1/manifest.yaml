@@ -495,6 +495,16 @@ evidence:
     locator: tests/integration/core/dag/test_dag_scenario_production_path.py::test_b3_stateful_runtime_cases_pin_exact_contracts
     claim: The seven B3 stateful cases pin exact aggregation membership, expansion lineage, retry and error dispositions, routes, artifacts, sink-effect attempts, and durable and portable audit parity.
     stages: [config, build, runtime, audit]
+  - id: row-union-two-variant-ab-production-contract
+    kind: pytest
+    locator: tests/integration/core/dag/test_dag_scenario_production_path.py::test_row_union_two_variant_ab_preserves_complete_declared_groups_and_statistics
+    claim: The canonical two-variant A/B case pins the production graph, long-format statistics, declared control/treatment group order, complete batch membership, and terminal scheduler work.
+    stages: [config, build, runtime, audit]
+  - id: composer-row-union-authoring-parity
+    kind: pytest
+    locator: tests/integration/web/composer/parity/test_fixture_matrix.py::test_surface_derives_isomorphic_committed_graph
+    claim: Freeform, guided-full, and guided-staged authoring derive the canonical row-union A/B graph and public runtime pipeline semantics.
+    stages: [config, build]
   - id: harness-aggregation-immutable-batch-eof-immutable-membership
     kind: harness
     locator: aggregation-immutable-batch:eof-immutable-membership
@@ -515,6 +525,11 @@ evidence:
     locator: row-expansion-parent-child-recovery:resume-after-child-enqueue
     claim: Using the supported observed-schema JSON source contract, a fresh-object public resume after source exhaustion and before sink flush preserves the exact three parents, six children, 2/1/3 expansion groups, and nine scheduler identities, does not replay the source or duplicate enqueue, emits one exact six-row artifact, removes the checkpoint, and preserves durable/export parity; fixed-any schema reconstruction remains separately owned by P1 elspeth-0b0eaa63df, and this pre-platform evidence is provisional until the deferred-platform rebase.
     stages: [config, build, runtime, audit, recovery]
+  - id: harness-row-union-interleave-two-variant-ab
+    kind: harness
+    locator: row-union-interleave:two-variant-ab
+    claim: The canonical two-variant A/B case proves semantic production runtime behavior for a deterministic fork, declared-order row_union release, end-of-source long-format experiment comparison, and one complete terminal publication.
+    stages: [config, build, runtime]
   - id: harness-retry-quarantine-discard-routed-errors-retry-then-success
     kind: harness
     locator: retry-quarantine-discard-routed-errors:retry-then-success
@@ -4055,25 +4070,59 @@ scenarios:
   - id: row-union-interleave
     ordinal: 11
     title: Row union or interleave, whether supported or consistently rejected
-    cases: []
+    cases:
+      - id: two-variant-ab
+        workflow: run
+        fixture: row-union-interleave/two-variant-ab.yaml
+        input_fixtures:
+          primary: row-union-interleave/input.csv
+        output_artifacts:
+          output: output.jsonl
+        expected: {"audit_record_counts":[{"count":1,"record_type":"artifact"},{"count":1,"record_type":"batch"},{"count":8,"record_type":"batch_member"},{"count":3,"record_type":"call"},{"count":7,"record_type":"edge"},{"count":1,"record_type":"manifest"},{"count":7,"record_type":"node"},{"count":26,"record_type":"node_state"},{"count":2,"record_type":"operation"},{"count":8,"record_type":"routing_event"},{"count":4,"record_type":"row"},{"count":1,"record_type":"run"},{"count":78,"record_type":"scheduler_event"},{"count":1,"record_type":"sink_effect"},{"count":3,"record_type":"sink_effect_attempt"},{"count":1,"record_type":"sink_effect_member"},{"count":1,"record_type":"sink_effect_stream"},{"count":13,"record_type":"token"},{"count":21,"record_type":"token_outcome"},{"count":9,"record_type":"token_parent"}],"kind":"semantic_runtime","projection_counts":{"batch_members":8,"batches":1,"intermediate_outcomes":8,"node_states":26,"parent_links":9,"routes":8,"rows":4,"scheduler_work":21,"terminal_dispositions":13,"tokens":13},"projection_sha256":"89d17c13b2ab7c433ffe5d2a32edc66939798beeea096a4a5a8b1b3202ea0061","rows_failed":0,"rows_processed":4,"rows_succeeded":1,"sink_outputs":[{"rows":["{\"baseline_count\":4,\"baseline_mean\":25,\"baseline_missing_count\":0,\"baseline_non_finite_count\":0,\"baseline_stdev\":12.909944487358056,\"baseline_total_count\":4,\"baseline_variant\":\"control\",\"batch_size\":8,\"confidence_95_high\":35.308258738155935,\"confidence_95_low\":-10.308258738155935,\"mean_delta\":12.5,\"relative_lift\":0.5,\"score_field\":\"score\",\"standard_error\":11.636866703140784,\"variant\":\"treatment\",\"variant_count\":4,\"variant_field\":\"prompt_variant\",\"variant_mean\":37.5,\"variant_missing_count\":0,\"variant_non_finite_count\":0,\"variant_stdev\":19.364916731037084,\"variant_total_count\":4,\"z_score\":1.0741723110591492}"],"sink_name":"output"}],"source_operation_count":1,"status":"completed"}
     dimensions:
-      config: &row_union_fail
-        status: fail
-        reason: Row union has neither a supported construct nor one consistent rejection contract.
+      config:
+        status: pass
+        evidence: [harness-row-union-interleave-two-variant-ab]
+      build:
+        status: pass
+        evidence: [harness-row-union-interleave-two-variant-ab]
+      contracts:
+        status: pass
+        evidence: [row-union-two-variant-ab-production-contract]
+      runtime:
+        status: pass
+        evidence: [harness-row-union-interleave-two-variant-ab]
+      audit:
+        status: partial
+        evidence: [row-union-two-variant-ab-production-contract]
+        reason: Semantic runtime evidence pins exact audit record counts and durable/export parity, but does not pin canonical raw audit identity across equivalent runs.
         owner_issue: elspeth-a5b86149d4
-        exit_gate: The row-union corpus case passes one explicit support path or exact rejection contract.
-      build: *row_union_fail
-      contracts: *row_union_fail
-      runtime: *row_union_fail
-      audit: &row_union_not_applicable
-        status: not_applicable
-        reason: Row union has no supported construct, so post-build audit, recovery, and concurrency do not apply after configuration, build, contract, and runtime already fail.
-      recovery: *row_union_not_applicable
-      concurrency: *row_union_not_applicable
-      freeform: *row_union_fail
-      guided: *row_union_fail
-      round_trip: *row_union_not_applicable
-      scale: *row_union_not_applicable
+        exit_gate: A repeated row-union corpus run pins canonical raw audit identity or an explicit accepted identity boundary, and the corpus gate passes.
+      recovery:
+        status: unknown
+        reason: No registered row-union corpus recovery case exists.
+        owner_issue: elspeth-a5b86149d4
+        exit_gate: The row-union corpus case passes database-reopen and public-resume assertions without duplicate or partial group release.
+      concurrency:
+        status: unknown
+        reason: No complete row-union contention and fencing case exists.
+        owner_issue: elspeth-a5b86149d4
+        exit_gate: The row-union corpus contention case passes single-effective-owner, declared-order release, and stale-worker fencing assertions.
+      freeform: *freeform_pass
+      guided:
+        status: pass
+        evidence: [composer-row-union-authoring-parity]
+      round_trip:
+        status: partial
+        evidence: [yaml-importer-generator, yaml-importer-generator-02]
+        reason: Import and export helpers cover row_union, but canonical browser-backed round-trip equality is incomplete.
+        owner_issue: elspeth-a5b86149d4
+        exit_gate: The browser-backed row-union corpus round-trip passes canonical graph and traversal-plan equality.
+      scale:
+        status: unknown
+        reason: No supported row-union scale envelope has been executed.
+        owner_issue: elspeth-a5b86149d4
+        exit_gate: The row-union corpus scale case passes its declared supported threshold in the required CI gate.
 
   - id: retry-quarantine-discard-routed-errors
     ordinal: 12

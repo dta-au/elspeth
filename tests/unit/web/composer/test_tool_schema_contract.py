@@ -60,6 +60,23 @@ _BASE_PIPELINE: dict[str, Any] = {
             ],
         ),
         (
+            ("nodes",),
+            [
+                {
+                    "id": "variant_union",
+                    "node_type": "row_union",
+                    "input": "control_done",
+                    "plugin": None,
+                    "on_success": "unioned_rows",
+                    "branches": {
+                        "control": "control_done",
+                        "treatment": "treatment_done",
+                    },
+                    "timeout_seconds": 30.0,
+                }
+            ],
+        ),
+        (
             ("edges",),
             [{"id": "edge", "from_node": "source", "to_node": "sink", "edge_type": "on_success", "label": None}],
         ),
@@ -96,6 +113,21 @@ def test_inline_blob_mime_types_share_the_blob_contract_closed_set() -> None:
             "content": "one\n",
         }
         SetPipelineArgumentsModel.model_validate(payload)
+
+
+def test_provider_schemas_explicitly_describe_row_union_routing_fields() -> None:
+    definitions = get_tool_definitions()
+    upsert = next(definition["parameters"] for definition in definitions if definition["name"] == "upsert_node")
+    set_pipeline = _registered_set_pipeline_schema()
+    pipeline_node = set_pipeline["properties"]["nodes"]["items"]
+
+    for properties in (upsert["properties"], pipeline_node["properties"]):
+        on_success_description = properties["on_success"]["description"]
+        branches_description = properties["branches"]["description"]
+        assert "row_union" in on_success_description
+        assert "processing connection" in on_success_description
+        assert "row_union" in branches_description
+        assert "consum" in branches_description
 
     unsupported = deepcopy(_BASE_PIPELINE)
     unsupported["source"]["inline_blob"] = {
@@ -206,6 +238,7 @@ def test_registered_schema_lookup_rejects_missing_internal_definition_name(monke
         (("properties", "source", "properties", "inline_blob", "properties", "description"), "string"),
         (("properties", "sources", "additionalProperties", "properties", "on_validation_failure"), "string"),
         (("properties", "nodes", "items", "properties", "trigger", "properties", "timeout_seconds"), "number"),
+        (("properties", "nodes", "items", "properties", "timeout_seconds"), "number"),
         (("properties", "edges", "items", "properties", "label"), "string"),
         (("properties", "outputs", "items", "properties", "on_write_failure"), "string"),
     ],

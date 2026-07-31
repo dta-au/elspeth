@@ -53,6 +53,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [029](029-journal-is-barrier-buffer-truth.md) | Scheduler Journal Is the Single Source of Barrier-Buffer Truth | 2026-06-11 | **Accepted** |
 | [030](030-multi-worker-deployment-shape.md) | Multi-Worker Deployment Shape — One-Host WAL Pack | 2026-06-11 | **Accepted** |
 | [031](031-tutorial-is-a-fixed-script-canary.md) | The Tutorial Is a Fixed-Script Canary for the General Guided Surface | 2026-07-22 | **Accepted** |
+| [032](032-validate-by-trust-domain.md) | Boundary Validation Splits by Trust Domain — Parse External Input, Nominally Type Internal Input | 2026-07-31 | **Accepted** |
 
 ## Status Definitions
 

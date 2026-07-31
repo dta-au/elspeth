@@ -11551,7 +11551,7 @@ class TestPreviewPipeline:
                 "on_error": None,
                 "options": {},
                 "condition": "True",
-                "routes": {},
+                "routes": {"true": "fork", "false": "fork"},
                 "fork_to": ["classified_rows_to_fraud_filter", "classified_rows_to_regular_filter"],
                 "branches": None,
                 "policy": None,
@@ -11570,6 +11570,397 @@ class TestPreviewPipeline:
         fixed_preview = execute_tool("preview_pipeline", {}, fixed_state, _mock_catalog()).to_dict()["data"]
 
         assert not any("Duplicate consumer for connection 'classified_rows'" in err["message"] for err in fixed_preview["errors"])
+
+    @pytest.mark.parametrize("duplicate_branch", ["control", "treatment"])
+    def test_duplicate_consumer_repair_patches_row_union_branch_and_validates(self, duplicate_branch: str) -> None:
+        """Every suggested mutation succeeds and repairs the real branch slot.
+
+        The deliberately minimal fork skeleton does not synthesize an inner
+        correlated barrier. It therefore leaves the pre-existing independent
+        fork-destination/topology issue visible for the planner's next repair
+        turn instead of silently changing downstream semantics.
+        """
+        branch_connections = {
+            "control": "control_done",
+            "treatment": "treatment_done",
+        }
+        duplicate_connection = branch_connections[duplicate_branch]
+        state = (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="fan_out",
+                    node_type="gate",
+                    plugin=None,
+                    input="rows",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("control", "treatment"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="control_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="control",
+                    on_success="control_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="treatment_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="treatment",
+                    on_success="treatment_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="variant_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control_done",
+                    on_success="unioned_rows",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=branch_connections,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="duplicate_reader",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input=duplicate_connection,
+                    on_success="duplicate_rows",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="consume_union",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="unioned_rows",
+                    on_success="main",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="main",
+                    plugin="json",
+                    options={"path": "outputs/main.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="duplicate_rows",
+                    plugin="json",
+                    options={"path": "outputs/duplicate.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        repair = preview.data["graph_repair_suggestions"][0]
+        union_step = next(
+            step for step in repair["tool_sequence"] if step["tool"] == "upsert_node" and step["arguments"]["id"] == "variant_union"
+        )
+        repaired_branches = union_step["arguments"]["branches"]
+        repaired_connection = repaired_branches[duplicate_branch]
+
+        assert repaired_connection != duplicate_connection
+        assert union_step["arguments"]["input"] == (repaired_connection if duplicate_branch == "control" else "control_done")
+
+        repaired_state = state
+        for step in repair["tool_sequence"][:-1]:
+            step_result = execute_tool(step["tool"], dict(step["arguments"]), repaired_state, _mock_catalog())
+            assert step_result.success is True, step_result.to_dict()
+            repaired_state = step_result.updated_state
+
+        repaired_preview = execute_tool("preview_pipeline", {}, repaired_state, _mock_catalog())
+        remaining_codes = {entry["error_code"] for entry in repaired_preview.data["errors"]}
+        assert "duplicate_connection_consumer" not in remaining_codes
+        assert "row_union_input_mismatch" not in remaining_codes
+        assert "fork_branch_no_destination" in remaining_codes
+
+    def test_duplicate_consumer_repair_excludes_row_union_identity_branch(self) -> None:
+        """Identity barrier branches are direct COPY edges, not connection consumers."""
+
+        def _consumer(node_id: str) -> NodeSpec:
+            return NodeSpec(
+                id=node_id,
+                node_type="transform",
+                plugin="passthrough",
+                input="control",
+                on_success=f"{node_id}_out",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+
+        state = (
+            _empty_state()
+            .with_node(_consumer("ordinary_a"))
+            .with_node(_consumer("ordinary_b"))
+            .with_node(
+                NodeSpec(
+                    id="variant_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control",
+                    on_success="unioned_rows",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches={"control": "control", "treatment": "treatment"},
+                    policy=None,
+                    merge=None,
+                )
+            )
+        )
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        duplicate_error = next(entry for entry in preview.data["errors"] if entry["error_code"] == "duplicate_connection_consumer")
+        assert "ordinary_a" in duplicate_error["message"]
+        assert "ordinary_b" in duplicate_error["message"]
+        assert "variant_union" not in duplicate_error["message"]
+
+        repair = next(entry for entry in preview.data["graph_repair_suggestions"] if entry["connection"] == "control")
+        assert [consumer["id"] for consumer in repair["affected_consumers"]] == [
+            "ordinary_a",
+            "ordinary_b",
+        ]
+        assert [step["arguments"]["id"] for step in repair["tool_sequence"] if step["tool"] == "upsert_node"] == [
+            "ordinary_a",
+            "ordinary_b",
+            "fork_control",
+        ]
+
+    def test_duplicate_consumer_repair_patches_one_node_once_for_two_branch_bindings(self) -> None:
+        """Two aliases of one row_union sharing a connection collapse to one upsert.
+
+        A repair skeleton rebuilt from the original node per binding emits two
+        ``upsert_node`` calls for the same id, and the second reverts the first
+        — applying the suggested sequence leaves the duplicate in place. The
+        patches must accumulate onto one payload per node id while the fork
+        gate still publishes one distinct branch per binding.
+        """
+        state = (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="fan_out",
+                    node_type="gate",
+                    plugin=None,
+                    input="rows",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("control", "treatment"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="control_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="control",
+                    on_success="control_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="treatment_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="treatment",
+                    on_success="treatment_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            # Inner barrier: its release connection is downstream of BOTH fork
+            # branches, so the outer row_union can bind both aliases to it.
+            .with_node(
+                NodeSpec(
+                    id="inner_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control_done",
+                    on_success="union_out",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches={"control": "control_done", "treatment": "treatment_done"},
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="outer_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="union_out",
+                    on_success="union_out2",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    # BOTH aliases claim the one connection: one node, two bindings.
+                    branches={"control": "union_out", "treatment": "union_out"},
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="consume_union",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="union_out2",
+                    on_success="main",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="main",
+                    plugin="json",
+                    options={"path": "outputs/main.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        assert "duplicate_connection_consumer" in {entry["error_code"] for entry in preview.data["errors"]}
+        repair = next(entry for entry in preview.data["graph_repair_suggestions"] if entry["connection"] == "union_out")
+
+        upsert_ids = [step["arguments"]["id"] for step in repair["tool_sequence"] if step["tool"] == "upsert_node"]
+        assert len(upsert_ids) == len(set(upsert_ids)), repair["tool_sequence"]
+        assert upsert_ids.count("outer_union") == 1
+
+        union_step = next(step for step in repair["tool_sequence"] if step["arguments"].get("id") == "outer_union")
+        patched_branches = union_step["arguments"]["branches"]
+        assert patched_branches["control"] != patched_branches["treatment"]
+        assert "union_out" not in patched_branches.values()
+        assert union_step["arguments"]["input"] == patched_branches["control"]
+
+        gate_step = repair["tool_sequence"][-2]
+        assert gate_step["arguments"]["node_type"] == "gate"
+        assert sorted(gate_step["arguments"]["fork_to"]) == sorted(patched_branches.values())
+        assert repair["tool_sequence"][-1] == {"tool": "preview_pipeline", "arguments": {}}
+
+        repaired_state = state
+        for step in repair["tool_sequence"][:-1]:
+            step_result = execute_tool(step["tool"], dict(step["arguments"]), repaired_state, _mock_catalog())
+            assert step_result.success is True, step_result.to_dict()
+            repaired_state = step_result.updated_state
+
+        repaired_preview = execute_tool("preview_pipeline", {}, repaired_state, _mock_catalog())
+        remaining_codes = {entry["error_code"] for entry in repaired_preview.data["errors"]}
+        assert "duplicate_connection_consumer" not in remaining_codes
+        assert "row_union_input_mismatch" not in remaining_codes
 
     def test_preview_source_with_schema_config_field_name(self) -> None:
         state = _empty_state().with_source(
@@ -14996,6 +15387,465 @@ class TestUpsertNodeQueue:
         assert all(n.id != "inbound" for n in result.updated_state.nodes)
 
 
+_ROW_UNION_UPSERT_ARGS: dict[str, Any] = {
+    "id": "variant_union",
+    "node_type": "row_union",
+    "plugin": None,
+    "input": "control_done",
+    "on_success": "unioned_rows",
+    "on_error": None,
+    "options": {},
+    "branches": {
+        "control": "control_done",
+        "treatment": "treatment_done",
+    },
+    "timeout_seconds": 45.0,
+}
+
+
+def _row_union_node_spec() -> NodeSpec:
+    return NodeSpec(
+        id="variant_union",
+        node_type="row_union",
+        plugin=None,
+        input="control_done",
+        on_success="unioned_rows",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={
+            "control": "control_done",
+            "treatment": "treatment_done",
+        },
+        policy=None,
+        merge=None,
+        timeout_seconds=45.0,
+    )
+
+
+class TestUpsertNodeRowUnion:
+    def test_generic_tool_schema_advertises_row_union_and_structural_timeout(self) -> None:
+        definitions = get_tool_definitions()
+        names = {definition["name"] for definition in definitions}
+        assert "upsert_row_union" not in names
+
+        upsert = _upsert_node_definition()
+        assert "row_union" in upsert["parameters"]["properties"]["node_type"]["enum"]
+        timeout = upsert["parameters"]["properties"]["timeout_seconds"]
+        assert timeout["type"] == ["number", "null"]
+        assert timeout["exclusiveMinimum"] == 0
+        assert "finite" in timeout["description"]
+
+    def test_upsert_persists_canonical_row_union_and_timeout(self) -> None:
+        result = execute_tool("upsert_node", dict(_ROW_UNION_UPSERT_ARGS), _empty_state(), _mock_catalog())
+
+        assert result.success is True, result.to_dict()
+        union = next(node for node in result.updated_state.nodes if node.id == "variant_union")
+        assert union.node_type == "row_union"
+        assert union.plugin is None
+        assert union.input == "control_done"
+        assert dict(union.branches or {}) == {
+            "control": "control_done",
+            "treatment": "treatment_done",
+        }
+        assert union.on_success == "unioned_rows"
+        assert union.timeout_seconds == 45.0
+
+        inspected = execute_tool(
+            "get_pipeline_state",
+            {"component": "variant_union"},
+            result.updated_state,
+            _mock_catalog(),
+        )
+        assert inspected.success is True
+        assert inspected.data["node"]["timeout_seconds"] == 45.0
+
+    @pytest.mark.parametrize("invalid_timeout", [True, "30", 0, -1, float("nan"), float("inf")])
+    def test_timeout_rejects_invalid_tier_3_values_without_mutation(self, invalid_timeout: object) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        state = _empty_state()
+
+        with pytest.raises(ToolArgumentError):
+            execute_tool(
+                "upsert_node",
+                {**_ROW_UNION_UPSERT_ARGS, "timeout_seconds": invalid_timeout},
+                state,
+                _mock_catalog(),
+            )
+
+        assert state.version == 1
+        assert state.nodes == ()
+
+    @pytest.mark.parametrize("timeout_seconds", [30, 30.5])
+    def test_timeout_accepts_actual_int_and_float_values(self, timeout_seconds: int | float) -> None:
+        result = execute_tool(
+            "upsert_node",
+            {**_ROW_UNION_UPSERT_ARGS, "timeout_seconds": timeout_seconds},
+            _empty_state(),
+            _mock_catalog(),
+        )
+
+        assert result.success is True, result.to_dict()
+        assert result.updated_state.nodes[0].timeout_seconds == float(timeout_seconds)
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {
+                "id": "transform_node",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "rows",
+                "on_success": "transformed",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "gate_node",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "discard", "false": "discard"},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "aggregation_node",
+                "node_type": "aggregation",
+                "plugin": None,
+                "input": "rows",
+                "on_success": "aggregated",
+                "on_error": "discard",
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "queue_node",
+                "node_type": "queue",
+                "plugin": None,
+                "input": "queue_node",
+                "options": {},
+                "timeout_seconds": 30,
+            },
+        ],
+        ids=["transform", "gate", "aggregation", "queue"],
+    )
+    def test_timeout_rejects_non_barrier_node_types_atomically(self, arguments: dict[str, Any]) -> None:
+        state = _empty_state()
+
+        result = execute_tool("upsert_node", arguments, state, _mock_catalog())
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert "timeout_seconds" in result.data["error"]
+
+    def test_patch_node_options_cannot_add_options_to_row_union(self) -> None:
+        state = _empty_state().with_node(_row_union_node_spec())
+
+        result = execute_tool(
+            "patch_node_options",
+            {"node_id": "variant_union", "patch": {"schema": {"mode": "observed"}}},
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.updated_state.nodes[0].options == {}
+
+    @pytest.mark.parametrize("edge_type", ["on_success", "on_error"])
+    def test_upsert_edge_cannot_route_row_union_directly_to_sink(self, edge_type: str) -> None:
+        state = (
+            _empty_state()
+            .with_node(_row_union_node_spec())
+            .with_output(
+                OutputSpec(
+                    name="results",
+                    plugin="json",
+                    options={"path": "outputs/results.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+        result = execute_tool(
+            "upsert_edge",
+            {
+                "id": f"variant_union_{edge_type}",
+                "from_node": "variant_union",
+                "to_node": "results",
+                "edge_type": edge_type,
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        union = result.updated_state.nodes[0]
+        assert union.on_success == "unioned_rows"
+        assert union.on_error is None
+
+    def test_set_output_cannot_turn_row_union_processing_connection_into_sink(self) -> None:
+        state = _empty_state().with_node(_row_union_node_spec())
+
+        result = execute_tool(
+            "set_output",
+            {
+                "sink_name": "unioned_rows",
+                "plugin": "json",
+                "options": {"path": "outputs/results.json", "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.updated_state.outputs == ()
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"plugin": "passthrough"},
+            {"input": "not_the_first_branch"},
+            {"on_success": None},
+            {"on_error": "errors"},
+            {"options": {"schema": {"mode": "observed"}}},
+            {"branches": {"only": "control_done"}},
+            {"policy": "require_all"},
+            {"merge": "union"},
+        ],
+    )
+    def test_intrinsically_malformed_row_union_is_rejected_atomically(self, override: dict[str, Any]) -> None:
+        state = _empty_state()
+        result = execute_tool(
+            "upsert_node",
+            {**_ROW_UNION_UPSERT_ARGS, **override},
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+
+
+class TestRowUnionTopologyCodesDoNotBlockUnrelatedMutations:
+    """row_union step-8 topology findings are telemetry, not mutation gates.
+
+    ``_post_mutation_invariant_error`` selects only intrinsic node-shape and
+    namespace invariants. While the two step-8 topology checks shared the
+    intrinsic ``row_union_branch_invalid`` code, completing the topology from
+    an *unrelated* node made that node's own mutation roll back with an error
+    naming the mis-wired row_union.
+    """
+
+    @staticmethod
+    def _transform(node_id: str, input_connection: str, on_success: str) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _mis_wired_state(self) -> CompositionState:
+        """A swapped-branch row_union whose topology is not yet complete.
+
+        ``treatment`` is deliberately absent, so ``treatment_done`` has no
+        producer and only the non-blocking reachability code fires.
+        """
+        return (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="fork_in",
+                    options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="fork_rows",
+                    node_type="gate",
+                    plugin=None,
+                    input="fork_in",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("control_branch", "treatment_branch"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(self._transform("control", "control_branch", "control_done"))
+            .with_node(
+                NodeSpec(
+                    id="variant_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="treatment_done",
+                    on_success="union_out",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    # Swapped: each alias claims the other branch's connection.
+                    branches={
+                        "control_branch": "treatment_done",
+                        "treatment_branch": "control_done",
+                    },
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(self._transform("after_union", "union_out", "main"))
+            .with_output(
+                OutputSpec(
+                    name="main",
+                    plugin="json",
+                    options={"path": "outputs/main.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+    def test_topology_codes_are_not_mutation_blocking_invariants(self) -> None:
+        from elspeth.web.composer.tools._common import (
+            _MUTATION_BLOCKING_INVARIANT_CODES,
+            _ROW_UNION_INTRINSIC_ERROR_CODES,
+        )
+
+        topology_codes = {
+            "row_union_branch_origin_invalid",
+            "row_union_branch_not_downstream",
+            "row_union_downstream_group_invalid",
+            "row_union_schema_incompatible",
+        }
+        assert not topology_codes & _MUTATION_BLOCKING_INVARIANT_CODES
+        assert not topology_codes & _ROW_UNION_INTRINSIC_ERROR_CODES
+        # The intrinsic node-shape family must still gate mutations.
+        assert {
+            "row_union_config_invalid",
+            "row_union_branches_invalid",
+            "row_union_branch_invalid",
+            "row_union_input_mismatch",
+            "row_union_on_success_invalid",
+            "row_union_timeout_invalid",
+        } <= _MUTATION_BLOCKING_INVARIANT_CODES
+
+    def test_completing_topology_from_an_unrelated_node_is_not_rejected(self) -> None:
+        state = self._mis_wired_state()
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        assert "row_union_branch_unreachable" in {entry["error_code"] for entry in preview.data["errors"]}
+
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "treatment",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "treatment_branch",
+                "on_success": "treatment_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+                "condition": None,
+                "routes": None,
+                "fork_to": None,
+                "branches": None,
+                "policy": None,
+                "merge": None,
+                "trigger": None,
+                "output_mode": None,
+                "expected_output_count": None,
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is True, result.to_dict()
+        assert any(node.id == "treatment" for node in result.updated_state.nodes)
+        assert not any(entry.component == "rejected_mutation" for entry in result.validation.errors)
+
+        # The mis-wiring now surfaces as non-blocking validation telemetry
+        # against the row_union itself, under a topology-specific code.
+        codes = {entry.error_code for entry in result.validation.errors}
+        assert "row_union_branch_not_downstream" in codes
+        assert "row_union_branch_invalid" not in codes
+
+    def test_mis_wired_row_union_still_persists_while_topology_is_incomplete(self) -> None:
+        state = self._mis_wired_state()
+
+        result = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+
+        assert result.success is True
+        assert any(node.id == "variant_union" for node in result.updated_state.nodes)
+
+
+class TestStructuralBarrierTimeoutBoundary:
+    @staticmethod
+    def _coalesce_arguments(timeout_seconds: object) -> dict[str, Any]:
+        return {
+            "id": "joined",
+            "node_type": "coalesce",
+            "plugin": None,
+            "input": "control_done",
+            "branches": {
+                "control": "control_done",
+                "treatment": "treatment_done",
+            },
+            "policy": "require_all",
+            "merge": "union",
+            "timeout_seconds": timeout_seconds,
+        }
+
+    @pytest.mark.parametrize("invalid_timeout", [0, -1, float("nan"), float("inf")])
+    @pytest.mark.parametrize("tool_name", ["upsert_node", "set_pipeline"])
+    def test_invalid_coalesce_timeout_is_rejected_before_mutation(
+        self,
+        tool_name: str,
+        invalid_timeout: float,
+    ) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        state = _empty_state()
+        node = self._coalesce_arguments(invalid_timeout)
+        arguments = node
+        if tool_name == "set_pipeline":
+            arguments = _valid_pipeline_args()
+            arguments["nodes"] = [node]
+
+        with pytest.raises(ToolArgumentError):
+            execute_tool(tool_name, arguments, state, _mock_catalog())
+
+        assert state.version == 1
+        assert state.nodes == ()
+
+
 class TestQueueBoundaryFieldEvidenceAbstains:
     """A queue exposes observed/unknown schema — field/numeric evidence must
     abstain at that boundary and MUST NOT synthesise a union of the
@@ -15154,7 +16004,7 @@ class TestExplainStructuralNodeShapeCodes:
 
 
 class TestStructuralNodeTypeProbedAsPlugin:
-    """gate/coalesce/queue are built-in node_types, not plugins. A model that
+    """gate/coalesce/row_union/queue are built-in node_types, not plugins. A model that
     probes the plugin registry for them must be taught the wiring, not told
     "not installed" — live regression: the composer honestly declined an A/B
     request on the false premise that coalesce "is not installed in this
@@ -15172,6 +16022,10 @@ class TestStructuralNodeTypeProbedAsPlugin:
         [
             ("coalesce", ("node_type", "branches", "policy", "queries")),
             ("gate", ("node_type", "fork_to", "routes")),
+            (
+                "row_union",
+                ("node_type", "branches", "input", "on_success", "require_all", "N-to-N", "timeout_seconds"),
+            ),
             ("queue", ("node_type", "fan-in")),
         ],
     )

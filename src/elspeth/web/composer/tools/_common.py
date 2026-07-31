@@ -640,13 +640,26 @@ def _duplicate_consumer_repair_suggestions(
     if not duplicate_error_components:
         return []
 
-    consumers_by_connection: dict[str, list[NodeSpec]] = {}
+    # ``branch_alias`` is None for an ordinary ``node.input`` consumer and
+    # names the branch slot for a row_union consumer. The row_union's own
+    # ``input`` is only an adapter placeholder and must never be repaired as
+    # though it were an independent consumption edge.
+    consumers_by_connection: dict[str, list[tuple[NodeSpec, str | None]]] = {}
     for node in state.nodes:
-        if node.node_type == "coalesce":
+        if node.node_type in ("coalesce", "queue", "row_union"):
             continue
-        if node.input not in consumers_by_connection:
-            consumers_by_connection[node.input] = []
-        consumers_by_connection[node.input].append(node)
+        consumers_by_connection.setdefault(node.input, []).append((node, None))
+    for node in state.nodes:
+        if node.node_type != "row_union":
+            continue
+        for row_union_branch_alias, branch_connection in zip(
+            _coalesce_branch_names(node.branches),
+            _coalesce_branch_connections(node.branches),
+            strict=True,
+        ):
+            if row_union_branch_alias == branch_connection:
+                continue
+            consumers_by_connection.setdefault(branch_connection, []).append((node, row_union_branch_alias))
 
     reserved_node_ids = {node.id for node in state.nodes}
     reserved_connection_names = _reserved_connection_names(state)
@@ -660,10 +673,10 @@ def _duplicate_consumer_repair_suggestions(
         gate_id = _unique_name(f"fork_{connection_fragment}", reserved_node_ids)
         branch_names = [
             _unique_name(
-                f"{connection_fragment}_to_{_repair_identifier_fragment(node.id, fallback='node')}",
+                f"{connection_fragment}_to_{_repair_identifier_fragment(binding[0].id, fallback='node')}",
                 reserved_connection_names,
             )
-            for node in consumer_nodes
+            for binding in consumer_nodes
         ]
         gate_args: dict[str, object] = {
             "id": gate_id,
@@ -674,7 +687,7 @@ def _duplicate_consumer_repair_suggestions(
             "on_error": None,
             "options": {},
             "condition": "True",
-            "routes": {},
+            "routes": {"true": "fork", "false": "fork"},
             "fork_to": branch_names,
             "branches": None,
             "policy": None,
@@ -685,10 +698,35 @@ def _duplicate_consumer_repair_suggestions(
         }
         tool_sequence: list[_RepairToolCall] = []
         affected_consumers: list[_AffectedConsumer] = []
-        for node, branch_name in zip(consumer_nodes, branch_names, strict=True):
-            patched_consumer = _serialize_node(node)
-            patched_consumer["input"] = branch_name
-            tool_sequence.append({"tool": "upsert_node", "arguments": patched_consumer})
+        # One row_union can contribute two (node, alias) bindings when two of
+        # its aliases share a connection. Every patch for a node must land on
+        # one running payload: re-serializing the original node per binding
+        # emits two upsert_node calls for the same id, and the second reverts
+        # the first. Insertion order preserves the cross-node sequence.
+        patched_consumers: dict[str, dict[str, Any]] = {}
+        for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
+            patched_consumer = patched_consumers.get(node.id)
+            if patched_consumer is None:
+                patched_consumer = _serialize_node(node)
+                patched_consumers[node.id] = patched_consumer
+            if consumer_branch_alias is None:
+                patched_consumer["input"] = branch_name
+            else:
+                patched_branches = patched_consumer["branches"]
+                if not isinstance(patched_branches, dict):
+                    patched_branches = dict(
+                        zip(
+                            _coalesce_branch_names(node.branches),
+                            _coalesce_branch_connections(node.branches),
+                            strict=True,
+                        )
+                    )
+                patched_branches[consumer_branch_alias] = branch_name
+                patched_consumer["branches"] = patched_branches
+                # ``input`` is only the adapter placeholder for the first
+                # branch connection; re-derive it from the accumulated mapping
+                # so it stays consistent no matter which aliases were repaired.
+                patched_consumer["input"] = next(iter(patched_branches.values()))
             affected_consumers.append(
                 {
                     "id": node.id,
@@ -696,6 +734,7 @@ def _duplicate_consumer_repair_suggestions(
                     "new_input": branch_name,
                 }
             )
+        tool_sequence.extend({"tool": "upsert_node", "arguments": patched_consumer} for patched_consumer in patched_consumers.values())
         tool_sequence.append({"tool": "upsert_node", "arguments": gate_args})
         tool_sequence.append({"tool": "preview_pipeline", "arguments": {}})
         suggestions.append(
@@ -1200,6 +1239,7 @@ def _serialize_node(node: NodeSpec) -> dict[str, Any]:
         "trigger": deep_thaw(node.trigger) if node.trigger else None,
         "output_mode": node.output_mode,
         "expected_output_count": node.expected_output_count,
+        "timeout_seconds": node.timeout_seconds,
     }
 
 
@@ -1390,10 +1430,11 @@ def _plugin_unavailable_message(plugin_type: PluginKind, reason: PluginUnavailab
     return f"{plugin_type} plugin selection is unavailable ({reason.value}): {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}"
 
 
-# gate/coalesce/queue are built-in node_types wired with plugin=null — they do
-# not exist in the plugin registry, and answering a registry probe for them
-# with "not installed" invites a false honest decline ("this deployment cannot
-# merge branches"). These names are closed composer vocabulary, safe to echo.
+# gate/coalesce/row_union/queue are built-in node_types wired with plugin=null —
+# they do not exist in the plugin registry, and answering a registry probe for
+# them with "not installed" invites a false honest decline ("this deployment
+# cannot merge branches"). These names are closed composer vocabulary, safe to
+# echo.
 _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
     "coalesce": (
         "'coalesce' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
@@ -1406,6 +1447,15 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
         "'gate' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a node "
         "with node_type='gate', plugin=null, a `condition` row expression and routes={'true': ..., "
         "'false': ...}; route to 'fork' with fork_to=[...] to fan a row out to several branches."
+    ),
+    "row_union": (
+        "'row_union' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
+        "node with node_type='row_union', plugin=null, at least two ordered `branches` mapping each "
+        "fork branch alias to its incoming connection, `input` equal to the first mapped connection "
+        "as a serialization placeholder, and `on_success` naming a downstream processing connection. "
+        "It has fixed require_all N-to-N semantics: it waits for every branch, then releases every "
+        "original row unchanged in declared branch order; an optional finite positive "
+        "`timeout_seconds` is supported."
     ),
     "queue": (
         "'queue' is not a plugin — it is a built-in node_type that needs no plugin, used for fan-in: "
@@ -2591,6 +2641,7 @@ class _SetPipelineNodePayload(TypedDict):
     trigger: dict[str, JsonValue] | None
     output_mode: str | None
     expected_output_count: int | None
+    timeout_seconds: float | None
 
 
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:
@@ -2615,6 +2666,80 @@ def _serialize_set_pipeline_node(node: NodeSpec) -> _SetPipelineNodePayload:
     payload = cast(_SetPipelineNodePayload, _serialize_node(node))
     payload["options"] = _serialize_authoring_options(node.options)
     return payload
+
+
+_ROW_UNION_INTRINSIC_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "row_union_config_invalid",
+        "row_union_branches_invalid",
+        "row_union_branch_invalid",
+        "row_union_input_mismatch",
+        "row_union_on_success_invalid",
+        "row_union_timeout_invalid",
+    }
+)
+
+_MUTATION_BLOCKING_INVARIANT_CODES: Final[frozenset[str]] = _ROW_UNION_INTRINSIC_ERROR_CODES | {
+    "row_union_on_success_must_be_connection",
+    "node_timeout_unsupported",
+}
+
+
+def _post_mutation_invariant_error(
+    proposed_state: CompositionState,
+) -> tuple[str, str] | None:
+    """Return an invariant a mutation must not persist.
+
+    Composer permits incomplete topology during incremental authoring, so a
+    mutation cannot require the entire pipeline to validate. This shared
+    preflight selects only intrinsic node-shape and namespace invariants whose
+    persistence would make later generic mutation tools violate their own
+    contracts. Callers return the original state on failure, giving the tools
+    one rollback discipline without weakening ordinary validation telemetry.
+    """
+    for entry in proposed_state.validate().errors:
+        if entry.error_code in _MUTATION_BLOCKING_INVARIANT_CODES:
+            assert entry.error_code is not None
+            return entry.message, entry.error_code
+    return None
+
+
+def _row_union_node_contract_error(
+    node: NodeSpec,
+    *,
+    output_names: frozenset[str] = frozenset(),
+) -> tuple[str, str] | None:
+    """Return the first intrinsic row-union authoring failure.
+
+    Reuse ``CompositionState.validate`` as the contract authority rather than
+    maintaining a second structural validator in the tool layer. Topology
+    findings (unreachable branches and a not-yet-consumed output connection)
+    remain incremental-authoring telemetry. A configured sink target is
+    rejected here because row_union v1 may release only to processing.
+    """
+    if node.node_type != "row_union":
+        return None
+    if node.on_success in output_names:
+        return (
+            (
+                f"row_union '{node.id}' on_success '{node.on_success}' names a sink. "
+                "A released group must continue on a processing connection."
+            ),
+            "row_union_on_success_must_be_connection",
+        )
+    probe = CompositionState(
+        source=None,
+        nodes=(node,),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    for entry in probe.validate().errors:
+        if entry.component == f"node:{node.id}" and entry.error_code in _ROW_UNION_INTRINSIC_ERROR_CODES:
+            assert entry.error_code is not None
+            return entry.message, entry.error_code
+    return None
 
 
 def _serialize_set_pipeline_source(

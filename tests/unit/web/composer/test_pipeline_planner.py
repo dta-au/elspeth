@@ -4031,6 +4031,63 @@ def test_escape_hatch_model_and_provider_must_be_configured_together(overrides: 
         _model(_ScriptedCompletion(), **overrides)
 
 
+def test_escape_hatch_api_base_requires_escape_hatch_model() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_base requires escape_hatch_model"):
+        _model(_ScriptedCompletion(), api_base="https://primary.example.test/v1", escape_hatch_api_base="https://advisor.example.test/v1")
+
+
+def test_escape_hatch_api_key_requires_escape_hatch_model() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_key requires escape_hatch_model"):
+        _model(_ScriptedCompletion(), escape_hatch_api_key="advisor-secret")
+
+
+def test_api_base_without_api_key_rejected() -> None:
+    """Defense-in-depth (belt-and-braces alongside the WebSettings-level
+    pairing validator): a PlannerModelConfig built with an unpaired primary
+    endpoint must be rejected at construction, not silently forwarded."""
+    with pytest.raises(ValueError, match="api_base and api_key must be configured together"):
+        _model(_ScriptedCompletion(), api_base="https://primary-gateway.example.test/v1")
+
+
+def test_api_key_without_api_base_rejected() -> None:
+    with pytest.raises(ValueError, match="api_base and api_key must be configured together"):
+        _model(_ScriptedCompletion(), api_key="orphaned-primary-key")
+
+
+def test_escape_hatch_api_base_without_api_key_rejected() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_base and escape_hatch_api_key must be configured together"):
+        _model(
+            _ScriptedCompletion(),
+            escape_hatch_model="openrouter/advisor-under-test",
+            escape_hatch_provider="openrouter",
+            escape_hatch_api_base="https://advisor-gateway.example.test/v1",
+        )
+
+
+def test_escape_hatch_api_key_without_api_base_rejected() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_base and escape_hatch_api_key must be configured together"):
+        _model(
+            _ScriptedCompletion(),
+            escape_hatch_model="openrouter/advisor-under-test",
+            escape_hatch_provider="openrouter",
+            escape_hatch_api_key="orphaned-advisor-key",
+        )
+
+
+def test_both_endpoint_pairs_configured_together_is_valid() -> None:
+    config = _model(
+        _ScriptedCompletion(),
+        api_base="https://primary-gateway.example.test/v1",
+        api_key="primary-secret",
+        escape_hatch_model="openrouter/advisor-under-test",
+        escape_hatch_provider="openrouter",
+        escape_hatch_api_base="https://advisor-gateway.example.test/v1",
+        escape_hatch_api_key="advisor-secret",
+    )
+    assert config.api_base == "https://primary-gateway.example.test/v1"
+    assert config.escape_hatch_api_base == "https://advisor-gateway.example.test/v1"
+
+
 @pytest.mark.asyncio
 async def test_discovery_pressure_notice_injected_at_two_turns_remaining(
     tmp_path: Path,
@@ -4104,6 +4161,127 @@ async def test_escape_hatch_overtime_turn_runs_advisor_with_terminal_tool_only(
     assert proposal.provider == "openrouter"
     # The second discovery batch was never dispatched.
     assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
+
+
+@pytest.mark.asyncio
+async def test_planner_omits_endpoint_kwargs_when_unset(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """No-regression guarantee: with no endpoint settings configured, ordinary
+    planner calls carry no api_base/api_key at all — byte-identical to
+    pre-affordance behaviour."""
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert len(completion.requests) == 1
+    assert "api_base" not in completion.requests[0]
+    assert "api_key" not in completion.requests[0]
+
+
+@pytest.mark.asyncio
+async def test_planner_ordinary_calls_use_primary_endpoint(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Ordinary (non-hatch) planner calls get the PRIMARY role's endpoint."""
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={
+            "api_base": "https://primary-gateway.example.test/v1",
+            "api_key": "primary-bearer-token",  # secret-scan: allow-this-line
+        },
+    )
+
+    assert len(completion.requests) == 2
+    for request in completion.requests:
+        assert request["api_base"] == "https://primary-gateway.example.test/v1"
+        assert request["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_uses_advisor_endpoint_not_primary(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The highest-risk routing case: model_override selects the escape-hatch
+    (ADVISOR) model at line ~1552, so the SAME condition must select the
+    escape-hatch endpoint — never the primary's. Both endpoints are
+    configured here, deliberately different, so a cross-role leak in either
+    direction would be caught."""
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("list_sinks", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={
+            "max_discovery_turns": 1,
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+            "api_base": "https://primary-gateway.example.test/v1",
+            "api_key": "primary-bearer-token",  # secret-scan: allow-this-line
+            "escape_hatch_api_base": "https://advisor-gateway.example.test/v1",
+            "escape_hatch_api_key": "advisor-bearer-token",  # secret-scan: allow-this-line
+        },
+    )
+
+    assert len(completion.requests) == 3
+    ordinary_calls = completion.requests[:2]
+    hatch_call = completion.requests[2]
+    for request in ordinary_calls:
+        assert request["api_base"] == "https://primary-gateway.example.test/v1"
+        assert request["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+    assert hatch_call["model"] == "openrouter/advisor-under-test"
+    assert hatch_call["api_base"] == "https://advisor-gateway.example.test/v1"
+    assert hatch_call["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_omits_endpoint_kwargs_when_only_primary_configured(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The advisor never silently falls back to the primary's endpoint: with
+    only the primary endpoint configured, the hatch call carries no
+    api_base/api_key at all."""
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("list_sinks", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={
+            "max_discovery_turns": 1,
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+            "api_base": "https://primary-gateway.example.test/v1",
+            "api_key": "primary-bearer-token",  # secret-scan: allow-this-line
+        },
+    )
+
+    hatch_call = completion.requests[2]
+    assert hatch_call["model"] == "openrouter/advisor-under-test"
+    assert "api_base" not in hatch_call
+    assert "api_key" not in hatch_call
 
 
 @pytest.mark.asyncio

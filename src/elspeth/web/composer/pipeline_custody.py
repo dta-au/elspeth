@@ -28,13 +28,13 @@ from elspeth.contracts.blobs import (
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.core.canonical import stable_hash
 from elspeth.web.blobs.service import (
     BlobServiceImpl,
     content_hash,
     inline_custody_blob_id,
     sanitize_filename,
 )
+from elspeth.web.composer.authority_hashing import composer_authority_hash
 
 if TYPE_CHECKING:
     from elspeth.web.composer.tools.blobs import _PreparedBlobCreate
@@ -225,7 +225,7 @@ def prepare_pipeline_custody(
     source["blob_id"] = str(blob_id)
     if _contains_inline_blob(safe_arguments):
         raise AuditIntegrityError("Pipeline custody rewrite left an inline_blob member in proposal arguments")
-    safe_arguments_hash = stable_hash(safe_arguments)
+    safe_arguments_hash = composer_authority_hash(safe_arguments)
     final_arguments_hash = safe_arguments_hash if prepared.creation_modality is not CreationModality.VERBATIM else None
     request = replace(
         provisional_request,

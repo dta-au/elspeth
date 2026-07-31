@@ -23,12 +23,14 @@ recovery after committed blob deletion. The notes below intentionally cover
 only major changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 39. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 40. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
 deployment-policy refusal settles as a permanent failure instead of being
-misattributed to the model provider.
+misattributed to the model provider. Epoch 40 makes the explicit coalesce
+`timeout_seconds` key required in persisted proposal payloads, including
+`null`, so epoch-39 sessions fail at startup instead of during guided replay.
 Guided checkpoints remain at schema 10 and Landscape
 `SQLITE_SCHEMA_EPOCH` advances from 29 to 30, which adds the durable row_union
 barrier attribution column to scheduler work items. ELSPETH does not migrate
@@ -53,6 +55,13 @@ drained and repair this release forward.
   retain provider, prompt, failure, source, and fork evidence, while runtime
   preflight and approved tutorial execution are keyed to the composition that
   produced them.
+- **Correlated row unions are first-class Composer topology** — freeform,
+  guided, import/export, validation, and graph surfaces can author and inspect
+  plugin-free, require-all `row_union` barriers that release branch rows
+  unchanged in declared order for long-format processing. Canonical
+  configuration, build, runtime, and guided coverage is present; broader audit,
+  recovery, concurrency, browser-backed round-trip, and scale acceptance
+  remains deferred under the open row-union work.
 
 ### Critical fixes
 

@@ -97,6 +97,7 @@ class _ExemplarNode(TypedDict, total=False):
     branches: dict[str, str]
     policy: str
     merge: str
+    timeout_seconds: float
 
 
 class _ExemplarEdge(TypedDict):
@@ -146,6 +147,11 @@ class _ForkCoalesceAid(TypedDict):
     set_pipeline_exemplar: _SetPipelineExemplar
 
 
+class _ForkRowUnionAid(TypedDict):
+    rules: list[str]
+    set_pipeline_exemplar: _SetPipelineExemplar
+
+
 class _RulesAid(TypedDict):
     rules: list[str]
 
@@ -166,6 +172,7 @@ class _PlannerAuthoringAids(TypedDict, total=False):
     purpose: Required[str]
     source_custody: _SourceCustodyAid
     fork_coalesce: _ForkCoalesceAid
+    fork_row_union: _ForkRowUnionAid
     model_custody: _RulesAid
     llm_output_contract: _RulesAid
     review_registry: _ReviewRegistryAid
@@ -246,6 +253,17 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
 )
 
 _FORK_EXEMPLAR_CONTENT: Final[str] = "ticket_id,body\nT-1001,Cannot log in since the update\nT-1002,Invoice totals look wrong\n"
+
+_FORK_ROW_UNION_RULES: Final[tuple[str, ...]] = (
+    "Use row_union for require_all N-to-N reconvergence: every fork branch contributes its original rows, "
+    "and the barrier releases all of them in declared branch order without merging fields.",
+    "Key branches by the upstream gate's fork_to branch names. Each value is the unique connection published "
+    "by that branch's final transform.",
+    "Set input to the first branch connection exactly. It is an adapter placeholder; all branches values are the real consuming bindings.",
+    "Set on_success to a downstream processing connection, never directly to a sink. Omit plugin, options, "
+    "on_error, policy, merge, gate routing, and aggregation fields.",
+    "timeout_seconds is optional; when present it must be finite and greater than zero.",
+)
 
 
 def _prompt_shield_rules(
@@ -1125,6 +1143,113 @@ def fork_coalesce_exemplar_args(
     return exemplar
 
 
+def fork_row_union_exemplar_args(
+    catalog: PolicyCatalogView,
+    *,
+    visible: Mapping[str, frozenset[str]] | None = None,
+) -> _SetPipelineExemplar | None:
+    """Complete ``set_pipeline`` args for forked rows released by row_union."""
+    if visible is None:
+        visible = _visible_plugin_names(catalog, _plugin_summaries(catalog))
+    if (
+        "csv" not in visible["source"]
+        or "json" not in visible["sink"]
+        or "passthrough" not in visible["transform"]
+        or "field_mapper" not in visible["transform"]
+    ):
+        return None
+
+    branches = {"branch_a": "branch_a_done", "branch_b": "branch_b_done"}
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["ticket_id: str", "body: str"],
+                    "guaranteed_fields": ["ticket_id", "body"],
+                }
+            },
+            "on_validation_failure": "discard",
+            "inline_blob": {
+                "filename": "support_tickets.csv",
+                "mime_type": "text/csv",
+                "content": _FORK_EXEMPLAR_CONTENT,
+                "description": "Literal rows the user pasted into chat",
+            },
+        },
+        "nodes": [
+            {
+                "id": "fan_out_variants",
+                "node_type": "gate",
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "fork", "false": "fork"},
+                "fork_to": list(branches),
+            },
+            {
+                "id": "process_control",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_a",
+                "on_success": "branch_a_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {
+                "id": "process_treatment",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_b",
+                "on_success": "branch_b_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {
+                "id": "variant_union",
+                "node_type": "row_union",
+                "input": next(iter(branches.values())),
+                "branches": branches,
+                "on_success": "unioned_rows",
+                "timeout_seconds": 30.0,
+            },
+            {
+                "id": "tidy_unioned_rows",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "unioned_rows",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "mapping": {"ticket_id": "ticket_id", "body": "body"},
+                    "select_only": True,
+                },
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "main",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/row_union_variants.json",
+                    "format": "json",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+        "metadata": {
+            "name": "Fork and release row variants",
+            "description": "Fan rows through two independent branches, then release every correlated row with row_union.",
+        },
+    }
+
+
 # Payload memo keyed by plugin-policy snapshot hash. The aids depend only on
 # the policy-visible catalog projection (plugin classes are static per
 # process; visibility and profile aliases are exactly what the snapshot hash
@@ -1184,6 +1309,12 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
             "rules": list(_FORK_COALESCE_RULES),
             "set_pipeline_exemplar": fork_coalesce,
         }
+    fork_row_union = fork_row_union_exemplar_args(catalog, visible=visible)
+    if fork_row_union is not None:
+        aids["fork_row_union"] = {
+            "rules": list(_FORK_ROW_UNION_RULES),
+            "set_pipeline_exemplar": fork_row_union,
+        }
     # Resolved before the llm aids because the on_error rule they carry is
     # control-mode conditional. ``_selected_control_profile`` returns None for
     # recommend mode or no selection, so this is the same gate the
@@ -1238,5 +1369,6 @@ __all__ = [
     "build_planner_authoring_aids",
     "discovery_digest",
     "fork_coalesce_exemplar_args",
+    "fork_row_union_exemplar_args",
     "source_custody_exemplar_args",
 ]

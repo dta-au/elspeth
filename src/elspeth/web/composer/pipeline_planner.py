@@ -18,7 +18,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, final
@@ -42,6 +42,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
+from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads, require_bounded_text
 from elspeth.web.composer.capability_skill import (
     PLANNER_DISCOVERY_TOOL_NAMES,
@@ -214,6 +215,20 @@ class PlannerModelConfig:
     # None disables the hatch: budget exhaustion raises exactly as before.
     escape_hatch_model: str | None = None
     escape_hatch_provider: str | None = None
+    # Endpoint affordance (Phase 3 Task 2): when the operator has pointed the
+    # PRIMARY composer role at a custom OpenAI-compatible endpoint, these are
+    # forwarded as ``api_base``/``api_key`` on every ordinary (non-hatch)
+    # planner completion. None (the default) omits both kwargs entirely.
+    # ``repr=False`` keeps the credential out of any dataclass repr that
+    # might land in a log line or exception message.
+    api_base: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    # Same affordance for the escape-hatch (ADVISOR) model — used only on
+    # hatch turns, mirroring escape_hatch_model/escape_hatch_provider. Never
+    # falls back to the primary api_base/api_key: the two roles are
+    # deliberately independent (see composer_advisor_endpoint_base_url).
+    escape_hatch_api_base: str | None = None
+    escape_hatch_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         for string_field_name, string_value in (
@@ -230,6 +245,24 @@ class PlannerModelConfig:
             raise ValueError("escape_hatch_provider must be a non-empty exact string or None")
         if (self.escape_hatch_model is None) != (self.escape_hatch_provider is None):
             raise ValueError("escape_hatch_model and escape_hatch_provider must be configured together")
+        if self.escape_hatch_api_base is not None and self.escape_hatch_model is None:
+            raise ValueError("escape_hatch_api_base requires escape_hatch_model to be configured")
+        if self.escape_hatch_api_key is not None and self.escape_hatch_model is None:
+            raise ValueError("escape_hatch_api_key requires escape_hatch_model to be configured")
+        # Defense-in-depth pairing (belt-and-braces alongside
+        # WebSettings._validate_composer_endpoint_credential_pairing): a
+        # constructed PlannerModelConfig must never carry a base URL without
+        # its explicit key, or vice versa, for either role. An endpoint with
+        # no key would let LiteLLM silently fall back to an ambient provider
+        # credential (e.g. OPENAI_API_KEY) and send it to the configured
+        # endpoint. This does not replace the settings-level validator (the
+        # only production source of these values); it forecloses the same
+        # bug reappearing if a future caller ever constructs this dataclass
+        # from something other than validated WebSettings fields.
+        if (self.api_base is None) != (self.api_key is None):
+            raise ValueError("api_base and api_key must be configured together (or both omitted)")
+        if (self.escape_hatch_api_base is None) != (self.escape_hatch_api_key is None):
+            raise ValueError("escape_hatch_api_base and escape_hatch_api_key must be configured together (or both omitted)")
         for integer_field_name, integer_value in (
             ("max_composition_turns", self.max_composition_turns),
             ("max_discovery_turns", self.max_discovery_turns),
@@ -873,6 +906,14 @@ def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint:
             # fields are missing. This stays inside the message-redaction
             # boundary this allowlist protects.
             projected["contract"] = entry.contract.to_dict()
+        if entry.row_union_schema is not None:
+            # Structured row-union branch declarations: branch aliases,
+            # schema modes, field names, and declared field properties from
+            # the REJECTED candidate the planner authored. These are the
+            # row-union equivalent of the safe contract facts above, never
+            # runtime row content, and make the incompatibility repairable
+            # without exposing the free-form validation message.
+            projected["row_union_schema"] = entry.row_union_schema.to_dict()
         errors.append(projected)
     feedback: dict[str, Any] = {
         "success": False,
@@ -1178,7 +1219,10 @@ async def _build_valid_pipeline_plan(
     # Validate the exact provider-authored payload before adding server-owned
     # interpretation identity/status. Otherwise a forged canonical-looking row
     # would be indistinguishable from the trusted canonicalizer's output.
-    candidate_context = replace(terminal_context, tool_arguments_hash=stable_hash({"pipeline": pipeline}))
+    candidate_context = replace(
+        terminal_context,
+        tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(pipeline)}),
+    )
     try:
         candidate = await run_sync(
             build_set_pipeline_candidate,
@@ -1204,7 +1248,7 @@ async def _build_valid_pipeline_plan(
     pipeline = canonicalize_authored_node_review_requirements(pipeline, current_state=current_state)
     candidate_context = replace(
         terminal_context,
-        tool_arguments_hash=stable_hash({"pipeline": pipeline}),
+        tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(pipeline)}),
         _interpretation_requirements_are_internal=True,
     )
     candidate = await run_sync(
@@ -1251,7 +1295,7 @@ async def _build_valid_pipeline_plan(
         safe_pipeline = cast(dict[str, Any], deep_thaw(preparation.arguments))
         safe_context = replace(
             terminal_context,
-            tool_arguments_hash=stable_hash({"pipeline": safe_pipeline}),
+            tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(safe_pipeline)}),
             _interpretation_requirements_are_internal=True,
         )
         safe_candidate = await run_sync(
@@ -1718,6 +1762,20 @@ async def _plan_pipeline_inner(
                 kwargs["temperature"] = model_config.temperature
             if model_config.seed is not None:
                 kwargs["seed"] = model_config.seed
+            # Endpoint affordance: select by the SAME condition that selects
+            # effective_model above (model_override set == hatch turn), so
+            # the escape-hatch call never lands on the primary's endpoint —
+            # the two roles are independent by design.
+            if model_override is not None:
+                if model_config.escape_hatch_api_base is not None:
+                    kwargs["api_base"] = model_config.escape_hatch_api_base
+                if model_config.escape_hatch_api_key is not None:
+                    kwargs["api_key"] = model_config.escape_hatch_api_key
+            else:
+                if model_config.api_base is not None:
+                    kwargs["api_base"] = model_config.api_base
+                if model_config.api_key is not None:
+                    kwargs["api_key"] = model_config.api_key
 
             try:
                 response = await asyncio.wait_for(model_config.completion(**kwargs), timeout=remaining)

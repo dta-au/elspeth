@@ -40,7 +40,6 @@ from elspeth.telemetry.circuit_breaker import CircuitBreaker
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
 from elspeth.telemetry.filtering import should_emit
 from elspeth.telemetry.protocols import (
-    DeliveryMetricsExporterProtocol,
     ExporterDeliveryMetrics,
     ExporterProtocol,
 )
@@ -740,12 +739,39 @@ class TelemetryManager:
         self._reconcile_deferred_delivery(delivered=delivered_on_close, failed=failed_on_close, dropped=dropped_on_close)
 
 
+_DELIVERY_METRICS_ABSENT = object()
+
+
 def _exporter_delivery_metrics(exporter: ExporterProtocol) -> ExporterDeliveryMetrics | None:
-    """Read and validate the optional exporter-native delivery capability."""
-    if not isinstance(exporter, DeliveryMetricsExporterProtocol):
+    """Read and validate the optional exporter-native delivery capability.
+
+    The capability is probed with ``getattr(..., _DELIVERY_METRICS_ABSENT)``
+    and NEVER with a ``runtime_checkable`` ``Protocol`` ``isinstance()``
+    check. Exporters reach here from third-party pluggy plugins via
+    ``elspeth_get_exporters`` with no type gate in front of them, and since
+    Python 3.12 a runtime-checkable Protocol's ``__instancecheck__`` resolves
+    members through ``inspect.getattr_static``, which deliberately bypasses
+    ``__getattr__``. A perfectly valid third-party exporter that forwards
+    ``delivery_metrics`` from a wrapped implementation therefore failed the
+    check and its delivery accounting vanished silently — no error, no log
+    (ADR-032, same defect class as elspeth-9ea866438b). Do not "harden" this
+    back into a Protocol check.
+
+    Absence stays a legitimate answer: this is an OPTIONAL capability and
+    ``None`` means "this exporter does not report delivery metrics", which
+    every caller already handles. Malformed metrics that ARE present remain a
+    hard raise, so a broken exporter is loud rather than silently ignored: in
+    the export thread ``_export_loop`` stores such an exception and re-raises
+    it from ``flush()``.
+
+    ``getattr`` absorbs only ``AttributeError``. An exporter whose
+    ``delivery_metrics`` raises anything else propagates that exception rather
+    than being downgraded to "capability absent".
+    """
+    metrics = getattr(exporter, "delivery_metrics", _DELIVERY_METRICS_ABSENT)
+    if metrics is _DELIVERY_METRICS_ABSENT:
         return None
 
-    metrics = exporter.delivery_metrics
     if type(metrics) is not dict:
         raise TypeError("delivery_metrics must be a dict")
 

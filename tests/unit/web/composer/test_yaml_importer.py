@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -127,24 +128,166 @@ def test_composition_state_from_runtime_yaml_rejects_empty_mapping() -> None:
         composition_state_from_runtime_yaml("{}\n")
 
 
-def test_composition_state_from_runtime_yaml_rejects_unsupported_row_unions() -> None:
-    pipeline_yaml = """
-transforms:
-- name: normalize
-  plugin: field_mapper
-  input: source
-  on_success: control
-  on_error: discard
-  options:
-    mapping: {}
+@pytest.mark.parametrize(
+    ("branches_yaml", "expected_branches", "expected_input"),
+    [
+        ("[control, treatment]", {"control": "control", "treatment": "treatment"}, "control"),
+        (
+            "\n      control_branch: control_scored\n      treatment_branch: treatment_scored",
+            {"control_branch": "control_scored", "treatment_branch": "treatment_scored"},
+            "control_scored",
+        ),
+    ],
+)
+def test_composition_state_from_runtime_yaml_imports_row_union_branches(
+    branches_yaml: str,
+    expected_branches: dict[str, str],
+    expected_input: str,
+) -> None:
+    state = composition_state_from_runtime_yaml(
+        f"""
 row_unions:
-- name: variants
-  branches: [control, treatment]
-  on_success: compared
+  - name: variants
+    branches: {branches_yaml}
+    on_success: compared
 """
+    )
 
-    with pytest.raises(RuntimeYamlImportError, match=r"row_unions.*not supported by Composer import"):
-        composition_state_from_runtime_yaml(pipeline_yaml)
+    assert len(state.nodes) == 1
+    row_union = state.nodes[0]
+    assert row_union.node_type == "row_union"
+    assert row_union.id == "variants"
+    assert isinstance(row_union.branches, Mapping)
+    assert row_union.branches == expected_branches
+    assert row_union.input == expected_input
+    assert row_union.on_success == "compared"
+    assert row_union.timeout_seconds is None
+
+
+def test_composition_state_from_runtime_yaml_imports_row_union_timeout_and_matching_input() -> None:
+    state = composition_state_from_runtime_yaml(
+        """
+row_unions:
+  - name: variants
+    branches:
+      control_branch: control_scored
+      treatment_branch: treatment_scored
+    input: control_scored
+    on_success: compared
+    timeout_seconds: 2.5
+"""
+    )
+
+    row_union = state.nodes[0]
+    assert row_union.input == "control_scored"
+    assert row_union.timeout_seconds == 2.5
+
+
+def test_composition_state_from_runtime_yaml_rejects_non_list_row_unions_section() -> None:
+    with pytest.raises(RuntimeYamlImportError, match="row_unions must be a list"):
+        composition_state_from_runtime_yaml(
+            """
+row_unions:
+  variants:
+    branches: [control, treatment]
+    on_success: compared
+"""
+        )
+
+
+@pytest.mark.parametrize(
+    "branches_yaml",
+    [
+        "[control]",
+        "[control, control]",
+        "{control_branch: control_scored}",
+    ],
+)
+def test_composition_state_from_runtime_yaml_rejects_row_union_without_two_unique_branches(branches_yaml: str) -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"row_unions\[0\]\.branches must contain at least two unique branches"):
+        composition_state_from_runtime_yaml(
+            f"""
+row_unions:
+  - name: variants
+    branches: {branches_yaml}
+    on_success: compared
+"""
+        )
+
+
+@pytest.mark.parametrize("on_success_line", ["", "    on_success: '   '"])
+def test_composition_state_from_runtime_yaml_rejects_missing_or_blank_row_union_on_success(on_success_line: str) -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"row_unions\[0\]\.on_success must be a non-empty string"):
+        composition_state_from_runtime_yaml(
+            f"""
+row_unions:
+  - name: variants
+    branches: [control, treatment]
+{on_success_line}
+"""
+        )
+
+
+def test_composition_state_from_runtime_yaml_rejects_row_union_input_mismatch() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"row_unions\[0\]\.input must match its first branch input 'control'"):
+        composition_state_from_runtime_yaml(
+            """
+row_unions:
+  - name: variants
+    branches: [control, treatment]
+    input: other
+    on_success: compared
+"""
+        )
+
+
+@pytest.mark.parametrize("timeout_yaml", ["true", ".nan", ".inf", "-.inf", "0", "-1", "slow"])
+def test_composition_state_from_runtime_yaml_rejects_invalid_row_union_timeout(timeout_yaml: str) -> None:
+    with pytest.raises(
+        RuntimeYamlImportError,
+        match=r"row_unions\[0\]\.timeout_seconds must be a finite positive number",
+    ):
+        composition_state_from_runtime_yaml(
+            f"""
+row_unions:
+  - name: variants
+    branches: [control, treatment]
+    on_success: compared
+    timeout_seconds: {timeout_yaml}
+"""
+        )
+
+
+def test_composition_state_from_runtime_yaml_maps_oversized_row_union_timeout_to_import_error() -> None:
+    oversized_integer = "9" * 400
+
+    with pytest.raises(
+        RuntimeYamlImportError,
+        match=r"row_unions\[0\]\.timeout_seconds must be a finite positive number",
+    ):
+        composition_state_from_runtime_yaml(
+            f"""
+row_unions:
+  - name: variants
+    branches: [control, treatment]
+    on_success: compared
+    timeout_seconds: {oversized_integer}
+"""
+        )
+
+
+@pytest.mark.parametrize("field", ["plugin", "options", "policy", "merge", "condition", "unexpected"])
+def test_composition_state_from_runtime_yaml_rejects_extra_or_inapplicable_row_union_fields(field: str) -> None:
+    with pytest.raises(RuntimeYamlImportError, match=rf"row_unions\[0\] contains unknown or inapplicable field\(s\): \['{field}'\]"):
+        composition_state_from_runtime_yaml(
+            f"""
+row_unions:
+  - name: variants
+    branches: [control, treatment]
+    on_success: compared
+    {field}: invalid
+"""
+        )
 
 
 def test_composition_state_from_runtime_yaml_rejects_aliases() -> None:
@@ -327,6 +470,41 @@ coalesce:
 sinks:
   out:
     plugin: csv
+"""
+        )
+
+
+def test_composition_state_from_runtime_yaml_preserves_coalesce_timeout() -> None:
+    state = composition_state_from_runtime_yaml(
+        """
+coalesce:
+  - name: joined
+    branches: [a, b]
+    policy: require_all
+    merge: nested
+    timeout_seconds: 4.25
+"""
+    )
+
+    assert state.nodes[0].node_type == "coalesce"
+    assert state.nodes[0].timeout_seconds == 4.25
+
+
+def test_composition_state_from_runtime_yaml_maps_oversized_coalesce_timeout_to_import_error() -> None:
+    oversized_integer = "9" * 400
+
+    with pytest.raises(
+        RuntimeYamlImportError,
+        match=r"coalesce\[0\]\.timeout_seconds must be a finite positive number",
+    ):
+        composition_state_from_runtime_yaml(
+            f"""
+coalesce:
+  - name: joined
+    branches: [a, b]
+    policy: require_all
+    merge: nested
+    timeout_seconds: {oversized_integer}
 """
         )
 

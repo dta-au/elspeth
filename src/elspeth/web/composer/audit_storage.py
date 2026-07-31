@@ -10,8 +10,14 @@ from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json as primitive_canonical_json
 from elspeth.contracts.hashing import is_lower_sha256_hex
 from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.authority_hashing import (
+    composer_authority_canonical_json,
+    project_composer_authority_payload,
+    restore_composer_authority_payload,
+)
 from elspeth.web.composer.redaction import (
     MANIFEST,
     redact_arg_error_response,
@@ -50,28 +56,74 @@ def _load_canonical_mapping(canonical_payload: str | None) -> dict[str, object] 
     return cast(dict[str, object], decoded)
 
 
-def _redacted_argument_canonical(
+def _validated_canonical_mapping_pair(
+    canonical_payload: str,
+    payload_hash: str,
+    *,
+    label: str,
+) -> dict[str, object]:
+    payload = _load_canonical_mapping(canonical_payload)
+    assert payload is not None
+    if primitive_canonical_json(payload) != canonical_payload:
+        raise AuditIntegrityError(f"Tier 1 audit anomaly: {label} is not the exact canonical representation.")
+    if _hash_canonical_payload(canonical_payload) != payload_hash:
+        raise AuditIntegrityError(f"Tier 1 audit anomaly: {label} hash mismatch.")
+    return payload
+
+
+def _validated_invocation_arguments(invocation: ComposerToolInvocation) -> dict[str, object]:
+    """Validate both argument bindings and restore authored pipeline order."""
+    arguments = _validated_canonical_mapping_pair(
+        invocation.arguments_canonical,
+        invocation.arguments_hash,
+        label="composer tool-invocation arguments",
+    )
+    authority_canonical = invocation.authority_arguments_canonical
+    authority_hash = invocation.authority_arguments_hash
+    if invocation.tool_name != "set_pipeline":
+        if authority_canonical is not None or authority_hash is not None:
+            raise AuditIntegrityError("non-set_pipeline invocation carries a set-pipeline authority binding")
+        return arguments
+    if authority_canonical is None and authority_hash is None:
+        if invocation.status is ComposerToolStatus.SUCCESS:
+            raise AuditIntegrityError("successful set_pipeline invocation is missing its authority binding")
+        return arguments
+    if type(authority_canonical) is not str or type(authority_hash) is not str:
+        raise AuditIntegrityError("set_pipeline invocation authority binding is incomplete")
+    authority = _validated_canonical_mapping_pair(
+        authority_canonical,
+        authority_hash,
+        label="set_pipeline authority arguments",
+    )
+    try:
+        restored = restore_composer_authority_payload(authority)
+    except ValueError as exc:
+        raise AuditIntegrityError("set_pipeline invocation authority projection is malformed") from exc
+    if primitive_canonical_json(restored) != invocation.arguments_canonical:
+        raise AuditIntegrityError("set_pipeline invocation authority projection differs from its tool arguments")
+    if primitive_canonical_json(project_composer_authority_payload(restored)) != authority_canonical:
+        raise AuditIntegrityError("set_pipeline invocation authority projection is not reversible")
+    return cast(dict[str, object], restored)
+
+
+def _redacted_arguments(
     invocation: ComposerToolInvocation,
+    arguments: dict[str, object],
     *,
     telemetry: OtelRedactionTelemetry,
-) -> str:
-    arguments = _load_canonical_mapping(invocation.arguments_canonical)
+) -> dict[str, object]:
     if invocation.status == ComposerToolStatus.ARG_ERROR:
         arg_error_projection = redact_arg_error_response(
             error_class=invocation.error_class,
             error_message=None,
         )
-        return canonical_json(
-            {
-                "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
-                "error_class": arg_error_projection["error_class"],
-                "field_count": 0 if arguments is None else len(arguments),
-            }
-        )
+        return {
+            "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+            "error_class": arg_error_projection["error_class"],
+            "field_count": len(arguments),
+        }
     if invocation.tool_name not in MANIFEST:
-        return canonical_json(unknown_tool_arguments_redaction(telemetry=telemetry))
-    if arguments is None:
-        return invocation.arguments_canonical
+        return dict(unknown_tool_arguments_redaction(telemetry=telemetry))
     try:
         redacted = redact_tool_call_arguments(
             invocation.tool_name,
@@ -91,7 +143,7 @@ def _redacted_argument_canonical(
             "error_class": failure_projection["error_class"],
             "field_count": len(arguments),
         }
-    return canonical_json(redacted)
+    return redacted
 
 
 def _redacted_result_canonical(
@@ -136,7 +188,9 @@ def redacted_tool_invocation_content_and_envelope(
     """
 
     telemetry = OtelRedactionTelemetry()
-    arguments_canonical = _redacted_argument_canonical(invocation, telemetry=telemetry)
+    arguments = _validated_invocation_arguments(invocation)
+    redacted_arguments = _redacted_arguments(invocation, arguments, telemetry=telemetry)
+    arguments_canonical = canonical_json(redacted_arguments)
     result_canonical = _redacted_result_canonical(invocation, telemetry=telemetry)
     arg_error_projection = (
         redact_arg_error_response(
@@ -175,6 +229,10 @@ def redacted_tool_invocation_content_and_envelope(
     invocation_payload: dict[str, Any] = invocation.to_dict()
     invocation_payload["arguments_canonical"] = arguments_canonical
     invocation_payload["arguments_hash"] = _hash_canonical_payload(arguments_canonical)
+    if invocation.tool_name == "set_pipeline":
+        authority_arguments_canonical = composer_authority_canonical_json(redacted_arguments)
+        invocation_payload["authority_arguments_canonical"] = authority_arguments_canonical
+        invocation_payload["authority_arguments_hash"] = _hash_canonical_payload(authority_arguments_canonical)
     invocation_payload["result_canonical"] = result_canonical
     invocation_payload["result_hash"] = _hash_canonical_payload(result_canonical) if result_canonical is not None else None
     if arg_error_projection is not None:

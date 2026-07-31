@@ -12,8 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from elspeth.contracts import EdgeInfo
+from elspeth.contracts import EdgeInfo, PluginSchema
 from elspeth.contracts.enums import NodeType, RoutingMode
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import GraphValidationError, NodeInfo
@@ -134,6 +135,136 @@ class TestMultiProducerFanInValidation:
 
         with pytest.raises(GraphValidationError, match="fan-in from multiple producers without a queue"):
             graph.validate()
+
+
+class TestRowUnionSchemaCompatibility:
+    """row_union is UNION ALL: known fixed branch rows need one long-format contract."""
+
+    @staticmethod
+    def _graph(
+        left_schema: type[PluginSchema] | None,
+        right_schema: type[PluginSchema] | None,
+        *,
+        left_mode: RoutingMode = RoutingMode.MOVE,
+        left_schema_config: SchemaConfig | None = None,
+        right_schema_config: SchemaConfig | None = None,
+    ) -> ExecutionGraph:
+        graph = ExecutionGraph()
+        graph.add_node(
+            "left",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="left",
+            output_schema=left_schema,
+            output_schema_config=left_schema_config,
+        )
+        graph.add_node(
+            "right",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="right",
+            output_schema=right_schema,
+            output_schema_config=right_schema_config,
+        )
+        graph.add_node(
+            "union",
+            node_type=NodeType.ROW_UNION,
+            plugin_name="row_union:union",
+            config={
+                "branches": {
+                    "left_branch": "left_out",
+                    "right_branch": "right_out",
+                },
+                "on_success": "union_out",
+            },
+        )
+        graph.add_edge("left", "union", label="continue", mode=left_mode)
+        graph.add_edge("right", "union", label="continue", mode=RoutingMode.MOVE)
+        return graph
+
+    def test_compatible_fixed_branch_schemas_are_accepted(self) -> None:
+        class LeftSchema(PluginSchema):
+            id: str
+            score: float
+
+        class RightSchema(PluginSchema):
+            id: str
+            score: float
+
+        self._graph(LeftSchema, RightSchema).validate_edge_compatibility()
+
+    def test_incompatible_fixed_branch_schemas_are_rejected(self) -> None:
+        class ScoredRow(PluginSchema):
+            id: str
+            score: float
+
+        class LabelledRow(PluginSchema):
+            id: str
+            label: str
+
+        with pytest.raises(GraphValidationError, match=r"row_union 'union'.*incompatible schemas"):
+            self._graph(ScoredRow, LabelledRow).validate_edge_compatibility()
+
+    def test_observed_branch_abstains_against_fixed_branch(self) -> None:
+        class FixedRow(PluginSchema):
+            id: str
+            score: float
+
+        self._graph(None, FixedRow).validate_edge_compatibility()
+
+    def test_divert_branch_abstains_from_declared_output_schema(self) -> None:
+        class SuccessSchema(PluginSchema):
+            id: str
+            score: float
+
+        class OtherSuccessSchema(PluginSchema):
+            id: str
+            label: str
+
+        self._graph(
+            SuccessSchema,
+            OtherSuccessSchema,
+            left_mode=RoutingMode.DIVERT,
+        ).validate_edge_compatibility()
+
+    def test_disjoint_flexible_branch_declarations_are_compatible(self) -> None:
+        class ScoredRow(PluginSchema):
+            score: float
+
+        class LabelledRow(PluginSchema):
+            label: str
+
+        self._graph(
+            ScoredRow,
+            LabelledRow,
+            left_schema_config=SchemaConfig(
+                mode="flexible",
+                fields=(FieldDefinition("score", "float"),),
+            ),
+            right_schema_config=SchemaConfig(
+                mode="flexible",
+                fields=(FieldDefinition("label", "str"),),
+            ),
+        ).validate_edge_compatibility()
+
+    def test_flexible_branches_reject_conflicting_shared_field_types(self) -> None:
+        class StringIdRow(PluginSchema):
+            id: str
+
+        class IntegerIdRow(PluginSchema):
+            id: int
+
+        with pytest.raises(GraphValidationError, match=r"row_union 'union'.*incompatible schemas.*id"):
+            self._graph(
+                StringIdRow,
+                IntegerIdRow,
+                left_schema_config=SchemaConfig(
+                    mode="flexible",
+                    fields=(FieldDefinition("id", "str"),),
+                ),
+                right_schema_config=SchemaConfig(
+                    mode="flexible",
+                    fields=(FieldDefinition("id", "int"),),
+                ),
+            ).validate_edge_compatibility()
 
 
 # ---------------------------------------------------------------------------

@@ -46,7 +46,7 @@ class LLMConfig(TransformDataConfig):
     only declare the fields that are TRULY required (always accessed).
 
     LLM-specific fields:
-    - provider: LLM provider ("azure", "openrouter", or "bedrock")
+    - provider: LLM provider ("azure", "openrouter", "bedrock", or "gateway")
     - model: Model identifier (optional — Azure uses deployment_name instead)
     - prompt_template: Jinja2 prompt template (required)
     - system_prompt: Optional system message
@@ -64,7 +64,7 @@ class LLMConfig(TransformDataConfig):
     - max_capacity_retry_seconds: Max time to retry capacity errors per row
     """
 
-    provider: Literal["azure", "openrouter", "bedrock"] = Field(..., description="LLM provider")
+    provider: Literal["azure", "openrouter", "bedrock", "gateway"] = Field(..., description="LLM provider")
     model: str | None = Field(None, description="Model identifier (optional — Azure uses deployment_name)")
     queries: list[QueryDefinition] | dict[str, QueryDefinition] | None = Field(
         None, description="Multi-query specs (None = single-query mode)"

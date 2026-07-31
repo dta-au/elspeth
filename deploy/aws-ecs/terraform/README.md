@@ -328,8 +328,10 @@ on.
 
 `examples/scenario-a.tfvars` must name both Bedrock provider IDs, present and
 distinct. Set `alb_https_ingress_cidrs` to the operator or trusted-network
-CIDRs that need HTTPS access; the package rejects an empty list, duplicates,
-invalid CIDRs, and `0.0.0.0/0`.
+IPv4 CIDRs that need HTTPS access; the package rejects an empty list,
+unparseable CIDRs, IPv6 CIDRs, two entries covering the same network, and any
+`/0` however it is spelled (`0.0.0.0/00` parses as `/0` and EC2 canonicalises
+it back to `0.0.0.0/0`).
 
 Scenario A has no rollback or acceptance-coordinator inputs. Its compatibility
 inventory derives the candidate baseline and absolute tracked source paths from

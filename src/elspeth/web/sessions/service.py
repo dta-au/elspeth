@@ -42,6 +42,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import (
@@ -349,7 +350,7 @@ def _pipeline_private_arguments_hash(arguments: Mapping[str, Any]) -> str:
     return stable_hash(
         {
             "schema": "composer.pipeline-proposal-private-arguments.v1",
-            "arguments": deep_thaw(arguments),
+            "arguments": project_composer_authority_payload(arguments),
         }
     )
 
@@ -367,7 +368,7 @@ def _pipeline_audit_payload_hash(
             "summary": summary,
             "rationale": rationale,
             "affects": list(affects),
-            "arguments_redacted_json": deep_thaw(arguments_redacted_json),
+            "arguments_redacted_json": project_composer_authority_payload(arguments_redacted_json),
         }
     )
 
@@ -420,7 +421,7 @@ def _pipeline_created_payload(
     supersedes_proposal_id: UUID | None,
 ) -> _PipelineCreatedEventPayload:
     proposal = plan.proposal
-    tool_arguments_hash = stable_hash(proposal.pipeline)
+    tool_arguments_hash = composer_authority_hash(proposal.pipeline)
     payload: _PipelineCreatedEventPayload = {
         "schema": _PIPELINE_CREATED_SCHEMA,
         "tool_call_id": plan.tool_call_id,
@@ -456,7 +457,7 @@ def _pipeline_created_payload(
 
 
 def _composition_state_data_content_hash(state: CompositionStateData) -> str:
-    return stable_hash(
+    return composer_authority_hash(
         {
             "sources": state.sources,
             "nodes": state.nodes,
@@ -1731,7 +1732,7 @@ def _restore_authoritative_pipeline_proposal(
     )
     if payload["provenance_hash"] != expected_provenance_hash:
         raise AuditIntegrityError("pipeline proposal provenance binding mismatch")
-    if row.tool_arguments_hash != stable_hash(row.arguments_json):
+    if row.tool_arguments_hash != composer_authority_hash(row.arguments_json):
         raise AuditIntegrityError("pipeline proposal row arguments hash mismatch")
     if row.composer_skill_hash != payload["skill_hash"]:
         raise AuditIntegrityError("pipeline proposal skill provenance mismatch")
@@ -5808,7 +5809,7 @@ class SessionServiceImpl:
             composer_model_version=composer_model_version,
             composer_provider=composer_provider,
             composer_skill_hash=proposal.skill_hash,
-            tool_arguments_hash=stable_hash(proposal.pipeline),
+            tool_arguments_hash=composer_authority_hash(proposal.pipeline),
         )
         assert all(value is not None for value in normalized.values())
         payload = _pipeline_created_payload(
@@ -6054,7 +6055,7 @@ class SessionServiceImpl:
                     raise StaleComposeStateError("pipeline proposal draft hash echo is stale or mismatched")
                 if dispatch.tool_call_id != authority.row.tool_call_id:
                     raise AuditIntegrityError("pipeline dispatch tool call does not match proposal authority")
-                if dispatch.arguments_hash != stable_hash(authority.row.arguments_redacted_json):
+                if dispatch.arguments_hash != composer_authority_hash(authority.row.arguments_redacted_json):
                     raise AuditIntegrityError("pipeline dispatch arguments do not match persisted redacted proposal")
                 if _persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch) != (state_content_hash,):
                     raise AuditIntegrityError("pipeline settlement requires one durable dispatch audit bound to the exact state content")
@@ -6300,7 +6301,7 @@ class SessionServiceImpl:
                 if dispatch is not None:
                     if dispatch.tool_call_id != authority.row.tool_call_id:
                         raise AuditIntegrityError("pipeline rejection dispatch tool call does not match proposal authority")
-                    if dispatch.arguments_hash != stable_hash(authority.row.arguments_redacted_json):
+                    if dispatch.arguments_hash != composer_authority_hash(authority.row.arguments_redacted_json):
                         raise AuditIntegrityError("pipeline rejection dispatch arguments do not match persisted redacted proposal")
                     if len(_persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch)) != 1:
                         raise AuditIntegrityError("pipeline rejection requires exactly one matching durable dispatch audit")
@@ -9901,7 +9902,7 @@ class SessionServiceImpl:
             composer_model_version=command.plan.model_version,
             composer_provider=command.plan.provider,
             composer_skill_hash=proposal.skill_hash,
-            tool_arguments_hash=stable_hash(proposal.pipeline),
+            tool_arguments_hash=composer_authority_hash(proposal.pipeline),
         )
         assert all(value is not None for value in normalized.values())
         creation_payload = _pipeline_created_payload(
@@ -10419,7 +10420,7 @@ class SessionServiceImpl:
             composer_model_version=command.plan.model_version,
             composer_provider=command.plan.provider,
             composer_skill_hash=proposal.skill_hash,
-            tool_arguments_hash=stable_hash(proposal.pipeline),
+            tool_arguments_hash=composer_authority_hash(proposal.pipeline),
         )
         assert all(value is not None for value in normalized.values())
         creation_payload = _pipeline_created_payload(
@@ -11274,7 +11275,7 @@ class SessionServiceImpl:
         authority: AuthoritativePipelineProposal,
     ) -> PipelineDispatchRecovery | None:
         sid = str(authority.row.session_id)
-        expected_arguments_hash = stable_hash(authority.row.arguments_redacted_json)
+        expected_arguments_hash = composer_authority_hash(authority.row.arguments_redacted_json)
         rows = conn.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.session_id == sid)).fetchall()
         matches: list[PipelineDispatchRecovery] = []
         for row in rows:
@@ -11440,7 +11441,7 @@ class SessionServiceImpl:
                     invocation_binding.tool_call_id != authority.row.tool_call_id
                     or invocation_binding.arguments_hash != authority.row.tool_arguments_hash
                     or expected_binding.tool_call_id != authority.row.tool_call_id
-                    or expected_binding.arguments_hash != stable_hash(authority.row.arguments_redacted_json)
+                    or expected_binding.arguments_hash != composer_authority_hash(authority.row.arguments_redacted_json)
                 ):
                     raise AuditIntegrityError("guided dispatch record differs from proposal authority")
                 existing = self._pipeline_dispatch_recovery_on_connection(conn, authority=authority)
@@ -11544,7 +11545,7 @@ class SessionServiceImpl:
                     raise AuditIntegrityError("guided proposal acceptance review checkpoint changed authored content")
                 if dispatch.tool_call_id != authority.row.tool_call_id:
                     raise AuditIntegrityError("guided proposal acceptance dispatch differs from authority")
-                if dispatch.arguments_hash != stable_hash(authority.row.arguments_redacted_json):
+                if dispatch.arguments_hash != composer_authority_hash(authority.row.arguments_redacted_json):
                     raise AuditIntegrityError("guided proposal acceptance dispatch arguments differ from authority")
 
                 current_guided = state_from_record(current_record).guided_session

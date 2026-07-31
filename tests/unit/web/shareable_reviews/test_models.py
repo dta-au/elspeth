@@ -328,3 +328,25 @@ def test_shared_inspect_response_accepts_queue_node_in_snapshot() -> None:
         expires_at=datetime.now(UTC),
     )
     assert response.composition_snapshot.nodes[0].node_type == "queue"
+
+
+def test_node_spec_response_accepts_row_union_timeout() -> None:
+    node = NodeSpecResponse.model_validate(
+        {
+            "id": "variant_union",
+            "node_type": "row_union",
+            "plugin": None,
+            "input": "control_done",
+            "on_success": "unioned_rows",
+            "on_error": None,
+            "options": {},
+            "branches": {
+                "control": "control_done",
+                "treatment": "treatment_done",
+            },
+            "timeout_seconds": 30.0,
+        }
+    )
+
+    assert node.node_type == "row_union"
+    assert node.timeout_seconds == 30.0
