@@ -50,12 +50,11 @@ class PluginSecretRequirement(_StrictResponse):
 class PluginSummary(_StrictResponse):
     """Lightweight plugin info for catalog browsing.
 
-    Phase 7A adds reference-content fields (when-to-use prose, capability
-    tags, audit-characteristic flags) so the catalog drawer can render
-    persona-facing reference cards instead of a bare name+description.
-    All new fields are optional and default to None / empty for plugins
-    that haven't been authored yet; the frontend renders a fallback
-    message rather than blocking display.
+    Reference-content fields let the catalog drawer render persona-facing
+    guidance instead of a bare name and description. They remain optional
+    on the wire for third-party and legacy compatibility. Repository tests
+    require every registered built-in to provide complete reference content;
+    external entries may still omit individual fields.
 
     `audit_characteristics` is the catalog service's *derived* set:
     declared characteristics from the plugin class composed with the
