@@ -878,4 +878,125 @@ describe("buildRunEgressSummary", () => {
       "Fetches over the network: fetch_page (web_scrape).",
     ]);
   });
+
+  // ── Catalog-load-failure uncertainty (review follow-up, elspeth-27bc704359) ──
+  //
+  // `pluginCatalogStore.transforms` is `null` for BOTH "not loaded yet" and
+  // "load failed" — the store's catch block resets `transforms` to `null`
+  // on error too. Silently falling back to the same hardcoded set for both
+  // states would reproduce R2-F7's exact under-disclosure the moment a
+  // catalog fetch errors, with no signal to the user. `catalogLoadFailed`
+  // (from `pluginCatalogStore.error !== null`) disambiguates: only the
+  // failed-load state adds an explicit uncertainty line.
+
+  it("names an unverifiable transform in an explicit uncertainty line when the catalog failed to load, while still confidently naming a hardcoded-set node", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "fetch_page",
+            node_type: "transform",
+            plugin: "web_scrape",
+            input: "in",
+            on_success: "extract_in",
+            on_error: null,
+            options: {},
+          },
+          {
+            id: "extract",
+            node_type: "transform",
+            plugin: "aws_textract_document_analysis",
+            input: "extract_in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      null,
+      true,
+    );
+
+    expect(lines).toEqual([
+      "Fetches over the network: fetch_page (web_scrape).",
+      "Plugin catalog unavailable — external-service effects could not be " +
+        "fully enumerated for: extract (aws_textract_document_analysis).",
+    ]);
+  });
+
+  it("does not double-count an LLM node in the load-failure uncertainty line", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: { model: "openrouter/anthropic/claude-sonnet-4.6" },
+          },
+        ],
+      }),
+      null,
+      true,
+    );
+
+    expect(lines).toEqual([
+      "Sends rows to the configured LLM: classify (model openrouter/anthropic/claude-sonnet-4.6).",
+    ]);
+  });
+
+  it("stays on the plain fallback (no uncertainty line) when the catalog simply hasn't loaded yet", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "extract",
+            node_type: "transform",
+            plugin: "aws_textract_document_analysis",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      null,
+      false,
+    );
+
+    expect(lines).toEqual([]);
+  });
+
+  it("fails open (no network line, no uncertainty line) for a transform absent from a loaded catalog", () => {
+    // Defensive pin, not a design goal: a plugin name with no matching
+    // catalog entry (renamed/policy-revoked since the composition was
+    // saved) is currently treated as non-network rather than flagged —
+    // see the `catalogFlagsExternalCall` doc comment.
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "mystery",
+            node_type: "transform",
+            plugin: "renamed_or_revoked_plugin",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      [
+        makePluginSummary({
+          name: "csv_transform",
+          audit_characteristics: ["deterministic"],
+        }),
+      ],
+    );
+
+    expect(lines).toEqual([]);
+  });
 });
