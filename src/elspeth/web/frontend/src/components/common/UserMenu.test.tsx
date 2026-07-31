@@ -49,6 +49,22 @@ describe("UserMenu", () => {
     ).not.toBeInTheDocument();
   });
 
+  // elspeth-bcd1a9b9b3: the dialog that onOpenSettings opens restores focus to
+  // whatever document.activeElement was when it mounted. Closing the menu first
+  // detaches the clicked item, browsers reset focus to <body>, and the dialog
+  // then captures <body> as its restore target — so on close the keyboard user
+  // lands nowhere. Handing focus back to the trigger BEFORE the item unmounts
+  // gives the dialog a live element to restore to.
+  it("returns focus to the Account trigger when Composer preferences is chosen", async () => {
+    render(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: /account/i });
+    await userEvent.click(trigger);
+    await userEvent.click(
+      screen.getByRole("button", { name: /composer preferences/i }),
+    );
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it("toggles the theme from the account menu", async () => {
     render(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />);
     await userEvent.click(screen.getByRole("button", { name: /account/i }));

@@ -206,3 +206,59 @@ assistant_message_kind: "synthetic_failure",
     expect(latestAssistantRationale(s)).toBe("Source created as a 3-row CSV.");
   });
 });
+
+// elspeth-bc8a35c1ab: the headline names the DECISION. A conversational
+// lead-in ("Here is an updated proposal.", "Great — you've given me…") names
+// nothing, and echoing chat prose into the h2 duplicates the bubble below it.
+// Rejection is safe: the caller falls back to the static step purpose.
+describe("latestAssistantRationale — conversational openers", () => {
+  function assistantSaying(content: string): GuidedSession {
+    return session({
+      chat_history: [
+        {
+          role: "assistant",
+          content,
+          seq: 2,
+          step: "step_1_source",
+          ts_iso: "t",
+          assistant_message_kind: "assistant",
+          synthetic_failure_reason: null,
+        },
+      ],
+    });
+  }
+
+  it.each([
+    "Here is an updated proposal.",
+    "Here's the updated pipeline.",
+    "Great — you've given me the exact rows, so I can picture the data clearly.",
+    "Thanks! I've set that up.",
+    "Sure, that works.",
+    "Perfect.",
+    "Let me set up the source.",
+    "I'll wire the sink next.",
+    "Okay, updating now.",
+  ])("rejects the conversational opener %j", (content) => {
+    expect(latestAssistantRationale(assistantSaying(content))).toBeNull();
+  });
+
+  it("rejects a multi-sentence paragraph — a headline is one sentence", () => {
+    expect(
+      latestAssistantRationale(
+        assistantSaying(
+          "You gave me the exact rows. The source is now a 3-row inline CSV.",
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  it.each([
+    "Source created as a 3-row CSV.",
+    "Sink set.",
+    "The source is built.",
+    "Inline CSV source with 3 comment rows.",
+    "Heres-a-weird-id set as the source name.",
+  ])("keeps the decision-naming headline %j", (content) => {
+    expect(latestAssistantRationale(assistantSaying(content))).toBe(content);
+  });
+});

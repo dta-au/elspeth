@@ -14,9 +14,11 @@ describe("pluginDisplayName", () => {
     expect(pluginDisplayName("batch_top_k")).toBe("Batch Top-K");
   });
 
-  it("never surfaces the developer value 'null' as a display name", () => {
-    expect(pluginDisplayName("null")).toBe("Resume Placeholder");
-  });
+  // "null" no longer needs a curated display name: CatalogDrawer filters
+  // internal-machinery plugins out of the catalog (elspeth-06566208b3), and
+  // pluginDisplayName has no consumer outside it. isInternalPlugin below is
+  // now load-bearing as that filter's predicate.
+  // (isInternalPlugin, that filter's predicate, is covered below.)
 
   it("humanises underscore ids to Title Case", () => {
     expect(pluginDisplayName("azure_document_intelligence")).toBe(

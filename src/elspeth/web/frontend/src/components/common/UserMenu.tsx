@@ -80,7 +80,15 @@ export function UserMenu({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [open]);
 
+  // Focus returns to the trigger BEFORE the item unmounts (elspeth-bcd1a9b9b3).
+  // The settings dialog's focus trap saves document.activeElement when it
+  // mounts and restores it on close. Closing the menu first detaches the
+  // clicked item, so the browser resets focus to <body> and the trap captures
+  // <body> as its restore target — leaving keyboard users nowhere on close.
+  // Handing focus back here (the same move the Escape path makes) gives the
+  // trap a live element to save and restore.
   const onSettings = useCallback(() => {
+    triggerRef.current?.focus();
     setOpen(false);
     onOpenSettings();
   }, [onOpenSettings]);

@@ -115,36 +115,10 @@ describe("PluginCard — collapsed header", () => {
     );
   });
 
-  it("never uses the developer value 'null' as the primary label and badges it internal", () => {
-    render(
-      <PluginCard
-        plugin={makePlugin({
-          name: "null",
-          plugin_type: "source",
-          description: "A source that yields no rows.",
-        })}
-        schema={null}
-        onExpand={vi.fn()}
-      />,
-    );
-    const article = screen.getByRole("article", { name: "Resume Placeholder" });
-    expect(within(article).getByText("internal")).toHaveClass(
-      "plugin-card-internal-badge",
-    );
-    // The raw id stays visible, but only as demoted mono metadata.
-    expect(within(article).getByText("null")).toHaveClass("plugin-card-id");
-  });
-
-  it("does not render the internal badge for ordinary plugins", () => {
-    render(
-      <PluginCard
-        plugin={makePlugin({ name: "csv" })}
-        schema={null}
-        onExpand={vi.fn()}
-      />,
-    );
-    expect(screen.queryByText("internal")).not.toBeInTheDocument();
-  });
+  // The internal badge is gone with elspeth-06566208b3: CatalogDrawer now
+  // omits internal-machinery plugins entirely, so no card can carry one and
+  // a badge branch here would be unreachable render code. The filter is
+  // covered by CatalogDrawer.test.tsx ("CatalogDrawer — internal plugins").
 });
 
 describe("PluginCard — flat single-model schema", () => {

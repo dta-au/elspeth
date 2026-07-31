@@ -248,3 +248,74 @@ describe("groupIntoTurns", () => {
     expect(turns[1].isComplete).toBe(false);
   });
 });
+
+// elspeth-e074575b6e — the composer's internal monologue reaching the user.
+//
+// Evidence (output/playwright/elspeth-web-full-20260710T003851Z/
+// 88-freeform-toolcalls-snapshot.txt): a bubble reading 'The auto-stager used
+// user_term="inline_source_data" and id="source_review:inline_source_data".
+// Surfacing with those exact values:' above "Tool calls (12)". That sentence
+// ends in a colon because it was narration written to PRECEDE a tool call,
+// not to answer the user.
+//
+// Why it surfaced: finalContent took the last non-empty content from ANY
+// assistant row. The backend only reaches finalize_no_tool_response — the
+// genuine "here is your answer" path — when the model emits NO tool calls,
+// and persists that reply as its own row via add_message (no tool_calls).
+// Mid-loop rows are persisted by persist_compose_turn_async WITH their
+// tool_calls. So `tool_calls === null` already separates answer from
+// narration. On convergence/timeout no reply row is ever written
+// (_handle_convergence_error persists partial state + tool audit, then
+// raises 422), and the last narration was promoted into its place.
+describe("groupIntoTurns — narration is never the answer", () => {
+  it("ignores content on rows that carry tool calls", () => {
+    const [turn] = groupIntoTurns([
+      msg({
+        id: "a1",
+        role: "assistant",
+        content: "Submitting the full set_pipeline:",
+        tool_calls: [tc("set_pipeline")],
+      }),
+      msg({ id: "a2", role: "assistant", content: "Your pipeline is ready." }),
+    ]);
+    expect(turn.finalContent).toBe("Your pipeline is ready.");
+    expect(turn.isComplete).toBe(true);
+  });
+
+  it("leaves an aborted turn with no answer rather than promoting narration", () => {
+    const [turn] = groupIntoTurns([
+      msg({
+        id: "a1",
+        role: "assistant",
+        content: 'The auto-stager used user_term="inline_source_data".',
+        tool_calls: [tc("upsert_node")],
+      }),
+      msg({
+        id: "a2",
+        role: "assistant",
+        content: "Surfacing with those exact values:",
+        tool_calls: [tc("set_pipeline")],
+      }),
+    ]);
+    expect(turn.finalContent).toBe("");
+    // Atomic reveal: no genuine reply landed, so the turn is not complete —
+    // ChatPanel keeps the thinking indicator rather than painting narration.
+    expect(turn.isComplete).toBe(false);
+    // The work itself is NOT lost — both tool calls stay on the turn.
+    expect(turn.aggregatedToolCalls).toHaveLength(2);
+  });
+
+  it("does not treat a later narration row as superseding the real answer", () => {
+    const [turn] = groupIntoTurns([
+      msg({ id: "a1", role: "assistant", content: "Done — CSV in, JSON out." }),
+      msg({
+        id: "a2",
+        role: "assistant",
+        content: "Let me double-check that:",
+        tool_calls: [tc("preview_pipeline")],
+      }),
+    ]);
+    expect(turn.finalContent).toBe("Done — CSV in, JSON out.");
+    expect(turn.primaryMessage.id).toBe("a1");
+  });
+});

@@ -104,6 +104,38 @@ function outputPhrase(output: OutputSpec): string {
   return WRITE_RESULTS_PHRASE;
 }
 
+/**
+ * Collapse consecutive runs of an identical phrase into one counted clause
+ * (elspeth-bc8a35c1ab). The phrases above are CATEGORY labels, not identities,
+ * so a two-transform chain that lands twice on the generic fallback used to
+ * read "…process each row, process each row, and write a JSON file".
+ *
+ * The count is carried ("twice", "3 times") rather than the repeat being
+ * dropped: silently printing one clause for two nodes would under-report the
+ * pipeline, which this gloss sits directly beside the graph to describe.
+ *
+ * Only consecutive runs collapse — a phrase that recurs after an intervening
+ * different step ("rate each row, merge the branches, rate each row") is a
+ * genuinely different position in the pipeline and stays separate.
+ *
+ * Sentence-level only: `buildPlainPhraseMap` must NOT collapse, because it is
+ * a component_id → phrase lookup that PipelineValidationSummary uses to
+ * attribute findings, where two nodes sharing a phrase is correct.
+ */
+function collapseRepeatedPhrases(phrases: string[]): string[] {
+  const collapsed: string[] = [];
+  for (let index = 0; index < phrases.length; ) {
+    const phrase = phrases[index];
+    let run = 1;
+    while (index + run < phrases.length && phrases[index + run] === phrase) run += 1;
+    if (run === 1) collapsed.push(phrase);
+    else if (run === 2) collapsed.push(`${phrase} twice`);
+    else collapsed.push(`${phrase} ${run} times`);
+    index += run;
+  }
+  return collapsed;
+}
+
 /** Join with an Oxford comma: [a] → "a"; [a,b] → "a and b"; [a,b,c] → "a, b, and c". */
 function oxfordJoin(items: string[]): string {
   if (items.length === 0) return "";
@@ -132,7 +164,7 @@ export function pipelineGloss(
     phrases.push(outputPhrase(output));
   }
   if (phrases.length === 0) return GLOSS_FALLBACK;
-  return `This pipeline will ${oxfordJoin(phrases)}.`;
+  return `This pipeline will ${oxfordJoin(collapseRepeatedPhrases(phrases))}.`;
 }
 
 /**

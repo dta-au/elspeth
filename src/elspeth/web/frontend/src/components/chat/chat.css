@@ -660,7 +660,28 @@
   font-size: var(--font-size-xs);
   font-weight: 400;
   color: var(--color-text-muted);
+  /* Truncate rather than overflow (elspeth-0b70269ccc). A bare `nowrap` gives
+     this chip a min-content width equal to the whole model id
+     ("openrouter/anthropic/claude-sonnet-4-6"), which flexbox will not shrink
+     below — so at 390px it pushed the sibling ModeSwitchButton past the panel
+     edge and .chat-panel's overflow:hidden cut it to "Sw". The full value stays
+     available via the element's title/aria-label. The same nowrap-chip-clips-
+     its-sibling failure was fixed for .mode-switch-confirm below. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Header action cluster: model chip + mode switch. Was an inline style prop on
+   ChatPanel's header (elspeth-0b70269ccc), which outranked every stylesheet
+   rule and made the row unresponsive at any breakpoint. */
+.chat-panel-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+  flex: 0 1 auto;
 }
 
 .chat-model-chip-label {
@@ -1860,6 +1881,18 @@
   position: sticky;
   top: 0;
   z-index: 2;
+  /* Bound the pinned stack (elspeth-0b70269ccc). Sticky with no height cap is
+     safe only while the stack stays short. At 390px the decision cards reflow
+     tall — five of them measured 1213px against an 844px viewport — so the
+     stack consumed the whole flex column and .chat-panel's overflow:hidden
+     occluded the composer-update card and the Files section beneath it.
+     Capping with internal scroll keeps the intent ("pending decisions stay
+     visible while the operator scrolls the conversation") while guaranteeing
+     the conversation below it always has room. Applies at every width: the
+     same overrun happens on desktop with enough pending decisions. */
+  max-height: 45vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .ack-stack-header {

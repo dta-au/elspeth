@@ -46,16 +46,20 @@ const DISPLAY_NAME_OVERRIDES: ReadonlyMap<string, string> = new Map([
   ["dataverse", "Microsoft Dataverse"],
   ["chroma_sink", "Chroma Vector Store"],
   ["batch_top_k", "Batch Top-K"],
-  // The resume-only placeholder source. Its id is literally "null"; the
-  // display name says what it is for instead of echoing a developer value
-  // at end users (the card also carries the internal badge below).
-  ["null", "Resume Placeholder"],
 ]);
 
 /**
  * Plugin ids that exist for internal/resume machinery rather than for
- * end-user pipelines. The catalog keeps them visible (it is a reference,
- * not a picker) but badges them so first-run users do not reach for them.
+ * end-user pipelines. The catalog OMITS these (elspeth-06566208b3):
+ * "reference, not a picker" governs what you can DO in the catalog
+ * (browse/read, never pick/wire) — it does not oblige the reference to list
+ * machinery that answers no question an operator can ask of it. The
+ * resume-only `null` source was surfacing on the Sources tab as a source
+ * that "yields no rows", which reads as a broken entry.
+ *
+ * Backend listings are unaffected: CatalogServiceImpl.list_sources still
+ * returns `null` because composer and MCP discovery need it for resume.
+ * The filter is applied by CatalogDrawer.
  */
 const INTERNAL_PLUGIN_IDS: ReadonlySet<string> = new Set(["null"]);
 
