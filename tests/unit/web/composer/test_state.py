@@ -6620,6 +6620,35 @@ class TestCompositionStateRowUnion:
             merge=None,
         )
 
+    def _aggregation(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        output_mode: str | None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="aggregation",
+            plugin="batch_stats",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "value_field": "value",
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={},
+            output_mode=output_mode,
+        )
+
     def _row_union(self, **overrides: Any) -> NodeSpec:
         defaults: dict[str, Any] = {
             "id": "variant_union",
@@ -6739,6 +6768,135 @@ class TestCompositionStateRowUnion:
         result = self._state().validate()
 
         assert result.is_valid, result.errors
+
+    @pytest.mark.parametrize("output_mode", [None, "transform"])
+    def test_row_union_rejects_transform_mode_aggregation_inside_branch(self, output_mode: str | None) -> None:
+        state = self._state()
+        branch_aggregation = self._aggregation(
+            "control",
+            "control_branch",
+            "control_done",
+            output_mode=output_mode,
+        )
+        state = replace(
+            state,
+            nodes=tuple(branch_aggregation if node.id == "control" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_branch_aggregation_invalid")
+        assert error.component == "node:variant_union"
+        assert "control" in error.message
+        assert "row_id" in error.message
+        assert "passthrough" in error.message
+
+    def test_row_union_accepts_passthrough_aggregation_inside_branch(self) -> None:
+        state = self._state()
+        branch_aggregation = self._aggregation(
+            "control",
+            "control_branch",
+            "control_done",
+            output_mode="passthrough",
+        )
+        state = replace(
+            state,
+            nodes=tuple(branch_aggregation if node.id == "control" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_accepts_transform_mode_aggregation_before_fork(self) -> None:
+        state = self._state()
+        pre_fork_aggregation = self._aggregation(
+            "pre_fork_batch",
+            "pre_fork_in",
+            "fork_in",
+            output_mode="transform",
+        )
+        state = replace(
+            state,
+            sources={"source": self._source(on_success="pre_fork_in")},
+            nodes=(pre_fork_aggregation, *state.nodes),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_rejects_nested_fork_inside_branch(self) -> None:
+        nested_gate = self._gate(
+            id="nested_fork",
+            input="control_branch",
+            fork_to=("nested_a", "nested_b"),
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._gate(),
+                nested_gate,
+                self._transform("control", "nested_a", "control_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                self._row_union(),
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(self._output(), self._output("nested_b")),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_nested_fork_invalid")
+        assert error.component == "node:variant_union"
+        assert "nested_fork" in error.message
+        assert "control_branch" in error.message
+
+    def test_gate_fork_aliases_must_be_unique_before_row_union_origin_resolution(self) -> None:
+        state = self._state(
+            gate=self._gate(
+                fork_to=("control_branch", "control_branch", "treatment_branch"),
+            )
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "gate_duplicate_fork_branch")
+        assert error.component == "node:fork_rows"
+        assert "control_branch" in error.message
+
+    @pytest.mark.parametrize(
+        "node_id",
+        [
+            "bad name",
+            "a" * 39,
+            "fork",
+            "__private",
+            " variant_union ",
+        ],
+    )
+    def test_row_union_name_matches_runtime_identifier_contract(self, node_id: str) -> None:
+        result = self._state(row_union=self._row_union(id=node_id)).validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_name_invalid")
+        assert error.component == f"node:{node_id}"
+
+    def test_malformed_row_union_branch_values_return_errors_without_sorting_type_error(self) -> None:
+        payload = json.loads(json.dumps(self._state().to_dict()))
+        row_union = next(node for node in payload["nodes"] if node["node_type"] == "row_union")
+        row_union["branches"] = {
+            "control_branch": 123,
+            "treatment_branch": "missing",
+        }
+        row_union["input"] = 123
+
+        result = CompositionState.from_dict(payload).validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "row_union_branch_invalid" for error in result.errors)
 
     def test_row_union_rejects_branch_aliases_from_multiple_fork_gates(self) -> None:
         second_gate = self._gate(

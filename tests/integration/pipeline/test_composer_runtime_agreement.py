@@ -4535,3 +4535,120 @@ class TestComposerRuntimeRowUnionAgreement:
         assert "downstream of row_union 'variant_union'" in message
         assert "count/timeout/condition trigger" in message
         assert "Use the implicit end_of_source trigger" in message
+
+    def test_transform_mode_branch_aggregation_is_rejected_by_both_layers(self) -> None:
+        """Composer mirrors the runtime branch-aggregation identity guard.
+
+        Bug-verification protocol: before the Composer backward branch walk,
+        ``CompositionState.validate()`` accepted this candidate while
+        ``_build_runtime_graph_for_settings`` raised ``GraphValidationError``
+        naming ``control_batch`` and its transform-mode row_id hazard.
+        """
+        import yaml
+
+        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        doc = yaml.safe_load(self._example_yaml())
+        control = doc["transforms"].pop(0)
+        doc["aggregations"].insert(
+            0,
+            {
+                "name": "control_batch",
+                "plugin": "batch_replicate",
+                "input": control["input"],
+                "on_success": control["on_success"],
+                "on_error": "discard",
+                "trigger": {},
+                "output_mode": "transform",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "copies_field": "baseline_quality",
+                    "default_copies": 1,
+                    "include_copy_index": False,
+                },
+            },
+        )
+        invalid_yaml = yaml.safe_dump(doc, sort_keys=False)
+
+        composer_result = composition_state_from_runtime_yaml(invalid_yaml).validate()
+        composer_error = next(error for error in composer_result.errors if error.error_code == "row_union_branch_aggregation_invalid")
+        assert "control_batch" in composer_error.message
+        assert "passthrough" in composer_error.message
+
+        settings = load_settings_from_yaml_string(invalid_yaml)
+        with pytest.raises(GraphValidationError) as exc_info:
+            self._build_runtime_graph_for_settings(settings)
+        assert "control_batch" in str(exc_info.value)
+        assert "row_id" in str(exc_info.value)
+
+    def test_nested_branch_fork_is_rejected_by_both_layers(self, tmp_path: Path) -> None:
+        """Composer mirrors the runtime nested-fork branch-identity guard.
+
+        Bug-verification protocol: before the Composer backward branch walk,
+        ``CompositionState.validate()`` accepted this candidate while
+        ``_build_runtime_graph_for_settings`` raised ``GraphValidationError``
+        naming ``nested_fork`` and ``variant_union``.
+        """
+        import yaml
+
+        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        doc = yaml.safe_load(self._example_yaml())
+        doc["transforms"][0]["on_success"] = "control_staged"
+        doc["gates"].append(
+            {
+                "name": "nested_fork",
+                "input": "control_staged",
+                "condition": "True",
+                "routes": {"true": "fork", "false": "control_scored"},
+                "fork_to": ["inner_left", "inner_right"],
+            }
+        )
+        for branch_name in ("inner_left", "inner_right"):
+            doc["sinks"][branch_name] = {
+                "plugin": "json",
+                "on_write_failure": "discard",
+                "options": {
+                    "path": str(tmp_path / f"{branch_name}.jsonl"),
+                    "format": "jsonl",
+                    "schema": {"mode": "observed"},
+                },
+            }
+        invalid_yaml = yaml.safe_dump(doc, sort_keys=False)
+
+        composer_result = composition_state_from_runtime_yaml(invalid_yaml).validate()
+        composer_error = next(error for error in composer_result.errors if error.error_code == "row_union_nested_fork_invalid")
+        assert "nested_fork" in composer_error.message
+        assert "variant_union" in composer_error.message
+
+        settings = load_settings_from_yaml_string(invalid_yaml)
+        with pytest.raises(GraphValidationError) as exc_info:
+            self._build_runtime_graph_for_settings(settings)
+        assert "nested_fork" in str(exc_info.value)
+        assert "variant_union" in str(exc_info.value)
+
+    def test_invalid_row_union_name_is_rejected_by_both_layers(self) -> None:
+        """Composer mirrors the runtime RowUnionSettings name validators.
+
+        Bug-verification protocol: before the row_union name check in
+        ``CompositionState.validate()``, Composer imported and accepted
+        ``name: bad name`` while ``load_settings_from_yaml_string`` raised a
+        Pydantic ``ValidationError`` for the invalid identifier.
+        """
+        import yaml
+
+        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        doc = yaml.safe_load(self._example_yaml())
+        doc["row_unions"][0]["name"] = "bad name"
+        invalid_yaml = yaml.safe_dump(doc, sort_keys=False)
+
+        composer_result = composition_state_from_runtime_yaml(invalid_yaml).validate()
+        composer_error = next(error for error in composer_result.errors if error.error_code == "row_union_name_invalid")
+        assert "bad name" in composer_error.message
+
+        with pytest.raises(ValidationError):
+            load_settings_from_yaml_string(invalid_yaml)

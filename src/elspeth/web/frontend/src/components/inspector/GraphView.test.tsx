@@ -1401,6 +1401,82 @@ describe("GraphView", () => {
       ).toBeInTheDocument();
     });
 
+    it("drops a stale error lane that shares the authoritative row union success endpoint", () => {
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "live-union-success",
+          from_node: "variant_union",
+          to_node: "compare",
+          edge_type: "on_success",
+          label: "success",
+        }),
+        makeEdge({
+          id: "stale-union-error",
+          from_node: "variant_union",
+          to_node: "compare",
+          edge_type: "on_error",
+          label: "error",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      const { container } = render(<GraphView />);
+
+      const unionOutbound = Array.from(
+        container.querySelectorAll(
+          '[data-edge-source="variant_union"][data-edge-target="compare"]',
+        ),
+      );
+      expect(unionOutbound).toHaveLength(1);
+      expect(unionOutbound[0]).toHaveTextContent("success");
+
+      const connections = screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      });
+      expect(
+        within(connections).getByText(
+          "variant_union to compare: success (success)",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(connections).queryByText(
+          "variant_union to compare: error (error)",
+        ),
+      ).not.toBeInTheDocument();
+    });
+
+    it("replaces a stale row union outbound label with authoritative success semantics", () => {
+      const state = rowUnionState();
+      state.edges = [
+        makeEdge({
+          id: "stale-union-label",
+          from_node: "variant_union",
+          to_node: "compare",
+          edge_type: "on_success",
+          label: "legacy_success",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      render(<GraphView />);
+
+      expect(
+        screen.getByTestId("edge-e-variant_union-compare-0"),
+      ).toHaveTextContent("success");
+      const connections = screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      });
+      expect(
+        within(connections).getByText(
+          "variant_union to compare: success (success)",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(connections).queryByText(/legacy_success/),
+      ).not.toBeInTheDocument();
+    });
+
     it.each([
       {
         caseName: "an explicit queue edge",

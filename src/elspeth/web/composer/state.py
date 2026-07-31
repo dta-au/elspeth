@@ -963,13 +963,28 @@ def _runtime_connection_is_downstream(
     sources: Mapping[str, SourceSpec],
     nodes: tuple[NodeSpec, ...],
 ) -> bool:
-    """Return whether ``target`` is exclusively derived from ``origin``.
+    """Return whether ``target`` is exclusively derived from ``origin``."""
+    is_downstream, _lineage = _runtime_connection_lineage(origin, target, sources, nodes)
+    return is_downstream
+
+
+def _runtime_connection_lineage(
+    origin: str,
+    target: str,
+    sources: Mapping[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...],
+) -> tuple[bool, tuple[NodeSpec, ...]]:
+    """Return exclusive lineage from ``origin`` to ``target``.
 
     Ordinary connections have one producer (the duplicate-producer check owns
     ambiguity), so one proven predecessor establishes lineage. A queue is the
     deliberate exception: it can have many producers, and every predecessor
     must derive from the mapped fork alias. Otherwise one valid branch path
     could hide unrelated queue traffic and bypass row_union correlation.
+
+    The lineage excludes the producer of ``origin`` itself. For a fork alias,
+    this makes the originating fork gate the traversal boundary while retaining
+    every node inside the branch for row_union hazard checks.
     """
     from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id
 
@@ -984,42 +999,64 @@ def _runtime_connection_is_downstream(
         producer: ProducerEntry,
         *,
         visiting: frozenset[str],
-    ) -> bool:
+    ) -> tuple[bool, frozenset[str]]:
         if is_source_producer_id(producer.producer_id):
-            return False
+            return False, frozenset()
         producer_node = resolver.get_node(producer.producer_id)
         if producer_node is None:
-            return False
+            return False, frozenset()
         if producer_node.node_type in ("coalesce", "row_union"):
             dependencies = _coalesce_branch_connections(producer_node.branches)
-            return bool(dependencies) and all(_connection_is_compatible(dependency, visiting=visiting) for dependency in dependencies)
+            if not dependencies:
+                return False, frozenset()
+            lineage = frozenset((producer_node.id,))
+            for dependency in dependencies:
+                is_compatible, dependency_lineage = _connection_is_compatible(dependency, visiting=visiting)
+                if not is_compatible:
+                    return False, frozenset()
+                lineage |= dependency_lineage
+            return True, lineage
         if producer_node.node_type == "queue":
             # Queue compatibility is resolved through every registered
             # predecessor in _connection_is_compatible(), never through the
             # queue's structural input placeholder.
             return _connection_is_compatible(producer_node.id, visiting=visiting)
-        return _connection_is_compatible(producer_node.input, visiting=visiting)
+        is_compatible, lineage = _connection_is_compatible(producer_node.input, visiting=visiting)
+        if not is_compatible:
+            return False, frozenset()
+        return True, lineage | {producer_node.id}
 
     def _connection_is_compatible(
         connection_name: str,
         *,
         visiting: frozenset[str],
-    ) -> bool:
+    ) -> tuple[bool, frozenset[str]]:
         if connection_name == origin:
-            return True
+            return True, frozenset()
         if connection_name in visiting:
-            return False
+            return False, frozenset()
         next_visiting = visiting | {connection_name}
         producer = resolver.find_producer_for(connection_name)
         if producer is None:
-            return False
+            return False, frozenset()
         producer_node = resolver.get_node(producer.producer_id)
         if producer_node is not None and producer_node.node_type == "queue":
             predecessors = resolver.queue_predecessors(producer_node.id)
-            return bool(predecessors) and all(_producer_is_compatible(predecessor, visiting=next_visiting) for predecessor in predecessors)
+            if not predecessors:
+                return False, frozenset()
+            lineage = frozenset((producer_node.id,))
+            for predecessor in predecessors:
+                is_compatible, predecessor_lineage = _producer_is_compatible(predecessor, visiting=next_visiting)
+                if not is_compatible:
+                    return False, frozenset()
+                lineage |= predecessor_lineage
+            return True, lineage
         return _producer_is_compatible(producer, visiting=next_visiting)
 
-    return _connection_is_compatible(target, visiting=frozenset())
+    is_compatible, lineage_ids = _connection_is_compatible(target, visiting=frozenset())
+    if not is_compatible:
+        return False, ()
+    return True, tuple(node for node in nodes if node.id in lineage_ids)
 
 
 def _runtime_nodes_downstream_of_connection(
@@ -3233,6 +3270,7 @@ class CompositionState:
         """
         errors: list[ValidationEntry] = []
         _err = ValidationEntry  # local alias for brevity
+        invalid_row_union_branch_nodes: set[str] = set()
 
         # 1. Source exists
         if not self.sources:
@@ -3500,6 +3538,30 @@ class CompositionState:
                         )
                     )
             elif node.node_type == "row_union":
+                try:
+                    if not node.id or not node.id.strip():
+                        raise ValueError("row_union name must not be empty")
+                    row_union_name = node.id
+                    _validate_max_length(
+                        row_union_name,
+                        field_label="row_union name",
+                        max_length=_MAX_NODE_NAME_LENGTH,
+                    )
+                    _validate_node_name_chars(row_union_name, field_label="row_union name")
+                    if row_union_name in _RESERVED_EDGE_LABELS:
+                        raise ValueError(f"row_union name '{row_union_name}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+                    if row_union_name.startswith("__"):
+                        raise ValueError(f"row_union name '{row_union_name}' starts with '__', which is reserved for system edges")
+                except ValueError as exc:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            str(exc),
+                            "high",
+                            "row_union_name_invalid",
+                        )
+                    )
+
                 forbidden = {
                     "plugin": node.plugin,
                     "on_error": node.on_error,
@@ -3528,6 +3590,7 @@ class CompositionState:
                 branch_names = _coalesce_branch_names(node.branches)
                 branch_connections = _coalesce_branch_connections(node.branches)
                 if len(branch_names) < 2:
+                    invalid_row_union_branch_nodes.add(node.id)
                     errors.append(
                         _err(
                             f"node:{node.id}",
@@ -3536,7 +3599,8 @@ class CompositionState:
                             "row_union_branches_invalid",
                         )
                     )
-                elif len(set(branch_names)) != len(branch_names):
+                elif any(branch_name in branch_names[:index] for index, branch_name in enumerate(branch_names)):
+                    invalid_row_union_branch_nodes.add(node.id)
                     errors.append(
                         _err(
                             f"node:{node.id}",
@@ -3559,6 +3623,7 @@ class CompositionState:
                                 field_label=f"row_union {field_label}",
                             )
                         except ValueError as exc:
+                            invalid_row_union_branch_nodes.add(node.id)
                             errors.append(
                                 _err(
                                     f"node:{node.id}",
@@ -3664,6 +3729,19 @@ class CompositionState:
 
         # 8. Connection completeness
         runtime_connections = _runtime_connection_targets(self.sources, self.nodes)
+        for candidate in self.nodes:
+            if candidate.node_type != "gate" or candidate.fork_to is None:
+                continue
+            duplicate_branches = sorted(branch for branch, count in Counter(candidate.fork_to).items() if count > 1)
+            if duplicate_branches:
+                errors.append(
+                    _err(
+                        f"node:{candidate.id}",
+                        f"Gate '{candidate.id}' has duplicate fork branches: {duplicate_branches}. Each fork branch name must be unique.",
+                        "high",
+                        "gate_duplicate_fork_branch",
+                    )
+                )
         gate_fork_branches_by_id = {
             candidate.id: frozenset(candidate.fork_to)
             for candidate in self.nodes
@@ -3721,6 +3799,11 @@ class CompositionState:
                     )
                 continue
             if node.node_type == "row_union":
+                # Intrinsic validation owns malformed external branch values.
+                # Do not pass them into topology set/sort/walk operations,
+                # which assume runtime-valid strings.
+                if node.id in invalid_row_union_branch_nodes:
+                    continue
                 branch_aliases = _coalesce_branch_names(node.branches)
                 branch_connections = _coalesce_branch_connections(node.branches)
                 missing_aliases = sorted(branch for branch in branch_aliases if branch not in gate_fork_branches)
@@ -3772,14 +3855,19 @@ class CompositionState:
                             )
                         )
                     else:
+                        branch_lineages: list[tuple[str, tuple[NodeSpec, ...]]] = []
+                        lineage_is_valid = True
                         for branch_alias, branch_connection in zip(branch_aliases, branch_connections, strict=True):
-                            if _runtime_connection_is_downstream(
+                            is_downstream, lineage = _runtime_connection_lineage(
                                 branch_alias,
                                 branch_connection,
                                 self.sources,
                                 self.nodes,
-                            ):
+                            )
+                            if is_downstream:
+                                branch_lineages.append((branch_alias, lineage))
                                 continue
+                            lineage_is_valid = False
                             errors.append(
                                 _err(
                                     f"node:{node.id}",
@@ -3790,6 +3878,41 @@ class CompositionState:
                                     "row_union_branch_not_downstream",
                                 )
                             )
+                        if lineage_is_valid:
+                            branch_aggregations: dict[str, tuple[NodeSpec, str]] = {}
+                            nested_forks: dict[str, tuple[NodeSpec, str]] = {}
+                            for branch_alias, lineage in branch_lineages:
+                                for ancestor in lineage:
+                                    if ancestor.node_type == "aggregation" and ancestor.output_mode in (None, "transform"):
+                                        branch_aggregations.setdefault(ancestor.id, (ancestor, branch_alias))
+                                    if ancestor.node_type == "gate" and ancestor.fork_to:
+                                        nested_forks.setdefault(ancestor.id, (ancestor, branch_alias))
+                            for aggregation, branch_alias in branch_aggregations.values():
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"Aggregation '{aggregation.id}' is inside fork branch '{branch_alias}' that feeds "
+                                        f"row_union '{node.id}' and uses output_mode 'transform' (the default). "
+                                        "A transform-mode flush emits its rows from a single buffered parent token, "
+                                        "so every emitted row carries that parent's row_id and the union group can never "
+                                        f"be satisfied. Set 'output_mode: passthrough' on '{aggregation.id}' so each row "
+                                        "keeps its own identity, or move the aggregation upstream of the originating fork.",
+                                        "high",
+                                        "row_union_branch_aggregation_invalid",
+                                    )
+                                )
+                            for nested_fork, branch_alias in nested_forks.values():
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"Fork gate '{nested_fork.id}' is nested inside fork branch '{branch_alias}' that "
+                                        f"feeds row_union '{node.id}'. A nested fork replaces the enclosing branch identity, "
+                                        "so the union group can never be satisfied. Move the nested fork before the fork "
+                                        f"that produces '{branch_alias}', or terminate that branch at a sink.",
+                                        "high",
+                                        "row_union_nested_fork_invalid",
+                                    )
+                                )
                         for downstream in _runtime_nodes_downstream_of_connection(node.on_success or "", self.nodes):
                             if downstream.node_type in ("coalesce", "row_union"):
                                 errors.append(

@@ -64,6 +64,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCallRecorder,
 )
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 
 __all__ = [
@@ -377,6 +378,13 @@ class DispatchAudit:
     started_at: datetime
     started_ns: int
     actor: str
+    authority_arguments_canonical: str | None = None
+    authority_arguments_hash: str | None = None
+
+    @property
+    def binding_arguments_hash(self) -> str:
+        """Return the semantic binding when this dispatch defines one."""
+        return self.authority_arguments_hash or self.arguments_hash
 
 
 def begin_dispatch(
@@ -405,9 +413,13 @@ def begin_dispatch(
         truncated = arguments[:4096]
         canon = canonical_json({"_unparseable_arguments": truncated, "_truncated": len(arguments) > 4096})
         h = stable_hash({"_unparseable_arguments": truncated, "_truncated": len(arguments) > 4096})
+        authority_canon = None
+        authority_hash = None
     else:
         canon = canonical_json(arguments)
         h = stable_hash(arguments)
+        authority_canon = composer_authority_canonical_json(arguments) if tool_name == "set_pipeline" else None
+        authority_hash = composer_authority_hash(arguments) if tool_name == "set_pipeline" else None
     return DispatchAudit(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
@@ -417,6 +429,8 @@ def begin_dispatch(
         started_at=datetime.now(UTC),
         started_ns=time.monotonic_ns(),
         actor=actor,
+        authority_arguments_canonical=authority_canon,
+        authority_arguments_hash=authority_hash,
     )
 
 
@@ -487,6 +501,8 @@ def rebind_dispatch_arguments(
         audit,
         arguments_canonical=canonical_json(arguments),
         arguments_hash=stable_hash(arguments),
+        authority_arguments_canonical=(composer_authority_canonical_json(arguments) if audit.tool_name == "set_pipeline" else None),
+        authority_arguments_hash=composer_authority_hash(arguments) if audit.tool_name == "set_pipeline" else None,
     )
 
 
@@ -566,6 +582,8 @@ def finish_success(
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
         cache_hit=cache_hit,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 
@@ -610,6 +628,8 @@ def finish_arg_error(
         finished_at=datetime.now(UTC),
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 
@@ -644,6 +664,8 @@ def finish_cancelled(
         finished_at=datetime.now(UTC),
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 
@@ -686,6 +708,8 @@ def finish_plugin_crash(
         finished_at=datetime.now(UTC),
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 

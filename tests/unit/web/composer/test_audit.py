@@ -100,6 +100,8 @@ def test_audit_envelope_kind_discriminator() -> None:
     assert isinstance(inv_payload, dict)
     assert inv_payload["tool_call_id"] == "tc-1"
     assert inv_payload["status"] == "success"
+    assert "authority_arguments_canonical" not in inv_payload
+    assert "authority_arguments_hash" not in inv_payload
 
 
 def test_audit_envelope_invocation_is_json_serializable() -> None:

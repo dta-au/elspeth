@@ -288,7 +288,7 @@ export function ProposePipelineTurn({
     const to = edge.to_endpoint.kind === "discard"
       ? "discard"
       : (labelById.get(edge.to_endpoint.stable_id) ?? "component");
-    return `route from ${from} to ${to}`;
+    return `route from ${from} to ${to}: ${flowLabel(edge.flow, routeKeyByAlias)}`;
   };
 
   return (

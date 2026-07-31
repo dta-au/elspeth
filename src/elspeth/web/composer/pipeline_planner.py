@@ -42,6 +42,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
+from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads, require_bounded_text
 from elspeth.web.composer.capability_skill import (
     PLANNER_DISCOVERY_TOOL_NAMES,
@@ -1186,7 +1187,10 @@ async def _build_valid_pipeline_plan(
     # Validate the exact provider-authored payload before adding server-owned
     # interpretation identity/status. Otherwise a forged canonical-looking row
     # would be indistinguishable from the trusted canonicalizer's output.
-    candidate_context = replace(terminal_context, tool_arguments_hash=stable_hash({"pipeline": pipeline}))
+    candidate_context = replace(
+        terminal_context,
+        tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(pipeline)}),
+    )
     try:
         candidate = await run_sync(
             build_set_pipeline_candidate,
@@ -1212,7 +1216,7 @@ async def _build_valid_pipeline_plan(
     pipeline = canonicalize_authored_node_review_requirements(pipeline, current_state=current_state)
     candidate_context = replace(
         terminal_context,
-        tool_arguments_hash=stable_hash({"pipeline": pipeline}),
+        tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(pipeline)}),
         _interpretation_requirements_are_internal=True,
     )
     candidate = await run_sync(
@@ -1259,7 +1263,7 @@ async def _build_valid_pipeline_plan(
         safe_pipeline = cast(dict[str, Any], deep_thaw(preparation.arguments))
         safe_context = replace(
             terminal_context,
-            tool_arguments_hash=stable_hash({"pipeline": safe_pipeline}),
+            tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(safe_pipeline)}),
             _interpretation_requirements_are_internal=True,
         )
         safe_candidate = await run_sync(

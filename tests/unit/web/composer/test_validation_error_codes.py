@@ -309,6 +309,7 @@ class TestClosedCodeCatalogueInvariants:
             "coalesce_branch_unreachable",
             "coalesce_schema_mode_mixed",
             "row_union_config_invalid",
+            "row_union_name_invalid",
             "row_union_branches_invalid",
             "row_union_branch_invalid",
             "row_union_input_mismatch",
@@ -318,11 +319,14 @@ class TestClosedCodeCatalogueInvariants:
             "row_union_branch_unreachable",
             "row_union_branch_origin_invalid",
             "row_union_branch_not_downstream",
+            "row_union_branch_aggregation_invalid",
+            "row_union_nested_fork_invalid",
             "row_union_downstream_group_invalid",
             "row_union_schema_incompatible",
             "row_union_on_success_must_be_connection",
             "row_union_on_success_dangling",
             "fork_branch_multiple_barriers",
+            "gate_duplicate_fork_branch",
         ):
             assert code in _CLOSED_VALIDATION_ERROR_CODES, code
             guidance = explain_validation_code(code)
@@ -352,9 +356,26 @@ class TestClosedCodeCatalogueInvariants:
         assert downstream != origin
         assert "downstream" in downstream[0] or "downstream" in downstream[1]
 
+        branch_aggregation = explain_validation_code("row_union_branch_aggregation_invalid")
+        assert branch_aggregation is not None
+        assert branch_aggregation not in (intrinsic, origin, downstream)
+        assert "passthrough" in branch_aggregation[1]
+        assert "trigger" not in branch_aggregation[1]
+
+        nested_fork = explain_validation_code("row_union_nested_fork_invalid")
+        assert nested_fork is not None
+        assert nested_fork not in (intrinsic, origin, downstream, branch_aggregation)
+        assert "nested fork" in nested_fork[0].lower()
+        assert "before" in nested_fork[1] or "terminate" in nested_fork[1]
+
+        invalid_name = explain_validation_code("row_union_name_invalid")
+        assert invalid_name is not None
+        assert "name" in invalid_name[0].lower()
+        assert "letters" in invalid_name[1].lower()
+
         downstream_group = explain_validation_code("row_union_downstream_group_invalid")
         assert downstream_group is not None
-        assert downstream_group not in (intrinsic, origin, downstream)
+        assert downstream_group not in (intrinsic, origin, downstream, branch_aggregation, nested_fork)
         assert "indivisible" in downstream_group[0] or "indivisible" in downstream_group[1]
         assert "end_of_source" in downstream_group[1]
         assert "branches" not in downstream_group[1]

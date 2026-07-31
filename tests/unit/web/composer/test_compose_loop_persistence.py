@@ -22,6 +22,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServiceError, ToolArgumentError
 from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_tool_call_response
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -310,7 +311,9 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
 ) -> None:
-    arguments_canonical = canonical_json({"source": None, "nodes": [], "edges": [], "outputs": []})
+    arguments = {"source": None, "nodes": [], "edges": [], "outputs": []}
+    arguments_canonical = canonical_json(arguments)
+    authority_arguments_canonical = composer_authority_canonical_json(arguments)
     result_canonical = canonical_json(
         {
             "success": True,
@@ -344,6 +347,8 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
         finished_at=datetime(2026, 7, 27, tzinfo=UTC),
         latency_ms=12,
         actor="composer-web:user-test",
+        authority_arguments_canonical=authority_arguments_canonical,
+        authority_arguments_hash=hashlib.sha256(authority_arguments_canonical.encode()).hexdigest(),
     )
 
     with pytest.raises(AuditIntegrityError, match="content hash is malformed"):

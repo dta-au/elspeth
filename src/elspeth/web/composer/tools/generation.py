@@ -399,6 +399,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Keep only id, node_type='row_union', input, branches, on_success, and an optional finite positive timeout_seconds.",
     ),
     (
+        r"row_union_name_invalid",
+        "The row_union name does not satisfy the runtime identifier contract.",
+        "Choose a name of 1-38 characters that starts with a letter and contains only letters, digits, underscores, "
+        "and hyphens; do not use a reserved label or a name beginning with '__'.",
+    ),
+    (
         r"row_union_branches_invalid",
         "A row_union needs at least two declared fork branches.",
         "Provide an ordered branches mapping with at least two unique branch names and input connections.",
@@ -444,6 +450,17 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Wire each branches[alias] value through processing that starts at the matching gate fork branch.",
     ),
     (
+        r"row_union_branch_aggregation_invalid",
+        "A transform-mode aggregation inside a fork branch loses the per-row identity required to satisfy the row_union group.",
+        "Set that aggregation's output_mode to passthrough so each row keeps its identity, or move the aggregation "
+        "upstream of the fork that feeds the row_union.",
+    ),
+    (
+        r"row_union_nested_fork_invalid",
+        "A nested fork inside a row_union branch replaces the enclosing branch identity, so the require-all group cannot complete.",
+        "Move the nested fork before the fork that feeds the row_union, or terminate the nested branch at a sink.",
+    ),
+    (
         r"row_union_downstream_group_invalid",
         "A row_union release reaches a downstream early-trigger aggregation or correlated barrier that can split, "
         "drop, or duplicate members of the indivisible N-to-N group.",
@@ -466,6 +483,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "exactly one barrier, so the engine rejects the second claim at graph build time.",
         "Keep the branch on a single barrier: delete it from the other barrier's branches, or give each barrier its own "
         "fork branch name in the gate's fork_to and wire that branch to it.",
+    ),
+    (
+        r"gate_duplicate_fork_branch",
+        "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
+        "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",
     ),
     (
         r"row_union_on_success_must_be_connection",
@@ -879,6 +901,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "coalesce_policy_invalid",
     "coalesce_merge_invalid",
     "row_union_config_invalid",
+    "row_union_name_invalid",
     "row_union_branches_invalid",
     "row_union_branch_invalid",
     "row_union_input_mismatch",
@@ -888,6 +911,8 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "row_union_branch_unreachable",
     "row_union_branch_origin_invalid",
     "row_union_branch_not_downstream",
+    "row_union_branch_aggregation_invalid",
+    "row_union_nested_fork_invalid",
     "row_union_downstream_group_invalid",
     "row_union_schema_incompatible",
     "row_union_on_success_must_be_connection",
@@ -896,6 +921,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # only join at one barrier" rule for coalesce/coalesce, coalesce/row_union
     # and row_union/row_union claims.
     "fork_branch_multiple_barriers",
+    "gate_duplicate_fork_branch",
     "transform_missing_on_success",
     "transform_missing_on_error",
     "transform_on_success_dangling",

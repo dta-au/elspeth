@@ -260,11 +260,11 @@ def test_reviewed_anchor_hash_uses_versioned_deep_frozen_facts() -> None:
     assert reviewed_anchor_hash(facts) != expected
 
 
-def test_draft_hash_has_explicit_v2_expanded_envelope_golden_preimage() -> None:
-    """v2 deliberately supersedes the design's older pipeline-only v1 hash."""
+def test_draft_hash_has_explicit_v3_order_bound_envelope_golden_preimage() -> None:
+    """v3 adds row-union order binding to the expanded v2 envelope."""
     proposal = _create_proposal()
     expected_preimage = {
-        "schema": "composer.pipeline-proposal-envelope.v2",
+        "schema": "composer.pipeline-proposal-envelope.v3",
         "pipeline": _pipeline(),
         "base": {
             "kind": "present",
@@ -288,7 +288,7 @@ def test_draft_hash_has_explicit_v2_expanded_envelope_golden_preimage() -> None:
         '["name","score"],"credentials":{"secret_ref":"CSV_API_TOKEN"}},"plugin":"csv"}},"repair_count":1,'
         '"reviewed_anchor_hash":"'
         + reviewed_anchor_hash(_reviewed_facts())
-        + '","schema":"composer.pipeline-proposal-envelope.v2","skill_hash":"'
+        + '","schema":"composer.pipeline-proposal-envelope.v3","skill_hash":"'
         + "c" * 64
         + '","supersedes_draft_hash":"'
         + "d" * 64

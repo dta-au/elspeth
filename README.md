@@ -169,6 +169,12 @@ Composer authoring, trust boundaries, and committed blob cleanup.
 - **Composer validation stays bound to current state.** Runtime preflight is
   keyed to the composition content that produced it instead of reusing a stale
   result for different unsaved state.
+- **Web Composer can author correlated row unions.** Freeform, guided,
+  import/export, validation, and graph surfaces support plugin-free,
+  require-all `row_union` barriers that release branch rows unchanged in
+  declared order for long-format processing. Audit, recovery, concurrency,
+  browser-backed round-trip, and scale acceptance remains deferred and tracked
+  separately.
 - **Trust boundaries fail closed.** Deployment admission rejects unsafe state
   roots, weak uniform JWT secrets, and unauthenticated PostgreSQL transport for
   ECS; provider and tool data remain bounded and redacted.

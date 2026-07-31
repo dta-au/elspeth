@@ -36,6 +36,7 @@ const NODE_WIDTH = 168;
 const NODE_HEIGHT = 62;
 const GRAPH_PADDING = 32;
 const EDGE_LABEL_VERTICAL_PADDING = 12;
+const EDGE_LABEL_DY = -5;
 
 interface PositionedNode extends ReadOnlyPipelineGraphNode {
   x: number;
@@ -100,6 +101,17 @@ function edgeLaneOffsets(
   return offsets;
 }
 
+function edgeMidpointY(
+  source: PositionedNode,
+  target: PositionedNode,
+  laneOffset: number,
+): number {
+  // At t=0.5, the cubic weights are 1/8, 3/8, 3/8, 1/8.
+  // Only the two control points carry laneOffset, so the path midpoint carries
+  // three quarters of that offset.
+  return (source.y + target.y) / 2 + laneOffset * 0.75;
+}
+
 function graphVerticalBounds(
   layoutHeight: number,
   edges: ReadOnlyPipelineGraphEdge[],
@@ -114,7 +126,7 @@ function graphVerticalBounds(
     if (source === undefined || target === undefined) continue;
 
     const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
-    const labelY = (source.y + target.y) / 2 + laneOffset - 5;
+    const labelY = edgeMidpointY(source, target, laneOffset) + EDGE_LABEL_DY;
     minY = Math.min(
       minY,
       source.y + laneOffset,
@@ -179,7 +191,7 @@ export function ReadOnlyPipelineGraph({
             }
             const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
             const labelX = (source.x + target.x) / 2;
-            const labelY = (source.y + target.y) / 2 + laneOffset - 5;
+            const labelY = edgeMidpointY(source, target, laneOffset);
             return (
               <g key={edge.id}>
                 <path
@@ -196,6 +208,7 @@ export function ReadOnlyPipelineGraph({
                   className="guided-readonly-graph__edge-label"
                   x={labelX}
                   y={labelY}
+                  dy={EDGE_LABEL_DY}
                   textAnchor="middle"
                 >
                   {edge.label}

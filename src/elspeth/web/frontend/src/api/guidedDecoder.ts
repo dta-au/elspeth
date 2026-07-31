@@ -221,6 +221,34 @@ function validateEditTarget(value: unknown, path: string): DecodedTarget {
 }
 
 type ProposalEndpointKind = "source" | "node" | "output" | "discard";
+const LEGAL_NODE_FLOWS: Readonly<Record<string, ReadonlySet<string>>> = {
+  transform: new Set(["node_success", "node_error"]),
+  aggregation: new Set(["node_success", "node_error"]),
+  gate: new Set(["gate_route", "gate_fork"]),
+  queue: new Set(["queue_continue"]),
+  coalesce: new Set(["coalesce_success"]),
+  row_union: new Set(["row_union_success"]),
+};
+const LEGAL_FLOW_TARGETS: Readonly<
+  Record<string, ReadonlySet<ProposalEndpointKind>>
+> = {
+  source_success: new Set(["node", "output"]),
+  source_validation_failure: new Set(["output", "discard"]),
+  node_success: new Set(["node", "output"]),
+  node_error: new Set(["node", "output", "discard"]),
+  gate_route: new Set(["node", "output", "discard"]),
+  gate_fork: new Set(["node", "output"]),
+  queue_continue: new Set(["node", "output"]),
+  coalesce_success: new Set(["node", "output"]),
+  row_union_success: new Set(["node"]),
+  output_write_failure: new Set(["output", "discard"]),
+};
+const ROW_UNION_TARGET_NODE_TYPES = new Set([
+  "transform",
+  "gate",
+  "aggregation",
+  "queue",
+]);
 interface DecodedProposalEndpoint { kind: ProposalEndpointKind; stableId: string | null }
 interface DecodedProposalFlow { kind: string; route?: string; routes?: string[]; branch?: string | null }
 interface DecodedProposalEdge {
@@ -568,26 +596,6 @@ function validateProposalPayload(value: unknown, path: string): void {
   const branchOrigins = new Map<string, string[]>();
   const branchOriginGates = new Map<string, string[]>();
   const branchUses: Array<{ branch: string; from: string; flowKind: string; path: string }> = [];
-  const legalNodeFlows: Record<string, ReadonlySet<string>> = {
-    transform: new Set(["node_success", "node_error"]),
-    aggregation: new Set(["node_success", "node_error"]),
-    gate: new Set(["gate_route", "gate_fork"]),
-    queue: new Set(["queue_continue"]),
-    coalesce: new Set(["coalesce_success"]),
-    row_union: new Set(["row_union_success"]),
-  };
-  const legalTargets: Record<string, ReadonlySet<ProposalEndpointKind>> = {
-    source_success: new Set(["node", "output"]),
-    source_validation_failure: new Set(["output", "discard"]),
-    node_success: new Set(["node", "output"]),
-    node_error: new Set(["node", "output", "discard"]),
-    gate_route: new Set(["node", "output", "discard"]),
-    gate_fork: new Set(["node", "output"]),
-    queue_continue: new Set(["node", "output"]),
-    coalesce_success: new Set(["node", "output"]),
-    row_union_success: new Set(["node"]),
-    output_write_failure: new Set(["output", "discard"]),
-  };
   for (const edge of decodedEdges) {
     if (edge.from.stableId === null || componentKinds.get(edge.from.stableId) !== edge.from.kind) invalid(`${edge.path}.from_endpoint`, "kind and stable_id do not resolve together");
     if (edge.to.kind !== "discard" && (edge.to.stableId === null || componentKinds.get(edge.to.stableId) !== edge.to.kind)) invalid(`${edge.path}.to_endpoint`, "kind and stable_id do not resolve together");
@@ -596,8 +604,8 @@ function validateProposalPayload(value: unknown, path: string): void {
     if (fromId === null || toId === null) invalid(edge.path, "unresolved endpoint");
     const expectedFrom = edge.flow.kind.startsWith("source_") ? "source" : edge.flow.kind === "output_write_failure" ? "output" : "node";
     if (edge.from.kind !== expectedFrom) invalid(`${edge.path}.flow`, "illegal for source endpoint kind");
-    if (edge.from.kind === "node" && !legalNodeFlows[nodeById.get(fromId)!.nodeType].has(edge.flow.kind)) invalid(`${edge.path}.flow`, "illegal for node_type");
-    if (!legalTargets[edge.flow.kind].has(edge.to.kind)) invalid(`${edge.path}.flow`, "illegal for target endpoint kind");
+    if (edge.from.kind === "node" && !LEGAL_NODE_FLOWS[nodeById.get(fromId)!.nodeType].has(edge.flow.kind)) invalid(`${edge.path}.flow`, "illegal for node_type");
+    if (!LEGAL_FLOW_TARGETS[edge.flow.kind].has(edge.to.kind)) invalid(`${edge.path}.flow`, "illegal for target endpoint kind");
     if (fromId === toId) invalid(edge.path, "self-loop");
     if (
       edge.to.kind === "node"
@@ -731,9 +739,7 @@ function validateProposalPayload(value: unknown, path: string): void {
       if (
         rowUnionTargets.length !== 1
         || !nodeById.has(rowUnionTarget)
-        || !["transform", "gate", "aggregation", "queue"].includes(
-          nodeById.get(rowUnionTarget)!.nodeType,
-        )
+        || !ROW_UNION_TARGET_NODE_TYPES.has(nodeById.get(rowUnionTarget)!.nodeType)
       ) {
         invalid(
           path,
@@ -873,6 +879,110 @@ function validateWirePayload(value: unknown, path: string): void {
     arrayValue(payload[key], `${path}.${key}`);
   }
   booleanValue(payload.can_confirm, `${path}.can_confirm`);
+}
+
+function validateWireTopology(wire: WireStageData, path: string): void {
+  const componentKinds = new Map<string, ComponentKind>();
+  const addComponent = (
+    stableId: string,
+    kind: ComponentKind,
+    componentPath: string,
+  ) => {
+    if (componentKinds.has(stableId)) {
+      invalid(componentPath, "component stable IDs must be globally unique");
+    }
+    componentKinds.set(stableId, kind);
+  };
+  wire.sources.forEach((source, index) => {
+    addComponent(source.stable_id, "source", `${path}.sources[${index}].stable_id`);
+  });
+  wire.nodes.forEach((node, index) => {
+    addComponent(node.stable_id, "node", `${path}.nodes[${index}].stable_id`);
+  });
+  wire.outputs.forEach((output, index) => {
+    addComponent(output.stable_id, "output", `${path}.outputs[${index}].stable_id`);
+  });
+  const nodeById = new Map(wire.nodes.map((node) => [node.stable_id, node]));
+
+  wire.connections.forEach((connection, index) => {
+    const connectionPath = `${path}.connections[${index}]`;
+    addComponent(connection.stable_id, "edge", `${connectionPath}.stable_id`);
+    if (
+      componentKinds.get(connection.from_endpoint.stable_id)
+      !== connection.from_endpoint.kind
+    ) {
+      invalid(
+        `${connectionPath}.from_endpoint`,
+        "kind and stable_id do not resolve together",
+      );
+    }
+    if (
+      connection.to_endpoint.kind !== "discard"
+      && componentKinds.get(connection.to_endpoint.stable_id)
+      !== connection.to_endpoint.kind
+    ) {
+      invalid(
+        `${connectionPath}.to_endpoint`,
+        "kind and stable_id do not resolve together",
+      );
+    }
+
+    const expectedFrom = connection.flow.kind.startsWith("source_")
+      ? "source"
+      : connection.flow.kind === "output_write_failure"
+        ? "output"
+        : "node";
+    if (connection.from_endpoint.kind !== expectedFrom) {
+      invalid(`${connectionPath}.flow`, "illegal for source endpoint kind");
+    }
+    if (
+      connection.from_endpoint.kind === "node"
+      && !LEGAL_NODE_FLOWS[
+        nodeById.get(connection.from_endpoint.stable_id)!.node_type
+      ].has(connection.flow.kind)
+    ) {
+      invalid(`${connectionPath}.flow`, "illegal for node_type");
+    }
+    if (!LEGAL_FLOW_TARGETS[connection.flow.kind].has(connection.to_endpoint.kind)) {
+      invalid(`${connectionPath}.flow`, "illegal for target endpoint kind");
+    }
+    if (
+      connection.to_endpoint.kind !== "discard"
+      && connection.from_endpoint.stable_id === connection.to_endpoint.stable_id
+    ) {
+      invalid(connectionPath, "self-loop");
+    }
+
+    const branch = "branch" in connection.flow
+      ? connection.flow.branch
+      : null;
+    if (
+      connection.to_endpoint.kind === "node"
+      && ["coalesce", "row_union"].includes(
+        nodeById.get(connection.to_endpoint.stable_id)!.node_type,
+      )
+      && branch == null
+    ) {
+      invalid(
+        `${connectionPath}.flow`,
+        "correlated barrier input requires branch alias",
+      );
+    }
+    if (
+      connection.flow.kind === "row_union_success"
+      && (
+        connection.to_endpoint.kind !== "node"
+        || !ROW_UNION_TARGET_NODE_TYPES.has(
+          nodeById.get(connection.to_endpoint.stable_id)!.node_type,
+        )
+      )
+    ) {
+      invalid(
+        `${connectionPath}.flow`,
+        "row_union success must target one ordinary processing or queue node",
+      );
+    }
+  });
 }
 
 function decodeTurnType(value: unknown, path: string): TurnType {
@@ -1474,7 +1584,7 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
       satisfied: booleanValue(contract.satisfied, `${contractPath}.satisfied`),
     };
   };
-  return {
+  const decoded: WireStageData = {
     proposal_id: canonicalUuid(payload.proposal_id, `${path}.proposal_id`),
     draft_hash: stringValue(payload.draft_hash, `${path}.draft_hash`),
     sources: arrayValue(payload.sources, `${path}.sources`).map((item, index) => {
@@ -1621,6 +1731,8 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
     ),
     can_confirm: booleanValue(payload.can_confirm, `${path}.can_confirm`),
   };
+  validateWireTopology(decoded, path);
+  return decoded;
 }
 
 function decodeTurn(value: unknown, step: GuidedStep, path: string): TurnPayload {

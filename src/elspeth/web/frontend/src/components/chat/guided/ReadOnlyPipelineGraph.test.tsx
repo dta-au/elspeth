@@ -102,4 +102,47 @@ describe("ReadOnlyPipelineGraph", () => {
     expect(minY).toBeLessThan(Math.min(...labelYs));
     expect(maxY).toBeGreaterThan(Math.max(...labelYs));
   });
+
+  it("anchors large-fanout labels at the midpoint of their cubic lanes", () => {
+    const edges = Array.from({ length: 64 }, (_, index) => ({
+      id: `branch-${index + 1}`,
+      source: "experiment-gate",
+      target: "variant-union",
+      label: `branch-${index + 1}`,
+      isError: false,
+    }));
+    const { container } = render(
+      <ReadOnlyPipelineGraph
+        ariaLabel="64 identity fork branches into row union"
+        nodes={[
+          {
+            id: "experiment-gate",
+            label: "experiment gate",
+            kind: "gate",
+            subtitle: null,
+          },
+          {
+            id: "variant-union",
+            label: "variant union",
+            kind: "row_union",
+            subtitle: null,
+          },
+        ]}
+        edges={edges}
+      />,
+    );
+
+    for (const edgeId of ["branch-1", "branch-64"]) {
+      const path = container.querySelector(`path[data-edge-id="${edgeId}"]`);
+      const label = container.querySelector(`text[data-edge-id="${edgeId}"]`);
+      expect(path).not.toBeNull();
+      expect(label).not.toBeNull();
+      const coordinates = path!.getAttribute("d")!.match(/-?\d+(?:\.\d+)?/g)!.map(Number);
+      expect(coordinates).toHaveLength(8);
+      const [, startY, , controlOneY, , controlTwoY, , endY] = coordinates;
+      const cubicMidpointY =
+        (startY + 3 * controlOneY + 3 * controlTwoY + endY) / 8;
+      expect(Number(label!.getAttribute("y"))).toBeCloseTo(cubicMidpointY);
+    }
+  });
 });

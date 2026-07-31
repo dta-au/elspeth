@@ -293,6 +293,60 @@ describe("ProposePipelineTurn", () => {
     ).toBeGreaterThan(0);
   });
 
+  it("distinguishes parallel row-union revision controls by gate-fork flow", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const rowUnionPayload = payload();
+    rowUnionPayload.nodes[3] = {
+      ...rowUnionPayload.nodes[3],
+      node_type: "row_union",
+      behavior: {
+        kind: "row_union",
+        branch_aliases: ["branch-1", "branch-2"],
+        policy: "require_all",
+        timeout_seconds: null,
+      },
+    };
+    rowUnionPayload.graph.edges[5] = {
+      ...rowUnionPayload.graph.edges[5],
+      to_endpoint: { kind: "node", stable_id: IDS.coalesce },
+    };
+    rowUnionPayload.graph.edges[6] = {
+      ...rowUnionPayload.graph.edges[6],
+      to_endpoint: { kind: "node", stable_id: IDS.coalesce },
+    };
+    rowUnionPayload.edit_targets = [
+      { kind: "edge", stable_id: edgeId(6) },
+      { kind: "edge", stable_id: edgeId(7) },
+    ];
+
+    render(
+      <ProposePipelineTurn
+        payload={rowUnionPayload}
+        reviewState={activeReview()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    const control = screen.getByRole("button", {
+      name: "Revise route from node-1 to node-4: when true (route-1) forks to branch-1",
+    });
+    const treatment = screen.getByRole("button", {
+      name: "Revise route from node-1 to node-4: when true (route-1) forks to branch-2",
+    });
+    expect(control).toHaveTextContent(
+      "Revise route from node-1 to node-4: when true (route-1) forks to branch-1",
+    );
+    expect(treatment).toHaveTextContent(
+      "Revise route from node-1 to node-4: when true (route-1) forks to branch-2",
+    );
+
+    await user.click(treatment);
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      edit_target: { kind: "edge", stable_id: edgeId(7) },
+    }));
+  });
+
   it("uses fixed local copy for server template ids and never renders template ids as rationale", () => {
     render(
       <ProposePipelineTurn

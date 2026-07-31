@@ -129,7 +129,9 @@ describe("WireStageTurn", () => {
     ).toBeInTheDocument();
   });
 
-  it("keeps parallel gate forks uniquely identifiable by stable id and branch flow", () => {
+  it("keeps parallel gate forks uniquely identifiable in route and correction controls", async () => {
+    const user = userEvent.setup();
+    const onCorrect = vi.fn();
     const gateId = "00000000-0000-4000-8000-000000000024";
     const rowUnionId = "00000000-0000-4000-8000-000000000025";
     const controlEdgeId = "00000000-0000-4000-8000-000000000050";
@@ -201,6 +203,7 @@ describe("WireStageTurn", () => {
         data={canonicalData({ nodes, connections })}
         onConfirm={vi.fn()}
         confirmDisabled={false}
+        onCorrect={onCorrect}
       />,
     );
 
@@ -220,6 +223,26 @@ describe("WireStageTurn", () => {
         "triage (Gate) to variant union (Row Union) — Gate fork route-2 (when treatment) as branch-2 — not yet checked",
       ],
     });
+
+    const controlOption = screen.getByRole("option", {
+      name: "triage (Gate) → variant union (Row Union) — Gate fork route-1 (when control) as branch-1",
+    });
+    const treatmentOption = screen.getByRole("option", {
+      name: "triage (Gate) → variant union (Row Union) — Gate fork route-2 (when treatment) as branch-2",
+    });
+    expect(controlOption).toHaveValue(controlEdgeId);
+    expect(treatmentOption).toHaveValue(treatmentEdgeId);
+
+    await user.selectOptions(screen.getByLabelText("Component"), treatmentEdgeId);
+    await user.type(
+      screen.getByLabelText("What should change?"),
+      "Change only the treatment fork.",
+    );
+    await user.click(screen.getByRole("button", { name: "Re-plan wiring" }));
+    expect(onCorrect).toHaveBeenCalledWith(
+      { kind: "edge", stable_id: treatmentEdgeId },
+      "Change only the treatment fork.",
+    );
   });
 
   it("labels the correction controls and styles them as the app's form idiom", () => {

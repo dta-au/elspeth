@@ -14,6 +14,7 @@ import pytest
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 
@@ -504,6 +505,7 @@ async def test_legacy_set_pipeline_rejects_malformed_bound_content_hash() -> Non
         "pipeline_content_hash": hash_canary,
     }
     arguments_canonical = canonical_json(arguments)
+    authority_arguments_canonical = composer_authority_canonical_json(arguments)
     result_canonical = canonical_json(result)
     invocation = ComposerToolInvocation(
         tool_call_id="call_set_pipeline_hash_canary",
@@ -521,6 +523,8 @@ async def test_legacy_set_pipeline_rejects_malformed_bound_content_hash() -> Non
         finished_at=datetime(2026, 7, 27, tzinfo=UTC),
         latency_ms=12,
         actor="composer-web:user-test",
+        authority_arguments_canonical=authority_arguments_canonical,
+        authority_arguments_hash=_hash_canonical(authority_arguments_canonical),
     )
     service = _CapturingSessionService()
 

@@ -77,6 +77,12 @@ class ComposerToolInvocation:
         durable storage MUST recompute the digest and crash on mismatch
         (silent coercion of the audit trail is evidence tampering).
 
+    ``authority_arguments_canonical`` / ``authority_arguments_hash``
+        Optional set-pipeline-only semantic binding. The generic arguments
+        pair retains the exact tool payload shape; this second pair projects
+        order-sensitive Composer fields into an unambiguous canonical form.
+        Non-``set_pipeline`` records omit both fields from :meth:`to_dict`.
+
     ``result_canonical`` / ``result_hash``
         Same pair for the dispatch result. ``None`` when the dispatch did
         not complete (``ARG_ERROR`` pre-dispatch sites, ``CANCELLED``,
@@ -145,6 +151,8 @@ class ComposerToolInvocation:
     latency_ms: int
     actor: str
     cache_hit: bool = False
+    authority_arguments_canonical: str | None = None
+    authority_arguments_hash: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-friendly dict for sidecar serialization.
@@ -160,6 +168,9 @@ class ComposerToolInvocation:
         raw["status"] = self.status.value
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
+        if self.authority_arguments_canonical is None and self.authority_arguments_hash is None:
+            del raw["authority_arguments_canonical"]
+            del raw["authority_arguments_hash"]
         return raw
 
 

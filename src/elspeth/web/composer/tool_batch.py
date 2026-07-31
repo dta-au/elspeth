@@ -878,7 +878,7 @@ async def run_tool_batch(
                         composer_model_version=safe_response_model(response) or ctx.service._model,
                         composer_provider=ctx.service._availability.provider or "unknown",
                         composer_skill_hash=ctx.service._composer_skill_hash,
-                        tool_arguments_hash=audit.arguments_hash,
+                        tool_arguments_hash=audit.binding_arguments_hash,
                     )
                     candidate = await run_sync_in_worker(
                         build_set_pipeline_candidate,
@@ -918,7 +918,7 @@ async def run_tool_batch(
                         )
                         safe_candidate_context = replace(
                             candidate_context,
-                            tool_arguments_hash=audit.arguments_hash,
+                            tool_arguments_hash=audit.binding_arguments_hash,
                         )
                         custody_outcome = await _try_finalize_proposal_custody(
                             custody,
@@ -1026,7 +1026,7 @@ async def run_tool_batch(
                     composer_model_version=safe_response_model(response) or ctx.service._model,
                     composer_provider=ctx.service._availability.provider or "unknown",
                     composer_skill_hash=ctx.service._composer_skill_hash,
-                    tool_arguments_hash=audit.arguments_hash,
+                    tool_arguments_hash=audit.binding_arguments_hash,
                 )
                 proposals_this_turn += 1
                 proposal_payload = {
@@ -1568,7 +1568,7 @@ async def run_tool_batch(
             _composer_model_version: str = safe_response_model(response) or ctx.service._model,
             _composer_provider: str = ctx.service._availability.provider or "unknown",
             _composer_skill_hash: str = ctx.service._composer_skill_hash,
-            _tool_arguments_hash: str = audit.arguments_hash,
+            _tool_arguments_hash: str = audit.binding_arguments_hash,
             _prevalidated_unapplied_result: ToolResult | None = prevalidated_unapplied_result,
             _preproposal_exception: BaseException | None = preproposal_exception,
         ) -> Any:

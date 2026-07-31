@@ -20,6 +20,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_plugin_crash, finish_success
+from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.pipeline_commit import (
     PipelineCommitConfig,
@@ -781,6 +782,8 @@ def test_pipeline_dispatch_binding_restores_core_domain_normalized_reserved_mapp
     assert arguments_canonical.count('"__elspeth_canonical_type__":"mapping"') == 1
     assert '"entries":[' in arguments_canonical
     arguments_hash = hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest()
+    authority_arguments_canonical = composer_authority_canonical_json(arguments)
+    authority_arguments_hash = hashlib.sha256(authority_arguments_canonical.encode("utf-8")).hexdigest()
     result_hash = hashlib.sha256(result_canonical.encode("utf-8")).hexdigest()
     envelope: dict[str, object] = {
         "_kind": "audit",
@@ -790,6 +793,8 @@ def test_pipeline_dispatch_binding_restores_core_domain_normalized_reserved_mapp
             "status": ComposerToolStatus.SUCCESS.value,
             "arguments_canonical": arguments_canonical,
             "arguments_hash": arguments_hash,
+            "authority_arguments_canonical": authority_arguments_canonical,
+            "authority_arguments_hash": authority_arguments_hash,
             "result_canonical": result_canonical,
             "result_hash": result_hash,
         },
@@ -800,7 +805,7 @@ def test_pipeline_dispatch_binding_restores_core_domain_normalized_reserved_mapp
     assert binding.tool_call_id == "reserved-mapping-call"
     assert binding.tool_name == "set_pipeline"
     assert binding.status is ComposerToolStatus.SUCCESS
-    assert binding.arguments_hash == arguments_hash
+    assert binding.arguments_hash == authority_arguments_hash
     assert binding.result_hash == result_hash
 
 

@@ -55,6 +55,13 @@ drained and repair this release forward.
   retain provider, prompt, failure, source, and fork evidence, while runtime
   preflight and approved tutorial execution are keyed to the composition that
   produced them.
+- **Correlated row unions are first-class Composer topology** — freeform,
+  guided, import/export, validation, and graph surfaces can author and inspect
+  plugin-free, require-all `row_union` barriers that release branch rows
+  unchanged in declared order for long-format processing. Canonical
+  configuration, build, runtime, and guided coverage is present; broader audit,
+  recovery, concurrency, browser-backed round-trip, and scale acceptance
+  remains deferred under the open row-union work.
 
 ### Critical fixes
 

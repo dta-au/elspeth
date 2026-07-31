@@ -11738,6 +11738,66 @@ class TestPreviewPipeline:
         assert "row_union_input_mismatch" not in remaining_codes
         assert "fork_branch_no_destination" in remaining_codes
 
+    def test_duplicate_consumer_repair_excludes_row_union_identity_branch(self) -> None:
+        """Identity barrier branches are direct COPY edges, not connection consumers."""
+
+        def _consumer(node_id: str) -> NodeSpec:
+            return NodeSpec(
+                id=node_id,
+                node_type="transform",
+                plugin="passthrough",
+                input="control",
+                on_success=f"{node_id}_out",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+
+        state = (
+            _empty_state()
+            .with_node(_consumer("ordinary_a"))
+            .with_node(_consumer("ordinary_b"))
+            .with_node(
+                NodeSpec(
+                    id="variant_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control",
+                    on_success="unioned_rows",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches={"control": "control", "treatment": "treatment"},
+                    policy=None,
+                    merge=None,
+                )
+            )
+        )
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        duplicate_error = next(entry for entry in preview.data["errors"] if entry["error_code"] == "duplicate_connection_consumer")
+        assert "ordinary_a" in duplicate_error["message"]
+        assert "ordinary_b" in duplicate_error["message"]
+        assert "variant_union" not in duplicate_error["message"]
+
+        repair = next(entry for entry in preview.data["graph_repair_suggestions"] if entry["connection"] == "control")
+        assert [consumer["id"] for consumer in repair["affected_consumers"]] == [
+            "ordinary_a",
+            "ordinary_b",
+        ]
+        assert [step["arguments"]["id"] for step in repair["tool_sequence"] if step["tool"] == "upsert_node"] == [
+            "ordinary_a",
+            "ordinary_b",
+            "fork_control",
+        ]
+
     def test_duplicate_consumer_repair_patches_one_node_once_for_two_branch_bindings(self) -> None:
         """Two aliases of one row_union sharing a connection collapse to one upsert.
 

@@ -1188,31 +1188,16 @@ def _nested_fork_outer_row_union_proposal(
     )
 
 
-def test_projection_accepts_nested_descendant_fork_inside_outer_row_union_arm() -> None:
+def test_projection_rejects_nested_descendant_fork_inside_outer_row_union_arm() -> None:
     guided = _ab_coalesce_guided()
     proposal = _nested_fork_outer_row_union_proposal(guided)
-    catalog = {
-        "source": frozenset({"csv"}),
-        "transform": frozenset({"value_transform"}),
-        "sink": frozenset({"json"}),
-    }
-    assert not guided_candidate_state(proposal).validate().errors
 
-    payload = build_guided_proposal_projection(
-        proposal_id=PROPOSAL_ID,
-        proposal=proposal,
-        guided=guided,
-        catalog_plugin_ids=catalog,
-    )
+    validation = guided_candidate_state(proposal).validate()
 
-    verify_guided_proposal_projection(
-        payload=payload,
-        proposal_id=PROPOSAL_ID,
-        proposal=proposal,
-        guided=guided,
-        catalog_plugin_ids=catalog,
-    )
-    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+    assert validation.is_valid is False
+    assert [(error.component, error.error_code) for error in validation.errors] == [
+        ("node:outer_union", "row_union_nested_fork_invalid"),
+    ]
 
 
 def test_nested_fork_projection_rejects_outer_sibling_branch_contamination() -> None:

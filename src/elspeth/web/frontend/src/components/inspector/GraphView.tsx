@@ -1045,7 +1045,28 @@ export function GraphView() {
         .filter((node) => node.node_type === "row_union")
         .map((node) => node.id),
     );
-    const authoritativeRowUnionOutboundConnections = new Set<string>();
+    const authoritativeRowUnionOutboundSemantics = new Map<
+      string,
+      ProducerInfo[]
+    >();
+    function registerAuthoritativeRowUnionOutbound(
+      connectionKey: string,
+      producer: ProducerInfo,
+    ): void {
+      const semantics =
+        authoritativeRowUnionOutboundSemantics.get(connectionKey) ?? [];
+      if (
+        semantics.some(
+          (semantic) =>
+            semantic.edgeType === producer.edgeType
+            && semantic.label === producer.label,
+        )
+      ) {
+        return;
+      }
+      semantics.push(producer);
+      authoritativeRowUnionOutboundSemantics.set(connectionKey, semantics);
+    }
 
     // Each source produces on its on_success connection
     for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
@@ -1210,7 +1231,7 @@ export function GraphView() {
         if (producer.nodeId === queueId) continue; // no queue self-loop
         const connectionKey = `${producer.nodeId}->${queueId}`;
         if (rowUnionIds.has(producer.nodeId)) {
-          authoritativeRowUnionOutboundConnections.add(connectionKey);
+          registerAuthoritativeRowUnionOutbound(connectionKey, producer);
         }
         if (existingConnections.has(connectionKey)) continue;
         const isError = producer.edgeType === "error";
@@ -1263,7 +1284,7 @@ export function GraphView() {
         if (producer.nodeId === node.id) continue;
         const connectionKey = `${producer.nodeId}->${node.id}`;
         if (rowUnionIds.has(producer.nodeId)) {
-          authoritativeRowUnionOutboundConnections.add(connectionKey);
+          registerAuthoritativeRowUnionOutbound(connectionKey, producer);
         }
         if (existingConnections.has(connectionKey)) continue;
         const isError = producer.edgeType === "error";
@@ -1317,7 +1338,11 @@ export function GraphView() {
         && node.on_success
         && nodeIds.has(node.on_success)
       ) {
-        authoritativeRowUnionOutboundConnections.add(successConnectionKey);
+        registerAuthoritativeRowUnionOutbound(successConnectionKey, {
+          nodeId: node.id,
+          edgeType: "success",
+          label: "success",
+        });
       }
       if (
         node.on_success &&
@@ -1343,7 +1368,11 @@ export function GraphView() {
         && node.on_error
         && nodeIds.has(node.on_error)
       ) {
-        authoritativeRowUnionOutboundConnections.add(errorConnectionKey);
+        registerAuthoritativeRowUnionOutbound(errorConnectionKey, {
+          nodeId: node.id,
+          edgeType: "error",
+          label: "error",
+        });
       }
       if (
         node.on_error &&
@@ -1368,7 +1397,11 @@ export function GraphView() {
         for (const [routeLabel, targetId] of Object.entries(node.routes)) {
           const routeConnectionKey = `${node.id}->${targetId}`;
           if (rowUnionIds.has(node.id) && nodeIds.has(targetId)) {
-            authoritativeRowUnionOutboundConnections.add(routeConnectionKey);
+            registerAuthoritativeRowUnionOutbound(routeConnectionKey, {
+              nodeId: node.id,
+              edgeType: "success",
+              label: routeLabel,
+            });
           }
           if (nodeIds.has(targetId) && !existingConnections.has(routeConnectionKey)) {
             rfEdges.push({
@@ -1387,21 +1420,65 @@ export function GraphView() {
     }
 
     // A row union's connection properties are authoritative for its outbound
-    // topology just as `branches` is authoritative for its inbound topology.
-    // Explicit row_union edges are materialized render hints and can survive a
-    // `with_node` repoint, so retain them only when an inference phase above
-    // observed the same live producer → consumer connection. Endpoint-matched
-    // parallel lanes remain intact, as do all unrelated explicit edges.
+    // semantics just as `branches` is authoritative for its inbound topology.
+    // Explicit edges are materialized render hints and can retain a stale
+    // label/route even when their endpoints still match. Claim at most one hint
+    // per live semantic, rewrite it from authority, and drop every unclaimed
+    // row_union hint. When no explicit hint exists, the inference phase above
+    // has already emitted the authoritative edge.
+    const claimedExplicitRowUnionOutboundEdgeIds = new Set<string>();
+    for (
+      const [connectionKey, semantics]
+      of authoritativeRowUnionOutboundSemantics
+    ) {
+      const candidates = rfEdges.filter(
+        (edge) =>
+          explicitRfEdgeIds.has(edge.id)
+          && rowUnionIds.has(edge.source)
+          && `${edge.source}->${edge.target}` === connectionKey,
+      );
+      for (const semantic of semantics) {
+        const unclaimed = candidates.filter(
+          (edge) => !claimedExplicitRowUnionOutboundEdgeIds.has(edge.id),
+        );
+        const claimed =
+          unclaimed.find(
+            (edge) =>
+              edge.data.flowType === semantic.edgeType
+              && edge.label === semantic.label,
+          )
+          ?? unclaimed.find(
+            (edge) => edge.data.flowType === semantic.edgeType,
+          )
+          ?? unclaimed[0];
+        if (!claimed) continue;
+
+        claimedExplicitRowUnionOutboundEdgeIds.add(claimed.id);
+        const claimedIndex = rfEdges.findIndex(
+          (edge) => edge.id === claimed.id,
+        );
+        const isError = semantic.edgeType === "error";
+        rfEdges[claimedIndex] = {
+          ...claimed,
+          label: semantic.label,
+          data: {
+            ...claimed.data,
+            flowType: semantic.edgeType,
+          },
+          animated: isError,
+          style: {
+            ...claimed.style,
+            stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
+          },
+        };
+      }
+    }
     for (let index = rfEdges.length - 1; index >= 0; index -= 1) {
       const edge = rfEdges[index]!;
       if (!explicitRfEdgeIds.has(edge.id) || !rowUnionIds.has(edge.source)) {
         continue;
       }
-      if (
-        authoritativeRowUnionOutboundConnections.has(
-          `${edge.source}->${edge.target}`,
-        )
-      ) {
+      if (claimedExplicitRowUnionOutboundEdgeIds.has(edge.id)) {
         continue;
       }
       rfEdges.splice(index, 1);

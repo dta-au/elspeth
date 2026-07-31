@@ -657,6 +657,8 @@ def _duplicate_consumer_repair_suggestions(
             _coalesce_branch_connections(node.branches),
             strict=True,
         ):
+            if row_union_branch_alias == branch_connection:
+                continue
             consumers_by_connection.setdefault(branch_connection, []).append((node, row_union_branch_alias))
 
     reserved_node_ids = {node.id for node in state.nodes}

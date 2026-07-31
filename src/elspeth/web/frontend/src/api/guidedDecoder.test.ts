@@ -42,6 +42,53 @@ function wireResponse(payloadOverrides: Record<string, unknown> = {}): Record<st
   };
 }
 
+function sourceToOutputWireProjection({
+  sourceId = "00000000-0000-4000-8000-000000000020",
+  outputId = "00000000-0000-4000-8000-000000000021",
+  targetId = outputId,
+  connectionId = "00000000-0000-4000-8000-000000000022",
+}: {
+  sourceId?: string;
+  outputId?: string;
+  targetId?: string;
+  connectionId?: string;
+} = {}): Record<string, unknown> {
+  return {
+    sources: [{
+      stable_id: sourceId,
+      label: "source",
+      plugin: "csv",
+      on_validation_failure: "discard",
+      guaranteed_fields: [],
+      row_cardinality: {
+        input: "none",
+        output: "one",
+        expected_output_count: null,
+      },
+    }],
+    outputs: [{
+      stable_id: outputId,
+      label: "output",
+      plugin: "csv",
+      on_write_failure: "discard",
+      required_fields: [],
+      business_schema: {
+        mode: "strict",
+        fields: [],
+        guaranteed_fields: [],
+        required_fields: [],
+      },
+    }],
+    connections: [{
+      stable_id: connectionId,
+      from_endpoint: { kind: "source", stable_id: sourceId },
+      to_endpoint: { kind: "output", stable_id: targetId },
+      flow: { kind: "source_success", branch: null },
+      schema_contract: null,
+    }],
+  };
+}
+
 function singleSelectWireResponse(): Record<string, unknown> {
   return {
     guided_session: {
@@ -1142,6 +1189,83 @@ describe("guided schema-10 wire decoder", () => {
         expected_output_count: null,
       });
     }
+  });
+
+  it("rejects row_union_success wiring that targets an output", () => {
+    expect(() => decodeGetGuidedResponse(
+      wireResponse({
+        nodes: [
+          {
+            stable_id: "00000000-0000-4000-8000-000000000009",
+            label: "row union",
+            node_type: "row_union",
+            plugin: null,
+            behavior: {
+              kind: "row_union",
+              branch_aliases: ["branch-1", "branch-2"],
+              policy: "require_all",
+              timeout_seconds: null,
+            },
+            required_fields: [],
+            guaranteed_fields: [],
+            row_cardinality: {
+              input: "branches",
+              output: "one_per_branch",
+              expected_output_count: null,
+            },
+            structured_output_fields: [],
+          },
+        ],
+        outputs: [
+          {
+            stable_id: "00000000-0000-4000-8000-000000000010",
+            label: "output",
+            plugin: "csv",
+            on_write_failure: "discard",
+            required_fields: [],
+            business_schema: {
+              mode: "strict",
+              fields: [],
+              guaranteed_fields: [],
+              required_fields: [],
+            },
+          },
+        ],
+        connections: [
+          {
+            stable_id: "00000000-0000-4000-8000-000000000011",
+            from_endpoint: {
+              kind: "node",
+              stable_id: "00000000-0000-4000-8000-000000000009",
+            },
+            to_endpoint: {
+              kind: "output",
+              stable_id: "00000000-0000-4000-8000-000000000010",
+            },
+            flow: { kind: "row_union_success", branch: null },
+            schema_contract: null,
+          },
+        ],
+      }),
+    )).toThrow(/row_union_success|target endpoint|ordinary processing/i);
+  });
+
+  it("rejects wire connections whose endpoint stable ID does not resolve", () => {
+    expect(() => decodeGetGuidedResponse(wireResponse(
+      sourceToOutputWireProjection({
+        targetId: "00000000-0000-4000-8000-000000000099",
+      }),
+    ))).toThrow(/to_endpoint|resolve/i);
+  });
+
+  it("rejects wire connection stable IDs that collide with components", () => {
+    const sourceId = "00000000-0000-4000-8000-000000000020";
+    expect(() => decodeGetGuidedResponse(wireResponse(
+      sourceToOutputWireProjection({
+        sourceId,
+        connectionId: sourceId,
+      }),
+    ))).toThrow(/stable IDs|unique/i);
   });
 
   it.each([

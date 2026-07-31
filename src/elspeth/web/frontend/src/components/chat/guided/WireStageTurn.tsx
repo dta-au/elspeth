@@ -283,9 +283,15 @@ export function WireStageTurn({
   const correctionTargets: Array<{ target: GuidedEditTarget; label: string }> = [
     ...data.sources.map((source) => ({ target: { kind: "source" as const, stable_id: source.stable_id }, label: source.label })),
     ...data.nodes.map((node) => ({ target: { kind: "node" as const, stable_id: node.stable_id }, label: node.label })),
-    ...data.connections.map((connection, index) => ({
+    ...data.connections.map((connection) => ({
       target: { kind: "edge" as const, stable_id: connection.stable_id },
-      label: `Route ${index + 1}`,
+      label: `${nameFor(connection.from_endpoint.stable_id)} → ${
+        nameFor(
+          connection.to_endpoint.kind === "discard"
+            ? "discard"
+            : connection.to_endpoint.stable_id,
+        )
+      } — ${flowText(connection.flow, routeKeys)}`,
     })),
     ...data.outputs.map((output) => ({ target: { kind: "output" as const, stable_id: output.stable_id }, label: output.label })),
   ];
