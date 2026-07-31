@@ -5,7 +5,7 @@ observability platforms (OTLP, Azure Monitor, Datadog, etc.).
 """
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
 if TYPE_CHECKING:
     from elspeth.contracts.events import TelemetryEvent
@@ -46,12 +46,26 @@ class DeliveryMetricsExporterProtocol(Protocol):
         ...
 
 
-@runtime_checkable
 class ExporterProtocol(Protocol):
     """Protocol for telemetry exporters.
 
     Exporters ship telemetry events to external observability platforms.
     They are discovered via pluggy hooks and configured via pipeline settings.
+
+    Deliberately NOT ``@runtime_checkable``, for the same reason as its
+    sibling :class:`DeliveryMetricsExporterProtocol`: nothing
+    ``isinstance``-checks this Protocol in production, and leaving the
+    decorator on would invite a future author to use it as an admission gate
+    (ADR-032 rule 3). It would be a bad one — exporters arrive from
+    third-party pluggy plugins, and since Python 3.12 a runtime-checkable
+    Protocol resolves members through ``inspect.getattr_static``, so the
+    check admits any impostor declaring the right attribute names while
+    silently rejecting an honest exporter that forwards ``export`` or
+    ``flush`` through ``__getattr__``. ``isinstance()`` against it now raises
+    ``TypeError`` rather than quietly becoming a duck-type check. This
+    remains the static-typing and documentation contract for exporter
+    authors; ``TelemetryManager`` calls the members and handles their
+    failures rather than type-gating the object.
 
     Lifecycle:
         1. Discovery: elspeth_get_exporters hook returns exporter classes
