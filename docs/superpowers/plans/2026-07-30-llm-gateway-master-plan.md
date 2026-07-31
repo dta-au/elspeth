@@ -8,7 +8,9 @@
 - `docs/superpowers/specs/2026-07-30-llm-compatibility-gateway-runtime-design.md`
 - `docs/superpowers/specs/2026-07-30-elspeth-llm-gateway-integration-design.md`
 
-**Branch:** `feature/llm-gateway` (worktree `.claude/worktrees/llm-gateway`, based on `eb7c17851` = release/0.7.2 HEAD). Merge target: `release/0.7.2` with `--no-ff`.
+**Branch:** `feature/llm-gateway` (worktree `.claude/worktrees/llm-gateway`). Merge target: `release/0.7.2` with `--no-ff`.
+
+**Branch base — corrected 2026-07-31.** This document previously claimed the branch was based on `eb7c17851` "= release/0.7.2 HEAD". That was wrong: `eb7c17851` is the design commit, and `release/0.7.2` was 24 commits ahead of it. `release/0.7.2` has since been merged INTO this branch (`c8f9947f4`) as pre-merge reconciliation, and the full CI-equivalent suite was re-run on the reconciled tree (33,662 passed) — testing either side alone would not have exercised the interaction.
 
 ## Custody amendments (binding, from sign-off)
 
