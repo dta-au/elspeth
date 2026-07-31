@@ -424,7 +424,7 @@ PYTHONPATH=/home/john/elspeth/src /home/john/elspeth/.venv/bin/pytest \
 PYTHONPATH=elspeth-lints/src /home/john/elspeth/.venv/bin/python \
   -m elspeth_lints.core.cli check \
   --rules plugin_contract.plugin_hashes --root src/elspeth
-wardline scan . --fail-on ERROR
+.venv/bin/python scripts/wardline_gate.py
 git diff --check
 ```
 
@@ -1000,7 +1000,7 @@ Metadata-only class attributes and trim-aware display logic do not change an ext
 
 ```bash
 cd /home/john/elspeth
-wardline scan . --fail-on ERROR
+.venv/bin/python scripts/wardline_gate.py
 ```
 
 Fix any finding at the boundary and rescan.

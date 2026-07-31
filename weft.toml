@@ -4,3 +4,4 @@
 [wardline]
 source_roots = ["src"]
 exclude = [".git/**", ".venv/**", "venv/**", ".uv-cache/**", ".mypy_cache/**", ".pytest_cache/**", ".ruff_cache/**", ".tox/**", ".nox/**", "node_modules/**", "telemetry/**", "data/**"]
+packs = ["scripts.wardline_pack"]
