@@ -114,7 +114,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
     )
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:33b27013dff59e4c"
+    source_file_hash: str | None = "sha256:9516e48630df9db5"
     config_model = AzurePromptShieldConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("azure", "prompt-shield", "security")
@@ -125,7 +125,8 @@ class AzurePromptShield(BaseAzureSafetyTransform):
     )
     usage_when_not_to_use = (
         "Not for harmful-content moderation after generation; use azure_content_safety for category "
-        "threshold enforcement. Avoid both when one analysis type is sufficient because it makes two calls."
+        "threshold enforcement. Avoid both when one analysis type is sufficient: it requests two analyses "
+        "and may incur both analysis costs, but sends one audited HTTP call."
     )
     example_use = (
         "transform:\n"
@@ -146,7 +147,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
                 issue_code=None,
                 summary="Uses Azure Prompt Shield to detect jailbreak and prompt-injection attacks.",
                 composer_hints=(
-                    "Choose analysis_type deliberately: both checks user_prompt and document paths and costs two analyses.",
+                    "Choose analysis_type deliberately: both requests two analyses and may incur both analysis costs, but sends one audited HTTP call.",
                     "Use user_prompt for direct user text; use document for retrieved context or untrusted documents.",
                     "Set fields to the string fields to inspect, or 'all' only when every string field should be scanned.",
                     "Detected attacks return errors; route on_error to quarantine or security review.",

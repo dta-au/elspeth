@@ -1155,7 +1155,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f78b16ec1f33b506"
+    source_file_hash: str | None = "sha256:acc31f06c294a33c"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1164,7 +1164,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
     usage_when_to_use = (
         "Use an operator-approved profile for text generation or structured-output workflows. "
-        "ELSPETH records prompts, responses, the returned model, and input/output tokens in the audit trail. "
+        "ELSPETH records prompts, responses, the returned model, and input/output tokens when reported by the provider "
+        "in the audit trail. "
         "Returned provider content is untrusted before LLM reuse or tool routing."
     )
     usage_when_not_to_use = (

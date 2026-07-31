@@ -287,7 +287,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:5c9016610d994e60"
+    source_file_hash: str | None = "sha256:0774b4a6f8d0f40f"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     creates_tokens = False
@@ -318,6 +318,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         "    source_field: document_url\n"
         "    content_field: di_content\n"
         "    output_content_format: markdown\n"
+        "    features: [keyValuePairs]\n"
         "    extract: {tables: di_tables, key_value_pairs: di_kv}\n"
         "    schema: {mode: observed}"
     )

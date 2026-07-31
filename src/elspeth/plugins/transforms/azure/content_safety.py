@@ -37,10 +37,10 @@ class ContentSafetyThresholds(BaseModel):
     """Per-category severity thresholds for Azure Content Safety.
 
     Azure Content Safety returns severity scores from 0-6 for each category.
-    Content is flagged when its severity exceeds the configured threshold.
+    Content is flagged only when ``severity > threshold``.
 
-    A threshold of 0 means all content of that type is blocked.
-    A threshold of 6 means only the most severe content is blocked.
+    A threshold of 0 allows severity 0 and blocks severities 1-6.
+    A threshold of 6 blocks nothing.
     """
 
     model_config = {"extra": "forbid", "frozen": True}
@@ -160,7 +160,7 @@ class AzureContentSafety(BaseAzureSafetyTransform):
 
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:20aed8dea71a970a"
+    source_file_hash: str | None = "sha256:437a1c362c8defea"
     config_model = AzureContentSafetyConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("azure", "content-safety", "moderation")
@@ -405,7 +405,7 @@ class AzureContentSafety(BaseAzureSafetyTransform):
                 composer_hints=(
                     "Thresholds use OR logic: a row is flagged when ANY category exceeds its threshold. Tighten thresholds individually, not globally.",
                     "Default thresholds tend to be 4 — set per-category based on the audit policy, not on Azure's recommendation.",
-                    "Always place upstream of any LLM transform when input came from web_scrape or other external sources (Tier 3 → safety check → Tier 2).",
+                    "Category moderation can block remote text that exceeds configured severity thresholds, but remote content remains untrusted; apply prompt-injection defenses before sending it to an LLM.",
                     "The transform records the full per-category response in audit, not just the flag — verify this is visible before declaring success.",
                 ),
             )
