@@ -24,7 +24,10 @@ from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLim
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
-from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
+from elspeth.contracts.wire_visible_identity import (
+    is_operator_required_placeholder_value,
+    reject_operator_required_placeholder_value,
+)
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseAuthConfig,
@@ -248,7 +251,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:285d2c6baf4a7630"
+    source_file_hash: str | None = "sha256:f4c1784ddf970583"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -423,21 +426,43 @@ class DataverseSource(BaseSource):
             )
         else:
             identity = page.rows[0]
-            try:
-                returned_logical_name = _validate_dataverse_logical_name(identity.get("LogicalName"), field_name="LogicalName")
-            except ValueError:
+            if "LogicalName" not in identity:
                 metadata_error_message = (
                     "Dataverse entity metadata did not provide a usable string LogicalName. "
                     "Expected a lowercase ASCII identifier; check the metadata response and table configuration."
                 )
+            else:
+                raw_logical_name = identity["LogicalName"]
+                if (
+                    not isinstance(raw_logical_name, str)
+                    or is_operator_required_placeholder_value(raw_logical_name)
+                    or _DATAVERSE_LOGICAL_NAME_PATTERN.fullmatch(raw_logical_name) is None
+                ):
+                    metadata_error_message = (
+                        "Dataverse entity metadata did not provide a usable string LogicalName. "
+                        "Expected a lowercase ASCII identifier; check the metadata response and table configuration."
+                    )
+                else:
+                    returned_logical_name = raw_logical_name
             if metadata_error_message is None:
-                try:
-                    entity_set_name = _validate_dataverse_entity_set_name(identity.get("EntitySetName"), field_name="EntitySetName")
-                except ValueError:
+                if "EntitySetName" not in identity:
                     metadata_error_message = (
                         "Dataverse entity metadata did not provide a usable string EntitySetName. "
                         "Expected an ASCII identifier; malformed metadata fails closed."
                     )
+                else:
+                    raw_entity_set_name = identity["EntitySetName"]
+                    if (
+                        not isinstance(raw_entity_set_name, str)
+                        or is_operator_required_placeholder_value(raw_entity_set_name)
+                        or _DATAVERSE_ENTITY_SET_NAME_PATTERN.fullmatch(raw_entity_set_name) is None
+                    ):
+                        metadata_error_message = (
+                            "Dataverse entity metadata did not provide a usable string EntitySetName. "
+                            "Expected an ASCII identifier; malformed metadata fails closed."
+                        )
+                    else:
+                        entity_set_name = raw_entity_set_name
             if metadata_error_message is None and returned_logical_name != logical_name:
                 metadata_error_message = (
                     f"Dataverse metadata LogicalName did not match the requested logical name '{logical_name}'. "
