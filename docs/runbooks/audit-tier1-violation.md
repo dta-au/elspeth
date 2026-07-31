@@ -49,12 +49,22 @@ Adjust the database path for the deployment. For staging, inspect
 A user can only quote what the browser showed them. Two fields make that
 quotable value sufficient to find the server-side record:
 
-- The `X-Request-ID` response header, stamped on every response by
-  `RequestIdMiddleware`.
-- The `request_id` field, present in every structured (object-shaped) error
-  body. An app-level `HTTPException` handler injects it at one boundary, so
-  the value is identical to the header. Errors whose `detail` is a plain
-  string carry no `request_id` — the header is the only handle for those.
+- The `X-Request-ID` response header, stamped on **every** response by
+  `RequestIdMiddleware`. This is the handle that always works.
+- The `request_id` field in the error body, when present. It is always equal to
+  the header.
+
+Which bodies carry `request_id`:
+
+| Carries it | Does not |
+|---|---|
+| Any dict-shaped `HTTPException` detail — all guided terminal-failure envelopes, freeform convergence 422s, execution and interpretation envelopes. An app-level handler injects it at one boundary. | `HTTPException`s whose `detail` is a plain string. |
+| `audit_integrity_error`, `fingerprint_key_missing`, `secret_decryption_failed`, `database_unavailable`, `storage_unavailable` — these handlers source it themselves. | `corrupt_preferences`, `audit_story_integrity_error`, `audit_story_not_recorded`, `stale_compose_state`, `audit_access_log_write_failed`, `run_already_active` — these handlers build their `JSONResponse` directly and do not yet source it. |
+
+For anything in the right-hand column — including
+`audit_access_log_write_failed`, whose counter is in the Signals table above —
+use the `X-Request-ID` header. Request-body validation failures (HTTP 422 with
+a list-shaped `detail`) carry no `request_id` either.
 
 Search the structured server log for that id. The terminal-error events are:
 
