@@ -121,6 +121,19 @@ class ComposerLLMCall:
     pipeline LLM transform, the composer does not treat a non-``stop`` value
     as an error, so it makes truncation visible without changing control flow.
 
+    Provider-authored strings (``model_returned``, ``provider_request_id``,
+    ``finish_reason``, ``error_message``, ``reasoning_content``) arrive
+    already bounded: ``web/composer/llm_response_parsing.build_llm_call_record``
+    is the sole construction site in ``src`` and caps each one at extraction,
+    so the envelope, the rendered summary, and the sidecar all inherit one
+    bounded value. This contract deliberately does **not** re-check their
+    length. Rejecting an oversized field would raise instead of recording —
+    discarding the very evidence that the endpoint misbehaved — and a second
+    bound in a second place would be a second limit to keep in sync. The
+    guarantee is therefore capture-point-enforced, not contract-enforced: a
+    record constructed directly (a test, or future code that bypasses
+    ``build_llm_call_record``) is not bounded by anything here.
+
     ``temperature`` and ``seed`` capture the sampling parameters actually sent
     on composer LLM requests. Both are operator-set
     (``WebSettings.composer_temperature`` / ``composer_seed``) and recorded as

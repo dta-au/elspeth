@@ -34,7 +34,7 @@ import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from types import MemberDescriptorType
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import (
     PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST,
@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
 
 __all__ = [
+    "PROVIDER_STRING_TRUNCATION_MARKER",
     "apply_anthropic_cache_markers",
     "attach_llm_calls",
     "build_llm_call_record",
@@ -300,12 +301,111 @@ def _validated_provider_cost(
     return cost, source
 
 
+# ---------------------------------------------------------------------------
+# Bounds on provider-authored strings that reach a stored or rendered
+# projection (elspeth: composer endpoint affordance).
+#
+# ELSPETH lets an operator point the composer at any OpenAI-compatible
+# endpoint. The realistic failure mode is not a hostile provider but a
+# malfunctioning one: a buggy proxy, a mis-translated upstream, or an error
+# blob returned where a short token belongs. Those strings land in
+# ``chat_messages.tool_calls`` (stored) and, via ``llm_call_audit_summary``,
+# in the message-list view (rendered), so an unbounded value is unbounded
+# text in a durable, rendered column.
+#
+# The response is graceful degradation, never rejection: truncate, keep the
+# audit row, and make the anomaly legible. Dropping the record because a
+# field is oversized would discard the very evidence that the endpoint
+# misbehaved.
+#
+# Bounding happens HERE, at the single extraction point, so the envelope,
+# the rendered summary, and the sidecar all inherit one already-bounded
+# value and there is one place to reason about the limit. The contract
+# (``ComposerLLMCall``) deliberately does not re-check length: a contract
+# that rejected an oversized value would raise instead of recording, which
+# is exactly the outcome this bound exists to prevent.
+# ---------------------------------------------------------------------------
+
+PROVIDER_STRING_TRUNCATION_MARKER: Final[str] = "<truncated:"
+"""Opening marker of the in-band suffix appended to a truncated provider string.
+
+The full suffix is ``<truncated:{original_length}>``. Readers detect
+truncation with ``PROVIDER_STRING_TRUNCATION_MARKER in value`` rather than
+hardcoding the literal.
+"""
+
+# A closed-vocabulary provider token (``finish_reason``). Real values are
+# short: the longest ones any provider emits are Gemini's
+# ``FINISH_REASON_UNSPECIFIED`` / ``MALFORMED_FUNCTION_CALL`` at ~25
+# characters. 128 is ~5x the longest real value — no legitimate token, even
+# one no provider has invented yet, is ever cut — while anything longer is
+# self-evidently not a termination token.
+_PROVIDER_TOKEN_MAX_CHARS: Final[int] = 128
+
+# A provider routing identifier (``model_returned``). These are legitimately
+# long: Bedrock inference-profile ARNs and Vertex resource paths run
+# ~100-140 characters. 256 clears those with room to spare and matches the
+# bound ``_safe_provider_request_id`` already applies to the sibling
+# provider identifier in this module, so there is one identifier bound to
+# justify rather than two.
+_PROVIDER_IDENTIFIER_MAX_CHARS: Final[int] = 256
+
+
+def _bounded_provider_string(value: str, *, limit: int) -> str:
+    """Cap one provider-authored string, signalling truncation in band.
+
+    Returns ``value`` unchanged — byte-identical — when it is within
+    ``limit``; a well-behaved endpoint's output is never altered. Beyond the
+    limit the value is cut and an in-band ``<truncated:{original_length}>``
+    suffix is appended.
+
+    Why in-band rather than a companion flag
+    ----------------------------------------
+    Silent truncation is the failure to avoid: it turns "the endpoint sent
+    garbage" into "the value looks fine but short". The signal therefore
+    travels with the value. An in-band suffix propagates through every
+    projection — the ``tool_calls`` envelope, the rendered summary, the
+    sidecar ``to_dict()`` — with no schema change and no risk of a
+    projection carrying the value while dropping its flag. This follows the
+    precedent this module already sets for a scalar provider string in
+    ``_append_llm_error_hash`` (``...[raw_error_hash=…]``); the companion
+    ``_truncated`` dict flag at ``audit.py:475`` works there only because
+    that value is already a dict.
+
+    The original length is included because it is the diagnostic that
+    distinguishes "the endpoint sent 200 characters" from "the endpoint sent
+    two megabytes" — the difference between a sloppy value and a broken one.
+
+    Accepted trade-off: a legitimate provider value that itself ended in
+    ``<truncated:N>`` would be indistinguishable from a truncated one. That
+    is not defended against — the collision is vanishingly unlikely, and
+    guarding it would cost more clarity than the risk is worth.
+
+    Typed ``str -> str``: both call sites assert the value is an exact
+    ``str`` before calling, so a non-string branch here would be dead code.
+    """
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}{PROVIDER_STRING_TRUNCATION_MARKER}{len(value)}>"
+
+
 def safe_response_model(response: Any | None) -> str | None:
+    """Return the provider's own ``response.model`` string, bounded.
+
+    Provider-authored: the endpoint chooses these bytes. Besides the audit
+    row's ``model_returned``, this value is the provenance ``model_version``
+    stored on proposals and interpretation events, so bounding it here
+    covers every stored consumer at once.
+
+    A legitimate identifier — including a Bedrock inference-profile ARN or a
+    Vertex resource path — passes through unchanged; see
+    :func:`_bounded_provider_string` for the truncation signal.
+    """
     if response is None:
         return None
     model = _provider_field(response, "model")
     if isinstance(model, str) and model.strip():
-        return model
+        return _bounded_provider_string(model, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
     return None
 
 
@@ -351,11 +451,22 @@ def _finish_reason_from_response(response: Any | None) -> str | None:
     vocabulary (which lives in ``elspeth.plugins`` and must not be imported
     from ``contracts``), and no normalisation of unrecognised values, so a
     provider term ELSPETH has never seen still reaches the audit trail.
+
+    "Verbatim" is bounded, not unlimited. Every real termination token is a
+    handful of characters, so a value past
+    :data:`_PROVIDER_TOKEN_MAX_CHARS` is not a token the composer failed to
+    recognise — it is an endpoint returning something else entirely where a
+    token belongs (an error blob, an HTML page). Such a value is truncated
+    with an in-band marker rather than rejected: the audit row survives, and
+    the anomaly is legible in the rendered summary, which is precisely where
+    an operator would otherwise see unbounded provider text. A value within
+    the bound — which is every value a working endpoint produces — is
+    recorded byte-identically as before.
     """
     finish_reason = _provider_field(_first_response_choice(response), "finish_reason")
     if type(finish_reason) is not str or not finish_reason.strip():
         return None
-    return finish_reason
+    return _bounded_provider_string(finish_reason, limit=_PROVIDER_TOKEN_MAX_CHARS)
 
 
 def _provider_artifact_owned_fields(value: Any) -> Mapping[str, Any] | None:
