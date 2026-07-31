@@ -163,4 +163,11 @@ This project uses **wardline** as its trust-boundary gate. Before handing back c
 
 ## Judge-signature stage (tier-model allowlist signing)
 
+The trust-tier CI failure is a deliberate fail-closed state: it prevents
+unauthorised merges while keeping the outstanding package-level signing work
+visible. **Do not attempt to resolve, re-sign, restage, or otherwise clear the
+trust-tier CI failure during ordinary feature work.** Treat it only as a signal
+to follow the existing trust-tier standards. The operator signs once, at
+package completion, after churn has settled.
+
 The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule, elspeth-b3a3335c9f) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs on the agentic harness with read-only tool access (`--judge-transport agent --judge-tools readonly`, 2026-07-09 policy): the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and `docs/judge-signature-handoff.md`.
