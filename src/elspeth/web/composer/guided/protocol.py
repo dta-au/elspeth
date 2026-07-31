@@ -269,6 +269,10 @@ class _ProposalNodeSummary(TypedDict):
     node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce", "row_union"]
     plugin: _ProposalPluginRef | None
     behavior: _ProposalNodeBehavior
+    # Allowlisted key options as pre-rendered display pairs; see
+    # ``_NODE_OPTION_SUMMARY_ALLOWLIST``. Empty for a structural node or an
+    # unlisted plugin — the key itself is always present.
+    node_options_summary: Sequence[_NodeOptionSummary]
 
 
 class _ProposalOutputSummary(TypedDict):
@@ -288,9 +292,14 @@ class ProposePipelinePayload(TypedDict):
     """Redacted display/audit projection of a durable pipeline proposal.
 
     This projection is deliberately non-executable: it contains only
-    catalog-authoritative plugin identities, never component names, options,
-    prompts, paths, inline content, secret references, or model-authored
-    rationale. Exact canonical arguments remain in private proposal custody.
+    catalog-authoritative plugin identities, never component names, prompts,
+    paths, inline content, secret references, or model-authored rationale.
+    Exact canonical arguments remain in private proposal custody. The sole
+    authored values it publishes are the ones a human must see to accept the
+    proposal at all, each drawn from a closed server-owned allowlist: gate
+    behavior (the predicate and its trigger thresholds) and, per
+    ``_NODE_OPTION_SUMMARY_ALLOWLIST``, a node's key options rendered as
+    display text. Everything outside those allowlists stays private.
     Human copy is selected from exact server-owned template ids; structural
     labels are deterministic ordinals rather than canonical route, branch, or
     component names. Task 4 must validate catalog and private-proposal
@@ -356,6 +365,7 @@ class _WireNodeReview(TypedDict):
     guaranteed_fields: Sequence[str]
     row_cardinality: _WireRowCardinality
     structured_output_fields: Sequence[_WireStructuredOutputField]
+    node_options_summary: Sequence[_NodeOptionSummary]
 
 
 class _WireBusinessSchema(TypedDict):
@@ -747,6 +757,109 @@ def proposal_structural_label(kind: Literal["route", "branch"], index: int) -> s
     if type(index) is not int or index < 0 or index >= _MAX_PROPOSAL_LABELS:
         raise ValueError("proposal structural label index is outside the bounded range")
     return f"{kind}-{index + 1}"
+
+
+# ── Key transform options at the review surfaces (R2-F3) ─────────────────────
+#
+# Both review cards used to render only the behavior discriminant, so every
+# transform read as "transforms each incoming item" — a field_mapper's renames
+# and its drop-the-rest projection were invisible on the surfaces an operator
+# accepts. This projects those knobs as pre-rendered {key, value} text.
+#
+# The allowlist is a CLOSED server-owned vocabulary keyed by plugin, and it is
+# enforced by the validator, not just by the projector — same hygiene rationale
+# as ``_wire_schema``: path-, credential-, and prompt-adjacent options must
+# never reach a public projection, so adding a plugin here is a deliberate
+# per-option decision rather than a whole-options dump.
+_NODE_OPTION_SUMMARY_ALLOWLIST: Mapping[str, tuple[str, ...]] = {
+    "field_mapper": ("mapping", "select_only"),
+}
+_MAX_NODE_OPTION_SUMMARY_PAIRS = 20
+_MAX_NODE_OPTION_SUMMARY_VALUE = 240
+
+
+class _NodeOptionSummary(TypedDict):
+    key: str
+    value: str
+
+
+def _rendered_mapping(value: object) -> str:
+    """Render ``{source: target}`` renames as bounded "src → dst" display text."""
+
+    if not isinstance(value, Mapping):
+        return ""
+    pairs = [f"{source} → {target}" for source, target in value.items() if type(source) is str and type(target) is str]
+    if not pairs:
+        return ""
+    shown = pairs[:_MAX_NODE_OPTION_SUMMARY_PAIRS]
+    remaining = len(pairs) - len(shown)
+    rendered = ", ".join(shown) + (f", +{remaining} more" if remaining > 0 else "")
+    if len(rendered) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        return rendered[: _MAX_NODE_OPTION_SUMMARY_VALUE - 1] + "…"
+    return rendered
+
+
+def _rendered_select_only(value: object) -> str:
+    """Name the consequence of the projection flag, not the flag's literal."""
+
+    if value is True:
+        return "only the mapped fields are kept"
+    if value is False:
+        return "unmapped fields pass through"
+    return ""
+
+
+_NODE_OPTION_SUMMARY_RENDERERS: Mapping[str, Callable[[object], str]] = {
+    "mapping": _rendered_mapping,
+    "select_only": _rendered_select_only,
+}
+
+
+def node_options_summary(plugin: str | None, options: Mapping[str, Any]) -> list[_NodeOptionSummary]:
+    """Project one node's allowlisted key options as bounded display pairs.
+
+    Returns ``[]`` for a structural node, an unlisted plugin, or an allowlisted
+    knob whose authored value renders to nothing — the review surfaces render
+    an empty summary as "no key options", never as a missing section.
+    """
+
+    keys = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", ())
+    if not keys or not isinstance(options, Mapping):
+        return []
+    summary: list[_NodeOptionSummary] = []
+    for key in keys:
+        if key not in options:
+            continue
+        value = _NODE_OPTION_SUMMARY_RENDERERS[key](options[key])
+        if value:
+            summary.append({"key": key, "value": value})
+    return summary
+
+
+def _node_options_summary_error(value: object, path: str, *, plugin: str | None) -> str | None:
+    """Reject any option pair outside the plugin's server-owned allowlist."""
+
+    items, error = _current_sequence(value, path)
+    if error is not None:
+        return error
+    assert items is not None
+    allowed = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", ())
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        item_path = f"{path}[{index}]"
+        if (error := _exact_nested_keys(item, frozenset({"key", "value"}), item_path)) is not None:
+            return error
+        assert isinstance(item, Mapping)
+        if item["key"] not in allowed:
+            return f"{item_path}.key is outside the node option summary allowlist"
+        if item["key"] in seen:
+            return f"{item_path}.key duplicates another projected option"
+        seen.add(item["key"])
+        if (error := _current_text_error(item["value"], f"{item_path}.value", nonempty=True)) is not None:
+            return error
+        if len(cast(str, item["value"])) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+            return f"{item_path}.value exceeds the bounded option summary length"
+    return None
 
 
 def _exact_nested_keys(value: object, expected: frozenset[str], path: str) -> str | None:
@@ -1208,6 +1321,7 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
             "guaranteed_fields",
             "row_cardinality",
             "structured_output_fields",
+            "node_options_summary",
         }
     )
     for index, node in enumerate(nodes):
@@ -1238,6 +1352,14 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         ) is not None:
             return error
         if (error := _public_json_error(node["structured_output_fields"], f"{path}.structured_output_fields")) is not None:
+            return error
+        if (
+            error := _node_options_summary_error(
+                node["node_options_summary"],
+                f"{path}.node_options_summary",
+                plugin=node["plugin"] if type(node["plugin"]) is str else None,
+            )
+        ) is not None:
             return error
 
     output_keys = frozenset({"stable_id", "label", "plugin", "on_write_failure", "required_fields", "business_schema"})
@@ -1707,7 +1829,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     assert nodes is not None
     for index, node in enumerate(nodes):
         path = f"payload.nodes[{index}]"
-        expected = frozenset({"stable_id", "label", "node_type", "plugin", "behavior"})
+        expected = frozenset({"stable_id", "label", "node_type", "plugin", "behavior", "node_options_summary"})
         if (error := _exact_nested_keys(node, expected, path)) is not None:
             return error
         if (error := _canonical_uuid_error(node["stable_id"], f"{path}.stable_id")) is not None:
@@ -1721,6 +1843,14 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
                 return error
         elif node["plugin"] is not None:
             return f"{path}.plugin must be null for a structural node"
+        if (
+            error := _node_options_summary_error(
+                node["node_options_summary"],
+                f"{path}.node_options_summary",
+                plugin=(node["plugin"]["id"] if isinstance(node["plugin"], Mapping) and type(node["plugin"].get("id")) is str else None),
+            )
+        ) is not None:
+            return error
 
     outputs, error = _sequence_of_mappings(payload["outputs"], "payload.outputs")
     if error is not None:

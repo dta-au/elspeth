@@ -657,6 +657,7 @@ export interface ProposePipelinePayload {
       | "row_union";
     plugin: ProposalPluginRef | null;
     behavior: ProposalNodeBehavior;
+    node_options_summary: NodeOptionSummary[];
   }>;
   outputs: Array<{
     stable_id: string;
@@ -664,6 +665,14 @@ export interface ProposePipelinePayload {
     plugin: ProposalPluginRef;
   }>;
   edit_targets: GuidedEditTarget[];
+}
+
+/** One allowlisted node option, pre-rendered server-side as display text.
+ *  The backend owns both the key vocabulary and the rendering (see
+ *  ``_NODE_OPTION_SUMMARY_ALLOWLIST``); the client only labels and prints. */
+export interface NodeOptionSummary {
+  key: string;
+  value: string;
 }
 
 export interface WireRowCardinality {
@@ -727,6 +736,7 @@ export interface WireStageData {
     guaranteed_fields: string[];
     row_cardinality: WireRowCardinality;
     structured_output_fields: WireStructuredOutputField[];
+    node_options_summary: NodeOptionSummary[];
   }>;
   outputs: Array<{
     stable_id: string;

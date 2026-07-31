@@ -12,6 +12,7 @@ import type {
   InspectAndConfirmPayload,
   KnobField,
   MultiSelectWithCustomPayload,
+  NodeOptionSummary,
   Option,
   ProposalBlocker,
   ProposalEndpoint,
@@ -185,6 +186,21 @@ function arrayValue(value: unknown, path: string): unknown[] {
 
 function stringArray(value: unknown, path: string): string[] {
   return arrayValue(value, path).map((item, index) => stringValue(item, `${path}[${index}]`));
+}
+
+/** The allowlisted node options the backend already rendered as display text
+ *  (R2-F3). The key vocabulary is server-owned and enforced server-side, so
+ *  this seam pins the SHAPE — an exact {key, value} string pair — and leaves
+ *  which keys are publishable to the projection's own allowlist. */
+function nodeOptionsSummary(value: unknown, path: string): NodeOptionSummary[] {
+  return arrayValue(value, path).map((item, index) => {
+    const entryPath = `${path}[${index}]`;
+    const entry = exactRecord(item, entryPath, ["key", "value"]);
+    return {
+      key: stringValue(entry.key, `${entryPath}.key`),
+      value: stringValue(entry.value, `${entryPath}.value`),
+    };
+  });
 }
 
 function jsonValue(value: unknown, path: string): unknown {
@@ -542,7 +558,10 @@ function validateProposalPayload(value: unknown, path: string): void {
   });
   const nodes = arrayValue(payload.nodes, `${path}.nodes`).map((item, index): DecodedProposalNode => {
     const nodePath = `${path}.nodes[${index}]`;
-    const node = exactRecord(item, nodePath, ["stable_id", "label", "node_type", "plugin", "behavior"]);
+    const node = exactRecord(item, nodePath, [
+      "stable_id", "label", "node_type", "plugin", "behavior", "node_options_summary",
+    ]);
+    nodeOptionsSummary(node.node_options_summary, `${nodePath}.node_options_summary`);
     const stableId = canonicalUuid(node.stable_id, `${nodePath}.stable_id`);
     addComponent(stableId, "node", `${nodePath}.stable_id`);
     if (stringValue(node.label, `${nodePath}.label`) !== `node-${index + 1}`) invalid(`${nodePath}.label`, "not exact server ordinal");
@@ -1479,7 +1498,9 @@ function decodeProposalPayload(value: unknown, path: string): ProposePipelinePay
   });
   const nodes = arrayValue(payload.nodes, `${path}.nodes`).map((item, index) => {
     const nodePath = `${path}.nodes[${index}]`;
-    const node = exactRecord(item, nodePath, ["stable_id", "label", "node_type", "plugin", "behavior"]);
+    const node = exactRecord(item, nodePath, [
+      "stable_id", "label", "node_type", "plugin", "behavior", "node_options_summary",
+    ]);
     const rawType = decodeProposalNodeType(node.node_type, `${nodePath}.node_type`);
     const plugin = node.plugin === null
       ? null
@@ -1490,6 +1511,7 @@ function decodeProposalPayload(value: unknown, path: string): ProposePipelinePay
       node_type: rawType,
       plugin,
       behavior: decodeProposalBehavior(node.behavior, rawType, nodePath),
+      node_options_summary: nodeOptionsSummary(node.node_options_summary, `${nodePath}.node_options_summary`),
     };
   });
   return {
@@ -1629,7 +1651,7 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
       const nodePath = `${path}.nodes[${index}]`;
       const node = exactRecord(item, nodePath, [
         "stable_id", "label", "node_type", "plugin", "behavior", "required_fields", "guaranteed_fields",
-        "row_cardinality", "structured_output_fields",
+        "row_cardinality", "structured_output_fields", "node_options_summary",
       ]);
       const nodeType = decodeProposalNodeType(node.node_type, `${nodePath}.node_type`);
       const rowCardinality = decodeCardinality(
@@ -1679,6 +1701,7 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
             };
           },
         ),
+        node_options_summary: nodeOptionsSummary(node.node_options_summary, `${nodePath}.node_options_summary`),
       };
     }),
     outputs: arrayValue(payload.outputs, `${path}.outputs`).map((item, index) => {

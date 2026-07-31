@@ -942,6 +942,7 @@ describe("ProposePipelineTurn", () => {
           node_type: "transform",
           plugin: { kind: "transform", id: "llm" },
           behavior: { kind: "transform" },
+          node_options_summary: [],
         },
       ],
       outputs: [

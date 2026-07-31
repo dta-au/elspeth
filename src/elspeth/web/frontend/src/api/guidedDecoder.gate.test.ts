@@ -77,6 +77,7 @@ function wireResponse(gateBehavior: unknown): Record<string, unknown> {
           node_type: "gate",
           plugin: null,
           behavior: gateBehavior,
+          node_options_summary: [],
           required_fields: [],
           guaranteed_fields: [],
           row_cardinality: { input: "one", output: "one", expected_output_count: null },

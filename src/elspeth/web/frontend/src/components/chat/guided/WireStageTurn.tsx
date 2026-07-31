@@ -1,5 +1,5 @@
 import { useId, useState } from "react";
-import type { GuidedEditTarget, ProposalFlow, ProposalNodeBehavior, WireRowCardinality, WireStageData } from "@/types/guided";
+import type { GuidedEditTarget, NodeOptionSummary, ProposalFlow, ProposalNodeBehavior, WireRowCardinality, WireStageData } from "@/types/guided";
 import { focusAcknowledgementCard } from "../AcknowledgementCard";
 import { stepLabelForPlugin } from "../interpretationStepLabel";
 import { WireReviewList } from "./WireReviewList";
@@ -225,15 +225,25 @@ function behaviorDetails(
   }
 }
 
+/** "Mapping: a → b" — the server-owned option key as a sentence-case label
+ *  beside the value the backend already rendered (R2-F3). */
+export function nodeOptionText(entry: NodeOptionSummary): string {
+  const label = humanToken(entry.key);
+  return `${label.charAt(0).toUpperCase()}${label.slice(1)}: ${entry.value}`;
+}
+
 /** The verbatim engineer-grade row, preserved behind the Technical details
  *  expander for operators (same idiom as the validation summary's raw dump). */
 function rawEdgeRow(edge: WireEdge, routeKeys: ReadonlyMap<string, string>): string {
+  // A null contract is not a pending check: the validator emits no contract
+  // row at all when the consumer requires nothing, so there is nothing left to
+  // check. "(contract unchecked)" read as a check that never arrives.
   const status =
     edge.satisfied === true
       ? "(connected)"
       : edge.satisfied === false
         ? "(not satisfied)"
-        : "(contract unchecked)";
+        : "(no required fields — contract not applicable)";
   const missing =
     edge.missing_fields.length > 0
       ? ` Missing fields: ${edge.missing_fields.join(", ")}`
@@ -414,6 +424,9 @@ export function WireStageTurn({
                   <p>{fieldsText("Required", node.required_fields)}</p>
                   <p>{fieldsText("Guaranteed", node.guaranteed_fields)}</p>
                   {behaviorDetails(node.behavior, routeDestinationFor(node.stable_id)).map((detail) => <p key={detail}>{detail}</p>)}
+                  {node.node_options_summary.map((entry) => (
+                    <p key={entry.key}>{nodeOptionText(entry)}</p>
+                  ))}
                   {node.structured_output_fields.length > 0 ? (
                     <ul aria-label={`${node.label} structured output fields`}>
                       {node.structured_output_fields.map((field) => (

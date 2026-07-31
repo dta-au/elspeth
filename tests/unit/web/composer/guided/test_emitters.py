@@ -170,6 +170,60 @@ def _gate_state() -> CompositionState:
     )
 
 
+def _field_mapper_state(*, plugin: str = "field_mapper", options: dict[str, object] | None = None) -> CompositionState:
+    """One source feeding a single transform whose options carry the key knobs."""
+
+    return CompositionState(
+        source=None,
+        sources={
+            "rows": SourceSpec(
+                plugin="csv",
+                on_success="rename",
+                options={"schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="rename",
+                node_type="transform",
+                plugin=plugin,
+                input="rename",
+                on_success="combined",
+                on_error="discard",
+                options=(
+                    options
+                    if options is not None
+                    else {
+                        "schema": {"mode": "observed"},
+                        "mapping": {"given_name": "first_name", "meta.source": "origin"},
+                        "select_only": True,
+                        "strict": True,
+                        "description": "/private/secrets.txt",
+                    }
+                ),
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="combined",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(name="Transform option review", description=""),
+        version=1,
+    )
+
+
 def _schema_output_state(fields: list[object]) -> CompositionState:
     return CompositionState(
         source=SourceSpec(
@@ -544,6 +598,53 @@ class TestStep4WireEmitter:
         }
         assert "/private/result.jsonl" not in str(turn)
         assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
+    def test_field_mapper_options_summary_projects_only_the_allowlisted_knobs(self) -> None:
+        # R2-F3: the review surfaces rendered the behavior discriminant only, so
+        # a field_mapper read as a generic "transforms each incoming item" and
+        # the operator could not see WHICH fields it renames or that unmapped
+        # fields are dropped. Project those two knobs — and nothing adjacent.
+        turn = _wire_turn(_field_mapper_state())
+
+        node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "field_mapper")
+        assert node["node_options_summary"] == [
+            {"key": "mapping", "value": "given_name → first_name, meta.source → origin"},
+            {"key": "select_only", "value": "only the mapped fields are kept"},
+        ]
+        # Same hygiene rationale as ``_wire_schema``: never project adjacent
+        # path/secret-shaped options, and never a knob outside the allowlist.
+        assert "/private/secrets.txt" not in str(turn)
+        assert "strict" not in str(node["node_options_summary"])
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
+    def test_field_mapper_options_summary_reports_the_pass_through_default(self) -> None:
+        turn = _wire_turn(
+            _field_mapper_state(options={"schema": {"mode": "observed"}, "mapping": {"given_name": "first_name"}, "select_only": False})
+        )
+
+        node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "field_mapper")
+        assert node["node_options_summary"] == [
+            {"key": "mapping", "value": "given_name → first_name"},
+            {"key": "select_only", "value": "unmapped fields pass through"},
+        ]
+
+    def test_options_summary_is_empty_for_a_plugin_outside_the_allowlist(self) -> None:
+        turn = _wire_turn(
+            _field_mapper_state(
+                plugin="passthrough",
+                options={"schema": {"mode": "observed"}, "mapping": {"given_name": "first_name"}, "select_only": True},
+            )
+        )
+
+        node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "passthrough")
+        assert node["node_options_summary"] == []
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
+    def test_options_summary_is_empty_for_a_structural_node_without_a_plugin(self) -> None:
+        turn = _wire_turn(_queue_state())
+
+        queue = next(node for node in turn["payload"]["nodes"] if node["node_type"] == "queue")
+        assert queue["node_options_summary"] == []
 
     def test_aggregation_projection_uses_the_canonical_trigger_contract(self) -> None:
         node = NodeSpec(

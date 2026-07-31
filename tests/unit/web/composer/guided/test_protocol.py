@@ -113,6 +113,7 @@ def _wire_payload_for_cardinality(
             "node_type": node_type,
             "plugin": plugin,
             "behavior": behavior,
+            "node_options_summary": [],
             "required_fields": [],
             "guaranteed_fields": [],
             "row_cardinality": row_cardinality,
@@ -727,6 +728,7 @@ class TestPayloadValidation:
                     "node_type": "queue",
                     "plugin": None,
                     "behavior": {"kind": "queue"},
+                    "node_options_summary": [],
                     "required_fields": [],
                     "guaranteed_fields": [],
                     "row_cardinality": {
