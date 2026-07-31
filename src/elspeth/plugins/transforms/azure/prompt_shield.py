@@ -114,9 +114,29 @@ class AzurePromptShield(BaseAzureSafetyTransform):
     )
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:91d27d2d3ccc1569"
+    source_file_hash: str | None = "sha256:33b27013dff59e4c"
     config_model = AzurePromptShieldConfig
     passes_through_input = True
+    capability_tags: tuple[str, ...] = ("azure", "prompt-shield", "security")
+
+    usage_when_to_use = (
+        "Use as a pre-LLM jailbreak and prompt injection control. Select user_prompt for direct user "
+        "text, document for retrieved context, or both when the same fields need both analyses."
+    )
+    usage_when_not_to_use = (
+        "Not for harmful-content moderation after generation; use azure_content_safety for category "
+        "threshold enforcement. Avoid both when one analysis type is sufficient because it makes two calls."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: azure_prompt_shield\n"
+        "  options:\n"
+        "    endpoint: https://catalogue-safety.cognitiveservices.azure.com\n"
+        "    api_key: {secret_ref: AZURE_CONTENT_SAFETY_KEY}\n"
+        "    fields: [retrieved_context]\n"
+        "    analysis_type: document\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

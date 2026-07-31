@@ -242,9 +242,33 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2c5a53cc0e54a008"
+    source_file_hash: str | None = "sha256:a4cdb705809468b2"
     config_model = BlobFetchConfig
     passes_through_input = True
+    capability_tags: tuple[str, ...] = ("http", "network", "blob")
+
+    usage_when_to_use = (
+        "Use when each row contains an authorized HTTP(S) file URL and the run must preserve the "
+        "original response bytes in the payload store with MIME type, size, and SHA-256 metadata. "
+        "Fetched bytes and later parser output remain untrusted before LLM consumption."
+    )
+    usage_when_not_to_use = (
+        "Not for semantic extraction or authenticated origins: blob_fetch has no origin-auth option. "
+        "Use web_scrape for public HTML page extraction, then a format-specific parser for stored bytes."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: blob_fetch\n"
+        "  options:\n"
+        "    url_field: document_url\n"
+        "    blob_ref_field: document_blob_ref\n"
+        "    allowed_content_types: [text/csv, application/json]\n"
+        "    http:\n"
+        "      abuse_contact: catalogue-ops@example.org\n"
+        "      fetch_reason: Preserve approved public reference files\n"
+        "      allowed_hosts: public_only\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:

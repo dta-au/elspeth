@@ -306,7 +306,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1aa32fa8b982f024"
+    source_file_hash: str | None = "sha256:a89e44b13e69f59c"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -315,20 +315,19 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
 
     usage_when_to_use = (
         "Use when each row names a document already stored in S3 and you need asynchronous Textract "
-        "text, forms, tables, queries, signatures, or layout enrichment with a complete audit trail."
+        "OCR, forms, tables, queries, signatures, or layout enrichment. The runtime identity needs S3 read "
+        "scope, and extracted remote content remains untrusted before LLM consumption."
     )
     usage_when_not_to_use = (
-        "Not for inline bytes or synchronous single-page analysis; use the separate synchronous Textract "
-        "plugin when that surface is available. This transform requires an S3 object locator per row."
+        "Not for inline bytes, document URLs, or synchronous low-latency analysis. This catalogue has no "
+        "registered synchronous Textract transform; stage each document in S3 before using this plugin."
     )
     example_use = (
         "transform:\n"
         "  plugin: aws_textract_document_analysis\n"
         "  options:\n"
         "    region: ap-southeast-2\n"
-        "    auth_mode: secret_refs\n"
-        "    aws_access_key_id: {secret_ref: AWS_ACCESS_KEY_ID}\n"
-        "    aws_secret_access_key: {secret_ref: AWS_SECRET_ACCESS_KEY}\n"
+        "    auth_mode: default_chain\n"
         "    bucket_field: document_bucket\n"
         "    key_field: document_key\n"
         "    feature_types: [TABLES, FORMS]\n"

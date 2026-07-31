@@ -160,9 +160,33 @@ class AzureContentSafety(BaseAzureSafetyTransform):
 
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:99c7979ca759fc26"
+    source_file_hash: str | None = "sha256:20aed8dea71a970a"
     config_model = AzureContentSafetyConfig
     passes_through_input = True
+    capability_tags: tuple[str, ...] = ("azure", "content-safety", "moderation")
+
+    usage_when_to_use = (
+        "Use for Azure harmful-content moderation with explicit hate, violence, sexual, and self-harm "
+        "category threshold values from 0 through 6."
+    )
+    usage_when_not_to_use = (
+        "Not for jailbreak or prompt-injection detection; use azure_prompt_shield for those attacks. "
+        "Threshold 6 is effectively non-blocking because Azure severities never exceed 6."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: azure_content_safety\n"
+        "  options:\n"
+        "    endpoint: https://catalogue-safety.cognitiveservices.azure.com\n"
+        "    api_key: {secret_ref: AZURE_CONTENT_SAFETY_KEY}\n"
+        "    fields: [generated_text]\n"
+        "    thresholds:\n"
+        "      hate: 2\n"
+        "      violence: 2\n"
+        "      sexual: 2\n"
+        "      self_harm: 2\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:

@@ -55,11 +55,37 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f79530b7533b8958"
+    source_file_hash: str | None = "sha256:3f33ede23f7d50ee"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
     _provider: RetrievalProvider | None
+    capability_tags: tuple[str, ...] = ("rag", "retrieval", "vector-search")
+
+    usage_when_to_use = (
+        "Use to retrieve ranked, provenance-bearing context from an existing Chroma collection or "
+        "Azure Search index. Retrieved text is untrusted before LLM consumption even when it comes "
+        "from an approved index."
+    )
+    usage_when_not_to_use = (
+        "Not for corpus indexing or answer generation: populate the collection with chroma_sink or "
+        "an operator-managed indexer, and add an llm transform separately when an answer is required."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: rag_retrieval\n"
+        "  options:\n"
+        "    output_prefix: policy\n"
+        "    query_field: question\n"
+        "    provider: azure_search\n"
+        "    provider_config:\n"
+        "      endpoint: https://catalogue-reference.search.windows.net\n"
+        "      index: approved-documents\n"
+        "      api_key: {secret_ref: AZURE_SEARCH_API_KEY}\n"
+        "      search_mode: hybrid\n"
+        "    top_k: 5\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
