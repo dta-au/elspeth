@@ -3,9 +3,10 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
+import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
-import type { CompositionState } from "@/types/index";
+import type { CompositionState, PluginSummary } from "@/types/index";
 import type { ReadinessRowId } from "@/types/api";
 
 /**
@@ -18,9 +19,16 @@ export const INTERPRETATION_PENDING_RUN_BLOCK_TITLE =
   "Resolve pending interpretation first.";
 
 /**
- * Transform plugins that reach the network during a run (page fetches and
- * external analysis services). Used only to phrase the pre-run disclosure —
- * which nodes appear is always derived from the actual pipeline config.
+ * Fallback transform plugins treated as network-reaching when the plugin
+ * catalog hasn't loaded yet (so `PluginSummary.audit_characteristics` isn't
+ * available to classify by). This set predates the catalog-driven check
+ * below and is Azure-only by history, not by design — it under-discloses
+ * the AWS externals (aws_textract_document_analysis,
+ * aws_bedrock_content_safety, aws_bedrock_prompt_shield, all backend-side
+ * `Determinism.EXTERNAL_CALL`) once R2-F7 (elspeth-27bc704359) surfaced the
+ * gap. Kept ONLY as the no-catalog fallback; whenever the catalog has
+ * loaded, `audit_characteristics` (below) is the sole source of truth so
+ * this list can never drift from the backend's own classification again.
  */
 const NETWORK_FETCH_PLUGINS = new Set([
   "web_scrape",
@@ -29,15 +37,39 @@ const NETWORK_FETCH_PLUGINS = new Set([
   "azure_document_intelligence",
 ]);
 
+/** True if `pluginName` is classified as reaching the network, per the
+ *  catalog's `audit_characteristics` for that transform. */
+function catalogFlagsExternalCall(
+  pluginName: string,
+  catalogTransforms: readonly PluginSummary[],
+): boolean {
+  return catalogTransforms.some(
+    (summary) =>
+      summary.name === pluginName &&
+      summary.audit_characteristics.includes("external_call"),
+  );
+}
+
 /**
  * Derive the pre-run egress disclosure lines from the actual composition
  * (elspeth-c18ad229cc). Nothing here is hardcoded pipeline content: each
  * line names the configured components (sources, LLM nodes and their model
  * option, network-fetching transforms, output sinks) from the live
- * CompositionState. Exported for tests.
+ * CompositionState.
+ *
+ * `catalogTransforms` is the plugin catalog's transform list
+ * (`usePluginCatalogStore((s) => s.transforms)`), the same source of truth
+ * the audit-readiness `plugin_trust` row and
+ * `tests/unit/web/audit_readiness/test_boundary_predicate_parity.py` are
+ * pinned against (R2-F7, elspeth-27bc704359) — a transform is network-
+ * reaching here iff its backend-declared `audit_characteristics` contains
+ * `"external_call"`. `null` means the catalog hasn't loaded yet; the
+ * hardcoded `NETWORK_FETCH_PLUGINS` fallback covers that window only.
+ * Exported for tests.
  */
 export function buildRunEgressSummary(
   compositionState: CompositionState | null,
+  catalogTransforms: readonly PluginSummary[] | null = null,
 ): string[] {
   if (!compositionState) return [];
   const lines: string[] = [];
@@ -68,7 +100,12 @@ export function buildRunEgressSummary(
   }
 
   const networkNodes = compositionState.nodes
-    .filter((node) => node.plugin !== null && NETWORK_FETCH_PLUGINS.has(node.plugin))
+    .filter((node) => {
+      if (node.plugin === null) return false;
+      return catalogTransforms !== null
+        ? catalogFlagsExternalCall(node.plugin, catalogTransforms)
+        : NETWORK_FETCH_PLUGINS.has(node.plugin);
+    })
     .map((node) => `${node.id} (${node.plugin})`);
   if (networkNodes.length > 0) {
     lines.push(`Fetches over the network: ${networkNodes.join(", ")}.`);
@@ -242,6 +279,12 @@ export function ExecuteButton(): JSX.Element | null {
     return cached?.composition_version === compositionVersion ? cached : undefined;
   });
 
+  // R2-F7 (elspeth-27bc704359): the same catalog transforms list the
+  // audit-readiness panel reads, used below to classify network-egress
+  // lines in the pre-run disclosure by `audit_characteristics` rather than
+  // the Azure-only hardcoded fallback.
+  const catalogTransforms = usePluginCatalogStore((s) => s.transforms);
+
   const reactId = useId();
   const describedById = `${reactId}-run-block-reason`;
   const [showRunDisclosure, setShowRunDisclosure] = useState(false);
@@ -297,7 +340,7 @@ export function ExecuteButton(): JSX.Element | null {
     void execute(activeSessionId);
   }
 
-  const egressLines = buildRunEgressSummary(compositionState);
+  const egressLines = buildRunEgressSummary(compositionState, catalogTransforms);
 
   return (
     <>

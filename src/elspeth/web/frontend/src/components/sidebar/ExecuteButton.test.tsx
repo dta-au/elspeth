@@ -12,7 +12,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { resetStore } from "@/test/store-helpers";
-import type { CompositionState } from "@/types/index";
+import type { CompositionState, PluginSummary } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import type { AuditReadinessSnapshot } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
@@ -44,6 +44,23 @@ function makeInterpretationEvent(
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
     resolved_prompt_template_hash: null,
+    ...overrides,
+  };
+}
+
+function makePluginSummary(
+  overrides: Partial<PluginSummary> = {},
+): PluginSummary {
+  return {
+    name: "stub_transform",
+    plugin_type: "transform",
+    description: "",
+    config_fields: [],
+    usage_when_to_use: null,
+    usage_when_not_to_use: null,
+    example_use: null,
+    capability_tags: [],
+    audit_characteristics: [],
     ...overrides,
   };
 }
@@ -773,5 +790,92 @@ describe("buildRunEgressSummary", () => {
       }),
     );
     expect(lines).toEqual(["Writes output: results (csv)."]);
+  });
+
+  // ── Catalog-driven external-effect classification (R2-F7, elspeth-27bc704359) ──
+  //
+  // The hardcoded NETWORK_FETCH_PLUGINS set only covered the Azure-backed
+  // network transforms; the AWS externals (Textract, Bedrock content_safety /
+  // prompt_shield — all Determinism.EXTERNAL_CALL backend-side) never
+  // appeared, under-disclosing the consent dialog. Catalog-driven
+  // classification (audit_characteristics containing "external_call") is now
+  // primary whenever the catalog has loaded; the hardcoded set is only a
+  // catalog-not-yet-loaded fallback.
+
+  it("includes a catalog-classified external_call transform (e.g. AWS Textract) in the network-egress line", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "extract",
+            node_type: "transform",
+            plugin: "aws_textract_document_analysis",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      [
+        makePluginSummary({
+          name: "aws_textract_document_analysis",
+          audit_characteristics: ["external_call"],
+        }),
+      ],
+    );
+
+    expect(lines).toEqual([
+      "Fetches over the network: extract (aws_textract_document_analysis).",
+    ]);
+  });
+
+  it("does not flag a deterministic transform as network egress even with a loaded catalog", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "normalize",
+            node_type: "transform",
+            plugin: "csv_transform",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      [
+        makePluginSummary({
+          name: "csv_transform",
+          audit_characteristics: ["deterministic"],
+        }),
+      ],
+    );
+
+    expect(lines).toEqual([]);
+  });
+
+  it("falls back to the hardcoded network set when the catalog has not loaded yet", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "fetch_page",
+            node_type: "transform",
+            plugin: "web_scrape",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      null,
+    );
+
+    expect(lines).toEqual([
+      "Fetches over the network: fetch_page (web_scrape).",
+    ]);
   });
 });
