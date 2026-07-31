@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import InitVar, dataclass
 from datetime import datetime
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, final, get_args, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, final, get_args
 from uuid import UUID
 
 from elspeth.contracts.auth import AuthProviderType
@@ -2328,7 +2328,6 @@ class ToolCallIDMismatchError(RuntimeError):
         )
 
 
-@runtime_checkable
 class SessionServiceProtocol(Protocol):
     """Protocol for session persistence operations."""
 

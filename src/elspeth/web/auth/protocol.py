@@ -37,7 +37,6 @@ class AuthProvider(Protocol):
         ...
 
 
-@runtime_checkable
 class CredentialAuthProvider(AuthProvider, Protocol):
     """AuthProvider that also supports username/password login and token refresh.
 

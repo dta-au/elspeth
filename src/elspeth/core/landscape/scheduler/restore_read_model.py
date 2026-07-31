@@ -240,6 +240,37 @@ class BarrierRestoreReadModel:
         )
         return frozenset(row.token_id for row in self._ops.execute_fetchall(query))
 
+    def find_released_node_state_token_ids(
+        self,
+        run_id: str,
+        *,
+        node_ids: Sequence[str],
+        token_ids: Sequence[str],
+    ) -> frozenset[str]:
+        """Token ids holding a status-COMPLETED node_state at the given nodes.
+
+        Token-scoped sibling of :meth:`get_released_row_ids_for_nodes`: release
+        evidence for a (node, row) key proves the GROUP released, but a
+        late-arrival residual shares that key while its own closure at the
+        barrier node is FAILED. Restore's released-group reconstruction must
+        admit only tokens the release itself completed.
+        """
+        if not node_ids:
+            return frozenset()
+        result: set[str] = set()
+        for i in range(0, len(token_ids), _TOKEN_ID_CHUNK_SIZE):
+            chunk = list(token_ids[i : i + _TOKEN_ID_CHUNK_SIZE])
+            query = (
+                select(node_states_table.c.token_id)
+                .where(node_states_table.c.run_id == run_id)
+                .where(node_states_table.c.node_id.in_(list(node_ids)))
+                .where(node_states_table.c.token_id.in_(chunk))
+                .where(node_states_table.c.completed_at.isnot(None))
+                .where(node_states_table.c.status == NodeStateStatus.COMPLETED.value)
+            )
+            result.update(row.token_id for row in self._ops.execute_fetchall(query))
+        return frozenset(result)
+
     def find_duplicate_live_buffered_acceptances(self, run_id: str) -> list[tuple[str, int]]:
         """Run-wide sweep for tokens with more than one live BUFFERED outcome."""
         terminal = token_outcomes_table.alias("terminal_outcomes")

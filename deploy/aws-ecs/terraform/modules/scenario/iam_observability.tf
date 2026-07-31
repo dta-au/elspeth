@@ -570,11 +570,43 @@ resource "aws_cloudwatch_metric_alarm" "operator_export_failures" {
   treat_missing_data  = "notBreaching"
   alarm_actions       = concat([aws_sns_topic.operator_alarms.arn], var.alarm_actions)
 
+  # The failure and drop counters are cumulative per task, so a replacement
+  # task restarts them near zero. Summing identities before DIFF folds that
+  # reset into one negative delta that the clamp discards along with the new
+  # task's first real failures; each series is therefore diffed and clamped
+  # on its own before the sum. CloudWatch allows at most 10 metric queries
+  # per alarm and this shape uses 4N + 1 for N identities (N is at most 2).
   metric_query {
-    id          = "combined"
-    expression  = "IF(DIFF(SUM(METRICS())) > 0, DIFF(SUM(METRICS())), 0)"
+    id = "combined"
+    expression = format(
+      "SUM([%s])",
+      join(", ", concat(
+        [for id in keys(local.cloudwatch_dimension_maps_by_id) : "delta_failures_${id}"],
+        [for id in keys(local.cloudwatch_dimension_maps_by_id) : "delta_drops_${id}"],
+      )),
+    )
     label       = "New export failures or queue drops"
     return_data = true
+  }
+
+  dynamic "metric_query" {
+    for_each = local.cloudwatch_dimension_maps_by_id
+
+    content {
+      id          = "delta_failures_${metric_query.key}"
+      expression  = "IF(DIFF(failures_${metric_query.key}) > 0, DIFF(failures_${metric_query.key}), 0)"
+      return_data = false
+    }
+  }
+
+  dynamic "metric_query" {
+    for_each = local.cloudwatch_dimension_maps_by_id
+
+    content {
+      id          = "delta_drops_${metric_query.key}"
+      expression  = "IF(DIFF(drops_${metric_query.key}) > 0, DIFF(drops_${metric_query.key}), 0)"
+      return_data = false
+    }
   }
 
   dynamic "metric_query" {

@@ -918,3 +918,9 @@ installer removes inline policies and the known managed attachment before the
 lifecycle principal deletes each role. The lifecycle principal then deletes
 the custom boundary only during the final bootstrap destroy. Repeated apply
 and full `terraform destroy` commands remain the supported idempotent workflow.
+
+The three installer policies and the lifecycle policy attached before
+bootstrap live outside every Terraform state, so no destroy removes them.
+After the bootstrap destroy succeeds — both destroys still need those
+policies — detach and delete all four through the same paths used to attach
+them.

@@ -1136,18 +1136,101 @@ class BarrierRecoveryCoordinator:
                     for node_id, row_id in released_pairs
                     if node_id in node_id_to_row_union_name
                 }
-                released_keys = {
-                    (str(item.barrier_key), item.row_id) for item in holdless if (str(item.barrier_key), item.row_id) in released_group_keys
-                }
-                for released_key in sorted(released_keys):
-                    row_union_released_groups.append(
-                        [item for item in row_union_items if (str(item.barrier_key), item.row_id) == released_key]
+                released_candidates = [item for item in holdless if (str(item.barrier_key), item.row_id) in released_group_keys]
+                # Token-scoped membership (§E.3a residuals): release evidence
+                # proves the KEY released, not that THIS token was in the
+                # released group. A surplus branch token that failed late
+                # AFTER the release shares the row id, but its own closure at
+                # the union node is FAILED — grouping it here would hand
+                # reconcile_released_group an incomplete branch set and wedge
+                # the resume. Only tokens the release itself completed
+                # (status-COMPLETED state at the union node) reconstruct the
+                # group; everything else under a released key is a stranded
+                # late-arrival residual. Scoped per candidate's OWN barrier
+                # node: released tokens keep their token ids downstream, so a
+                # residual at a later union in a chained-union pipeline still
+                # holds a COMPLETED state at the earlier union and must not
+                # borrow membership from it.
+                member_token_ids: set[str] = set()
+                candidates_by_node: dict[str, list[TokenWorkItem]] = {}
+                for item in released_candidates:
+                    node_id_str = str(self._row_union_node_ids[RowUnionName(str(item.barrier_key))])
+                    candidates_by_node.setdefault(node_id_str, []).append(item)
+                for node_id_str in sorted(candidates_by_node):
+                    member_token_ids.update(
+                        self._barrier_restore_reads.find_released_node_state_token_ids(
+                            self._run_id,
+                            node_ids=[node_id_str],
+                            token_ids=[item.token_id for item in candidates_by_node[node_id_str]],
+                        )
                     )
-                row_union_holdless_items = [item for item in holdless if (str(item.barrier_key), item.row_id) not in released_keys]
+                residuals = [item for item in released_candidates if item.token_id not in member_token_ids]
+                residual_token_ids = {item.token_id for item in residuals}
+                residual_terminal_ids: frozenset[str] = frozenset()
+                if residuals:
+                    residual_terminal_ids = self._barrier_restore_reads.find_failed_unrouted_terminal_token_ids(
+                        self._run_id, [item.token_id for item in residuals]
+                    )
+                for item in residuals:
+                    if item.token_id not in residual_terminal_ids:
+                        continue
+                    # The residual's audit trail is already terminal
+                    # (_fail_late_arrival committed the FAILED state and the
+                    # FAILURE/UNROUTED outcome); only its BLOCKED journal row
+                    # survived the crash. Journal-release it under this
+                    # leader's coordination token, mirroring the live arm.
+                    released = self._scheduler.mark_blocked_barrier_terminal(
+                        run_id=self._run_id,
+                        barrier_key=str(item.barrier_key),
+                        token_ids=(item.token_id,),
+                        now=now,
+                        coordination_token=self._coordination_token,
+                        release_context={
+                            "late_arrival": True,
+                            "reason": "late_arrival_after_release",
+                            "released_by": self._scheduler_lease_owner,
+                            "scope_row_id": item.row_id,
+                            "restore_reconcile": True,
+                        },
+                    )
+                    if released != 1:
+                        raise AuditIntegrityError(
+                            f"Restore §E.3a row_union reconcile: late-arrival release for token {item.token_id!r} "
+                            f"at row_union {item.barrier_key!r} (run {self._run_id!r}) terminalized "
+                            f"{released} rows; expected exactly one."
+                        )
+                    logger.info(
+                        "barrier journal restore: §E.3a reconcile released late-arrival residual token %s at row_union %s/%s (run %s)",
+                        item.token_id,
+                        item.barrier_key,
+                        item.row_id,
+                        self._run_id,
+                    )
+                member_keys = {(str(item.barrier_key), item.row_id) for item in released_candidates if item.token_id in member_token_ids}
+                for released_key in sorted(member_keys):
+                    row_union_released_groups.append(
+                        [
+                            item
+                            for item in row_union_items
+                            if (str(item.barrier_key), item.row_id) == released_key and item.token_id not in residual_token_ids
+                        ]
+                    )
+                # A residual without a recorded terminal outcome (crash before
+                # record_token_outcome, or adoption committed but accept()
+                # never ran) has an incomplete audit trail: reset it to
+                # intake-pending with the other holdless non-members so the
+                # live late-arrival arm replays state + outcome + release on
+                # re-accept.
+                row_union_holdless_items = [
+                    item
+                    for item in holdless
+                    if (str(item.barrier_key), item.row_id) not in released_group_keys
+                    or (item.token_id in residual_token_ids and item.token_id not in residual_terminal_ids)
+                ]
                 row_union_items = [
                     item
                     for item in row_union_items
-                    if item.token_id in row_union_state_ids and (str(item.barrier_key), item.row_id) not in released_keys
+                    if item.token_id in row_union_state_ids and (str(item.barrier_key), item.row_id) not in member_keys
                 ]
 
             if row_union_holdless_items:
