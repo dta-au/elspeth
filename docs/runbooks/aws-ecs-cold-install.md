@@ -429,6 +429,7 @@ cleanup deadline used by bootstrap, then set:
   `/0` prefix, so do not open the listener to the internet;
 - `iam_permissions_boundary_arn = "$BOUNDARY_ARN"`;
 - `cloudwatch_agent_image = "$CLOUDWATCH_AGENT_IMAGE"`;
+- `cloudwatch_agent_ecr_repository = "$AGENT_REPOSITORY"`;
 - `composer_model = "bedrock/$PRIMARY_PROFILE_ID"`;
 - `composer_advisor_model = "bedrock/$ADVISOR_PROFILE_ID"`;
 - `bedrock_inference_profile_arns` to the exact two profile ARNs;
@@ -569,13 +570,11 @@ section states the required bundle digest, CA label, and
 Inspect Terraform's generated command, then enable the service explicitly:
 
 ```bash
-terraform -chdir=scenario-a output -raw service_enable_command
+SERVICE_ENABLE_COMMAND="$(terraform -chdir=scenario-a output -raw service_enable_command)"
+printf '%s\n' "$SERVICE_ENABLE_COMMAND"
+bash -Eeuo pipefail -c "$SERVICE_ENABLE_COMMAND"
 
 ECS_SERVICE=$(terraform -chdir=scenario-a output -raw service_name)
-aws ecs update-service \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
-  --desired-count 1 >/dev/null
 aws ecs wait services-stable \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
@@ -604,7 +603,7 @@ aws ecs describe-tasks \
   --query 'tasks[0].containers[].[name,lastStatus,healthStatus]' \
   --output table
 
-NAMESPACE=${ECS_CLUSTER%-cluster}
+NAMESPACE="$scenario_a_namespace"
 aws logs describe-log-groups \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --log-group-name-prefix "/aws/ecs/${NAMESPACE}" \

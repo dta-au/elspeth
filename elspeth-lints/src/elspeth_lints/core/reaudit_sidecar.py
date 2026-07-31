@@ -57,13 +57,14 @@ Tail-truncation recovery (T6c, CRITICAL): a SIGKILL between the writer's
 with N complete lines + 1 partial final line (no trailing newline). The
 loader distinguishes:
 
-* **Tail truncation** — last line fails JSON parse AND the file does
-  not end with ``\\n``. Treat as "process killed mid-write", log a
-  structured warning to stderr naming the byte offset, return the prior
-  complete outcomes. ``--render-incomplete`` then surfaces the recovered
-  view; ``--resume`` continues from the next entry. The dead in-flight
-  entry will be re-classified on resume.
-* **Mid-file corruption** — a non-last line fails to parse, or the
+* **Tail truncation** — last line ends inside a multibyte UTF-8
+  codepoint or fails JSON syntax decoding AND the file does not end with
+  ``\\n``. Treat as "process killed mid-write", log a structured warning
+  to stderr naming the byte offset, return the prior complete outcomes.
+  ``--render-incomplete`` then surfaces the recovered view; ``--resume``
+  continues from the next entry. The dead in-flight entry will be
+  re-classified on resume.
+* **Mid-file corruption** — a non-last line fails to decode, or the
   trailing-newline-test indicates the partial line is followed by more
   bytes. Tier-1 corruption: crash with ``SidecarCorruptError`` carrying
   line number + byte offset. Hand-editing, kernel page-cache
@@ -71,11 +72,12 @@ loader distinguishes:
   recoverable.
 
 This is the deliberate exception to "crash on Tier-1 corruption" carved
-out by the sidecar's whole purpose. It is bounded to ``JSONDecodeError``
-on the LAST line of a no-trailing-newline file; lines that parse JSON
-but fail structured validation (``_outcome_from_dict`` raising) stay
-sweep-fatal even on the last line — evidence corruption looking like a
-valid prefix is still corruption.
+out by the sidecar's whole purpose. It is bounded to an incomplete
+UTF-8 codepoint at EOF or ``JSONDecodeError`` on the LAST line of a
+no-trailing-newline file; other Unicode failures and lines that decode
+but fail strict JSON or structured validation (``_outcome_from_dict``
+raising) stay sweep-fatal even on the last line — evidence corruption
+looking like a valid prefix is still corruption.
 
 Retention (T6c): sidecars with a trailer (completed sweeps) are deleted
 lazily by ``SidecarWriter.__enter__`` when older than
@@ -100,11 +102,14 @@ recovery action destroys the data the read-side fix preserved.
 line INSIDE the flock-held window, AFTER the resume-validate callback
 runs and BEFORE the first append. If the final line parses as JSON, it
 is already durable data and the writer appends the missing newline. If
-the final line does not parse as JSON, it is the true partial-write case
-and is truncated at ``rfind(b"\\n") + 1`` (keep the final newline; drop
-the partial bytes after it). Persistence: ``os.ftruncate`` or newline
-append on the open fd, ``os.fsync`` of the fd, then ``os.fsync`` of the
-parent directory to make the repair durable across crashes.
+strict decoding reaches an incomplete UTF-8 codepoint at EOF or a JSON
+syntax error, it is the true partial-write case and is truncated at
+``rfind(b"\\n") + 1`` (keep the final newline; drop the partial bytes
+after it). Other Unicode failures and strict semantic violations such
+as duplicate keys or non-JSON numeric constants remain fatal
+corruption. Persistence: ``os.ftruncate`` or newline append on the open
+fd, ``os.fsync`` of the fd, then ``os.fsync`` of the parent directory to
+make the repair durable across crashes.
 
 The malformed partial last line is unrecoverable data — that is the
 deliberate Tier-1 trade-off: losing the one in-flight outcome (which
@@ -167,6 +172,11 @@ SIDECAR_DIRNAME = ".reaudit-state"
 # enough that a routine reaudit cadence keeps the directory bounded.
 COMPLETED_SIDECAR_RETENTION_DAYS = 30
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _is_incomplete_utf8_at_eof(exc: UnicodeDecodeError, payload: bytes) -> bool:
+    """Return whether decoding stopped on a multibyte codepoint split at EOF."""
+    return exc.reason == "unexpected end of data" and exc.end == len(payload)
 
 
 # =========================================================================
@@ -311,16 +321,17 @@ class SidecarWriter:
     with ``os.ftruncate`` or newline append on the locked fd plus an
     ``os.fsync`` of the file and the parent directory. A final line that
     parses as JSON is durable data and is preserved by appending the
-    missing newline. A final line that does not parse is the deliberate
-    Tier-1 trade-off documented at module scope: the partial last line
-    (a SIGKILL'd in-flight write, never durably persisted) is LOST, but
-    everything written before it is preserved, and the new outcomes
-    append cleanly without gluing onto a truncated tail. Without this
-    repair, POSIX append-mode writes start at the mid-line byte offset
-    and produce a glued line. The repair runs AFTER ``on_resume_locked``
-    (so a rejected resume leaves the file untouched) and INSIDE the
-    flock window (so a second process cannot append between read-and-
-    repair).
+    missing newline. An incomplete UTF-8 codepoint at EOF or a JSON
+    syntax error is the deliberate Tier-1 trade-off documented at module
+    scope: the partial last line (a SIGKILL'd in-flight write, never
+    durably persisted) is LOST, but everything written before it is
+    preserved, and the new outcomes append cleanly without gluing onto a
+    truncated tail. Other Unicode failures and strict semantic
+    violations remain fatal corruption. Without this repair, POSIX
+    append-mode writes start at the mid-line byte offset and produce a
+    glued line. The repair runs AFTER ``on_resume_locked`` (so a rejected
+    resume leaves the file untouched) and INSIDE the flock window (so a
+    second process cannot append between read-and-repair).
     """
 
     def __init__(
@@ -416,10 +427,13 @@ class SidecarWriter:
         Reads the on-disk bytes (we hold the exclusive flock, so no
         other process can have appended since the fd was opened). If
         the final line parses as JSON, it is a complete durable sidecar
-        line missing only the separator byte, so append ``\\n``. If it
-        does not parse, locate the last newline and ``ftruncate`` to one
-        past it. Then ``fsync`` the fd and parent directory so the repair
-        survives a crash before the next file-content write.
+        line missing only the separator byte, so append ``\\n``. If
+        decoding reaches an incomplete UTF-8 codepoint at EOF or a JSON
+        syntax error, locate the last newline and ``ftruncate`` to one
+        past it. Other Unicode failures and strict semantic violations
+        remain fatal corruption. Then ``fsync`` the fd and parent
+        directory so the repair survives a crash before the next
+        file-content write.
 
         Failure modes propagate as :class:`OSError` (disk full,
         permission, EIO from the underlying device) — those are
@@ -441,8 +455,17 @@ class SidecarWriter:
         if tail.strip():
             try:
                 strict_json_loads(tail.decode("utf-8"))
-            except (UnicodeDecodeError, StrictJSONError):
-                pass
+            except UnicodeDecodeError as exc:
+                if not _is_incomplete_utf8_at_eof(exc, tail):
+                    raise SidecarCorruptError(
+                        f"sidecar {self._sidecar_path} final unterminated line (byte offset {last_newline + 1}): invalid UTF-8: {exc}"
+                    ) from exc
+            except StrictJSONError as exc:
+                if not isinstance(exc.__cause__, json.JSONDecodeError):
+                    raise SidecarCorruptError(
+                        f"sidecar {self._sidecar_path} final unterminated line "
+                        f"(byte offset {last_newline + 1}): strict JSON corruption: {exc}"
+                    ) from exc
             else:
                 self._file.write("\n")
                 self._file.flush()
@@ -576,8 +599,9 @@ def load_sidecar(sidecar_path: Path) -> LoadedSidecar:
     * trailer ``run_id`` mismatch with header
     * more than one header or trailer
 
-    RECOVERS from (T6c CRITICAL): the LAST line failing JSON parse when
-    the file does NOT end with a newline. Treats this as "process killed
+    RECOVERS from (T6c CRITICAL): the LAST line ending inside a
+    multibyte UTF-8 codepoint or failing JSON syntax decoding when the
+    file does NOT end with a newline. Treats this as "process killed
     between write() and the next flush()+fsync()" and:
 
     * Logs a structured warning to stderr naming the byte offset of the
@@ -589,27 +613,27 @@ def load_sidecar(sidecar_path: Path) -> LoadedSidecar:
       ``classified_keys``); ``--render-incomplete`` will report it via
       ``entries_dispatched < total_entries``
 
-    The recovery path is bounded to ``JSONDecodeError`` on the final line
-    of a file missing its terminating newline. Lines that JSON-parse but
-    fail structured validation stay sweep-fatal even on the last line —
-    evidence corruption that looks like a valid prefix is still
-    corruption.
+    The recovery path is bounded to an incomplete UTF-8 codepoint at
+    EOF or ``JSONDecodeError`` on the final line of a file missing its
+    terminating newline. Other Unicode failures and lines that decode
+    but fail strict JSON or structured validation stay sweep-fatal even
+    on the last line — evidence corruption that looks like a valid
+    prefix is still corruption.
     """
     if not sidecar_path.exists():
         raise SidecarCorruptError(f"sidecar {sidecar_path} does not exist")
     raw_bytes = sidecar_path.read_bytes()
     if not raw_bytes:
         raise SidecarCorruptError(f"sidecar {sidecar_path} is empty (no header line)")
-    text = raw_bytes.decode("utf-8")
     # The writer's discipline (line + "\n" → flush → fsync, all in
     # _write_line) guarantees every COMPLETE line ends in "\n". Absence
     # of a trailing newline therefore implies the final line was being
     # written when the process died.
-    ends_with_newline = text.endswith("\n")
+    ends_with_newline = raw_bytes.endswith(b"\n")
     # keepends=True so we can compute per-line byte offsets for the
     # truncation warning. Empty / whitespace-only entries are skipped at
     # the consumption site below.
-    raw_lines_with_eol = text.splitlines(keepends=True)
+    raw_lines_with_eol = raw_bytes.splitlines(keepends=True)
     if not raw_lines_with_eol:
         raise SidecarCorruptError(f"sidecar {sidecar_path} is empty (no header line)")
 
@@ -623,15 +647,32 @@ def load_sidecar(sidecar_path: Path) -> LoadedSidecar:
     for line_index, raw_with_eol in enumerate(raw_lines_with_eol):
         line_no = line_index + 1
         line_offset = running_offset
-        running_offset += len(raw_with_eol.encode("utf-8"))
-        raw = raw_with_eol.rstrip("\n")
-        if not raw.strip():
+        running_offset += len(raw_with_eol)
+        raw_line = raw_with_eol.rstrip(b"\n")
+        if not raw_line.strip():
             continue
         is_last_line = line_index == last_index
         try:
+            raw = raw_line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            is_incomplete_utf8_tail = _is_incomplete_utf8_at_eof(exc, raw_line)
+            if is_incomplete_utf8_tail and is_last_line and not ends_with_newline:
+                sys.stderr.write(
+                    f"reaudit sidecar {sidecar_path}: partial final line "
+                    f"detected at byte offset {line_offset} "
+                    f"(no trailing newline; UTF-8 decode failed: {exc}). "
+                    "Treating as 'process killed mid-write'; the in-flight "
+                    "outcome is dropped and will be re-classified on "
+                    f"--resume. {len(outcomes)} prior complete outcome(s) "
+                    "recovered.\n"
+                )
+                break
+            raise SidecarCorruptError(f"sidecar {sidecar_path} line {line_no} (byte offset {line_offset}): invalid UTF-8: {exc}") from exc
+        try:
             payload = strict_json_loads(raw)
         except StrictJSONError as exc:
-            if is_last_line and not ends_with_newline:
+            is_decoder_error = isinstance(exc.__cause__, json.JSONDecodeError)
+            if is_decoder_error and is_last_line and not ends_with_newline:
                 # T6c recovery — partial last line from SIGKILL between
                 # write() and flush()+fsync(). The in-flight outcome is
                 # lost; everything written before it is durable. Log to

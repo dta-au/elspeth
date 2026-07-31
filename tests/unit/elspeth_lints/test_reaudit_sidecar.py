@@ -22,6 +22,7 @@ from elspeth_lints.core.allowlist import AllowlistEntry, JudgeVerdict
 from elspeth_lints.core.reaudit_sidecar import (
     SidecarCorruptError,
     SidecarHeader,
+    SidecarWriter,
     _entry_from_dict,
     _entry_to_dict,
     _header_to_dict,
@@ -134,8 +135,8 @@ def _write_sidecar(path: Path, *lines: str) -> None:
     path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
 
-def _valid_header_line() -> str:
-    header = SidecarHeader(
+def _valid_header() -> SidecarHeader:
+    return SidecarHeader(
         run_id="a" * 32,
         started_at=datetime(2026, 7, 31, tzinfo=UTC),
         total_entries=1,
@@ -147,7 +148,10 @@ def _valid_header_line() -> str:
         limit=None,
         include_pre_judge=False,
     )
-    return json.dumps(_header_to_dict(header), sort_keys=True)
+
+
+def _valid_header_line() -> str:
+    return json.dumps(_header_to_dict(_valid_header()), sort_keys=True)
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
@@ -183,3 +187,162 @@ def test_load_sidecar_rejects_duplicate_object_keys(tmp_path: Path) -> None:
     with pytest.raises(SidecarCorruptError) as exc_info:
         load_sidecar(sidecar)
     assert "duplicate JSON object key" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("corrupt_tail", "expected_error"),
+    [
+        ('{"type": "outcome", "key": "a", "key": "b"}', "duplicate JSON object key"),
+        ('{"type": "outcome", "judge_confidence": NaN}', "non-JSON numeric constant"),
+        ('{"type": "outcome", "judge_confidence": Infinity}', "non-JSON numeric constant"),
+        ('{"type": "outcome", "judge_confidence": -Infinity}', "non-JSON numeric constant"),
+    ],
+)
+def test_load_sidecar_rejects_complete_unterminated_strict_json_corruption(
+    tmp_path: Path,
+    corrupt_tail: str,
+    expected_error: str,
+) -> None:
+    """A complete strict-JSON violation is corruption even without a final newline."""
+    sidecar = tmp_path / "sweep.jsonl"
+    original = (_valid_header_line() + "\n" + corrupt_tail).encode()
+    sidecar.write_bytes(original)
+
+    with pytest.raises(SidecarCorruptError) as exc_info:
+        load_sidecar(sidecar)
+
+    assert "line 2" in str(exc_info.value)
+    assert expected_error in str(exc_info.value)
+    assert sidecar.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("corrupt_tail", "expected_error"),
+    [
+        ('{"type": "outcome", "key": "a", "key": "b"}', "duplicate JSON object key"),
+        ('{"type": "outcome", "judge_confidence": NaN}', "non-JSON numeric constant"),
+        ('{"type": "outcome", "judge_confidence": Infinity}', "non-JSON numeric constant"),
+        ('{"type": "outcome", "judge_confidence": -Infinity}', "non-JSON numeric constant"),
+    ],
+)
+def test_sidecar_writer_refuses_complete_unterminated_strict_json_corruption_without_mutation(
+    tmp_path: Path,
+    corrupt_tail: str,
+    expected_error: str,
+) -> None:
+    """Append repair must not truncate a complete strict-JSON violation."""
+    sidecar = tmp_path / ".reaudit-state" / "sweep.jsonl"
+    sidecar.parent.mkdir()
+    original = (_valid_header_line() + "\n" + corrupt_tail).encode()
+    sidecar.write_bytes(original)
+
+    with pytest.raises(SidecarCorruptError) as exc_info, SidecarWriter(sidecar, _valid_header(), append=True):
+        pass
+
+    assert expected_error in str(exc_info.value)
+    assert sidecar.read_bytes() == original
+
+
+def test_load_sidecar_recovers_final_tail_split_inside_utf8_codepoint(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A killed write may leave only the first byte of a multibyte character."""
+    sidecar = tmp_path / "sweep.jsonl"
+    header = _valid_header_line().encode() + b"\n"
+    partial_tail = b'{"type": "outcome", "fresh_rationale": "\xe2'
+    sidecar.write_bytes(header + partial_tail)
+
+    loaded = load_sidecar(sidecar)
+
+    assert loaded.header.run_id == _valid_header().run_id
+    assert loaded.outcomes == ()
+    assert loaded.trailer is None
+    warning = capsys.readouterr().err
+    assert "partial final line" in warning
+    assert f"byte offset {len(header)}" in warning
+    assert "UTF-8 decode failed" in warning
+
+
+def test_sidecar_writer_resume_repairs_final_tail_split_inside_utf8_codepoint(tmp_path: Path) -> None:
+    """Resume validates under lock, then truncates the split UTF-8 tail."""
+    sidecar = tmp_path / ".reaudit-state" / "sweep.jsonl"
+    sidecar.parent.mkdir()
+    header = _valid_header_line().encode() + b"\n"
+    partial_tail = b'{"type": "outcome", "fresh_rationale": "\xe2'
+    sidecar.write_bytes(header + partial_tail)
+    loaded_under_lock = []
+
+    with SidecarWriter(
+        sidecar,
+        _valid_header(),
+        append=True,
+        on_resume_locked=loaded_under_lock.append,
+    ):
+        pass
+
+    assert len(loaded_under_lock) == 1
+    assert loaded_under_lock[0].header.run_id == _valid_header().run_id
+    assert sidecar.read_bytes() == header
+    assert load_sidecar(sidecar).outcomes == ()
+
+
+_COMPLETE_INVALID_UTF8_TAILS = [
+    pytest.param(b"\xff", "invalid start byte", id="invalid-start-byte"),
+    pytest.param(b"\xe2X", "invalid continuation byte", id="invalid-continuation-byte"),
+]
+
+
+@pytest.mark.parametrize(("corrupt_sequence", "expected_reason"), _COMPLETE_INVALID_UTF8_TAILS)
+def test_load_sidecar_rejects_complete_unterminated_invalid_utf8_without_mutation(
+    tmp_path: Path,
+    corrupt_sequence: bytes,
+    expected_reason: str,
+) -> None:
+    """Complete invalid UTF-8 is corruption, not an interrupted codepoint."""
+    sidecar = tmp_path / "sweep.jsonl"
+    original = _valid_header_line().encode() + b'\n{"type": "outcome", "fresh_rationale": "' + corrupt_sequence + b'"}'
+    sidecar.write_bytes(original)
+
+    with pytest.raises(SidecarCorruptError, match=expected_reason):
+        load_sidecar(sidecar)
+
+    assert sidecar.read_bytes() == original
+
+
+@pytest.mark.parametrize(("corrupt_sequence", "expected_reason"), _COMPLETE_INVALID_UTF8_TAILS)
+def test_sidecar_writer_refuses_complete_unterminated_invalid_utf8_without_mutation(
+    tmp_path: Path,
+    corrupt_sequence: bytes,
+    expected_reason: str,
+) -> None:
+    """Append repair must not truncate complete invalid UTF-8."""
+    sidecar = tmp_path / ".reaudit-state" / "sweep.jsonl"
+    sidecar.parent.mkdir()
+    original = _valid_header_line().encode() + b'\n{"type": "outcome", "fresh_rationale": "' + corrupt_sequence + b'"}'
+    sidecar.write_bytes(original)
+
+    with pytest.raises(SidecarCorruptError, match=expected_reason), SidecarWriter(sidecar, _valid_header(), append=True):
+        pass
+
+    assert sidecar.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        b'{"type": "outcome", "fresh_rationale": "\xe2\n',
+        b'{"type": "outcome", "fresh_rationale": "\xe2\n{}\n',
+    ],
+    ids=["newline-terminated-final-line", "non-final-line"],
+)
+def test_load_sidecar_rejects_invalid_utf8_outside_recoverable_final_tail(
+    tmp_path: Path,
+    suffix: bytes,
+) -> None:
+    """Invalid UTF-8 is recoverable only in the final unterminated line."""
+    sidecar = tmp_path / "sweep.jsonl"
+    sidecar.write_bytes(_valid_header_line().encode() + b"\n" + suffix)
+
+    with pytest.raises(SidecarCorruptError, match="invalid UTF-8"):
+        load_sidecar(sidecar)

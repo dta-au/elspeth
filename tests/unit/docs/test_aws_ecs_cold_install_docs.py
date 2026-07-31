@@ -104,6 +104,40 @@ def test_cold_install_fails_closed_on_identity_images_and_database_admission() -
     assert "Do not paste environment or secret arrays" in text
 
 
+def test_cold_install_sets_the_agent_repository_for_scenario_a() -> None:
+    text = _read(RUNBOOK)
+    scenario = text[text.index("## 6. Configure Scenario A") : text.index("## 7. Plan and create the stack")]
+    repository_input = '- `cloudwatch_agent_ecr_repository = "$AGENT_REPOSITORY"`;'
+    placeholder_gate = "! rg -n 'REPLACE_WITH|2030-01-01'"
+
+    assert repository_input in scenario
+    assert scenario.index(repository_input) < scenario.index(placeholder_gate)
+
+
+def test_cold_install_executes_terraform_service_enable_command() -> None:
+    text = _read(RUNBOOK)
+    enable = text[text.index("## 9. Enable and verify the service") : text.index("## Troubleshooting")]
+    output_command = "terraform -chdir=scenario-a output -raw service_enable_command"
+    capture = f'SERVICE_ENABLE_COMMAND="$({output_command})"'
+    display = "printf '%s\\n' \"$SERVICE_ENABLE_COMMAND\""
+    execute = 'bash -Eeuo pipefail -c "$SERVICE_ENABLE_COMMAND"'
+
+    assert enable.count(output_command) == 1
+    assert capture in enable
+    assert display in enable
+    assert execute in enable
+    assert enable.index(capture) < enable.index(display) < enable.index(execute)
+
+
+def test_cold_install_uses_the_scenario_namespace_for_monitoring() -> None:
+    text = _read(RUNBOOK)
+    verify = text[text.index("Verify the application and monitoring sidecar:") : text.index("Trust the temporary ALB")]
+
+    assert 'export scenario_a_namespace="a-$(printf \'%s\\0A\' "$RUN_ID" | sha256sum | cut -c1-20)"' in text
+    assert 'NAMESPACE="$scenario_a_namespace"' in verify
+    assert "${ECS_CLUSTER%-cluster}" not in verify
+
+
 def test_cold_install_teardown_is_scenario_then_bootstrap_with_orphan_check() -> None:
     text = _read(RUNBOOK)
     teardown = text[text.index("## Teardown") :]
