@@ -117,10 +117,10 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:33cf043c6f597d8f"
+    source_file_hash: str | None = "sha256:a7516a8fa7616fd2"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
-        "Use to rename, copy, or drop known row fields into a stable downstream shape, including "
+        "Use to rename, select, or drop known row fields into a stable downstream shape, including "
         "selecting only the mapped fields when an explicit projection is required."
     )
     usage_when_not_to_use: str = (

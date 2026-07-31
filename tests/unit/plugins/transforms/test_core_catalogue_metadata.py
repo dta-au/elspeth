@@ -42,7 +42,7 @@ _PLACEHOLDER_MARKERS = ("todo", "tbd", "replace-me", "placeholder", "see the tec
 
 _REQUIRED_GUIDANCE = {
     "blob_csv_expand": (("payload-store", "csv blob", "rows"), ("file source", "binary parser")),
-    "field_mapper": (("rename", "copy", "drop"), ("expression", "type coercion")),
+    "field_mapper": (("rename", "select", "drop"), ("expression", "type coercion")),
     "json_explode": (("one json array field",), ("object flattening", "batch aggregation")),
     "keyword_filter": (("regex", "on_error"), ("general expression",)),
     "line_explode": (("text field", "rows"), ("file", "csv")),
@@ -129,3 +129,20 @@ def test_core_catalogue_examples_use_the_required_direct_section() -> None:
 
 def test_value_transform_preserves_its_accurate_avoid_warning() -> None:
     assert CORE_BY_NAME["value_transform"].plugin_cls.usage_when_not_to_use == _VALUE_TRANSFORM_AVOID
+
+
+def test_field_mapper_guidance_describes_rename_select_drop_not_copy() -> None:
+    to_use = CORE_BY_NAME["field_mapper"].plugin_cls.usage_when_to_use
+    not_to_use = CORE_BY_NAME["field_mapper"].plugin_cls.usage_when_not_to_use
+    assert isinstance(to_use, str)
+    assert isinstance(not_to_use, str)
+    assert "rename, select, or drop" in to_use.casefold()
+    assert "copy" not in f"{to_use} {not_to_use}".casefold()
+
+
+def test_blob_csv_expand_guidance_calls_copied_data_upstream_row_fields() -> None:
+    to_use = CORE_BY_NAME["blob_csv_expand"].plugin_cls.usage_when_to_use
+    assert isinstance(to_use, str)
+    normalized = to_use.casefold()
+    assert "upstream row fields" in normalized
+    assert "provenance fields" not in normalized

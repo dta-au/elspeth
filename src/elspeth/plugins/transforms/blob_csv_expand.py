@@ -157,11 +157,11 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f3968fbab7272252"
+    source_file_hash: str | None = "sha256:e50a0a00fc42e7b4"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
-        "expand its records into rows while retaining the input row's provenance fields."
+        "expand its records into rows while retaining the upstream row fields."
     )
     usage_when_not_to_use: str = (
         "Not a file source or an arbitrary binary parser: use the csv source for a pipeline input "
