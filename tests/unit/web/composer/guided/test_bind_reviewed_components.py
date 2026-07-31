@@ -10,6 +10,9 @@ repair loop burns to REPAIR_EXHAUSTED (elspeth-859e2702dd).
 
 from __future__ import annotations
 
+import pytest
+
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.guided.planning import bind_guided_reviewed_components
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
@@ -45,6 +48,26 @@ def _guided() -> GuidedSession:
             )
         },
     )
+
+
+def test_bind_still_refuses_a_candidate_that_names_no_source() -> None:
+    """The binder's contract is unchanged; only the planner loop's handling is.
+
+    Repairing a sources-free candidate is the planner loop's job
+    (elspeth-bcc6bdac99) — it rejects the shape ahead of the finalizer. The
+    binder must keep refusing outright: it has no reviewed component to bind
+    and must never invent one.
+    """
+    pipeline = {
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    with pytest.raises(AuditIntegrityError, match="does not identify reviewed sources"):
+        bind_guided_reviewed_components(pipeline, _guided())
 
 
 def test_bind_rewrites_invented_output_name_in_edges_and_routing() -> None:

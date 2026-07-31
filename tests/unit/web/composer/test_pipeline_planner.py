@@ -599,6 +599,7 @@ async def _plan(
     claim_evaluator: Any = None,
     rendered_skill: str | None = None,
     supersedes_draft_hash: str | None = None,
+    candidate_finalizer: Any = None,
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -632,7 +633,7 @@ async def _plan(
         custody_config=custody_config or _custody(tmp_path),
         lifecycle=lifecycle or _lifecycle(),
         recorder=recorder or BufferingRecorder(),
-        candidate_finalizer=lambda candidate: candidate,
+        candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
     )
 
 
@@ -3126,6 +3127,169 @@ async def test_pydantic_invalid_terminal_draft_gets_bounded_schema_repair(
             ],
         },
     }
+
+
+_CANONICAL_SCHEMA_FEEDBACK = {
+    "success": False,
+    "validation": {
+        "is_valid": False,
+        "errors": [
+            {
+                "component": "pipeline",
+                "severity": "high",
+                "error_code": "canonical_schema",
+                "error_class": "SchemaValidationError",
+            }
+        ],
+    },
+}
+
+
+def _missing_source_feedback() -> dict[str, Any]:
+    explanation, suggested_fix = explain_validation_code("no_source_configured") or ("", "")
+    return {
+        "success": False,
+        "validation": {
+            "is_valid": False,
+            "errors": [
+                {
+                    "component": "rejected_mutation",
+                    "severity": "high",
+                    "error_code": "no_source_configured",
+                    "error_class": "ValidationError",
+                    "explanation": explanation,
+                    "suggested_fix": suggested_fix,
+                }
+            ],
+        },
+        "guidance": "To expand any code, call explain_validation_error with the exact code string.",
+    }
+
+
+def _sourceless_pipeline(data_dir: Path) -> dict[str, Any]:
+    """A terminal candidate naming no source at all.
+
+    Legal against the terminal schema: ``SetPipelineArgumentsModel`` leaves
+    both ``source`` and ``sources`` optional, so a re-plan "delta" candidate
+    that drops the source block validates and reaches the finalizer.
+    """
+    pipeline = _pipeline(data_dir)
+    del pipeline["source"]
+    return pipeline
+
+
+def _binder_style_finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Stand in for ``bind_guided_reviewed_components``'s sources contract."""
+    if candidate.get("sources") is None and candidate.get("source") is None:
+        raise AuditIntegrityError("guided planner candidate does not identify reviewed sources")
+    return candidate
+
+
+@pytest.mark.asyncio
+async def test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Characterize the repair the freeform surface already produces.
+
+    Pins the exact feedback the guided surface must match — the parity the
+    planner-side guard preserves rather than replacing with a bare schema
+    complaint.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert proposal.proposal.repair_count == 1
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+
+
+@pytest.mark.asyncio
+async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrity_error(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A sources-free candidate is an authoring slip, not an integrity breach.
+
+    The guided binder answers that shape with ``AuditIntegrityError``; before
+    the planner-side guard that error escaped the loop as a terminal 500
+    (elspeth-bcc6bdac99) instead of one budgeted repair turn.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=_binder_style_finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 1
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+
+
+@pytest.mark.asyncio
+async def test_binder_candidate_shape_defect_gets_bounded_schema_repair(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Every remaining binder candidate-shape defect is repairable too."""
+    attempts: list[Mapping[str, Any]] = []
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        attempts.append(candidate)
+        if len(attempts) == 1:
+            raise AuditIntegrityError("guided planner candidate sources differ from reviewed authority")
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 1
+    assert len(attempts) == 2
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _CANONICAL_SCHEMA_FEEDBACK
+
+
+@pytest.mark.asyncio
+async def test_finalizer_integrity_error_outside_candidate_shape_stays_terminal(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A genuine integrity breach is never downgraded into repair feedback."""
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise AuditIntegrityError("reviewed source authority hash does not match the sealed session")
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="reviewed source authority hash"):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            surface=PlannerSurface.GUIDED_STAGED,
+            candidate_finalizer=finalizer,
+        )
 
 
 @pytest.mark.asyncio

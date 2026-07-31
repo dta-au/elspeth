@@ -689,6 +689,12 @@ def _truncated_response_notice() -> str:
 # died terminal on a single prose reply with its whole repair budget unspent).
 _PROSE_NUDGE_BUDGET = 2
 
+# Message prefix every ``bind_guided_reviewed_components`` complaint about the
+# SHAPE OF THE CANDIDATE carries (guided/planning.py). Those describe what the
+# planner authored, so they are repairable; every other AuditIntegrityError
+# reaching the finalizer describes server-side authority and stays terminal.
+_CANDIDATE_SHAPE_INTEGRITY_PREFIX: Final[str] = "guided planner candidate"
+
 
 def _prose_reply_notice() -> str:
     return "Your previous reply called no tool. You must respond with a declared tool call — continue from where you were."
@@ -752,6 +758,33 @@ def _nodeless_revision_rejection(state: CompositionState) -> ToolResult:
         ),
         severity="high",
         error_code="proposal_missing_requested_transforms",
+    )
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
+        affected_nodes=(),
+    )
+
+
+def _missing_source_rejection(state: CompositionState) -> ToolResult:
+    """Synthesize the coded rejection for a candidate that names no source.
+
+    Both ``source`` and ``sources`` are optional on the terminal schema, so a
+    re-plan "delta" candidate that drops the source block is schema-legal and
+    reaches the candidate finalizer. The guided finalizer binds reviewed
+    component authority and has nothing to bind, so it answers that shape with
+    ``AuditIntegrityError`` — a terminal 500 for what is an ordinary authoring
+    slip (elspeth-bcc6bdac99). Rejecting the shape here, ahead of any
+    finalizer, keeps the repair identical on every surface: the same
+    ``no_source_configured`` entry ``set_pipeline`` already produces, carrying
+    the catalogue's "include a source block" fix.
+    """
+    entry = ValidationEntry(
+        component="rejected_mutation",
+        message="set_pipeline requires source or sources.",
+        severity="high",
+        error_code="no_source_configured",
     )
     return ToolResult(
         success=False,
@@ -2087,6 +2120,30 @@ async def _plan_pipeline_inner(
                     claimed_deferred_intent_ids = tuple(str(intent_id) for intent_id in payload.claimed_deferred_intent_ids)
                     if not set(claimed_deferred_intent_ids).issubset(eligible_deferred_intent_ids):
                         terminal_feedback = _deferred_intent_claim_feedback()
+            finalized_pipeline: Mapping[str, Any] | None = None
+            if terminal_feedback is None:
+                assert pipeline is not None
+                if pipeline.get("source") is None and pipeline.get("sources") is None:
+                    terminal_feedback = _allowlisted_candidate_feedback(_missing_source_rejection(current_state))
+                else:
+                    try:
+                        finalizer_result = candidate_finalizer(pipeline)
+                    except AuditIntegrityError as exc:
+                        if not str(exc).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX):
+                            # Not a candidate-shape complaint: a genuine
+                            # integrity breach stays terminal.
+                            raise
+                        # The reviewed-authority binder rejected the shape the
+                        # planner authored — repairable in one budgeted turn,
+                        # never a 500. The sourceless case is already answered
+                        # above with its own code; the residue (an empty
+                        # ``sources`` map, an invented component name) reaches
+                        # here and gets the canonical schema complaint.
+                        terminal_feedback = _canonical_schema_feedback()
+                    else:
+                        if type(finalizer_result) is not dict:
+                            raise AuditIntegrityError("pipeline candidate finalizer must return an exact dict")
+                        finalized_pipeline = finalizer_result
             if terminal_feedback is not None:
                 last_rejection_codes = _feedback_error_codes(terminal_feedback)
                 if is_hatch_turn:
@@ -2115,14 +2172,11 @@ async def _plan_pipeline_inner(
                     }
                 )
                 continue
-            assert pipeline is not None
+            assert finalized_pipeline is not None
             effective_provider = model_config.provider
             if is_hatch_turn:
                 assert model_config.escape_hatch_provider is not None
                 effective_provider = model_config.escape_hatch_provider
-            finalized_pipeline = candidate_finalizer(pipeline)
-            if type(finalized_pipeline) is not dict:
-                raise AuditIntegrityError("pipeline candidate finalizer must return an exact dict")
             terminal_context = replace(
                 request_context,
                 composer_model_identifier=audited_call.model_requested,
