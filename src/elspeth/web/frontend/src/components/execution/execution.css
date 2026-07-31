@@ -1,6 +1,7 @@
 /* execution.css — Execution progress UI.
    Owners: .progress-container, .progress-ws-banner, .progress-status-*,
-   .progress-cancel-btn, .progress-bar-outer, .progress-counters*,
+   .progress-cancel-btn, .progress-bar-outer, .progress-counters-caption,
+   .progress-counters*,
    .progress-routing-summary, .progress-accounting*, .progress-cancelled-msg,
    .progress-failed-msg, .progress-errors-*, .progress-error-*. */
 
@@ -42,6 +43,12 @@
   height: 8px;
   border-radius: var(--radius-sm);
   margin-bottom: var(--space-md);
+}
+
+.progress-counters-caption {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-xs);
 }
 
 .progress-counters {
