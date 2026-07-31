@@ -1816,8 +1816,8 @@ def test_explicit_aws_profile_is_bound_across_provider_backend_and_local_cli() -
 COLD_INSTALL_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-cold-install.md"
 
 
-def test_cold_install_runbook_reads_the_namespace_from_terraform() -> None:
-    """The runbook must ask Terraform for the namespace, not re-derive it.
+def test_cold_install_runbook_does_not_re_derive_the_namespace() -> None:
+    """The runbook must reuse the namespace, not recover it by string surgery.
 
     `NAMESPACE=${ECS_CLUSTER%-cluster}` stripped only the suffix, but
     `cluster_name` is `acceptance-<namespace>-cluster` — prefixed as well. The
@@ -1827,10 +1827,10 @@ def test_cold_install_runbook_reads_the_namespace_from_terraform() -> None:
     reported a false failure.
 
     String surgery on one name to recover another re-encodes the naming
-    convention in a second place, which is the defect itself. The namespace is
-    an output; the runbook reads it. This test pins that, and pins the
-    per-resource suffixes the runbook still spells out against the module that
-    actually builds them.
+    convention in a second place, which is the defect itself. This test pins
+    that the surgery is gone, that the namespace is derived exactly once, and
+    that the per-resource suffixes the runbook still spells out match the module
+    that actually builds them.
     """
     locals_text = _text("modules/scenario/locals.tf")
     runbook = COLD_INSTALL_RUNBOOK.read_text(encoding="utf-8")
@@ -1843,7 +1843,14 @@ def test_cold_install_runbook_reads_the_namespace_from_terraform() -> None:
         for relative in ("modules/scenario/outputs.tf", "scenario-a/outputs.tf", "scenario-b/outputs.tf"):
             assert f'output "{name}"' in _text(relative), f"{relative} must expose the {name} output"
 
-    assert "NAMESPACE=$(terraform -chdir=scenario-a output -raw namespace)" in runbook
+    # The runbook reuses the namespace it already had to compute at install
+    # time. `scenario_a_namespace` is exported before apply because it feeds the
+    # tfvars, so there is no state to read an output from at that point; reusing
+    # it here introduces no derivation the procedure did not already require.
+    # (A `terraform output -raw namespace` read is drift-proof but only resolves
+    # post-apply, which would add a second mechanism alongside a mandatory one.)
+    assert 'NAMESPACE="$scenario_a_namespace"' in runbook
+    assert runbook.count("export scenario_a_namespace=") == 1, "the namespace must be derived exactly once"
     assert "%-cluster" not in runbook, "the runbook must not re-derive the namespace from the cluster name"
 
     # Every namespace-derived literal the runbook still spells out has to match
