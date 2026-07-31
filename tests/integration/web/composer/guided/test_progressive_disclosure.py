@@ -161,7 +161,10 @@ def composer_freeform_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     app.state.operator_profile_registry = profiles
     app.state.plugin_snapshot_factory = lambda _user: snapshot
     app.state.composer_recorder = BufferingRecorder()
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=session_service.session_operation_authority,
+    )
 
     router = create_session_router()
     app.include_router(router)

@@ -13,13 +13,23 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import InitVar, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, final, get_args, runtime_checkable
 from uuid import UUID
 
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.blobs import BlobForkPlanEntry, BlobRecord, BlobRunLinkDirection, BlobRunLinkRecord
+from elspeth.contracts.blobs import (
+    BlobCreationObligation,
+    BlobDeletionPlan,
+    BlobForkPlanEntry,
+    BlobGuidedOperationWriteFence,
+    BlobRecord,
+    BlobReplacementPlan,
+    BlobRunLinkDirection,
+    BlobRunLinkRecord,
+)
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import (
@@ -29,6 +39,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCall
+from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields, require_int
 from elspeth.contracts.hashing import stable_hash
@@ -40,12 +51,15 @@ from elspeth.web.composer.guided.deferred_intents import (
 from elspeth.web.composer.guided.protocol import TurnType
 from elspeth.web.composer.guided.state_machine import GUIDED_MAX_CHAT_TURNS, ComponentTarget
 from elspeth.web.coordination.contracts import (
+    ArchiveDeleteReconciliation,
+    ArchiveManifestRelation,
     CancellationSource,
     CompatibilityKey,
     InstanceState,
     RecoveryRequiredReason,
     RunOwnershipFence,
     RunSagaState,
+    SessionOperationContext,
     SessionOperationFence,
     SessionOperationKind,
     StartPermitState,
@@ -288,6 +302,104 @@ class GuidedOperationFence:
 
 @final
 @dataclass(frozen=True, slots=True)
+class SessionForkParentAuthority:
+    """Exact parent session-operation and guided-operation authority pair."""
+
+    parent_context: SessionOperationContext
+    guided_fence: GuidedOperationFence
+
+    def __post_init__(self) -> None:
+        if type(self.parent_context) is not SessionOperationContext:
+            raise AuditIntegrityError("SessionForkParentAuthority.parent_context must be exact")
+        if type(self.guided_fence) is not GuidedOperationFence:
+            raise AuditIntegrityError("SessionForkParentAuthority.guided_fence must be exact")
+        if self.parent_context.operation_kind is not SessionOperationKind.SESSION_FORK:
+            raise AuditIntegrityError("SessionForkParentAuthority requires SESSION_FORK context")
+        if self.parent_context.fence.session_id != str(self.guided_fence.session_id):
+            raise AuditIntegrityError("Session fork authorities must name the same parent session")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionForkAuthority:
+    """Exact parent, child, and guided authority for one fork attempt."""
+
+    parent: SessionForkParentAuthority
+    child_context: SessionOperationContext
+
+    def __post_init__(self) -> None:
+        if type(self.parent) is not SessionForkParentAuthority:
+            raise AuditIntegrityError("SessionForkAuthority.parent must be exact")
+        if type(self.child_context) is not SessionOperationContext:
+            raise AuditIntegrityError("SessionForkAuthority.child_context must be exact")
+        if self.child_context.operation_kind is not SessionOperationKind.SESSION_FORK:
+            raise AuditIntegrityError("SessionForkAuthority child requires SESSION_FORK context")
+        parent_fence = self.parent.parent_context.fence
+        child_fence = self.child_context.fence
+        if parent_fence.session_id == child_fence.session_id:
+            raise AuditIntegrityError("Session fork parent and child must be different sessions")
+        if child_fence.operation_epoch < 2:
+            raise AuditIntegrityError("Session fork child authority begins at epoch 2")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionForkChildCreation:
+    """Caller-provided child contents with all authority identity omitted."""
+
+    user_id: str
+    auth_provider_type: AuthProviderType
+    title: str
+    created_at: datetime
+    archived_at: datetime
+    forked_from_message_id: UUID
+
+    def __post_init__(self) -> None:
+        if type(self.user_id) is not str or not self.user_id:
+            raise AuditIntegrityError("SessionForkChildCreation.user_id must be non-empty")
+        if self.auth_provider_type not in get_args(AuthProviderType):
+            raise AuditIntegrityError("SessionForkChildCreation.auth_provider_type is invalid")
+        if type(self.title) is not str:
+            raise AuditIntegrityError("SessionForkChildCreation.title must be exact")
+        if not isinstance(self.created_at, datetime) or not isinstance(self.archived_at, datetime):
+            raise AuditIntegrityError("SessionForkChildCreation timestamps must be datetimes")
+        if type(self.forked_from_message_id) is not UUID:
+            raise AuditIntegrityError("SessionForkChildCreation.forked_from_message_id must be UUID")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionForkChildMessageCreation:
+    """One child message whose custody and sequence are repository-owned."""
+
+    id: UUID
+    role: ChatMessageRole
+    content: str
+    raw_content: str | None
+    tool_calls: Sequence[Mapping[str, Any]] | None
+    tool_call_id: str | None
+    parent_assistant_id: UUID | None
+    writer_principal: ChatMessageWriterPrincipal
+    created_at: datetime
+    composition_state_id: UUID | None
+
+    def __post_init__(self) -> None:
+        if type(self.id) is not UUID:
+            raise AuditIntegrityError("SessionForkChildMessageCreation.id must be UUID")
+        if self.role not in CHAT_MESSAGE_ROLE_VALUES:
+            raise AuditIntegrityError("SessionForkChildMessageCreation.role is invalid")
+        if self.writer_principal not in CHAT_MESSAGE_WRITER_PRINCIPAL_VALUES:
+            raise AuditIntegrityError("SessionForkChildMessageCreation.writer_principal is invalid")
+        if type(self.content) is not str:
+            raise AuditIntegrityError("SessionForkChildMessageCreation.content must be exact")
+        if not isinstance(self.created_at, datetime):
+            raise AuditIntegrityError("SessionForkChildMessageCreation.created_at must be datetime")
+        if self.tool_calls is not None:
+            freeze_fields(self, "tool_calls")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class GuidedCompositionStateResult:
     """Replay locator for state-producing guided operations."""
 
@@ -459,6 +571,24 @@ class RunEventRecord:
     timestamp: datetime
     event_type: SessionRunEventType
     data: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if type(self.id) is not UUID:
+            raise AuditIntegrityError("RunEventRecord.id must be an exact UUID")
+        if type(self.run_id) is not UUID:
+            raise AuditIntegrityError("RunEventRecord.run_id must be an exact UUID")
+        if type(self.sequence) is not int or self.sequence < 1:
+            raise AuditIntegrityError("RunEventRecord.sequence must be a positive exact integer")
+        if type(self.timestamp) is not datetime or self.timestamp.utcoffset() is None:
+            raise AuditIntegrityError("RunEventRecord.timestamp must be an aware exact datetime")
+        event_type: object = self.event_type
+        if type(event_type) is not str or event_type not in SESSION_RUN_EVENT_TYPE_VALUES:
+            raise AuditIntegrityError("RunEventRecord.event_type is invalid")
+        data: object = self.data
+        if not isinstance(data, Mapping):
+            raise AuditIntegrityError("RunEventRecord.data must be a mapping")
+        object.__setattr__(self, "timestamp", self.timestamp.astimezone(UTC))
+        freeze_fields(self, "data")
 
 
 @dataclass(frozen=True, slots=True)
@@ -769,6 +899,24 @@ class CompositionStateData:
             freeze_fields(self, *non_none)
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class SessionForkChildStateCreation:
+    """One fork child checkpoint with repository-owned version allocation."""
+
+    id: UUID
+    data: CompositionStateData
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        if type(self.id) is not UUID:
+            raise AuditIntegrityError("SessionForkChildStateCreation.id must be UUID")
+        if type(self.data) is not CompositionStateData:
+            raise AuditIntegrityError("SessionForkChildStateCreation.data must be exact")
+        if not isinstance(self.created_at, datetime):
+            raise AuditIntegrityError("SessionForkChildStateCreation.created_at must be datetime")
+
+
 @dataclass(frozen=True, slots=True)
 class CompositionStateRecord:
     """Represents a row from the composition_states table.
@@ -844,10 +992,15 @@ class StagedForkSession:
     messages: tuple[ChatMessageRecord, ...]
     state: CompositionStateRecord | None
     blob_plan: tuple[BlobForkPlanEntry, ...]
+    authority: SessionForkAuthority
 
     def __post_init__(self) -> None:
         if type(self.session) is not SessionRecord or self.session.archived_at is None:
             raise AuditIntegrityError("StagedForkSession.session must be an archived exact SessionRecord")
+        if type(self.authority) is not SessionForkAuthority:
+            raise AuditIntegrityError("StagedForkSession.authority must be exact")
+        if self.authority.child_context.fence.session_id != str(self.session.id):
+            raise AuditIntegrityError("StagedForkSession authority must name its child")
         if type(self.messages) is not tuple or any(type(message) is not ChatMessageRecord for message in self.messages):
             raise AuditIntegrityError("StagedForkSession.messages must be an exact ChatMessageRecord tuple")
         if type(self.blob_plan) is not tuple or any(type(entry) is not BlobForkPlanEntry for entry in self.blob_plan):
@@ -865,8 +1018,7 @@ class StagedForkSession:
 class GuidedForkSettlementCommand:
     """Atomic staged-child rewrite, activation, and operation completion."""
 
-    fence: GuidedOperationFence
-    child_session_id: UUID
+    authority: SessionForkAuthority
     expected_current_state_id: UUID | None
     edited_message_id: UUID
     rewritten_state_id: UUID | None
@@ -875,11 +1027,10 @@ class GuidedForkSettlementCommand:
     actor: str
 
     def __post_init__(self) -> None:
-        if type(self.fence) is not GuidedOperationFence:
-            raise AuditIntegrityError("GuidedForkSettlementCommand.fence must be exact")
-        for field_name in ("child_session_id", "edited_message_id"):
-            if type(getattr(self, field_name)) is not UUID:
-                raise AuditIntegrityError(f"GuidedForkSettlementCommand.{field_name} must be a UUID")
+        if type(self.authority) is not SessionForkAuthority:
+            raise AuditIntegrityError("GuidedForkSettlementCommand.authority must be exact")
+        if type(self.edited_message_id) is not UUID:
+            raise AuditIntegrityError("GuidedForkSettlementCommand.edited_message_id must be a UUID")
         if self.expected_current_state_id is not None and type(self.expected_current_state_id) is not UUID:
             raise AuditIntegrityError("GuidedForkSettlementCommand.expected_current_state_id must be a UUID or None")
         if (self.rewritten_state_id is None) != (self.rewritten_state is None):
@@ -893,6 +1044,14 @@ class GuidedForkSettlementCommand:
         _require_guided_sha256(self.response_hash, "GuidedForkSettlementCommand.response_hash")
         if type(self.actor) is not str or not self.actor:
             raise AuditIntegrityError("GuidedForkSettlementCommand.actor must be non-empty")
+
+    @property
+    def fence(self) -> GuidedOperationFence:
+        return self.authority.parent.guided_fence
+
+    @property
+    def child_session_id(self) -> UUID:
+        return UUID(self.authority.child_context.fence.session_id)
 
 
 GuidedJsonPayloadPurpose = Literal["turn", "turn_response"]
@@ -2209,32 +2368,69 @@ class ToolCallIDMismatchError(RuntimeError):
         )
 
 
-@final
-@dataclass(frozen=True, slots=True)
-class SessionOperationMutationResult:
-    """Detached result from one bounded statement in a fenced transaction."""
+class SessionArchiveDisposition(StrEnum):
+    """Database disposition selected by the fenced archive decision."""
 
-    rowcount: int
-    rows: tuple[Mapping[str, Any], ...] = ()
-
-    def __post_init__(self) -> None:
-        if type(self.rowcount) is not int:
-            raise TypeError("SessionOperationMutationResult.rowcount must be an exact integer")
-        freeze_fields(self, "rows")
+    PHYSICAL_DELETE = "physical_delete"
+    SOFT_ARCHIVED = "soft_archived"
 
 
 @runtime_checkable
-class SessionOperationMutationTransaction(Protocol):
-    """Session-bound statement executor backed by one private transaction.
+class AuditAccessLogAuthority(Protocol):
+    """Handle-free authority for one audit-grade transcript access row."""
 
-    Implementations accept normalized SQLAlchemy Select/Insert/Update/Delete
-    statements over canonical, directly session-scoped tables only. They bind
-    every read/write to the active fence's session, detach all returned rows,
-    and expose no connection, commit, rollback, raw-SQL, or transaction-control
-    surface.
-    """
+    def record_audit_grade_view(
+        self,
+        *,
+        session_id: str,
+        requesting_principal: str,
+        auth_provider_type: AuthProviderType,
+        request_path: str,
+        query_args: Mapping[str, str],
+        ip_address: str | None,
+    ) -> AuditAccessLogRecord: ...
 
-    def execute(self, statement: object) -> SessionOperationMutationResult: ...
+
+@runtime_checkable
+class SessionOperationSessionMutations(Protocol):
+    """Session-row mutations available inside one exact operation fence."""
+
+    def record_plugin_crash_breadcrumb(self) -> None: ...
+
+    def decide_and_soft_archive(
+        self,
+        *,
+        archived_at: datetime,
+    ) -> SessionArchiveDisposition: ...
+
+
+@runtime_checkable
+class SessionOperationRunMutations(Protocol):
+    """Run mutations available inside one exact EXECUTE operation fence."""
+
+    def create_pending_run(
+        self,
+        *,
+        run_id: UUID,
+        state_id: UUID,
+        pipeline_yaml: str | None,
+        started_at: datetime,
+    ) -> RunRecord: ...
+
+    def transition_run_status(
+        self,
+        *,
+        run_id: UUID,
+        status: SessionRunStatus,
+        error: str | None,
+        landscape_run_id: str | None,
+        rows_processed: int | None,
+        rows_succeeded: int | None,
+        rows_failed: int | None,
+        rows_routed_success: int | None,
+        rows_routed_failure: int | None,
+        rows_quarantined: int | None,
+    ) -> None: ...
 
     def append_run_event(
         self,
@@ -2252,6 +2448,111 @@ class SessionOperationMutationTransaction(Protocol):
         after_sequence: int,
     ) -> tuple[RunEventRecord, ...]: ...
 
+
+@runtime_checkable
+class SessionOperationBlobMutations(Protocol):
+    """Blob/run-custody mutations available inside one exact operation fence."""
+
+    def read_blob(self, *, blob_id: UUID) -> BlobRecord: ...
+
+    def prepare_blob_replacement(
+        self,
+        *,
+        replacement_id: UUID,
+        expected: BlobRecord,
+        replacement: BlobRecord,
+        staging_path: str,
+        backup_path: str,
+        max_storage_per_session: int,
+        accepting_proposal_id: UUID | None,
+    ) -> BlobReplacementPlan: ...
+
+    def read_blob_replacement(self, *, blob_id: UUID) -> BlobReplacementPlan | None: ...
+
+    def list_blob_replacements(self) -> tuple[BlobReplacementPlan, ...]: ...
+
+    def mark_blob_replacement_staged(self, *, plan: BlobReplacementPlan) -> BlobReplacementPlan: ...
+
+    def commit_blob_replacement(
+        self,
+        *,
+        plan: BlobReplacementPlan,
+        max_storage_per_session: int,
+        accepting_proposal_id: UUID | None,
+    ) -> BlobReplacementPlan: ...
+
+    def retire_blob_replacement(self, *, plan: BlobReplacementPlan) -> bool: ...
+
+    def abort_blob_replacement(self, *, plan: BlobReplacementPlan) -> bool: ...
+
+    def reserve_pending_output_blob(self, *, record: BlobRecord) -> BlobRecord: ...
+
+    def finalize_pending_output_blob(
+        self,
+        *,
+        blob_id: UUID,
+        status: Literal["ready", "error"],
+        size_bytes: int | None,
+        content_hash: str | None,
+        max_storage_per_session: int,
+    ) -> BlobRecord: ...
+
+    def reserve_blob(
+        self,
+        *,
+        record: BlobRecord,
+        max_storage_per_session: int,
+        idempotent: bool,
+        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
+    ) -> bool: ...
+
+    def mark_blob_ready(
+        self,
+        *,
+        blob_id: UUID,
+        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
+    ) -> BlobRecord: ...
+
+    def discard_pending_blob(
+        self,
+        *,
+        blob_id: UUID,
+        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
+    ) -> bool: ...
+
+    def list_abandoned_blob_reservations(self) -> tuple[BlobCreationObligation, ...]: ...
+
+    def retire_abandoned_blob_reservation(self, *, obligation: BlobCreationObligation) -> bool: ...
+
+    def prepare_blob_deletion(
+        self,
+        *,
+        blob_id: UUID,
+        tombstone_path: str,
+        blob_snapshot_hash: str,
+        expected_file_present: bool,
+        expected_file_size: int | None,
+        expected_file_hash: str | None,
+        accepting_proposal_id: UUID | None,
+    ) -> BlobDeletionPlan: ...
+
+    def mark_blob_deletion_staged(self, *, plan: BlobDeletionPlan) -> BlobDeletionPlan: ...
+
+    def commit_blob_deletion(
+        self,
+        *,
+        plan: BlobDeletionPlan,
+        accepting_proposal_id: UUID | None,
+    ) -> BlobDeletionPlan: ...
+
+    def read_blob_deletion(self, *, blob_id: UUID) -> BlobDeletionPlan | None: ...
+
+    def list_blob_deletions(self) -> tuple[BlobDeletionPlan, ...]: ...
+
+    def retire_blob_deletion(self, *, plan: BlobDeletionPlan) -> bool: ...
+
+    def abort_blob_deletion(self, *, plan: BlobDeletionPlan) -> bool: ...
+
     def insert_blob_run_link(
         self,
         *,
@@ -2264,6 +2565,25 @@ class SessionOperationMutationTransaction(Protocol):
 
     def list_run_output_blobs(self, *, run_id: UUID) -> tuple[BlobRecord, ...]: ...
 
+    def list_pending_run_output_blobs(self, *, run_id: UUID) -> tuple[BlobRecord, ...]: ...
+
+    def mark_run_output_blob_ready(
+        self,
+        *,
+        run_id: UUID,
+        blob_id: UUID,
+        size_bytes: int,
+        content_hash: str,
+        max_storage_per_session: int,
+    ) -> BlobRecord: ...
+
+    def mark_run_output_blob_error(
+        self,
+        *,
+        run_id: UUID,
+        blob_id: UUID,
+    ) -> BlobRecord: ...
+
     def insert_blob_inline_resolutions(
         self,
         *,
@@ -2275,12 +2595,150 @@ class SessionOperationMutationTransaction(Protocol):
 
 
 @runtime_checkable
+class SessionOperationComposerProgressMutations(Protocol):
+    """Composer-progress mutations under one exact operation fence."""
+
+    def start_request(
+        self,
+        *,
+        request_id: str,
+        user_id: str,
+        event: ComposerProgressEvent,
+    ) -> datetime: ...
+
+    def publish_progress(
+        self,
+        *,
+        request_id: str,
+        user_id: str,
+        event: ComposerProgressEvent,
+    ) -> datetime: ...
+
+    def finish_request(
+        self,
+        *,
+        request_id: str,
+        user_id: str,
+        terminal_event: ComposerProgressEvent | None,
+    ) -> datetime: ...
+
+    def retire_session_progress(self) -> None: ...
+
+
+@runtime_checkable
+class SessionOperationComposerCompletionMutations(Protocol):
+    """Completion-audit writes under one exact BLOB_READ operation fence."""
+
+    def mark_ready_for_review(
+        self,
+        *,
+        composition_state_id: UUID,
+        actor: str,
+        created_at: datetime,
+        payload_digest: str,
+        expires_at: datetime,
+    ) -> None: ...
+
+    def record_yaml_export(
+        self,
+        *,
+        composition_state_id: UUID,
+        actor: str,
+        created_at: datetime,
+    ) -> None: ...
+
+
+@runtime_checkable
+class SessionOperationMutationTransaction(Protocol):
+    """Read-only capability composition over one private fenced transaction."""
+
+    @property
+    def database_now(self) -> datetime: ...
+
+    @property
+    def session(self) -> SessionOperationSessionMutations: ...
+
+    @property
+    def runs(self) -> SessionOperationRunMutations: ...
+
+    @property
+    def blobs(self) -> SessionOperationBlobMutations: ...
+
+    @property
+    def composer_progress(self) -> SessionOperationComposerProgressMutations: ...
+
+    @property
+    def composer_completion(self) -> SessionOperationComposerCompletionMutations: ...
+
+
+class SessionForkChildMutations(Protocol):
+    """Child-session writes permitted during one atomic fork creation."""
+
+    def insert_child_state(self, creation: SessionForkChildStateCreation) -> None: ...
+
+    def append_child_messages(
+        self,
+        messages: tuple[SessionForkChildMessageCreation, ...],
+    ) -> None: ...
+
+
+class SessionForkParentGuidedMutations(Protocol):
+    """Exact parent-guided binding permitted during one atomic fork creation."""
+
+    def bind_guided_fork(
+        self,
+        *,
+        originating_message_id: UUID,
+    ) -> None: ...
+
+
+@runtime_checkable
+class SessionForkCreationTransaction(Protocol):
+    """Pair-session transaction restricted to the guided fork staging cohort."""
+
+    @property
+    def child_mutations(self) -> SessionForkChildMutations: ...
+
+    @property
+    def parent_guided_mutations(self) -> SessionForkParentGuidedMutations: ...
+
+    def require_parent_guided_operation(
+        self,
+        fence: GuidedOperationFence,
+    ) -> tuple[Mapping[str, Any], datetime]: ...
+
+    def read_parent_session(self) -> Any | None: ...
+
+    def read_parent_message(self, message_id: UUID) -> Any | None: ...
+
+    def read_parent_state(self, state_id: UUID) -> Any | None: ...
+
+    def read_parent_ready_blobs(self) -> tuple[Any, ...]: ...
+
+    def read_parent_proposal(self, proposal_id: UUID) -> Any | None: ...
+
+    def read_parent_proposal_creation_events(
+        self,
+        proposal_id: UUID,
+    ) -> tuple[Any, ...]: ...
+
+    def count_parent_proposal_terminal_events(self, proposal_id: UUID) -> int: ...
+
+    def read_parent_guided_root_authority(
+        self,
+        message_id: UUID,
+    ) -> tuple[Any | None, tuple[Any, ...], Any | None]: ...
+
+    def read_child_snapshot(self) -> tuple[Any | None, tuple[Any, ...], Any | None]: ...
+
+
+@runtime_checkable
 class SessionOperationAuthority(Protocol):
     """Persistent per-session operation authority without database-handle leakage.
 
     Implementations own their transactions.  Callers receive only immutable
-    records/fences; a raw SQLAlchemy engine or connection is never part of the
-    public authority surface.
+    records/operation contexts; a raw SQLAlchemy engine or connection is never
+    part of the public authority surface.
     """
 
     def create_session_with_initial_fence(
@@ -2300,26 +2758,62 @@ class SessionOperationAuthority(Protocol):
         operation_kind: SessionOperationKind,
         owner_instance_id: str,
         lease_seconds: int,
-    ) -> SessionOperationFence: ...
+    ) -> SessionOperationContext: ...
 
     def renew(
         self,
-        fence: SessionOperationFence,
+        context: SessionOperationContext,
         *,
         lease_seconds: int,
-    ) -> SessionOperationFence: ...
+    ) -> SessionOperationContext: ...
 
-    def compare_and_swap(self, fence: SessionOperationFence) -> None: ...
+    def compare_and_swap(self, context: SessionOperationContext) -> None: ...
+
+    def validate_fork_child_lease(
+        self,
+        authority: SessionForkAuthority,
+    ) -> SessionOperationContext: ...
+
+    def renew_fork_child_lease(
+        self,
+        authority: SessionForkAuthority,
+        *,
+        lease_seconds: int,
+    ) -> SessionOperationContext: ...
+
+    def reconcile_blob_reservation(
+        self,
+        context: SessionOperationContext,
+        *,
+        expected: BlobRecord,
+    ) -> BlobRecord | None: ...
 
     def mutate[T](
         self,
-        fence: SessionOperationFence,
+        context: SessionOperationContext,
         mutation: Callable[[SessionOperationMutationTransaction], T],
     ) -> T: ...
 
-    def release(self, fence: SessionOperationFence) -> None: ...
+    def release(self, context: SessionOperationContext) -> None: ...
 
-    def archive_delete(self, fence: SessionOperationFence) -> None: ...
+    def archive_delete(self, context: SessionOperationContext) -> None: ...
+
+    def reconcile_archive_delete(self, context: SessionOperationContext) -> ArchiveDeleteReconciliation: ...
+
+    def classify_archive_manifest(
+        self,
+        current_context: SessionOperationContext,
+        *,
+        manifest_operation_id: UUID | str,
+        manifest_operation_epoch: int,
+    ) -> ArchiveManifestRelation: ...
+
+    def mutate_fork_creation[T](
+        self,
+        parent_authority: SessionForkParentAuthority,
+        child: SessionForkChildCreation,
+        mutation: Callable[[SessionForkCreationTransaction, SessionForkAuthority], T],
+    ) -> T: ...
 
 
 @runtime_checkable
@@ -2328,6 +2822,12 @@ class SessionServiceProtocol(Protocol):
 
     @property
     def session_operation_authority(self) -> SessionOperationAuthority: ...
+
+    @property
+    def session_operation_owner_instance_id(self) -> str: ...
+
+    @property
+    def session_operation_lease_seconds(self) -> int: ...
 
     async def create_session(
         self,
@@ -2347,6 +2847,7 @@ class SessionServiceProtocol(Protocol):
         request_hash: str,
         actor: str,
         lease_seconds: int,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationOutcome: ...
 
     async def get_guided_operation(
@@ -2358,13 +2859,23 @@ class SessionServiceProtocol(Protocol):
         request_hash: str,
     ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None: ...
 
+    async def get_guided_start_reconciliation(
+        self,
+        *,
+        session_id: UUID,
+        operation_id: str,
+    ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None: ...
+
     async def reconcile_guided_start_operation(
         self,
         *,
         session_id: UUID,
         operation_id: str,
+        observed_attempt: int | None,
         actor: str,
-    ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed: ...
+        lease_seconds: int,
+        session_operation_context: SessionOperationContext,
+    ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None: ...
 
     async def renew_guided_operation(
         self,
@@ -2372,6 +2883,7 @@ class SessionServiceProtocol(Protocol):
         *,
         actor: str,
         lease_seconds: int,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationFence: ...
 
     async def bind_guided_operation(
@@ -2382,6 +2894,7 @@ class SessionServiceProtocol(Protocol):
         proposal_id: UUID | None = None,
         result_state_id: UUID | None = None,
         result_session_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> None: ...
 
     async def complete_guided_operation(
@@ -2391,6 +2904,7 @@ class SessionServiceProtocol(Protocol):
         result: GuidedOperationResult,
         response_hash: str,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationCompleted: ...
 
     async def fail_guided_operation(
@@ -2399,11 +2913,14 @@ class SessionServiceProtocol(Protocol):
         *,
         failure_code: GuidedOperationFailureCode,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationFailed: ...
 
     async def fail_guided_operation_with_audit(
         self,
         command: GuidedOperationFailureCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationFailed: ...
 
     async def revert_state_for_guided_operation(
@@ -2415,6 +2932,7 @@ class SessionServiceProtocol(Protocol):
         expected_current_state_version: int,
         actor: str,
         response_hash_factory: Callable[[CompositionStateRecord], str],
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord: ...
 
     async def save_state_for_guided_operation(
@@ -2431,6 +2949,7 @@ class SessionServiceProtocol(Protocol):
         payloads: tuple[PreparedGuidedJsonPayload, ...] = (),
         audit_evidence: GuidedAuditEvidence | None = None,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord: ...
 
     async def settle_guided_state_operation(
@@ -2438,6 +2957,7 @@ class SessionServiceProtocol(Protocol):
         command: GuidedStateOperationCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedStateOperationSettlement: ...
 
     async def stage_guided_pipeline_proposal(
@@ -2445,38 +2965,36 @@ class SessionServiceProtocol(Protocol):
         command: GuidedPipelineProposalStageCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement: ...
 
     async def stage_guided_full_pipeline_proposal(
         self,
         command: GuidedFullPipelineProposalStageCommand,
-    ) -> GuidedFullPipelineProposalStageSettlement: ...
-
-    async def reconcile_rejected_guided_pipeline_proposal(
-        self,
         *,
-        session_id: UUID,
-        expected_current_state_id: UUID,
-        proposal_id: UUID,
-        draft_hash: str,
-        reviewed_facts: Mapping[str, Any],
-    ) -> CompositionStateRecord: ...
+        session_operation_context: SessionOperationContext,
+    ) -> GuidedFullPipelineProposalStageSettlement: ...
 
     async def accept_guided_pipeline_proposal(
         self,
         command: GuidedPipelineProposalAcceptCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement: ...
 
     async def admit_guided_pipeline_confirmation(
         self,
         command: GuidedPipelineConfirmationAdmissionCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> PipelineDispatchRecovery | None: ...
 
     async def record_guided_pipeline_dispatch(
         self,
         command: GuidedPipelineDispatchRecordCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> PipelineDispatchRecovery: ...
 
     async def back_edit_guided_pipeline_proposal(
@@ -2484,11 +3002,14 @@ class SessionServiceProtocol(Protocol):
         command: GuidedPipelineProposalBackEditCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement: ...
 
     async def reject_guided_pipeline_proposal(
         self,
         command: GuidedPipelineProposalRejectCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement: ...
 
     async def seed_or_complete_guided_start_operation(
@@ -2503,6 +3024,7 @@ class SessionServiceProtocol(Protocol):
         audit_evidence: GuidedAuditEvidence | None = None,
         originating_message: GuidedOriginatingUserMessageDraft | None = None,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedStartStateOutcome: ...
 
     async def complete_existing_state_guided_operation(
@@ -2514,6 +3036,7 @@ class SessionServiceProtocol(Protocol):
         expected_current_state_version: int,
         actor: str,
         response_hash_factory: Callable[[CompositionStateRecord], str],
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord: ...
 
     async def update_session_title(self, session_id: UUID, title: str) -> SessionRecord: ...
@@ -2541,6 +3064,7 @@ class SessionServiceProtocol(Protocol):
         trust_mode: ComposerTrustMode,
         density_default: ComposerDensityDefault,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> ComposerSessionPreferencesTransition: ...
 
     async def create_composition_proposal(
@@ -2562,6 +3086,7 @@ class SessionServiceProtocol(Protocol):
         composer_provider: str | None = None,
         composer_skill_hash: str | None = None,
         tool_arguments_hash: str | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
 
     async def create_pipeline_composition_proposal(
@@ -2579,6 +3104,7 @@ class SessionServiceProtocol(Protocol):
         composer_provider: str,
         user_message_id: UUID | None = None,
         supersedes_proposal_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
 
     async def get_authoritative_pipeline_proposal(
@@ -2644,16 +3170,27 @@ class SessionServiceProtocol(Protocol):
         session_id: UUID,
         proposal_id: UUID,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
 
-    async def mark_composition_proposal_committed(
+    async def accept_composition_proposal(
         self,
         *,
         session_id: UUID,
         proposal_id: UUID,
-        committed_state_id: UUID,
+        expected_current_state_id: UUID | None,
+        state: CompositionStateData | None,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
+
+    async def has_applied_blob_proposal_effect(
+        self,
+        *,
+        session_id: UUID,
+        proposal_id: UUID,
+        session_operation_context: SessionOperationContext,
+    ) -> bool: ...
 
     async def list_proposal_events(
         self,
@@ -2762,7 +3299,6 @@ class SessionServiceProtocol(Protocol):
         skill_hash: str,
         filename: str,
         content: str,
-        first_seen_at: datetime | None = None,
     ) -> bool:
         """Best-effort INSERT-OR-IGNORE into ``skill_markdown_history`` (F-5c).
 
@@ -2860,6 +3396,7 @@ class SessionServiceProtocol(Protocol):
         *,
         session_id: str,
         requesting_principal: str,
+        auth_provider_type: AuthProviderType,
         request_path: str,
         query_args: Mapping[str, str],
         ip_address: str | None,
@@ -2961,6 +3498,8 @@ class SessionServiceProtocol(Protocol):
         session_id: UUID,
         state_id: UUID,
         pipeline_yaml: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> RunRecord: ...
 
     async def get_run(self, run_id: UUID) -> RunRecord: ...
@@ -2979,6 +3518,8 @@ class SessionServiceProtocol(Protocol):
         rows_routed_success: int | None = None,
         rows_routed_failure: int | None = None,
         rows_quarantined: int | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Update a run's status and metadata.
 
@@ -2998,6 +3539,7 @@ class SessionServiceProtocol(Protocol):
         timestamp: datetime,
         event_type: SessionRunEventType,
         data: Mapping[str, Any],
+        session_operation_context: SessionOperationContext,
     ) -> RunEventRecord:
         """Append a structured execution event for replay/audit."""
         ...
@@ -3012,6 +3554,7 @@ class SessionServiceProtocol(Protocol):
         run_id: UUID,
         resolutions: Sequence[ResolvedBlobContent],
         attempt: int = 1,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Write audit rows for inline-content blob refs before plugin construction."""
         ...
@@ -3036,7 +3579,7 @@ class SessionServiceProtocol(Protocol):
 
     async def fork_session(
         self,
-        fence: GuidedOperationFence,
+        authority: SessionForkParentAuthority,
         *,
         fork_message_id: UUID,
         new_message_content: str,
@@ -3053,6 +3596,14 @@ class SessionServiceProtocol(Protocol):
     ) -> SessionRecord:
         """Atomically rewrite, activate, and settle one staged fork child."""
         ...
+
+    async def fail_guided_fork_operation(
+        self,
+        authority: SessionForkAuthority,
+        *,
+        failure_code: GuidedOperationFailureCode,
+        actor: str,
+    ) -> GuidedOperationFailed: ...
 
     async def cancel_orphaned_runs(
         self,

@@ -34,6 +34,7 @@ from elspeth.contracts.blobs_inline import (
     WidenedBlobRefShape,
     is_widened_blob_ref,
 )
+from elspeth.contracts.session_operation import SessionOperationContext
 
 _NODE_COLLECTION_KEYS: Final = ("transforms", "gates", "aggregations", "coalesce")
 _OUTPUT_COLLECTION_KEYS: Final = ("outputs", "sinks")
@@ -78,6 +79,7 @@ async def _validate_blob_content_refs(
     session_id: UUID,
     per_ref_byte_cap: int | None = None,
     aggregate_byte_cap: int | None = None,
+    session_operation_context: SessionOperationContext,
 ) -> list[BlobInlineValidationViolation]:
     """Return validate-path violations without raising recoverable errors."""
     try:
@@ -89,7 +91,10 @@ async def _validate_blob_content_refs(
     not_ready_by_blob_id: dict[UUID, str] = {}
     for ref in refs:
         try:
-            record = await blob_service.get_blob(ref.blob_id)
+            record = await blob_service.get_blob(
+                ref.blob_id,
+                session_operation_context=session_operation_context,
+            )
         except BlobNotFoundError:
             continue
         except BlobStateError as exc:
@@ -307,13 +312,30 @@ def _short_hash(value: str | None) -> str:
 async def _fetch_blob_contents(
     blob_service: BlobServiceProtocol,
     refs: list[BlobInlineRef],
+    *,
+    session_operation_context: SessionOperationContext,
 ) -> dict[BlobInlineRef, bytes]:
     """Fetch content bytes for discovered refs, deduped by blob id."""
     unique_blob_ids = _unique_blob_ids(refs)
     results = await asyncio.gather(
-        *(blob_service.read_blob_content(blob_id) for blob_id in unique_blob_ids),
+        *(
+            blob_service.read_blob_content(
+                blob_id,
+                session_operation_context=session_operation_context,
+            )
+            for blob_id in unique_blob_ids
+        ),
         return_exceptions=True,
     )
+    return _resolve_blob_content_results(refs, unique_blob_ids, results)
+
+
+def _resolve_blob_content_results(
+    refs: list[BlobInlineRef],
+    unique_blob_ids: list[UUID],
+    results: list[bytes | BaseException],
+) -> dict[BlobInlineRef, bytes]:
+    """Classify one exact-context content-read batch into ref-keyed bytes."""
     refs_by_blob = _refs_by_blob_id(refs)
     bytes_by_blob: dict[UUID, bytes] = {}
     missing: list[str] = []

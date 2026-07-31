@@ -220,6 +220,7 @@ class Orchestrator:
         openrouter_catalog_sha256: str | None = None,
         openrouter_catalog_source: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult:
         """Execute a pipeline run.
 
@@ -274,6 +275,7 @@ class Orchestrator:
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            check_coordination_latch=check_coordination_latch,
             # Bound AT CALL TIME (not construction) so monkeypatch.setattr on
             # the class and patch.object on this instance keep intercepting.
             initialize_database_phase=self._initialize_database_phase,

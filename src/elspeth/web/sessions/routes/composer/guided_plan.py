@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import replace
 from uuid import UUID, uuid4
 
@@ -13,6 +14,7 @@ from elspeth.contracts.blobs import (
     BlobIntegrityError,
     BlobQuotaExceededError,
 )
+from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.audit import BufferingRecorder
@@ -23,6 +25,7 @@ from elspeth.web.composer.protocol import ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.guided_replay import project_composition_proposal
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
@@ -50,9 +53,9 @@ from .._helpers import (
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
     _is_client_disconnect_cancel,
+    _join_progress_write,
     _request_plugin_policy_context,
     _state_from_record,
-    _track_compose_inflight,
     _verify_session_ownership,
     get_current_user,
     get_rate_limiter,
@@ -116,7 +119,6 @@ async def post_guided_plan(
     request: Request,
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
     rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
-    _inflight_tally: None = Depends(_track_compose_inflight),
 ) -> CompositionProposalResponse:
     """Plan and atomically stage one full guided proposal."""
 
@@ -178,12 +180,26 @@ async def post_guided_plan(
         return reserved
 
     recorder = BufferingRecorder()
+    progress_registry = _get_composer_progress_registry(request)
+    progress_started = False
     try:
+        await progress_registry.start_request(
+            session_operation_context=reserved.session_operation_context,
+            request_id=body.operation_id,
+            user_id=user.user_id,
+            event=ComposerProgressEvent(
+                phase="starting",
+                headline="ELSPETH is preparing the guided pipeline plan.",
+                evidence=("The guided planning request was accepted for this session.",),
+                likely_next="ELSPETH will inspect the current state and build a proposal.",
+            ),
+        )
+        progress_started = True
         catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
         progress = _composer_progress_sink(
-            _get_composer_progress_registry(request),
-            session_id=str(session_id),
+            progress_registry,
+            session_operation_context=reserved.session_operation_context,
             request_id=body.operation_id,
             user_id=user.user_id,
         )
@@ -211,6 +227,7 @@ async def post_guided_plan(
                 reserved.fence,
                 actor="composer_route",
                 lease_seconds=300,
+                session_operation_context=reserved.session_operation_context,
             )
 
         async with _cancel_on_client_disconnect(request):
@@ -231,6 +248,7 @@ async def post_guided_plan(
                 plugin_snapshot=plugin_snapshot,
                 recorder=recorder,
                 operation_fence=fence,
+                session_operation_context=reserved.session_operation_context,
                 progress=progress,
             )
 
@@ -260,6 +278,7 @@ async def post_guided_plan(
                 fence,
                 actor="composer_route",
                 lease_seconds=300,
+                session_operation_context=reserved.session_operation_context,
             )
             settlement = await _await_guided_atomic_settlement(
                 service.stage_guided_full_pipeline_proposal(
@@ -283,7 +302,8 @@ async def post_guided_plan(
                             llm_calls=recorder.llm_calls,
                             chat_turns=recorder.chat_turns,
                         ),
-                    )
+                    ),
+                    session_operation_context=reserved.session_operation_context,
                 )
             )
         return project_composition_proposal(settlement.proposal)
@@ -326,7 +346,8 @@ async def post_guided_plan(
                             llm_calls=recorder.llm_calls,
                             chat_turns=recorder.chat_turns,
                         ),
-                    )
+                    ),
+                    session_operation_context=reserved.session_operation_context,
                 )
             )
         except GuidedOperationFenceLostError as fence_lost:
@@ -354,7 +375,8 @@ async def post_guided_plan(
                         llm_calls=recorder.llm_calls,
                         chat_turns=recorder.chat_turns,
                     ),
-                )
+                ),
+                session_operation_context=reserved.session_operation_context,
             )
         except GuidedOperationFenceLostError:
             joined = await reserve_or_replay_guided_operation(
@@ -370,6 +392,20 @@ async def post_guided_plan(
                 raise AuditIntegrityError("guided-full failure lost its fence without a winner") from exc
             return joined
         raise_guided_operation_failure(failed)
+    finally:
+        try:
+            if progress_started:
+                with contextlib.suppress(SessionOperationFenceLost):
+                    await _join_progress_write(
+                        progress_registry.finish_request(
+                            session_operation_context=reserved.session_operation_context,
+                            request_id=body.operation_id,
+                            user_id=user.user_id,
+                            terminal_event=None,
+                        )
+                    )
+        finally:
+            await reserved.close()
 
 
 __all__ = ["router"]

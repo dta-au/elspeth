@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, final
 from uuid import UUID
 
 if TYPE_CHECKING:
+    from elspeth.contracts.session_operation import SessionOperationContext
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalState
@@ -1154,6 +1155,7 @@ class ComposerService(Protocol):
         progress: ComposerProgressSink | None = None,
         guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 
@@ -1203,6 +1205,7 @@ class ComposerService(Protocol):
         supersedes_draft_hash: str | None,
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]]:
         """Run the shared planner once with split private/provider-safe facts."""
@@ -1219,6 +1222,7 @@ class ComposerService(Protocol):
         plugin_snapshot: PluginAvailabilitySnapshot,
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]]:
         """Plan one ordinary guided-full proposal through the shared planner."""

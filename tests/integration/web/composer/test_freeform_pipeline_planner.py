@@ -20,6 +20,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ComposerResult
@@ -27,6 +28,7 @@ from elspeth.web.composer.recipe_intent_routing import FreeformRecipeIntentMatch
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
@@ -201,15 +203,26 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
 
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
 
-    result = await composer.compose(
-        "Build a CSV to JSONL pipeline.",
-        [],
-        _empty_state(),
-        session_id=str(session.id),
-        current_state_id=str(current_state.id) if current_state is not None else None,
-        user_id="planner-user",
-        user_message_id=str(user_message.id),
+    operation_lease = await SessionOperationLease.acquire(
+        sessions.session_operation_authority,
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=sessions.session_operation_lease_seconds,
     )
+    try:
+        result = await composer.compose(
+            "Build a CSV to JSONL pipeline.",
+            [],
+            _empty_state(),
+            session_id=str(session.id),
+            current_state_id=str(current_state.id) if current_state is not None else None,
+            user_id="planner-user",
+            user_message_id=str(user_message.id),
+            session_operation_context=operation_lease.context,
+        )
+    finally:
+        await operation_lease.close()
 
     proposals = await sessions.list_composition_proposals(session.id, status="pending")
     assert len(proposals) == 1
@@ -320,6 +333,13 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
         return await original_run_sync(paused_create)
 
     monkeypatch.setattr(sessions, "_run_sync", pause_create_worker)
+    operation_lease = await SessionOperationLease.acquire(
+        sessions.session_operation_authority,
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=sessions.session_operation_lease_seconds,
+    )
     compose_task = asyncio.create_task(
         composer.compose(
             "Build a CSV to JSONL pipeline.",
@@ -328,6 +348,7 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
             session_id=str(session.id),
             user_id="planner-user",
             user_message_id=str(user_message.id),
+            session_operation_context=operation_lease.context,
         )
     )
     assert await asyncio.to_thread(worker_started.wait, 5.0), "proposal creation worker did not start"
@@ -340,6 +361,7 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(compose_task, timeout=5.0)
+    await operation_lease.close()
 
     proposals = await sessions.list_composition_proposals(session.id)
     assert not cancellation_escaped_before_worker, "request cancellation escaped while proposal creation was still in flight"
@@ -892,7 +914,7 @@ async def test_recipe_custody_failure_cannot_publish_reviewable_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     message = "Build the requested pipeline."
-    engine, _sessions, session, user_message, composer = await _recipe_composer_context(
+    engine, sessions, session, user_message, composer = await _recipe_composer_context(
         tmp_path,
         monkeypatch,
         message=message,
@@ -919,6 +941,13 @@ async def test_recipe_custody_failure_cannot_publish_reviewable_authority(
             side_effect=AuditIntegrityError("custody failed"),
         ),
     )
+    operation_lease = await SessionOperationLease.acquire(
+        sessions.session_operation_authority,
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=sessions.session_operation_lease_seconds,
+    )
 
     with pytest.raises(AuditIntegrityError, match="custody failed"):
         await composer.compose(
@@ -928,6 +957,8 @@ async def test_recipe_custody_failure_cannot_publish_reviewable_authority(
             session_id=str(session.id),
             user_id="planner-user",
             user_message_id=str(user_message.id),
+            session_operation_context=operation_lease.context,
         )
 
+    await operation_lease.close()
     _assert_no_pipeline_side_effects(engine)

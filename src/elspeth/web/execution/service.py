@@ -18,9 +18,11 @@ import asyncio
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
+from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from uuid import UUID
 
@@ -36,12 +38,13 @@ from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
     _discover_blob_content_refs,
     _enforce_blob_content_ref_metadata,
-    _fetch_blob_contents,
+    _resolve_blob_content_results,
     _substitute_blob_content_refs,
 )
 from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
@@ -74,6 +77,8 @@ from elspeth.web.blobs.protocol import (
 from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
@@ -179,6 +184,13 @@ def _build_web_plugin_policy_evidence(
 
 
 T = TypeVar("T")
+
+
+class _LeaseCompletionFuture(Future[None]):
+    """Join handle whose lease cleanup cannot be cancelled by observers."""
+
+    def cancel(self) -> bool:
+        return False
 
 
 def _sanitize_error_for_client(exc: BaseException) -> str:
@@ -382,6 +394,7 @@ class ExecutionServiceImpl:
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._shutdown_events: dict[str, threading.Event] = {}
         self._shutdown_events_lock = threading.Lock()
+        self._lease_completion_futures: set[Future[None]] = set()
 
         # Per-session asyncio lock to prevent TOCTOU on the active-run check.
         # Keyed by session_id string; lazily created, cleaned up on session
@@ -503,13 +516,26 @@ class ExecutionServiceImpl:
             events = list(self._shutdown_events.values())
         for event in events:
             event.set()
-        await run_sync_in_worker(self._executor.shutdown, True)
+
+        def _shutdown_executor() -> None:
+            self._executor.shutdown(wait=True)
+
+        await run_sync_in_worker(_shutdown_executor)
+        while True:
+            with self._shutdown_events_lock:
+                completion_futures = tuple(self._lease_completion_futures)
+            if not completion_futures:
+                break
+            await asyncio.gather(
+                *(asyncio.wrap_future(completion) for completion in completion_futures),
+            )
 
     async def execute(
         self,
         session_id: UUID,
         state_id: UUID | None = None,
         *,
+        session_operation_lease: SessionOperationLease,
         user_id: str | None = None,
         auth_provider_type: str | None = None,
         fanout_ack_token: str | None = None,
@@ -532,30 +558,77 @@ class ExecutionServiceImpl:
         Note: async because SessionService methods are async. The pipeline
         itself runs in a background thread — only setup is async.
         """
+        if type(session_operation_lease) is not SessionOperationLease:
+            raise TypeError("session_operation_lease must be an exact SessionOperationLease")
+        session_operation_context = session_operation_lease.context
+        if session_operation_context.operation_kind is not SessionOperationKind.EXECUTE:
+            raise ValueError("session_operation_lease must carry EXECUTE authority")
+        if session_operation_context.fence.session_id != str(session_id):
+            raise ValueError("session_operation_lease belongs to a different session")
+
         # TOCTOU fix: per-session asyncio lock serialises the
         # get_active_run → create_run window so two concurrent execute()
         # calls cannot both pass the check before either creates a run.
         session_key = str(session_id)
         lock = self.get_session_lock(session_key)
         async with lock:
-            return await self._execute_locked(
+            prepared = await self._execute_locked(
                 session_id,
                 state_id,
+                session_operation_lease=session_operation_lease,
                 user_id=user_id,
                 auth_provider_type=auth_provider_type,
                 fanout_ack_token=fanout_ack_token,
             )
+            loss_watcher = asyncio.create_task(
+                self._signal_shutdown_on_operation_loss(
+                    session_operation_lease,
+                    prepared.shutdown_event,
+                ),
+                name=f"execution-operation-loss-{prepared.run_id}",
+            )
+            try:
+                future = self._executor.submit(
+                    self._run_pipeline,
+                    str(prepared.run_id),
+                    prepared.pipeline_yaml,
+                    prepared.shutdown_event,
+                    prepared.frozen_run_settings,
+                    prepared.user_id,
+                    prepared.auth_provider_type,
+                    session_operation_lease=session_operation_lease,
+                )
+            except BaseException as exc:
+                loss_watcher.cancel()
+                await asyncio.gather(loss_watcher, return_exceptions=True)
+                await self._handle_pipeline_submission_failure(
+                    prepared.run_id,
+                    exc,
+                    session_operation_lease=session_operation_lease,
+                )
+                raise
+            future.add_done_callback(
+                partial(
+                    self._on_pipeline_done,
+                    session_operation_lease=session_operation_lease,
+                    loss_watcher=loss_watcher,
+                )
+            )
+            return prepared.run_id
 
     async def _execute_locked(
         self,
         session_id: UUID,
         state_id: UUID | None = None,
         *,
+        session_operation_lease: SessionOperationLease,
         user_id: str | None = None,
         auth_provider_type: str | None = None,
         fanout_ack_token: str | None = None,
-    ) -> UUID:
+    ) -> _PreparedPipelineExecution:
         """Inner execute — runs under the per-session asyncio.Lock."""
+        session_operation_context = session_operation_lease.context
+        await run_sync_in_worker(session_operation_lease.guard_external_effect)
         # B6: One active run per session (AC #17: via SessionService)
         active = await self._session_service.get_active_run(session_id)
         if active is not None:
@@ -864,7 +937,11 @@ class ExecutionServiceImpl:
                 # distinguishable HTTP status (404 vs 500, because
                 # ``BlobNotFoundError`` was uncaught), a two-channel
                 # oracle strictly worse than the state_id surface.
-                blob_record = await self._blob_service.get_blob(parsed_blob_id)
+                await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                blob_record = await self._blob_service.get_blob(
+                    parsed_blob_id,
+                    session_operation_context=session_operation_context,
+                )
                 if blob_record.session_id != session_id:
                     raise BlobNotFoundError(blob_ref)
 
@@ -912,10 +989,12 @@ class ExecutionServiceImpl:
         # B9 fix: create_run() generates its own UUID internally and returns
         # a RunRecord. Read the run_id back from the returned record so our
         # _shutdown_events key matches the DB record.
+        await run_sync_in_worker(session_operation_lease.guard_external_effect)
         run_record = await self._session_service.create_run(
             session_id=session_id,
             state_id=state_record.id,  # From the record, not the domain object
             pipeline_yaml=pipeline_yaml,
+            session_operation_context=session_operation_context,
         )
         run_id = run_record.id  # Use the DB-generated UUID as canonical
 
@@ -928,73 +1007,70 @@ class ExecutionServiceImpl:
             self._shutdown_events[str(run_id)] = shutdown_event
 
         try:
-            # Record blob-to-run linkage for input blobs
+            # Record blob-to-run linkage for input blobs before the worker starts.
             if parsed_blob_ids and self._blob_service is not None:
                 for parsed_blob_id in parsed_blob_ids:
+                    await run_sync_in_worker(session_operation_lease.guard_external_effect)
                     await self._blob_service.link_blob_to_run(
                         blob_id=parsed_blob_id,
                         run_id=run_id,
                         direction="input",
+                        session_operation_context=session_operation_context,
                     )
-
-            # Submit to thread pool
-            future = self._executor.submit(
-                self._run_pipeline,
-                str(run_id),
-                pipeline_yaml,
-                shutdown_event,
-                frozen_run_settings,
-                user_id,
-                auth_provider_type,
-            )
         except BaseException as exc:
-            with self._shutdown_events_lock:
-                # Idempotent cleanup of an internal bookkeeping key. Access it
-                # directly (R9 remediation); the membership guard preserves the
-                # silent no-op when cleanup races or runs twice.
-                run_key = str(run_id)
-                if run_key in self._shutdown_events:
-                    del self._shutdown_events[run_key]
-            # Transition run out of pending so the one-active-run constraint
-            # doesn't permanently block this session.
-            #
-            # Narrow catch (canonical pattern, commits b8ba2214/127417cb):
-            # ``SQLAlchemyError`` covers every DB-layer failure mode
-            # (lock timeout, pool disconnect, deadlock, IntegrityError,
-            # OperationalError, ProgrammingError); ``OSError`` covers
-            # filesystem-adjacent failures routed through SQLAlchemy on
-            # SQLite (``database is locked`` is an OperationalError subclass
-            # of SQLAlchemyError, but a disk-full midway through a commit
-            # can surface as OSError before SQLAlchemy wraps it). Programmer
-            # bugs (AttributeError, TypeError, KeyError) from our own
-            # service code must propagate — a cleanup path masking a
-            # programmer bug is exactly the silent-wrong-result pattern
-            # CLAUDE.md forbids.
-            #
-            # ``exc_class`` only: ``str(cleanup_err)`` on SQLAlchemyError
-            # subclasses expands to ``[SQL: ...] [parameters: ...]`` and
-            # appends ``__cause__`` text that can carry DB URLs /
-            # credentials. ``str(exc)`` (the original) is similarly unsafe
-            # because the outer ``BaseException`` catch sweeps up anything
-            # including sanitizer bugs.  The client-facing message is
-            # already routed through ``_sanitize_error_for_client`` above;
-            # the slog must not re-expose the raw form.
-            try:
-                await self._session_service.update_run_status(
-                    run_id, status="failed", error=f"Setup failed: {_sanitize_error_for_client(exc)}"
-                )
-            except (SQLAlchemyError, OSError) as cleanup_err:
-                slog.error(
-                    "run_cleanup_status_update_failed",
-                    run_id=str(run_id),
-                    original_exc_class=type(exc).__name__,
-                    cleanup_exc_class=type(cleanup_err).__name__,
-                )
+            await self._handle_pipeline_submission_failure(
+                run_id,
+                exc,
+                session_operation_lease=session_operation_lease,
+            )
             raise
-        # B7 Layer 2: safety net callback
-        future.add_done_callback(self._on_pipeline_done)
 
-        return run_id
+        return _PreparedPipelineExecution(
+            run_id=run_id,
+            pipeline_yaml=pipeline_yaml,
+            shutdown_event=shutdown_event,
+            frozen_run_settings=frozen_run_settings,
+            user_id=user_id,
+            auth_provider_type=auth_provider_type,
+        )
+
+    async def _handle_pipeline_submission_failure(
+        self,
+        run_id: UUID,
+        exc: BaseException,
+        *,
+        session_operation_lease: SessionOperationLease,
+    ) -> None:
+        """Terminalize a prepared run when the worker cannot be submitted."""
+        session_operation_context = session_operation_lease.context
+        with self._shutdown_events_lock:
+            run_key = str(run_id)
+            if run_key in self._shutdown_events:
+                del self._shutdown_events[run_key]
+        try:
+            await run_sync_in_worker(session_operation_lease.guard_external_effect)
+            await self._session_service.update_run_status(
+                run_id,
+                status="failed",
+                error=f"Setup failed: {_sanitize_error_for_client(exc)}",
+                session_operation_context=session_operation_context,
+            )
+        except (SQLAlchemyError, OSError) as cleanup_err:
+            slog.error(
+                "run_cleanup_status_update_failed",
+                run_id=str(run_id),
+                original_exc_class=type(exc).__name__,
+                cleanup_exc_class=type(cleanup_err).__name__,
+            )
+
+    @staticmethod
+    async def _signal_shutdown_on_operation_loss(
+        session_operation_lease: SessionOperationLease,
+        shutdown_event: threading.Event,
+    ) -> None:
+        """Stop the worker as soon as renewal proves EXECUTE authority lost."""
+        await session_operation_lease.wait_until_lost()
+        shutdown_event.set()
 
     async def get_status(
         self,
@@ -1025,7 +1101,13 @@ class ExecutionServiceImpl:
             cancel_requested=cancel_requested,
         )
 
-    async def validate(self, session_id: UUID, *, user_id: str | None = None) -> ValidationResult:
+    async def validate(
+        self,
+        session_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+    ) -> ValidationResult:
         """Dry-run validation using real engine code paths.
 
         Wraps the sync validate_pipeline() call via run_in_executor
@@ -1073,12 +1155,18 @@ class ExecutionServiceImpl:
             )
 
         composition_state = state_from_record(state_record)
-        return await self.validate_state(composition_state, user_id=user_id, session_id=session_id)
+        return await self.validate_state(
+            composition_state,
+            session_operation_context=session_operation_context,
+            user_id=user_id,
+            session_id=session_id,
+        )
 
     async def validate_state(
         self,
         state: CompositionState,
         *,
+        session_operation_context: SessionOperationContext,
         user_id: str | None = None,
         session_id: UUID | None = None,
     ) -> ValidationResult:
@@ -1090,8 +1178,6 @@ class ExecutionServiceImpl:
         ``session_id`` scopes inline-blob metadata lookups to the same session
         boundary enforced by ``link_blob_to_run()`` at execution time.
         """
-        from functools import partial
-
         from elspeth.web.execution.validation import validate_pipeline
 
         plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="validation")
@@ -1100,7 +1186,12 @@ class ExecutionServiceImpl:
             if self._blob_service is None:
                 return None
             try:
-                record = self._call_async(self._blob_service.get_blob(blob_id))
+                record = self._call_async(
+                    self._blob_service.get_blob(
+                        blob_id,
+                        session_operation_context=session_operation_context,
+                    )
+                )
             except BlobNotFoundError:
                 return None
             if session_id is not None and record.session_id != session_id:
@@ -1169,10 +1260,12 @@ class ExecutionServiceImpl:
         if event is not None:
             event.set()
         else:
-            # No event means either pending (not yet started) or already done
+            # A missing local event means this process does not own the EXECUTE
+            # authority required to mutate the run. Terminal reads stay
+            # idempotent; non-terminal cancellation fails closed.
             run = await self._session_service.get_run(run_id)
             if run.status not in SESSION_TERMINAL_RUN_STATUS_VALUES:
-                await self._session_service.update_run_status(run_id, status="cancelled")
+                raise RuntimeError("Cannot cancel a non-terminal run without local EXECUTE authority")
 
     # ── Background Thread ──────────────────────────────────────────────
 
@@ -1184,6 +1277,8 @@ class ExecutionServiceImpl:
         frozen_run_settings: FrozenRunSettings | None = None,
         user_id: str | None = None,
         auth_provider_type: str | None = None,
+        *,
+        session_operation_lease: SessionOperationLease,
     ) -> _RunPipelineOutcome:
         """Execute a pipeline in the background thread.
 
@@ -1203,13 +1298,26 @@ class ExecutionServiceImpl:
         rate_limit_registry: Any | None = None
         telemetry_manager: Any | None = None
         run_uuid = UUID(run_id)
+        session_operation_context = session_operation_lease.context
         sink_effect_gate_passed = False
         try:
+            session_operation_lease.guard_external_effect()
             # Early shutdown check: if cancel()/shutdown() fired before we
             # start setup, skip the expensive LandscapeDB/plugin/graph work.
             if shutdown_event.is_set():
-                self._finalize_output_blobs(run_id, success=False)
-                self._call_async(self._session_service.update_run_status(run_uuid, status="cancelled"))
+                self._finalize_output_blobs(
+                    run_id,
+                    success=False,
+                    session_operation_lease=session_operation_lease,
+                )
+                session_operation_lease.guard_external_effect()
+                self._call_async(
+                    self._session_service.update_run_status(
+                        run_uuid,
+                        status="cancelled",
+                        session_operation_context=session_operation_context,
+                    )
+                )
                 self._persist_and_broadcast_run_event(
                     run_id,
                     RunEvent(
@@ -1225,6 +1333,7 @@ class ExecutionServiceImpl:
                             tokens_routed_failure=0,
                         ),
                     ),
+                    session_operation_lease=session_operation_lease,
                 )
                 return None
 
@@ -1343,16 +1452,16 @@ class ExecutionServiceImpl:
                         unique_blob_ids.append(ref.blob_id)
 
                     async def _link_inline_blobs_to_run() -> None:
-                        await asyncio.gather(
-                            *(
-                                blob_service.link_blob_to_run(
-                                    blob_id=blob_id,
-                                    run_id=run_uuid,
-                                    direction="input",
-                                )
-                                for blob_id in unique_blob_ids
+                        async def _link_one(blob_id: UUID) -> None:
+                            await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                            await blob_service.link_blob_to_run(
+                                blob_id=blob_id,
+                                run_id=run_uuid,
+                                direction="input",
+                                session_operation_context=session_operation_context,
                             )
-                        )
+
+                        await asyncio.gather(*(_link_one(blob_id) for blob_id in unique_blob_ids))
 
                     try:
                         # IDOR contract (mirrors the source blob_ref path at
@@ -1368,10 +1477,15 @@ class ExecutionServiceImpl:
                         # or any ``link_blob_to_run`` / ``read_blob_content``
                         # access, so no metadata of another session's blob is
                         # ever observable.
+                        session_operation_lease.guard_external_effect()
                         owning_session_id = self._call_async(self._session_service.get_run(run_uuid)).session_id
 
                         async def _get_blob_scoped(blob_id: UUID) -> BlobRecord:
-                            record = await blob_service.get_blob(blob_id)
+                            await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                            record = await blob_service.get_blob(
+                                blob_id,
+                                session_operation_context=session_operation_context,
+                            )
                             if record.session_id != owning_session_id:
                                 raise BlobNotFoundError(str(blob_id))
                             return record
@@ -1390,7 +1504,22 @@ class ExecutionServiceImpl:
                             aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
                         )
                         self._call_async(_link_inline_blobs_to_run())
-                        fetched = self._call_async(_fetch_blob_contents(blob_service, inline_refs))
+
+                        async def _read_inline_blob_contents() -> dict[Any, bytes]:
+                            async def _read_one(blob_id: UUID) -> bytes:
+                                await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                                return await blob_service.read_blob_content(
+                                    blob_id,
+                                    session_operation_context=session_operation_context,
+                                )
+
+                            results = await asyncio.gather(
+                                *(_read_one(blob_id) for blob_id in unique_blob_ids),
+                                return_exceptions=True,
+                            )
+                            return _resolve_blob_content_results(inline_refs, unique_blob_ids, results)
+
+                        fetched = self._call_async(_read_inline_blob_contents())
                         blob_metadata: dict[UUID, tuple[AllowedMimeType, int]] = {
                             blob_id: (cast(AllowedMimeType, record.mime_type), record.size_bytes)
                             for blob_id, record in zip(unique_blob_ids, metadata_records, strict=True)
@@ -1404,11 +1533,13 @@ class ExecutionServiceImpl:
                     except BlobIntegrityError:
                         _BLOB_INLINE_HASH_MISMATCH_TOTAL.add(1)
                         raise
+                    session_operation_lease.guard_external_effect()
                     self._call_async(
                         self._session_service.record_blob_inline_resolutions(
                             run_id=run_uuid,
                             resolutions=blob_resolutions,
                             attempt=1,
+                            session_operation_context=session_operation_context,
                         )
                     )
 
@@ -1460,11 +1591,24 @@ class ExecutionServiceImpl:
             sink_effect_gate_passed = True
 
             try:
-                self._call_async(self._session_service.update_run_status(run_uuid, status="running", landscape_run_id=run_id))
+                session_operation_lease.guard_external_effect()
+                self._call_async(
+                    self._session_service.update_run_status(
+                        run_uuid,
+                        status="running",
+                        landscape_run_id=run_id,
+                        session_operation_context=session_operation_context,
+                    )
+                )
             except IllegalRunTransitionError:
+                session_operation_lease.guard_external_effect()
                 current = self._call_async(self._session_service.get_run(run_uuid))
                 if current.status == "cancelled":
-                    self._finalize_output_blobs(run_id, success=False)
+                    self._finalize_output_blobs(
+                        run_id,
+                        success=False,
+                        session_operation_lease=session_operation_lease,
+                    )
                     self._persist_and_broadcast_run_event(
                         run_id,
                         RunEvent(
@@ -1480,13 +1624,16 @@ class ExecutionServiceImpl:
                                 tokens_routed_failure=0,
                             ),
                         ),
+                        session_operation_lease=session_operation_lease,
                     )
                     return None
                 raise
 
             # These are the first durable runtime resources. The exact sink
             # instances have already earned admission above.
+            session_operation_lease.guard_external_effect()
             landscape_db = open_landscape_db(self._settings)
+            session_operation_lease.guard_external_effect()
             payload_store = FilesystemPayloadStore(base_path=self._settings.get_payload_store_path())
 
             # Fold aggregations into transforms, assemble PipelineConfig, and
@@ -1523,7 +1670,11 @@ class ExecutionServiceImpl:
             # RuntimeError from an open loop remains a programmer/infrastructure
             # invariant failure and propagates through EventBus.
             def _broadcast_progress(evt: ProgressEvent) -> None:
-                self._broadcast_progress_event(run_id, evt)
+                self._broadcast_progress_event(
+                    run_id,
+                    evt,
+                    session_operation_lease=session_operation_lease,
+                )
 
             event_bus = EventBus()
             event_bus.subscribe(ProgressEvent, _broadcast_progress)
@@ -1587,6 +1738,7 @@ class ExecutionServiceImpl:
                     settings.landscape.export
                 )
 
+            session_operation_lease.guard_external_effect()
             result = orchestrator.run(
                 pipeline_config,
                 graph=graph,
@@ -1609,6 +1761,7 @@ class ExecutionServiceImpl:
                     snapshot=plugin_snapshot,
                     policy=self._web_plugin_policy,
                 ),
+                check_coordination_latch=session_operation_lease.guard_external_effect,
             )
 
             # Orchestrator.run() returns normally ONLY on completion.
@@ -1678,6 +1831,7 @@ class ExecutionServiceImpl:
             # IllegalRunTransitionError docstring for why bare ValueError must
             # propagate (Tier-1 invariant breaches must not be masked).
             try:
+                session_operation_lease.guard_external_effect()
                 self._call_async(
                     self._session_service.update_run_status(
                         run_uuid,
@@ -1689,9 +1843,11 @@ class ExecutionServiceImpl:
                         rows_routed_success=result.rows_routed_success,
                         rows_routed_failure=result.rows_routed_failure,
                         rows_quarantined=result.rows_quarantined,
+                        session_operation_context=session_operation_context,
                     )
                 )
             except IllegalRunTransitionError:
+                session_operation_lease.guard_external_effect()
                 current = self._call_async(self._session_service.get_run(run_uuid))
                 if current.status == "cancelled":
                     slog.warning(
@@ -1701,7 +1857,11 @@ class ExecutionServiceImpl:
                         rows_processed=result.rows_processed,
                         rows_failed=result.rows_failed,
                     )
-                    self._finalize_output_blobs(run_id, success=False)
+                    self._finalize_output_blobs(
+                        run_id,
+                        success=False,
+                        session_operation_lease=session_operation_lease,
+                    )
                     self._persist_and_broadcast_run_event(
                         run_id,
                         RunEvent(
@@ -1717,6 +1877,7 @@ class ExecutionServiceImpl:
                                 tokens_routed_failure=result.rows_routed_failure,
                             ),
                         ),
+                        session_operation_lease=session_operation_lease,
                     )
                     return None
                 raise
@@ -1734,7 +1895,11 @@ class ExecutionServiceImpl:
             # evidence (e.g. quarantine sink contents), so finalize as
             # success=False to keep the failure-track outputs distinct
             # from clean-completion outputs in the blob lifecycle.
-            self._finalize_output_blobs(run_id, success=(result.status != RunStatus.FAILED))
+            self._finalize_output_blobs(
+                run_id,
+                success=(result.status != RunStatus.FAILED),
+                session_operation_lease=session_operation_lease,
+            )
 
             if result.status == RunStatus.FAILED:
                 # Engine returned normally but no row reached success.  Emit
@@ -1760,10 +1925,12 @@ class ExecutionServiceImpl:
                             node_id=None,
                         ),
                     ),
+                    session_operation_lease=session_operation_lease,
                 )
             else:
                 if landscape_db is None:
                     raise RuntimeError("Tier-1 invariant: completed run has no open LandscapeDB for accounting projection")
+                session_operation_lease.guard_external_effect()
                 accounting = load_run_accounting_from_db(landscape_db, landscape_run_id=result.run_id)
                 self._persist_and_broadcast_run_event(
                     run_id,
@@ -1794,12 +1961,25 @@ class ExecutionServiceImpl:
                             landscape_run_id=result.run_id,
                         ),
                     ),
+                    session_operation_lease=session_operation_lease,
                 )
+
+        except SessionOperationFenceLost:
+            # A successor now owns the session.  Do not translate authority
+            # loss into user cancellation or failure: either would finalize
+            # blobs, allocate an event sequence, or broadcast stale state.
+            # The finally block still retires worker-local resources.
+            raise
 
         except GracefulShutdownError as gse:
             # Orchestrator detected shutdown during processing and raised
             # after flushing in-progress work. Finalize → status → broadcast.
-            self._finalize_output_blobs(run_id, success=False)
+            self._finalize_output_blobs(
+                run_id,
+                success=False,
+                session_operation_lease=session_operation_lease,
+            )
+            session_operation_lease.guard_external_effect()
             self._call_async(
                 self._session_service.update_run_status(
                     run_uuid,
@@ -1810,6 +1990,7 @@ class ExecutionServiceImpl:
                     rows_routed_success=gse.rows_routed_success,
                     rows_routed_failure=gse.rows_routed_failure,
                     rows_quarantined=gse.rows_quarantined,
+                    session_operation_context=session_operation_context,
                 )
             )
             self._persist_and_broadcast_run_event(
@@ -1827,6 +2008,7 @@ class ExecutionServiceImpl:
                         tokens_routed_failure=gse.rows_routed_failure,
                     ),
                 ),
+                session_operation_lease=session_operation_lease,
             )
             return _RUN_PIPELINE_GRACEFUL_SHUTDOWN_HANDLED
 
@@ -1839,7 +2021,11 @@ class ExecutionServiceImpl:
             # Without this, the Run record stays in 'running' forever.
 
             # Finalize blobs first — before any terminal event surfaces.
-            self._finalize_output_blobs(run_id, success=False)
+            self._finalize_output_blobs(
+                run_id,
+                success=False,
+                session_operation_lease=session_operation_lease,
+            )
 
             client_msg = _sanitize_error_for_client(exc)
             if type(exc) is PydanticValidationError:
@@ -1897,6 +2083,7 @@ class ExecutionServiceImpl:
                     run_uuid,
                     run_id=run_id,
                     original_exc_class=type(exc).__name__,
+                    session_operation_lease=session_operation_lease,
                 )
                 run_already_terminal = probe_outcome.run_already_terminal
 
@@ -1933,6 +2120,7 @@ class ExecutionServiceImpl:
                         status_update_exc_class = self._persist_failed_run_status(
                             run_uuid,
                             error=client_msg,
+                            session_operation_lease=session_operation_lease,
                         )
                     except IllegalRunTransitionError as irte:
                         # elspeth-879f6de6bd recovery branch 3 (probe-failed
@@ -2021,6 +2209,7 @@ class ExecutionServiceImpl:
                         event_type="failed",
                         data=FailedData(detail=client_msg, node_id=None),
                     ),
+                    session_operation_lease=session_operation_lease,
                 )
             raise
         finally:
@@ -2047,15 +2236,30 @@ class ExecutionServiceImpl:
             self._broadcaster.cleanup_run(run_id)
         return None
 
-    def _persist_failed_run_status(self, run_uuid: UUID, *, error: str) -> str | None:
+    def _persist_failed_run_status(
+        self,
+        run_uuid: UUID,
+        *,
+        error: str,
+        session_operation_lease: SessionOperationLease,
+    ) -> str | None:
         """Best-effort failed-status persistence for exception recovery.
 
         Returns the transient DB/filesystem exception class when persistence
         cannot be recorded, rather than raising it and masking the original
         pipeline exception being recovered.
         """
+        session_operation_context = session_operation_lease.context
         try:
-            self._call_async(self._session_service.update_run_status(run_uuid, status="failed", error=error))
+            session_operation_lease.guard_external_effect()
+            self._call_async(
+                self._session_service.update_run_status(
+                    run_uuid,
+                    status="failed",
+                    error=error,
+                    session_operation_context=session_operation_context,
+                )
+            )
         except (SQLAlchemyError, OSError) as status_err:
             # Narrow catch (canonical pattern, commits b8ba2214/127417cb):
             # SQLAlchemyError family + OSError only. Programmer bugs in
@@ -2091,8 +2295,10 @@ class ExecutionServiceImpl:
         *,
         run_id: str,
         original_exc_class: str,
+        session_operation_lease: SessionOperationLease,
     ) -> _RunStateProbeOutcome:
         try:
+            session_operation_lease.guard_external_effect()
             current_run = self._call_async(self._session_service.get_run(run_uuid))
             return _RunStateProbeOutcome(run_already_terminal=current_run.status in SESSION_TERMINAL_RUN_STATUS_VALUES)
         except (SQLAlchemyError, OSError) as probe_err:
@@ -2117,9 +2323,19 @@ class ExecutionServiceImpl:
             )
             return _RunStateProbeOutcome(run_already_terminal=False, failed=True)
 
-    def _broadcast_progress_event(self, run_id: str, progress: ProgressEvent) -> None:
+    def _broadcast_progress_event(
+        self,
+        run_id: str,
+        progress: ProgressEvent,
+        *,
+        session_operation_lease: SessionOperationLease,
+    ) -> None:
         run_event = self._to_run_event(run_id, progress)
-        broadcast_result = self._persist_and_broadcast_run_event(run_id, run_event)
+        broadcast_result = self._persist_and_broadcast_run_event(
+            run_id,
+            run_event,
+            session_operation_lease=session_operation_lease,
+        )
         if broadcast_result.dropped_count > 0:
             assert broadcast_result.drop_reason is not None, "BroadcastResult with drops must carry a drop_reason"
             self._telemetry.progress_broadcast_dropped_total.add(
@@ -2127,14 +2343,23 @@ class ExecutionServiceImpl:
                 attributes={"reason": broadcast_result.drop_reason},
             )
 
-    def _persist_and_broadcast_run_event(self, run_id: str, run_event: RunEvent) -> BroadcastResult:
+    def _persist_and_broadcast_run_event(
+        self,
+        run_id: str,
+        run_event: RunEvent,
+        *,
+        session_operation_lease: SessionOperationLease,
+    ) -> BroadcastResult:
+        session_operation_context = session_operation_lease.context
         try:
+            session_operation_lease.guard_external_effect()
             record = self._call_async(
                 self._session_service.append_run_event(
                     run_id=UUID(run_id),
                     timestamp=run_event.timestamp,
                     event_type=run_event.event_type,
                     data=run_event.data.model_dump(mode="json"),
+                    session_operation_context=session_operation_context,
                 )
             )
             run_event = run_event.with_event_sequence(record.sequence)
@@ -2152,6 +2377,7 @@ class ExecutionServiceImpl:
                 event_type=run_event.event_type,
                 exc_class=type(exc).__name__,
             )
+        session_operation_lease.guard_external_effect()
         return self._broadcaster.broadcast(run_id, run_event)
 
     # Exceptions that can escape finalize_run_output_blobs itself
@@ -2174,15 +2400,24 @@ class ExecutionServiceImpl:
         BlobStateError,
     )
 
-    def _finalize_output_blobs_outcome(self, run_id: str, *, success: bool) -> _OutputBlobFinalizationOutcome:
+    def _finalize_output_blobs_outcome(
+        self,
+        run_id: str,
+        *,
+        success: bool,
+        session_operation_lease: SessionOperationLease,
+    ) -> _OutputBlobFinalizationOutcome:
+        session_operation_context = session_operation_lease.context
         blob_service = self._blob_service
         if blob_service is None:
             raise RuntimeError("_finalize_output_blobs_outcome requires blob_service; caller must check before finalizing")
         try:
+            session_operation_lease.guard_external_effect()
             result = self._call_async(
                 blob_service.finalize_run_output_blobs(
                     UUID(run_id),
                     success=success,
+                    session_operation_context=session_operation_context,
                 )
             )
         except self._FINALIZE_SUPPRESSED as blob_err:
@@ -2196,7 +2431,13 @@ class ExecutionServiceImpl:
             errors=tuple({"blob_id": str(e.blob_id), "exc_type": e.exc_type} for e in result.errors),
         )
 
-    def _finalize_output_blobs(self, run_id: str, *, success: bool) -> None:
+    def _finalize_output_blobs(
+        self,
+        run_id: str,
+        *,
+        success: bool,
+        session_operation_lease: SessionOperationLease,
+    ) -> None:
         """Finalize pending output blobs after a run completes/fails/cancels.
 
         Uses _call_async to bridge from the background thread to the async
@@ -2206,7 +2447,11 @@ class ExecutionServiceImpl:
         """
         if self._blob_service is None:
             return
-        outcome = self._finalize_output_blobs_outcome(run_id, success=success)
+        outcome = self._finalize_output_blobs_outcome(
+            run_id,
+            success=success,
+            session_operation_lease=session_operation_lease,
+        )
         if outcome.failure_exc_type is not None:
             slog.error(
                 "blob_finalization_failed",
@@ -2225,7 +2470,13 @@ class ExecutionServiceImpl:
                 errors=list(outcome.errors),
             )
 
-    def _on_pipeline_done(self, future: Future[_RunPipelineOutcome]) -> None:
+    def _on_pipeline_done(
+        self,
+        future: Future[_RunPipelineOutcome],
+        *,
+        session_operation_lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None] | None = None,
+    ) -> None:
         """B7 Layer 2: Safety net callback.
 
         Fires when the Future completes. Retrieves (and suppresses) any
@@ -2239,7 +2490,10 @@ class ExecutionServiceImpl:
         never completed. In that case this callback is the ONLY place
         the failure surfaces, so we log as a last-resort safety net.
         """
-        exc = future.exception()
+        try:
+            exc = future.exception()
+        except FutureCancelledError:
+            exc = None
         if exc is not None and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
             # _run_pipeline's except block logs via slog when the status
             # update itself fails.  If we reach here with an exception,
@@ -2270,6 +2524,51 @@ class ExecutionServiceImpl:
                 exc_type=type(exc).__name__,
                 exc_class_chain=exc_class_chain,
             )
+
+        async def _finish_execution_authority() -> None:
+            try:
+                if loss_watcher is not None:
+                    loss_watcher.cancel()
+                    await asyncio.gather(loss_watcher, return_exceptions=True)
+            finally:
+                await session_operation_lease.close()
+
+        scheduled_completion = asyncio.run_coroutine_threadsafe(
+            _finish_execution_authority(),
+            self._loop,
+        )
+        completion = _LeaseCompletionFuture()
+
+        def _settle_completion(done: Future[None]) -> None:
+            try:
+                completion_error = done.exception()
+            except FutureCancelledError as error:
+                completion.set_exception(error)
+                return
+            if completion_error is None:
+                completion.set_result(None)
+            else:
+                completion.set_exception(completion_error)
+
+        scheduled_completion.add_done_callback(_settle_completion)
+        with self._shutdown_events_lock:
+            self._lease_completion_futures.add(completion)
+
+        def _retire_completion(done: Future[None]) -> None:
+            with self._shutdown_events_lock:
+                self._lease_completion_futures.discard(done)
+            try:
+                completion_error = done.exception()
+            except FutureCancelledError:
+                slog.error("execution_lease_completion_cancelled")
+                return
+            if completion_error is not None:
+                slog.error(
+                    "execution_lease_completion_failed",
+                    exc_type=type(completion_error).__name__,
+                )
+
+        completion.add_done_callback(_retire_completion)
 
     def _to_run_event(self, run_id: str, progress: ProgressEvent) -> RunEvent:
         """Translate engine ProgressEvent to web RunEvent.
@@ -2307,6 +2606,16 @@ class _OutputBlobFinalizationOutcome:
     finalized_count: int
     errors: tuple[Mapping[str, str], ...]
     failure_exc_type: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPipelineExecution:
+    run_id: UUID
+    pipeline_yaml: str
+    shutdown_event: threading.Event
+    frozen_run_settings: FrozenRunSettings
+    user_id: str | None
+    auth_provider_type: str | None
 
 
 @dataclass(frozen=True, slots=True)

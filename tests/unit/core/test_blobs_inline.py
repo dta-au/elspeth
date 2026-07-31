@@ -18,6 +18,7 @@ from elspeth.contracts.blobs import (
 )
 from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef, BlobInlineValidationViolation, ResolvedBlobContent
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.core.blobs_inline import (
     _discover_blob_content_refs,
     _enforce_blob_content_ref_metadata,
@@ -34,6 +35,15 @@ BLOB2 = "7c3a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3aaa"
 BLOB3 = "9d4a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3bbb"
 SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_SESSION_ID = UUID("22222222-2222-4222-8222-222222222222")
+SESSION_OPERATION_CONTEXT = SessionOperationContext(
+    fence=SessionOperationFence(
+        session_id=str(SESSION_ID),
+        operation_id="33333333-3333-4333-8333-333333333333",
+        lease_token="inline-blob-test-lease-token",
+        operation_epoch=1,
+    ),
+    operation_kind=SessionOperationKind.BLOB_READ,
+)
 
 
 class _AsyncCallRecorder:
@@ -271,9 +281,16 @@ class TestFetchBlobContents:
         blob_service.read_blob_content.return_value = b"content"
         ref = _ref()
 
-        fetched = await _fetch_blob_contents(blob_service, [ref])
+        fetched = await _fetch_blob_contents(
+            blob_service,
+            [ref],
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
-        blob_service.read_blob_content.assert_awaited_once_with(UUID(BLOB1))
+        blob_service.read_blob_content.assert_awaited_once_with(
+            UUID(BLOB1),
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
         assert fetched == {ref: b"content"}
 
     @pytest.mark.asyncio
@@ -285,9 +302,16 @@ class TestFetchBlobContents:
             _ref(BLOB1, "source.options.b"),
         ]
 
-        fetched = await _fetch_blob_contents(blob_service, refs)
+        fetched = await _fetch_blob_contents(
+            blob_service,
+            refs,
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
-        blob_service.read_blob_content.assert_awaited_once_with(UUID(BLOB1))
+        blob_service.read_blob_content.assert_awaited_once_with(
+            UUID(BLOB1),
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
         assert fetched == {refs[0]: b"content", refs[1]: b"content"}
 
     @pytest.mark.asyncio
@@ -296,7 +320,16 @@ class TestFetchBlobContents:
         blob_service.read_blob_content.side_effect = BlobIntegrityError(BLOB1, expected="a" * 64, actual="b" * 64)
 
         with pytest.raises(BlobIntegrityError):
-            await _fetch_blob_contents(blob_service, [_ref()])
+            await _fetch_blob_contents(
+                blob_service,
+                [_ref()],
+                session_operation_context=SESSION_OPERATION_CONTEXT,
+            )
+
+        blob_service.read_blob_content.assert_awaited_once_with(
+            UUID(BLOB1),
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
     @pytest.mark.asyncio
     async def test_propagates_content_missing_errors(self) -> None:
@@ -304,7 +337,16 @@ class TestFetchBlobContents:
         blob_service.read_blob_content.side_effect = BlobContentMissingError(BLOB1, storage_path="/tmp/blob.csv")
 
         with pytest.raises(BlobContentMissingError):
-            await _fetch_blob_contents(blob_service, [_ref()])
+            await _fetch_blob_contents(
+                blob_service,
+                [_ref()],
+                session_operation_context=SESSION_OPERATION_CONTEXT,
+            )
+
+        blob_service.read_blob_content.assert_awaited_once_with(
+            UUID(BLOB1),
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
     @pytest.mark.asyncio
     async def test_collects_not_found_by_field_path(self) -> None:
@@ -312,9 +354,17 @@ class TestFetchBlobContents:
         blob_service.read_blob_content.side_effect = BlobNotFoundError(BLOB1)
 
         with pytest.raises(BlobContentResolutionError) as exc_info:
-            await _fetch_blob_contents(blob_service, [_ref()])
+            await _fetch_blob_contents(
+                blob_service,
+                [_ref()],
+                session_operation_context=SESSION_OPERATION_CONTEXT,
+            )
 
         assert exc_info.value.missing == ("source.options.x",)
+        blob_service.read_blob_content.assert_awaited_once_with(
+            UUID(BLOB1),
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
     @pytest.mark.asyncio
     async def test_collects_not_ready_by_field_path(self) -> None:
@@ -322,9 +372,17 @@ class TestFetchBlobContents:
         blob_service.read_blob_content.side_effect = BlobStateError(BLOB1, message="Blob is pending")
 
         with pytest.raises(BlobContentResolutionError) as exc_info:
-            await _fetch_blob_contents(blob_service, [_ref()])
+            await _fetch_blob_contents(
+                blob_service,
+                [_ref()],
+                session_operation_context=SESSION_OPERATION_CONTEXT,
+            )
 
         assert exc_info.value.not_ready == (("source.options.x", "Blob is pending"),)
+        blob_service.read_blob_content.assert_awaited_once_with(
+            UUID(BLOB1),
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
 
 class TestSubstituteBlobContentRefs:
@@ -551,7 +609,12 @@ class TestValidateBlobContentRefs:
         blob_service.get_blob.side_effect = BlobNotFoundError(BLOB1)
         config = {"source": {"options": {"x": _marker(BLOB1, VALID_HASH)}}}
 
-        violations = await _validate_blob_content_refs(blob_service, config, session_id=SESSION_ID)
+        violations = await _validate_blob_content_refs(
+            blob_service,
+            config,
+            session_id=SESSION_ID,
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
         assert violations == [
             BlobInlineValidationViolation(
@@ -560,6 +623,10 @@ class TestValidateBlobContentRefs:
                 detail=f"blob {UUID(BLOB1)} not found",
             )
         ]
+        blob_service.get_blob.assert_awaited_once_with(
+            UUID(BLOB1),
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
     @pytest.mark.asyncio
     async def test_async_treats_cross_session_blob_as_missing_before_metadata_checks(self) -> None:
@@ -572,7 +639,12 @@ class TestValidateBlobContentRefs:
         )
         config = {"source": {"options": {"x": _marker(BLOB1, VALID_HASH)}}}
 
-        violations = await _validate_blob_content_refs(blob_service, config, session_id=SESSION_ID)
+        violations = await _validate_blob_content_refs(
+            blob_service,
+            config,
+            session_id=SESSION_ID,
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
         assert violations == [
             BlobInlineValidationViolation(
@@ -581,13 +653,22 @@ class TestValidateBlobContentRefs:
                 detail=f"blob {UUID(BLOB1)} not found",
             )
         ]
+        blob_service.get_blob.assert_awaited_once_with(
+            UUID(BLOB1),
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
     @pytest.mark.asyncio
     async def test_async_returns_malformed_violation_without_lookup(self) -> None:
         blob_service = _BlobServiceDouble()
         config = {"source": {"options": {"x": {"blob_ref": BLOB1}}}}
 
-        violations = await _validate_blob_content_refs(blob_service, config, session_id=SESSION_ID)
+        violations = await _validate_blob_content_refs(
+            blob_service,
+            config,
+            session_id=SESSION_ID,
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
         assert violations == [
             BlobInlineValidationViolation(
@@ -603,7 +684,12 @@ class TestValidateBlobContentRefs:
         blob_service = _BlobServiceDouble()
         config = {"source": {"options": {"x": {"blob_ref": BLOB1, "mode": []}}}}
 
-        violations = await _validate_blob_content_refs(blob_service, config, session_id=SESSION_ID)
+        violations = await _validate_blob_content_refs(
+            blob_service,
+            config,
+            session_id=SESSION_ID,
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
         assert violations == [
             BlobInlineValidationViolation(
@@ -625,10 +711,15 @@ class TestValidateBlobContentRefs:
             config,
             session_id=SESSION_ID,
             per_ref_byte_cap=64,
+            session_operation_context=SESSION_OPERATION_CONTEXT,
         )
 
         assert [violation.category for violation in violations] == ["hash_mismatch"]
         assert violations[0].field_path == "source.options.x"
+        blob_service.get_blob.assert_awaited_once_with(
+            UUID(BLOB1),
+            session_operation_context=SESSION_OPERATION_CONTEXT,
+        )
 
     def test_sync_returns_missing_violation_without_raising(self) -> None:
         config = {"source": {"options": {"x": _marker(BLOB1, VALID_HASH)}}}

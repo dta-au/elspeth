@@ -26,6 +26,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
@@ -63,6 +64,8 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.schemas import (
     ValidationCheck,
@@ -76,7 +79,7 @@ from elspeth.web.execution.schemas import (
 from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
+from elspeth.web.sessions.models import blobs_table, chat_messages_table, session_operation_fences_table, sessions_table
 from elspeth.web.sessions.protocol import GuidedOperationFence
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -158,7 +161,16 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
 
     monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
     current_state = _empty_state()
-    session_id = uuid4()
+    sessions = cast(SessionServiceImpl | None, composer_service_with_real_sessions._sessions_service)
+    assert sessions is not None
+    session_id = (await sessions.create_session("test-user", "Planner custody", "local")).id
+    operation_lease = await SessionOperationLease.acquire(
+        sessions.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=sessions.session_operation_lease_seconds,
+    )
     custody_fence = GuidedOperationFence(
         session_id=session_id,
         operation_id=str(uuid4()),
@@ -180,6 +192,7 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
         supersedes_draft_hash=None,
         recorder=BufferingRecorder(),
         operation_fence=custody_fence,
+        session_operation_context=operation_lease.context,
     )
 
     assert result is sentinel_plan
@@ -193,6 +206,8 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
         lease_token=custody_fence.lease_token,
         attempt=custody_fence.attempt,
     )
+    assert captured[0]["custody_config"].session_operation_context is operation_lease.context
+    await operation_lease.close()
 
 
 @pytest.mark.asyncio
@@ -211,6 +226,13 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
         session_engine=sessions._engine,
     )
     session = await sessions.create_session("test-user", "Planner parity", "local")
+    operation_lease = await SessionOperationLease.acquire(
+        sessions.session_operation_authority,
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=sessions.session_operation_lease_seconds,
+    )
     source_id = "11111111-1111-4111-8111-111111111111"
     output_id = "22222222-2222-4222-8222-222222222222"
     ordinary = GuidedSession(
@@ -280,6 +302,7 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
                     lease_token=uuid4().hex,
                     attempt=1,
                 ),
+                session_operation_context=operation_lease.context,
             )
 
     assert len(manifests) == len(requests) == 2
@@ -289,6 +312,7 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
     assert manifests[0].effective_tool_hash == manifests[1].effective_tool_hash
     assert requests[0]["messages"] == requests[1]["messages"]
     assert requests[0]["tools"] == requests[1]["tools"]
+    await operation_lease.close()
 
 
 def _execute_tool(
@@ -786,11 +810,22 @@ class TestComposerSingleToolCall:
             actor="user:alice",
         )
 
-        result = await composer_service_with_real_sessions._run_one_turn_for_test(
-            llm=fake_llm_one_set_pipeline_tool_call,
-            session_id=result_session_id,
-            initial_state=state,
+        operation_lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
+            session_id=session_uuid,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
         )
+        try:
+            result = await composer_service_with_real_sessions._run_one_turn_for_test(
+                llm=fake_llm_one_set_pipeline_tool_call,
+                session_id=result_session_id,
+                initial_state=state,
+                session_operation_context=operation_lease.context,
+            )
+        finally:
+            await operation_lease.close()
 
         proposals = await sessions_service.list_composition_proposals(session_uuid)
         assert len(proposals) == 1
@@ -814,19 +849,31 @@ class TestComposerSingleToolCall:
     ) -> None:
         sessions_service = composer_service_with_real_sessions._sessions_service
         assert sessions_service is not None
+        session_uuid = UUID(result_session_id)
         await sessions_service.update_composer_preferences(
-            UUID(result_session_id),
+            session_uuid,
             trust_mode="explicit_approve",
             density_default="high",
             actor="user:alice",
         )
         state = _empty_state()
 
-        result = await composer_service_with_real_sessions._run_one_turn_for_test(
-            llm=fake_llm_one_set_pipeline_tool_call,
-            session_id=result_session_id,
-            initial_state=state,
+        operation_lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
+            session_id=session_uuid,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
         )
+        try:
+            result = await composer_service_with_real_sessions._run_one_turn_for_test(
+                llm=fake_llm_one_set_pipeline_tool_call,
+                session_id=result_session_id,
+                initial_state=state,
+                session_operation_context=operation_lease.context,
+            )
+        finally:
+            await operation_lease.close()
 
         proposal_result = result.tool_outcomes[0].response
         assert isinstance(proposal_result, ToolResult)
@@ -848,23 +895,34 @@ class TestComposerSingleToolCall:
         assert sessions_service is not None
         session_uuid = UUID(result_session_id)
 
-        proposal = await sessions_service.create_composition_proposal(
+        operation_lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
             session_id=session_uuid,
-            tool_call_id="call_set_pipeline",
-            tool_name="set_pipeline",
-            summary="Replace the pipeline.",
-            rationale="Composer proposed a pipeline update.",
-            affects=["graph"],
-            arguments_json={"source": {"plugin": "csv", "options": {}}},
-            arguments_redacted_json={"source": {"plugin": "csv", "options": {}}},
-            base_state_id=None,
-            actor="assistant",
-            composer_model_identifier=" openai/gpt-5-mini ",
-            composer_model_version=" gpt-5-mini-2026-05-01 ",
-            composer_provider=" openai ",
-            composer_skill_hash=" sha256:composer-skill ",
-            tool_arguments_hash=" sha256:tool-arguments ",
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
         )
+        try:
+            proposal = await sessions_service.create_composition_proposal(
+                session_id=session_uuid,
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                summary="Replace the pipeline.",
+                rationale="Composer proposed a pipeline update.",
+                affects=["graph"],
+                arguments_json={"source": {"plugin": "csv", "options": {}}},
+                arguments_redacted_json={"source": {"plugin": "csv", "options": {}}},
+                base_state_id=None,
+                actor="assistant",
+                composer_model_identifier=" openai/gpt-5-mini ",
+                composer_model_version=" gpt-5-mini-2026-05-01 ",
+                composer_provider=" openai ",
+                composer_skill_hash=" sha256:composer-skill ",
+                tool_arguments_hash=" sha256:tool-arguments ",
+                session_operation_context=operation_lease.context,
+            )
+        finally:
+            await operation_lease.close()
 
         assert proposal.composer_model_identifier == "openai/gpt-5-mini"
         assert proposal.composer_model_version == "gpt-5-mini-2026-05-01"
@@ -885,24 +943,35 @@ class TestComposerSingleToolCall:
         assert sessions_service is not None
         session_uuid = UUID(result_session_id)
 
-        with pytest.raises(AuditIntegrityError, match=r"composer provenance.*composer_provider"):
-            await sessions_service.create_composition_proposal(
-                session_id=session_uuid,
-                tool_call_id="call_set_pipeline",
-                tool_name="set_pipeline",
-                summary="Replace the pipeline.",
-                rationale="Composer proposed a pipeline update.",
-                affects=["graph"],
-                arguments_json={"source": {"plugin": "csv", "options": {}}},
-                arguments_redacted_json={"source": {"plugin": "csv", "options": {}}},
-                base_state_id=None,
-                actor="assistant",
-                composer_model_identifier="openai/gpt-5-mini",
-                composer_model_version="gpt-5-mini-2026-05-01",
-                composer_provider="\t ",
-                composer_skill_hash="sha256:composer-skill",
-                tool_arguments_hash="sha256:tool-arguments",
-            )
+        operation_lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
+            session_id=session_uuid,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        try:
+            with pytest.raises(AuditIntegrityError, match=r"composer provenance.*composer_provider"):
+                await sessions_service.create_composition_proposal(
+                    session_id=session_uuid,
+                    tool_call_id="call_set_pipeline",
+                    tool_name="set_pipeline",
+                    summary="Replace the pipeline.",
+                    rationale="Composer proposed a pipeline update.",
+                    affects=["graph"],
+                    arguments_json={"source": {"plugin": "csv", "options": {}}},
+                    arguments_redacted_json={"source": {"plugin": "csv", "options": {}}},
+                    base_state_id=None,
+                    actor="assistant",
+                    composer_model_identifier="openai/gpt-5-mini",
+                    composer_model_version="gpt-5-mini-2026-05-01",
+                    composer_provider="\t ",
+                    composer_skill_hash="sha256:composer-skill",
+                    tool_arguments_hash="sha256:tool-arguments",
+                    session_operation_context=operation_lease.context,
+                )
+        finally:
+            await operation_lease.close()
 
         assert await sessions_service.list_composition_proposals(session_uuid) == []
 
@@ -3868,7 +3937,6 @@ class TestPluginCrashSessionPersistence:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path: Path) -> None:
         from datetime import UTC, datetime
-        from uuid import uuid4
 
         from sqlalchemy.pool import StaticPool
 
@@ -3883,24 +3951,206 @@ class TestPluginCrashSessionPersistence:
         )
         initialize_session_schema(self.engine)
 
-        self.session_id = str(uuid4())
         self.data_dir = tmp_path
+        self.sessions_service = _test_sessions_service(self.engine, self.data_dir)
+        session = self.sessions_service.session_operation_authority.create_session_with_initial_fence(
+            user_id="test-user",
+            title="Test",
+            auth_provider_type="local",
+            owner_instance_id=self.sessions_service.session_operation_owner_instance_id,
+            lease_seconds=self.sessions_service.session_operation_lease_seconds,
+        )
+        self.session_id = str(session.id)
         # Seed the sessions row with a DELIBERATELY OLD updated_at so the
         # crash-path bump is unambiguously distinguishable from the seed.
         self.seeded_at = datetime(2020, 1, 1, tzinfo=UTC)
         with self.engine.begin() as conn:
-            conn.execute(
-                sessions_table.insert().values(
-                    id=self.session_id,
-                    user_id="test-user",
-                    auth_provider_type="local",
-                    title="Test",
-                    trust_mode="auto_commit",
-                    density_default="high",
-                    created_at=self.seeded_at,
-                    updated_at=self.seeded_at,
-                )
+            conn.execute(sessions_table.update().where(sessions_table.c.id == self.session_id).values(updated_at=self.seeded_at))
+
+    async def _compose_with_authority(
+        self,
+        service: ComposerServiceImpl,
+        message: str,
+        messages: list[dict[str, Any]],
+        state: CompositionState,
+    ) -> ComposerResult:
+        lease = await SessionOperationLease.acquire(
+            self.sessions_service.session_operation_authority,
+            session_id=UUID(self.session_id),
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=self.sessions_service.session_operation_owner_instance_id,
+            lease_seconds=self.sessions_service.session_operation_lease_seconds,
+        )
+        try:
+            return await service.compose(
+                message,
+                messages,
+                state,
+                session_id=self.session_id,
+                session_operation_context=lease.context,
             )
+        finally:
+            await lease.close()
+
+    @pytest.mark.asyncio
+    async def test_exact_compose_authority_records_plugin_crash_breadcrumb(self) -> None:
+        sessions_service = _test_sessions_service(self.engine, self.data_dir)
+        session = sessions_service.session_operation_authority.create_session_with_initial_fence(
+            user_id="test-user",
+            title="Plugin crash authority",
+            auth_provider_type="local",
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        with self.engine.begin() as conn:
+            conn.execute(sessions_table.update().where(sessions_table.c.id == str(session.id)).values(updated_at=self.seeded_at))
+        lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        try:
+            await asyncio.to_thread(
+                sessions_service.session_operation_authority.mutate,
+                lease.context,
+                lambda transaction: transaction.session.record_plugin_crash_breadcrumb(),
+            )
+        finally:
+            await lease.close()
+
+        with self.engine.begin() as conn:
+            updated_at = conn.execute(select(sessions_table.c.updated_at).where(sessions_table.c.id == str(session.id))).scalar_one()
+        assert updated_at > self.seeded_at.replace(tzinfo=None)
+
+    @pytest.mark.asyncio
+    async def test_wrong_kind_authority_cannot_record_plugin_crash_breadcrumb(self) -> None:
+        sessions_service = _test_sessions_service(self.engine, self.data_dir)
+        session = sessions_service.session_operation_authority.create_session_with_initial_fence(
+            user_id="test-user",
+            title="Wrong-kind plugin crash authority",
+            auth_provider_type="local",
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        with self.engine.begin() as conn:
+            conn.execute(sessions_table.update().where(sessions_table.c.id == str(session.id)).values(updated_at=self.seeded_at))
+        lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        try:
+            with pytest.raises(SessionOperationFenceLost):
+                await asyncio.to_thread(
+                    sessions_service.session_operation_authority.mutate,
+                    lease.context,
+                    lambda transaction: transaction.session.record_plugin_crash_breadcrumb(),
+                )
+        finally:
+            await lease.close()
+
+        with self.engine.begin() as conn:
+            updated_at = conn.execute(select(sessions_table.c.updated_at).where(sessions_table.c.id == str(session.id))).scalar_one()
+        assert updated_at == self.seeded_at.replace(tzinfo=None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("authority_state", ("released", "expired", "successor"))
+    async def test_invalid_compose_authority_cannot_record_plugin_crash_breadcrumb(
+        self,
+        authority_state: str,
+    ) -> None:
+        from structlog.testing import capture_logs
+
+        sessions_service = _test_sessions_service(self.engine, self.data_dir)
+        session = sessions_service.session_operation_authority.create_session_with_initial_fence(
+            user_id="test-user",
+            title="Released plugin crash authority",
+            auth_provider_type="local",
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        with self.engine.begin() as conn:
+            conn.execute(sessions_table.update().where(sessions_table.c.id == str(session.id)).values(updated_at=self.seeded_at))
+        lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        successor: SessionOperationLease | None = None
+        if authority_state == "released":
+            await lease.close()
+        elif authority_state == "expired":
+            with self.engine.begin() as conn:
+                conn.execute(
+                    session_operation_fences_table.update()
+                    .where(session_operation_fences_table.c.session_id == str(session.id))
+                    .values(lease_expires_at=self.seeded_at)
+                )
+        else:
+            await lease.close()
+            successor = await SessionOperationLease.acquire(
+                sessions_service.session_operation_authority,
+                session_id=session.id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=f"{sessions_service.session_operation_owner_instance_id}-successor",
+                lease_seconds=sessions_service.session_operation_lease_seconds,
+            )
+        service = ComposerServiceImpl.for_trained_operator(
+            catalog=_mock_catalog(),
+            settings=_make_settings(data_dir=self.data_dir),
+            sessions_service=sessions_service,
+            session_engine=self.engine,
+        )
+        valid_call = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "name": "set_source",
+                    "arguments": {
+                        "plugin": "csv",
+                        "on_success": "out",
+                        "options": {},
+                        "on_validation_failure": "quarantine",
+                    },
+                }
+            ],
+        )
+
+        try:
+            with (
+                patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+                patch(
+                    "elspeth.web.composer.tool_batch.execute_tool",
+                    side_effect=ValueError("original plugin bug"),
+                ),
+                capture_logs() as cap_logs,
+            ):
+                mock_llm.return_value = valid_call
+                with pytest.raises(ComposerPluginCrashError) as exc_info:
+                    await service.compose(
+                        "Setup",
+                        [],
+                        _empty_state(),
+                        session_id=str(session.id),
+                        session_operation_context=lease.context,
+                    )
+        finally:
+            if successor is not None:
+                await successor.close()
+
+        assert isinstance(exc_info.value.original_exc, ValueError)
+        with self.engine.begin() as conn:
+            updated_at = conn.execute(select(sessions_table.c.updated_at).where(sessions_table.c.id == str(session.id))).scalar_one()
+        assert updated_at == self.seeded_at.replace(tzinfo=None)
+        events = [entry for entry in cap_logs if entry.get("event") == "composer_crash_persistence_failed"]
+        assert len(events) == 1
+        assert events[0]["audit_exc_class"] == "SessionOperationFenceLost"
 
     @pytest.mark.asyncio
     async def test_plugin_crash_bumps_session_updated_at(self) -> None:
@@ -3940,7 +4190,7 @@ class TestPluginCrashSessionPersistence:
         ):
             mock_llm.return_value = valid_call
             with pytest.raises(ComposerPluginCrashError) as exc_info:
-                await service.compose("Setup", [], state, session_id=self.session_id)
+                await self._compose_with_authority(service, "Setup", [], state)
         # The underlying plugin exception is preserved on the wrapper.
         assert isinstance(exc_info.value.original_exc, ValueError)
         assert "plugin bug" in str(exc_info.value.original_exc)
@@ -4035,7 +4285,7 @@ class TestPluginCrashSessionPersistence:
         ):
             mock_llm.return_value = valid_call
             with pytest.raises(ComposerPluginCrashError) as exc_info:
-                await service.compose("Setup", [], state, session_id=self.session_id)
+                await self._compose_with_authority(service, "Setup", [], state)
         # Original plugin exception survives the wrap.
         assert isinstance(exc_info.value.original_exc, ValueError)
         assert "original plugin bug" in str(exc_info.value.original_exc)
@@ -4118,7 +4368,7 @@ class TestPluginCrashSessionPersistence:
         ):
             mock_llm.return_value = valid_call
             with pytest.raises(ComposerPluginCrashError) as exc_info:
-                await service.compose("Setup", [], state, session_id=self.session_id)
+                await self._compose_with_authority(service, "Setup", [], state)
         assert isinstance(exc_info.value.original_exc, ValueError)
         assert "plugin bug" in str(exc_info.value.original_exc)
 
@@ -4198,7 +4448,7 @@ class TestPluginCrashSessionPersistence:
             # ComposerPluginCrashError is never re-raised because the
             # audit-site AttributeError propagates first.
             with pytest.raises(AttributeError) as exc_info:
-                await service.compose("Setup", [], state, session_id=self.session_id)
+                await self._compose_with_authority(service, "Setup", [], state)
 
         assert "sessions_table" in str(exc_info.value)
 
@@ -4243,10 +4493,10 @@ class TestPluginCrashSessionPersistence:
 
         original_persist = service._persist_crashed_session
 
-        def capture_thread(session_id: str) -> None:
+        def capture_thread(session_operation_context: Any) -> None:
             nonlocal persist_thread
             persist_thread = threading.current_thread()
-            original_persist(session_id)
+            original_persist(session_operation_context)
 
         valid_call = _make_llm_response(
             tool_calls=[
@@ -4273,7 +4523,7 @@ class TestPluginCrashSessionPersistence:
         ):
             mock_llm.return_value = valid_call
             with pytest.raises(ComposerPluginCrashError):
-                await service.compose("Setup", [], state, session_id=self.session_id)
+                await self._compose_with_authority(service, "Setup", [], state)
 
         assert persist_thread is not None, "_persist_crashed_session was never called"
         assert persist_thread is not event_loop_thread, (
@@ -7735,8 +7985,16 @@ class TestComposeLoopForcedRepair:
 class TestComposeLoopFreeformRecipeIntentRouting:
     @pytest.mark.asyncio
     async def test_fork_coalesce_truncate_intent_applies_recipe_before_llm(self, tmp_path: Path) -> None:
-        engine, session_id = _session_engine_with_session()
+        engine, _legacy_session_id = _session_engine_with_session()
         sessions_service = _test_sessions_service(engine, tmp_path)
+        session = await sessions_service.create_session("test-user", "Recipe custody", "local")
+        session_id = str(session.id)
+        await sessions_service.update_composer_preferences(
+            session.id,
+            trust_mode="auto_commit",
+            density_default="high",
+            actor="test",
+        )
         service = ComposerServiceImpl.for_trained_operator(
             catalog=_mock_catalog(),
             settings=_make_settings(data_dir=tmp_path),
@@ -7758,6 +8016,13 @@ class TestComposeLoopFreeformRecipeIntentRouting:
             "charlie,another lengthy customer description that exceeds thirty characters comfortably"
         )
         user_message_id = _insert_user_message(engine, session_id, prompt)
+        operation_lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
+            session_id=UUID(session_id),
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
 
         with patch.object(
             service,
@@ -7772,6 +8037,7 @@ class TestComposeLoopFreeformRecipeIntentRouting:
                 session_id=session_id,
                 user_id="test-user",
                 user_message_id=user_message_id,
+                session_operation_context=operation_lease.context,
             )
 
         assert mock_llm.call_count == 0
@@ -7789,6 +8055,7 @@ class TestComposeLoopFreeformRecipeIntentRouting:
         assert proposal.composer_model_identifier == "composer-server-recipe-router"
         assert proposal.composer_model_version == "composer.server-recipe-router.v1"
         assert proposal.composer_provider == "server"
+        await operation_lease.close()
         recipe_contract = canonical_json(
             {
                 "schema": "composer.server-recipe-router.v1",

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+
 from .._helpers import (
     _COMPOSER_REQUESTS_INFLIGHT,
     UUID,
@@ -39,6 +42,7 @@ from .._helpers import (
     _handle_runtime_preflight_failure,
     _initial_composition_state_with_guided_session,
     _is_client_disconnect_cancel,
+    _join_progress_write,
     _litellm_error_detail,
     _llm_calls_from_exception,
     _message_response,
@@ -53,7 +57,6 @@ from .._helpers import (
     _state_data_from_composer_state,
     _state_from_record,
     _state_response,
-    _track_compose_inflight,
     _verify_session_ownership,
     asyncio,
     client_cancelled_progress_event,
@@ -79,9 +82,6 @@ async def recompose(
     request: Request,
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
     rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
-    # In-flight compose tally for the SPA's post-abort settlement signal
-    # (elspeth-06a23adfcc); decrements only after the route fully unwinds.
-    _inflight_tally: None = Depends(_track_compose_inflight),
 ) -> MessageWithStateResponse:
     """Re-run the composer without inserting a new user message.
 
@@ -127,36 +127,46 @@ async def recompose(
         last_user_content = conversation_records[-1].content
         request_id = str(conversation_records[-1].id)
         progress_registry = _get_composer_progress_registry(request)
-        progress_sink = _composer_progress_sink(
-            progress_registry,
-            session_id=str(session.id),
-            request_id=request_id,
-            user_id=str(user.user_id),
+        compose_operation_lease = await SessionOperationLease.acquire(
+            service.session_operation_authority,
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
         )
-        await _publish_progress(
-            progress_registry,
-            session_id=str(session.id),
-            request_id=request_id,
-            user_id=str(user.user_id),
-            event=ComposerProgressEvent(
-                phase="starting",
-                headline="I'm rereading your request and current pipeline.",
-                evidence=("The retry was accepted for this session.",),
-                likely_next="ELSPETH will prepare the composer prompt with the current pipeline.",
-            ),
-        )
-        # Detect guided→freeform mode transition (spec §8.2).
-        # Recompose is a retried freeform chat call — progressive disclosure
-        # fires here on the same semantics as send_message (first freeform
-        # turn after guided_session.terminal is set uses the layered prompt).
-        _guided = state.guided_session
-        _guided_terminal_for_compose = (
-            _guided.terminal if (_guided is not None and _guided.terminal is not None and not _guided.transition_consumed) else None
-        )
-
         _COMPOSER_REQUESTS_INFLIGHT.add(1, {"endpoint": "recompose"})
         terminal_status: _ComposerRequestTerminalStatus = "failed"
+        progress_started = False
         try:
+            progress_sink = _composer_progress_sink(
+                progress_registry,
+                session_operation_context=compose_operation_lease.context,
+                request_id=request_id,
+                user_id=str(user.user_id),
+            )
+            await _publish_progress(
+                progress_registry,
+                session_operation_context=compose_operation_lease.context,
+                request_id=request_id,
+                user_id=str(user.user_id),
+                event=ComposerProgressEvent(
+                    phase="starting",
+                    headline="I'm rereading your request and current pipeline.",
+                    evidence=("The retry was accepted for this session.",),
+                    likely_next="ELSPETH will prepare the composer prompt with the current pipeline.",
+                ),
+                start_request=True,
+            )
+            progress_started = True
+            # Detect guided→freeform mode transition (spec §8.2).
+            # Recompose is a retried freeform chat call — progressive disclosure
+            # fires here on the same semantics as send_message (first freeform
+            # turn after guided_session.terminal is set uses the layered prompt).
+            _guided = state.guided_session
+            _guided_terminal_for_compose = (
+                _guided.terminal if (_guided is not None and _guided.terminal is not None and not _guided.transition_consumed) else None
+            )
+
             # Exclude the last user message — the composer receives it
             # separately via the message arg and appends it in _build_messages.
             chat_messages = _composer_chat_history(conversation_records[:-1])
@@ -182,6 +192,7 @@ async def recompose(
                         progress=progress_sink,
                         guided_terminal=_guided_terminal_for_compose,
                         user_message_id=request_id,
+                        session_operation_context=compose_operation_lease.context,
                     )
             except ComposerConvergenceError as exc:
                 terminal_status = "timed_out" if exc.budget_exhausted == "timeout" else "failed"
@@ -190,7 +201,7 @@ async def recompose(
                 # routes cannot drift on failure UX.
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=convergence_progress_event(budget_exhausted=exc.budget_exhausted),
@@ -223,7 +234,7 @@ async def recompose(
                 )
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -253,7 +264,7 @@ async def recompose(
                 )
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -283,7 +294,7 @@ async def recompose(
                 )
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -325,7 +336,7 @@ async def recompose(
                 )
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -352,7 +363,7 @@ async def recompose(
                 )
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -387,7 +398,7 @@ async def recompose(
                 # already-durable planner LLM-call audit evidence.
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -408,7 +419,7 @@ async def recompose(
             except ComposerServiceError as exc:
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -492,7 +503,7 @@ async def recompose(
             elif result.state.version != state.version:
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -527,7 +538,7 @@ async def recompose(
                     )
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=request_id,
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -554,7 +565,7 @@ async def recompose(
                     raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=request_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -646,7 +657,7 @@ async def recompose(
                 )
             await _publish_progress(
                 progress_registry,
-                session_id=str(session.id),
+                session_operation_context=compose_operation_lease.context,
                 request_id=request_id,
                 user_id=str(user.user_id),
                 event=ComposerProgressEvent(
@@ -687,8 +698,8 @@ async def recompose(
                 detail="Server invariant violated. See application audit log for diagnostic detail.",
             ) from exc
         except asyncio.CancelledError as exc:
-            # Mirror of send_message cancellation path. See block
-            # comment there for the shielded-publish rationale.
+            # Mirror of send_message cancellation path. Join the durable
+            # cancellation publish before the exact COMPOSE lease closes.
             llm_calls = _llm_calls_from_exception(exc)
             if llm_calls:
                 with contextlib.suppress(asyncio.CancelledError):
@@ -702,10 +713,10 @@ async def recompose(
                         )
                     )
             with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.shield(
+                await _join_progress_write(
                     _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=request_id,
                         user_id=str(user.user_id),
                         event=client_cancelled_progress_event(),
@@ -721,5 +732,19 @@ async def recompose(
                 ) from exc
             raise
         finally:
-            _COMPOSER_REQUESTS_INFLIGHT.add(-1, {"endpoint": "recompose"})
-            _record_composer_request_terminal(terminal_status, endpoint="recompose")
+            try:
+                _COMPOSER_REQUESTS_INFLIGHT.add(-1, {"endpoint": "recompose"})
+                _record_composer_request_terminal(terminal_status, endpoint="recompose")
+            finally:
+                try:
+                    if progress_started:
+                        await _join_progress_write(
+                            progress_registry.finish_request(
+                                session_operation_context=compose_operation_lease.context,
+                                request_id=request_id,
+                                user_id=str(user.user_id),
+                                terminal_event=None,
+                            )
+                        )
+                finally:
+                    await compose_operation_lease.close()

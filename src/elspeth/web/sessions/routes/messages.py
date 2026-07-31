@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.titles import is_default_session_title
 
 from ._helpers import (
@@ -49,6 +51,7 @@ from ._helpers import (
     _handle_runtime_preflight_failure,
     _initial_composition_state_with_guided_session,
     _is_client_disconnect_cancel,
+    _join_progress_write,
     _litellm_error_detail,
     _llm_calls_from_exception,
     _message_response,
@@ -63,7 +66,6 @@ from ._helpers import (
     _state_data_from_composer_state,
     _state_from_record,
     _state_response,
-    _track_compose_inflight,
     _verify_session_ownership,
     asyncio,
     client_cancelled_progress_event,
@@ -100,9 +102,6 @@ def register_message_routes(router: APIRouter) -> None:
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
         rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
-        # In-flight compose tally for the SPA's post-abort settlement signal
-        # (elspeth-06a23adfcc); decrements only after the route fully unwinds.
-        _inflight_tally: None = Depends(_track_compose_inflight),
     ) -> MessageWithStateResponse:
         """Send a user message, run the LLM composer, persist results.
 
@@ -196,6 +195,7 @@ def register_message_routes(router: APIRouter) -> None:
             # Keep the inserted row so the subsequent snapshot can prove
             # it is composing against the transcript that actually ends
             # at this request's user turn.
+            progress_registry = _get_composer_progress_registry(request)
             user_msg = await service.add_message(
                 session.id,
                 "user",
@@ -203,34 +203,45 @@ def register_message_routes(router: APIRouter) -> None:
                 composition_state_id=pre_send_state_id,
                 writer_principal="route_user_message",
             )
-            progress_registry = _get_composer_progress_registry(request)
-            progress_sink = _composer_progress_sink(
-                progress_registry,
-                session_id=str(session.id),
-                request_id=str(user_msg.id),
-                user_id=str(user.user_id),
+            compose_operation_lease = await SessionOperationLease.acquire(
+                service.session_operation_authority,
+                session_id=session.id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
             )
-            await _publish_progress(
-                progress_registry,
-                session_id=str(session.id),
-                request_id=str(user_msg.id),
-                user_id=str(user.user_id),
-                event=ComposerProgressEvent(
-                    phase="starting",
-                    headline="I'm reading your request and current pipeline.",
-                    evidence=("The request was accepted for this session.",),
-                    likely_next="ELSPETH will prepare the composer prompt with the current pipeline.",
-                ),
-            )
-
-            _COMPOSER_REQUESTS_INFLIGHT.add(1, {"endpoint": "send_message"})
             terminal_status: _ComposerRequestTerminalStatus = "failed"
             # Initialized here so the finally block can reference it even
             # if an exception fires before the first-message branch is
             # reached. Assigned below only when first-message conditions
             # hold.
             auto_title_task: asyncio.Task[None] | None = None
+            progress_started = False
+            inflight_tally_started = False
             try:
+                progress_sink = _composer_progress_sink(
+                    progress_registry,
+                    session_operation_context=compose_operation_lease.context,
+                    request_id=str(user_msg.id),
+                    user_id=str(user.user_id),
+                )
+                await _publish_progress(
+                    progress_registry,
+                    session_operation_context=compose_operation_lease.context,
+                    request_id=str(user_msg.id),
+                    user_id=str(user.user_id),
+                    event=ComposerProgressEvent(
+                        phase="starting",
+                        headline="I'm reading your request and current pipeline.",
+                        evidence=("The request was accepted for this session.",),
+                        likely_next="ELSPETH will prepare the composer prompt with the current pipeline.",
+                    ),
+                    start_request=True,
+                )
+                progress_started = True
+
+                _COMPOSER_REQUESTS_INFLIGHT.add(1, {"endpoint": "send_message"})
+                inflight_tally_started = True
                 # 3. Pre-fetch chat history as plain dicts (seam contract B)
                 # Pass limit=None to fetch the full conversation — the default
                 # limit=100 would silently drop recent context once a session
@@ -309,6 +320,7 @@ def register_message_routes(router: APIRouter) -> None:
                             # would surface as an IntegrityError, not as a
                             # silent provenance corruption.
                             user_message_id=str(user_msg.id),
+                            session_operation_context=compose_operation_lease.context,
                         )
                 except ComposerConvergenceError as exc:
                     terminal_status = "timed_out" if exc.budget_exhausted == "timeout" else "failed"
@@ -318,7 +330,7 @@ def register_message_routes(router: APIRouter) -> None:
                     # generic event — the original bug filed as elspeth-5030f7373d.
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=convergence_progress_event(budget_exhausted=exc.budget_exhausted),
@@ -360,7 +372,7 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -395,7 +407,7 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -425,7 +437,7 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -490,7 +502,7 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -535,7 +547,7 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -574,7 +586,7 @@ def register_message_routes(router: APIRouter) -> None:
                     # does not — persist it again.
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -595,7 +607,7 @@ def register_message_routes(router: APIRouter) -> None:
                 except ComposerServiceError as exc:
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -697,7 +709,7 @@ def register_message_routes(router: APIRouter) -> None:
                 elif result.state.version != state.version:
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -736,7 +748,7 @@ def register_message_routes(router: APIRouter) -> None:
                         # a compose-stage failure.
                         await _publish_progress(
                             progress_registry,
-                            session_id=str(session.id),
+                            session_operation_context=compose_operation_lease.context,
                             request_id=str(user_msg.id),
                             user_id=str(user.user_id),
                             event=ComposerProgressEvent(
@@ -763,7 +775,7 @@ def register_message_routes(router: APIRouter) -> None:
                         raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session.id),
+                        session_operation_context=compose_operation_lease.context,
                         request_id=str(user_msg.id),
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -858,7 +870,7 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session.id),
+                    session_operation_context=compose_operation_lease.context,
                     request_id=str(user_msg.id),
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -912,14 +924,10 @@ def register_message_routes(router: APIRouter) -> None:
                 ) from exc
             except asyncio.CancelledError as exc:
                 # Client-disconnect or operator cancel during the
-                # composer-engaged window. Publish a discriminated
-                # ``cancelled`` snapshot under ``asyncio.shield`` so the
-                # registry update reaches /_active and per-session pollers
-                # even though the outer task is being torn down. The
-                # nested except absorbs the CancelledError that ``await
-                # asyncio.shield`` re-raises on the cancelling task — the
-                # shielded coroutine itself runs to completion in the
-                # background.
+                # composer-engaged window. Publish and join a discriminated
+                # ``cancelled`` snapshot so the durable registry update
+                # completes before the COMPOSE lease closes, even though the
+                # outer task is being torn down.
                 llm_calls = _llm_calls_from_exception(exc)
                 if llm_calls:
                     with contextlib.suppress(asyncio.CancelledError):
@@ -933,15 +941,13 @@ def register_message_routes(router: APIRouter) -> None:
                             )
                         )
                 with contextlib.suppress(asyncio.CancelledError):
-                    # The shielded publish runs to completion in the
-                    # background; the outer await re-raises CancelledError
-                    # on the cancelling task, which we deliberately swallow
-                    # because we already know we're being cancelled and
-                    # ``raise`` two lines below restores the cancel chain.
-                    await asyncio.shield(
+                    # The joined helper re-raises cancellation only after
+                    # the owned write finishes. Swallow that re-raise here;
+                    # the bare ``raise`` below restores the original chain.
+                    await _join_progress_write(
                         _publish_progress(
                             progress_registry,
-                            session_id=str(session.id),
+                            session_operation_context=compose_operation_lease.context,
                             request_id=str(user_msg.id),
                             user_id=str(user.user_id),
                             event=client_cancelled_progress_event(),
@@ -966,29 +972,44 @@ def register_message_routes(router: APIRouter) -> None:
                     ) from exc
                 raise
             finally:
-                _COMPOSER_REQUESTS_INFLIGHT.add(-1, {"endpoint": "send_message"})
-                _record_composer_request_terminal(terminal_status, endpoint="send_message")
-                # Bounded await of the auto-title task so its result is in
-                # the DB before the route returns and the strong reference
-                # outlives the event-loop's weak-ref GC window. Expected
-                # provider/timeout failures are recorded inside the task;
-                # programmer bugs and DB write failures propagate here
-                # instead of being silently swallowed.
-                #
-                # ``asyncio.wait`` reports the scheduling timeout as an
-                # explicit ``(done, pending)`` partition rather than as a
-                # raised ``TimeoutError`` — the timeout is a control-flow
-                # signal, not an error to catch. On the done path we call
-                # ``.result()`` to re-raise any task exception (programmer
-                # bug / DB write failure) so it propagates exactly as the
-                # comment above promises; on the not-done (timed-out) path
-                # we cancel the runaway task and let the route return.
-                if auto_title_task is not None:
-                    done, _ = await asyncio.wait({auto_title_task}, timeout=2.0)
-                    if auto_title_task in done:
-                        auto_title_task.result()
-                    else:
-                        auto_title_task.cancel()
+                try:
+                    if inflight_tally_started:
+                        _COMPOSER_REQUESTS_INFLIGHT.add(-1, {"endpoint": "send_message"})
+                        _record_composer_request_terminal(terminal_status, endpoint="send_message")
+                    # Bounded await of the auto-title task so its result is in
+                    # the DB before the route returns and the strong reference
+                    # outlives the event-loop's weak-ref GC window. Expected
+                    # provider/timeout failures are recorded inside the task;
+                    # programmer bugs and DB write failures propagate here
+                    # instead of being silently swallowed.
+                    #
+                    # ``asyncio.wait`` reports the scheduling timeout as an
+                    # explicit ``(done, pending)`` partition rather than as a
+                    # raised ``TimeoutError`` — the timeout is a control-flow
+                    # signal, not an error to catch. On the done path we call
+                    # ``.result()`` to re-raise any task exception (programmer
+                    # bug / DB write failure) so it propagates exactly as the
+                    # comment above promises; on the not-done (timed-out) path
+                    # we cancel the runaway task and let the route return.
+                    if auto_title_task is not None:
+                        done, _ = await asyncio.wait({auto_title_task}, timeout=2.0)
+                        if auto_title_task in done:
+                            auto_title_task.result()
+                        else:
+                            auto_title_task.cancel()
+                finally:
+                    try:
+                        if progress_started:
+                            await _join_progress_write(
+                                progress_registry.finish_request(
+                                    session_operation_context=compose_operation_lease.context,
+                                    request_id=str(user_msg.id),
+                                    user_id=str(user.user_id),
+                                    terminal_event=None,
+                                )
+                            )
+                    finally:
+                        await compose_operation_lease.close()
 
     @router.get(
         "/{session_id}/messages",
@@ -1024,6 +1045,7 @@ def register_message_routes(router: APIRouter) -> None:
             await service.record_audit_grade_view_async(
                 session_id=str(session.id),
                 requesting_principal=user.user_id,
+                auth_provider_type=request.app.state.settings.auth_provider,
                 request_path=request.url.path,
                 query_args=audit_query_args,
                 ip_address=request.client.host if request.client else None,

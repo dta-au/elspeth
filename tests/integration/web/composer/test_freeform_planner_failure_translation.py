@@ -227,7 +227,10 @@ def _build_app(
         secret_inventory=_EmptyInventory(),
         generation_key=b"freeform-planner-failure-policy-key",
     )
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=sessions.session_operation_authority,
+    )
     app.include_router(create_session_router())
 
     # A truly unhandled route exception must surface as a 500 response (not be

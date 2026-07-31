@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +33,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
     nodes_table,
@@ -54,6 +56,7 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResu
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import (
     RunAccounting,
@@ -82,6 +85,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     ChatMessageRole,
+    CompositionProposalRecord,
     CompositionStateData,
     CompositionStateRecord,
     SessionRecord,
@@ -135,6 +139,66 @@ def _async_return(value: Any):
         return value
 
     return _return_value
+
+
+@asynccontextmanager
+async def _execute_session_operation_context(
+    service: SessionServiceImpl,
+    session_id: uuid.UUID,
+) -> AsyncIterator[SessionOperationContext]:
+    """Hold one real EXECUTE authority for direct run mutations in tests."""
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
+    finally:
+        await service._run_sync(
+            service.session_operation_authority.release,
+            context,
+        )
+
+
+@asynccontextmanager
+async def _compose_session_operation_context(
+    service: SessionServiceImpl,
+    session_id: uuid.UUID,
+) -> AsyncIterator[SessionOperationContext]:
+    """Hold one real COMPOSE authority for direct proposal creation in tests."""
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
+    finally:
+        await service._run_sync(
+            service.session_operation_authority.release,
+            context,
+        )
+
+
+async def _create_test_composition_proposal(
+    service: SessionServiceImpl,
+    *,
+    session_id: uuid.UUID,
+    **kwargs: Any,
+) -> CompositionProposalRecord:
+    async with _compose_session_operation_context(service, session_id) as context:
+        return await service.create_composition_proposal(
+            session_id=session_id,
+            session_operation_context=context,
+            **kwargs,
+        )
 
 
 def _guided_chat_body(guided_response: Mapping[str, Any], message: str) -> dict[str, Any]:
@@ -301,8 +365,9 @@ class _BlockingRecordingComposer:
         progress=None,
         guided_terminal=None,
         user_message_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
-        del state, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id
+        del state, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id, session_operation_context
 
         self.calls.append(
             {
@@ -341,8 +406,10 @@ class _ProgressAwareComposer:
         progress=None,
         guided_terminal=None,
         user_message_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
         del message, chat_messages, session_id, current_state_id, user_id, guided_terminal, user_message_id
+        assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
         await progress(
@@ -368,14 +435,22 @@ class _ProgressRouteSessionService:
     """Minimal async session service for progress route tests."""
 
     def __init__(self, *, user_id: str = "alice", auth_provider_type: str = "local") -> None:
-        now = datetime.now(UTC)
-        self.session = SessionRecord(
-            id=uuid.uuid4(),
+        operation_engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        initialize_session_schema(operation_engine)
+        self._engine = operation_engine
+        self.session_operation_authority = SQLiteLocalSessionOperationAuthority(operation_engine)
+        self.session_operation_owner_instance_id = f"progress-route-{uuid.uuid4()}"
+        self.session_operation_lease_seconds = 30
+        self.session = self.session_operation_authority.create_session_with_initial_fence(
             user_id=user_id,
             auth_provider_type=auth_provider_type,
             title="Pipeline",
-            created_at=now,
-            updated_at=now,
+            owner_instance_id=self.session_operation_owner_instance_id,
+            lease_seconds=self.session_operation_lease_seconds,
         )
         self.messages: list[ChatMessageRecord] = []
         self.current_state: CompositionStateRecord | None = None
@@ -532,7 +607,10 @@ def _make_progress_route_app(
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.execution_service = _ExecutionServiceStub()
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=service._engine,
+        session_operation_authority=service.session_operation_authority,
+    )
     app.state.scoped_secret_resolver = None
     _install_restricted_plugin_policy(app)
     app.include_router(create_session_router())
@@ -597,7 +675,10 @@ def _make_app(
     from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=service.session_operation_authority,
+    )
     app.state.scoped_secret_resolver = None
     _install_restricted_plugin_policy(app)
 
@@ -704,6 +785,7 @@ def test_send_message_response_includes_pending_proposals_created_during_compose
             arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
             base_state_id=None,
             actor="composer-web:alice",
+            session_operation_context=cast(SessionOperationContext, kwargs["session_operation_context"]),
         )
         return ComposerResult(message="Needs approval.", state=_EMPTY_STATE)
 
@@ -766,7 +848,8 @@ def test_accept_proposal_executes_tool_and_commits_state(tmp_path, monkeypatch) 
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_text("value\n1\n", encoding="utf-8")
     proposal = asyncio.run(
-        service.create_composition_proposal(
+        _create_test_composition_proposal(
+            service,
             session_id=session_id,
             tool_call_id="call_set_pipeline",
             tool_name="set_pipeline",
@@ -1822,7 +1905,8 @@ def test_accept_proposal_threads_originating_message_id_to_inline_blob(tmp_path,
     }
     arguments_hash = stable_hash(arguments)
     proposal = asyncio.run(
-        service.create_composition_proposal(
+        _create_test_composition_proposal(
+            service,
             session_id=session_id,
             tool_call_id="call_set_pipeline_inline_blob",
             tool_name="set_pipeline",
@@ -1900,7 +1984,8 @@ def test_accept_inline_blob_proposal_without_composer_provenance_fails_closed(tm
         )
     )
     proposal = asyncio.run(
-        service.create_composition_proposal(
+        _create_test_composition_proposal(
+            service,
             session_id=session_id,
             tool_call_id="call_set_pipeline_inline_blob_legacy",
             tool_name="set_pipeline",
@@ -1973,7 +2058,8 @@ def test_accept_empty_inline_blob_proposal_without_composer_provenance_fails_clo
         )
     )
     proposal = asyncio.run(
-        service.create_composition_proposal(
+        _create_test_composition_proposal(
+            service,
             session_id=session_id,
             tool_call_id="call_set_pipeline_empty_inline_blob_legacy",
             tool_name="set_pipeline",
@@ -2356,8 +2442,6 @@ class TestSessionCRUDRoutes:
         app, service = _make_app(tmp_path)
         registry = _SessionComposeLockRegistry()
         app.state.session_compose_lock_registry = registry
-        clear_progress = AsyncMock(spec=app.state.composer_progress_registry.clear)
-        app.state.composer_progress_registry.clear = clear_progress
 
         async with AsyncClient(
             transport=ASGITransport(app=app, raise_app_exceptions=False),
@@ -2376,7 +2460,6 @@ class TestSessionCRUDRoutes:
 
         assert await registry.get_lock(admission_key) is admission
         assert app.state.execution_service.cleanup_session_lock.calls == []
-        clear_progress.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delete_session_blocked_by_active_run(self, tmp_path) -> None:
@@ -2393,7 +2476,12 @@ class TestSessionCRUDRoutes:
 
         # Create a pending run via the service layer
         state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.create_run(session_id, state.id)
+        async with _execute_session_operation_context(service, session_id) as context:
+            await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
 
         del_resp = client.delete(f"/api/sessions/{session_id}")
         assert del_resp.status_code == 409
@@ -2458,9 +2546,23 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-delete-allowed")
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id="lscp-delete-allowed",
+                session_operation_context=context,
+            )
 
         del_resp = client.delete(f"/api/sessions/{session_id}")
         assert del_resp.status_code == 204
@@ -2475,14 +2577,24 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "failed",
-            error="Pipeline execution failed (FrameworkBugError)",
-            rows_processed=1,
-        )
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "failed",
+                error="Pipeline execution failed (FrameworkBugError)",
+                rows_processed=1,
+                session_operation_context=context,
+            )
 
         runs_resp = client.get(f"/api/sessions/{session_id}/runs")
 
@@ -2505,19 +2617,29 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "completed",
-            landscape_run_id=str(run.id),
-            rows_processed=1,
-            rows_succeeded=9323,
-            rows_failed=0,
-            rows_routed_success=0,
-            rows_routed_failure=0,
-            rows_quarantined=0,
-        )
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id=str(run.id),
+                rows_processed=1,
+                rows_succeeded=9323,
+                rows_failed=0,
+                rows_routed_success=0,
+                rows_routed_failure=0,
+                rows_quarantined=0,
+                session_operation_context=context,
+            )
 
         monkeypatch.setattr(
             "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
@@ -2549,19 +2671,29 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "completed",
-            landscape_run_id=str(run.id),
-            rows_processed=1,
-            rows_succeeded=1,
-            rows_failed=0,
-            rows_routed_success=0,
-            rows_routed_failure=0,
-            rows_quarantined=0,
-        )
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id=str(run.id),
+                rows_processed=1,
+                rows_succeeded=1,
+                rows_failed=0,
+                rows_routed_success=0,
+                rows_routed_failure=0,
+                rows_quarantined=0,
+                session_operation_context=context,
+            )
 
         monkeypatch.setattr(
             "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
@@ -2591,19 +2723,29 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "completed",
-            landscape_run_id=str(run.id),
-            rows_processed=1,
-            rows_succeeded=1,
-            rows_failed=0,
-            rows_routed_success=0,
-            rows_routed_failure=0,
-            rows_quarantined=0,
-        )
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id=str(run.id),
+                rows_processed=1,
+                rows_succeeded=1,
+                rows_failed=0,
+                rows_routed_success=0,
+                rows_routed_failure=0,
+                rows_quarantined=0,
+                session_operation_context=context,
+            )
 
         monkeypatch.setattr(
             "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
@@ -2632,22 +2774,32 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        landscape_run_id = "lscape-discard-summary"
-        _insert_discard_audit_records(app.state.settings, landscape_run_id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "failed",
-            landscape_run_id=landscape_run_id,
-            error="No row reached a success path.",
-            rows_processed=2,
-            rows_succeeded=0,
-            rows_failed=2,
-            rows_routed_success=0,
-            rows_routed_failure=1,
-            rows_quarantined=0,
-        )
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            landscape_run_id = "lscape-discard-summary"
+            _insert_discard_audit_records(app.state.settings, landscape_run_id)
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "failed",
+                landscape_run_id=landscape_run_id,
+                error="No row reached a success path.",
+                rows_processed=2,
+                rows_succeeded=0,
+                rows_failed=2,
+                rows_routed_success=0,
+                rows_routed_failure=1,
+                rows_quarantined=0,
+                session_operation_context=context,
+            )
 
         runs_resp = client.get(f"/api/sessions/{session_id}/runs")
 
@@ -2691,8 +2843,18 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running", landscape_run_id="lscape-running")
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                landscape_run_id="lscape-running",
+                session_operation_context=context,
+            )
 
         def fail_if_called(*args: object, **kwargs: object) -> dict[str, object]:
             raise AssertionError("discard summary lookup should not run for non-terminal runs")
@@ -3136,7 +3298,10 @@ class TestIDORProtection:
             from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
             app.state.rate_limiter = ComposerRateLimiter(limit=100)
-            app.state.composer_progress_registry = ComposerProgressRegistry()
+            app.state.composer_progress_registry = ComposerProgressRegistry(
+                engine=engine,
+                session_operation_authority=service.session_operation_authority,
+            )
             app.include_router(create_session_router())
             return app
 
@@ -3457,7 +3622,10 @@ class TestSendMessageStateIdValidation:
             from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
             app.state.rate_limiter = ComposerRateLimiter(limit=100)
-            app.state.composer_progress_registry = ComposerProgressRegistry()
+            app.state.composer_progress_registry = ComposerProgressRegistry(
+                engine=engine,
+                session_operation_authority=service.session_operation_authority,
+            )
             app.include_router(create_session_router())
             return app
 
@@ -4712,7 +4880,16 @@ class TestMessageRoutes:
         )
         app.state.catalog_service = catalog
 
-        async def fake_create_blob(session_uuid, filename, content, mime_type, created_by="user", source_description=None):
+        async def fake_create_blob(
+            session_uuid,
+            filename,
+            content,
+            mime_type,
+            created_by="user",
+            source_description=None,
+            session_operation_context=None,
+        ):
+            assert session_operation_context is not None
             return BlobRecord(
                 id=uuid.uuid4(),
                 session_id=session_uuid,
@@ -6089,6 +6266,67 @@ class TestRevertEndpoint:
         assert lock_observations == [("target", True), ("reserve", False), ("mutation", True)]
 
     @pytest.mark.asyncio
+    async def test_revert_cancellation_terminalizes_guided_before_releasing_session_authority(self, tmp_path) -> None:
+        from sqlalchemy import select
+
+        from elspeth.web.sessions.models import guided_operations_table, session_operation_fences_table
+
+        app, service = _make_app(tmp_path)
+        session = await service.create_session("alice", "Pipeline", "local")
+        target = await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        operation_id = str(uuid.uuid4())
+        mutation_started = asyncio.Event()
+        release_mutation = asyncio.Event()
+        original_revert = service.revert_state_for_guided_operation
+
+        async def blocking_revert(*args, **kwargs):
+            mutation_started.set()
+            await release_mutation.wait()
+            return await original_revert(*args, **kwargs)
+
+        with patch.object(service, "revert_state_for_guided_operation", side_effect=blocking_revert):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                request_task = asyncio.create_task(
+                    client.post(
+                        f"/api/sessions/{session.id}/state/revert",
+                        json={"operation_id": operation_id, "state_id": str(target.id)},
+                    )
+                )
+                await asyncio.wait_for(mutation_started.wait(), timeout=3)
+                request_task.cancel("operator cancelled state revert")
+                request_task.cancel("shutdown repeated state revert cancellation")
+                with pytest.raises(asyncio.CancelledError, match="operator cancelled state revert") as caught:
+                    await request_task
+
+        assert caught.value.args == ("operator cancelled state revert",)
+        with service._engine.connect() as connection:
+            operation = (
+                connection.execute(
+                    select(guided_operations_table).where(
+                        guided_operations_table.c.session_id == str(session.id),
+                        guided_operations_table.c.operation_id == operation_id,
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            session_fence = connection.execute(
+                select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session.id))
+            ).one()
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "request_cancelled"
+        assert session_fence.released_at is not None
+
+    @pytest.mark.asyncio
     async def test_revert_creates_new_version(self, tmp_path) -> None:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
@@ -6184,7 +6422,10 @@ class TestRevertEndpoint:
             from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
             app.state.rate_limiter = ComposerRateLimiter(limit=100)
-            app.state.composer_progress_registry = ComposerProgressRegistry()
+            app.state.composer_progress_registry = ComposerProgressRegistry(
+                engine=engine,
+                session_operation_authority=service.session_operation_authority,
+            )
             app.include_router(create_session_router())
             return app
 
@@ -6862,7 +7103,13 @@ sinks:
             )
 
         assert resp.status_code == 200, resp.text
-        app.state.blob_service.get_blob.assert_awaited_once_with(blob_id)
+        app.state.blob_service.get_blob.assert_awaited_once()
+        blob_call = app.state.blob_service.get_blob.await_args
+        assert blob_call.args == (blob_id,)
+        context = blob_call.kwargs["session_operation_context"]
+        assert type(context) is SessionOperationContext
+        assert context.operation_kind is SessionOperationKind.COMPOSE
+        assert context.fence.session_id == str(session.id)
         record = await service.get_current_state(session.id)
         assert record is not None
         source_options = record.sources["source"]["options"]
@@ -6965,7 +7212,13 @@ sinks:
 
         assert resp.status_code == 404
         assert resp.json()["detail"] == "Blob not found"
-        app.state.blob_service.get_blob.assert_awaited_once_with(blob_id)
+        app.state.blob_service.get_blob.assert_awaited_once()
+        blob_call = app.state.blob_service.get_blob.await_args
+        assert blob_call.args == (blob_id,)
+        context = blob_call.kwargs["session_operation_context"]
+        assert type(context) is SessionOperationContext
+        assert context.operation_kind is SessionOperationKind.COMPOSE
+        assert context.fence.session_id == str(session.id)
 
     @pytest.mark.asyncio
     async def test_post_state_yaml_rejects_oversized_document(self, tmp_path) -> None:
@@ -8381,7 +8634,12 @@ class TestRunAlreadyActiveError:
         session = await service.create_session("alice", "Pipeline", "local")
         v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
         # Create a run to block the session
-        await service.create_run(session.id, v1.id)
+        async with _execute_session_operation_context(service, session.id) as context:
+            await service.create_run(
+                session.id,
+                v1.id,
+                session_operation_context=context,
+            )
 
         # Register the app-level exception handler (wired in create_app,
         # but our test app uses create_session_router directly). Wire it here.
@@ -8400,7 +8658,12 @@ class TestRunAlreadyActiveError:
         # Add a test endpoint that triggers the error
         @app.post("/api/_test_create_run")
         async def _test_create_run():
-            await service.create_run(session.id, v1.id)
+            async with _execute_session_operation_context(service, session.id) as context:
+                await service.create_run(
+                    session.id,
+                    v1.id,
+                    session_operation_context=context,
+                )
 
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post("/api/_test_create_run")
@@ -8466,8 +8729,24 @@ class TestComposerProgressRoutes:
     async def test_progress_endpoint_returns_latest_snapshot_for_owned_session(self, tmp_path) -> None:
         app, service = _make_progress_route_app(tmp_path)
         registry = app.state.composer_progress_registry
+        context = service.session_operation_authority.acquire(
+            session_id=service.session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=f"progress-endpoint-{uuid.uuid4()}",
+            lease_seconds=30,
+        )
+        await registry.start_request(
+            session_operation_context=context,
+            request_id="message-1",
+            user_id=service.session.user_id,
+            event=ComposerProgressEvent(
+                phase="starting",
+                headline="The composer request has started.",
+                evidence=("The exact COMPOSE operation owns durable progress.",),
+            ),
+        )
         await registry.publish(
-            session_id=str(service.session.id),
+            session_operation_context=context,
             request_id="message-1",
             user_id=service.session.user_id,
             event=ComposerProgressEvent(
@@ -8585,8 +8864,10 @@ class TestComposerProgressRoutes:
                 progress=None,
                 guided_terminal=None,
                 user_message_id: str | None = None,
+                session_operation_context: SessionOperationContext | None = None,
             ) -> ComposerResult:
                 del message, chat_messages, session_id, current_state_id, user_id, progress, user_message_id
+                assert session_operation_context is not None
                 assert guided_terminal == guided.terminal
                 return ComposerResult(message="Freeform response", state=state)
 
@@ -8637,10 +8918,17 @@ class TestComposerInFlightEndpoint:
     async def test_returns_only_authenticated_users_in_flight_sessions(self, tmp_path) -> None:
         app, service = _make_progress_route_app(tmp_path)
         registry = app.state.composer_progress_registry
+        authority = service.session_operation_authority
 
         # alice has one in-flight and one completed session.
-        await registry.publish(
-            session_id=str(service.session.id),
+        active_context = authority.acquire(
+            session_id=service.session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=f"progress-active-{uuid.uuid4()}",
+            lease_seconds=30,
+        )
+        await registry.start_request(
+            session_operation_context=active_context,
             request_id="msg-1",
             user_id="alice",
             event=ComposerProgressEvent(
@@ -8649,11 +8937,34 @@ class TestComposerInFlightEndpoint:
                 evidence=("Prompt was built.",),
             ),
         )
-        await registry.publish(
-            session_id="alice-completed-session",
+        completed_session = authority.create_session_with_initial_fence(
+            user_id="alice",
+            auth_provider_type="local",
+            title="Completed progress",
+            owner_instance_id=f"progress-create-{uuid.uuid4()}",
+            lease_seconds=30,
+        )
+        completed_context = authority.acquire(
+            session_id=completed_session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=f"progress-completed-{uuid.uuid4()}",
+            lease_seconds=30,
+        )
+        await registry.start_request(
+            session_operation_context=completed_context,
             request_id="msg-completed",
             user_id="alice",
             event=ComposerProgressEvent(
+                phase="starting",
+                headline="The composer request has started.",
+                evidence=("The exact COMPOSE operation owns durable progress.",),
+            ),
+        )
+        await registry.finish_request(
+            session_operation_context=completed_context,
+            request_id="msg-completed",
+            user_id="alice",
+            terminal_event=ComposerProgressEvent(
                 phase="complete",
                 headline="The composer response is ready.",
                 evidence=("Saved.",),
@@ -8661,8 +8972,21 @@ class TestComposerInFlightEndpoint:
             ),
         )
         # bob has one in-flight session — must not appear in alice's view.
-        await registry.publish(
-            session_id="bob-active-session",
+        bob_session = authority.create_session_with_initial_fence(
+            user_id="bob",
+            auth_provider_type="local",
+            title="Bob progress",
+            owner_instance_id=f"progress-create-{uuid.uuid4()}",
+            lease_seconds=30,
+        )
+        bob_context = authority.acquire(
+            session_id=bob_session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=f"progress-bob-{uuid.uuid4()}",
+            lease_seconds=30,
+        )
+        await registry.start_request(
+            session_operation_context=bob_context,
             request_id="msg-bob",
             user_id="bob",
             event=ComposerProgressEvent(

@@ -19,6 +19,7 @@ from sqlalchemy import select, text, update
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
@@ -936,18 +937,31 @@ async def test_tool_batch_rejects_id_reserved_by_prior_proposal_without_tool_row
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
-    await sessions_service.create_composition_proposal(
-        session_id=UUID(result_session_id),
-        tool_call_id="call_orphaned_proposal",
-        tool_name="set_metadata",
-        summary="Prior durable proposal.",
-        rationale="Tripwire for proposal-only ID ownership.",
-        affects=("metadata",),
-        arguments_json={"patch": {"name": "prior"}},
-        arguments_redacted_json={"patch": {"name": "prior"}},
-        base_state_id=None,
-        actor="test",
+    session_id = UUID(result_session_id)
+    context = await sessions_service._run_sync(
+        lambda: sessions_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
     )
+    try:
+        await sessions_service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_orphaned_proposal",
+            tool_name="set_metadata",
+            summary="Prior durable proposal.",
+            rationale="Tripwire for proposal-only ID ownership.",
+            affects=("metadata",),
+            arguments_json={"patch": {"name": "prior"}},
+            arguments_redacted_json={"patch": {"name": "prior"}},
+            base_state_id=None,
+            actor="test",
+            session_operation_context=context,
+        )
+    finally:
+        await sessions_service._run_sync(sessions_service.session_operation_authority.release, context)
     handler_calls = _record_real_tool_handlers(monkeypatch)
 
     caught = await _capture_tool_batch_rejection(

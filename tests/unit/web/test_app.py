@@ -254,6 +254,35 @@ class TestCreateApp:
         assert app.state.settings is settings
         assert app.state.settings.port == 9999
 
+    def test_blob_acquire_archive_race_maps_to_nonleaking_not_found(self, tmp_path, monkeypatch) -> None:
+        """Archive may win after ownership verification but before lease acquire."""
+        from elspeth.web.auth.middleware import get_current_user
+        from elspeth.web.auth.models import UserIdentity
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        app = create_app(_settings(tmp_path))
+
+        async def _mock_user() -> UserIdentity:
+            return UserIdentity(user_id="test-user", username="test-user")
+
+        app.dependency_overrides[get_current_user] = _mock_user
+        client = TestClient(app, raise_server_exceptions=False)
+        created = client.post("/api/sessions", json={"title": "Acquire race"})
+        assert created.status_code == 201
+        session_id = created.json()["id"]
+
+        authority = app.state.session_service.session_operation_authority
+
+        def _archive_won(**_kwargs: object) -> None:
+            raise SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+
+        monkeypatch.setattr(authority, "acquire", _archive_won)
+        response = client.get(f"/api/sessions/{session_id}/blobs/{uuid4()}")
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Session not found"}
+        assert "owner" not in response.text.lower()
+
     def test_repeated_create_app_reuses_process_telemetry_provider(self, tmp_path) -> None:
         first = create_app(_settings(tmp_path / "first"))
         second = create_app(_settings(tmp_path / "second"))
@@ -1063,6 +1092,10 @@ class TestSessionWiring:
         service = app.state.session_service
         assert service._operator_profile_registry is app.state.operator_profile_registry
         assert service._plugin_snapshot_factory.__self__ is app.state.plugin_snapshot_factory
+        assert service._audit_access_log_authority is app.state.audit_access_log_authority
+        assert service._skill_markdown_history_authority is app.state.skill_markdown_history_authority
+        assert app.state.user_secret_store._mutation_authority is app.state.user_secret_authority
+        assert app.state.preferences_service._mutation_authority is app.state.user_preference_authority
 
     def test_session_routes_registered(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))

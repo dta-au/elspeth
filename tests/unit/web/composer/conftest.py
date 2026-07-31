@@ -68,11 +68,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, get_args, get_origin
 from unittest.mock import MagicMock
-from uuid import uuid4
 
 import hypothesis.strategies as st
 import pytest
@@ -109,7 +107,6 @@ from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.config import WebSettings
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -600,23 +597,16 @@ def _composer_available_for_phase3(monkeypatch: pytest.MonkeyPatch) -> None:
 def result_session_id(composer_service_with_real_sessions: ComposerServiceImpl) -> str:
     """Session id used by ``_run_one_turn_for_test`` result assertions."""
 
-    session_id = str(uuid4())
-    now = datetime.now(UTC)
     sessions_service = composer_service_with_real_sessions._sessions_service
-    with sessions_service._engine.begin() as conn:
-        conn.execute(
-            sessions_table.insert().values(
-                id=session_id,
-                user_id="phase3-test-user",
-                auth_provider_type="local",
-                title="Phase 3 test session",
-                trust_mode="auto_commit",
-                density_default="high",
-                created_at=now,
-                updated_at=now,
-            )
-        )
-    return session_id
+    assert sessions_service is not None
+    session = sessions_service.session_operation_authority.create_session_with_initial_fence(
+        user_id="phase3-test-user",
+        auth_provider_type="local",
+        title="Phase 3 test session",
+        owner_instance_id=sessions_service.session_operation_owner_instance_id,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
+    return str(session.id)
 
 
 def build_test_sessions_service(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import threading
 import time
@@ -62,6 +63,7 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.skill_markdown_history import RepositorySkillMarkdownHistoryAuthority
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 pytestmark = pytest.mark.testcontainer
@@ -869,18 +871,20 @@ def test_skill_markdown_history_upsert_round_trips_on_postgres(postgres_engine: 
         log=structlog.get_logger("test"),
     )
 
+    content = "# Composer skill"
+    skill_hash = hashlib.sha256(content.encode()).hexdigest()
     first_inserted = asyncio.run(
         service.upsert_skill_markdown_history(
-            skill_hash="a" * 64,
+            skill_hash=skill_hash,
             filename="pipeline_composer.md",
-            content="# Composer skill",
+            content=content,
         )
     )
     duplicate_inserted = asyncio.run(
         service.upsert_skill_markdown_history(
-            skill_hash="a" * 64,
+            skill_hash=skill_hash,
             filename="pipeline_composer.md",
-            content="# Composer skill",
+            content=content,
         )
     )
 
@@ -889,6 +893,32 @@ def test_skill_markdown_history_upsert_round_trips_on_postgres(postgres_engine: 
     assert first_inserted is True
     assert duplicate_inserted is False
     assert len(rows) == 1
+
+
+def test_skill_markdown_history_duplicate_race_across_independent_postgres_engines(postgres_engine: Engine) -> None:
+    init_session_schema(postgres_engine)
+    second_engine = create_engine(postgres_engine.url)
+    first = RepositorySkillMarkdownHistoryAuthority(postgres_engine)
+    second = RepositorySkillMarkdownHistoryAuthority(second_engine)
+    content = "# Concurrent Composer skill"
+    skill_hash = hashlib.sha256(content.encode()).hexdigest()
+    barrier = threading.Barrier(2)
+
+    def upsert(authority: RepositorySkillMarkdownHistoryAuthority) -> bool:
+        barrier.wait()
+        return authority.upsert_exact(skill_hash=skill_hash, filename="pipeline_composer.md", content=content)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [future.result() for future in (pool.submit(upsert, first), pool.submit(upsert, second))]
+    finally:
+        second_engine.dispose()
+
+    assert set(results) == {True, False}
+    with postgres_engine.connect() as conn:
+        assert conn.execute(select(skill_markdown_history_table.c.hash).where(skill_markdown_history_table.c.hash == skill_hash)).all() == [
+            (skill_hash,)
+        ]
 
 
 def test_landscape_server_default_is_false(postgres_engine: Engine) -> None:

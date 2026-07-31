@@ -32,6 +32,8 @@ from elspeth.web.blobs.protocol import (
 from elspeth.web.blobs.schemas import BlobMetadataResponse, CreateInlineBlobRequest
 from elspeth.web.blobs.service import BlobServiceImpl, sanitize_filename
 from elspeth.web.blobs.sniff import detect_mime_type
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 
 
 def _blob_response(record: BlobRecord) -> BlobMetadataResponse:
@@ -91,13 +93,18 @@ async def _get_owned_blob(
     blob_service: BlobServiceImpl,
     session_id: UUID,
     blob_id: UUID,
+    *,
+    session_operation_context: SessionOperationContext,
 ) -> BlobRecord:
     """Fetch a blob and verify it belongs to the given session.
 
     Returns 404 for missing blobs or session mismatches.
     """
     try:
-        blob = await blob_service.get_blob(blob_id)
+        blob = await blob_service.get_blob(
+            blob_id,
+            session_operation_context=session_operation_context,
+        )
     except BlobNotFoundError:
         raise HTTPException(status_code=404, detail="Blob not found") from None
 
@@ -123,6 +130,7 @@ def create_blobs_router() -> APIRouter:
     ) -> BlobMetadataResponse:
         """Create a blob from a multipart file upload."""
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
+        session_service = request.app.state.session_service
         settings = request.app.state.settings
 
         # Record the browser-declared MIME type but do NOT reject based on
@@ -173,18 +181,29 @@ def create_blobs_router() -> APIRouter:
         # check would also be a type-safety regression.
         effective_mime_typed = cast(AllowedMimeType, effective_mime)
 
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.CREATE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
         try:
-            record = await blob_service.create_blob(
-                session_id=session_id,
-                filename=original_filename,
-                content=content,
-                mime_type=effective_mime_typed,
-                created_by="user",
-                source_description="uploaded",
-            )
-        except BlobQuotaExceededError as exc:
-            raise HTTPException(status_code=413, detail=str(exc)) from None
-        return _blob_response(record)
+            try:
+                record = await blob_service.create_blob(
+                    session_id=session_id,
+                    filename=original_filename,
+                    content=content,
+                    mime_type=effective_mime_typed,
+                    created_by="user",
+                    source_description="uploaded",
+                    session_operation_context=lease.context,
+                )
+            except BlobQuotaExceededError as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from None
+            return _blob_response(record)
+        finally:
+            await lease.close()
 
     @router.post("/inline", status_code=201, response_model=BlobMetadataResponse)
     async def create_blob_inline(
@@ -201,6 +220,7 @@ def create_blobs_router() -> APIRouter:
         This route only enforces size and persistence-layer concerns.
         """
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
+        session_service = request.app.state.session_service
 
         settings = request.app.state.settings
         content_bytes = body.content.encode("utf-8")
@@ -210,18 +230,29 @@ def create_blobs_router() -> APIRouter:
                 detail=f"Content exceeds maximum size of {settings.max_upload_bytes} bytes",
             )
 
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.CREATE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
         try:
-            record = await blob_service.create_blob(
-                session_id=session_id,
-                filename=body.filename,
-                content=content_bytes,
-                mime_type=body.mime_type,
-                created_by="user",
-                source_description="created inline",
-            )
-        except BlobQuotaExceededError as exc:
-            raise HTTPException(status_code=413, detail=str(exc)) from None
-        return _blob_response(record)
+            try:
+                record = await blob_service.create_blob(
+                    session_id=session_id,
+                    filename=body.filename,
+                    content=content_bytes,
+                    mime_type=body.mime_type,
+                    created_by="user",
+                    source_description="created inline",
+                    session_operation_context=lease.context,
+                )
+            except BlobQuotaExceededError as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from None
+            return _blob_response(record)
+        finally:
+            await lease.close()
 
     @router.get("", response_model=list[BlobMetadataResponse])
     async def list_blobs(
@@ -245,8 +276,24 @@ def create_blobs_router() -> APIRouter:
     ) -> BlobMetadataResponse:
         """Get blob metadata."""
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
-        blob = await _get_owned_blob(blob_service, session_id, blob_id)
-        return _blob_response(blob)
+        session_service = request.app.state.session_service
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+        try:
+            blob = await _get_owned_blob(
+                blob_service,
+                session_id,
+                blob_id,
+                session_operation_context=lease.context,
+            )
+            return _blob_response(blob)
+        finally:
+            await lease.close()
 
     @router.get("/{blob_id}/content")
     async def download_blob_content(
@@ -262,38 +309,44 @@ def create_blobs_router() -> APIRouter:
         exists but its state precludes the operation).
         """
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
-        blob = await _get_owned_blob(blob_service, session_id, blob_id)
-
-        # Lifecycle guard — defense-in-depth (service layer also checks)
-        if blob.status != "ready":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Blob is in '{blob.status}' state and is not downloadable",
-            )
-
-        try:
-            content = await blob_service.read_blob_content(blob_id)
-        except BlobNotFoundError:
-            raise HTTPException(status_code=404, detail="Blob content not found") from None
-        except BlobStateError:
-            # Use a generic message — blob.status was fetched before the
-            # service call and may be stale if a concurrent transition
-            # happened between the route guard and the service read.
-            raise HTTPException(
-                status_code=409,
-                detail="Blob is not in a downloadable state",
-            ) from None
-        except (BlobIntegrityError, BlobContentMissingError):
-            raise HTTPException(
-                status_code=500,
-                detail="Blob content integrity verification failed",
-            ) from None
-
-        return Response(
-            content=content,
-            media_type=blob.mime_type,
-            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(blob.filename, safe='')}"},
+        session_service = request.app.state.session_service
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
         )
+        try:
+            blob = await _get_owned_blob(
+                blob_service,
+                session_id,
+                blob_id,
+                session_operation_context=lease.context,
+            )
+            if blob.status != "ready":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Blob is in '{blob.status}' state and is not downloadable",
+                )
+            try:
+                content = await blob_service.read_blob_content(
+                    blob_id,
+                    session_operation_context=lease.context,
+                )
+            except BlobNotFoundError:
+                raise HTTPException(status_code=404, detail="Blob content not found") from None
+            except BlobStateError:
+                raise HTTPException(status_code=409, detail="Blob is not in a downloadable state") from None
+            except (BlobIntegrityError, BlobContentMissingError):
+                raise HTTPException(status_code=500, detail="Blob content integrity verification failed") from None
+            return Response(
+                content=content,
+                media_type=blob.mime_type,
+                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(blob.filename, safe='')}"},
+            )
+        finally:
+            await lease.close()
 
     @router.get("/{blob_id}/preview")
     async def preview_blob_content(
@@ -305,37 +358,45 @@ def create_blobs_router() -> APIRouter:
     ) -> Response:
         """Return a bounded prefix for inline blob preview."""
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
-        blob = await _get_owned_blob(blob_service, session_id, blob_id)
-
-        if blob.status != "ready":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Blob is in '{blob.status}' state and is not previewable",
-            )
-
-        try:
-            content, truncated = await blob_service.read_blob_preview(blob_id, limit_bytes=limit)
-        except BlobNotFoundError:
-            raise HTTPException(status_code=404, detail="Blob content not found") from None
-        except BlobStateError:
-            raise HTTPException(
-                status_code=409,
-                detail="Blob is not in a previewable state",
-            ) from None
-        except (BlobIntegrityError, BlobContentMissingError):
-            raise HTTPException(
-                status_code=500,
-                detail="Blob preview integrity verification failed",
-            ) from None
-
-        return Response(
-            content=content,
-            media_type=blob.mime_type,
-            headers={
-                "X-Preview-Truncated": "true" if truncated else "false",
-                "X-Preview-Limit": str(limit),
-            },
+        session_service = request.app.state.session_service
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
         )
+        try:
+            blob = await _get_owned_blob(
+                blob_service,
+                session_id,
+                blob_id,
+                session_operation_context=lease.context,
+            )
+            if blob.status != "ready":
+                raise HTTPException(status_code=409, detail=f"Blob is in '{blob.status}' state and is not previewable")
+            try:
+                content, truncated = await blob_service.read_blob_preview(
+                    blob_id,
+                    limit_bytes=limit,
+                    session_operation_context=lease.context,
+                )
+            except BlobNotFoundError:
+                raise HTTPException(status_code=404, detail="Blob content not found") from None
+            except BlobStateError:
+                raise HTTPException(status_code=409, detail="Blob is not in a previewable state") from None
+            except (BlobIntegrityError, BlobContentMissingError):
+                raise HTTPException(status_code=500, detail="Blob preview integrity verification failed") from None
+            return Response(
+                content=content,
+                media_type=blob.mime_type,
+                headers={
+                    "X-Preview-Truncated": "true" if truncated else "false",
+                    "X-Preview-Limit": str(limit),
+                },
+            )
+        finally:
+            await lease.close()
 
     @router.delete("/{blob_id}", status_code=204)
     async def delete_blob(
@@ -346,16 +407,24 @@ def create_blobs_router() -> APIRouter:
     ) -> None:
         """Delete a blob and its backing file."""
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
-        await _get_owned_blob(blob_service, session_id, blob_id)
-
+        session_service = request.app.state.session_service
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.ARCHIVE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
         try:
-            await blob_service.delete_blob(blob_id)
+            await blob_service.delete_blob(
+                blob_id,
+                session_operation_context=lease.context,
+            )
         except BlobNotFoundError:
-            raise HTTPException(status_code=404, detail="Blob not found") from None
+            return
         except (BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError) as exc:
-            raise HTTPException(
-                status_code=409,
-                detail=str(exc),
-            ) from None
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        finally:
+            await lease.close()
 
     return router

@@ -26,7 +26,8 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Final, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
+from uuid import UUID
 
 from pydantic import BaseModel, JsonValue
 from pydantic import ValidationError as PydanticValidationError
@@ -37,6 +38,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
 from elspeth.core.config import TriggerConfig
 from elspeth.core.secrets import (
@@ -97,6 +99,9 @@ from elspeth.web.secrets.ref_policy import (
 from elspeth.web.validation import (
     INTERPRETATION_PLACEHOLDER_RE,
 )
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.protocol import SessionOperationAuthority
 
 _FULL_STATE_COMPONENT_ALIASES: Final[tuple[str, ...]] = ("", "full", "all", "pipeline")
 _FULL_STATE_COMPONENT_ALIAS_SET: Final[frozenset[str]] = frozenset(_FULL_STATE_COMPONENT_ALIASES)
@@ -2474,6 +2479,10 @@ class ToolContext:
             for the request.
         tool_arguments_hash: Canonical audited hash of the tool-call
             arguments that produced an LLM-authored blob.
+        accepting_proposal_id: Private server-owned identity of the exact
+            pending proposal currently being accepted. Blob replacement and
+            deletion admission revalidate it before excluding that one
+            proposal from retention checks.
         reviewed_source_authority: Private session-bound reviewed source
             authority. Generic/manual callers leave this unset and therefore
             remain subject to the normal fail-closed custody checks.
@@ -2489,6 +2498,8 @@ class ToolContext:
     require_data_dir_for_paths: bool = False
     session_engine: Engine | None = None
     session_id: str | None = None
+    session_operation_authority: SessionOperationAuthority | None = None
+    session_operation_context: SessionOperationContext | None = None
     secret_service: WebSecretResolver | None = None
     user_id: str | None = None
     baseline: CompositionState | None = None
@@ -2502,6 +2513,7 @@ class ToolContext:
     composer_provider: str | None = None
     composer_skill_hash: str | None = None
     tool_arguments_hash: str | None = None
+    accepting_proposal_id: UUID | None = None
     reviewed_source_authority: ReviewedSourceAuthority | None = None
     _interpretation_requirements_are_internal: bool = False
 

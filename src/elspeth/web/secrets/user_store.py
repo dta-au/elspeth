@@ -14,9 +14,7 @@ import base64
 import hashlib
 import os
 import uuid
-from collections.abc import Callable
-from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Protocol, cast, final, runtime_checkable
 
 import sqlalchemy as sa
 from cryptography.fernet import Fernet, InvalidToken
@@ -102,9 +100,6 @@ def _secret_binary_to_bytes(name: str, field_name: str, value: object) -> bytes:
     )
 
 
-_UpsertBuilder = Callable[[sa.Table, dict[str, Any]], Any]
-
-
 def _upsert_update_mapping(table: sa.Table, insert_namespace: Any) -> dict[str, Any]:
     """Build the per-column update mapping for dialect-specific upsert clauses."""
     return {
@@ -113,50 +108,100 @@ def _upsert_update_mapping(table: sa.Table, insert_namespace: Any) -> dict[str, 
     }
 
 
-def _resolve_upsert_builder(engine: Engine) -> _UpsertBuilder:
-    """Resolve the dialect-specific upsert builder for atomic secret writes.
+@runtime_checkable
+class UserSecretAuthority(Protocol):
+    """Handle-free capability for user-secret table mutations."""
 
-    SQLite and PostgreSQL expose ``INSERT ... ON CONFLICT DO UPDATE`` via
-    dialect-specific ``insert()`` helpers. MySQL-family backends use
-    ``INSERT ... ON DUPLICATE KEY UPDATE``. Resolve the builder once at
-    construction time so unsupported dialects still fail fast at startup.
-    """
-    dialect = engine.dialect.name
-    if dialect == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert as _sqlite_insert
+    def upsert_encrypted_secret(
+        self,
+        *,
+        name: str,
+        user_id: str,
+        auth_provider_type: AuthProviderType,
+        encrypted_value: bytes,
+        salt: bytes,
+    ) -> None: ...
 
-        def _sqlite_upsert(table: sa.Table, values: dict[str, Any]) -> Any:
-            stmt = _sqlite_insert(table).values(**values)
-            return stmt.on_conflict_do_update(
-                index_elements=list(_USER_SECRET_CONFLICT_COLUMNS),
-                set_=_upsert_update_mapping(table, stmt.excluded),
+    def delete_secret(self, *, name: str, user_id: str, auth_provider_type: AuthProviderType) -> bool: ...
+
+
+@final
+class RepositoryUserSecretAuthority:
+    """Own every user-secret write without exposing its database handle."""
+
+    __slots__ = ("_dialect", "_engine")
+
+    def __init__(self, engine: Engine) -> None:
+        dialect = engine.dialect.name
+        if dialect not in {"sqlite", "postgresql", "mysql", "mariadb"}:
+            raise NotImplementedError(
+                "UserSecretAuthority requires an atomic upsert, "
+                f"but no implementation is registered for session database dialect {dialect!r}. "
+                "Supported dialects: sqlite, postgresql, mysql, mariadb."
             )
+        self._engine = engine
+        self._dialect = dialect
 
-        return _sqlite_upsert
-    if dialect == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert as _pg_insert
+    def upsert_encrypted_secret(
+        self,
+        *,
+        name: str,
+        user_id: str,
+        auth_provider_type: AuthProviderType,
+        encrypted_value: bytes,
+        salt: bytes,
+    ) -> None:
+        """Atomically insert or rotate one encrypted user-secret row."""
+        values = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "user_id": user_id,
+            "auth_provider_type": auth_provider_type,
+            "encrypted_value": encrypted_value,
+            "salt": salt,
+            "version": 1,
+            "created_at": sa.func.current_timestamp(),
+            "updated_at": sa.func.current_timestamp(),
+        }
+        stmt: Any
+        if self._dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        def _pg_upsert(table: sa.Table, values: dict[str, Any]) -> Any:
-            stmt = _pg_insert(table).values(**values)
-            return stmt.on_conflict_do_update(
+            stmt = sqlite_insert(user_secrets_table).values(**values)
+            stmt = stmt.on_conflict_do_update(
                 index_elements=list(_USER_SECRET_CONFLICT_COLUMNS),
-                set_=_upsert_update_mapping(table, stmt.excluded),
+                set_=_upsert_update_mapping(user_secrets_table, stmt.excluded),
             )
+        elif self._dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
-        return _pg_upsert
-    if dialect in {"mysql", "mariadb"}:
-        from sqlalchemy.dialects.mysql import insert as _mysql_insert
+            stmt = postgresql_insert(user_secrets_table).values(**values)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=list(_USER_SECRET_CONFLICT_COLUMNS),
+                set_=_upsert_update_mapping(user_secrets_table, stmt.excluded),
+            )
+        else:
+            from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-        def _mysql_upsert(table: sa.Table, values: dict[str, Any]) -> Any:
-            stmt = _mysql_insert(table).values(**values)
-            return stmt.on_duplicate_key_update(**_upsert_update_mapping(table, stmt.inserted))
+            stmt = mysql_insert(user_secrets_table).values(**values)
+            stmt = stmt.on_duplicate_key_update(**_upsert_update_mapping(user_secrets_table, stmt.inserted))
 
-        return _mysql_upsert
-    raise NotImplementedError(
-        "UserSecretStore requires an atomic upsert for concurrent secret writes, "
-        f"but no dialect builder is registered for session database dialect {dialect!r}. "
-        "Supported dialects: sqlite, postgresql, mysql, mariadb."
-    )
+        with self._engine.begin() as conn:
+            conn.execute(stmt)
+
+    def delete_secret(self, *, name: str, user_id: str, auth_provider_type: AuthProviderType) -> bool:
+        """Delete exactly one principal/provider-scoped secret when present."""
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                user_secrets_table.delete().where(
+                    sa.and_(
+                        user_secrets_table.c.name == name,
+                        user_secrets_table.c.user_id == user_id,
+                        user_secrets_table.c.auth_provider_type == auth_provider_type,
+                    )
+                )
+            )
+        return result.rowcount > 0
 
 
 class UserSecretStore:
@@ -171,10 +216,16 @@ class UserSecretStore:
         Fernet encryption keys.
     """
 
-    def __init__(self, engine: Engine, master_key: str) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        master_key: str,
+        *,
+        mutation_authority: UserSecretAuthority | None = None,
+    ) -> None:
         self._engine = engine
         self._master_key = master_key
-        self._build_upsert = _resolve_upsert_builder(engine)
+        self._mutation_authority = mutation_authority or RepositoryUserSecretAuthority(engine)
 
     # ------------------------------------------------------------------
     # Public API
@@ -272,23 +323,13 @@ class UserSecretStore:
         salt = os.urandom(_SALT_BYTES)
         key = _derive_fernet_key(self._master_key, salt)
         encrypted = Fernet(key).encrypt(value.encode("utf-8"))
-        now = datetime.now(UTC)
-
-        t = user_secrets_table
-        values = {
-            "id": str(uuid.uuid4()),
-            "name": name,
-            "user_id": user_id,
-            "auth_provider_type": auth_provider_type,
-            "encrypted_value": encrypted,
-            "salt": salt,
-            "version": 1,
-            "created_at": now,
-            "updated_at": now,
-        }
-        stmt = self._build_upsert(t, values)
-        with self._engine.begin() as conn:
-            conn.execute(stmt)
+        self._mutation_authority.upsert_encrypted_secret(
+            name=name,
+            user_id=user_id,
+            auth_provider_type=auth_provider_type,
+            encrypted_value=encrypted,
+            salt=salt,
+        )
         return fingerprint
 
     def delete_secret(self, name: str, *, user_id: str, auth_provider_type: AuthProviderType) -> bool:
@@ -296,19 +337,11 @@ class UserSecretStore:
 
         Returns ``True`` if a row was deleted, ``False`` if it did not exist.
         """
-        t = user_secrets_table
-
-        with self._engine.begin() as conn:
-            result = conn.execute(
-                t.delete().where(
-                    sa.and_(
-                        t.c.name == name,
-                        t.c.user_id == user_id,
-                        t.c.auth_provider_type == auth_provider_type,
-                    )
-                )
-            )
-        return result.rowcount > 0
+        return self._mutation_authority.delete_secret(
+            name=name,
+            user_id=user_id,
+            auth_provider_type=auth_provider_type,
+        )
 
     def list_secrets(self, *, user_id: str, auth_provider_type: AuthProviderType) -> list[SecretInventoryItem]:
         """List secret metadata for a user (no values returned).

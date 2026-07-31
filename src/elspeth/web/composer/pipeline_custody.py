@@ -28,6 +28,7 @@ from elspeth.contracts.blobs import (
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import stable_hash
 from elspeth.web.blobs.service import (
     BlobServiceImpl,
@@ -246,9 +247,16 @@ async def finalize_pipeline_custody(
     engine: Engine,
     data_dir: str | Path,
     max_storage_per_session: int,
+    session_operation_context: SessionOperationContext,
     write_fence: BlobGuidedOperationWriteFence | None = None,
 ) -> BlobRecord:
     """Materialize a prepared inline source through the shared blob service."""
+    if type(session_operation_context) is not SessionOperationContext:
+        raise TypeError("pipeline custody requires an exact SessionOperationContext")
+    if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+        raise ValueError("pipeline custody requires COMPOSE session authority")
+    if session_operation_context.fence.session_id != str(preparation.request.session_id):
+        raise AuditIntegrityError("Pipeline custody session authority targets a different session")
     if write_fence is not None and type(write_fence) is not BlobGuidedOperationWriteFence:
         raise TypeError("pipeline custody write_fence must be an exact BlobGuidedOperationWriteFence")
     if write_fence is not None and write_fence.session_id != preparation.request.session_id:
@@ -258,7 +266,11 @@ async def finalize_pipeline_custody(
         Path(data_dir),
         max_storage_per_session=max_storage_per_session,
     )
-    record = await service.reserve_inline_custody(preparation.request, write_fence=write_fence)
+    record = await service.reserve_inline_custody(
+        preparation.request,
+        session_operation_context=session_operation_context,
+        write_fence=write_fence,
+    )
     if record.id != preparation.blob_id:
         raise AuditIntegrityError("Inline custody returned a blob id different from the prepared proposal")
     return record

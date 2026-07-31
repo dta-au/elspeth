@@ -5,12 +5,11 @@ Hosts:
 - Tool handlers for blob CRUD: ``_execute_create_blob`` / ``_execute_update_blob``
   / ``_execute_delete_blob`` / ``_execute_get_blob_content`` /
   ``_handle_list_blobs`` / ``_handle_get_blob_metadata``.
-- Quota / lock state (``_BLOB_QUOTA_BYTES``, ``_SESSION_BLOB_LOCKS``).
+- Quota state (``_BLOB_QUOTA_BYTES``).
 - Storage primitives (``_prepare_blob_create`` / ``_persist_prepared_blob_create`` /
   ``_sync_get_blob`` / ``_sync_list_blobs`` / ``_check_blob_quota``).
 - Blob DTOs (``BlobToolRecord`` / ``BlobCreatePayload`` / ``_PreparedBlobCreate``)
-  and in-transaction signal exceptions (``_BlobQuotaExceededInTxn`` /
-  ``_BlobUpdateBlockedByRetentionGuard``).
+  and invariant-specific typed mutation routing.
 - Tool-classification name sets and predicates live in
   ``elspeth.web.composer.tools.discovery``; the trailing comment in this file
   points to that module.
@@ -24,9 +23,6 @@ helpers here resolve those names via their local module namespace.
 from __future__ import annotations
 
 import hmac
-import os
-import tempfile
-import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -34,9 +30,14 @@ from typing import Any, TypedDict, cast
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import Engine, delete, func, select, update
+from sqlalchemy import Engine, func, select
 
-from elspeth.contracts.blobs import ALLOWED_MIME_TYPES
+from elspeth.contracts.blobs import (
+    ALLOWED_MIME_TYPES,
+    BlobActiveRunError,
+    BlobInProgressForkError,
+    BlobPendingProposalError,
+)
 from elspeth.contracts.blobs_inline import (
     ALLOWED_CONTENT_ENCODINGS,
     BlobInlineRef,
@@ -45,17 +46,15 @@ from elspeth.contracts.blobs_inline import (
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.blobs.protocol import AllowedMimeType, BlobIntegrityError, BlobQuotaExceededError
 from elspeth.web.blobs.service import (
-    _ACTIVE_RUN_COMPOSITION_COLUMNS,
-    _active_run_pipeline_dict,
-    _composition_references_blob,
+    _BlobDeletionCoordinator,
+    _BlobReplacementCoordinator,
     _guard_blob_row_literals,
-    _in_progress_session_fork_operation_id,
     _lock_session_for_blob_quota,
     _persist_blob_content,
-    _remove_blob_temp_artifacts,
     content_hash,
     sanitize_filename,
 )
@@ -80,11 +79,22 @@ from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.repository import SessionDerivedCustodyError
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
-from elspeth.web.sessions.locking import locked_session_transaction
-from elspeth.web.sessions.models import blob_run_links_table, blobs_table, composition_states_table, runs_table
-from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
+from elspeth.web.sessions.locking import filesystem_session_lock
+from elspeth.web.sessions.models import blobs_table
+from elspeth.web.sessions.protocol import SessionOperationAuthority
+
+_BLOB_APPROVAL_MUTATION_OPERATION_KINDS = frozenset(
+    {
+        SessionOperationKind.COMPOSE,
+        SessionOperationKind.PROPOSAL,
+    }
+)
+
+_BLOB_DIRECT_CREATE_OPERATION_KINDS = frozenset({SessionOperationKind.COMPOSE})
 
 
 class BlobToolRecord(TypedDict):
@@ -932,6 +942,8 @@ def _persist_prepared_blob_create(
     *,
     session_engine: Engine,
     session_id: str,
+    session_operation_authority: SessionOperationAuthority,
+    session_operation_context: SessionOperationContext,
     max_blob_storage_per_session_bytes: int | None = None,
 ) -> str | None:
     """Persist a prepared blob through the shared blob custody primitive."""
@@ -961,6 +973,8 @@ def _persist_prepared_blob_create(
             creating_composer_skill_hash=prepared.creating_composer_skill_hash,
             creating_arguments_hash=prepared.creating_arguments_hash,
             idempotent=False,
+            session_operation_authority=session_operation_authority,
+            session_operation_context=session_operation_context,
         )
     except BlobQuotaExceededError as exc:
         return (
@@ -1058,10 +1072,22 @@ def _execute_create_blob(
         creating_arguments_hash=provenance.creating_arguments_hash,
     )
 
+    session_operation_authority = context.session_operation_authority
+    session_operation_context = context.session_operation_context
+    if session_operation_authority is None or session_operation_context is None:
+        return _failure_result(state, "create_blob requires session operation authority context.")
+    if (
+        type(session_operation_context) is not SessionOperationContext
+        or session_operation_context.operation_kind not in _BLOB_DIRECT_CREATE_OPERATION_KINDS
+        or session_operation_context.fence.session_id != session_id
+    ):
+        return _failure_result(state, "create_blob requires exact COMPOSE authority for this session.")
     quota_error = _persist_prepared_blob_create(
         prepared,
         session_engine=session_engine,
         session_id=session_id,
+        session_operation_authority=session_operation_authority,
+        session_operation_context=session_operation_context,
         max_blob_storage_per_session_bytes=context.max_blob_storage_per_session_bytes,
     )
     if quota_error is not None:
@@ -1107,177 +1133,17 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
 )
 
 
-# Per-session mutex guarding blob-file/DB consistency.
-#
-# ``_execute_update_blob`` reads the prior file content, writes new
-# content, then opens a DB transaction that updates the size/hash
-# metadata.  Two concurrent callers on the same session+blob can
-# otherwise interleave these steps so that:
-#
-#   1. Thread A reads ``old_A`` from storage_path.
-#   2. Thread A writes ``new_A``.
-#   3. Thread B reads ``new_A`` (believing it to be ``old_B``).
-#   4. Thread B writes ``new_B`` and commits the DB row with ``new_B``'s
-#      size/hash.
-#   5. Thread A's DB transaction fails.
-#   6. Thread A's rollback writes ``old_A`` back to storage_path —
-#      clobbering B's committed content.  File = ``old_A``, DB row =
-#      ``new_B`` metadata: silent file/DB divergence with no signal.
-#
-# The composer tool layer is the only writer with this
-# read→write→commit shape.  ``BlobServiceImpl.create_blob`` allocates a
-# unique storage_path per blob, so it cannot hit this race; only the
-# update path shares a storage_path between sequential writers.
-#
-# Serialising per-session (rather than per-blob) is deliberate: composer
-# blob operations are low-frequency and a human typically interacts with
-# one session at a time, so contention is benign.  Per-blob locking
-# would require bookkeeping (reference counting, stale-lock GC) without
-# a meaningful throughput win.
-#
-# The registry is a plain dict protected by a registry mutex.  A
-# ``WeakValueDictionary`` cannot hold ``threading.Lock`` because the
-# lock primitive does not support weak references.  Stale entries
-# accumulate at roughly one entry per unique session_id observed during
-# process lifetime (~150 bytes each) — negligible for the expected
-# deployment (hundreds of sessions per server process).  If this ever
-# becomes a concern, ``clear_session_blob_lock(session_id)`` below is
-# the single-site cleanup hook; today there is no caller because
-# session teardown is not yet observable from this module.
-#
-# PROCESS-LOCAL CORRECTNESS PRECONDITION:
-# This registry holds Python ``threading.Lock`` objects — in-process
-# mutexes with zero cross-process visibility.  The I4 blob-file/DB
-# rollback race is serialised correctly ONLY because the web app
-# refuses to start in multi-worker mode: see the startup guard in
-# ``create_app`` (web/app.py) that raises ``RuntimeError`` on
-# ``--workers > 1`` / ``-w > 1`` / ``--workers=N``.  If that guard is
-# ever relaxed, every per-session lock becomes silently per-worker
-# and two workers handling the same session can interleave
-# blob-file writes and DB rollbacks.  The fix at that point is not
-# to widen this registry but to move the lock into a cross-process
-# coordination primitive (advisory DB lock / file lock / Redis) —
-# changing this dict from process-local is a design-level decision
-# that needs to be made alongside the multi-worker relaxation, not
-# after it.
-_SESSION_BLOB_LOCKS: dict[str, threading.Lock] = {}
-
-_SESSION_BLOB_LOCKS_REGISTRY_MUTEX = threading.Lock()
-
-
-def _session_blob_lock(session_id: str) -> threading.Lock:
-    """Return the per-session mutex guarding blob-file/DB consistency.
-
-    Double-checked locking: the fast path skips the registry mutex when
-    the lock already exists; the registry mutex serialises the
-    get-or-create race on first access so two concurrent callers on the
-    same session_id cannot each install a different lock instance.
-    """
-    if session_id in _SESSION_BLOB_LOCKS:
-        return _SESSION_BLOB_LOCKS[session_id]
-    with _SESSION_BLOB_LOCKS_REGISTRY_MUTEX:
-        if session_id not in _SESSION_BLOB_LOCKS:
-            _SESSION_BLOB_LOCKS[session_id] = threading.Lock()
-        return _SESSION_BLOB_LOCKS[session_id]
-
-
-class _BlobQuotaExceededInTxn(Exception):
-    """Internal sentinel raised inside the blob-update DB transaction.
-
-    The quota check in ``_execute_update_blob`` must fire AFTER the file
-    has been overwritten (so the size delta reflects the newly-written
-    bytes) and INSIDE the DB transaction (so the delta uses the current
-    row's size_bytes rather than a stale pre-transaction snapshot).
-    When the quota is exceeded, the transaction must roll back AND the
-    file must be restored from the ``old_content`` snapshot — the same
-    rollback-write-with-add_note discipline the DB-failure path applies.
-
-    Raising a distinct sentinel lets the outer ``except`` clauses model
-    this cleanly:
-
-    * ``except _BlobQuotaExceededInTxn`` handles the quota-exceeded
-      flow: attempt the rollback write, attach add_note on rollback
-      failure, then (if rollback succeeded) return the failure result.
-    * ``except Exception as primary_exc`` handles DB-layer failures
-      identically but re-raises ``primary_exc`` rather than returning a
-      ToolResult.
-
-    The two clauses share the rollback-with-add_note structure so the
-    divergence-on-rollback-failure diagnostic is produced identically
-    for both paths.
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.user_message = message
-
-
-class _BlobUpdateBlockedByRetentionGuard(Exception):
-    """Internal sentinel raised inside the blob-update DB transaction.
-
-    Session-fork and active-run retention guards fire inside
-    ``locked_session_transaction`` so they share the canonical same-session
-    lock with concurrent fork/run creation. When either guard trips, we must
-    (a) roll the DB transaction back so no partial mutation leaks out, and
-    (b) surface a tool-failure result rather than an exception so the compose
-    loop treats the rejection as recoverable.
-
-    Raising a distinct sentinel lets the outer handler distinguish
-    three exit paths cleanly:
-
-    * ``except _BlobUpdateBlockedByRetentionGuard`` — returns
-      ``_failure_result`` (caller retries after the retaining operation
-      completes).
-    * ``except _BlobQuotaExceededInTxn`` — returns a quota-specific
-      ``_failure_result``.
-    * ``except Exception`` — DB-layer or ``os.replace`` fault;
-      re-raises after attaching rollback diagnostics on divergence.
-
-    Keeping this separate from ``_BlobQuotaExceededInTxn`` is deliberate:
-    the two conditions reach the same rollback-on-divergence handler
-    but produce different user-facing failure messages.
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.user_message = message
-
-
 def _execute_update_blob(
     arguments: dict[str, Any],
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    """Update the content of an existing blob.
-
-    Tier-3 boundary: ``arguments`` is an LLM-supplied dict.  Validated
-    via :class:`UpdateBlobArgumentsModel` (the single source of truth
-    for the argument schema — supersedes the deleted
-    ``_TOOL_REQUIRED_PATHS["update_blob"]`` entry in ``service.py``,
-    rev-3 N7 / rev-4 M1).  On :class:`pydantic.ValidationError` we
-    re-raise as :class:`ToolArgumentError` so the compose loop's
-    ARG_ERROR routing at ``service.py:2480`` receives the right
-    exception class.
-
-    Validation precedence (file/lock safety).  ``model_validate`` MUST
-    run BEFORE :func:`_session_blob_lock` is acquired and BEFORE any
-    filesystem read/write.  The prior in-handler ``isinstance(content,
-    str)`` guard documented this requirement at length — the same
-    discipline still applies, now expressed structurally: Pydantic
-    rejects a non-str ``content`` (or a missing ``blob_id``) before the
-    handler reaches the tempfile/replace critical section, so the
-    rollback-on-divergence path (which would otherwise issue an
-    unnecessary filesystem write over an unmodified file) is never
-    entered on a pure argument-validation failure.  ``_execute_create_blob``'s
-    cleanup is ``unlink(missing_ok=True)`` (a genuine no-op); ``_execute_update_blob``'s
-    is ``write_bytes(old_content)`` (a real filesystem mutation) — hence
-    the validation MUST precede lock acquisition here, not merely
-    precede the begin-transaction block.
-    """
+    """Replace one exact ready blob under the caller's live COMPOSE fence."""
     session_engine = context.session_engine
     session_id = context.session_id
-    if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+    data_dir = context.data_dir
+    if session_engine is None or session_id is None or data_dir is None:
+        return _failure_result(state, "Blob tools require session context and data_dir for storage.")
 
     try:
         validated = UpdateBlobArgumentsModel.model_validate(arguments)
@@ -1292,280 +1158,98 @@ def _execute_update_blob(
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    content = validated.content
     if blob_id in _state_source_blob_refs(state):
         return _failure_result(
             state,
             f"Blob '{blob_id}' is currently bound as a pipeline source; create a new blob and rebind the source instead.",
         )
+
+    authority = context.session_operation_authority
+    operation_context = context.session_operation_context
+    if authority is None or operation_context is None:
+        return _failure_result(state, "update_blob requires session operation authority context.")
+    if (
+        type(operation_context) is not SessionOperationContext
+        or operation_context.operation_kind not in _BLOB_APPROVAL_MUTATION_OPERATION_KINDS
+        or operation_context.fence.session_id != session_id
+    ):
+        return _failure_result(state, "update_blob requires exact COMPOSE or PROPOSAL authority for this session.")
+    accepting_proposal_id = context.accepting_proposal_id
+    if operation_context.operation_kind is SessionOperationKind.PROPOSAL:
+        if type(accepting_proposal_id) is not UUID:
+            return _failure_result(state, "update_blob proposal execution requires its exact accepting proposal identity.")
+    elif accepting_proposal_id is not None:
+        return _failure_result(state, "update_blob COMPOSE execution cannot exclude proposal retention.")
+
+    content = validated.content
+    try:
+        content_bytes = content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ToolArgumentError(
+            argument="update_blob content",
+            expected="valid UTF-8 text",
+            actual_type=type(exc).__name__,
+        ) from exc
+    file_hash = content_hash(content_bytes)
     provenance = _blob_creation_provenance(content, context)
     provenance_message_id = _blob_provenance_message_id(context.user_message_id)
 
-    # Serialise the read→write→commit critical section across concurrent
-    # composer-tool callers on this session.  See ``_session_blob_lock``'s
-    # module-level docstring for the rollback-clobber race this closes
-    # (I4).  The lock MUST be acquired BEFORE ``_sync_get_blob`` — a lock
-    # scoped any tighter (e.g. only around the file write) would still
-    # permit the interleave described in that docstring.
-    with _session_blob_lock(session_id):
-        blob = _sync_get_blob(session_engine, blob_id, session_id)
-        if blob is None:
-            return _failure_result(state, f"Blob '{blob_id}' not found.")
-
-        storage_path = Path(blob["storage_path"])
-        try:
-            content_bytes = content.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ToolArgumentError(
-                argument="update_blob content",
-                expected="valid UTF-8 text",
-                actual_type=type(exc).__name__,
-            ) from exc
-        file_hash = content_hash(content_bytes)
-        new_size = len(content_bytes)
-
-        # Snapshot the prior bytes BEFORE any filesystem mutation so the
-        # post-replace divergence rollback (commit-failure window) can
-        # restore them.  read_bytes() precedes tempfile creation so a
-        # read-side OSError cannot orphan a tempfile.
-        old_content = storage_path.read_bytes()
-
-        # Write the NEW content to a sibling tempfile; ``os.replace``
-        # swaps it in atomically only after the active-run guard, quota
-        # check, and DB UPDATE have all succeeded.  Writing to a tempfile
-        # (rather than overwriting storage_path up front as the pre-fix
-        # code did) closes two audit-corruption windows:
-        #
-        # * Path-based sources reading the backing file mid-update would
-        #   observe the new bytes against the stale DB content_hash —
-        #   silent Tier-1 audit corruption.
-        # * blob_ref sources recomputing the hash mid-update would raise
-        #   a false-positive BlobIntegrityError because the on-disk
-        #   bytes no longer match the stored hash.
-        #
-        # ``tempfile.mkstemp`` in ``storage_path.parent`` guarantees a
-        # same-filesystem swap (required for POSIX ``os.replace``
-        # atomicity).  The ``dot-prefix + .tmp`` suffix keeps stray
-        # tempfiles (if any survive a kill) out of directory listings
-        # that assume blob files are exactly ``{blob_id}_*`` — the
-        # composer listing logic filters on that prefix.
-        tmp_fd, tmp_name = tempfile.mkstemp(
-            dir=storage_path.parent,
-            prefix=f".{storage_path.name}.",
-            suffix=".tmp",
+    try:
+        expected = authority.mutate(
+            operation_context,
+            lambda transaction: transaction.blobs.read_blob(blob_id=UUID(blob_id)),
         )
-        tmp_path = Path(tmp_name)
-        replaced = False
-        try:
-            with os.fdopen(tmp_fd, "wb") as tmp_file:
-                tmp_file.write(content_bytes)
-
-            try:
-                with locked_session_transaction(session_engine, session_id) as conn:
-                    fork_operation_id = _in_progress_session_fork_operation_id(conn, session_id)
-                    if fork_operation_id is not None:
-                        raise _BlobUpdateBlockedByRetentionGuard(
-                            f"Blob '{blob_id}' is frozen by in-progress session fork '{fork_operation_id}' and cannot be updated."
-                        )
-
-                    # Active-run guard (two checks — mirror of the
-                    # pattern in ``_execute_delete_blob``).  Lives
-                    # INSIDE the transaction so SQLite's writer lock
-                    # serialises it against concurrent run inserts —
-                    # ``_execute_locked`` cannot slip a new run row
-                    # past this guard because its INSERT would block on
-                    # our transaction's lock.
-                    #
-                    # 1. Explicit link: ``blob_run_links`` already
-                    #    points at an active run.
-                    active_link = conn.execute(
-                        select(blob_run_links_table)
-                        .join(runs_table, blob_run_links_table.c.run_id == runs_table.c.id)
-                        .where(blob_run_links_table.c.blob_id == blob_id)
-                        .where(runs_table.c.status.in_(["pending", "running"]))
-                    ).first()
-                    if active_link is not None:
-                        raise _BlobUpdateBlockedByRetentionGuard(
-                            f"Blob '{blob_id}' is linked to active run '{active_link.run_id}' and cannot be updated."
-                        )
-
-                    # 2. Pre-link window: ``_execute_locked`` creates
-                    #    the run record before ``link_blob_to_run``
-                    #    inserts the link row.  During that gap the
-                    #    explicit-link check sees nothing, but the
-                    #    backing file is about to be read.  Scan the active
-                    #    run's canonical pipeline dict for a ``blob_ref``
-                    #    match OR a ``path``/``file`` that matches
-                    #    ``storage_path``.
-                    active_run = conn.execute(
-                        select(*_ACTIVE_RUN_COMPOSITION_COLUMNS)
-                        .join(
-                            composition_states_table,
-                            runs_table.c.state_id == composition_states_table.c.id,
-                        )
-                        .where(runs_table.c.session_id == session_id)
-                        .where(runs_table.c.status.in_(["pending", "running"]))
-                    ).first()
-                    if active_run is not None and _composition_references_blob(
-                        _active_run_pipeline_dict(active_run),
-                        blob_id,
-                        str(storage_path),
-                    ):
-                        raise _BlobUpdateBlockedByRetentionGuard(
-                            f"Blob '{blob_id}' cannot be updated while active run '{active_run.run_id}' references it."
-                        )
-
-                    # Atomic quota check. The session row lock serializes
-                    # same-session writers before ``size_bytes`` is re-read,
-                    # so the delta reflects the current DB row rather than a
-                    # pre-transaction snapshot (stale under writers that
-                    # bypass the composer session lock — e.g.
-                    # ``BlobServiceImpl`` paths that share the same
-                    # session_engine).
-                    _lock_session_for_blob_quota(conn, session_id)
-                    current_size: int = conn.execute(
-                        select(blobs_table.c.size_bytes).where(
-                            blobs_table.c.id == blob_id,
-                            blobs_table.c.session_id == session_id,
-                        )
-                    ).scalar_one()
-                    size_delta = new_size - current_size
-                    if size_delta > 0:
-                        quota_error = _check_blob_quota(
-                            conn,
-                            session_id,
-                            size_delta,
-                            quota_bytes=context.max_blob_storage_per_session_bytes,
-                            session_locked=True,
-                        )
-                        if quota_error is not None:
-                            # Raising inside the ``with`` rolls the DB
-                            # transaction back before the outer handler
-                            # runs.  ``os.replace`` has not executed,
-                            # so storage_path is still the prior bytes
-                            # and no rollback write is required.
-                            raise _BlobQuotaExceededInTxn(quota_error)
-
-                    update_values = {
-                        "size_bytes": new_size,
-                        "content_hash": file_hash,
-                    }
-                    if provenance is not None:
-                        update_values.update(
-                            creation_modality=provenance.creation_modality.value,
-                            created_from_message_id=provenance_message_id,
-                            creating_model_identifier=provenance.creating_model_identifier,
-                            creating_model_version=provenance.creating_model_version,
-                            creating_provider=provenance.creating_provider,
-                            creating_composer_skill_hash=provenance.creating_composer_skill_hash,
-                            creating_arguments_hash=provenance.creating_arguments_hash,
-                        )
-
-                    conn.execute(
-                        update(blobs_table)
-                        .where(
-                            blobs_table.c.id == blob_id,
-                            blobs_table.c.session_id == session_id,
-                        )
-                        .values(**update_values)
-                    )
-
-                    # Atomic file swap — the final mutation before the
-                    # with-block commit.  If ``os.replace`` raises,
-                    # control exits the with-block via exception and
-                    # the DB transaction rolls back — neither the file
-                    # nor the DB row changes.  On success, control
-                    # returns to the with-block which then commits;
-                    # file and DB land in sync on the happy path.
-                    #
-                    # The residual divergence window is narrow and
-                    # handled by the ``except Exception`` arm below:
-                    # (os.replace succeeded) ∧ (commit subsequently
-                    # failed).
-                    os.replace(tmp_path, storage_path)
-                    replaced = True
-            except _BlobUpdateBlockedByRetentionGuard as blocked:
-                # Guard rejected the update BEFORE ``os.replace`` ran;
-                # DB transaction has rolled back, tempfile awaits
-                # cleanup in the outer finally, storage_path is
-                # unchanged.  Surface as tool-failure so the compose
-                # loop treats the rejection as recoverable.
-                return _failure_result(state, blocked.user_message)
-            except _BlobQuotaExceededInTxn as quota_exc:
-                # Quota raised BEFORE ``os.replace`` ran; storage_path
-                # is unchanged.  If for any reason ``replaced`` is True
-                # here (defensive — current ordering raises before
-                # replace), restore old_content with add_note
-                # discipline mirroring the DB-failure path so
-                # divergence is surfaced, not silenced.
-                if replaced:
-                    try:
-                        storage_path.write_bytes(old_content)
-                    except OSError as rollback_exc:
-                        quota_exc.add_note(
-                            f"Rollback failed: could not restore prior content of {storage_path} "
-                            f"({type(rollback_exc).__name__}: {rollback_exc}). "
-                            f"Storage file and DB metadata for blob_id={blob_id!r} may now be "
-                            f"inconsistent — the file may contain the new (uncommitted) bytes "
-                            f"while the DB row retains the prior size_bytes/content_hash. "
-                            f"Manual reconciliation required."
-                        )
-                        raise RuntimeError(
-                            f"Blob quota rollback diverged for {blob_id!r}: "
-                            f"{quota_exc.user_message}  Rollback write_bytes raised "
-                            f"{type(rollback_exc).__name__}: {rollback_exc}. "
-                            f"storage_path {storage_path!s} contains the uncommitted "
-                            f"new content while the DB row retains the prior "
-                            f"size_bytes/content_hash.  Manual reconciliation required."
-                        ) from rollback_exc
-                return _failure_result(state, quota_exc.user_message)
-            except Exception as primary_exc:
-                # DB-layer fault (commit OSError, UPDATE I/O error,
-                # SQLAlchemy error) or ``os.replace`` fault.  If
-                # ``replaced`` is True, ``os.replace`` has already
-                # swapped the new bytes in and storage_path now
-                # diverges from the (un-committed or about-to-fail) DB
-                # row — restore from old_content.  Narrow the
-                # rollback-error handler to OSError per
-                # offensive-programming policy: programmer bugs
-                # (TypeError, AttributeError, AssertionError) must
-                # propagate so a broken rollback isn't silently
-                # downgraded to a note.  Catching ``Exception`` (not
-                # ``BaseException``) preserves KeyboardInterrupt /
-                # SystemExit — asserted by
-                # ``test_blob_rollback_does_not_catch_keyboard_interrupt``.
-                if replaced:
-                    try:
-                        storage_path.write_bytes(old_content)
-                    except OSError as rollback_exc:
-                        primary_exc.add_note(
-                            f"Rollback failed: could not restore prior content of {storage_path} "
-                            f"({type(rollback_exc).__name__}: {rollback_exc}). "
-                            f"Storage file and DB metadata for blob_id={blob_id!r} may now be "
-                            f"inconsistent — the file may contain the new (uncommitted) bytes "
-                            f"while the DB row retains the prior size_bytes/content_hash. "
-                            f"Manual reconciliation required."
-                        )
-                raise
-        finally:
-            # Unconditional tempfile cleanup.  On the happy path
-            # ``os.replace`` moves the inode and ``tmp_path`` vanishes
-            # (unlink becomes a no-op via missing_ok).  On every
-            # failure path the tempfile still exists and must be
-            # removed to prevent inode exhaustion and leakage of
-            # uncommitted content to any directory listing.
-            tmp_path.unlink(missing_ok=True)
-
-        return _discovery_result(
+        if expected.status != "ready":
+            return _failure_result(state, f"Blob '{blob_id}' is not ready and cannot be updated.")
+        replacement = replace(
+            expected,
+            size_bytes=len(content_bytes),
+            content_hash=file_hash,
+            creation_modality=provenance.creation_modality,
+            created_from_message_id=provenance_message_id,
+            creating_model_identifier=provenance.creating_model_identifier,
+            creating_model_version=provenance.creating_model_version,
+            creating_provider=provenance.creating_provider,
+            creating_composer_skill_hash=provenance.creating_composer_skill_hash,
+            creating_arguments_hash=provenance.creating_arguments_hash,
+        )
+        committed = _BlobReplacementCoordinator(
+            data_dir=Path(data_dir),
+            session_operation_authority=authority,
+        ).replace_blob(
+            expected=expected,
+            replacement=replacement,
+            content=content_bytes,
+            context=operation_context,
+            max_storage_per_session=_resolve_blob_quota_bytes(context.max_blob_storage_per_session_bytes),
+            accepting_proposal_id=accepting_proposal_id,
+        )
+    except BlobInProgressForkError as exc:
+        return _failure_result(state, str(exc).replace("deleted", "updated"))
+    except BlobPendingProposalError as exc:
+        return _failure_result(state, str(exc).replace("deleted", "updated"))
+    except BlobActiveRunError as exc:
+        return _failure_result(state, str(exc).replace("deleted", "updated"))
+    except BlobQuotaExceededError as exc:
+        return _failure_result(
             state,
-            {
-                "blob_id": blob_id,
-                "filename": blob["filename"],
-                "mime_type": blob["mime_type"],
-                "size_bytes": len(content_bytes),
-                "content_hash": file_hash,
-            },
+            f"Session blob quota exceeded: {exc.current_bytes - expected.size_bytes + len(content_bytes)} bytes "
+            f"would exceed {exc.limit_bytes} byte limit.",
         )
+    except SessionOperationFenceLost:
+        return _failure_result(state, "update_blob lost its session operation authority before mutation.")
+    except SessionDerivedCustodyError:
+        return _failure_result(state, f"Blob '{blob_id}' not found.")
+
+    return _discovery_result(
+        state,
+        {
+            "blob_id": blob_id,
+            "filename": committed.filename,
+            "size_bytes": committed.size_bytes,
+            "content_hash": committed.content_hash,
+        },
+    )
 
 
 _UPDATE_BLOB_DECLARATION = ToolDeclaration(
@@ -1597,133 +1281,59 @@ def _execute_delete_blob(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    """Delete a blob and its storage file."""
-    session_engine = context.session_engine
+    """Delete one blob through the shared durable deletion ledger."""
     session_id = context.session_id
-    if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+    data_dir = context.data_dir
+    if context.session_engine is None or session_id is None or data_dir is None:
+        return _failure_result(state, "Blob tools require session context and data_dir for storage.")
 
     blob_id = arguments["blob_id"]
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
 
-    blob = _sync_get_blob(session_engine, blob_id, session_id)
-    if blob is None:
-        return _failure_result(state, f"Blob '{blob_id}' not found.")
+    authority = context.session_operation_authority
+    operation_context = context.session_operation_context
+    if authority is None or operation_context is None:
+        return _failure_result(state, "delete_blob requires session operation authority context.")
+    if (
+        type(operation_context) is not SessionOperationContext
+        or operation_context.operation_kind not in _BLOB_APPROVAL_MUTATION_OPERATION_KINDS
+        or operation_context.fence.session_id != session_id
+    ):
+        return _failure_result(state, "delete_blob requires exact COMPOSE or PROPOSAL authority for this session.")
+    accepting_proposal_id = context.accepting_proposal_id
+    if operation_context.operation_kind is SessionOperationKind.PROPOSAL:
+        if type(accepting_proposal_id) is not UUID:
+            return _failure_result(state, "delete_blob proposal execution requires its exact accepting proposal identity.")
+    elif accepting_proposal_id is not None:
+        return _failure_result(state, "delete_blob COMPOSE execution cannot exclude proposal retention.")
 
-    storage_path = Path(blob["storage_path"])
-    tombstone_path: Path | None = None
-
+    blob_uuid = UUID(blob_id)
     try:
-        with locked_session_transaction(session_engine, session_id) as conn:
-            locked_row = conn.execute(
-                select(blobs_table).where(
-                    blobs_table.c.id == blob_id,
-                    blobs_table.c.session_id == session_id,
-                )
-            ).first()
-            if locked_row is None:
-                return _failure_result(state, f"Blob '{blob_id}' not found.")
-            blob = _blob_row_to_tool_dict(locked_row)
-            storage_path = Path(blob["storage_path"])
-            fork_operation_id = _in_progress_session_fork_operation_id(conn, session_id)
-            if fork_operation_id is not None:
-                return _failure_result(
-                    state,
-                    f"Blob '{blob_id}' is frozen by in-progress session fork '{fork_operation_id}' and cannot be deleted.",
-                )
-            retaining_proposal_id = pending_proposal_reference_id(
-                conn,
-                session_id=session_id,
-                blob_id=blob_id,
+        with filesystem_session_lock(Path(data_dir), session_id):
+            authority.mutate(
+                operation_context,
+                lambda transaction: transaction.blobs.read_blob(blob_id=blob_uuid),
             )
-            if retaining_proposal_id is not None:
-                return _failure_result(
-                    state,
-                    f"Blob '{blob_id}' is referenced by pending proposal '{retaining_proposal_id}' and cannot be deleted.",
-                )
-
-            # Active-run guard (two checks):
-            #
-            # 1. Explicit link: blob_run_links already points at an active run.
-            active_link = conn.execute(
-                select(blob_run_links_table)
-                .join(runs_table, blob_run_links_table.c.run_id == runs_table.c.id)
-                .where(blob_run_links_table.c.blob_id == blob_id)
-                .where(runs_table.c.status.in_(["pending", "running"]))
-            ).first()
-            if active_link is not None:
-                return _failure_result(
-                    state,
-                    f"Blob '{blob_id}' is linked to active run '{active_link.run_id}' and cannot be deleted.",
-                )
-
-            # 2. Pre-link window: _execute_locked() creates the run record before
-            #    link_blob_to_run() inserts the blob_run_links row.  During that
-            #    gap the explicit-link check above sees nothing, but the backing
-            #    file is about to be needed.
-            #
-            #    Scoped to THIS blob: join runs → composition_states and check
-            #    whether the active run's canonical pipeline dict references
-            #    this blob via blob_ref OR via a path/file matching this
-            #    blob's storage_path.
-            #    Runs whose source doesn't touch this blob must not block
-            #    unrelated blob deletions.
-            active_run = conn.execute(
-                select(*_ACTIVE_RUN_COMPOSITION_COLUMNS)
-                .join(
-                    composition_states_table,
-                    runs_table.c.state_id == composition_states_table.c.id,
-                )
-                .where(runs_table.c.session_id == session_id)
-                .where(runs_table.c.status.in_(["pending", "running"]))
-            ).first()
-            if active_run is not None and _composition_references_blob(
-                _active_run_pipeline_dict(active_run),
-                blob_id,
-                blob["storage_path"],
-            ):
-                return _failure_result(
-                    state,
-                    f"Blob '{blob_id}' cannot be deleted while active run '{active_run.run_id}' references it.",
-                )
-
-            # Move the file to a tombstone path before the DB delete so a
-            # later SQL/commit failure can restore it atomically. This avoids
-            # leaving a live blobs row pointing at missing bytes.
-            if storage_path.exists():
-                tombstone_path = storage_path.with_name(f".{storage_path.name}.delete-{uuid4().hex}")
-                os.replace(storage_path, tombstone_path)
-            _remove_blob_temp_artifacts(storage_path)
-
-            # Delete record — include session_id filter for defence in depth
-            conn.execute(
-                delete(blobs_table).where(
-                    blobs_table.c.id == blob_id,
-                    blobs_table.c.session_id == session_id,
-                )
+            _BlobDeletionCoordinator(
+                data_dir=Path(data_dir),
+                session_operation_authority=authority,
+            ).delete_blob(
+                blob_id=blob_uuid,
+                context=operation_context,
+                accepting_proposal_id=accepting_proposal_id,
             )
-    except Exception as primary_exc:
-        if tombstone_path is not None and tombstone_path.exists():
-            try:
-                os.replace(tombstone_path, storage_path)
-            except OSError as rollback_exc:
-                primary_exc.add_note(
-                    f"Rollback failed: could not restore deleted blob file {storage_path} from tombstone "
-                    f"{tombstone_path} ({type(rollback_exc).__name__}: {rollback_exc}). "
-                    f"Blob row and storage may now diverge; manual reconciliation required."
-                )
-        raise
-
-    if tombstone_path is not None and tombstone_path.exists():
-        try:
-            tombstone_path.unlink()
-        except OSError as cleanup_exc:
-            raise RuntimeError(
-                f"Blob '{blob_id}' metadata was deleted but tombstone cleanup failed for {tombstone_path}: "
-                f"{type(cleanup_exc).__name__}: {cleanup_exc}"
-            ) from cleanup_exc
+    except BlobInProgressForkError as exc:
+        return _failure_result(state, str(exc))
+    except BlobPendingProposalError as exc:
+        return _failure_result(state, str(exc))
+    except BlobActiveRunError as exc:
+        return _failure_result(state, str(exc))
+    except SessionOperationFenceLost:
+        return _failure_result(state, "delete_blob lost its session operation authority before mutation.")
+    except SessionDerivedCustodyError:
+        return _failure_result(state, f"Blob '{blob_id}' not found.")
 
     return _discovery_result(state, {"blob_id": blob_id, "deleted": True})
 

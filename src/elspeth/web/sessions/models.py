@@ -429,7 +429,7 @@ session_operation_fences_table = Table(
     CheckConstraint("lease_token <> owner_instance_id", name="ck_session_operation_fences_token_not_owner"),
     CheckConstraint("operation_epoch > 0", name="ck_session_operation_fences_positive_epoch"),
     CheckConstraint(
-        "operation_kind IN ('create', 'compose', 'proposal', 'execute', 'archive', 'progress')",
+        "operation_kind IN ('create', 'compose', 'proposal', 'execute', 'archive', 'progress', 'blob_read', 'session_fork')",
         name="ck_session_operation_fences_kind",
     ),
 )
@@ -1040,6 +1040,54 @@ Index(
     proposal_events_table.c.created_at,
 )
 
+# One durable obligation per approved blob effect. The blob coordinator writes
+# this row in the same database transaction that changes/removes blob metadata;
+# ordinary proposal settlement then binds the receipt to its accepted event.
+# A receipt may remain unaccepted after process death, but it may never be
+# rejected or cause the tool to execute again.
+proposal_blob_effect_receipts_table = Table(
+    "proposal_blob_effect_receipts",
+    metadata,
+    Column("proposal_id", String, primary_key=True),
+    Column("session_id", String, nullable=False, index=True),
+    Column("tool_name", String, nullable=False),
+    Column("blob_id", String, nullable=False),
+    Column("arguments_hash", String, nullable=False),
+    Column("result_blob_snapshot", JSON, nullable=False),
+    Column("result_blob_snapshot_hash", String, nullable=False),
+    Column("accepted_event_id", String, ForeignKey("proposal_events.id"), nullable=True, unique=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("accepted_at", DateTime(timezone=True), nullable=True),
+    ForeignKeyConstraint(
+        ["proposal_id", "session_id"],
+        ["composition_proposals.id", "composition_proposals.session_id"],
+        name="fk_proposal_blob_effect_receipts_proposal_session",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("tool_name IN ('update_blob', 'delete_blob')", name="ck_proposal_blob_effect_receipts_tool"),
+    CheckConstraint(
+        "(accepted_event_id IS NULL) = (accepted_at IS NULL)",
+        name="ck_proposal_blob_effect_receipts_acceptance_bundle",
+    ),
+    *_non_blank_text_constraints("blob_id", name="ck_proposal_blob_effect_receipts_blob_id_nonblank"),
+    CheckConstraint(
+        _lower_sha256_check("arguments_hash", dialect="sqlite"),
+        name="ck_proposal_blob_effect_receipts_arguments_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _lower_sha256_check("arguments_hash", dialect="postgresql"),
+        name="ck_proposal_blob_effect_receipts_arguments_hash",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        _lower_sha256_check("result_blob_snapshot_hash", dialect="sqlite"),
+        name="ck_proposal_blob_effect_receipts_result_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _lower_sha256_check("result_blob_snapshot_hash", dialect="postgresql"),
+        name="ck_proposal_blob_effect_receipts_result_hash",
+    ).ddl_if(dialect="postgresql"),
+)
+
 interpretation_events_table = Table(
     "interpretation_events",
     metadata,
@@ -1356,7 +1404,7 @@ Index(
 # ``skill_markdown_history`` (F-5c) — content-addressed archive of every
 # distinct ``pipeline_composer.md`` version seen at runtime.
 #
-# One row per (SHA-256 hash, filename) pair. The compose loop upserts
+# One row per SHA-256 hash. The compose loop upserts
 # (INSERT OR IGNORE) on first use of a hash, capturing the exact text that
 # was in memory when the LLM was prompted. This makes every
 # ``composer_skill_hash`` on ``interpretation_events`` rows forensically
@@ -2417,6 +2465,12 @@ blobs_table = Table(
     Column("creating_provider", String, nullable=True),
     Column("creating_composer_skill_hash", String, nullable=True),
     Column("creating_arguments_hash", String, nullable=True),
+    # Transient exact owner of a standalone-create reservation. The complete
+    # operation identity is cleared when the row becomes ready; a later
+    # current creator may retire only the exact abandoned pending obligation.
+    Column("custody_operation_id", String, nullable=True),
+    Column("custody_operation_epoch", Integer, nullable=True),
+    Column("custody_operation_kind", String, nullable=True),
     # Composite FK: (created_from_message_id, session_id) must reference an
     # existing (chat_messages.id, chat_messages.session_id) pair.  Mirrors
     # fk_chat_messages_parent_assistant_session above.  ON DELETE RESTRICT
@@ -2431,6 +2485,28 @@ blobs_table = Table(
         ["chat_messages.id", "chat_messages.session_id"],
         name="fk_blobs_created_from_message_session",
         ondelete="RESTRICT",
+    ),
+    CheckConstraint(
+        "(custody_operation_id IS NULL) = (custody_operation_epoch IS NULL) "
+        "AND (custody_operation_id IS NULL) = (custody_operation_kind IS NULL)",
+        name="ck_blobs_custody_operation_identity",
+    ),
+    *_non_blank_text_constraints(
+        "custody_operation_id",
+        name="ck_blobs_custody_operation_id_nonblank",
+        nullable=True,
+    ),
+    CheckConstraint(
+        "custody_operation_epoch IS NULL OR custody_operation_epoch > 0",
+        name="ck_blobs_custody_operation_positive_epoch",
+    ),
+    CheckConstraint(
+        "custody_operation_kind IS NULL OR custody_operation_kind IN ('create', 'compose', 'proposal', 'execute')",
+        name="ck_blobs_custody_operation_kind",
+    ),
+    CheckConstraint(
+        "(status = 'pending') OR custody_operation_id IS NULL",
+        name="ck_blobs_custody_pending_only",
     ),
     CheckConstraint(
         "creation_modality IN ('verbatim', 'llm_generated', 'disambiguated', 'llm_generated_then_amended')",
@@ -2503,14 +2579,12 @@ blobs_table = Table(
     ).ddl_if(dialect="postgresql"),
 )
 
-# A blob delete spans two durability domains: the metadata row is removed in a
-# database transaction, then its same-directory filesystem tombstone is unlinked
-# and the parent directory is fsynced. Keep the exact stage transactionally so a
-# post-commit purge failure remains discoverable and retryable after restart.
-# This row deliberately does not reference ``blobs.id`` because the blob row and
-# its dependent run links are removed in the same transaction that creates this
-# cleanup record. Session archival owns the whole blob directory, so its cascade
-# may retire cleanup rows after moving that directory into archive quarantine.
+# A blob delete spans database and filesystem durability domains. Persist the
+# exact intent before staging bytes, advance it to ``staged`` after rename+fsync,
+# and atomically pair metadata deletion with ``purge_pending``. The row does not
+# reference ``blobs.id`` because it must survive that metadata deletion for
+# cleanup-only retry. Session archival owns the whole blob directory, so its
+# cascade may retire cleanup rows after moving that directory into quarantine.
 blob_deletion_cleanups_table = Table(
     "blob_deletion_cleanups",
     metadata,
@@ -2523,8 +2597,120 @@ blob_deletion_cleanups_table = Table(
         index=True,
     ),
     Column("storage_path", String, nullable=False),
-    Column("tombstone_path", String, nullable=True),
+    Column("tombstone_path", String, nullable=False),
+    Column("operation_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("operation_kind", String, nullable=False),
+    Column("phase", String, nullable=False),
+    Column("blob_snapshot_hash", String, nullable=False),
+    Column("expected_file_present", Boolean, nullable=False),
+    Column("expected_file_size", Integer, nullable=True),
+    Column("expected_file_hash", String, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("operation_epoch > 0", name="ck_blob_deletion_cleanups_positive_epoch"),
+    CheckConstraint(
+        "operation_kind IN ('archive', 'compose', 'proposal', 'session_fork')",
+        name="ck_blob_deletion_cleanups_kind",
+    ),
+    CheckConstraint("phase IN ('intent', 'staged', 'purge_pending')", name="ck_blob_deletion_cleanups_phase"),
+    *_non_blank_text_constraints("storage_path", name="ck_blob_deletion_cleanups_storage_path_nonblank"),
+    *_non_blank_text_constraints("tombstone_path", name="ck_blob_deletion_cleanups_tombstone_path_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_blob_deletion_cleanups_operation_id_nonblank"),
+    CheckConstraint(
+        "expected_file_present IN (0, 1)",
+        name="ck_blob_deletion_cleanups_expected_file_present",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint("storage_path <> tombstone_path", name="ck_blob_deletion_cleanups_paths_differ"),
+    CheckConstraint(
+        "expected_file_present = (expected_file_size IS NOT NULL) AND expected_file_present = (expected_file_hash IS NOT NULL)",
+        name="ck_blob_deletion_cleanups_expected_file_evidence",
+    ),
+    CheckConstraint("expected_file_size IS NULL OR expected_file_size >= 0", name="ck_blob_deletion_cleanups_nonnegative_size"),
+    CheckConstraint("updated_at >= created_at", name="ck_blob_deletion_cleanups_monotonic_timestamps"),
+    CheckConstraint("length(blob_snapshot_hash) = 64", name="ck_blob_deletion_cleanups_snapshot_hash_length"),
+    CheckConstraint("expected_file_hash IS NULL OR length(expected_file_hash) = 64", name="ck_blob_deletion_cleanups_file_hash_length"),
+    CheckConstraint(
+        "blob_snapshot_hash NOT GLOB '*[^a-f0-9]*'",
+        name="ck_blob_deletion_cleanups_snapshot_hash_lowercase",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "blob_snapshot_hash ~ '^[a-f0-9]+$'",
+        name="ck_blob_deletion_cleanups_snapshot_hash_lowercase",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "expected_file_hash IS NULL OR expected_file_hash NOT GLOB '*[^a-f0-9]*'",
+        name="ck_blob_deletion_cleanups_file_hash_lowercase",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "expected_file_hash IS NULL OR expected_file_hash ~ '^[a-f0-9]+$'",
+        name="ck_blob_deletion_cleanups_file_hash_lowercase",
+    ).ddl_if(dialect="postgresql"),
+)
+
+# A blob replacement crosses the same database/filesystem durability seam as a
+# delete, but its recovery evidence is intentionally separate: the live blob
+# row survives, and commit atomically changes its exact metadata while advancing
+# this obligation to ``purge_pending``. ``blob_id`` therefore has no FK to
+# ``blobs.id``; the session FK alone owns lifecycle cleanup.
+blob_replacement_cleanups_table = Table(
+    "blob_replacement_cleanups",
+    metadata,
+    Column("blob_id", String, primary_key=True),
+    Column("replacement_id", String, nullable=False, unique=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("storage_path", String, nullable=False),
+    Column("staging_path", String, nullable=False),
+    Column("backup_path", String, nullable=False),
+    Column("operation_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("operation_kind", String, nullable=False),
+    Column("lease_token", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("phase", String, nullable=False),
+    Column("old_blob_snapshot", JSON, nullable=False),
+    Column("replacement_blob_snapshot", JSON, nullable=False),
+    Column("old_blob_snapshot_hash", String, nullable=False),
+    Column("replacement_blob_snapshot_hash", String, nullable=False),
+    Column("old_size_bytes", Integer, nullable=False),
+    Column("old_content_hash", String, nullable=False),
+    Column("replacement_size_bytes", Integer, nullable=False),
+    Column("replacement_content_hash", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("operation_epoch > 0", name="ck_blob_replacement_cleanups_positive_epoch"),
+    CheckConstraint("operation_kind IN ('compose', 'proposal')", name="ck_blob_replacement_cleanups_kind"),
+    CheckConstraint("phase IN ('intent', 'swap_pending', 'purge_pending')", name="ck_blob_replacement_cleanups_phase"),
+    *_non_blank_text_constraints("replacement_id", name="ck_blob_replacement_cleanups_replacement_id_nonblank"),
+    *_non_blank_text_constraints("storage_path", name="ck_blob_replacement_cleanups_storage_path_nonblank"),
+    *_non_blank_text_constraints("staging_path", name="ck_blob_replacement_cleanups_staging_path_nonblank"),
+    *_non_blank_text_constraints("backup_path", name="ck_blob_replacement_cleanups_backup_path_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_blob_replacement_cleanups_operation_id_nonblank"),
+    *_non_blank_text_constraints("lease_token", name="ck_blob_replacement_cleanups_lease_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_blob_replacement_cleanups_owner_nonblank"),
+    CheckConstraint(
+        "storage_path <> staging_path AND storage_path <> backup_path AND staging_path <> backup_path",
+        name="ck_blob_replacement_cleanups_paths_distinct",
+    ),
+    CheckConstraint("old_size_bytes >= 0", name="ck_blob_replacement_cleanups_old_size_nonnegative"),
+    CheckConstraint("replacement_size_bytes >= 0", name="ck_blob_replacement_cleanups_replacement_size_nonnegative"),
+    CheckConstraint("updated_at >= created_at", name="ck_blob_replacement_cleanups_monotonic_timestamps"),
+    CheckConstraint("length(old_blob_snapshot_hash) = 64", name="ck_blob_replacement_cleanups_old_snapshot_hash_length"),
+    CheckConstraint(
+        "length(replacement_blob_snapshot_hash) = 64",
+        name="ck_blob_replacement_cleanups_replacement_snapshot_hash_length",
+    ),
+    CheckConstraint("length(old_content_hash) = 64", name="ck_blob_replacement_cleanups_old_content_hash_length"),
+    CheckConstraint(
+        "length(replacement_content_hash) = 64",
+        name="ck_blob_replacement_cleanups_replacement_content_hash_length",
+    ),
 )
 
 # Index for the reverse-lookup path: "given a chat message, which inline
@@ -2622,6 +2808,7 @@ run_events_table = Table(
     Column("event_type", String, nullable=False),
     Column("data", JSON, nullable=False),
     UniqueConstraint("run_id", "sequence", name="uq_run_events_run_sequence"),
+    CheckConstraint("sequence >= 1", name="ck_run_events_positive_sequence"),
     CheckConstraint(
         "event_type IN ('progress', 'error', 'completed', 'cancelled', 'failed')",
         name="ck_run_events_type",

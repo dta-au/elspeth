@@ -25,18 +25,18 @@ drain). See ``sessions/service.py`` for the canonical usage pattern.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Any
+from datetime import datetime
+from typing import Any, Protocol, final, runtime_checkable
 
 from opentelemetry import metrics
-from sqlalchemy import String, select
+from sqlalchemy import String, func, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 
+from elspeth.contracts.advisory_locks import ELSPETH_USER_PREFERENCES_LOCK_CLASSID
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.tutorial_telemetry import record_tutorial_completed_path
 from elspeth.web.preferences.models import (
@@ -112,6 +112,17 @@ class CorruptPreferencesError(RuntimeError):
         self.bad_value = bad_value
 
 
+@runtime_checkable
+class UserPreferenceAuthority(Protocol):
+    """Handle-free capability for one committed preferences PATCH."""
+
+    def apply_patch(
+        self,
+        user_id: str,
+        payload: UpdateComposerPreferencesRequest,
+    ) -> ComposerPreferencesTransition: ...
+
+
 # ── Telemetry (Panel S1) ───────────────────────────────────────────────────
 # Operational signal only — preferences are user state, not a pipeline
 # decision boundary, so NO Landscape emit (see CLAUDE.md primacy rule:
@@ -140,10 +151,6 @@ _VALID_MODES: frozenset[ComposerMode] = frozenset({"guided", "freeform"})
 # ``TutorialStage`` Literal (models.py) and the
 # ``ck_user_preferences_tutorial_stage`` CHECK (sessions/models.py).
 _VALID_TUTORIAL_STAGES: frozenset[TutorialStage] = frozenset({"guided", "run", "audit", "graduation"})
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 def _select_preferences_for_user(user_id: str) -> Any:
@@ -188,83 +195,59 @@ def _decode_tutorial_completed_at(user_id: str, raw_value: object) -> datetime |
     )
 
 
-class PreferencesService:
-    """Reads and writes per-user composer preferences."""
+def decode_preferences_row(row: Any, user_id: str) -> ComposerPreferences:
+    """Decode a stored preferences row with shared fail-closed guards."""
+    mode = row.default_composer_mode
+    if mode not in _VALID_MODES:
+        raise CorruptPreferencesError(user_id, mode)
+    tutorial_completed_at = _decode_tutorial_completed_at(user_id, row.tutorial_completed_at)
+    stage = row.tutorial_stage
+    if stage is not None and stage not in _VALID_TUTORIAL_STAGES:
+        raise CorruptPreferencesError(user_id, stage, field_name="tutorial_stage")
+    return ComposerPreferences(
+        default_mode=mode,
+        banner_dismissed_at=row.banner_dismissed_at,
+        freeform_intro_dismissed_at=row.freeform_intro_dismissed_at,
+        tutorial_completed_at=tutorial_completed_at,
+        tutorial_stage=stage,
+        tutorial_session_id=row.tutorial_session_id,
+        tutorial_run_id=row.tutorial_run_id,
+        tutorial_source_data_hash=row.tutorial_source_data_hash,
+        updated_at=row.updated_at,
+    )
 
-    def __init__(self, engine: Engine, *, now: Callable[[], datetime] = _utcnow) -> None:
-        self._engine = engine
-        self._now = now
 
-    async def get_composer_preferences(self, user_id: str) -> ComposerPreferences:
-        """Return the user's preferences, falling back to 'guided' if no row exists.
+def _default_preferences() -> ComposerPreferences:
+    return ComposerPreferences(
+        default_mode=_DEFAULT_MODE,
+        banner_dismissed_at=None,
+        freeform_intro_dismissed_at=None,
+        tutorial_completed_at=None,
+        tutorial_stage=None,
+        tutorial_session_id=None,
+        tutorial_run_id=None,
+        tutorial_source_data_hash=None,
+        updated_at=None,
+    )
 
-        Default policy:
-          - No row => 'guided' (new-user default; the existing-user
-            session-count heuristic was retired under
-            ``project_db_migration_policy`` — see plan 12 Task 5).
-          - Row exists => use stored value; crash if stored value is
-            corrupt.
-        """
 
-        def _sync() -> ComposerPreferences:
-            with self._engine.connect() as conn:
-                row = conn.execute(_select_preferences_for_user(user_id)).first()
-                if row is not None:
-                    return self._row_to_prefs(row, user_id)
+@final
+class RepositoryUserPreferenceAuthority:
+    """Own the complete transaction for user-preference mutations."""
 
-            # No row: return the new-user guided default. We do not write
-            # a row here (lazy — avoid write traffic for users who never
-            # touch preferences). Panel U1: updated_at=None because no
-            # write event exists to associate a timestamp with;
-            # fabricating self._now() would put a value the system never
-            # actually wrote into an audit-visible field.
-            return ComposerPreferences(
-                default_mode=_DEFAULT_MODE,
-                banner_dismissed_at=None,
-                freeform_intro_dismissed_at=None,
-                tutorial_completed_at=None,
-                tutorial_stage=None,
-                tutorial_session_id=None,
-                tutorial_run_id=None,
-                tutorial_source_data_hash=None,
-                updated_at=None,
+    __slots__ = ("_dialect", "_engine")
+
+    def __init__(self, engine: Engine) -> None:
+        dialect = engine.dialect.name
+        if dialect not in {"sqlite", "postgresql"}:
+            raise NotImplementedError(
+                "UserPreferenceAuthority requires transactional upsert support; "
+                f"unsupported session database dialect {dialect!r}; supported dialects: sqlite, postgresql"
             )
+        self._engine = engine
+        self._dialect = dialect
 
-        return await run_sync_in_worker(_sync)
-
-    def _row_to_prefs(self, row: Any, user_id: str) -> ComposerPreferences:
-        """Convert a DB row to the response model with a Tier-1 read guard.
-
-        A stored mode outside the validated set is a fault we caused
-        (bug, tampering, or DB corruption). Crash with the offending
-        value named so the operator can diagnose.
-
-        ``row: Any`` matches the established sessions/service.py
-        convention (see lines 326, 346, 1945, 2836) and avoids
-        ``type: ignore[attr-defined]`` noise on every column access.
-        SQLAlchemy ``Row`` objects don't have a useful static type for
-        the column attributes the engine exposes via dot access.
-        """
-        mode = row.default_composer_mode
-        if mode not in _VALID_MODES:
-            raise CorruptPreferencesError(user_id, mode)
-        tutorial_completed_at = _decode_tutorial_completed_at(user_id, row.tutorial_completed_at)
-        stage = row.tutorial_stage
-        if stage is not None and stage not in _VALID_TUTORIAL_STAGES:
-            raise CorruptPreferencesError(user_id, stage, field_name="tutorial_stage")
-        return ComposerPreferences(
-            default_mode=mode,
-            banner_dismissed_at=row.banner_dismissed_at,
-            freeform_intro_dismissed_at=row.freeform_intro_dismissed_at,
-            tutorial_completed_at=tutorial_completed_at,
-            tutorial_stage=stage,
-            tutorial_session_id=row.tutorial_session_id,
-            tutorial_run_id=row.tutorial_run_id,
-            tutorial_source_data_hash=row.tutorial_source_data_hash,
-            updated_at=row.updated_at,
-        )
-
-    async def update_composer_preferences(self, user_id: str, payload: UpdateComposerPreferencesRequest) -> ComposerPreferencesTransition:
+    def apply_patch(self, user_id: str, payload: UpdateComposerPreferencesRequest) -> ComposerPreferencesTransition:
         """Upsert the preferences row, touching only fields in ``payload``.
 
         Empty payloads are accepted as no-ops (the request succeeds; if a
@@ -300,7 +283,6 @@ class PreferencesService:
         The earlier behaviour (insert a default row on empty PATCH)
         contradicted the documented lazy-write contract on the GET side.
         """
-        now = self._now()
         tutorial_in_payload = "tutorial_completed_at" in payload.model_fields_set
         banner_in_payload = "banner_dismissed_at" in payload.model_fields_set
         intro_in_payload = "freeform_intro_dismissed_at" in payload.model_fields_set
@@ -326,18 +308,29 @@ class PreferencesService:
         def _sync() -> tuple[ComposerPreferences, bool, ComposerPreferences | None]:
             """Returns (current_prefs, wrote, prior_prefs)."""
             with self._engine.begin() as conn:
+                if self._dialect == "postgresql":
+                    conn.exec_driver_sql(
+                        "SELECT pg_catalog.pg_advisory_xact_lock(%s, pg_catalog.hashtext(%s))",
+                        (ELSPETH_USER_PREFERENCES_LOCK_CLASSID, user_id),
+                    )
+                    write_timestamp = func.clock_timestamp()
+                else:
+                    write_timestamp = func.current_timestamp()
                 # B2 (load-bearing): load the prior row inside the same
                 # transaction as the upsert. The result is `None` if no
                 # row exists for this user — synthesising a default
                 # sentinel here would fabricate state the system never
                 # wrote (see ComposerPreferencesTransition docstring and
                 # CLAUDE.md §"Three-Tier Trust Model" fabrication test).
-                prior_row = conn.execute(_select_preferences_for_user(user_id)).first()
+                prior_select = _select_preferences_for_user(user_id)
+                if self._dialect == "postgresql":
+                    prior_select = prior_select.with_for_update()
+                prior_row = conn.execute(prior_select).first()
                 prior_prefs: ComposerPreferences | None
                 if prior_row is None:
                     prior_prefs = None
                 else:
-                    prior_prefs = self._row_to_prefs(prior_row, user_id)
+                    prior_prefs = decode_preferences_row(prior_row, user_id)
 
                 # Panel C2 guard: empty PATCH against a no-row user is a
                 # no-write no-op. Check existence BEFORE the upsert so we
@@ -426,21 +419,15 @@ class PreferencesService:
                     "banner_dismissed_at": resolved_banner,
                     "freeform_intro_dismissed_at": resolved_intro,
                     "tutorial_completed_at": resolved_tutorial,
-                    "updated_at": now,
+                    "updated_at": write_timestamp,
                     **resolved_progress,
                 }
-                dialect = conn.dialect.name
                 stmt: Any
-                if dialect == "sqlite":
+                if self._dialect == "sqlite":
                     stmt = sqlite_insert(user_preferences_table).values(**values)
-                elif dialect == "postgresql":
-                    stmt = postgresql_insert(user_preferences_table).values(**values)
                 else:
-                    raise NotImplementedError(
-                        "PreferencesService requires an atomic upsert for session database "
-                        f"dialect {dialect!r}; supported dialects: sqlite, postgresql"
-                    )
-                update_clause: dict[str, object] = {"updated_at": now}
+                    stmt = postgresql_insert(user_preferences_table).values(**values)
+                update_clause: dict[str, object] = {"updated_at": write_timestamp}
                 if payload.default_mode is not None:
                     update_clause["default_composer_mode"] = payload.default_mode
                 if banner_in_payload:
@@ -469,7 +456,7 @@ class PreferencesService:
                     )
                 ).one()
 
-            returned = self._row_to_prefs(row, user_id)
+            returned = decode_preferences_row(row, user_id)
             current = ComposerPreferences(
                 default_mode=payload.default_mode if payload.default_mode is not None else returned.default_mode,
                 banner_dismissed_at=payload.banner_dismissed_at if banner_in_payload else returned.banner_dismissed_at,
@@ -484,40 +471,79 @@ class PreferencesService:
                 tutorial_session_id=returned.tutorial_session_id,
                 tutorial_run_id=returned.tutorial_run_id,
                 tutorial_source_data_hash=returned.tutorial_source_data_hash,
-                updated_at=now,
+                updated_at=returned.updated_at,
             )
             return current, True, prior_prefs
 
-        current, wrote, prior_prefs = await run_sync_in_worker(_sync)
-        # Panel S1: operational telemetry only — no Landscape (user state,
-        # not pipeline decision boundary). See module-level comment for
-        # the no-Landscape rationale and the future-promote criterion.
-        _PREFERENCES_PATCH_COUNTER.add(
-            1,
-            attributes={
-                "mode_changed": payload.default_mode is not None,
-                "banner_dismissed": payload.banner_dismissed_at is not None,
-                "freeform_intro_dismissed": payload.freeform_intro_dismissed_at is not None,
-                "tutorial_changed": tutorial_in_payload,
-                "tutorial_progress_changed": any_progress_in_payload,
-                "wrote_row": wrote,
-            },
-        )
-        if tutorial_in_payload:
-            prior_tutorial = prior_prefs.tutorial_completed_at if prior_prefs is not None else None
-            addressed_mode = "default_mode" in payload.model_fields_set
-            # The explicit discriminator outranks the payload-shape inference
-            # below: an exit-to-freeform opt-out (elspeth-61591e64bb) is a
-            # one-key completion write that shape-reads as "skip" (or, with a
-            # mode change riding along, "first_time").
-            if payload.tutorial_completed_at is not None and payload.tutorial_completed_via == "exit":
-                record_tutorial_completed_path("exit")
-            elif prior_tutorial is None and payload.tutorial_completed_at is not None and addressed_mode:
-                record_tutorial_completed_path("first_time")
-            elif prior_tutorial is None and payload.tutorial_completed_at is not None and not addressed_mode:
-                record_tutorial_completed_path("skip")
-            elif prior_tutorial is not None and payload.tutorial_completed_at is None:
-                record_tutorial_completed_path("retake")
-            elif prior_tutorial is not None and payload.tutorial_completed_at is not None:
-                record_tutorial_completed_path("repeat")
+        current, _wrote, prior_prefs = _sync()
         return ComposerPreferencesTransition(prior=prior_prefs, current=current)
+
+
+def _emit_patch_telemetry(
+    payload: UpdateComposerPreferencesRequest,
+    transition: ComposerPreferencesTransition,
+) -> None:
+    tutorial_in_payload = "tutorial_completed_at" in payload.model_fields_set
+    progress_in_payload = any(
+        name in payload.model_fields_set
+        for name in ("tutorial_stage", "tutorial_session_id", "tutorial_run_id", "tutorial_source_data_hash")
+    )
+    _PREFERENCES_PATCH_COUNTER.add(
+        1,
+        attributes={
+            "mode_changed": payload.default_mode is not None,
+            "banner_dismissed": payload.banner_dismissed_at is not None,
+            "freeform_intro_dismissed": payload.freeform_intro_dismissed_at is not None,
+            "tutorial_changed": tutorial_in_payload,
+            "tutorial_progress_changed": progress_in_payload,
+            "wrote_row": transition.current.updated_at is not None,
+        },
+    )
+    if not tutorial_in_payload:
+        return
+    prior_tutorial = transition.prior.tutorial_completed_at if transition.prior is not None else None
+    addressed_mode = "default_mode" in payload.model_fields_set
+    if payload.tutorial_completed_at is not None and payload.tutorial_completed_via == "exit":
+        record_tutorial_completed_path("exit")
+    elif prior_tutorial is None and payload.tutorial_completed_at is not None and addressed_mode:
+        record_tutorial_completed_path("first_time")
+    elif prior_tutorial is None and payload.tutorial_completed_at is not None:
+        record_tutorial_completed_path("skip")
+    elif prior_tutorial is not None and payload.tutorial_completed_at is None:
+        record_tutorial_completed_path("retake")
+    elif prior_tutorial is not None and payload.tutorial_completed_at is not None:
+        record_tutorial_completed_path("repeat")
+
+
+class PreferencesService:
+    """Read preferences and delegate every mutation to its authority."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        mutation_authority: UserPreferenceAuthority | None = None,
+    ) -> None:
+        self._engine = engine
+        self._mutation_authority = mutation_authority or RepositoryUserPreferenceAuthority(engine)
+
+    async def get_composer_preferences(self, user_id: str) -> ComposerPreferences:
+        def _sync() -> ComposerPreferences:
+            with self._engine.connect() as conn:
+                row = conn.execute(_select_preferences_for_user(user_id)).first()
+            return decode_preferences_row(row, user_id) if row is not None else _default_preferences()
+
+        return await run_sync_in_worker(_sync)
+
+    def _row_to_prefs(self, row: Any, user_id: str) -> ComposerPreferences:
+        """Compatibility shim for callers migrating to the pure decoder."""
+        return decode_preferences_row(row, user_id)
+
+    async def update_composer_preferences(
+        self,
+        user_id: str,
+        payload: UpdateComposerPreferencesRequest,
+    ) -> ComposerPreferencesTransition:
+        transition = await run_sync_in_worker(lambda: self._mutation_authority.apply_patch(user_id, payload))
+        _emit_patch_telemetry(payload, transition)
+        return transition

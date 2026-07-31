@@ -28,6 +28,7 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
@@ -132,6 +133,105 @@ def _csv_state() -> CompositionStateData:
         metadata_={"name": "Test Pipeline", "description": ""},
         is_valid=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_export_yaml_authority_failure_returns_no_yaml_and_emits_no_counter(tmp_path: Path) -> None:
+    app, service = _make_app_with_telemetry(tmp_path)
+    telemetry = app.state.sessions_telemetry
+    client = TestClient(app, raise_server_exceptions=False)
+    session = await service.create_session("alice", "Pipeline", "local")
+    await service.save_composition_state(session.id, _csv_state(), provenance="session_seed")
+
+    async def _pass_preflight(  # type: ignore[no-untyped-def]
+        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+    ):
+        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
+
+    with (
+        patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight),
+        patch.object(type(service.session_operation_authority), "mutate", side_effect=RuntimeError("audit unavailable")),
+    ):
+        response = client.get(f"/api/sessions/{session.id}/state/yaml")
+
+    assert response.status_code == 500
+    assert "yaml" not in response.text
+    assert observed_value(telemetry.session_completed_total) == 0
+    with app.state.session_engine.connect() as conn:
+        rows = conn.execute(select(composer_completion_events_table)).all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_export_yaml_taken_over_authority_returns_no_yaml_and_emits_no_counter(tmp_path: Path) -> None:
+    app, service = _make_app_with_telemetry(tmp_path)
+    telemetry = app.state.sessions_telemetry
+    client = TestClient(app, raise_server_exceptions=False)
+    session = await service.create_session("alice", "Pipeline", "local")
+    await service.save_composition_state(session.id, _csv_state(), provenance="session_seed")
+
+    async def _pass_preflight(  # type: ignore[no-untyped-def]
+        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+    ):
+        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
+
+    authority = service.session_operation_authority
+    authority_type = type(authority)
+    original_mutate = authority_type.mutate
+
+    def take_over_before_mutation(self, context, mutation):  # type: ignore[no-untyped-def]
+        self.release(context)
+        successor = self.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id="yaml-export-successor",
+            lease_seconds=30,
+        )
+        try:
+            return original_mutate(self, context, mutation)
+        finally:
+            self.release(successor)
+
+    with (
+        patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight),
+        patch.object(authority_type, "mutate", take_over_before_mutation),
+    ):
+        response = client.get(f"/api/sessions/{session.id}/state/yaml")
+
+    assert response.status_code == 500
+    assert "yaml" not in response.text
+    assert observed_value(telemetry.session_completed_total) == 0
+    with app.state.session_engine.connect() as conn:
+        assert conn.execute(select(composer_completion_events_table)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_export_yaml_records_the_authored_state_when_a_newer_state_appears_after_preflight(tmp_path: Path) -> None:
+    app, service = _make_app_with_telemetry(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Pipeline", "local")
+    await service.save_composition_state(session.id, _csv_state(), provenance="session_seed")
+    authored = await service.get_current_state(session.id)
+    assert authored is not None
+
+    async def _supersede_after_preflight(  # type: ignore[no-untyped-def]
+        state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+    ):
+        del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
+        await service.save_composition_state(session.id, _csv_state(), provenance="tool_call")
+        return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
+
+    with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_supersede_after_preflight):
+        response = client.get(f"/api/sessions/{session.id}/state/yaml")
+
+    assert response.status_code == 200, response.text
+    with app.state.session_engine.connect() as conn:
+        rows = conn.execute(select(composer_completion_events_table)).all()
+    assert len(rows) == 1
+    assert rows[0].composition_state_id == str(authored.id)
+    assert rows[0].event_type == "export_yaml"
 
 
 @pytest.mark.asyncio

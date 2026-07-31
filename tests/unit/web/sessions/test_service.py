@@ -2,14 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
+import threading
+import traceback
 import uuid
+import warnings
+from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import structlog
-from sqlalchemy import insert, select
+from sqlalchemy import event, func, insert, select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.web.coordination.contracts import (
+    ArchiveDeleteReconciliation,
+    ArchiveManifestRelation,
+    FenceLossReason,
+    SessionOperationContext,
+    SessionOperationFenceLost,
+    SessionOperationKind,
+    SessionOperationTerminalOutcomeUnknown,
+)
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution.schemas import (
     RunAccounting,
     RunAccountingIntegrity,
@@ -18,12 +35,25 @@ from elspeth.web.execution.schemas import (
     RunAccountingTokens,
     RunStatusResponse,
 )
+from elspeth.web.sessions import service as service_module
+from elspeth.web.sessions.archive_quarantine import (
+    ArchiveQuarantineCollisionError,
+    ArchiveQuarantineIdentity,
+    archive_quarantine_paths,
+    list_archive_quarantine_manifests,
+    prepare_archive_quarantine,
+    purge_archive_quarantine,
+    restore_archive_quarantine,
+    retire_archive_quarantine,
+    stage_archive_quarantine,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     composer_completion_events_table,
     composition_states_table,
     run_events_table,
     runs_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import (
@@ -35,11 +65,161 @@ from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     RunAlreadyActiveError,
     RunRecord,
+    SessionGuidedOperationInProgressError,
     SessionRecord,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import QuarantineCleanupError, SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+
+
+class _RecordingSessionOperationAuthority:
+    def __init__(self, delegate: SQLiteLocalSessionOperationAuthority) -> None:
+        self._delegate = delegate
+        self.acquire_calls: list[dict[str, object]] = []
+        self.acquire_lease_seconds_override: int | None = None
+        self.release_calls: list[SessionOperationContext] = []
+        self.archive_delete_calls: list[SessionOperationContext] = []
+        self.reconcile_archive_delete_calls: list[SessionOperationContext] = []
+        self.classify_archive_manifest_calls: list[tuple[SessionOperationContext, object, int]] = []
+        self.compare_and_swap_calls: list[SessionOperationContext] = []
+        self.events: list[str] = []
+        self.archive_delete_error: BaseException | None = None
+        self.reconcile_archive_delete_error: BaseException | None = None
+        self.compare_and_swap_errors: dict[int, BaseException] = {}
+        self.renew_error: BaseException | None = None
+        self.renew_wait_for: threading.Event | None = None
+        self.renew_started = threading.Event()
+        self.mutate_blocked = False
+        self.mutate_started = threading.Event()
+        self.mutate_allowed = threading.Event()
+        self.mutate_allowed.set()
+        self.mutate_finished = threading.Event()
+
+    def create_session_with_initial_fence(self, **kwargs):
+        return self._delegate.create_session_with_initial_fence(**kwargs)
+
+    def acquire(self, **kwargs) -> SessionOperationContext:
+        self.acquire_calls.append(dict(kwargs))
+        if self.acquire_lease_seconds_override is not None:
+            kwargs = {**kwargs, "lease_seconds": self.acquire_lease_seconds_override}
+        return self._delegate.acquire(**kwargs)
+
+    def renew(self, context: SessionOperationContext, *, lease_seconds: int) -> SessionOperationContext:
+        if self.renew_wait_for is not None:
+            assert self.renew_wait_for.wait(timeout=5)
+        self.renew_started.set()
+        if self.renew_error is not None:
+            raise self.renew_error
+        return self._delegate.renew(context, lease_seconds=lease_seconds)
+
+    def compare_and_swap(self, context: SessionOperationContext) -> None:
+        self.compare_and_swap_calls.append(context)
+        self.events.append("compare_and_swap")
+        error = self.compare_and_swap_errors.get(len(self.compare_and_swap_calls))
+        if error is not None:
+            raise error
+        self._delegate.compare_and_swap(context)
+
+    def mutate(self, context: SessionOperationContext, mutation: Callable[[Any], Any]) -> Any:
+        self.events.append("mutate")
+        if not self.mutate_blocked:
+            return self._delegate.mutate(context, mutation)
+        self.mutate_started.set()
+        try:
+            assert self.mutate_allowed.wait(timeout=5)
+            return self._delegate.mutate(context, mutation)
+        finally:
+            self.mutate_finished.set()
+
+    def release(self, context: SessionOperationContext) -> None:
+        self.release_calls.append(context)
+        self.events.append("release")
+        self._delegate.release(context)
+
+    def archive_delete(self, context: SessionOperationContext) -> None:
+        self.archive_delete_calls.append(context)
+        self.events.append("archive_delete")
+        if self.archive_delete_error is not None:
+            raise self.archive_delete_error
+        self._delegate.archive_delete(context)
+
+    def reconcile_archive_delete(self, context: SessionOperationContext) -> ArchiveDeleteReconciliation:
+        self.reconcile_archive_delete_calls.append(context)
+        self.events.append("reconcile_archive_delete")
+        if self.reconcile_archive_delete_error is not None:
+            raise self.reconcile_archive_delete_error
+        return self._delegate.reconcile_archive_delete(context)
+
+    def classify_archive_manifest(
+        self,
+        current_context: SessionOperationContext,
+        *,
+        manifest_operation_id: object,
+        manifest_operation_epoch: int,
+    ) -> ArchiveManifestRelation:
+        self.classify_archive_manifest_calls.append((current_context, manifest_operation_id, manifest_operation_epoch))
+        self.events.append("classify_archive_manifest")
+        return self._delegate.classify_archive_manifest(
+            current_context,
+            manifest_operation_id=manifest_operation_id,  # type: ignore[arg-type]
+            manifest_operation_epoch=manifest_operation_epoch,
+        )
+
+    def mutate_fork_creation(self, **kwargs):
+        return self._delegate.mutate_fork_creation(**kwargs)
+
+
+def _service_with_recording_authority(
+    engine,
+    *,
+    data_dir=None,
+    lease_seconds: int = 30,
+) -> tuple[SessionServiceImpl, _RecordingSessionOperationAuthority]:
+    authority = _RecordingSessionOperationAuthority(SQLiteLocalSessionOperationAuthority(engine))
+    return (
+        SessionServiceImpl(
+            engine,
+            data_dir=data_dir,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.archive-authority"),
+            session_operation_authority=authority,
+            owner_instance_id="test-archive-owner",
+            session_operation_lease_seconds=lease_seconds,
+        ),
+        authority,
+    )
+
+
+class _SessionOperationContexts:
+    """Acquire real per-session operation contexts and release test-held leases."""
+
+    def __init__(self) -> None:
+        self._held: list[tuple[SessionServiceImpl, SessionOperationContext]] = []
+
+    def acquire(
+        self,
+        service: SessionServiceImpl,
+        session_id: uuid.UUID,
+        operation_kind: SessionOperationKind = SessionOperationKind.EXECUTE,
+    ) -> SessionOperationContext:
+        context = service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=operation_kind,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        self._held.append((service, context))
+        return context
+
+    def release(self, service: SessionServiceImpl, context: SessionOperationContext) -> None:
+        service.session_operation_authority.release(context)
+        self._held.remove((service, context))
+
+    def close(self) -> None:
+        for service, context in reversed(self._held):
+            service.session_operation_authority.release(context)
+        self._held.clear()
 
 
 @pytest.fixture
@@ -56,6 +236,15 @@ def engine():
     )
     initialize_session_schema(eng)
     return eng
+
+
+@pytest.fixture
+def session_operation_contexts():
+    contexts = _SessionOperationContexts()
+    try:
+        yield contexts
+    finally:
+        contexts.close()
 
 
 @pytest.fixture
@@ -143,6 +332,116 @@ class TestSessionCRUD:
         assert len(messages) == 0
 
     @pytest.mark.asyncio
+    async def test_physical_archive_consumes_exact_archive_context_without_release(self, engine) -> None:
+        service, authority = _service_with_recording_authority(engine)
+        session = await service.create_session("alice", "Consume Archive", "local")
+
+        await service.archive_session(session.id)
+
+        archive_acquire_calls = [call for call in authority.acquire_calls if call["operation_kind"] is SessionOperationKind.ARCHIVE]
+        assert archive_acquire_calls == [
+            {
+                "session_id": session.id,
+                "operation_kind": SessionOperationKind.ARCHIVE,
+                "owner_instance_id": "test-archive-owner",
+                "lease_seconds": 30,
+            }
+        ]
+        assert len(authority.archive_delete_calls) == 1
+        consumed_context = authority.archive_delete_calls[0]
+        assert consumed_context.operation_kind is SessionOperationKind.ARCHIVE
+        assert consumed_context.fence.session_id == str(session.id)
+        assert authority.release_calls == []
+        with engine.connect() as conn:
+            assert conn.execute(select(sessions_table.c.id).where(sessions_table.c.id == str(session.id))).first() is None
+            assert (
+                conn.execute(
+                    select(session_operation_fences_table.c.session_id).where(
+                        session_operation_fences_table.c.session_id == str(session.id)
+                    )
+                ).first()
+                is None
+            )
+
+    @pytest.mark.asyncio
+    async def test_archive_missing_session_uses_public_not_found_contract(self, service) -> None:
+        missing = uuid.uuid4()
+
+        with pytest.raises(ValueError, match=f"Session not found: {missing}"):
+            await service.archive_session(missing)
+
+    @pytest.mark.asyncio
+    async def test_soft_archive_releases_exact_archive_context_and_retains_session_and_fence(
+        self,
+        engine,
+        session_operation_contexts,
+    ) -> None:
+        service, authority = _service_with_recording_authority(engine)
+        session = await service.create_session("alice", "Soft Archive", "local")
+        state = await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
+
+        await service.archive_session(session.id)
+
+        archive_acquire_calls = [call for call in authority.acquire_calls if call["operation_kind"] is SessionOperationKind.ARCHIVE]
+        assert len(archive_acquire_calls) == 1
+        assert authority.archive_delete_calls == []
+        archive_release_calls = [context for context in authority.release_calls if context.operation_kind is SessionOperationKind.ARCHIVE]
+        assert len(archive_release_calls) == 1
+        released_context = archive_release_calls[0]
+        assert released_context.operation_kind is SessionOperationKind.ARCHIVE
+        assert released_context.fence.session_id == str(session.id)
+        with engine.connect() as conn:
+            retained = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session.id))).one()
+            fence = conn.execute(
+                select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session.id))
+            ).one()
+        assert retained.archived_at is not None
+        assert fence.released_at is not None
+
+    @pytest.mark.asyncio
+    async def test_active_guided_archive_guard_releases_current_archive_context(self, engine) -> None:
+        service, authority = _service_with_recording_authority(engine)
+        session = await service.create_session("alice", "Active Guided", "local")
+        compose_context = authority._delegate.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id="test-guided-owner",
+            lease_seconds=300,
+        )
+        await service.reserve_guided_operation(
+            session_id=session.id,
+            operation_id=str(uuid.uuid4()),
+            kind="guided_start",
+            request_hash="a" * 64,
+            actor="composer_route",
+            lease_seconds=300,
+            session_operation_context=compose_context,
+        )
+        authority._delegate.release(compose_context)
+
+        with pytest.raises(SessionGuidedOperationInProgressError):
+            await service.archive_session(session.id)
+
+        assert len(authority.acquire_calls) == 1
+        assert authority.acquire_calls[0]["operation_kind"] is SessionOperationKind.ARCHIVE
+        assert authority.archive_delete_calls == []
+        assert len([context for context in authority.release_calls if context.operation_kind is SessionOperationKind.ARCHIVE]) == 1
+        assert authority.release_calls[0].operation_kind is SessionOperationKind.ARCHIVE
+        assert authority.release_calls[0].fence.session_id == str(session.id)
+        with engine.connect() as conn:
+            fence = conn.execute(
+                select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session.id))
+            ).one()
+        assert fence.released_at is not None
+
+    @pytest.mark.asyncio
     async def test_archive_session_hides_session_with_durable_completion_history(self, engine, service) -> None:
         session = await service.create_session("alice", "To Archive", "local")
         await service.add_message(session.id, "user", "hello", writer_principal="route_user_message")
@@ -177,6 +476,606 @@ class TestSessionCRUD:
                 select(composer_completion_events_table).where(composer_completion_events_table.c.session_id == str(session.id))
             ).all()
         assert len(remaining_completion_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_soft_archive_with_data_dir_preserves_blob_bytes_and_creates_no_quarantine(
+        self,
+        engine,
+        tmp_path,
+        session_operation_contexts,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        session = await service.create_session("alice", "Soft archive with blobs", "local")
+        state = await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        blob = blob_dir / "keep.csv"
+        blob.write_bytes(b"value\n")
+
+        await service.archive_session(session.id)
+
+        assert blob.read_bytes() == b"value\n"
+        assert not (data_dir / ".archive_quarantine").exists()
+        assert authority.archive_delete_calls == []
+        assert len([context for context in authority.release_calls if context.operation_kind is SessionOperationKind.ARCHIVE]) == 1
+
+    @pytest.mark.asyncio
+    async def test_physical_archive_uses_manifest_and_exact_authority_checkpoints(
+        self,
+        engine,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        session = await service.create_session("alice", "Durable archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        (blob_dir / "payload.csv").write_bytes(b"row\n")
+
+        def record_prepare(*args: Any, **kwargs: Any):
+            authority.events.append("prepare")
+            return prepare_archive_quarantine(*args, **kwargs)
+
+        def record_stage(*args: Any, **kwargs: Any) -> None:
+            identity = args[1]
+            assert archive_quarantine_paths(data_dir, identity).manifest.is_file()
+            authority.events.append("stage")
+            stage_archive_quarantine(*args, **kwargs)
+
+        def record_purge(*args: Any, **kwargs: Any) -> None:
+            authority.events.append("purge")
+            purge_archive_quarantine(*args, **kwargs)
+
+        def record_retire(*args: Any, **kwargs: Any) -> None:
+            authority.events.append("retire")
+            retire_archive_quarantine(*args, **kwargs)
+
+        monkeypatch.setattr(service_module, "prepare_archive_quarantine", record_prepare, raising=False)
+        monkeypatch.setattr(service_module, "stage_archive_quarantine", record_stage, raising=False)
+        monkeypatch.setattr(service_module, "purge_archive_quarantine", record_purge, raising=False)
+        monkeypatch.setattr(service_module, "retire_archive_quarantine", record_retire, raising=False)
+
+        await service.archive_session(session.id)
+
+        assert authority.events == [
+            "mutate",
+            "compare_and_swap",
+            "prepare",
+            "compare_and_swap",
+            "compare_and_swap",
+            "stage",
+            "compare_and_swap",
+            "compare_and_swap",
+            "archive_delete",
+            "purge",
+            "retire",
+        ]
+        assert not blob_dir.exists()
+        assert list_archive_quarantine_manifests(data_dir, session.id) == ()
+        assert authority.release_calls == []
+
+    @pytest.mark.asyncio
+    async def test_physical_archive_prepare_failure_does_not_delete_or_touch_canonical(
+        self,
+        engine,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        session = await service.create_session("alice", "Prepare failure", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        blob = blob_dir / "payload.csv"
+        blob.write_bytes(b"row\n")
+
+        def fail_prepare(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("injected prepare failure")
+
+        monkeypatch.setattr(service_module, "prepare_archive_quarantine", fail_prepare, raising=False)
+
+        with pytest.raises(OSError, match="injected prepare failure"):
+            await service.archive_session(session.id)
+
+        assert blob.read_bytes() == b"row\n"
+        assert authority.archive_delete_calls == []
+        assert len(authority.release_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_physical_archive_current_reconciliation_restores_and_retires_before_release(
+        self,
+        engine,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        authority.archive_delete_error = RuntimeError("injected database failure")
+        session = await service.create_session("alice", "Rollback archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        blob = blob_dir / "payload.csv"
+        blob.write_bytes(b"row\n")
+
+        def record_restore(*args: Any, **kwargs: Any) -> None:
+            authority.events.append("restore")
+            restore_archive_quarantine(*args, **kwargs)
+
+        def record_retire(*args: Any, **kwargs: Any) -> None:
+            authority.events.append("retire")
+            retire_archive_quarantine(*args, **kwargs)
+
+        monkeypatch.setattr(service_module, "restore_archive_quarantine", record_restore, raising=False)
+        monkeypatch.setattr(service_module, "retire_archive_quarantine", record_retire, raising=False)
+
+        with pytest.raises(RuntimeError, match="injected database failure"):
+            await service.archive_session(session.id)
+
+        assert blob.read_bytes() == b"row\n"
+        assert list_archive_quarantine_manifests(data_dir, session.id) == ()
+        assert authority.events[-6:] == [
+            "reconcile_archive_delete",
+            "compare_and_swap",
+            "restore",
+            "compare_and_swap",
+            "retire",
+            "release",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unknown_archive_outcome_preserves_exact_quarantine_obligation(
+        self,
+        engine,
+        tmp_path,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        authority.archive_delete_error = RuntimeError("secret primary detail")
+        authority.reconcile_archive_delete_error = OSError("secret reconciliation detail")
+        session = await service.create_session("alice", "Unknown archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        (blob_dir / "payload.csv").write_bytes(b"row\n")
+
+        with pytest.raises(SessionOperationTerminalOutcomeUnknown) as exc_info:
+            await service.archive_session(session.id)
+
+        assert "secret" not in str(exc_info.value)
+        manifests = list_archive_quarantine_manifests(data_dir, session.id)
+        assert len(manifests) == 1
+        paths = archive_quarantine_paths(data_dir, manifests[0].identity)
+        assert paths.payload.is_dir()
+        assert (paths.payload / "payload.csv").read_bytes() == b"row\n"
+        assert not blob_dir.exists()
+        assert authority.release_calls == []
+
+    @pytest.mark.asyncio
+    async def test_physical_archive_adopts_single_stale_payload_before_new_archive(
+        self,
+        engine,
+        tmp_path,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        session = await service.create_session("alice", "Adopt archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        (blob_dir / "payload.csv").write_bytes(b"row\n")
+        stale_identity = ArchiveQuarantineIdentity(
+            session_id=session.id,
+            operation_id=uuid.uuid4(),
+            operation_epoch=1,
+        )
+        prepare_archive_quarantine(data_dir, stale_identity, source_present=True)
+        stage_archive_quarantine(data_dir, stale_identity, blob_dir)
+
+        await service.archive_session(session.id)
+
+        assert len(authority.classify_archive_manifest_calls) == 1
+        assert authority.classify_archive_manifest_calls[0][1:] == (
+            stale_identity.operation_id,
+            stale_identity.operation_epoch,
+        )
+        assert list_archive_quarantine_manifests(data_dir, session.id) == ()
+        assert not blob_dir.exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("residue", ["prepared-source", "absent-source"])
+    async def test_physical_archive_retires_safe_stale_manifest_without_payload(
+        self,
+        engine,
+        tmp_path,
+        residue: str,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        session = await service.create_session("alice", "Retire stale archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        source_present = residue == "prepared-source"
+        if source_present:
+            blob_dir.mkdir(parents=True)
+            (blob_dir / "payload.csv").write_bytes(b"row\n")
+        stale_identity = ArchiveQuarantineIdentity(
+            session_id=session.id,
+            operation_id=uuid.uuid4(),
+            operation_epoch=1,
+        )
+        prepare_archive_quarantine(
+            data_dir,
+            stale_identity,
+            source_present=source_present,
+        )
+
+        await service.archive_session(session.id)
+
+        assert len(authority.classify_archive_manifest_calls) == 1
+        assert list_archive_quarantine_manifests(data_dir, session.id) == ()
+        assert not blob_dir.exists()
+        assert len(authority.archive_delete_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_physical_archive_fails_closed_on_stale_payload_and_canonical_collision(
+        self,
+        engine,
+        tmp_path,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        session = await service.create_session("alice", "Collision archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        (blob_dir / "canonical.csv").write_bytes(b"canonical\n")
+        stale_identity = ArchiveQuarantineIdentity(
+            session_id=session.id,
+            operation_id=uuid.uuid4(),
+            operation_epoch=1,
+        )
+        prepare_archive_quarantine(data_dir, stale_identity, source_present=True)
+        stale_paths = archive_quarantine_paths(data_dir, stale_identity)
+        stale_paths.payload.mkdir()
+        (stale_paths.payload / "stale.csv").write_bytes(b"stale\n")
+
+        with pytest.raises(ArchiveQuarantineCollisionError):
+            await service.archive_session(session.id)
+
+        assert (blob_dir / "canonical.csv").read_bytes() == b"canonical\n"
+        assert (stale_paths.payload / "stale.csv").read_bytes() == b"stale\n"
+        assert authority.archive_delete_calls == []
+        assert len(authority.release_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_physical_archive_cancellation_joins_stage_then_restores_before_release(
+        self,
+        engine,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        session = await service.create_session("alice", "Cancelled archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        blob = blob_dir / "payload.csv"
+        blob.write_bytes(b"row\n")
+        stage_started = threading.Event()
+        stage_allowed = threading.Event()
+        stage_finished = threading.Event()
+
+        def blocked_stage(*args: Any, **kwargs: Any) -> None:
+            stage_archive_quarantine(*args, **kwargs)
+            stage_started.set()
+            try:
+                assert stage_allowed.wait(timeout=5)
+            finally:
+                stage_finished.set()
+
+        monkeypatch.setattr(service_module, "stage_archive_quarantine", blocked_stage)
+
+        archive_task = asyncio.create_task(service.archive_session(session.id))
+        assert await asyncio.to_thread(stage_started.wait, 5)
+        archive_task.cancel("client disconnected")
+        stage_allowed.set()
+
+        with pytest.raises(asyncio.CancelledError, match="client disconnected"):
+            await archive_task
+
+        assert stage_finished.is_set()
+        assert blob.read_bytes() == b"row\n"
+        assert list_archive_quarantine_manifests(data_dir, session.id) == ()
+        assert authority.archive_delete_calls == []
+        assert len(authority.release_calls) == 1
+        assert authority.events[-1] == "release"
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_joins_stage_before_restore_and_preserves_first_cancel(
+        self,
+        engine,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        session = await service.create_session("alice", "Repeatedly cancelled archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        blob = blob_dir / "payload.csv"
+        blob.write_bytes(b"row\n")
+        stage_started = threading.Event()
+        stage_allowed = threading.Event()
+        stage_finished = threading.Event()
+        restore_started = threading.Event()
+        restore_after_stage: list[bool] = []
+
+        def blocked_stage(*args: Any, **kwargs: Any) -> None:
+            stage_archive_quarantine(*args, **kwargs)
+            stage_started.set()
+            try:
+                assert stage_allowed.wait(timeout=5)
+            finally:
+                stage_finished.set()
+
+        def record_restore(*args: Any, **kwargs: Any) -> None:
+            restore_after_stage.append(stage_finished.is_set())
+            restore_started.set()
+            restore_archive_quarantine(*args, **kwargs)
+
+        monkeypatch.setattr(service_module, "stage_archive_quarantine", blocked_stage)
+        monkeypatch.setattr(service_module, "restore_archive_quarantine", record_restore)
+
+        archive_task = asyncio.create_task(service.archive_session(session.id))
+        assert await asyncio.to_thread(stage_started.wait, 5)
+        assert archive_task.cancel("first exact cancellation")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert archive_task.cancel("second cancellation")
+        restore_overlapped_stage = await asyncio.to_thread(restore_started.wait, 0.25)
+        stage_allowed.set()
+
+        with pytest.raises(asyncio.CancelledError, match="first exact cancellation"):
+            await archive_task
+
+        assert not restore_overlapped_stage
+        assert stage_finished.is_set()
+        assert restore_after_stage == [True]
+        assert not any(task.get_name().startswith("session-archive-quarantine-stage") and not task.done() for task in asyncio.all_tasks())
+        assert blob.read_bytes() == b"row\n"
+        assert list_archive_quarantine_manifests(data_dir, session.id) == ()
+        assert authority.archive_delete_calls == []
+        assert len(authority.release_calls) == 1
+        assert authority.events[-1] == "release"
+
+    @pytest.mark.asyncio
+    async def test_renewal_loss_joins_stage_worker_and_surfaces_exact_lease_error(
+        self,
+        engine,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(
+            engine,
+            data_dir=data_dir,
+            lease_seconds=1,
+        )
+        renewal_error = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+        authority.renew_error = renewal_error
+        authority.acquire_lease_seconds_override = 30
+        session = await service.create_session("alice", "Renewal-lost archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        (blob_dir / "payload.csv").write_bytes(b"row\n")
+        stage_started = threading.Event()
+        stage_allowed = threading.Event()
+        stage_finished = threading.Event()
+        archive_returned = threading.Event()
+        cancelling_at_return: list[int] = []
+        stage_finished_at_return: list[bool] = []
+
+        def blocked_stage(*args: Any, **kwargs: Any) -> None:
+            stage_archive_quarantine(*args, **kwargs)
+            stage_started.set()
+            try:
+                assert stage_allowed.wait(timeout=5)
+            finally:
+                stage_finished.set()
+
+        authority.renew_wait_for = stage_started
+        monkeypatch.setattr(service_module, "stage_archive_quarantine", blocked_stage)
+
+        archive_task = asyncio.create_task(service.archive_session(session.id))
+
+        def record_return(task: asyncio.Task[None]) -> None:
+            cancelling_at_return.append(task.cancelling())
+            stage_finished_at_return.append(stage_finished.is_set())
+            archive_returned.set()
+
+        archive_task.add_done_callback(record_return)
+        assert await asyncio.to_thread(stage_started.wait, 5)
+        assert await asyncio.to_thread(authority.renew_started.wait, 5)
+        returned_before_stage_release = await asyncio.to_thread(archive_returned.wait, 0.25)
+        stage_allowed.set()
+        try:
+            await archive_task
+        except BaseException as error:
+            observed_error = error
+        else:
+            pytest.fail("archive unexpectedly succeeded after renewal loss")
+
+        assert not returned_before_stage_release
+        assert stage_finished.is_set()
+        assert stage_finished_at_return == [True]
+        assert cancelling_at_return == [0]
+        assert observed_error is renewal_error
+        assert type(observed_error) is SessionOperationFenceLost
+        assert observed_error.reason is FenceLossReason.LEASE_EXPIRED
+        assert not isinstance(observed_error, asyncio.CancelledError)
+        assert not any(task.get_name().startswith("session-archive-quarantine-stage") and not task.done() for task in asyncio.all_tasks())
+        assert not blob_dir.exists()
+        manifests = list_archive_quarantine_manifests(data_dir, session.id)
+        assert len(manifests) == 1
+        obligation = archive_quarantine_paths(data_dir, manifests[0].identity)
+        assert (obligation.payload / "payload.csv").read_bytes() == b"row\n"
+        assert authority.archive_delete_calls == []
+
+    @pytest.mark.asyncio
+    async def test_renewal_loss_joins_decision_worker_and_surfaces_exact_lease_error(
+        self,
+        engine,
+        tmp_path,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(
+            engine,
+            data_dir=data_dir,
+            lease_seconds=1,
+        )
+        renewal_error = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+        authority.renew_error = renewal_error
+        authority.acquire_lease_seconds_override = 30
+        authority.renew_wait_for = authority.mutate_started
+        authority.mutate_blocked = True
+        authority.mutate_allowed.clear()
+        session = await service.create_session("alice", "Renewal-lost decision", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        blob = blob_dir / "payload.csv"
+        blob.write_bytes(b"row\n")
+        archive_returned = threading.Event()
+        cancelling_at_return: list[int] = []
+        worker_finished_at_return: list[bool] = []
+
+        archive_task = asyncio.create_task(service.archive_session(session.id))
+
+        def record_return(task: asyncio.Task[None]) -> None:
+            cancelling_at_return.append(task.cancelling())
+            worker_finished_at_return.append(authority.mutate_finished.is_set())
+            archive_returned.set()
+
+        archive_task.add_done_callback(record_return)
+        assert await asyncio.to_thread(authority.mutate_started.wait, 5)
+        assert await asyncio.to_thread(authority.renew_started.wait, 5)
+        returned_before_worker_release = await asyncio.to_thread(archive_returned.wait, 0.25)
+        authority.mutate_allowed.set()
+        try:
+            await archive_task
+        except BaseException as error:
+            observed_error = error
+        else:
+            pytest.fail("archive unexpectedly succeeded after decision renewal loss")
+
+        assert not returned_before_worker_release
+        assert authority.mutate_finished.is_set()
+        assert worker_finished_at_return == [True]
+        assert cancelling_at_return == [0]
+        assert observed_error is renewal_error
+        assert type(observed_error) is SessionOperationFenceLost
+        assert observed_error.reason is FenceLossReason.LEASE_EXPIRED
+        assert not isinstance(observed_error, asyncio.CancelledError)
+        assert not any(task.get_name().startswith("session-archive-decision") and not task.done() for task in asyncio.all_tasks())
+        assert blob.read_bytes() == b"row\n"
+        assert not (data_dir / ".archive_quarantine").exists()
+        assert authority.archive_delete_calls == []
+
+    @pytest.mark.asyncio
+    async def test_lease_loss_before_owned_phase_start_surfaces_exact_error_without_coroutine_leak(
+        self,
+        engine,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        session = await service.create_session("alice", "Pre-start lease loss", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        blob = blob_dir / "payload.csv"
+        blob.write_bytes(b"row\n")
+        renewal_error = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+        original_create_task = service_module.SessionOperationLease.create_task
+
+        def cancel_reconcile_before_start(
+            lease: Any,
+            coroutine: Any,
+            *,
+            name: str | None = None,
+        ) -> asyncio.Task[Any]:
+            task = original_create_task(lease, coroutine, name=name)
+            if name == "session-archive-quarantine-reconcile-prior":
+                lease._record_renewal_error(renewal_error)
+            return task
+
+        monkeypatch.setattr(service_module.SessionOperationLease, "create_task", cancel_reconcile_before_start)
+
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            warnings.simplefilter("always", RuntimeWarning)
+            try:
+                await service.archive_session(session.id)
+            except BaseException as error:
+                observed_error = error
+            else:
+                pytest.fail("archive unexpectedly succeeded after pre-start lease loss")
+            await asyncio.sleep(0)
+            gc.collect()
+
+        assert observed_error is renewal_error
+        assert type(observed_error) is SessionOperationFenceLost
+        assert observed_error.reason is FenceLossReason.LEASE_EXPIRED
+        assert not isinstance(observed_error, asyncio.CancelledError)
+        assert not any("was never awaited" in str(warning.message) for warning in captured_warnings)
+        assert not any(
+            task.get_name().startswith("session-archive-quarantine-reconcile-prior") and not task.done() for task in asyncio.all_tasks()
+        )
+        assert blob.read_bytes() == b"row\n"
+        assert not (data_dir / ".archive_quarantine").exists()
+        assert authority.archive_delete_calls == []
+
+    @pytest.mark.asyncio
+    async def test_post_stage_fence_loss_preserves_payload_obligation_without_cleanup(
+        self,
+        engine,
+        tmp_path,
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        service, authority = _service_with_recording_authority(engine, data_dir=data_dir)
+        authority.compare_and_swap_errors[4] = SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
+        session = await service.create_session("alice", "Lost archive", "local")
+        blob_dir = data_dir / "blobs" / str(session.id)
+        blob_dir.mkdir(parents=True)
+        (blob_dir / "payload.csv").write_bytes(b"row\n")
+
+        with pytest.raises(SessionOperationFenceLost) as exc_info:
+            await service.archive_session(session.id)
+
+        assert exc_info.value.reason is FenceLossReason.STALE_EPOCH
+        assert authority.archive_delete_calls == []
+        manifests = list_archive_quarantine_manifests(data_dir, session.id)
+        assert len(manifests) == 1
+        obligation = archive_quarantine_paths(data_dir, manifests[0].identity)
+        assert not blob_dir.exists()
+        assert (obligation.payload / "payload.csv").read_bytes() == b"row\n"
 
     @pytest.mark.asyncio
     async def test_archive_session_deletes_blob_directory(self, engine, tmp_path) -> None:
@@ -216,22 +1115,11 @@ class TestSessionCRUD:
         tmp_path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Post-commit blob purge failure must stay visible to the operator.
-
-        The session delete has already committed by the time the filesystem purge
-        runs. If purge fails, the staged directory remains a recoverable
-        quarantine path and a named audit exception states that the session
-        delete committed before cleanup failed.
-        """
+        """Post-commit purge failure preserves one sanitized obligation."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        service_with_dir = SessionServiceImpl(
-            engine,
-            data_dir=data_dir,
-            telemetry=build_sessions_telemetry(),
-            log=structlog.get_logger("test"),
-        )
+        service_with_dir, authority = _service_with_recording_authority(engine, data_dir=data_dir)
 
         session = await service_with_dir.create_session("alice", "Blob Session", "local")
         sid = str(session.id)
@@ -240,43 +1128,131 @@ class TestSessionCRUD:
         blob_file = blob_dir / "some-blob_data.csv"
         blob_file.write_text("col1\nval1")
 
-        quarantine_dir = data_dir / ".archive_quarantine" / sid
-
-        def fail_rmtree(_path: object) -> None:
+        def fail_purge(*_args: Any, **_kwargs: Any) -> None:
             raise OSError("permission denied removing staged blob directory")
 
-        monkeypatch.setattr("elspeth.web.sessions.service.shutil.rmtree", fail_rmtree)
+        monkeypatch.setattr(service_module, "purge_archive_quarantine", fail_purge, raising=False)
 
-        with pytest.raises(QuarantineCleanupError, match=r"delete committed.*quarantine cleanup failed") as exc_info:
+        with pytest.raises(QuarantineCleanupError) as exc_info:
             await service_with_dir.archive_session(session.id)
-        assert isinstance(exc_info.value.__cause__, OSError)
-        assert "permission denied removing staged blob directory" in str(exc_info.value.__cause__)
+        rendered = "\n".join(
+            [
+                str(exc_info.value),
+                *(exc_info.value.__notes__ if hasattr(exc_info.value, "__notes__") else []),
+                "".join(traceback.format_exception(exc_info.value)),
+            ]
+        )
+        assert "permission denied" not in rendered
+        assert str(data_dir) not in rendered
+        assert exc_info.value.__cause__ is None
 
         with pytest.raises(ValueError):
             await service_with_dir.get_session(session.id)
 
         assert not blob_dir.exists()
-        assert quarantine_dir.is_dir()
-        assert (quarantine_dir / blob_file.name).read_text() == "col1\nval1"
+        manifests = list_archive_quarantine_manifests(data_dir, session.id)
+        assert len(manifests) == 1
+        obligation = archive_quarantine_paths(data_dir, manifests[0].identity)
+        assert obligation.payload.is_dir()
+        assert (obligation.payload / blob_file.name).read_text() == "col1\nval1"
+        assert authority.release_calls == []
 
 
 class TestRunEvents:
     @pytest.mark.asyncio
-    async def test_append_and_list_run_events_preserves_order_and_payload(self, service, engine) -> None:
-        session_id = uuid.uuid4()
+    @pytest.mark.parametrize("invalid_run_id_kind", ("canonical_string", "bool", "object"))
+    async def test_append_run_event_rejects_non_exact_uuid_before_database_work(
+        self,
+        service,
+        engine,
+        session_operation_contexts,
+        invalid_run_id_kind: str,
+    ) -> None:
+        session = await service.create_session("alice", "Invalid event run id", "local")
+        state = await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(
+            session.id,
+            state.id,
+            session_operation_context=execute_context,
+        )
+        invalid_run_id: object = {
+            "canonical_string": str(run.id),
+            "bool": True,
+            "object": object(),
+        }[invalid_run_id_kind]
+        statements: list[str] = []
+
+        def capture_statement(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", capture_statement)
+        try:
+            with pytest.raises(TypeError, match="run_id must be an exact UUID"):
+                await service.append_run_event(
+                    run_id=invalid_run_id,  # type: ignore[arg-type]
+                    timestamp=datetime.now(UTC),
+                    event_type="progress",
+                    data={},
+                    session_operation_context=execute_context,
+                )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_statement)
+
+        assert statements == []
+        with engine.connect() as conn:
+            event_count = conn.execute(select(func.count()).select_from(run_events_table)).scalar_one()
+        assert event_count == 0
+
+    @pytest.mark.asyncio
+    async def test_append_run_event_rejects_naive_timestamp_before_write(
+        self,
+        service,
+        engine,
+        session_operation_contexts,
+    ) -> None:
+        session = await service.create_session("alice", "Naive event", "local")
+        state = await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(
+            session.id,
+            state.id,
+            session_operation_context=execute_context,
+        )
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await service.append_run_event(
+                run_id=run.id,
+                timestamp=datetime.now(UTC).replace(tzinfo=None),
+                event_type="progress",
+                data={},
+                session_operation_context=execute_context,
+            )
+
+        with engine.connect() as conn:
+            assert conn.execute(select(run_events_table.c.id).where(run_events_table.c.run_id == str(run.id))).first() is None
+
+    @pytest.mark.asyncio
+    async def test_append_and_list_run_events_preserves_order_and_payload(
+        self,
+        service,
+        engine,
+        session_operation_contexts,
+    ) -> None:
+        session = await service.create_session("alice", "Run events", "local")
+        session_id = session.id
         state_id = uuid.uuid4()
         run_id = uuid.uuid4()
         created_at = datetime.now(UTC)
         with engine.begin() as conn:
-            conn.execute(
-                insert(sessions_table).values(
-                    id=str(session_id),
-                    user_id="alice",
-                    title="Run events",
-                    created_at=created_at,
-                    updated_at=created_at,
-                )
-            )
             conn.execute(
                 insert(composition_states_table).values(
                     id=str(state_id),
@@ -299,23 +1275,27 @@ class TestRunEvents:
                 )
             )
 
+        execute_context = session_operation_contexts.acquire(service, session_id)
         await service.append_run_event(
             run_id=run_id,
             timestamp=created_at,
             event_type="progress",
             data={"source_rows_processed": 1},
+            session_operation_context=execute_context,
         )
         await service.append_run_event(
             run_id=run_id,
             timestamp=created_at,
             event_type="error",
             data={"message": "bad row", "node_id": None, "row_id": None},
+            session_operation_context=execute_context,
         )
         await service.append_run_event(
             run_id=run_id,
             timestamp=created_at,
             event_type="failed",
             data={"status": "failed", "detail": "boom", "node_id": None},
+            session_operation_context=execute_context,
         )
 
         records = await service.list_run_events(run_id)
@@ -567,20 +1547,22 @@ class TestOneActiveRunEnforcement:
     """Tests for B6 -- one active run per session."""
 
     @pytest.mark.asyncio
-    async def test_second_pending_run_raises(self, service) -> None:
+    async def test_second_pending_run_raises(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        execute_context = session_operation_contexts.acquire(service, session.id)
         # First run should succeed
-        await service.create_run(session.id, state.id)
+        await service.create_run(session.id, state.id, session_operation_context=execute_context)
         # Second run should fail
         with pytest.raises(RunAlreadyActiveError):
-            await service.create_run(session.id, state.id)
+            await service.create_run(session.id, state.id, session_operation_context=execute_context)
 
     @pytest.mark.asyncio
-    async def test_create_run_returns_run_record(self, service) -> None:
+    async def test_create_run_returns_run_record(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         assert isinstance(run, RunRecord)
         assert run.status == "pending"
         assert run.session_id == session.id
@@ -588,47 +1570,57 @@ class TestOneActiveRunEnforcement:
         assert run.pipeline_yaml is None
 
     @pytest.mark.asyncio
-    async def test_create_run_with_pipeline_yaml(self, service) -> None:
+    async def test_create_run_with_pipeline_yaml(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        execute_context = session_operation_contexts.acquire(service, session.id)
         run = await service.create_run(
             session.id,
             state.id,
             pipeline_yaml="source:\n  type: csv",
+            session_operation_context=execute_context,
         )
         assert run.pipeline_yaml == "source:\n  type: csv"
 
     @pytest.mark.asyncio
-    async def test_completed_run_allows_new_run(self, service) -> None:
+    async def test_completed_run_allows_new_run(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         # Transition through legal path: pending -> running -> completed
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-complete-1")
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        await service.update_run_status(
+            run.id,
+            "completed",
+            landscape_run_id="lscp-complete-1",
+            session_operation_context=execute_context,
+        )
         # New run should succeed
-        run2 = await service.create_run(session.id, state.id)
+        run2 = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         assert run2.status == "pending"
 
     @pytest.mark.asyncio
-    async def test_failed_run_allows_new_run(self, service) -> None:
+    async def test_failed_run_allows_new_run(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         # Transition through legal path: pending -> running -> failed
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "failed", error="boom")
-        run2 = await service.create_run(session.id, state.id)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        await service.update_run_status(run.id, "failed", error="boom", session_operation_context=execute_context)
+        run2 = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         assert run2.status == "pending"
 
     @pytest.mark.asyncio
-    async def test_running_run_blocks_new_run(self, service) -> None:
+    async def test_running_run_blocks_new_run(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         with pytest.raises(RunAlreadyActiveError):
-            await service.create_run(session.id, state.id)
+            await service.create_run(session.id, state.id, session_operation_context=execute_context)
 
 
 class TestGetState:
@@ -778,10 +1770,11 @@ class TestGetRun:
     """Tests for get_run -- fetch a RunRecord by UUID."""
 
     @pytest.mark.asyncio
-    async def test_get_run_returns_record(self, service) -> None:
+    async def test_get_run_returns_record(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        created = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        created = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         fetched = await service.get_run(created.id)
         assert isinstance(fetched, RunRecord)
         assert fetched.id == created.id
@@ -797,10 +1790,11 @@ class TestGetActiveRun:
     """Tests for get_active_run -- pending/running run for a session."""
 
     @pytest.mark.asyncio
-    async def test_returns_active_run(self, service) -> None:
+    async def test_returns_active_run(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         active = await service.get_active_run(session.id)
         assert active is not None
         assert active.id == run.id
@@ -812,12 +1806,18 @@ class TestGetActiveRun:
         assert active is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_after_completion(self, service) -> None:
+    async def test_returns_none_after_completion(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-active-none")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        await service.update_run_status(
+            run.id,
+            "completed",
+            landscape_run_id="lscp-active-none",
+            session_operation_context=execute_context,
+        )
         active = await service.get_active_run(session.id)
         assert active is None
 
@@ -826,15 +1826,17 @@ class TestUpdateRunStatusExpanded:
     """Tests for expanded update_run_status signature (R6)."""
 
     @pytest.mark.asyncio
-    async def test_update_with_error(self, service) -> None:
+    async def test_update_with_error(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         await service.update_run_status(
             run.id,
             "failed",
             error="Source file not found",
+            session_operation_context=execute_context,
         )
         fetched = await service.get_run(run.id)
         assert fetched.status == "failed"
@@ -842,11 +1844,12 @@ class TestUpdateRunStatusExpanded:
         assert fetched.finished_at is not None
 
     @pytest.mark.asyncio
-    async def test_update_with_landscape_run_id(self, service) -> None:
+    async def test_update_with_landscape_run_id(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         await service.update_run_status(
             run.id,
             "completed_with_failures",
@@ -856,6 +1859,7 @@ class TestUpdateRunStatusExpanded:
             rows_routed_success=4,
             rows_routed_failure=0,
             rows_failed=3,
+            session_operation_context=execute_context,
         )
         fetched = await service.get_run(run.id)
         assert fetched.status == "completed_with_failures"
@@ -908,11 +1912,16 @@ class TestAdr019LegacyCounterReadCompatibility:
         )
 
     @pytest.mark.asyncio
-    async def test_get_run_normalizes_legacy_gate_routed_success_counter(self, service) -> None:
+    async def test_get_run_normalizes_legacy_gate_routed_success_counter(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         await service.update_run_status(
             run.id,
             "completed",
@@ -923,6 +1932,7 @@ class TestAdr019LegacyCounterReadCompatibility:
             rows_routed_success=4,
             rows_routed_failure=0,
             rows_quarantined=0,
+            session_operation_context=execute_context,
         )
 
         fetched = await service.get_run(run.id)
@@ -933,11 +1943,16 @@ class TestAdr019LegacyCounterReadCompatibility:
         assert response.status == "completed"
 
     @pytest.mark.asyncio
-    async def test_get_run_normalizes_legacy_quarantine_failure_counter(self, service) -> None:
+    async def test_get_run_normalizes_legacy_quarantine_failure_counter(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         await service.update_run_status(
             run.id,
             "completed_with_failures",
@@ -948,6 +1963,7 @@ class TestAdr019LegacyCounterReadCompatibility:
             rows_routed_success=0,
             rows_routed_failure=0,
             rows_quarantined=2,
+            session_operation_context=execute_context,
         )
 
         fetched = await service.get_run(run.id)
@@ -958,11 +1974,16 @@ class TestAdr019LegacyCounterReadCompatibility:
         assert response.status == "completed_with_failures"
 
     @pytest.mark.asyncio
-    async def test_get_run_leaves_current_subset_counters_unchanged(self, service) -> None:
+    async def test_get_run_leaves_current_subset_counters_unchanged(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         await service.update_run_status(
             run.id,
             "completed",
@@ -973,6 +1994,7 @@ class TestAdr019LegacyCounterReadCompatibility:
             rows_routed_success=2,
             rows_routed_failure=0,
             rows_quarantined=0,
+            session_operation_context=execute_context,
         )
 
         fetched = await service.get_run(run.id)
@@ -981,37 +2003,61 @@ class TestAdr019LegacyCounterReadCompatibility:
         assert fetched.rows_routed_success == 2
 
     @pytest.mark.asyncio
-    async def test_update_not_found_raises(self, service) -> None:
+    async def test_update_not_found_raises(self, service, session_operation_contexts) -> None:
+        session = await service.create_session("alice", "Missing run", "local")
+        execute_context = session_operation_contexts.acquire(service, session.id)
         with pytest.raises(ValueError, match="not found"):
-            await service.update_run_status(uuid.uuid4(), "completed")
+            await service.update_run_status(
+                uuid.uuid4(),
+                "completed",
+                session_operation_context=execute_context,
+            )
 
     @pytest.mark.asyncio
-    async def test_completed_requires_landscape_run_id(self, service) -> None:
+    async def test_completed_requires_landscape_run_id(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         with pytest.raises(ValueError, match="landscape_run_id"):
-            await service.update_run_status(run.id, "completed")
+            await service.update_run_status(run.id, "completed", session_operation_context=execute_context)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["completed", "completed_with_failures", "empty"])
-    async def test_operator_completion_status_requires_landscape_run_id(self, service, status) -> None:
+    async def test_operator_completion_status_requires_landscape_run_id(
+        self,
+        service,
+        session_operation_contexts,
+        status,
+    ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         with pytest.raises(ValueError, match="landscape_run_id"):
-            await service.update_run_status(run.id, status)
+            await service.update_run_status(run.id, status, session_operation_context=execute_context)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["completed_with_failures", "empty"])
-    async def test_widened_operator_completion_status_stamps_finished_at(self, service, status) -> None:
+    async def test_widened_operator_completion_status_stamps_finished_at(
+        self,
+        service,
+        session_operation_contexts,
+        status,
+    ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, status, landscape_run_id=f"lscp-{status}")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        await service.update_run_status(
+            run.id,
+            status,
+            landscape_run_id=f"lscp-{status}",
+            session_operation_context=execute_context,
+        )
 
         fetched = await service.get_run(run.id)
         assert fetched.status == status
@@ -1019,33 +2065,36 @@ class TestAdr019LegacyCounterReadCompatibility:
         assert fetched.landscape_run_id == f"lscp-{status}"
 
     @pytest.mark.asyncio
-    async def test_failed_requires_error(self, service) -> None:
+    async def test_failed_requires_error(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         with pytest.raises(ValueError, match="requires error"):
-            await service.update_run_status(run.id, "failed")
+            await service.update_run_status(run.id, "failed", session_operation_context=execute_context)
 
 
 class TestRunTransitionEnforcement:
     """Tests for D3 -- LEGAL_RUN_TRANSITIONS enforcement."""
 
     @pytest.mark.asyncio
-    async def test_legal_transition_pending_to_running(self, service) -> None:
+    async def test_legal_transition_pending_to_running(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
         fetched = await service.get_run(run.id)
         assert fetched.status == "running"
 
     @pytest.mark.asyncio
-    async def test_legal_transition_pending_to_cancelled(self, service) -> None:
+    async def test_legal_transition_pending_to_cancelled(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "cancelled")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "cancelled", session_operation_context=execute_context)
         fetched = await service.get_run(run.id)
         assert fetched.status == "cancelled"
         assert fetched.finished_at is not None
@@ -1054,75 +2103,97 @@ class TestRunTransitionEnforcement:
     async def test_illegal_transition_pending_to_completed_raises(
         self,
         service,
+        session_operation_contexts,
     ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         with pytest.raises(ValueError, match=r"Illegal.*transition"):
-            await service.update_run_status(run.id, "completed", landscape_run_id="lscp-illegal")
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id="lscp-illegal",
+                session_operation_context=execute_context,
+            )
 
     @pytest.mark.asyncio
     async def test_illegal_transition_completed_to_running_raises(
         self,
         service,
+        session_operation_contexts,
     ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-finished")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        await service.update_run_status(
+            run.id,
+            "completed",
+            landscape_run_id="lscp-finished",
+            session_operation_context=execute_context,
+        )
         with pytest.raises(ValueError, match=r"Illegal.*transition"):
-            await service.update_run_status(run.id, "running")
+            await service.update_run_status(run.id, "running", session_operation_context=execute_context)
 
 
 class TestLandscapeRunIdWriteOnce:
     """Tests for D4 -- landscape_run_id is write-once."""
 
     @pytest.mark.asyncio
-    async def test_set_landscape_run_id(self, service) -> None:
+    async def test_set_landscape_run_id(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         await service.update_run_status(
             run.id,
             "running",
             landscape_run_id="lscp-001",
+            session_operation_context=execute_context,
         )
         fetched = await service.get_run(run.id)
         assert fetched.landscape_run_id == "lscp-001"
 
     @pytest.mark.asyncio
-    async def test_overwrite_landscape_run_id_raises(self, service) -> None:
+    async def test_overwrite_landscape_run_id_raises(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         await service.update_run_status(
             run.id,
             "running",
             landscape_run_id="lscp-001",
+            session_operation_context=execute_context,
         )
         with pytest.raises(ValueError, match=r"landscape_run_id.*already set"):
             await service.update_run_status(
                 run.id,
                 "completed",
                 landscape_run_id="lscp-002",
+                session_operation_context=execute_context,
             )
 
     @pytest.mark.asyncio
     async def test_none_landscape_run_id_does_not_overwrite(
         self,
         service,
+        session_operation_contexts,
     ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         await service.update_run_status(
             run.id,
             "running",
             landscape_run_id="lscp-001",
+            session_operation_context=execute_context,
         )
         # Passing None (default) should not trigger the write-once guard
-        await service.update_run_status(run.id, "completed")
+        await service.update_run_status(run.id, "completed", session_operation_context=execute_context)
         fetched = await service.get_run(run.id)
         assert fetched.landscape_run_id == "lscp-001"
 
@@ -1131,11 +2202,13 @@ class TestCancelOrphanedRuns:
     """Tests for D5 -- cancel_orphaned_runs."""
 
     @pytest.mark.asyncio
-    async def test_cancels_stale_running_run(self, service) -> None:
+    async def test_cancels_stale_running_run(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
         # Cancel with max_age_seconds=0 so ANY running run is considered stale
         cancelled = await service.cancel_orphaned_runs(
             session.id,
@@ -1146,11 +2219,13 @@ class TestCancelOrphanedRuns:
         assert cancelled[0].status == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_does_not_cancel_recent_running_run(self, service) -> None:
+    async def test_does_not_cancel_recent_running_run(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
         # max_age_seconds=3600 -- run was just created, so not stale
         cancelled = await service.cancel_orphaned_runs(
             session.id,
@@ -1159,12 +2234,19 @@ class TestCancelOrphanedRuns:
         assert len(cancelled) == 0
 
     @pytest.mark.asyncio
-    async def test_does_not_cancel_completed_runs(self, service) -> None:
+    async def test_does_not_cancel_completed_runs(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-orphan-1")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        await service.update_run_status(
+            run.id,
+            "completed",
+            landscape_run_id="lscp-orphan-1",
+            session_operation_context=execute_context,
+        )
+        session_operation_contexts.release(service, execute_context)
         cancelled = await service.cancel_orphaned_runs(
             session.id,
             max_age_seconds=0,
@@ -1172,35 +2254,47 @@ class TestCancelOrphanedRuns:
         assert len(cancelled) == 0
 
     @pytest.mark.asyncio
-    async def test_cancel_unblocks_session_for_new_run(self, service) -> None:
+    async def test_cancel_unblocks_session_for_new_run(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
         await service.cancel_orphaned_runs(session.id, max_age_seconds=0)
         # Session should now accept a new run
-        run2 = await service.create_run(session.id, state.id)
+        successor_context = session_operation_contexts.acquire(service, session.id)
+        run2 = await service.create_run(session.id, state.id, session_operation_context=successor_context)
         assert run2.status == "pending"
 
     @pytest.mark.asyncio
-    async def test_cancel_includes_pending_orphans(self, service) -> None:
+    async def test_cancel_includes_pending_orphans(self, service, session_operation_contexts) -> None:
         """A run stuck in 'pending' (crash before transition to running) is also cleaned."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        execute_context = session_operation_contexts.acquire(service, session.id)
         # Create run that stays in pending (simulates crash before running transition)
-        await service.create_run(session.id, state.id)
+        await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
         cancelled = await service.cancel_orphaned_runs(session.id, max_age_seconds=0)
         assert len(cancelled) == 1
         assert cancelled[0].status == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_cancel_does_not_touch_completed_runs(self, service) -> None:
+    async def test_cancel_does_not_touch_completed_runs(self, service, session_operation_contexts) -> None:
         """Completed runs are never cancelled regardless of age."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-orphan-2")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        await service.update_run_status(
+            run.id,
+            "completed",
+            landscape_run_id="lscp-orphan-2",
+            session_operation_context=execute_context,
+        )
+        session_operation_contexts.release(service, execute_context)
         cancelled = await service.cancel_orphaned_runs(session.id, max_age_seconds=0)
         assert len(cancelled) == 0
 
@@ -1209,14 +2303,16 @@ class TestCancelAllOrphanedRuns:
     """Tests for cancel_all_orphaned_runs (global startup cleanup)."""
 
     @pytest.mark.asyncio
-    async def test_cancels_all_non_terminal_runs_without_age_filter(self, service) -> None:
+    async def test_cancels_all_non_terminal_runs_without_age_filter(self, service, session_operation_contexts) -> None:
         """Default (max_age_seconds=None) cancels ALL pending/running runs,
         not just old ones. Critical for single-process server restarts."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        execute_context = session_operation_contexts.acquire(service, session.id)
         # Create a fresh run (just created, zero age)
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         # No age filter — should cancel even a brand-new run
         cancelled = await service.cancel_all_orphaned_runs()
@@ -1226,12 +2322,19 @@ class TestCancelAllOrphanedRuns:
         assert updated.status == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_record_returning_cleanup_preserves_landscape_run_id(self, service) -> None:
+    async def test_record_returning_cleanup_preserves_landscape_run_id(self, service, session_operation_contexts) -> None:
         """Startup reconciliation needs cancelled run records to update Landscape."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running", landscape_run_id="lscp-orphan-1")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(
+            run.id,
+            "running",
+            landscape_run_id="lscp-orphan-1",
+            session_operation_context=execute_context,
+        )
+        session_operation_contexts.release(service, execute_context)
 
         cancelled = await service.cancel_all_orphaned_run_records(
             reason="Orphaned by server restart - no active process",
@@ -1246,94 +2349,135 @@ class TestCancelAllOrphanedRuns:
         assert cancelled_run.landscape_run_id == "lscp-orphan-1"
 
     @pytest.mark.asyncio
-    async def test_cancels_pending_runs_without_age_filter(self, service) -> None:
+    async def test_cancels_pending_runs_without_age_filter(self, service, session_operation_contexts) -> None:
         """Pending runs (never transitioned to running) are also cancelled."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         cancelled = await service.cancel_all_orphaned_runs()
         assert cancelled == 1
 
     @pytest.mark.asyncio
-    async def test_does_not_cancel_terminal_runs(self, service) -> None:
+    async def test_does_not_cancel_terminal_runs(self, service, session_operation_contexts) -> None:
         """Completed/cancelled/failed runs are never touched."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-global-1")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        await service.update_run_status(
+            run.id,
+            "completed",
+            landscape_run_id="lscp-global-1",
+            session_operation_context=execute_context,
+        )
+        session_operation_contexts.release(service, execute_context)
 
         cancelled = await service.cancel_all_orphaned_runs()
         assert cancelled == 0
 
     @pytest.mark.asyncio
-    async def test_age_filter_still_works_when_provided(self, service) -> None:
+    async def test_age_filter_still_works_when_provided(self, service, session_operation_contexts) -> None:
         """When max_age_seconds is given, only old runs are cancelled."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         # Run was just created — 3600s filter should skip it
         cancelled = await service.cancel_all_orphaned_runs(max_age_seconds=3600)
         assert cancelled == 0
 
     @pytest.mark.asyncio
-    async def test_unblocks_session_after_cancellation(self, service) -> None:
+    async def test_unblocks_session_after_cancellation(self, service, session_operation_contexts) -> None:
         """After cancelling orphaned runs, session can accept new runs."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         await service.cancel_all_orphaned_runs()
 
         # Session should now be unblocked
-        run2 = await service.create_run(session.id, state.id)
+        successor_context = session_operation_contexts.acquire(service, session.id)
+        run2 = await service.create_run(session.id, state.id, session_operation_context=successor_context)
         assert run2.status == "pending"
 
 
 class TestLandscapeReconciliationMarkers:
     @staticmethod
-    async def _cancelled_run(service, *, reason: str, landscape_run_id: str | None) -> RunRecord:
+    async def _cancelled_run(
+        service,
+        session_operation_contexts,
+        *,
+        reason: str,
+        landscape_run_id: str | None,
+    ) -> RunRecord:
         session = await service.create_session(str(uuid.uuid4()), "Pipeline", "local")
         state = await service.save_composition_state(
             session.id,
             CompositionStateData(is_valid=True),
             provenance="session_seed",
         )
-        run = await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
         if landscape_run_id is not None:
-            await service.update_run_status(run.id, "running", landscape_run_id=landscape_run_id)
+            await service.update_run_status(
+                run.id,
+                "running",
+                landscape_run_id=landscape_run_id,
+                session_operation_context=execute_context,
+            )
+        session_operation_contexts.release(service, execute_context)
         cancelled = await service.cancel_all_orphaned_run_records(reason=reason)
         assert len(cancelled) == 1
         return cancelled[0]
 
     @pytest.mark.asyncio
-    async def test_exact_pending_suffix_selection_includes_null_anchor_and_excludes_other_errors(self, service) -> None:
+    async def test_exact_pending_suffix_selection_includes_null_anchor_and_excludes_other_errors(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
         pending_null = await self._cancelled_run(
             service,
+            session_operation_contexts,
             reason=f"startup reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
             landscape_run_id=None,
         )
         pending_anchor = await self._cancelled_run(
             service,
+            session_operation_contexts,
             reason=f"periodic reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
             landscape_run_id="landscape-1",
         )
-        await self._cancelled_run(service, reason="ordinary user error", landscape_run_id="landscape-2")
         await self._cancelled_run(
             service,
+            session_operation_contexts,
+            reason="ordinary user error",
+            landscape_run_id="landscape-2",
+        )
+        await self._cancelled_run(
+            service,
+            session_operation_contexts,
             reason=f"embedded {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX} trailing text",
             landscape_run_id="landscape-3",
         )
         await self._cancelled_run(
             service,
+            session_operation_contexts,
             reason=f"startup reason {LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX}",
             landscape_run_id="landscape-4",
         )
         await self._cancelled_run(
             service,
+            session_operation_contexts,
             reason=f"startup reason {LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX}",
             landscape_run_id="landscape-5",
         )
@@ -1344,14 +2488,20 @@ class TestLandscapeReconciliationMarkers:
         assert {candidate.landscape_run_id for candidate in candidates} == {None, "landscape-1"}
 
     @pytest.mark.asyncio
-    async def test_outcome_update_is_atomic_exact_and_preserves_reason(self, service) -> None:
+    async def test_outcome_update_is_atomic_exact_and_preserves_reason(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
         complete = await self._cancelled_run(
             service,
+            session_operation_contexts,
             reason=f"human readable startup reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
             landscape_run_id=None,
         )
         absent = await self._cancelled_run(
             service,
+            session_operation_contexts,
             reason=f"human readable periodic reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
             landscape_run_id="missing-landscape",
         )
@@ -1368,9 +2518,14 @@ class TestLandscapeReconciliationMarkers:
         assert await service.list_pending_landscape_reconciliations() == []
 
     @pytest.mark.asyncio
-    async def test_outcome_update_rejects_overlap_without_mutation(self, service) -> None:
+    async def test_outcome_update_rejects_overlap_without_mutation(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
         candidate = await self._cancelled_run(
             service,
+            session_operation_contexts,
             reason=f"startup reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
             landscape_run_id="landscape-1",
         )
@@ -1386,12 +2541,14 @@ class TestCancelAllOrphanedRunsExcludeRunIds:
     """Tests for exclude_run_ids — liveness-aware orphan cleanup."""
 
     @pytest.mark.asyncio
-    async def test_excludes_live_run_ids_from_cancellation(self, service) -> None:
+    async def test_excludes_live_run_ids_from_cancellation(self, service, session_operation_contexts) -> None:
         """Runs with IDs in exclude_run_ids are skipped even if they exceed max_age."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         # Exclude this run's ID — it should NOT be cancelled
         cancelled = await service.cancel_all_orphaned_runs(
@@ -1405,12 +2562,14 @@ class TestCancelAllOrphanedRunsExcludeRunIds:
         assert fetched.status == "running"
 
     @pytest.mark.asyncio
-    async def test_cancels_non_excluded_runs(self, service) -> None:
+    async def test_cancels_non_excluded_runs(self, service, session_operation_contexts) -> None:
         """Runs NOT in exclude_run_ids are still cancelled normally."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         # Exclude a different run ID — this run should be cancelled
         cancelled = await service.cancel_all_orphaned_runs(
@@ -1423,12 +2582,14 @@ class TestCancelAllOrphanedRunsExcludeRunIds:
         assert fetched.status == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_empty_exclude_set_cancels_all(self, service) -> None:
+    async def test_empty_exclude_set_cancels_all(self, service, session_operation_contexts) -> None:
         """Empty exclude_run_ids (default) does not change behaviour."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         cancelled = await service.cancel_all_orphaned_runs(
             max_age_seconds=0,
@@ -1441,12 +2602,14 @@ class TestCancelAllOrphanedRunsReason:
     """Tests for reason parameter — error provenance on orphan cancellation."""
 
     @pytest.mark.asyncio
-    async def test_reason_written_to_error_column(self, service) -> None:
+    async def test_reason_written_to_error_column(self, service, session_operation_contexts) -> None:
         """When reason is provided, it's stored in the run's error field."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         await service.cancel_all_orphaned_runs(
             max_age_seconds=0,
@@ -1458,12 +2621,14 @@ class TestCancelAllOrphanedRunsReason:
         assert fetched.error == "Orphaned by server restart — no active process"
 
     @pytest.mark.asyncio
-    async def test_no_reason_leaves_error_null(self, service) -> None:
+    async def test_no_reason_leaves_error_null(self, service, session_operation_contexts) -> None:
         """When reason is None (default), error field stays unset."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         await service.cancel_all_orphaned_runs(max_age_seconds=0)
 
@@ -1482,29 +2647,41 @@ class TestCancelledTerminalTransitions:
     """
 
     @pytest.mark.asyncio
-    async def test_illegal_transition_cancelled_to_completed_raises(self, service) -> None:
+    async def test_illegal_transition_cancelled_to_completed_raises(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "cancelled")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "cancelled", session_operation_context=execute_context)
         with pytest.raises(ValueError, match=r"Illegal.*transition"):
-            await service.update_run_status(run.id, "completed", landscape_run_id="lscp-cancelled")
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id="lscp-cancelled",
+                session_operation_context=execute_context,
+            )
 
     @pytest.mark.asyncio
-    async def test_illegal_transition_cancelled_to_failed_raises(self, service) -> None:
+    async def test_illegal_transition_cancelled_to_failed_raises(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "cancelled")
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "cancelled", session_operation_context=execute_context)
         with pytest.raises(ValueError, match=r"Illegal.*transition"):
-            await service.update_run_status(run.id, "failed", error="boom")
+            await service.update_run_status(
+                run.id,
+                "failed",
+                error="boom",
+                session_operation_context=execute_context,
+            )
 
 
 class TestArchiveSessionWithActiveRun:
     """Tests for archive_session when a run is active."""
 
     @pytest.mark.asyncio
-    async def test_archive_soft_hides_session_with_active_run(self, service) -> None:
+    async def test_archive_soft_hides_session_with_active_run(self, service, session_operation_contexts) -> None:
         """A session with a durable run is soft-archived, not deleted.
 
         Commit 4c3e81182 ("Polish RC5 composer UX and archive behavior")
@@ -1519,7 +2696,9 @@ class TestArchiveSessionWithActiveRun:
         """
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.create_run(session.id, state.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        session_operation_contexts.release(service, execute_context)
 
         await service.archive_session(session.id)
 
@@ -1633,14 +2812,15 @@ class TestPruneStateVersions:
         assert [v.version for v in remaining] == [4, 5]
 
     @pytest.mark.asyncio
-    async def test_prune_preserves_run_referenced_versions(self, service) -> None:
+    async def test_prune_preserves_run_referenced_versions(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
         await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
         await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
 
         # Create a run referencing v1
-        await service.create_run(session.id, v1.id)
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        await service.create_run(session.id, v1.id, session_operation_context=execute_context)
 
         # Prune keeping only latest 1 -- v1 should survive (run-referenced), v2 deleted
         deleted = await service.prune_state_versions(session.id, keep_latest=1)

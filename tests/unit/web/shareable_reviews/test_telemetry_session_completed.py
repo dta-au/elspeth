@@ -14,6 +14,7 @@ are not cross-contaminated.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,14 +26,17 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import InvalidRequestError, OperationalError
 
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot, ReadinessRow
+from elspeth.web.coordination import repository as coordination_repository
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     composer_completion_events_table,
     composition_states_table,
-    sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
@@ -95,9 +99,16 @@ class _ExecutionServiceFake:
 class _ReadinessServiceFake:
     readiness: AuditReadinessSnapshot
 
-    async def compute_snapshot(self, *, session_id: UUID, user_id: str) -> AuditReadinessSnapshot:
+    async def compute_snapshot(
+        self,
+        *,
+        session_id: UUID,
+        user_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> AuditReadinessSnapshot:
         assert str(session_id) == self.readiness.session_id
         assert user_id
+        assert session_operation_context.fence.session_id == str(session_id)
         return self.readiness
 
 
@@ -156,25 +167,27 @@ def state_record(session_id: UUID, state_id: UUID) -> _StateRecord:
 
 
 @pytest.fixture
-def session_engine_with_row(engine, session_record: _SessionRecord, state_record: _StateRecord):  # type: ignore[no-untyped-def]
+def session_engine_with_row(  # type: ignore[no-untyped-def]
+    engine,
+    session_record: _SessionRecord,
+    state_record: _StateRecord,
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Insert the parent session + composition_state rows so the FK on
     ``composer_completion_events`` resolves at audit-insert time.
     """
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    monkeypatch.setattr(coordination_repository, "_new_session_id", lambda: session_record.id)
+    created = authority.create_session_with_initial_fence(
+        user_id=session_record.user_id,
+        title="t",
+        auth_provider_type="local",
+        owner_instance_id="shareable-telemetry-test",
+        lease_seconds=30,
+    )
+    assert created.id == session_record.id
     now = datetime.now(UTC)
     with engine.begin() as conn:
-        conn.execute(
-            sessions_table.insert().values(
-                id=str(session_record.id),
-                user_id=session_record.user_id,
-                auth_provider_type="local",
-                title="t",
-                trust_mode="auto_commit",
-                density_default="high",
-                created_at=now,
-                updated_at=now,
-                interpretation_review_disabled=False,
-            )
-        )
         conn.execute(
             composition_states_table.insert().values(
                 id=str(state_record.id),
@@ -195,6 +208,25 @@ def session_engine_with_row(engine, session_record: _SessionRecord, state_record
             )
         )
     return engine
+
+
+@pytest.fixture
+def session_operation_context(
+    session_engine_with_row,  # type: ignore[no-untyped-def]
+    session_record: _SessionRecord,
+):
+    authority = SQLiteLocalSessionOperationAuthority(session_engine_with_row)
+    context = authority.acquire(
+        session_id=session_record.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id="shareable-telemetry-test",
+        lease_seconds=30,
+    )
+    try:
+        yield context
+    finally:
+        with contextlib.suppress(SessionOperationFenceLost, InvalidRequestError, OperationalError):
+            authority.release(context)
 
 
 def _ok_validation() -> ValidationResult:
@@ -265,6 +297,7 @@ def _build_service_with_fresh_telemetry(  # type: ignore[no-untyped-def]
         signer=signer,
         settings=settings,
         sessions_db_engine=engine,
+        session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
         payload_store=payload_store,
         telemetry=telemetry,
     )
@@ -281,6 +314,7 @@ async def test_mark_ready_for_review_emits_completion_counter(
     signer: ShareTokenSigner,
     session_record: _SessionRecord,
     state_record: _StateRecord,
+    session_operation_context: SessionOperationContext,
 ) -> None:
     """Happy path: a successful ``mark_ready_for_review`` increments
     ``composer.session.completed_total`` exactly once with
@@ -304,6 +338,7 @@ async def test_mark_ready_for_review_emits_completion_counter(
     response = await service.mark_ready_for_review(
         session_id=session_record.id,
         user_id=session_record.user_id,
+        session_operation_context=session_operation_context,
     )
     assert response.token
 
@@ -338,6 +373,7 @@ async def test_mark_ready_for_review_audit_failure_does_not_emit_counter(
     signer: ShareTokenSigner,
     session_record: _SessionRecord,
     state_record: _StateRecord,
+    session_operation_context: SessionOperationContext,
 ) -> None:
     """Audit primacy regression: if the audit INSERT raises (we force
     this by disposing the engine before the call so ``engine.begin()``
@@ -375,6 +411,7 @@ async def test_mark_ready_for_review_audit_failure_does_not_emit_counter(
         await service.mark_ready_for_review(
             session_id=session_record.id,
             user_id=session_record.user_id,
+            session_operation_context=session_operation_context,
         )
 
     # Counter unchanged: audit primacy is structurally enforced by the

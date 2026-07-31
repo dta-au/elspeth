@@ -245,7 +245,7 @@ def _seed_blob(client: TestClient, session_id: str, *, content: str | None = Non
 
     # Retrieve storage_path from the blob service (not exposed by API).
     blob_service = client.app.state.blob_service
-    record = asyncio.run(blob_service.get_blob(UUID(blob_id)))
+    record = next(record for record in asyncio.run(blob_service.list_blobs(UUID(session_id), limit=None)) if record.id == UUID(blob_id))
     return blob_id, record.storage_path
 
 
@@ -292,7 +292,10 @@ def _independent_guided_peer_app(primary: TestClient) -> FastAPI:
     app.state.operator_profile_registry = primary_app.state.operator_profile_registry
     app.state.plugin_snapshot_factory = primary_app.state.plugin_snapshot_factory
     app.state.composer_recorder = BufferingRecorder()
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=app.state.session_service.session_operation_authority,
+    )
     app.state.session_compose_lock_registry = _SessionComposeLockRegistry()
     app.include_router(create_session_router())
     return app

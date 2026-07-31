@@ -17,11 +17,14 @@ import pytest
 import structlog
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import event as sqlalchemy_event
 
+import elspeth.web.sessions.service as sessions_service_module
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_operations import guided_operation_request_hash
 from elspeth.web.sessions.models import (
@@ -30,6 +33,7 @@ from elspeth.web.sessions.models import (
     guided_operation_admission_blocks_table,
     guided_operation_events_table,
     guided_operations_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import (
@@ -52,6 +56,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 class _StrictRequest(BaseModel):
@@ -62,8 +67,15 @@ class _StrictRequest(BaseModel):
     include_defaults: bool = True
 
 
+def test_guided_composite_authority_has_only_narrow_domain_mutations() -> None:
+    assert not hasattr(sessions_service_module, "_reject_guided_pending_proposal")
+    assert not hasattr(sessions_service_module, "_require_no_active_guided_confirmation_admission")
+    assert {"require_no_active_confirmation", "claim_confirmation"} <= set(dir(sessions_service_module._GuidedSessionMutations))
+    assert {"reject_pending_proposal"} <= set(dir(sessions_service_module._GuidedComposerMutations))
+
+
 def _service(engine) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided-operations"),
@@ -99,6 +111,41 @@ def durable_engine(request: pytest.FixtureRequest, tmp_path: Path):
 
 async def _create_session(service: SessionServiceImpl) -> UUID:
     return (await service.create_session("alice", "Guided operation", "local")).id
+
+
+async def _acquire_fork_parent_context(service: SessionServiceImpl, session_id: UUID) -> SessionOperationContext:
+    return cast(
+        SessionOperationContext,
+        await service._run_sync(
+            lambda: service.session_operation_authority.acquire(
+                session_id=session_id,
+                operation_kind=SessionOperationKind.SESSION_FORK,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            )
+        ),
+    )
+
+
+async def _acquire_compose_context(service: SessionServiceImpl, session_id: UUID) -> SessionOperationContext:
+    return cast(
+        SessionOperationContext,
+        await service._run_sync(
+            lambda: service.session_operation_authority.acquire(
+                session_id=session_id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            )
+        ),
+    )
+
+
+async def _release_session_operation_context(
+    service: SessionServiceImpl,
+    context: SessionOperationContext,
+) -> None:
+    await service._run_sync(service.session_operation_authority.release, context)
 
 
 def _failed_llm_call(marker: str) -> ComposerLLMCall:
@@ -195,6 +242,117 @@ def _expire_operation(engine, *, session_id: UUID, operation_id: str) -> None:
             )
             .values(lease_expires_at=datetime.now(UTC) - timedelta(minutes=1))
         )
+
+
+@pytest.mark.asyncio
+async def test_guided_start_reconciliation_read_is_noncontending_and_zero_dml(file_engine) -> None:
+    service = SessionServiceImpl(
+        file_engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.guided-start-reconciliation-read"),
+    )
+    session_id = await _create_session(service)
+    context = await _acquire_compose_context(service, session_id)
+    try:
+        claimed = await service.reserve_guided_operation(
+            session_id=session_id,
+            operation_id="guided-start-read-only",
+            kind="guided_start",
+            request_hash="a" * 64,
+            actor="worker",
+            lease_seconds=30,
+            session_operation_context=context,
+        )
+    finally:
+        await _release_session_operation_context(service, context)
+    assert isinstance(claimed, GuidedOperationClaimed)
+
+    statements: list[str] = []
+
+    def observe_dml(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        verb = statement.lstrip().partition(" ")[0].upper()
+        if verb in {"INSERT", "UPDATE", "DELETE"}:
+            statements.append(statement)
+
+    sqlalchemy_event.listen(file_engine, "before_cursor_execute", observe_dml)
+    try:
+        outcome = await service.get_guided_start_reconciliation(
+            session_id=session_id,
+            operation_id="guided-start-read-only",
+        )
+    finally:
+        sqlalchemy_event.remove(file_engine, "before_cursor_execute", observe_dml)
+
+    assert outcome == GuidedOperationActive(
+        attempt=1,
+        lease_expires_at=claimed.lease_expires_at,
+        expired=False,
+    )
+    assert statements == []
+
+
+@pytest.mark.asyncio
+async def test_expired_guided_start_reconciliation_mints_current_attempt_before_failing(file_engine) -> None:
+    service = SessionServiceImpl(
+        file_engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.guided-start-reconciliation-dual-fence"),
+    )
+    session_id = await _create_session(service)
+    original_context = await _acquire_compose_context(service, session_id)
+    try:
+        claimed = await service.reserve_guided_operation(
+            session_id=session_id,
+            operation_id="guided-start-expired-dual-fence",
+            kind="guided_start",
+            request_hash="b" * 64,
+            actor="worker",
+            lease_seconds=30,
+            session_operation_context=original_context,
+        )
+    finally:
+        await _release_session_operation_context(service, original_context)
+    assert isinstance(claimed, GuidedOperationClaimed)
+    _expire_operation(file_engine, session_id=session_id, operation_id="guided-start-expired-dual-fence")
+
+    observed = await service.get_guided_start_reconciliation(
+        session_id=session_id,
+        operation_id="guided-start-expired-dual-fence",
+    )
+    assert isinstance(observed, GuidedOperationActive)
+    assert observed.expired is True
+    current_context = await _acquire_compose_context(service, session_id)
+    try:
+        stale = await service.reconcile_guided_start_operation(
+            session_id=session_id,
+            operation_id="guided-start-expired-dual-fence",
+            observed_attempt=observed.attempt + 1,
+            actor="stale-reconciler",
+            lease_seconds=300,
+            session_operation_context=current_context,
+        )
+        settled = await service.reconcile_guided_start_operation(
+            session_id=session_id,
+            operation_id="guided-start-expired-dual-fence",
+            observed_attempt=observed.attempt,
+            actor="reconciler",
+            lease_seconds=300,
+            session_operation_context=current_context,
+        )
+    finally:
+        await _release_session_operation_context(service, current_context)
+
+    assert isinstance(stale, GuidedOperationActive)
+    assert stale.attempt == observed.attempt
+    assert stale.expired is True
+    assert settled == GuidedOperationFailed(failure_code="request_cancelled")
+    with file_engine.connect() as conn:
+        row = conn.execute(select(guided_operations_table)).one()
+        events = conn.execute(select(guided_operation_events_table).order_by(guided_operation_events_table.c.sequence)).all()
+    assert row.status == "failed"
+    assert row.attempt == observed.attempt + 1
+    assert [event.event_kind for event in events] == ["claimed", "taken_over", "failed"]
+    assert events[-2].attempt == events[-1].attempt == observed.attempt + 1
 
 
 async def _seed_state(engine, *, session_id: UUID) -> UUID:
@@ -351,6 +509,166 @@ async def test_claim_active_join_and_request_conflict_without_mutation(file_engi
     assert row.request_hash == request_hash
     assert row.attempt == 1
     assert [event.event_kind for event in events] == ["claimed"]
+
+
+@pytest.mark.asyncio
+async def test_every_guided_write_requires_current_matching_session_and_guided_authority(file_engine) -> None:
+    service = _service(file_engine)
+    session_id = await _create_session(service)
+    other_session_id = await _create_session(service)
+    first_context = await _acquire_compose_context(service, session_id)
+    other_context = await _acquire_compose_context(service, other_session_id)
+    request_hash = "d" * 64
+
+    claimed = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id="dual-fence-matrix",
+        kind="guided_chat",
+        request_hash=request_hash,
+        actor="worker-a",
+        lease_seconds=30,
+        session_operation_context=first_context,
+    )
+    assert isinstance(claimed, GuidedOperationClaimed)
+    assert (
+        await service.renew_guided_operation(
+            claimed.fence,
+            actor="worker-a",
+            lease_seconds=30,
+            session_operation_context=first_context,
+        )
+        == claimed.fence
+    )
+
+    await _release_session_operation_context(service, first_context)
+    current_context = await _acquire_compose_context(service, session_id)
+
+    def snapshot() -> tuple[tuple[object, ...], tuple[object, ...]]:
+        with file_engine.connect() as conn:
+            operation = tuple(conn.execute(select(guided_operations_table)).one())
+            events = tuple(
+                tuple(row) for row in conn.execute(select(guided_operation_events_table).order_by(guided_operation_events_table.c.sequence))
+            )
+        return operation, events
+
+    before_stale_session = snapshot()
+    with pytest.raises(GuidedOperationFenceLostError):
+        await service.renew_guided_operation(
+            claimed.fence,
+            actor="stale-session",
+            lease_seconds=30,
+            session_operation_context=first_context,
+        )
+    assert snapshot() == before_stale_session
+
+    before_mismatch = snapshot()
+    with pytest.raises(GuidedOperationFenceLostError):
+        await service.bind_guided_operation(
+            claimed.fence,
+            result_state_id=uuid4(),
+            session_operation_context=other_context,
+        )
+    assert snapshot() == before_mismatch
+
+    _expire_operation(file_engine, session_id=session_id, operation_id="dual-fence-matrix")
+    takeover = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id="dual-fence-matrix",
+        kind="guided_chat",
+        request_hash=request_hash,
+        actor="worker-b",
+        lease_seconds=30,
+        session_operation_context=current_context,
+    )
+    assert isinstance(takeover, GuidedOperationTakenOver)
+
+    before_stale_guided = snapshot()
+    with pytest.raises(GuidedOperationFenceLostError):
+        await service.fail_guided_operation(
+            claimed.fence,
+            failure_code="operation_failed",
+            actor="stale-guided",
+            session_operation_context=current_context,
+        )
+    assert snapshot() == before_stale_guided
+
+    failed = await service.fail_guided_operation(
+        takeover.fence,
+        failure_code="operation_failed",
+        actor="worker-b",
+        session_operation_context=current_context,
+    )
+    assert failed == GuidedOperationFailed(failure_code="operation_failed")
+
+
+@pytest.mark.asyncio
+async def test_guided_mutation_facet_revalidates_at_dml_and_dies_with_transaction(file_engine) -> None:
+    """The composite capability cannot outlive or bypass either exact fence."""
+
+    service = _service(file_engine)
+    session_id = await _create_session(service)
+    context = await _acquire_compose_context(service, session_id)
+    claimed = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id="facet-lifetime",
+        kind="guided_chat",
+        request_hash="e" * 64,
+        actor="worker-a",
+        lease_seconds=30,
+        session_operation_context=context,
+    )
+    assert isinstance(claimed, GuidedOperationClaimed)
+
+    def _lose_session_authority_after_construction() -> object:
+        sid = str(session_id)
+        with (
+            service._session_process_locked_begin(sid) as conn,
+            service._session_write_lock(conn, sid),
+            service._guided_session_mutation_transaction(
+                conn,
+                guided_fence=claimed.fence,
+                session_operation_context=context,
+            ) as mutation,
+        ):
+            facet = mutation.guided
+            assert not any(name in dir(facet) for name in ("connection", "conn", "engine", "execute"))
+            conn.execute(
+                update(session_operation_fences_table)
+                .where(
+                    session_operation_fences_table.c.session_id == sid,
+                    session_operation_fences_table.c.operation_id == context.fence.operation_id,
+                )
+                .values(released_at=datetime.now(UTC))
+            )
+            with pytest.raises(GuidedOperationFenceLostError):
+                facet.bind(result_state_id=uuid4())
+            return facet
+
+    escaped = await service._run_sync(_lose_session_authority_after_construction)
+    with pytest.raises(AuditIntegrityError, match=r"transaction.*active"):
+        escaped.bind(result_state_id=uuid4())
+
+    with file_engine.connect() as conn:
+        operation = conn.execute(
+            select(guided_operations_table).where(
+                guided_operations_table.c.session_id == str(session_id),
+                guided_operations_table.c.operation_id == "facet-lifetime",
+            )
+        ).one()
+        events = (
+            conn.execute(
+                select(guided_operation_events_table.c.event_kind)
+                .where(
+                    guided_operation_events_table.c.session_id == str(session_id),
+                    guided_operation_events_table.c.operation_id == "facet-lifetime",
+                )
+                .order_by(guided_operation_events_table.c.sequence)
+            )
+            .scalars()
+            .all()
+        )
+    assert operation.result_state_id is None
+    assert events == ["claimed"]
 
 
 @pytest.mark.asyncio
@@ -734,7 +1052,7 @@ async def test_failure_event_fault_rolls_back_the_bound_audit_cohort(
     def fail_after_audit_insert(*_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("injected terminal event failure")
 
-    monkeypatch.setattr(service, "fail_guided_operation_on_connection", fail_after_audit_insert)
+    monkeypatch.setattr(sessions_service_module._GuidedSessionMutations, "fail", fail_after_audit_insert)
     with pytest.raises(RuntimeError, match="injected terminal event failure"):
         await service.fail_guided_operation_with_audit(_failure_command(claim, marker="rollback"))
 
@@ -1226,8 +1544,8 @@ async def test_reconcile_guided_start_settles_expired_attempt_once_with_exact_em
     assert row.lease_token is None
     assert row.lease_expires_at is None
     assert row.settled_at is not None
-    assert [event.event_kind for event in events] == ["claimed", "failed"]
-    assert events[-1].attempt == claimed.fence.attempt
+    assert [event.event_kind for event in events] == ["claimed", "taken_over", "failed"]
+    assert events[-1].attempt == claimed.fence.attempt + 1
     assert events[-1].actor == "reconciler"
     assert events[-1].failure_audit_cohort == {
         "schema": "guided_failure_audit_cohort.v1",
@@ -1450,7 +1768,7 @@ async def test_expired_guided_start_reconciliation_race_with_takeover_has_one_au
     if isinstance(reconciled, GuidedOperationFailed):
         assert reconciled.failure_code == "request_cancelled"
         assert reserved == reconciled
-        assert [event.event_kind for event in events] == ["claimed", "failed"]
+        assert [event.event_kind for event in events] == ["claimed", "taken_over", "failed"]
     else:
         assert isinstance(reconciled, GuidedOperationActive)
         assert isinstance(reserved, GuidedOperationTakenOver)
@@ -1517,7 +1835,7 @@ async def test_expired_guided_start_reconciliation_race_rejects_stale_completion
             )
             .order_by(guided_operation_events_table.c.sequence)
         ).all()
-    assert [event.event_kind for event in events] == ["claimed", "failed"]
+    assert [event.event_kind for event in events] == ["claimed", "taken_over", "failed"]
 
 
 @pytest.mark.asyncio
@@ -1527,6 +1845,7 @@ async def test_absent_reconciliation_race_with_original_reservation_has_one_admi
     reconcile_service = _service(durable_engine)
     original_service = _service(durable_engine)
     session_id = await _create_session(reconcile_service)
+    await reconcile_service._guided_test_context(session_id, "guided_start")
     operation_id = f"absent-original-race-{uuid4()}"
     barrier = threading.Barrier(2)
 
@@ -1600,6 +1919,7 @@ async def test_absent_reconciliation_race_with_revised_start_leaves_only_revised
     reconcile_service = _service(durable_engine)
     revised_service = _service(durable_engine)
     session_id = await _create_session(reconcile_service)
+    await reconcile_service._guided_test_context(session_id, "guided_start")
     old_operation_id = f"old-start-{uuid4()}"
     revised_operation_id = f"revised-start-{uuid4()}"
     barrier = threading.Barrier(2)
@@ -1701,32 +2021,38 @@ async def test_terminal_replay_uses_closed_per_kind_locator(file_engine, kind: s
     }[result_factory]
     operation_id = f"operation-{kind}"
     request_hash = "f" * 64
-    claimed = await service.reserve_guided_operation(
-        session_id=session_id,
-        operation_id=operation_id,
-        kind=kind,
-        request_hash=request_hash,
-        actor="worker-a",
-        lease_seconds=30,
-    )
-    assert isinstance(claimed, GuidedOperationClaimed)
+    parent_context = await _acquire_fork_parent_context(service, session_id) if kind == "session_fork" else None
+    try:
+        claimed = await service.reserve_guided_operation(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind=kind,
+            request_hash=request_hash,
+            actor="worker-a",
+            lease_seconds=30,
+            session_operation_context=parent_context,
+        )
+        assert isinstance(claimed, GuidedOperationClaimed)
 
-    if isinstance(result, GuidedSessionResult):
-        await service.bind_guided_operation(claimed.fence, result_session_id=result.session_id)
+        if isinstance(result, GuidedSessionResult):
+            await service.bind_guided_operation(claimed.fence, result_session_id=result.session_id)
 
-    completed = await service.complete_guided_operation(
-        claimed.fence,
-        result=result,
-        response_hash="1" * 64,
-        actor="worker-a",
-    )
-    replay = await service.get_guided_operation(
-        session_id=session_id,
-        operation_id=operation_id,
-        kind=kind,
-        request_hash=request_hash,
-    )
-    assert completed == replay == GuidedOperationCompleted(result=result, response_hash="1" * 64)
+        completed = await service.complete_guided_operation(
+            claimed.fence,
+            result=result,
+            response_hash="1" * 64,
+            actor="worker-a",
+        )
+        replay = await service.get_guided_operation(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind=kind,
+            request_hash=request_hash,
+        )
+        assert completed == replay == GuidedOperationCompleted(result=result, response_hash="1" * 64)
+    finally:
+        if parent_context is not None:
+            await _release_session_operation_context(service, parent_context)
 
 
 @pytest.mark.asyncio
@@ -1747,31 +2073,36 @@ async def test_fork_completion_rejects_target_without_exact_lineage_and_principa
         target = await service.create_session("bob", "Cross-user child", "local")
         with file_engine.begin() as conn:
             conn.execute(update(sessions_table).where(sessions_table.c.id == str(target.id)).values(forked_from_session_id=str(parent_id)))
-    claimed = await service.reserve_guided_operation(
-        session_id=parent_id,
-        operation_id=f"operation-fork-{target_kind}",
-        kind="session_fork",
-        request_hash="c" * 64,
-        actor="worker-a",
-        lease_seconds=30,
-    )
-    assert isinstance(claimed, GuidedOperationClaimed)
-
-    with pytest.raises(AuditIntegrityError, match=r"fork result session.*custody"):
-        await service.complete_guided_operation(
-            claimed.fence,
-            result=GuidedSessionResult(session_id=target.id),
-            response_hash="d" * 64,
+    parent_context = await _acquire_fork_parent_context(service, parent_id)
+    try:
+        claimed = await service.reserve_guided_operation(
+            session_id=parent_id,
+            operation_id=f"operation-fork-{target_kind}",
+            kind="session_fork",
+            request_hash="c" * 64,
             actor="worker-a",
+            lease_seconds=30,
+            session_operation_context=parent_context,
         )
+        assert isinstance(claimed, GuidedOperationClaimed)
 
-    active = await service.get_guided_operation(
-        session_id=parent_id,
-        operation_id=f"operation-fork-{target_kind}",
-        kind="session_fork",
-        request_hash="c" * 64,
-    )
-    assert isinstance(active, GuidedOperationActive)
+        with pytest.raises(AuditIntegrityError, match=r"fork result session.*custody"):
+            await service.complete_guided_operation(
+                claimed.fence,
+                result=GuidedSessionResult(session_id=target.id),
+                response_hash="d" * 64,
+                actor="worker-a",
+            )
+
+        active = await service.get_guided_operation(
+            session_id=parent_id,
+            operation_id=f"operation-fork-{target_kind}",
+            kind="session_fork",
+            request_hash="c" * 64,
+        )
+        assert isinstance(active, GuidedOperationActive)
+    finally:
+        await _release_session_operation_context(service, parent_context)
 
 
 @pytest.mark.asyncio

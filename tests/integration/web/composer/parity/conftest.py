@@ -806,7 +806,10 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     app.state.operator_profile_registry = operator_profile_registry
     app.state.plugin_snapshot_factory = lambda user: build_snapshot(user.user_id)
     app.state.composer_recorder = BufferingRecorder()
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=sessions.session_operation_authority,
+    )
     app.include_router(create_session_router())
 
     try:

@@ -28,8 +28,11 @@ from fastapi.responses import JSONResponse
 from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
 from elspeth.web.sessions.ownership import verify_session_ownership
+from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.shareable_reviews.models import (
     MarkReadyForReviewResponse,
     ShareableLinkResponse,
@@ -72,20 +75,35 @@ def create_shareable_reviews_router() -> APIRouter:
         await rate_limiter.check(user.user_id)
         await verify_session_ownership(session_id, user, request)
         service: ShareableReviewService = request.app.state.shareable_review_service
-        try:
-            result = await service.mark_ready_for_review(session_id=session_id, user_id=user.user_id)
-        except CompositionNotRunnableError as exc:
-            # ``from exc``: preserves the server-side __context__ chain for
-            # logs. Wire-facing ``detail`` is unaffected — only the internal
-            # traceback chain. The probing-attacker rationale that justifies
-            # ``from None`` on InvalidToken (below) does NOT apply here: a
-            # 409 leaks no signal an authenticated session owner could not
-            # already obtain by inspecting their own session.
-            raise HTTPException(status_code=409, detail=exc.detail or exc.reason) from exc
-        return JSONResponse(
-            content=result.model_dump(mode="json"),
-            headers={"Cache-Control": _NO_STORE},
+        session_service: SessionServiceProtocol = request.app.state.session_service
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
         )
+        try:
+            try:
+                result = await service.mark_ready_for_review(
+                    session_id=session_id,
+                    user_id=user.user_id,
+                    session_operation_context=lease.context,
+                )
+            except CompositionNotRunnableError as exc:
+                # ``from exc``: preserves the server-side __context__ chain for
+                # logs. Wire-facing ``detail`` is unaffected — only the internal
+                # traceback chain. The probing-attacker rationale that justifies
+                # ``from None`` on InvalidToken (below) does NOT apply here: a
+                # 409 leaks no signal an authenticated session owner could not
+                # already obtain by inspecting their own session.
+                raise HTTPException(status_code=409, detail=exc.detail or exc.reason) from exc
+            return JSONResponse(
+                content=result.model_dump(mode="json"),
+                headers={"Cache-Control": _NO_STORE},
+            )
+        finally:
+            await lease.close()
 
     @router.get(
         "/api/sessions/{session_id}/shareable-link",

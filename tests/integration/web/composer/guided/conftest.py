@@ -313,7 +313,10 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     # the create_app() production wiring at app.py:930. Without this the
     # guided/chat route's unconditional _get_composer_progress_registry(request)
     # call AttributeErrors against this hand-rolled minimal app.
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=session_service.session_operation_authority,
+    )
 
     # Mount session router (sessions + guided endpoints)
     router = create_session_router()
@@ -367,7 +370,10 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             generation_key=b"guided-integration-policy-key",
         )
         restarted_app.state.composer_recorder = BufferingRecorder()
-        restarted_app.state.composer_progress_registry = ComposerProgressRegistry()
+        restarted_app.state.composer_progress_registry = ComposerProgressRegistry(
+            engine=restarted_engine,
+            session_operation_authority=restarted_app.state.session_service.session_operation_authority,
+        )
         restarted_app.state.restart_test_client = restart_test_client
         restarted_app.include_router(create_session_router())
         restarted_app.include_router(create_blobs_router())

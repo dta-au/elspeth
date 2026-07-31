@@ -543,8 +543,12 @@ class TestWebSocketTimeoutRecovery:
                 run_id=run_id,
                 sequence=2,
                 timestamp=timestamp,
-                event_type="failed",
-                data={"status": "failed", "detail": "pipeline crashed", "node_id": None},
+                event_type="completed",
+                data={
+                    "status": "completed",
+                    "accounting": _accounting().model_dump(mode="json"),
+                    "landscape_run_id": "land-1",
+                },
             ),
             RunEventRecord(
                 id=uuid4(),
@@ -558,7 +562,8 @@ class TestWebSocketTimeoutRecovery:
 
         websocket = await _call_websocket(app, str(run_id), ticket=_issue_ws_ticket(app, str(run_id)))
 
-        assert [payload["event_type"] for payload in websocket.sent_json] == ["progress", "failed", "error"]
+        assert [payload["event_type"] for payload in websocket.sent_json] == ["progress", "completed", "error"]
+        assert websocket.sent_json[1]["data"]["accounting"]["tokens"]["succeeded"] == 1
         assert websocket.close_code == 1000
 
     @pytest.mark.asyncio

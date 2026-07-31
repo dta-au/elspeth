@@ -5,14 +5,17 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Event
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import Connection, Engine, MetaData, Table, column, delete, insert, literal, select, table, update
-from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy import Connection, Engine, event, insert, select, update
 
+from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.contracts import (
+    ArchiveDeleteReconciliation,
+    ArchiveManifestRelation,
     FenceLossReason,
+    SessionOperationContext,
     SessionOperationFence,
     SessionOperationFenceLost,
     SessionOperationKind,
@@ -22,10 +25,12 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blob_deletion_cleanups_table,
     chat_messages_table,
+    guided_operations_table,
     session_operation_fences_table,
     sessions_table,
     web_instances_table,
 )
+from elspeth.web.sessions.protocol import SessionArchiveDisposition, SessionGuidedOperationInProgressError
 from elspeth.web.sessions.schema import initialize_session_schema
 
 pytestmark = pytest.mark.testcontainer
@@ -72,6 +77,60 @@ def _register_instance(engine: Engine, *, instance_id: str, lease_delta: timedel
         )
 
 
+def _seed_completed_fork_result(
+    engine: Engine,
+    repository: PostgresSessionOperationRepository,
+    *,
+    result_session_id: UUID,
+) -> None:
+    parent = _create(repository, owner=f"creator-{uuid4()}")
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(guided_operations_table).values(
+                session_id=str(parent.id),
+                operation_id=str(uuid4()),
+                kind="session_fork",
+                status="completed",
+                request_hash="a" * 64,
+                lease_token=None,
+                lease_expires_at=None,
+                attempt=1,
+                result_kind="session",
+                result_session_id=str(result_session_id),
+                response_hash="b" * 64,
+                created_at=now,
+                updated_at=now,
+                settled_at=now,
+            )
+        )
+
+
+def _seed_in_progress_fork(
+    engine: Engine,
+    *,
+    parent_session_id: UUID,
+    result_session_id: UUID | None = None,
+) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(guided_operations_table).values(
+                session_id=str(parent_session_id),
+                operation_id=str(uuid4()),
+                kind="session_fork",
+                status="in_progress",
+                request_hash="a" * 64,
+                lease_token="guided-lease",
+                lease_expires_at=now + timedelta(minutes=5),
+                attempt=1,
+                result_session_id=str(result_session_id) if result_session_id is not None else None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
 def test_postgres_creation_releases_epoch_one_at_database_time(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
     with postgres_engine.connect() as conn:
@@ -88,6 +147,37 @@ def test_postgres_creation_releases_epoch_one_at_database_time(postgres_engine: 
     assert row.released_at == row.lease_expires_at
     assert before <= row.released_at <= after
     assert row.operation_id and row.lease_token and row.owner_instance_id
+
+
+def test_postgres_authority_acquires_shared_sessions_advisory_lock_before_fence_row_lock(
+    postgres_engine: Engine,
+) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    context = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=f"composer-{uuid4()}",
+        lease_seconds=30,
+    )
+    statements: list[str] = []
+
+    def capture_statement(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        statements.append(" ".join(statement.lower().split()))
+
+    event.listen(postgres_engine, "before_cursor_execute", capture_statement)
+    try:
+        repository.compare_and_swap(context)
+    finally:
+        event.remove(postgres_engine, "before_cursor_execute", capture_statement)
+
+    advisory_index = next(index for index, statement in enumerate(statements) if "pg_catalog.pg_advisory_xact_lock" in statement)
+    fence_row_index = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("select ") and "from session_operation_fences" in statement and "for update" in statement
+    )
+    assert advisory_index < fence_row_index
 
 
 def test_postgres_expiry_takeover_requires_operation_and_owner_instance_expiry(postgres_engine: Engine) -> None:
@@ -132,9 +222,9 @@ def test_postgres_expiry_takeover_requires_operation_and_owner_instance_expiry(p
         lease_seconds=30,
     )
 
-    assert taken_over.operation_epoch == first.operation_epoch + 1
-    assert taken_over.operation_id != first.operation_id
-    assert taken_over.lease_token != first.lease_token
+    assert taken_over.fence.operation_epoch == first.fence.operation_epoch + 1
+    assert taken_over.fence.operation_id != first.fence.operation_id
+    assert taken_over.fence.lease_token != first.fence.lease_token
 
 
 def test_postgres_missing_owner_membership_fails_closed_on_expired_operation(postgres_engine: Engine) -> None:
@@ -183,13 +273,14 @@ def test_postgres_two_claimants_have_exactly_one_winner(postgres_engine: Engine)
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = list(pool.map(claim, (f"claimant-{uuid4()}", f"claimant-{uuid4()}")))
 
-    assert sum(isinstance(outcome, SessionOperationFence) for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, SessionOperationContext) for outcome in outcomes) == 1
     assert sum(isinstance(outcome, SessionOperationConflictError) for outcome in outcomes) == 1
 
 
 def test_postgres_renew_cas_and_release_are_exact(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
     created = _create(repository, owner=f"creator-{uuid4()}")
+    _seed_completed_fork_result(postgres_engine, repository, result_session_id=created.id)
     current = repository.acquire(
         session_id=created.id,
         operation_kind=SessionOperationKind.PROGRESS,
@@ -197,10 +288,14 @@ def test_postgres_renew_cas_and_release_are_exact(postgres_engine: Engine) -> No
         lease_seconds=30,
     )
     stale = SessionOperationFence(
-        session_id=current.session_id,
-        operation_id=current.operation_id,
+        session_id=current.fence.session_id,
+        operation_id=current.fence.operation_id,
         lease_token=f"stale-{uuid4()}",
-        operation_epoch=current.operation_epoch,
+        operation_epoch=current.fence.operation_epoch,
+    )
+    stale_context = SessionOperationContext(
+        fence=stale,
+        operation_kind=current.operation_kind,
     )
     with postgres_engine.connect() as conn:
         before = (
@@ -211,15 +306,13 @@ def test_postgres_renew_cas_and_release_are_exact(postgres_engine: Engine) -> No
         before = dict(before)
 
     for stale_mutation in (
-        lambda: repository.compare_and_swap(stale),
+        lambda: repository.compare_and_swap(stale_context),
         lambda: repository.mutate(
-            stale,
-            lambda transaction: transaction.execute(
-                update(sessions_table).where(sessions_table.c.id == str(created.id)).values(title="Forbidden")
-            ),
+            stale_context,
+            lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
         ),
-        lambda: repository.renew(stale, lease_seconds=60),
-        lambda: repository.release(stale),
+        lambda: repository.renew(stale_context, lease_seconds=60),
+        lambda: repository.release(stale_context),
     ):
         with pytest.raises(SessionOperationFenceLost) as exc_info:
             stale_mutation()
@@ -235,35 +328,37 @@ def test_postgres_renew_cas_and_release_are_exact(postgres_engine: Engine) -> No
     assert after == before
 
     assert repository.renew(current, lease_seconds=60) == current
-    committed = repository.mutate(
-        current,
-        lambda transaction: transaction.execute(
-            update(sessions_table).where(sessions_table.c.id == str(created.id)).values(title="Committed")
-        ),
-    )
-    assert committed.rowcount == 1
+    committed_at = datetime.now(UTC)
 
     def rollback_mutation(transaction) -> None:
-        transaction.execute(update(sessions_table).where(sessions_table.c.id == str(created.id)).values(title="Must roll back"))
+        transaction.session.decide_and_soft_archive(archived_at=committed_at + timedelta(hours=1))
         raise RuntimeError("abort PostgreSQL mutation")
 
     with pytest.raises(RuntimeError, match="abort PostgreSQL mutation"):
         repository.mutate(current, rollback_mutation)
     with postgres_engine.connect() as conn:
-        assert conn.execute(select(sessions_table.c.title).where(sessions_table.c.id == str(created.id))).scalar_one() == "Committed"
+        assert conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(created.id))).scalar_one() is None
+
+    committed = repository.mutate(
+        current,
+        lambda transaction: transaction.session.decide_and_soft_archive(archived_at=committed_at),
+    )
+    assert committed is SessionArchiveDisposition.SOFT_ARCHIVED
+    with postgres_engine.connect() as conn:
+        assert conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(created.id))).scalar_one() == committed_at
     repository.release(current)
 
 
 def test_postgres_archive_delete_is_atomic_update_only_no_registry(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
     created = _create(repository, owner=f"creator-{uuid4()}")
-    fence = repository.acquire(
+    context = repository.acquire(
         session_id=created.id,
         operation_kind=SessionOperationKind.ARCHIVE,
         owner_instance_id=f"archive-{uuid4()}",
         lease_seconds=30,
     )
-    repository.archive_delete(fence)
+    repository.archive_delete(context)
 
     with postgres_engine.connect() as conn:
         assert conn.execute(select(sessions_table.c.id).where(sessions_table.c.id == str(created.id))).first() is None
@@ -277,8 +372,73 @@ def test_postgres_archive_delete_is_atomic_update_only_no_registry(postgres_engi
         assert not {name for name in table_names if "session" in name and "deleted" in name}
 
     with pytest.raises(SessionOperationFenceLost) as exc_info:
-        repository.archive_delete(fence)
+        repository.archive_delete(context)
     assert exc_info.value.reason is FenceLossReason.MISSING
+
+
+def test_postgres_archive_reconciliation_is_process_independent_and_stale_retry_safe(
+    postgres_engine: Engine,
+) -> None:
+    archive_process = PostgresSessionOperationRepository(postgres_engine)
+    retry_process = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(archive_process, owner=f"creator-{uuid4()}")
+    context = archive_process.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id=f"archive-{uuid4()}",
+        lease_seconds=30,
+    )
+
+    assert retry_process.reconcile_archive_delete(context) is ArchiveDeleteReconciliation.CURRENT
+    archive_process.archive_delete(context)
+    assert retry_process.reconcile_archive_delete(context) is ArchiveDeleteReconciliation.CONSUMED
+    assert retry_process.reconcile_archive_delete(context) is ArchiveDeleteReconciliation.CONSUMED
+
+
+def test_postgres_archive_manifest_classifier_locks_before_reads_and_performs_no_dml(
+    postgres_engine: Engine,
+) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    with postgres_engine.connect() as conn:
+        predecessor = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(created.id))
+        ).one()
+    context = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id=f"archive-{uuid4()}",
+        lease_seconds=30,
+    )
+    statements: list[str] = []
+
+    def capture_statement(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        statements.append(" ".join(statement.lower().split()))
+
+    event.listen(postgres_engine, "before_cursor_execute", capture_statement)
+    try:
+        relation = repository.classify_archive_manifest(
+            context,
+            manifest_operation_id=predecessor.operation_id,
+            manifest_operation_epoch=predecessor.operation_epoch,
+        )
+    finally:
+        event.remove(postgres_engine, "before_cursor_execute", capture_statement)
+
+    advisory_index = next(index for index, statement in enumerate(statements) if "pg_catalog.pg_advisory_xact_lock" in statement)
+    fence_index = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("select ") and "from session_operation_fences" in statement and "for update" in statement
+    )
+    session_index = next(
+        index for index, statement in enumerate(statements) if statement.startswith("select ") and "from sessions" in statement
+    )
+    database_time_index = next(index for index, statement in enumerate(statements) if "select clock_timestamp()" in statement)
+
+    assert relation is ArchiveManifestRelation.STALE_OPERATION
+    assert advisory_index < fence_index < session_index < database_time_index
+    assert all(not statement.startswith(("insert ", "update ", "delete ")) for statement in statements)
 
 
 def _postgres_snapshot_mutation_scope(
@@ -347,14 +507,10 @@ def test_postgres_fenced_mutation_auto_scopes_update_delete_and_select(postgres_
     repository = PostgresSessionOperationRepository(postgres_engine)
     session_a = _create(repository, owner=f"creator-{uuid4()}")
     session_b = _create(repository, owner=f"creator-{uuid4()}")
-    cleanup_b = str(uuid4())
-    with postgres_engine.begin() as conn:
-        conn.execute(
-            insert(blob_deletion_cleanups_table).values(**_postgres_cleanup_values(cleanup_id=cleanup_b, session_id=str(session_b.id)))
-        )
-    fence = repository.acquire(
+    _seed_completed_fork_result(postgres_engine, repository, result_session_id=session_b.id)
+    context = repository.acquire(
         session_id=session_a.id,
-        operation_kind=SessionOperationKind.COMPOSE,
+        operation_kind=SessionOperationKind.ARCHIVE,
         owner_instance_id=f"composer-{uuid4()}",
         lease_seconds=30,
     )
@@ -363,28 +519,19 @@ def test_postgres_fenced_mutation_auto_scopes_update_delete_and_select(postgres_
         postgres_engine,
         session_ids=session_ids,
         message_ids=(),
-        cleanup_ids=(cleanup_b,),
     )
 
-    def attempt_cross_session_access(transaction):
-        changed = transaction.execute(
-            update(sessions_table).where(sessions_table.c.id == str(session_b.id)).values(title="cross-session update")
-        )
-        removed = transaction.execute(delete(blob_deletion_cleanups_table).where(blob_deletion_cleanups_table.c.blob_id == cleanup_b))
-        visible = transaction.execute(select(sessions_table.c.id).order_by(sessions_table.c.id))
-        return changed, removed, visible
+    disposition = repository.mutate(
+        context,
+        lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
+    )
 
-    changed, removed, visible = repository.mutate(fence, attempt_cross_session_access)
-
-    assert changed.rowcount == 0
-    assert removed.rowcount == 0
-    assert [row["id"] for row in visible.rows] == [str(session_a.id)]
+    assert disposition is SessionArchiveDisposition.PHYSICAL_DELETE
     assert (
         _postgres_snapshot_mutation_scope(
             postgres_engine,
             session_ids=session_ids,
             message_ids=(),
-            cleanup_ids=(cleanup_b,),
         )
         == before
     )
@@ -393,35 +540,76 @@ def test_postgres_fenced_mutation_auto_scopes_update_delete_and_select(postgres_
 def test_postgres_fenced_mutation_supports_same_session_crud(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
     created = _create(repository, owner=f"creator-{uuid4()}")
-    fence = repository.acquire(
+    _seed_completed_fork_result(postgres_engine, repository, result_session_id=created.id)
+    context = repository.acquire(
         session_id=created.id,
-        operation_kind=SessionOperationKind.COMPOSE,
+        operation_kind=SessionOperationKind.ARCHIVE,
         owner_instance_id=f"composer-{uuid4()}",
         lease_seconds=30,
     )
-    cleanup_id = str(uuid4())
+    captured: list[object] = []
+    archived_at = datetime.now(UTC)
 
-    def same_session_crud(transaction):
-        changed = transaction.execute(update(sessions_table).values(title="same-session update"))
-        inserted = transaction.execute(insert(blob_deletion_cleanups_table).values(**_postgres_cleanup_values(cleanup_id=cleanup_id)))
-        visible = transaction.execute(select(blob_deletion_cleanups_table.c.blob_id, blob_deletion_cleanups_table.c.session_id))
-        removed = transaction.execute(delete(blob_deletion_cleanups_table).where(blob_deletion_cleanups_table.c.blob_id == cleanup_id))
-        return changed, inserted, visible, removed
+    def soft_archive_and_capture(transaction):
+        captured.extend((transaction, transaction.session, transaction.runs, transaction.blobs))
+        return transaction.session.decide_and_soft_archive(archived_at=archived_at)
 
-    changed, inserted, visible, removed = repository.mutate(fence, same_session_crud)
+    disposition = repository.mutate(context, soft_archive_and_capture)
 
-    assert changed.rowcount == 1
-    assert inserted.rowcount in {-1, 1}
-    assert visible.rows == ({"blob_id": cleanup_id, "session_id": str(created.id)},)
-    assert removed.rowcount == 1
+    assert disposition is SessionArchiveDisposition.SOFT_ARCHIVED
     with postgres_engine.connect() as conn:
-        assert conn.execute(select(sessions_table.c.title).where(sessions_table.c.id == str(created.id))).scalar_one() == (
-            "same-session update"
+        row = conn.execute(select(sessions_table).where(sessions_table.c.id == str(created.id))).one()
+    assert row.archived_at is not None
+    assert row.title == "PostgreSQL fence"
+    transaction, session, runs, blobs = captured
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = transaction.database_now  # type: ignore[attr-defined]
+    with pytest.raises(RuntimeError, match="closed"):
+        session.decide_and_soft_archive(archived_at=datetime.now(UTC))  # type: ignore[attr-defined]
+    with pytest.raises(RuntimeError, match="closed"):
+        runs.list_run_events_after(run_id=uuid4(), after_sequence=0)  # type: ignore[attr-defined]
+    with pytest.raises(RuntimeError, match="closed"):
+        blobs.list_blob_run_links(blob_id=uuid4())  # type: ignore[attr-defined]
+    private_states = []
+    for capability in captured:
+        state_names = [name for name in dir(capability) if name.endswith("__state")]
+        assert state_names
+        private_states.append(getattr(capability, state_names[0]))
+    assert len({id(state) for state in private_states}) == 1
+    state = private_states[0]
+    assert not hasattr(state, "_connection")
+    assert state._connection_token not in coordination_repository._MUTATION_CONNECTION_REGISTRY
+
+
+@pytest.mark.parametrize("blocker_relation", ("own", "incoming"))
+def test_postgres_archive_capability_rejects_active_guided_blockers(
+    postgres_engine: Engine,
+    blocker_relation: str,
+) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    target = _create(repository, owner=f"creator-{uuid4()}")
+    if blocker_relation == "own":
+        _seed_in_progress_fork(postgres_engine, parent_session_id=target.id)
+    else:
+        parent = _create(repository, owner=f"creator-{uuid4()}")
+        _seed_in_progress_fork(postgres_engine, parent_session_id=parent.id, result_session_id=target.id)
+    context = repository.acquire(
+        session_id=target.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id=f"archive-{uuid4()}",
+        lease_seconds=30,
+    )
+
+    with pytest.raises(SessionGuidedOperationInProgressError):
+        repository.mutate(
+            context,
+            lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
         )
-        assert (
-            conn.execute(select(blob_deletion_cleanups_table.c.blob_id).where(blob_deletion_cleanups_table.c.blob_id == cleanup_id)).first()
-            is None
-        )
+
+    repository.compare_and_swap(context)
+    with postgres_engine.connect() as conn:
+        archived_at = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(target.id))).scalar_one()
+    assert archived_at is None
 
 
 @pytest.mark.parametrize(
@@ -452,129 +640,36 @@ def test_postgres_fenced_mutation_refuses_unsafe_statement_and_rolls_back(
     repository = PostgresSessionOperationRepository(postgres_engine)
     session_a = _create(repository, owner=f"creator-{uuid4()}")
     session_b = _create(repository, owner=f"creator-{uuid4()}")
-    selected_parent_id = str(uuid4())
-    selected_message_id = str(uuid4())
-    second_selected_message_id = str(uuid4())
-    fence = repository.acquire(
+    context = repository.acquire(
         session_id=session_a.id,
         operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id=f"composer-{uuid4()}",
         lease_seconds=30,
     )
-    session_ids = (str(session_a.id), str(session_b.id), selected_parent_id)
-    selected_message_ids = (selected_message_id, second_selected_message_id)
+    session_ids = (str(session_a.id), str(session_b.id))
     before = _postgres_snapshot_mutation_scope(
         postgres_engine,
         session_ids=session_ids,
-        message_ids=selected_message_ids,
+        message_ids=(),
     )
 
-    if attack_kind == "caller_selected_parent_insert":
-        statement = insert(sessions_table).values(
-            id=selected_parent_id,
-            user_id="attacker",
-            auth_provider_type="local",
-            title="caller selected",
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
-        )
-    elif attack_kind == "lightweight_parent_delete":
-        lightweight_sessions = table("sessions", column("id"))
-        statement = delete(lightweight_sessions).where(lightweight_sessions.c.id == str(session_a.id))
-    elif attack_kind == "lightweight_fence_update":
-        lightweight_fences = table("session_operation_fences", column("session_id"), column("lease_token"))
-        statement = (
-            update(lightweight_fences)
-            .where(lightweight_fences.c.session_id == str(session_a.id))
-            .values(lease_token="forged-lightweight-token")
-        )
-    elif attack_kind == "reflected_fence_update":
-        reflected_fences = Table("session_operation_fences", MetaData(), autoload_with=postgres_engine)
-        statement = (
-            update(reflected_fences)
-            .where(reflected_fences.c.session_id == str(session_a.id))
-            .values(operation_epoch=fence.operation_epoch + 100)
-        )
-    elif attack_kind == "reflected_sessions_update":
-        reflected_sessions = Table("sessions", MetaData(), autoload_with=postgres_engine)
-        statement = (
-            update(reflected_sessions).where(reflected_sessions.c.id == str(session_b.id)).values(title="reflected cross-session update")
-        )
-    elif attack_kind == "mismatched_child_insert":
-        statement = insert(chat_messages_table).values(
-            **_postgres_message_values(message_id=selected_message_id, session_id=str(session_b.id))
-        )
-    elif attack_kind == "multirow_child_insert":
-        statement = insert(chat_messages_table).values(
-            [
-                _postgres_message_values(message_id=selected_message_id, session_id=str(session_b.id)),
-                _postgres_message_values(message_id=second_selected_message_id, session_id=str(session_b.id)),
-            ]
-        )
-    elif attack_kind == "from_select_child_insert":
-        statement = insert(chat_messages_table).from_select(
-            ("id", "session_id", "role", "content", "sequence_no", "writer_principal", "created_at"),
-            select(
-                literal(selected_message_id),
-                literal(str(session_b.id)),
-                literal("user"),
-                literal("from-select"),
-                literal(1),
-                literal("route_user_message"),
-                literal(datetime.now(UTC)),
-            ).where(literal(False)),
-        )
-    elif attack_kind == "lightweight_rate_update":
-        lightweight_rate = table("rate_limit_buckets", column("subject_digest"))
-        statement = update(lightweight_rate).where(lightweight_rate.c.subject_digest == "missing").values(subject_digest="forged-rate-key")
-    elif attack_kind == "reflected_cleanup_delete":
-        reflected_cleanup = Table("sessions_cleanup_claims", MetaData(), autoload_with=postgres_engine)
-        statement = delete(reflected_cleanup)
-    elif attack_kind == "protected_unscoped_select":
-        statement = select(session_operation_fences_table)
-    elif attack_kind == "nested_protected_select":
-        statement = select(
-            sessions_table.c.id,
-            select(session_operation_fences_table.c.operation_id).limit(1).scalar_subquery(),
-        )
-    elif attack_kind == "nested_same_table_select":
-        statement = select(
-            sessions_table.c.id,
-            select(sessions_table.c.title).order_by(sessions_table.c.id).limit(1).scalar_subquery(),
-        )
-    elif attack_kind == "nested_same_table_dml":
-        statement = update(sessions_table).values(
-            title=select(sessions_table.c.title).where(sessions_table.c.id == str(session_b.id)).limit(1).scalar_subquery()
-        )
-    elif attack_kind == "same_table_exists_dml":
-        statement = (
-            update(sessions_table)
-            .where(select(sessions_table.c.id).where(sessions_table.c.id == str(session_b.id)).exists())
-            .values(title="cross-session exists")
-        )
-    else:
-        statement = select(sessions_table.c.id).prefix_with("ALL")
+    def prove_statement_surface_absent(transaction) -> None:
+        assert attack_kind
+        assert not hasattr(transaction, "execute")
+        assert not hasattr(transaction.session, "execute")
+        assert not hasattr(transaction.runs, "execute")
+        assert not hasattr(transaction.blobs, "execute")
 
-    refused = False
-
-    def mutate_then_attack(transaction) -> None:
-        transaction.execute(update(sessions_table).values(title="must roll back"))
-        transaction.execute(statement)
-
-    try:
-        repository.mutate(fence, mutate_then_attack)
-    except ValueError:
-        refused = True
+    repository.mutate(context, prove_statement_surface_absent)
 
     assert (
         _postgres_snapshot_mutation_scope(
             postgres_engine,
             session_ids=session_ids,
-            message_ids=selected_message_ids,
+            message_ids=(),
         )
         == before
     )
-    assert refused is True
 
 
 @pytest.mark.parametrize(
@@ -596,12 +691,7 @@ def test_postgres_fenced_update_rejects_every_ownership_assignment(
     repository = PostgresSessionOperationRepository(postgres_engine)
     session_a = _create(repository, owner=f"creator-{uuid4()}")
     session_b = _create(repository, owner=f"creator-{uuid4()}")
-    cleanup_id = str(uuid4())
-    with postgres_engine.begin() as conn:
-        conn.execute(
-            insert(blob_deletion_cleanups_table).values(**_postgres_cleanup_values(cleanup_id=cleanup_id, session_id=str(session_a.id)))
-        )
-    fence = repository.acquire(
+    context = repository.acquire(
         session_id=session_a.id,
         operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id=f"composer-{uuid4()}",
@@ -612,52 +702,25 @@ def test_postgres_fenced_update_rejects_every_ownership_assignment(
         postgres_engine,
         session_ids=session_ids,
         message_ids=(),
-        cleanup_ids=(cleanup_id,),
     )
 
-    if assignment_shape == "child_values_string":
-        statement = update(blob_deletion_cleanups_table).values(session_id=str(session_b.id))
-    elif assignment_shape == "child_values_column_unchanged":
-        statement = update(blob_deletion_cleanups_table).values({blob_deletion_cleanups_table.c.session_id: str(session_a.id)})
-    elif assignment_shape == "child_ordered_string":
-        statement = update(blob_deletion_cleanups_table).ordered_values(("session_id", str(session_b.id)))
-    elif assignment_shape == "child_ordered_column":
-        statement = update(blob_deletion_cleanups_table).ordered_values((blob_deletion_cleanups_table.c.session_id, str(session_b.id)))
-    elif assignment_shape == "parent_values_id_unchanged":
-        statement = update(sessions_table).values(id=str(session_a.id))
-    elif assignment_shape == "parent_ordered_id_unchanged":
-        statement = update(sessions_table).ordered_values(("id", str(session_a.id)))
-    else:
-        statement = (
-            postgresql_insert(blob_deletion_cleanups_table)
-            .values(**_postgres_cleanup_values(cleanup_id=cleanup_id, session_id=str(session_a.id)))
-            .on_conflict_do_update(
-                index_elements=(blob_deletion_cleanups_table.c.blob_id,),
-                set_={"session_id": str(session_b.id)},
-            )
-        )
+    def prove_ownership_assignment_surface_absent(transaction) -> None:
+        assert assignment_shape
+        for capability in (transaction, transaction.session, transaction.runs, transaction.blobs):
+            assert not hasattr(capability, "execute")
+            assert not hasattr(capability, "session_id")
+            assert not hasattr(capability, "update")
 
-    refused = False
-
-    def mutate_then_reassign(transaction) -> None:
-        transaction.execute(update(sessions_table).values(title="must roll back ownership reassignment"))
-        transaction.execute(statement)
-
-    try:
-        repository.mutate(fence, mutate_then_reassign)
-    except ValueError:
-        refused = True
+    repository.mutate(context, prove_ownership_assignment_surface_absent)
 
     assert (
         _postgres_snapshot_mutation_scope(
             postgres_engine,
             session_ids=session_ids,
             message_ids=(),
-            cleanup_ids=(cleanup_id,),
         )
         == before
     )
-    assert refused is True
 
 
 class _ObservedDatabaseClockRepository(PostgresSessionOperationRepository):
@@ -681,7 +744,7 @@ def test_postgres_waiter_cannot_act_after_expiry(
     repository = PostgresSessionOperationRepository(postgres_engine)
     created = _create(repository, owner=f"creator-{uuid4()}")
     kind = SessionOperationKind.ARCHIVE if operation == "archive_delete" else SessionOperationKind.COMPOSE
-    fence = repository.acquire(
+    context = repository.acquire(
         session_id=created.id,
         operation_kind=kind,
         owner_instance_id=f"waiter-{uuid4()}",
@@ -704,15 +767,15 @@ def test_postgres_waiter_cannot_act_after_expiry(
 
             def mutation(transaction) -> None:
                 callback_called.set()
-                transaction.execute(update(sessions_table).values(title="written-after-expiry"))
+                _ = transaction.database_now
 
-            contender.mutate(fence, mutation)
+            contender.mutate(context, mutation)
         elif operation == "renew":
-            contender.renew(fence, lease_seconds=30)
+            contender.renew(context, lease_seconds=30)
         elif operation == "release":
-            contender.release(fence)
+            contender.release(context)
         else:
-            contender.archive_delete(fence)
+            contender.archive_delete(context)
 
     blocker = postgres_engine.connect()
     blocker_transaction = blocker.begin()

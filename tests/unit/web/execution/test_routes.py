@@ -22,10 +22,14 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 from starlette.routing import Route
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService
 from elspeth.web.execution.schemas import (
@@ -47,11 +51,15 @@ from elspeth.web.execution.schemas import (
     ValidationResult,
 )
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
+from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateRecord, RunAlreadyActiveError, RunRecord, SessionRecord, SessionServiceProtocol
+from elspeth.web.sessions.schema import initialize_session_schema
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
 _TEST_USER_ID = "test-user-123"
+_ROUTE_SESSION_OPERATION_OWNER = "execution-routes-test"
+_ROUTE_SESSION_OPERATION_LEASE_SECONDS = 30
 
 
 @dataclass
@@ -147,6 +155,51 @@ def _progress_broadcaster() -> Any:
     return create_autospec(ProgressBroadcaster, instance=True, spec_set=True)
 
 
+@dataclass(frozen=True, slots=True)
+class _RouteSessionHarness:
+    authority: SQLiteLocalSessionOperationAuthority
+    session: SessionRecord
+
+
+def _route_session_harness() -> _RouteSessionHarness:
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    initialize_session_schema(engine)
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = authority.create_session_with_initial_fence(
+        user_id=_TEST_USER_ID,
+        title="Execution route test session",
+        auth_provider_type="local",
+        owner_instance_id=_ROUTE_SESSION_OPERATION_OWNER,
+        lease_seconds=_ROUTE_SESSION_OPERATION_LEASE_SECONDS,
+    )
+    return _RouteSessionHarness(authority=authority, session=session)
+
+
+def _execute_accepting_transferred_lease(run_id: UUID) -> Callable[..., Awaitable[UUID]]:
+    async def execute(
+        session_id: UUID,
+        state_id: UUID | None = None,
+        *,
+        session_operation_lease: SessionOperationLease,
+        user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        fanout_ack_token: str | None = None,
+    ) -> UUID:
+        del state_id, user_id, auth_provider_type, fanout_ack_token
+        assert type(session_operation_lease) is SessionOperationLease
+        assert session_operation_lease.context.fence.session_id == str(session_id)
+        assert session_operation_lease.context.operation_kind is SessionOperationKind.EXECUTE
+        await session_operation_lease.close()
+        assert session_operation_lease.closed
+        return run_id
+
+    return execute
+
+
 def _composition_state_record(
     *,
     session_id: UUID,
@@ -203,11 +256,16 @@ def _create_test_app(
     app.state.websocket_ticket_store = WebSocketTicketStore()
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
 
-    # Mock session_service for ownership checks
+    # Keep service behavior mocked while exercising the real lease authority.
     mock_session_service = _session_service()
-    mock_session_service.get_session.return_value = _session_record()
+    route_session = _route_session_harness()
+    mock_session_service.session_operation_authority = route_session.authority
+    mock_session_service.session_operation_owner_instance_id = _ROUTE_SESSION_OPERATION_OWNER
+    mock_session_service.session_operation_lease_seconds = _ROUTE_SESSION_OPERATION_LEASE_SECONDS
+    mock_session_service.get_session.return_value = route_session.session
     mock_session_service.get_run.return_value = _run_record()
     app.state.session_service = mock_session_service
+    app.state.route_session_id = route_session.session.id
 
     # Mock settings for ownership checks
     app.state.settings = _FakeWebSettings()
@@ -335,7 +393,7 @@ class TestValidateEndpoint:
         )
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/validate")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/validate")
             assert resp.status_code == 200
             body = resp.json()
             assert body["is_valid"] is True
@@ -350,14 +408,13 @@ class TestValidateEndpoint:
         )
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/validate")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/validate")
             assert resp.status_code == 200
             svc.validate.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_validate_state_id_delegates_to_validate_state(self) -> None:
         """An explicit state_id validates that reviewed snapshot, not latest."""
-        session_id = uuid4()
         state_id = uuid4()
         svc = _execution_service()
         svc.validate = AsyncMock(
@@ -368,6 +425,7 @@ class TestValidateEndpoint:
             return_value=ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness()),
         )
         app = _create_test_app(execution_service=svc)
+        session_id = app.state.route_session_id
         app.state.session_service.get_state = AsyncMock(
             spec=SessionServiceProtocol.get_state, return_value=_composition_state_record(session_id=session_id, state_id=state_id)
         )
@@ -386,7 +444,6 @@ class TestValidateEndpoint:
     @pytest.mark.asyncio
     async def test_validate_state_id_hides_missing_state(self) -> None:
         """Missing state_id returns the same 404 shape as inaccessible states."""
-        session_id = uuid4()
         state_id = uuid4()
         svc = _execution_service()
         svc.validate = AsyncMock(
@@ -396,6 +453,7 @@ class TestValidateEndpoint:
             spec=ExecutionService.validate_state,
         )
         app = _create_test_app(execution_service=svc)
+        session_id = app.state.route_session_id
         app.state.session_service.get_state = AsyncMock(spec=SessionServiceProtocol.get_state, side_effect=ValueError("missing"))
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -412,7 +470,6 @@ class TestValidateEndpoint:
     @pytest.mark.asyncio
     async def test_validate_state_id_hides_cross_session_state(self) -> None:
         """Cross-session state_id returns the same 404 shape as missing states."""
-        session_id = uuid4()
         state_id = uuid4()
         svc = _execution_service()
         svc.validate = AsyncMock(
@@ -422,6 +479,7 @@ class TestValidateEndpoint:
             spec=ExecutionService.validate_state,
         )
         app = _create_test_app(execution_service=svc)
+        session_id = app.state.route_session_id
         app.state.session_service.get_state = AsyncMock(
             spec=SessionServiceProtocol.get_state, return_value=_composition_state_record(session_id=uuid4(), state_id=state_id)
         )
@@ -459,7 +517,7 @@ class TestValidateEndpoint:
         )
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/validate")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/validate")
             assert resp.status_code == 200
             body = resp.json()
             assert body["is_valid"] is False
@@ -472,10 +530,10 @@ class TestExecuteEndpoint:
     async def test_execute_returns_202_with_run_id(self) -> None:
         expected_run_id = uuid4()
         svc = _execution_service()
-        svc.execute = AsyncMock(spec=ExecutionService.execute, return_value=expected_run_id)
+        svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=_execute_accepting_transferred_lease(expected_run_id))
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
             assert resp.status_code == 202
             body = resp.json()
             assert body["run_id"] == str(expected_run_id)
@@ -488,7 +546,7 @@ class TestExecuteEndpoint:
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=RunAlreadyActiveError("Already active"))
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
             assert resp.status_code == 409
             body = resp.json()
             # Seam Contract D: flat envelope, not nested
@@ -510,7 +568,7 @@ class TestExecuteEndpoint:
         app = _create_test_app(execution_service=svc)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
 
         assert resp.status_code == 500
         detail = resp.json()["detail"]
@@ -525,12 +583,12 @@ class TestExecuteEndpoint:
     async def test_execute_forwards_fanout_ack_token_to_service(self) -> None:
         expected_run_id = uuid4()
         svc = _execution_service()
-        svc.execute = AsyncMock(spec=ExecutionService.execute, return_value=expected_run_id)
+        svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=_execute_accepting_transferred_lease(expected_run_id))
         app = _create_test_app(execution_service=svc)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
-                f"/api/sessions/{uuid4()}/execute",
+                f"/api/sessions/{app.state.route_session_id}/execute",
                 json={"fanout_ack_token": "ack-test-token"},
             )
 
@@ -568,7 +626,7 @@ class TestExecuteEndpoint:
         app = _create_test_app(execution_service=svc)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
 
         assert resp.status_code == 428
         detail = resp.json()["detail"]
@@ -635,7 +693,7 @@ class TestExecuteEndpoint:
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
         assert resp.status_code == 422
         body = resp.json()
         detail = body["detail"]
@@ -693,7 +751,7 @@ class TestExecuteEndpoint:
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
         assert resp.status_code == 422
         detail = resp.json()["detail"]
         assert detail["error_type"] == "pipeline_validation_failure"
@@ -724,7 +782,7 @@ class TestExecuteEndpoint:
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
         assert resp.status_code == 422
         body = resp.json()
         detail = body["detail"]
@@ -1597,7 +1655,7 @@ class TestExecuteIDORAndPathTraversal:
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
-                f"/api/sessions/{uuid4()}/execute",
+                f"/api/sessions/{app.state.route_session_id}/execute",
                 params={"state_id": str(uuid4())},
             )
             assert resp.status_code == 404
@@ -1630,11 +1688,11 @@ class TestExecuteIDORAndPathTraversal:
             AsyncClient(transport=ASGITransport(app=app_b), base_url="http://test") as client_b,
         ):
             resp_a = await client_a.post(
-                f"/api/sessions/{uuid4()}/execute",
+                f"/api/sessions/{app_a.state.route_session_id}/execute",
                 params={"state_id": str(uuid4())},
             )
             resp_b = await client_b.post(
-                f"/api/sessions/{uuid4()}/execute",
+                f"/api/sessions/{app_b.state.route_session_id}/execute",
                 params={"state_id": str(uuid4())},
             )
 
@@ -1668,8 +1726,8 @@ class TestExecuteIDORAndPathTraversal:
             AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client_a,
             AsyncClient(transport=ASGITransport(app=app_b), base_url="http://test") as client_b,
         ):
-            resp_a = await client_a.post(f"/api/sessions/{uuid4()}/execute")
-            resp_b = await client_b.post(f"/api/sessions/{uuid4()}/execute")
+            resp_a = await client_a.post(f"/api/sessions/{app_a.state.route_session_id}/execute")
+            resp_b = await client_b.post(f"/api/sessions/{app_b.state.route_session_id}/execute")
 
         assert resp_a.status_code == resp_b.status_code == 404
         assert resp_a.content == resp_b.content
@@ -1687,7 +1745,7 @@ class TestExecuteIDORAndPathTraversal:
         )
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
             assert resp.status_code == 400
             assert "resolves outside" in resp.json()["detail"]
 
@@ -1703,7 +1761,7 @@ class TestExecuteIDORAndPathTraversal:
         )
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
             assert resp.status_code == 400
             assert "resolves outside" in resp.json()["detail"]
 
@@ -1716,7 +1774,7 @@ class TestExecuteIDORAndPathTraversal:
         svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=MalformedBlobRefError("blob_ref must be a UUID"))
         app = _create_test_app(execution_service=svc)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+            resp = await client.post(f"/api/sessions/{app.state.route_session_id}/execute")
             assert resp.status_code == 400
             assert resp.json()["detail"] == "blob_ref must be a UUID"
 

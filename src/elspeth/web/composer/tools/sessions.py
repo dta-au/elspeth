@@ -1206,10 +1206,16 @@ def _execute_set_pipeline(
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _tool_failure_result(state, "set_pipeline source.inline_blob requires session context.")
+    session_operation_authority = context.session_operation_authority
+    session_operation_context = context.session_operation_context
+    if session_operation_authority is None or session_operation_context is None:
+        return _tool_failure_result(state, "set_pipeline source.inline_blob requires session operation authority context.")
     quota_error = _persist_prepared_blob_create(
         prepared_inline_blob,
         session_engine=session_engine,
         session_id=session_id,
+        session_operation_authority=session_operation_authority,
+        session_operation_context=session_operation_context,
         max_blob_storage_per_session_bytes=context.max_blob_storage_per_session_bytes,
     )
     if quota_error is not None:

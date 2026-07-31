@@ -46,6 +46,7 @@ from __future__ import annotations
 import ast
 import re
 import textwrap
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,7 @@ _LOCK_HELPER_NAMES = (
 )
 
 _SESSION_WRITE_LOCK_NAME = "_session_write_lock"
+_TYPED_SESSION_AUTHORITY_LOCK_MARKER_NAME = "_session_authority_lock_marker"
 _LOCK_HELD_ASSERT_NAME = "_assert_session_write_lock_held"
 _PAIRED_SESSION_WRITE_LOCK_NAME = "_session_pair_locked_begin"
 
@@ -281,6 +283,52 @@ class _WriterCollector(ast.NodeVisitor):
         self.source_lines = source.splitlines()
         self.tree = tree
         self.matches: list[WriterMatch] = []
+        self.table_aliases: dict[str, str] = dict(_TABLE_IDENTIFIER_TO_NAME)
+        self.insert_aliases = {"insert"}
+        self.sqlalchemy_aliases = {"sqlalchemy"}
+        self._collect_aliases()
+
+    def _collect_aliases(self) -> None:
+        """Resolve the simple import/assignment aliases used by test fixtures."""
+
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Import):
+                for imported in node.names:
+                    if imported.name == "sqlalchemy":
+                        self.sqlalchemy_aliases.add(imported.asname or imported.name)
+            elif isinstance(node, ast.ImportFrom):
+                for imported in node.names:
+                    local = imported.asname or imported.name
+                    if imported.name == "insert" and (node.module or "").startswith("sqlalchemy"):
+                        self.insert_aliases.add(local)
+                    if imported.name in _TABLE_IDENTIFIER_TO_NAME:
+                        self.table_aliases[local] = _TABLE_IDENTIFIER_TO_NAME[imported.name]
+
+        # Assignment aliases may be chained, so iterate to a fixed point.
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(self.tree):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                value = node.value
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                table = self._table_name(value)
+                if table is not None:
+                    for target in targets:
+                        if isinstance(target, ast.Name) and self.table_aliases.get(target.id) != table:
+                            self.table_aliases[target.id] = table
+                            changed = True
+                if isinstance(value, ast.Name) and value.id in self.insert_aliases:
+                    for target in targets:
+                        if isinstance(target, ast.Name) and target.id not in self.insert_aliases:
+                            self.insert_aliases.add(target.id)
+                            changed = True
+
+    def _table_name(self, expression: ast.expr | None) -> str | None:
+        if isinstance(expression, ast.Name):
+            return self.table_aliases.get(expression.id)
+        return None
 
     def collect(self) -> list[WriterMatch]:
         self.visit(self.tree)
@@ -294,23 +342,32 @@ class _WriterCollector(ast.NodeVisitor):
         # Pattern 1: insert(chat_messages_table) — bare ``insert`` call with
         # a single Name argument that resolves to a tracked table identifier.
         func = node.func
-        if isinstance(func, ast.Name) and func.id == "insert" and node.args:
+        is_insert_call = isinstance(func, ast.Name) and func.id in self.insert_aliases
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "insert"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in self.sqlalchemy_aliases
+        ):
+            is_insert_call = True
+        if is_insert_call and node.args:
             first = node.args[0]
-            if isinstance(first, ast.Name) and first.id in _TABLE_IDENTIFIER_TO_NAME:
+            table = self._table_name(first)
+            if table is not None:
                 self._emit(
                     node,
-                    table=_TABLE_IDENTIFIER_TO_NAME[first.id],
+                    table=table,
                     operation="sqlalchemy_insert_call",
                 )
 
         # Pattern 2: chat_messages_table.insert() — Attribute access on a
         # tracked table identifier, with attr ``insert``.
         if isinstance(func, ast.Attribute) and func.attr == "insert":
-            value = func.value
-            if isinstance(value, ast.Name) and value.id in _TABLE_IDENTIFIER_TO_NAME:
+            table = self._table_name(func.value)
+            if table is not None:
                 self._emit(
                     node,
-                    table=_TABLE_IDENTIFIER_TO_NAME[value.id],
+                    table=table,
                     operation="sqlalchemy_table_insert",
                 )
 
@@ -402,14 +459,43 @@ def scan_writers(
     return matches
 
 
+def _writer_key(writer: ReviewedWriter | WriterMatch) -> tuple[str, str, str, str]:
+    return (writer.path, writer.enclosing_symbol, writer.table, writer.operation)
+
+
+def inventory_drift(
+    matches: Sequence[WriterMatch],
+    allowlist: Sequence[ReviewedWriter],
+) -> tuple[list[WriterMatch], list[ReviewedWriter]]:
+    """Return unexpected live sites and stale manifest rows with exact multiplicity."""
+
+    remaining_allowed = Counter(_writer_key(entry) for entry in allowlist)
+    unexpected: list[WriterMatch] = []
+    for match in matches:
+        key = _writer_key(match)
+        if remaining_allowed[key]:
+            remaining_allowed[key] -= 1
+        else:
+            unexpected.append(match)
+
+    remaining_live = Counter(_writer_key(match) for match in matches)
+    stale: list[ReviewedWriter] = []
+    for entry in allowlist:
+        key = _writer_key(entry)
+        if remaining_live[key]:
+            remaining_live[key] -= 1
+        else:
+            stale.append(entry)
+    return unexpected, stale
+
+
 def violations(
     matches: Sequence[WriterMatch],
     allowlist: Sequence[ReviewedWriter],
 ) -> list[WriterMatch]:
-    """Return matches whose ``(path, enclosing_symbol, table, operation)`` is not allowlisted."""
+    """Return live sites not covered by the multiplicity-aware allowlist."""
 
-    allowed_keys = {(entry.path, entry.enclosing_symbol, entry.table, entry.operation) for entry in allowlist}
-    return [m for m in matches if (m.path, m.enclosing_symbol, m.table, m.operation) not in allowed_keys]
+    return inventory_drift(matches, allowlist)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +541,12 @@ def _with_block_establishes_session_write_lock(with_node: ast.With | ast.AsyncWi
         func_name = _call_callable_name(ctx)
         if func_name == _SESSION_WRITE_LOCK_NAME:
             if _same_expression(writer_conn, _argument(ctx, 0, "conn")) and _same_expression(
+                writer_session,
+                _argument(ctx, 1, "session_id"),
+            ):
+                return True
+        elif func_name == _TYPED_SESSION_AUTHORITY_LOCK_MARKER_NAME:
+            if _same_expression(writer_conn, _argument(ctx, 0, "transaction")) and _same_expression(
                 writer_session,
                 _argument(ctx, 1, "session_id"),
             ):
@@ -782,24 +874,29 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         ),
     ),
     ReviewedWriter(
-        path="src/elspeth/web/sessions/service.py",
-        enclosing_symbol="SessionServiceImpl.fork_session._sync",
+        path="src/elspeth/web/coordination/repository.py",
+        enclosing_symbol="_ForkChildSessionMutations.append_child_messages",
         table="chat_messages",
         operation="sqlalchemy_insert_call",
         purpose=(
-            "fork_session batch-copies source-session chat rows. Task 14 (§14.6) "
-            "did NOT route this through ``_insert_chat_message`` — that would mean "
-            "N single-row inserts instead of one batch ``conn.execute(insert(...), "
-            "rows)`` and is materially slower for large source histories. Instead, "
-            "the batch is now wrapped in ``_session_write_lock(new_session_id)`` "
-            "with the chat ``sequence_no`` reserved via ``_reserve_sequence_range`` "
-            "for ``len(msg_records_data)`` rows in one allocation; the same lock "
-            "context covers the composition-state copy. ``writer_principal`` is "
-            "preserved verbatim from the source row (no role-keyed fabrication); "
-            "synthetic system + new edited-user rows use ``writer_principal="
-            "session_fork``. Tool rows have ``parent_assistant_id`` rewritten to "
-            "the copied assistant id; rows whose source parent is excluded from "
-            "the slice raise the precise RuntimeError before the FK can fire."
+            "Fork creation batch-copies child chat rows through the exact "
+            "``SessionForkChildMutations`` facet. It revalidates the retained "
+            "live child context before allocation and INSERT while the canonical "
+            "parent/child pair transaction remains the lifetime owner; no generic "
+            "SQL capability is exposed to the session service."
+        ),
+    ),
+    ReviewedWriter(
+        path="src/elspeth/web/coordination/repository.py",
+        enclosing_symbol="_ForkChildSessionMutations.insert_child_state",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Fork creation inserts the copied state through the exact "
+            "``SessionForkChildMutations`` facet. It revalidates the retained live "
+            "child context before version allocation and INSERT inside the same "
+            "canonical pair transaction; no generic SQL capability is exposed to "
+            "the session service."
         ),
     ),
     ReviewedWriter(
@@ -1088,14 +1185,6 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "focused on trigger/cascade semantics."
         ),
     ),
-    # ------ tests/unit/web/sessions/test_fork.py — corruption fixture ------
-    ReviewedWriter(
-        path="tests/unit/web/sessions/test_fork.py",
-        enclosing_symbol="test_orphaned_chat_message_recovery",
-        table="chat_messages",
-        operation="raw_string_in_execute",
-        purpose="corruption fixture: PRAGMA foreign_keys=OFF + raw INSERT to deliberately violate FK; tests fork_session's defensive check (line 179)",
-    ),
     # ------ tests/unit/evals/lib/test_decode_tools.py — standalone eval fixture ------
     ReviewedWriter(
         path="tests/unit/evals/lib/test_decode_tools.py",
@@ -1216,17 +1305,6 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "composer-service fixture helper: creates a deterministic "
             "route-level user message anchor for blob provenance tests while "
             "the service path under test remains the composer loop."
-        ),
-    ),
-    ReviewedWriter(
-        path="tests/unit/web/composer/test_service.py",
-        enclosing_symbol="TestComposerTextOnlyResponse.test_blob_only_success_then_empty_state_reply_returns_no_state_mutation_blocker",
-        table="chat_messages",
-        operation="sqlalchemy_table_insert",
-        purpose=(
-            "composer-service scenario fixture: seeds the exact user-message "
-            "anchor for a blob-only turn so the test can assert the text-only "
-            "response handling rather than the chat-message writer."
         ),
     ),
     ReviewedWriter(
@@ -1352,28 +1430,6 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "is the OperationalError param to simulate a real chat_messages "
             "INSERT failure; the test asserts the success-path tool-invocation "
             "helper raises AuditIntegrityError (500). Not an executed query"
-        ),
-    ),
-    ReviewedWriter(
-        path="tests/unit/web/sessions/test_routes.py",
-        enclosing_symbol="TestMessageRoutes.test_guided_respond_tool_invocation_persistence_failure_raises_on_success_path.flaky_add_message",
-        table="chat_messages",
-        operation="raw_string_in_OperationalError",
-        purpose=(
-            "Guided-mode audit sidecar canary: OperationalError statement "
-            "string simulates a real chat_messages INSERT failure after the "
-            "state transition succeeds; not an executed query"
-        ),
-    ),
-    ReviewedWriter(
-        path="tests/unit/web/sessions/test_routes.py",
-        enclosing_symbol="TestMessageRoutes.test_guided_chat_turn_persistence_failure_raises_on_success_path.flaky_add_message",
-        table="chat_messages",
-        operation="raw_string_in_OperationalError",
-        purpose=(
-            "Guided chat audit-row canary: OperationalError statement string "
-            "simulates a failed audit chat_messages INSERT so the route must "
-            "surface 500 instead of swallowing audit loss; not an executed query"
         ),
     ),
     ReviewedWriter(
@@ -1529,83 +1585,101 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Allowlist refresh helpers
+# Explicit fixture-writer identities
 # ---------------------------------------------------------------------------
 #
-# The reviewed-writer snapshot for ``tests/unit/web/blobs/test_service.py``
-# (12 sites) and ``tests/unit/web/composer/test_tools.py`` (5 sites) is
-# tedious to enumerate by hand: each line lives in a distinct test
-# function and the enclosing-symbol resolution requires AST traversal.
-# Rather than hand-tabulating 16 entries, we expand the allowlist at
-# import time with a hard-coded purpose tag, then verify the expanded
-# set matches the §57-68 reviewed snapshot count exactly. Any drift
-# (a new direct insert added in either file) shows up as a violation.
-
-_BLOBS_ALLOWLIST_PATH = "tests/unit/web/blobs/test_service.py"
-_BLOBS_EXPECTED_LINES = (318, 377, 441, 520, 590, 656, 733, 795, 1366, 1521, 1976, 2344)
-_COMPOSER_TOOLS_ALLOWLIST_PATH = "tests/unit/web/composer/test_tools.py"
-_COMPOSER_TOOLS_EXPECTED_LINES = (3125, 3188, 7581, 7634, 7875)
-
-
-def _expand_dynamic_allowlist(
-    base: tuple[ReviewedWriter, ...],
-    repo_root: Path,
-) -> tuple[ReviewedWriter, ...]:
-    """Expand the allowlist with line-anchored entries for blobs/composer tests.
-
-    Reads each target file once via the scanner, captures the
-    enclosing_symbol for every ``composition_states_table.insert(...)``
-    site, and emits a ReviewedWriter with the ``blobs_test_state_setup``
-    or ``composer_tools_test_state_setup`` purpose tag.
-
-    Any drift (a removed line, an added line, a renamed enclosing
-    function) shows up as a violation in the live-tree test because the
-    expanded allowlist won't include the new shape.
-    """
-
-    additions: list[ReviewedWriter] = []
-    for rel, expected_lines, purpose in (
-        (
-            _BLOBS_ALLOWLIST_PATH,
-            _BLOBS_EXPECTED_LINES,
-            "blob test setup row to satisfy composition_state_id FK on blob_run_links",
+# These entries are deliberately literal.  The old implementation discovered
+# the symbols from the live tree and checked only a count, which allowed a
+# removed site to be silently replaced by a different site.  Repeated entries
+# are meaningful: ``inventory_drift`` compares Counters, not sets.
+_EXPLICIT_FIXTURE_WRITERS: tuple[ReviewedWriter, ...] = tuple(
+    ReviewedWriter(*identity)
+    for identity in (
+        # Existing blob/composer FK setup sites.
+        *(
+            (
+                "tests/unit/web/blobs/test_service.py",
+                symbol,
+                "composition_states",
+                "sqlalchemy_table_insert",
+                "blob test setup row to satisfy composition-state/run FKs",
+            )
+            for symbol in (
+                "TestDeleteBlob.test_delete_blob_rejects_when_active_run_linked",
+                "TestDeleteBlob.test_delete_blob_allows_when_completed_run_linked",
+                "TestDeleteBlob.test_delete_blob_preserves_completed_inline_resolution_audit_rows",
+                "TestDeleteBlob.test_delete_blob_rejects_when_active_run_exists_without_link",
+                "TestDeleteBlob.test_delete_blob_allows_when_active_run_uses_different_source",
+                "TestDeleteBlob.test_delete_blob_rejects_when_transform_option_references_blob",
+                "TestDeleteBlob.test_delete_blob_rejects_when_active_run_path_matches_storage",
+                "TestDeleteBlob.test_delete_blob_allows_when_completed_run_exists_without_link",
+                "TestFinalizeRunOutputBlobs.run_env",
+                "TestFinalizeRunOutputBlobsPartialFailure.run_env",
+                "TestFinalizeRunOutputBlobsErrorCleanup.run_env",
+                "TestLinkBlobToRunDirectionGuard._make_run",
+            )
+        ),
+        *(
+            (
+                "tests/unit/web/composer/test_tools.py",
+                symbol,
+                "composition_states",
+                "sqlalchemy_table_insert",
+                "composer tool test setup row creates a composition state",
+            )
+            for symbol in (
+                "TestDeleteBlobActiveRunGuard._insert_run_and_link",
+                "TestDeleteBlobActiveRunGuard._insert_run_without_link",
+                "TestUpdateBlobActiveRunGuard._insert_run_and_link",
+                "TestUpdateBlobActiveRunGuard._insert_run_without_link",
+                "TestUpdateBlobAtomicWrite.test_guard_rejection_leaves_storage_untouched_and_no_tempfile",
+            )
         ),
         (
-            _COMPOSER_TOOLS_ALLOWLIST_PATH,
-            _COMPOSER_TOOLS_EXPECTED_LINES,
-            "composer test setup row creates composition_state for tool-test scenario",
+            "tests/unit/web/sessions/test_count_tool_responses_for_assistant.py",
+            "_persist_assistant_with_tools",
+            "chat_messages",
+            "sqlalchemy_insert_call",
+            "second static chat insert in the helper seeds each tool response",
         ),
-    ):
-        target = repo_root / rel
-        matches = scan_writers([target.parent], path_anchor=repo_root)
-        target_matches = [
-            m for m in matches if m.path == rel and m.table == "composition_states" and m.operation == "sqlalchemy_table_insert"
-        ]
-        # Index by line for deterministic mapping. The expected_lines
-        # tuple anchors the snapshot; if any line is missing or extra,
-        # the live-tree test fails because the allowlist doesn't cover
-        # the new shape.
-        for match in target_matches:
-            additions.append(
-                ReviewedWriter(
-                    path=match.path,
-                    enclosing_symbol=match.enclosing_symbol,
-                    table=match.table,
-                    operation=match.operation,
-                    purpose=f"{purpose} (line {match.line})",
-                )
-            )
-        # Snapshot count check: drift in either direction (added or
-        # removed line) breaks the §57-68 inventory and requires review.
-        if len(target_matches) != len(expected_lines):
-            raise AssertionError(
-                f"reviewed inventory drift: {rel} expected "
-                f"{len(expected_lines)} composition_states writer sites "
-                f"(lines {expected_lines}), found {len(target_matches)} "
-                f"({sorted(m.line for m in target_matches)}). The §57-68 "
-                f"inventory must be updated before this test can pass."
-            )
-    return base + tuple(additions)
+        # Task-4 derived-mutation fixtures (one SQLite, one PostgreSQL).
+        (
+            "tests/unit/web/coordination/test_session_derived_mutations.py",
+            "_seed_run_and_blob",
+            "composition_states",
+            "sqlalchemy_insert_call",
+            "Task-4 SQLite fixture seeds the derived mutation parent row",
+        ),
+        (
+            "tests/testcontainer/web/test_session_derived_mutations_postgres.py",
+            "_seed_run_and_blob",
+            "composition_states",
+            "sqlalchemy_insert_call",
+            "Task-4 PostgreSQL fixture seeds the derived mutation parent row",
+        ),
+        (
+            "tests/unit/web/coordination/test_sqlite_session_operation_authority.py",
+            "_mutate_fork",
+            "chat_messages",
+            "sqlalchemy_insert_call",
+            "B3 exact composite fork helper seeds the required parent fork-message FK anchor",
+        ),
+        (
+            "tests/unit/web/coordination/test_sqlite_session_operation_authority.py",
+            "_seed_parent_messages",
+            "chat_messages",
+            "sqlalchemy_insert_call",
+            "B3 fork-lineage fixtures seed parent message FK anchors with distinct identities",
+        ),
+        (
+            "tests/unit/web/coordination/test_sqlite_session_operation_authority.py",
+            "test_fork_creation_transaction_refuses_third_session_writes.forbidden",
+            "chat_messages",
+            "sqlalchemy_insert_call",
+            "B3 fork-creation custody negative presents an otherwise allowed insert bound to a third session",
+        ),
+    )
+)
 
 
 def _format_violations(
@@ -1655,12 +1729,12 @@ def test_static_direct_writers_match_reviewed_allowlist() -> None:
     """
 
     repo_root = _find_repo_root()
-    allowlist = _expand_dynamic_allowlist(_REVIEWED_ALLOWLIST, repo_root)
+    allowlist = _REVIEWED_ALLOWLIST + _EXPLICIT_FIXTURE_WRITERS
     matches = scan_writers(
         [repo_root / "src", repo_root / "tests"],
         path_anchor=repo_root,
     )
-    direct = violations(matches, allowlist)
+    direct, stale = inventory_drift(matches, allowlist)
     lock = check_lock_discipline(
         [repo_root / "src", repo_root / "tests"],
         path_anchor=repo_root,
@@ -1675,6 +1749,9 @@ def test_static_direct_writers_match_reviewed_allowlist() -> None:
         path_anchor=repo_root,
     )
     report = _format_violations(direct, lock, helper_assert, inline)
+    if stale:
+        stale_report = "\n".join(f"  {entry.path} [{entry.table}/{entry.operation}] in {entry.enclosing_symbol}" for entry in stale)
+        report = f"{report}\nStale reviewed writer identities:\n{stale_report}".lstrip()
     assert not report, (
         "Static direct-writer guard found unreviewed sites or lock-discipline drift.\n"
         "If a new writer/helper-call is intentional, update _REVIEWED_ALLOWLIST or the\n"
@@ -1737,6 +1814,78 @@ def test_static_direct_writer_guard_rejects_unreviewed_state_insert(tmp_path: Pa
         f"scanner failed to detect synthetic unallowlisted composition_states insert; matches={matches} unallowed={unallowed}"
     )
     assert any("test_synthetic_state_writer.py" in m.path for m in unallowed)
+
+
+def test_static_direct_writer_guard_counts_duplicate_identical_sites(tmp_path: Path) -> None:
+    synthetic = tmp_path / "duplicate.py"
+    synthetic.write_text(
+        "from elspeth.web.sessions.models import chat_messages_table\n"
+        "from sqlalchemy import insert\n"
+        "def writer(conn):\n"
+        "    conn.execute(insert(chat_messages_table))\n"
+        "    conn.execute(insert(chat_messages_table))\n"
+    )
+    matches = scan_writers([tmp_path], path_anchor=tmp_path)
+    one_entry = (
+        ReviewedWriter(
+            path="duplicate.py",
+            enclosing_symbol="writer",
+            table="chat_messages",
+            operation="sqlalchemy_insert_call",
+            purpose="one reviewed occurrence",
+        ),
+    )
+    unexpected, stale = inventory_drift(matches, one_entry)
+    assert len(matches) == 2
+    assert len(unexpected) == 1
+    assert stale == []
+
+
+def test_static_direct_writer_guard_detects_aliased_dml(tmp_path: Path) -> None:
+    synthetic = tmp_path / "aliased.py"
+    synthetic.write_text(
+        "from elspeth.web.sessions.models import chat_messages_table as messages\n"
+        "from sqlalchemy import insert as sa_insert\n"
+        "def writer(conn):\n"
+        "    conn.execute(sa_insert(messages))\n"
+    )
+    matches = scan_writers([tmp_path], path_anchor=tmp_path)
+    assert [(match.table, match.operation) for match in matches] == [("chat_messages", "sqlalchemy_insert_call")]
+
+
+def test_static_direct_writer_guard_rejects_same_count_replacement(tmp_path: Path) -> None:
+    synthetic = tmp_path / "replacement.py"
+    synthetic.write_text(
+        "from elspeth.web.sessions.models import composition_states_table\n"
+        "def writer(conn):\n"
+        "    conn.execute(composition_states_table.insert())\n"
+    )
+    matches = scan_writers([tmp_path], path_anchor=tmp_path)
+    replaced_manifest = (
+        ReviewedWriter(
+            path="replacement.py",
+            enclosing_symbol="writer",
+            table="chat_messages",
+            operation="sqlalchemy_table_insert",
+            purpose="the old site had the same total count",
+        ),
+    )
+    unexpected, stale = inventory_drift(matches, replaced_manifest)
+    assert len(unexpected) == 1
+    assert len(stale) == 1
+
+
+def test_static_direct_writer_guard_rejects_stale_manifest_entry() -> None:
+    stale_entry = ReviewedWriter(
+        path="removed.py",
+        enclosing_symbol="removed_writer",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose="removed site",
+    )
+    unexpected, stale = inventory_drift([], (stale_entry,))
+    assert unexpected == []
+    assert stale == [stale_entry]
 
 
 def test_static_helper_lock_guard_rejects_unlocked_allocator(tmp_path: Path) -> None:

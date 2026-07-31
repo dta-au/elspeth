@@ -6,24 +6,22 @@ thread pool executor to avoid blocking the async event loop.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
-import shutil
 import threading
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, final
 from uuid import UUID
 
 import structlog
 from opentelemetry import metrics
-from sqlalchemy import ColumnElement, Connection, Engine, delete, desc, exists, func, insert, or_, select, update
-from sqlalchemy.dialects.postgresql import insert as postgresql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import ColumnElement, Connection, Engine, case, delete, desc, exists, func, insert, or_, select, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
@@ -65,7 +63,19 @@ from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 # the audit-primacy rule (a broken OTel exporter must not 500 a POST
 # whose audit row already wrote).
 from elspeth.web.composer.telemetry_phase8 import record_interpretation_opt_out
-from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+from elspeth.web.composer.tools import is_blob_store_only_mutation_tool
+from elspeth.web.coordination.contracts import (
+    ArchiveManifestRelation,
+    FenceLossReason,
+    SessionOperationContext,
+    SessionOperationFenceLost,
+    SessionOperationKind,
+)
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.repository import (
+    PostgresSessionOperationRepository,
+    SessionDerivedCustodyError,
+)
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -80,6 +90,16 @@ from elspeth.web.interpretation_state import (
     validate_pipeline_decision_node_semantics,
 )
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, StatePayload
+from elspeth.web.sessions.archive_quarantine import (
+    ArchiveQuarantineIdentity,
+    canonical_archive_present,
+    list_archive_quarantine_manifests,
+    prepare_archive_quarantine,
+    purge_archive_quarantine,
+    restore_archive_quarantine,
+    retire_archive_quarantine,
+    stage_archive_quarantine,
+)
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.guided_audit import (
     bind_guided_failure_audit_rows,
@@ -104,33 +124,31 @@ from elspeth.web.sessions.locking import (
 )
 from elspeth.web.sessions.models import (
     audit_access_log_table,
-    blob_inline_resolutions_table,
     blobs_table,
     chat_messages_table,
-    composer_completion_events_table,
     composition_proposals_table,
     composition_states_table,
     guided_operation_admission_blocks_table,
     guided_operation_events_table,
     guided_operations_table,
     interpretation_events_table,
+    proposal_blob_effect_receipts_table,
     proposal_events_table,
     run_events_table,
     runs_table,
+    session_operation_fences_table,
     sessions_table,
-    skill_markdown_history_table,
 )
+from elspeth.web.sessions.proposal_blob_effects import blob_row_snapshot_payload, proposal_blob_arguments_hash
 from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
 from elspeth.web.sessions.protocol import (
     AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST,
-    AUDIT_GRADE_VIEW_WRITER_PRINCIPAL,
     GUIDED_FAILURE_AUDIT_LINEAGE_KEY,
     GUIDED_OPERATION_FAILURE_CODE_VALUES,
     GUIDED_OPERATION_KIND_VALUES,
-    LEGAL_RUN_TRANSITIONS,
-    OPERATOR_COMPLETION_RUN_STATUS_VALUES,
     SESSION_RUN_EVENT_TYPE_VALUES,
     SESSION_TERMINAL_RUN_STATUS_VALUES,
+    AuditAccessLogAuthority,
     AuditAccessLogRecord,
     AuditAccessLogWriteError,
     AuthoritativeCompositionProposal,
@@ -183,7 +201,6 @@ from elspeth.web.sessions.protocol import (
     GuidedStartStateSeeded,
     GuidedStateOperationCommand,
     GuidedStateOperationSettlement,
-    IllegalRunTransitionError,
     PipelineDispatchRecovery,
     PipelineProposalPublicMetadata,
     PipelineProposalRejectionReason,
@@ -192,12 +209,18 @@ from elspeth.web.sessions.protocol import (
     PreparedGuidedJsonPayload,
     ProposalEventRecord,
     ProposalLifecycleStatus,
-    RunAlreadyActiveError,
     RunEventRecord,
     RunRecord,
-    SessionGuidedOperationInProgressError,
+    SessionArchiveDisposition,
+    SessionForkAuthority,
+    SessionForkChildCreation,
+    SessionForkChildMessageCreation,
+    SessionForkChildStateCreation,
+    SessionForkCreationTransaction,
+    SessionForkParentAuthority,
     SessionNotFoundError,
     SessionOperationAuthority,
+    SessionOperationMutationTransaction,
     SessionRecord,
     SessionRunEventType,
     SessionRunStatus,
@@ -206,6 +229,10 @@ from elspeth.web.sessions.protocol import (
     ToolCallIDMismatchError,
     TransitionAssistantDraft,
     TransitionResponseSettlement,
+)
+from elspeth.web.sessions.skill_markdown_history import (
+    RepositorySkillMarkdownHistoryAuthority,
+    SkillMarkdownHistoryAuthority,
 )
 from elspeth.web.sessions.telemetry import _SessionsTelemetry
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE, _validate_accepted_value_content
@@ -748,29 +775,36 @@ def _verify_rejected_pipeline_authority(
 
 
 def _verify_pipeline_lifecycle_authority(
-    conn: Connection,
+    conn: Connection | SessionForkCreationTransaction,
     *,
     service: SessionServiceImpl,
     authority: AuthoritativePipelineProposal,
 ) -> None:
     """Verify the complete canonical lifecycle before exposing or mutating it."""
     if authority.row.status == "committed":
+        if isinstance(conn, SessionForkCreationTransaction):
+            raise AuditIntegrityError("fork source proposal must remain pending")
         _verify_committed_pipeline_authority(conn, service=service, authority=authority)
         return
     if authority.row.status == "rejected":
+        if isinstance(conn, SessionForkCreationTransaction):
+            raise AuditIntegrityError("fork source proposal must remain pending")
         _verify_rejected_pipeline_authority(conn, authority=authority)
         return
     if authority.row.status != "pending":
         raise AuditIntegrityError("pipeline proposal lifecycle status is malformed")
     sid = str(authority.row.session_id)
     pid = str(authority.row.id)
-    terminal_count = conn.execute(
-        select(func.count())
-        .select_from(proposal_events_table)
-        .where(proposal_events_table.c.session_id == sid)
-        .where(proposal_events_table.c.proposal_id == pid)
-        .where(proposal_events_table.c.event_type.in_(("proposal.accepted", "proposal.rejected")))
-    ).scalar_one()
+    if isinstance(conn, SessionForkCreationTransaction):
+        terminal_count = conn.count_parent_proposal_terminal_events(authority.row.id)
+    else:
+        terminal_count = conn.execute(
+            select(func.count(proposal_events_table.c.id))
+            .select_from(proposal_events_table)
+            .where(proposal_events_table.c.session_id == sid)
+            .where(proposal_events_table.c.proposal_id == pid)
+            .where(proposal_events_table.c.event_type.in_(("proposal.accepted", "proposal.rejected")))
+        ).scalar_one()
     if terminal_count != 0:
         raise AuditIntegrityError("pending pipeline proposal must not have a terminal event")
     if authority.row.audit_event_id != authority.creation_event_id or authority.row.committed_state_id is not None:
@@ -832,7 +866,7 @@ def _verify_guided_correction_message_authority(
 
 
 def _verify_guided_root_message_authority(
-    conn: Connection,
+    conn: Connection | SessionForkCreationTransaction,
     *,
     service: Any,
     session_id: str,
@@ -846,21 +880,43 @@ def _verify_guided_root_message_authority(
     from elspeth.web.sessions.schemas import StartGuidedRequest
 
     message_id = guided.root_intent_message_id
-    message_row = conn.execute(
-        select(chat_messages_table.c.role, chat_messages_table.c.content, chat_messages_table.c.writer_principal)
-        .where(chat_messages_table.c.session_id == session_id)
-        .where(chat_messages_table.c.id == message_id)
-    ).one_or_none()
+    if isinstance(conn, SessionForkCreationTransaction):
+        try:
+            root_message_id = UUID(message_id)
+        except ValueError as exc:
+            raise AuditIntegrityError("guided root intent message id is malformed") from exc
+        message_row, operations, state_row = conn.read_parent_guided_root_authority(root_message_id)
+    else:
+        message_row = conn.execute(
+            select(
+                chat_messages_table.c.role,
+                chat_messages_table.c.content,
+                chat_messages_table.c.writer_principal,
+            )
+            .where(chat_messages_table.c.session_id == session_id)
+            .where(chat_messages_table.c.id == message_id)
+        ).one_or_none()
+        operations = tuple(
+            conn.execute(
+                select(guided_operations_table)
+                .where(guided_operations_table.c.session_id == session_id)
+                .where(guided_operations_table.c.kind == "guided_start")
+                .where(guided_operations_table.c.status == "completed")
+                .where(guided_operations_table.c.originating_message_id == message_id)
+                .where(guided_operations_table.c.result_kind == "composition_state")
+            ).fetchall()
+        )
+        state_row = (
+            conn.execute(
+                select(composition_states_table)
+                .where(composition_states_table.c.session_id == session_id)
+                .where(composition_states_table.c.id == operations[0].result_state_id)
+            ).one_or_none()
+            if len(operations) == 1
+            else None
+        )
     if message_row is None or message_row.role != "user" or message_row.writer_principal != "route_user_message":
         raise AuditIntegrityError("guided root intent row failed session/role/writer custody")
-    operations = conn.execute(
-        select(guided_operations_table)
-        .where(guided_operations_table.c.session_id == session_id)
-        .where(guided_operations_table.c.kind == "guided_start")
-        .where(guided_operations_table.c.status == "completed")
-        .where(guided_operations_table.c.originating_message_id == message_id)
-        .where(guided_operations_table.c.result_kind == "composition_state")
-    ).fetchall()
     if len(operations) != 1:
         raise AuditIntegrityError("guided root intent has absent or ambiguous start-operation authority")
     operation = operations[0]
@@ -877,11 +933,6 @@ def _verify_guided_root_message_authority(
         != operation.request_hash
     ):
         raise AuditIntegrityError("guided root intent content no longer matches its start request hash")
-    state_row = conn.execute(
-        select(composition_states_table)
-        .where(composition_states_table.c.session_id == session_id)
-        .where(composition_states_table.c.id == operation.result_state_id)
-    ).one_or_none()
     if state_row is None:
         raise AuditIntegrityError("guided root intent start result state is missing")
     start_guided = state_from_record(service._row_to_state_record(state_row)).guided_session
@@ -1368,6 +1419,7 @@ def _fork_blob_plan_content(
                 {
                     "source_blob_id": str(entry.source_blob_id),
                     "target_blob_id": str(entry.target_blob_id),
+                    "source_storage_path": entry.source_storage_path,
                     "content_hash": entry.content_hash,
                     "size_bytes": entry.size_bytes,
                 }
@@ -1408,7 +1460,13 @@ def _fork_blob_plan_from_content(
         raise AuditIntegrityError("staged fork blob plan source_blobs must be a list")
     entries: list[BlobForkPlanEntry] = []
     for item in source_blobs:
-        if type(item) is not dict or set(item) != {"source_blob_id", "target_blob_id", "content_hash", "size_bytes"}:
+        if type(item) is not dict or set(item) != {
+            "source_blob_id",
+            "target_blob_id",
+            "source_storage_path",
+            "content_hash",
+            "size_bytes",
+        }:
             raise AuditIntegrityError("staged fork blob plan entry has malformed keys")
         try:
             raw_source_blob_id = item["source_blob_id"]
@@ -1430,6 +1488,7 @@ def _fork_blob_plan_from_content(
             entry = BlobForkPlanEntry(
                 source_blob_id=source_blob_id,
                 target_blob_id=target_blob_id,
+                source_storage_path=item["source_storage_path"],
                 content_hash=item["content_hash"],
                 size_bytes=item["size_bytes"],
             )
@@ -1661,7 +1720,7 @@ def _proposal_event_record_from_row(row: Any) -> ProposalEventRecord:
 
 def _restore_authoritative_pipeline_proposal(
     *,
-    conn: Connection,
+    conn: Connection | SessionForkCreationTransaction,
     row: CompositionProposalRecord,
     creation_event: ProposalEventRecord,
     reviewed_facts: Mapping[str, Any] | None,
@@ -1778,19 +1837,25 @@ def _restore_authoritative_pipeline_proposal(
     if (supersedes_proposal_id is None) != (proposal.supersedes_draft_hash is None):
         raise AuditIntegrityError("pipeline proposal supersedes id/draft binding is incomplete")
     if supersedes_proposal_id is not None:
-        referenced_row = conn.execute(
-            select(composition_proposals_table)
-            .where(composition_proposals_table.c.session_id == str(row.session_id))
-            .where(composition_proposals_table.c.id == str(supersedes_proposal_id))
-        ).one_or_none()
+        if isinstance(conn, SessionForkCreationTransaction):
+            referenced_row = conn.read_parent_proposal(supersedes_proposal_id)
+            referenced_events = conn.read_parent_proposal_creation_events(supersedes_proposal_id)
+        else:
+            referenced_row = conn.execute(
+                select(composition_proposals_table)
+                .where(composition_proposals_table.c.session_id == str(row.session_id))
+                .where(composition_proposals_table.c.id == str(supersedes_proposal_id))
+            ).one_or_none()
+            referenced_events = tuple(
+                conn.execute(
+                    select(proposal_events_table)
+                    .where(proposal_events_table.c.session_id == str(row.session_id))
+                    .where(proposal_events_table.c.proposal_id == str(supersedes_proposal_id))
+                    .where(proposal_events_table.c.event_type == "proposal.created")
+                ).fetchall()
+            )
         if referenced_row is None:
             raise AuditIntegrityError("pipeline proposal supersedes target is missing or cross-session")
-        referenced_events = conn.execute(
-            select(proposal_events_table)
-            .where(proposal_events_table.c.session_id == str(row.session_id))
-            .where(proposal_events_table.c.proposal_id == str(supersedes_proposal_id))
-            .where(proposal_events_table.c.event_type == "proposal.created")
-        ).fetchall()
         if len(referenced_events) != 1:
             raise AuditIntegrityError("pipeline proposal supersedes target creation authority is malformed")
         referenced_payload = referenced_events[0].payload
@@ -1814,7 +1879,7 @@ def _restore_authoritative_pipeline_proposal(
 
 
 def _require_pending_guided_checkpoint_proposal_authority(
-    conn: Connection,
+    conn: Connection | SessionForkCreationTransaction,
     *,
     service: SessionServiceImpl,
     session_id: str,
@@ -1855,19 +1920,25 @@ def _require_pending_guided_checkpoint_proposal_authority(
     if reference is None:
         return None
 
-    proposal_row = conn.execute(
-        select(composition_proposals_table)
-        .where(composition_proposals_table.c.session_id == session_id)
-        .where(composition_proposals_table.c.id == str(reference.proposal_id))
-    ).one_or_none()
+    if isinstance(conn, SessionForkCreationTransaction):
+        proposal_row = conn.read_parent_proposal(reference.proposal_id)
+        creation_rows = conn.read_parent_proposal_creation_events(reference.proposal_id)
+    else:
+        proposal_row = conn.execute(
+            select(composition_proposals_table)
+            .where(composition_proposals_table.c.session_id == session_id)
+            .where(composition_proposals_table.c.id == str(reference.proposal_id))
+        ).one_or_none()
+        creation_rows = tuple(
+            conn.execute(
+                select(proposal_events_table)
+                .where(proposal_events_table.c.session_id == session_id)
+                .where(proposal_events_table.c.proposal_id == str(reference.proposal_id))
+                .where(proposal_events_table.c.event_type == "proposal.created")
+            ).fetchall()
+        )
     if proposal_row is None:
         raise AuditIntegrityError(f"{role} guided proposal authority is missing or cross-session")
-    creation_rows = conn.execute(
-        select(proposal_events_table)
-        .where(proposal_events_table.c.session_id == session_id)
-        .where(proposal_events_table.c.proposal_id == str(reference.proposal_id))
-        .where(proposal_events_table.c.event_type == "proposal.created")
-    ).fetchall()
     if len(creation_rows) != 1:
         raise AuditIntegrityError(f"{role} guided proposal must have exactly one creation event")
     authority = _restore_authoritative_pipeline_proposal(
@@ -1876,7 +1947,13 @@ def _require_pending_guided_checkpoint_proposal_authority(
         creation_event=_proposal_event_record_from_row(creation_rows[0]),
         reviewed_facts=guided_private_reviewed_facts(guided),
     )
-    _verify_pipeline_lifecycle_authority(conn, service=service, authority=authority)
+    if authority.row.status != "pending":
+        raise AuditIntegrityError(f"{role} guided checkpoint references a terminal pipeline proposal")
+    _verify_pipeline_lifecycle_authority(
+        conn,
+        service=service,
+        authority=authority,
+    )
     proposal = authority.proposal
     if (
         reference.proposal_id != authority.row.id
@@ -1893,11 +1970,14 @@ def _require_pending_guided_checkpoint_proposal_authority(
         raise AuditIntegrityError(f"{role} guided proposal authority has an invalid surface")
     if type(proposal.base) is not PresentBase:
         raise AuditIntegrityError(f"{role} guided proposal checkpoint base is malformed")
-    base_row = conn.execute(
-        select(composition_states_table)
-        .where(composition_states_table.c.session_id == session_id)
-        .where(composition_states_table.c.id == str(proposal.base.state_id))
-    ).one_or_none()
+    if isinstance(conn, SessionForkCreationTransaction):
+        base_row = conn.read_parent_state(proposal.base.state_id)
+    else:
+        base_row = conn.execute(
+            select(composition_states_table)
+            .where(composition_states_table.c.session_id == session_id)
+            .where(composition_states_table.c.id == str(proposal.base.state_id))
+        ).one_or_none()
     if base_row is None:
         raise AuditIntegrityError(f"{role} guided proposal base is missing or cross-session")
     base_record = service._row_to_state_record(base_row)
@@ -1905,8 +1985,6 @@ def _require_pending_guided_checkpoint_proposal_authority(
         raise AuditIntegrityError(f"{role} guided proposal base content binding is malformed")
     if proposal.base.composition_content_hash != composition_content_hash(state_from_record(checkpoint)):
         raise AuditIntegrityError(f"{role} guided proposal checkpoint base content binding is malformed")
-    if authority.row.status != "pending":
-        raise AuditIntegrityError(f"{role} guided checkpoint references a terminal pipeline proposal")
     return authority
 
 
@@ -2006,89 +2084,6 @@ def _verify_guided_pending_proposal_invalidation(
     if proposal.base.composition_content_hash != context.expected_current_content_hash:
         raise AuditIntegrityError("guided proposal invalidation base content hash changed")
     return authority
-
-
-def _reject_guided_pending_proposal(
-    conn: Connection,
-    *,
-    authority: AuthoritativePipelineProposal,
-    actor: str,
-    created_at: datetime,
-) -> None:
-    """Append one immutable supersession event and terminalize the pending row."""
-
-    session_id = str(authority.row.session_id)
-    proposal_id = str(authority.row.id)
-    _require_no_active_guided_confirmation_admission(
-        conn,
-        session_id=session_id,
-        proposal_id=proposal_id,
-        now=created_at,
-    )
-    event_id = str(uuid.uuid4())
-    conn.execute(
-        insert(proposal_events_table).values(
-            id=event_id,
-            session_id=session_id,
-            proposal_id=proposal_id,
-            event_type="proposal.rejected",
-            actor=actor,
-            payload=_pipeline_rejected_payload(authority=authority, reason="superseded", dispatch=None),
-            created_at=created_at,
-        )
-    )
-    updated = conn.execute(
-        update(composition_proposals_table)
-        .where(composition_proposals_table.c.session_id == session_id)
-        .where(composition_proposals_table.c.id == proposal_id)
-        .where(composition_proposals_table.c.status == "pending")
-        .values(
-            status="rejected",
-            committed_state_id=None,
-            audit_event_id=event_id,
-            updated_at=created_at,
-        )
-    )
-    if updated.rowcount != 1:
-        raise AuditIntegrityError("guided proposal invalidation lost the pending proposal CAS")
-
-
-def _require_no_active_guided_confirmation_admission(
-    conn: Connection,
-    *,
-    session_id: str,
-    proposal_id: str,
-    now: datetime,
-) -> None:
-    """Fail a competing mutation while a live confirmation owns dispatch.
-
-    Expired leases cannot dispatch or persist under their old fence, so their
-    proposal locator is released before the active-owner check. This prevents
-    an abandoned admission from fencing the proposal forever.
-    """
-
-    conn.execute(
-        update(guided_operations_table)
-        .where(
-            guided_operations_table.c.session_id == session_id,
-            guided_operations_table.c.proposal_id == proposal_id,
-            guided_operations_table.c.status == "in_progress",
-            guided_operations_table.c.lease_expires_at <= now,
-        )
-        .values(proposal_id=None, updated_at=now)
-    )
-    active = conn.execute(
-        select(guided_operations_table.c.operation_id)
-        .where(
-            guided_operations_table.c.session_id == session_id,
-            guided_operations_table.c.proposal_id == proposal_id,
-            guided_operations_table.c.status == "in_progress",
-            guided_operations_table.c.lease_expires_at > now,
-        )
-        .limit(1)
-    ).one_or_none()
-    if active is not None:
-        raise GuidedOperationSettlementConflictError()
 
 
 def _classify_authoritative_composition_proposal(
@@ -3369,12 +3364,1088 @@ def _resolve_model_choice_review(
     return state_record.sources, final_nodes, None
 
 
-class SessionServiceImpl:
-    """Concrete session service backed by SQLAlchemy Core.
+@final
+class _SessionComposerMutationState:
+    """Private lifetime and exact operation-kind binding for one DB transaction."""
 
-    All public methods are async. Database I/O runs through _run_sync() in a
-    bounded worker thread so the async event loop is never blocked.
-    """
+    __slots__ = ("__active", "__connection", "__expected_kind", "__service", "__session_context", "__session_id")
+
+    def __init__(
+        self,
+        service: SessionServiceImpl,
+        connection: Connection,
+        *,
+        session_id: str,
+        session_operation_context: SessionOperationContext,
+        expected_kind: SessionOperationKind,
+    ) -> None:
+        self.__service = service
+        self.__connection = connection
+        self.__session_id = session_id
+        self.__session_context = session_operation_context
+        self.__expected_kind = expected_kind
+        self.__active = True
+
+    def _require_active(self) -> tuple[SessionServiceImpl, Connection, str, SessionOperationContext]:
+        if not self.__active:
+            raise AuditIntegrityError("composer mutation transaction is not active")
+        return self.__service, self.__connection, self.__session_id, self.__session_context
+
+    def _require_exact(self) -> tuple[SessionServiceImpl, Connection, str, datetime]:
+        service, connection, session_id, session_context = self._require_active()
+        now = service._guided_database_now(connection)
+        service._require_session_operation_context_on_connection(
+            connection,
+            session_context,
+            session_id=session_id,
+            expected_kind=self.__expected_kind,
+            now=now,
+        )
+        return service, connection, session_id, now
+
+    def _close(self) -> None:
+        self.__active = False
+
+
+@final
+class _SessionComposerMutations:
+    """Narrow ordinary proposal writes under one exact operation authority."""
+
+    __slots__ = ("__state",)
+
+    def __init__(self, state: _SessionComposerMutationState) -> None:
+        self.__state = state
+
+    def record_preferences_changed(
+        self,
+        *,
+        event_id: str,
+        actor: str,
+        trust_mode: ComposerTrustMode,
+        prior_trust_mode: ComposerTrustMode,
+        density_default: ComposerDensityDefault,
+        transaction_time: datetime,
+    ) -> None:
+        """Append the preferences audit event under exact COMPOSE authority."""
+        _service, connection, session_id, _now = self.__state._require_exact()
+        connection.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=session_id,
+                proposal_id=None,
+                event_type="trust_mode.changed",
+                actor=actor,
+                payload={
+                    "trust_mode": trust_mode,
+                    "prior_trust_mode": prior_trust_mode,
+                    "density_default": density_default,
+                },
+                created_at=transaction_time,
+            )
+        )
+
+    def create_composition_proposal(
+        self,
+        *,
+        proposal_id: str,
+        event_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        summary: str,
+        rationale: str,
+        affects: Sequence[str],
+        arguments_json: Mapping[str, Any],
+        arguments_redacted_json: Mapping[str, Any],
+        base_state_id: UUID | None,
+        actor: str,
+        user_message_id: UUID | None,
+        composer_provenance: Mapping[str, str | None],
+    ) -> CompositionProposalRecord:
+        _service, connection, session_id, _now = self.__state._require_exact()
+        validate_proposal_blob_references(
+            connection,
+            session_id=session_id,
+            tool_name=tool_name,
+            arguments=arguments_json,
+        )
+        _service, connection, session_id, now = self.__state._require_exact()
+        connection.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=session_id,
+                proposal_id=proposal_id,
+                event_type="proposal.created",
+                actor=actor,
+                payload={
+                    "schema": _TOOL_PROPOSAL_CREATED_SCHEMA,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "status": "pending",
+                },
+                created_at=now,
+            )
+        )
+        connection.execute(
+            insert(composition_proposals_table).values(
+                id=proposal_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                user_message_id=str(user_message_id) if user_message_id is not None else None,
+                composer_model_identifier=composer_provenance["composer_model_identifier"],
+                composer_model_version=composer_provenance["composer_model_version"],
+                composer_provider=composer_provenance["composer_provider"],
+                composer_skill_hash=composer_provenance["composer_skill_hash"],
+                tool_arguments_hash=composer_provenance["tool_arguments_hash"],
+                tool_name=tool_name,
+                status="pending",
+                summary=summary,
+                rationale=rationale,
+                affects=list(affects),
+                arguments_json=deep_thaw(arguments_json),
+                arguments_redacted_json=deep_thaw(arguments_redacted_json),
+                base_state_id=str(base_state_id) if base_state_id else None,
+                committed_state_id=None,
+                audit_event_id=event_id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        row = connection.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == proposal_id)).one()
+        return _proposal_record_from_row(row)
+
+    def create_pipeline_composition_proposal(
+        self,
+        *,
+        proposal_id: str,
+        event_id: str,
+        plan: PipelinePlanResult,
+        summary: str,
+        rationale: str,
+        affects: Sequence[str],
+        arguments_redacted_json: Mapping[str, Any],
+        actor: str,
+        normalized_provenance: Mapping[str, str | None],
+        payload: Mapping[str, Any],
+        user_message_id: UUID | None,
+        supersedes_proposal_id: UUID | None,
+    ) -> CompositionProposalRecord:
+        service, connection, session_id, _now = self.__state._require_exact()
+        proposal = plan.proposal
+        current_row = connection.execute(
+            select(composition_states_table)
+            .where(composition_states_table.c.session_id == session_id)
+            .order_by(desc(composition_states_table.c.version))
+            .limit(1)
+        ).one_or_none()
+        if type(proposal.base) is AbsentBase:
+            if current_row is not None:
+                raise StaleComposeStateError("pipeline proposal absent base conflicts with current state")
+            base_state_id = None
+        elif type(proposal.base) is PresentBase:
+            if current_row is None or current_row.id != str(proposal.base.state_id):
+                raise StaleComposeStateError("pipeline proposal present base state changed before creation")
+            current_record = service._row_to_state_record(current_row)
+            if composition_content_hash(state_from_record(current_record)) != proposal.base.composition_content_hash:
+                raise StaleComposeStateError("pipeline proposal present base content changed before creation")
+            base_state_id = str(proposal.base.state_id)
+        else:
+            raise AuditIntegrityError("pipeline proposal base is malformed")
+
+        if supersedes_proposal_id is not None:
+            superseded = connection.execute(
+                select(composition_proposals_table)
+                .where(composition_proposals_table.c.id == str(supersedes_proposal_id))
+                .where(composition_proposals_table.c.session_id == session_id)
+            ).one_or_none()
+            if superseded is None:
+                raise AuditIntegrityError("superseded pipeline proposal is not owned by this session")
+            superseded_events = connection.execute(
+                select(proposal_events_table)
+                .where(proposal_events_table.c.session_id == session_id)
+                .where(proposal_events_table.c.proposal_id == str(supersedes_proposal_id))
+                .where(proposal_events_table.c.event_type == "proposal.created")
+            ).fetchall()
+            if len(superseded_events) != 1:
+                raise AuditIntegrityError("superseded pipeline proposal has invalid creation authority")
+            superseded_payload = superseded_events[0].payload
+            if (
+                not isinstance(superseded_payload, Mapping)
+                or superseded_payload.get("schema") != _PIPELINE_CREATED_SCHEMA
+                or superseded_payload.get("draft_hash") != proposal.supersedes_draft_hash
+            ):
+                raise AuditIntegrityError("superseded pipeline proposal draft binding mismatch")
+
+        validate_proposal_blob_references(
+            connection,
+            session_id=session_id,
+            tool_name="set_pipeline",
+            arguments=deep_thaw(proposal.pipeline),
+        )
+        service, connection, session_id, now = self.__state._require_exact()
+        connection.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=session_id,
+                proposal_id=proposal_id,
+                event_type="proposal.created",
+                actor=actor,
+                payload=payload,
+                created_at=now,
+            )
+        )
+        connection.execute(
+            insert(composition_proposals_table).values(
+                id=proposal_id,
+                session_id=session_id,
+                tool_call_id=plan.tool_call_id,
+                user_message_id=str(user_message_id) if user_message_id is not None else None,
+                composer_model_identifier=normalized_provenance["composer_model_identifier"],
+                composer_model_version=normalized_provenance["composer_model_version"],
+                composer_provider=normalized_provenance["composer_provider"],
+                composer_skill_hash=normalized_provenance["composer_skill_hash"],
+                tool_arguments_hash=normalized_provenance["tool_arguments_hash"],
+                tool_name="set_pipeline",
+                status="pending",
+                summary=summary,
+                rationale=rationale,
+                affects=list(affects),
+                arguments_json=deep_thaw(proposal.pipeline),
+                arguments_redacted_json=deep_thaw(arguments_redacted_json),
+                base_state_id=base_state_id,
+                committed_state_id=None,
+                audit_event_id=event_id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        row = connection.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == proposal_id)).one()
+        record = _proposal_record_from_row(row)
+        authority = AuthoritativePipelineProposal(
+            row=record,
+            proposal=proposal,
+            creation_event_id=UUID(event_id),
+            custody_result=plan.custody_result,
+            supersedes_proposal_id=supersedes_proposal_id,
+        )
+        return replace(record, pipeline_metadata=_pipeline_public_metadata(authority))
+
+    def _validated_blob_effect_receipt(self, proposal_row: Any) -> Any | None:
+        """Read one receipt and prove its proposal and committed-result binding."""
+        _service, connection, session_id, _now = self.__state._require_exact()
+        receipt_rows = connection.execute(
+            select(proposal_blob_effect_receipts_table).where(
+                proposal_blob_effect_receipts_table.c.proposal_id == proposal_row.id,
+                proposal_blob_effect_receipts_table.c.session_id == session_id,
+            )
+        ).fetchall()
+        if len(receipt_rows) > 1:
+            raise AuditIntegrityError("Tier 1: blob proposal has multiple applied-effect receipts")
+        if not receipt_rows:
+            return None
+        receipt = receipt_rows[0]
+        if proposal_row.tool_name not in {"update_blob", "delete_blob"}:
+            raise AuditIntegrityError("Tier 1: non-blob proposal has an applied blob-effect receipt")
+        if (
+            receipt.proposal_id != proposal_row.id
+            or receipt.session_id != session_id
+            or receipt.tool_name != proposal_row.tool_name
+            or type(receipt.blob_id) is not str
+            or not receipt.blob_id
+        ):
+            raise AuditIntegrityError("Tier 1: blob effect receipt identity binding is malformed")
+        expected_arguments_hash = proposal_blob_arguments_hash(
+            tool_name=proposal_row.tool_name,
+            arguments=proposal_row.arguments_json,
+            blob_id=receipt.blob_id,
+        )
+        if receipt.arguments_hash != expected_arguments_hash:
+            raise AuditIntegrityError("Tier 1: blob effect receipt arguments binding changed")
+        if type(receipt.result_blob_snapshot) is not dict:
+            raise AuditIntegrityError("Tier 1: blob effect receipt result snapshot is malformed")
+        if (
+            receipt.result_blob_snapshot.get("id") != receipt.blob_id
+            or receipt.result_blob_snapshot.get("session_id") != session_id
+            or not is_lower_sha256_hex(receipt.result_blob_snapshot_hash)
+            or stable_hash(receipt.result_blob_snapshot) != receipt.result_blob_snapshot_hash
+        ):
+            raise AuditIntegrityError("Tier 1: blob effect receipt result hash is malformed")
+        if proposal_row.status == "pending":
+            live_blob = connection.execute(
+                select(blobs_table).where(
+                    blobs_table.c.id == receipt.blob_id,
+                    blobs_table.c.session_id == session_id,
+                )
+            ).one_or_none()
+            if receipt.tool_name == "update_blob":
+                if live_blob is None or blob_row_snapshot_payload(live_blob) != receipt.result_blob_snapshot:
+                    raise AuditIntegrityError("Tier 1: applied update_blob receipt no longer matches the committed blob result")
+            elif live_blob is not None:
+                raise AuditIntegrityError("Tier 1: applied delete_blob receipt still has live blob metadata")
+            if receipt.accepted_event_id is not None or receipt.accepted_at is not None:
+                raise AuditIntegrityError("Tier 1: pending blob proposal receipt is already bound to acceptance")
+        elif proposal_row.status == "committed":
+            if receipt.accepted_event_id != proposal_row.audit_event_id or receipt.accepted_at is None:
+                raise AuditIntegrityError("Tier 1: committed blob proposal receipt lacks its exact accepted-event binding")
+        else:
+            raise AuditIntegrityError("Tier 1: rejected blob proposal retained an applied-effect receipt")
+        return receipt
+
+    def has_applied_blob_effect(self, *, proposal_id: str) -> bool:
+        _service, connection, session_id, _now = self.__state._require_exact()
+        proposal_row = connection.execute(
+            select(composition_proposals_table).where(
+                composition_proposals_table.c.id == proposal_id,
+                composition_proposals_table.c.session_id == session_id,
+            )
+        ).one_or_none()
+        if proposal_row is None:
+            raise KeyError(proposal_id)
+        return self._validated_blob_effect_receipt(proposal_row) is not None
+
+    def reject_pending_proposal(
+        self,
+        *,
+        proposal_id: str,
+        event_id: str,
+        actor: str,
+    ) -> None:
+        """Append and bind one terminal rejection under exact PROPOSAL authority."""
+        _service, connection, session_id, now = self.__state._require_exact()
+        proposal_row = connection.execute(
+            select(composition_proposals_table).where(
+                composition_proposals_table.c.id == proposal_id,
+                composition_proposals_table.c.session_id == session_id,
+            )
+        ).one_or_none()
+        if proposal_row is None:
+            raise KeyError(proposal_id)
+        if self._validated_blob_effect_receipt(proposal_row) is not None:
+            raise ValueError(f"Proposal {proposal_id} has an applied blob effect and must complete acceptance")
+        connection.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=session_id,
+                proposal_id=proposal_id,
+                event_type="proposal.rejected",
+                actor=actor,
+                payload={"status": "rejected"},
+                created_at=now,
+            )
+        )
+        updated = connection.execute(
+            update(composition_proposals_table)
+            .where(composition_proposals_table.c.id == proposal_id)
+            .where(composition_proposals_table.c.session_id == session_id)
+            .where(composition_proposals_table.c.status == "pending")
+            .values(
+                status="rejected",
+                audit_event_id=event_id,
+                updated_at=now,
+            )
+        )
+        if updated.rowcount != 1:
+            raise ValueError(f"Proposal {proposal_id} must be pending to reject")
+
+    def accept_pending_ordinary_proposal(
+        self,
+        *,
+        proposal_id: str,
+        event_id: str,
+        expected_current_state_id: UUID | None,
+        state: CompositionStateData | None,
+        actor: str,
+    ) -> CompositionProposalRecord:
+        """Atomically bind one ordinary proposal to its accepted state."""
+        service, connection, session_id, _now = self.__state._require_exact()
+        proposal_row = connection.execute(
+            select(composition_proposals_table)
+            .where(composition_proposals_table.c.id == proposal_id)
+            .where(composition_proposals_table.c.session_id == session_id)
+        ).one_or_none()
+        if proposal_row is None:
+            raise KeyError(proposal_id)
+        creation_rows = connection.execute(
+            select(proposal_events_table)
+            .where(proposal_events_table.c.session_id == session_id)
+            .where(proposal_events_table.c.proposal_id == proposal_id)
+            .where(proposal_events_table.c.event_type == "proposal.created")
+        ).fetchall()
+        if len(creation_rows) != 1:
+            raise AuditIntegrityError("ordinary proposal acceptance requires exactly one creation event")
+        authority = _classify_authoritative_composition_proposal(
+            conn=connection,
+            row=_proposal_record_from_row(proposal_row),
+            creation_event=_proposal_event_record_from_row(creation_rows[0]),
+            reviewed_facts=None,
+        )
+        if authority.pipeline is not None:
+            raise ValueError("Canonical pipeline proposals require the pipeline settlement authority")
+        if authority.row.status != "pending":
+            raise ValueError(f"Proposal {proposal_id} must be pending to commit; got {authority.row.status!r}")
+        blob_effect_receipt = self._validated_blob_effect_receipt(proposal_row)
+        terminal_rows = connection.execute(
+            select(proposal_events_table.c.id)
+            .where(proposal_events_table.c.session_id == session_id)
+            .where(proposal_events_table.c.proposal_id == proposal_id)
+            .where(proposal_events_table.c.event_type.in_(("proposal.accepted", "proposal.rejected")))
+        ).fetchall()
+        if terminal_rows:
+            raise AuditIntegrityError("pending ordinary proposal already has a terminal event")
+
+        current_row = connection.execute(
+            select(composition_states_table)
+            .where(composition_states_table.c.session_id == session_id)
+            .order_by(desc(composition_states_table.c.version))
+            .limit(1)
+        ).one_or_none()
+        actual_current_state_id = UUID(current_row.id) if current_row is not None else None
+        if actual_current_state_id != expected_current_state_id:
+            raise StaleComposeStateError(
+                "ordinary proposal acceptance: current composition state changed "
+                f"for session_id={session_id!r}; expected={expected_current_state_id!s}, "
+                f"actual={actual_current_state_id!s}"
+            )
+        if authority.row.base_state_id != actual_current_state_id and (blob_effect_receipt is None or actual_current_state_id is None):
+            raise StaleComposeStateError("ordinary proposal acceptance: proposal base no longer matches the current state")
+
+        blob_store_only = is_blob_store_only_mutation_tool(authority.row.tool_name)
+        if blob_store_only and blob_effect_receipt is None:
+            raise ValueError("blob-only ordinary proposal acceptance requires its durable applied-effect receipt")
+        if blob_store_only and actual_current_state_id is not None and state is not None:
+            raise ValueError("blob-only ordinary proposal with an existing state must bind that state")
+        if blob_store_only and actual_current_state_id is None and state is None:
+            raise ValueError("blob-only ordinary proposal with no existing state requires an initial state snapshot")
+        if not blob_store_only and state is None:
+            raise ValueError("non-blob ordinary proposal acceptance requires a new state")
+
+        service, connection, session_id, transaction_time = self.__state._require_exact()
+        if state is None:
+            if actual_current_state_id is None:
+                raise ValueError("ordinary proposal acceptance requires an existing state or a new state snapshot")
+            committed_state_id = str(actual_current_state_id)
+        else:
+            committed_state_id = service._insert_composition_state(
+                connection,
+                session_id=session_id,
+                payload=StatePayload(
+                    data=state,
+                    derived_from_state_id=str(actual_current_state_id) if actual_current_state_id is not None else None,
+                ),
+                provenance="tool_call",
+                created_at=transaction_time,
+            )
+
+        connection.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=session_id,
+                proposal_id=proposal_id,
+                event_type="proposal.accepted",
+                actor=actor,
+                payload={"committed_state_id": committed_state_id},
+                created_at=transaction_time,
+            )
+        )
+        if blob_effect_receipt is not None:
+            receipt_bound = connection.execute(
+                update(proposal_blob_effect_receipts_table)
+                .where(
+                    proposal_blob_effect_receipts_table.c.proposal_id == proposal_id,
+                    proposal_blob_effect_receipts_table.c.session_id == session_id,
+                    proposal_blob_effect_receipts_table.c.accepted_event_id.is_(None),
+                    proposal_blob_effect_receipts_table.c.accepted_at.is_(None),
+                )
+                .values(accepted_event_id=event_id, accepted_at=transaction_time)
+            )
+            if receipt_bound.rowcount != 1:
+                raise AuditIntegrityError("blob effect receipt changed before acceptance binding")
+        updated = connection.execute(
+            update(composition_proposals_table)
+            .where(composition_proposals_table.c.id == proposal_id)
+            .where(composition_proposals_table.c.session_id == session_id)
+            .where(composition_proposals_table.c.status == "pending")
+            .values(
+                status="committed",
+                committed_state_id=committed_state_id,
+                audit_event_id=event_id,
+                updated_at=transaction_time,
+            )
+        )
+        if updated.rowcount != 1:
+            raise ValueError(f"Proposal {proposal_id} must be pending to commit")
+        updated_row = connection.execute(
+            select(composition_proposals_table)
+            .where(composition_proposals_table.c.id == proposal_id)
+            .where(composition_proposals_table.c.session_id == session_id)
+        ).one()
+        return _proposal_record_from_row(updated_row)
+
+
+@final
+class _SessionMutations:
+    """Narrow session-row writes sharing an exact COMPOSE transaction."""
+
+    __slots__ = ("__composer", "__state")
+
+    def __init__(
+        self,
+        state: _SessionComposerMutationState,
+        composer: _SessionComposerMutations,
+    ) -> None:
+        self.__state = state
+        self.__composer = composer
+
+    def update_composer_preferences(
+        self,
+        *,
+        event_id: str,
+        trust_mode: ComposerTrustMode,
+        density_default: ComposerDensityDefault,
+        actor: str,
+    ) -> ComposerSessionPreferencesTransition:
+        """Audit and update preferences atomically under exact COMPOSE authority."""
+        service, connection, session_id, transaction_time = self.__state._require_exact()
+        prior_row = connection.execute(select(sessions_table).where(sessions_table.c.id == session_id)).one()
+        prior_record = ComposerSessionPreferencesRecord(
+            session_id=UUID(prior_row.id),
+            trust_mode=prior_row.trust_mode,
+            density_default=prior_row.density_default,
+            interpretation_review_disabled=bool(prior_row.interpretation_review_disabled),
+            updated_at=service._ensure_utc(prior_row.updated_at),
+        )
+        self.__composer.record_preferences_changed(
+            event_id=event_id,
+            actor=actor,
+            trust_mode=trust_mode,
+            prior_trust_mode=prior_record.trust_mode,
+            density_default=density_default,
+            transaction_time=transaction_time,
+        )
+        _service, connection, session_id, _now = self.__state._require_exact()
+        connection.execute(
+            update(sessions_table)
+            .where(sessions_table.c.id == session_id)
+            .values(
+                trust_mode=trust_mode,
+                density_default=density_default,
+                updated_at=transaction_time,
+            )
+        )
+        row = connection.execute(select(sessions_table).where(sessions_table.c.id == session_id)).one()
+        current_record = ComposerSessionPreferencesRecord(
+            session_id=UUID(row.id),
+            trust_mode=row.trust_mode,
+            density_default=row.density_default,
+            interpretation_review_disabled=bool(row.interpretation_review_disabled),
+            updated_at=service._ensure_utc(row.updated_at),
+        )
+        return ComposerSessionPreferencesTransition(prior=prior_record, current=current_record)
+
+
+@final
+class _SessionComposerMutationTransaction:
+    """Handle-free ordinary Composer mutation capability."""
+
+    __slots__ = ("__composer", "__session", "__state")
+
+    def __init__(
+        self,
+        service: SessionServiceImpl,
+        connection: Connection,
+        *,
+        session_id: str,
+        session_operation_context: SessionOperationContext,
+        expected_kind: SessionOperationKind,
+    ) -> None:
+        state = _SessionComposerMutationState(
+            service,
+            connection,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            expected_kind=expected_kind,
+        )
+        self.__state = state
+        self.__composer = _SessionComposerMutations(state)
+        self.__session = _SessionMutations(state, self.__composer)
+
+    @property
+    def composer(self) -> _SessionComposerMutations:
+        self.__state._require_active()
+        return self.__composer
+
+    @property
+    def session(self) -> _SessionMutations:
+        self.__state._require_active()
+        return self.__session
+
+    def _close(self) -> None:
+        self.__state._close()
+
+
+@final
+class _GuidedSessionMutationState:
+    """Private lifetime and exact dual-fence binding for one DB transaction."""
+
+    __slots__ = ("__active", "__connection", "__guided_fence", "__service", "__session_context")
+
+    def __init__(
+        self,
+        service: SessionServiceImpl,
+        connection: Connection,
+        *,
+        guided_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        self.__service = service
+        self.__connection = connection
+        self.__guided_fence = guided_fence
+        self.__session_context = session_operation_context
+        self.__active = True
+
+    def _require_active(self) -> tuple[SessionServiceImpl, Connection, GuidedOperationFence, SessionOperationContext]:
+        if not self.__active:
+            raise AuditIntegrityError("guided mutation transaction is not active")
+        return self.__service, self.__connection, self.__guided_fence, self.__session_context
+
+    def _require_exact(self) -> tuple[SessionServiceImpl, Connection, GuidedOperationFence, RowMapping, datetime]:
+        service, connection, guided_fence, session_context = self._require_active()
+        row, now = service.require_guided_operation_authority_on_connection(
+            connection,
+            guided_fence,
+            session_context,
+        )
+        return service, connection, guided_fence, row, now
+
+    def _close(self) -> None:
+        self.__active = False
+
+
+@final
+class _GuidedSessionMutations:
+    """Narrow guided-operation writes over one exact dual-fenced lifetime."""
+
+    __slots__ = ("__state",)
+
+    def __init__(self, state: _GuidedSessionMutationState) -> None:
+        self.__state = state
+
+    def record_nonterminal_event(
+        self,
+        *,
+        event_kind: Literal["claimed", "renewed", "taken_over"],
+        actor: str,
+        attempt: int,
+        prior_attempt: int | None,
+        lease_expires_at: datetime,
+        request_hash: str,
+        occurred_at: datetime,
+    ) -> None:
+        service, connection, fence, row, _now = self.__state._require_exact()
+        if event_kind not in {"claimed", "renewed", "taken_over"}:
+            raise ValueError("guided nonterminal event kind is unsupported")
+        if row["request_hash"] != request_hash or row["attempt"] != attempt:
+            raise GuidedOperationFenceLostError(fence)
+        next_sequence = connection.execute(
+            select(func.coalesce(func.max(guided_operation_events_table.c.sequence), 0) + 1).where(
+                guided_operation_events_table.c.session_id == str(fence.session_id),
+                guided_operation_events_table.c.operation_id == fence.operation_id,
+            )
+        ).scalar_one()
+        # Revalidate immediately before the INSERT, after sequence allocation.
+        self.__state._require_exact()
+        connection.execute(
+            insert(guided_operation_events_table).values(
+                **service._guided_operation_event_values(
+                    session_id=str(fence.session_id),
+                    operation_id=fence.operation_id,
+                    sequence=int(next_sequence),
+                    event_kind=event_kind,
+                    actor=actor,
+                    attempt=attempt,
+                    prior_attempt=prior_attempt,
+                    lease_expires_at=lease_expires_at,
+                    request_hash=request_hash,
+                    failure_audit_cohort=None,
+                    occurred_at=occurred_at,
+                )
+            )
+        )
+
+    def bind(
+        self,
+        *,
+        originating_message_id: UUID | None = None,
+        proposal_id: UUID | None = None,
+        result_state_id: UUID | None = None,
+        result_session_id: UUID | None = None,
+    ) -> None:
+        service, connection, fence, row, now = self.__state._require_exact()
+        values = {
+            "originating_message_id": service._merge_guided_binding(
+                current=row["originating_message_id"], requested=originating_message_id, label="originating message"
+            ),
+            "proposal_id": service._merge_guided_binding(current=row["proposal_id"], requested=proposal_id, label="proposal"),
+            "result_state_id": service._merge_guided_binding(
+                current=row["result_state_id"], requested=result_state_id, label="result state"
+            ),
+            "result_session_id": service._merge_guided_binding(
+                current=row["result_session_id"], requested=result_session_id, label="result session"
+            ),
+            "updated_at": now,
+        }
+        changed = connection.execute(
+            update(guided_operations_table)
+            .where(
+                guided_operations_table.c.session_id == str(fence.session_id),
+                guided_operations_table.c.operation_id == fence.operation_id,
+                guided_operations_table.c.status == "in_progress",
+                guided_operations_table.c.lease_token == fence.lease_token,
+                guided_operations_table.c.attempt == fence.attempt,
+                guided_operations_table.c.lease_expires_at > now,
+            )
+            .values(**values)
+        ).rowcount
+        if changed != 1:
+            self.__state._close()
+            raise GuidedOperationFenceLostError(fence)
+
+    def require_no_active_confirmation(self, *, proposal_id: UUID, now: datetime) -> None:
+        _service, connection, fence, _row, _database_now = self.__state._require_exact()
+        if type(proposal_id) is not UUID:
+            raise TypeError("proposal_id must be an exact UUID")
+        proposal_id_str = str(proposal_id)
+        connection.execute(
+            update(guided_operations_table)
+            .where(
+                guided_operations_table.c.session_id == str(fence.session_id),
+                guided_operations_table.c.proposal_id == proposal_id_str,
+                guided_operations_table.c.status == "in_progress",
+                guided_operations_table.c.lease_expires_at <= now,
+            )
+            .values(proposal_id=None, updated_at=now)
+        )
+        active = connection.execute(
+            select(guided_operations_table.c.operation_id)
+            .where(
+                guided_operations_table.c.session_id == str(fence.session_id),
+                guided_operations_table.c.proposal_id == proposal_id_str,
+                guided_operations_table.c.status == "in_progress",
+                guided_operations_table.c.lease_expires_at > now,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if active is not None:
+            raise GuidedOperationSettlementConflictError()
+
+    def claim_confirmation(self, *, proposal_id: UUID, now: datetime) -> None:
+        service, connection, fence, row, _database_now = self.__state._require_exact()
+        if row["kind"] != "guided_respond":
+            raise AuditIntegrityError("guided confirmation admission requires guided_respond")
+        if type(proposal_id) is not UUID:
+            raise TypeError("proposal_id must be an exact UUID")
+        proposal_id_str = str(proposal_id)
+        connection.execute(
+            update(guided_operations_table)
+            .where(
+                guided_operations_table.c.session_id == str(fence.session_id),
+                guided_operations_table.c.proposal_id == proposal_id_str,
+                guided_operations_table.c.status == "in_progress",
+                guided_operations_table.c.lease_expires_at <= now,
+            )
+            .values(proposal_id=None, updated_at=now)
+        )
+        owner = connection.execute(
+            select(guided_operations_table.c.operation_id)
+            .where(
+                guided_operations_table.c.session_id == str(fence.session_id),
+                guided_operations_table.c.proposal_id == proposal_id_str,
+                guided_operations_table.c.status == "in_progress",
+                guided_operations_table.c.lease_expires_at > now,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if owner is not None and owner != fence.operation_id:
+            raise GuidedOperationSettlementConflictError()
+        _service, connection, fence, current, database_now = self.__state._require_exact()
+        bound = service._merge_guided_binding(current=current["proposal_id"], requested=proposal_id, label="proposal")
+        changed = connection.execute(
+            update(guided_operations_table)
+            .where(
+                guided_operations_table.c.session_id == str(fence.session_id),
+                guided_operations_table.c.operation_id == fence.operation_id,
+                guided_operations_table.c.status == "in_progress",
+                guided_operations_table.c.lease_token == fence.lease_token,
+                guided_operations_table.c.attempt == fence.attempt,
+                guided_operations_table.c.lease_expires_at > database_now,
+            )
+            .values(proposal_id=bound, updated_at=database_now)
+        ).rowcount
+        if changed != 1:
+            self.__state._close()
+            raise GuidedOperationFenceLostError(fence)
+
+    def complete(
+        self,
+        *,
+        result: GuidedOperationResult,
+        response_hash: str,
+        actor: str,
+    ) -> GuidedOperationCompleted:
+        service, connection, fence, row, now = self.__state._require_exact()
+        service._validate_guided_actor(actor)
+        service._validate_guided_hash(response_hash, label="guided operation response_hash")
+        if isinstance(result, GuidedSessionResult):
+            parent = (
+                connection.execute(
+                    select(sessions_table.c.user_id, sessions_table.c.auth_provider_type).where(
+                        sessions_table.c.id == str(fence.session_id)
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            child = (
+                connection.execute(
+                    select(
+                        sessions_table.c.user_id,
+                        sessions_table.c.auth_provider_type,
+                        sessions_table.c.forked_from_session_id,
+                    ).where(sessions_table.c.id == str(result.session_id))
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if (
+                parent is None
+                or child is None
+                or child["forked_from_session_id"] != str(fence.session_id)
+                or child["user_id"] != parent["user_id"]
+                or child["auth_provider_type"] != parent["auth_provider_type"]
+            ):
+                raise AuditIntegrityError("Guided fork result session failed lineage or principal custody validation")
+        locator_values, normalized = service._guided_completion_values(row=row, result=result)
+        # The exact pair is checked again immediately before terminal DML.
+        _service, connection, fence, row, now = self.__state._require_exact()
+        try:
+            changed = connection.execute(
+                update(guided_operations_table)
+                .where(
+                    guided_operations_table.c.session_id == str(fence.session_id),
+                    guided_operations_table.c.operation_id == fence.operation_id,
+                    guided_operations_table.c.status == "in_progress",
+                    guided_operations_table.c.lease_token == fence.lease_token,
+                    guided_operations_table.c.attempt == fence.attempt,
+                    guided_operations_table.c.lease_expires_at > now,
+                )
+                .values(
+                    status="completed",
+                    lease_token=None,
+                    lease_expires_at=None,
+                    response_hash=response_hash,
+                    failure_code=None,
+                    settled_at=now,
+                    updated_at=now,
+                    **locator_values,
+                )
+            ).rowcount
+            if changed != 1:
+                raise GuidedOperationFenceLostError(fence)
+            next_sequence = connection.execute(
+                select(func.coalesce(func.max(guided_operation_events_table.c.sequence), 0) + 1).where(
+                    guided_operation_events_table.c.session_id == str(fence.session_id),
+                    guided_operation_events_table.c.operation_id == fence.operation_id,
+                )
+            ).scalar_one()
+            connection.execute(
+                insert(guided_operation_events_table).values(
+                    **service._guided_operation_event_values(
+                        session_id=str(fence.session_id),
+                        operation_id=fence.operation_id,
+                        sequence=int(next_sequence),
+                        event_kind="completed",
+                        actor=actor,
+                        attempt=fence.attempt,
+                        prior_attempt=None,
+                        lease_expires_at=None,
+                        request_hash=row["request_hash"],
+                        failure_audit_cohort=None,
+                        occurred_at=now,
+                    )
+                )
+            )
+        except BaseException:
+            self.__state._close()
+            raise
+        self.__state._close()
+        return GuidedOperationCompleted(result=normalized, response_hash=response_hash)
+
+    def fail(
+        self,
+        *,
+        failure_code: GuidedOperationFailureCode,
+        actor: str,
+        failure_audit_cohort: GuidedFailureAuditCohort,
+    ) -> GuidedOperationFailed:
+        service, connection, fence, row, now = self.__state._require_exact()
+        service._validate_guided_actor(actor)
+        if failure_code not in GUIDED_OPERATION_FAILURE_CODE_VALUES:
+            raise ValueError("unsupported guided operation failure code")
+        if type(failure_audit_cohort) is not GuidedFailureAuditCohort:
+            raise AuditIntegrityError("failed guided operation event must carry exactly one failure audit cohort commitment")
+        try:
+            changed = connection.execute(
+                update(guided_operations_table)
+                .where(
+                    guided_operations_table.c.session_id == str(fence.session_id),
+                    guided_operations_table.c.operation_id == fence.operation_id,
+                    guided_operations_table.c.status == "in_progress",
+                    guided_operations_table.c.lease_token == fence.lease_token,
+                    guided_operations_table.c.attempt == fence.attempt,
+                    guided_operations_table.c.lease_expires_at > now,
+                )
+                .values(
+                    status="failed",
+                    lease_token=None,
+                    lease_expires_at=None,
+                    proposal_id=None,
+                    result_kind=None,
+                    result_state_id=None,
+                    result_session_id=None,
+                    response_hash=None,
+                    failure_code=failure_code,
+                    settled_at=now,
+                    updated_at=now,
+                )
+            ).rowcount
+            if changed != 1:
+                raise GuidedOperationFenceLostError(fence)
+            next_sequence = connection.execute(
+                select(func.coalesce(func.max(guided_operation_events_table.c.sequence), 0) + 1).where(
+                    guided_operation_events_table.c.session_id == str(fence.session_id),
+                    guided_operation_events_table.c.operation_id == fence.operation_id,
+                )
+            ).scalar_one()
+            connection.execute(
+                insert(guided_operation_events_table).values(
+                    **service._guided_operation_event_values(
+                        session_id=str(fence.session_id),
+                        operation_id=fence.operation_id,
+                        sequence=int(next_sequence),
+                        event_kind="failed",
+                        actor=actor,
+                        attempt=fence.attempt,
+                        prior_attempt=None,
+                        lease_expires_at=None,
+                        request_hash=row["request_hash"],
+                        failure_audit_cohort=failure_audit_cohort,
+                        occurred_at=now,
+                    )
+                )
+            )
+        except BaseException:
+            self.__state._close()
+            raise
+        self.__state._close()
+        return GuidedOperationFailed(failure_code=failure_code)
+
+
+@final
+class _GuidedComposerMutations:
+    """Narrow Composer writes sharing one exact guided/session transaction."""
+
+    __slots__ = ("__state",)
+
+    def __init__(self, state: _GuidedSessionMutationState) -> None:
+        self.__state = state
+
+    def reject_pending_proposal(
+        self,
+        *,
+        authority: AuthoritativePipelineProposal,
+        actor: str,
+        created_at: datetime,
+    ) -> None:
+        service, connection, fence, _row, database_now = self.__state._require_exact()
+        if type(authority) is not AuthoritativePipelineProposal:
+            raise TypeError("authority must be an exact AuthoritativePipelineProposal")
+        if authority.row.session_id != fence.session_id or authority.row.status != "pending":
+            raise AuditIntegrityError("guided pending proposal authority is not exact for this session")
+        _verify_pipeline_lifecycle_authority(connection, service=service, authority=authority)
+        proposal_id = authority.row.id
+        _GuidedSessionMutations(self.__state).require_no_active_confirmation(
+            proposal_id=proposal_id,
+            now=database_now,
+        )
+        event_id = str(uuid.uuid4())
+        # Revalidate after expiry cleanup and immediately before the event INSERT.
+        _service, connection, fence, _row, _database_now = self.__state._require_exact()
+        connection.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=str(fence.session_id),
+                proposal_id=str(proposal_id),
+                event_type="proposal.rejected",
+                actor=actor,
+                payload=_pipeline_rejected_payload(authority=authority, reason="superseded", dispatch=None),
+                created_at=created_at,
+            )
+        )
+        updated = connection.execute(
+            update(composition_proposals_table)
+            .where(composition_proposals_table.c.session_id == str(fence.session_id))
+            .where(composition_proposals_table.c.id == str(proposal_id))
+            .where(composition_proposals_table.c.status == "pending")
+            .values(
+                status="rejected",
+                committed_state_id=None,
+                audit_event_id=event_id,
+                updated_at=created_at,
+            )
+        )
+        if updated.rowcount != 1:
+            raise AuditIntegrityError("guided proposal invalidation lost the pending proposal CAS")
+
+
+@final
+class _GuidedSessionMutationTransaction:
+    """Capability composition with no raw database handle on its surface."""
+
+    __slots__ = ("__composer", "__guided", "__state")
+
+    def __init__(
+        self,
+        service: SessionServiceImpl,
+        connection: Connection,
+        *,
+        guided_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        state = _GuidedSessionMutationState(
+            service,
+            connection,
+            guided_fence=guided_fence,
+            session_operation_context=session_operation_context,
+        )
+        self.__state = state
+        self.__guided = _GuidedSessionMutations(state)
+        self.__composer = _GuidedComposerMutations(state)
+
+    @property
+    def guided(self) -> _GuidedSessionMutations:
+        self.__state._require_active()
+        return self.__guided
+
+    @property
+    def composer(self) -> _GuidedComposerMutations:
+        self.__state._require_active()
+        return self.__composer
+
+    def _close(self) -> None:
+        self.__state._close()
+
+
+class SessionServiceImpl:
+    """Concrete async session service backed by worker-dispatched SQLAlchemy Core."""
 
     def __init__(
         self,
@@ -3387,9 +4458,13 @@ class SessionServiceImpl:
         operator_profile_registry: OperatorProfileRegistry | None = None,
         catalog: CatalogService | None = None,
         session_operation_authority: SessionOperationAuthority | None = None,
+        audit_access_log_authority: AuditAccessLogAuthority | None = None,
+        skill_markdown_history_authority: SkillMarkdownHistoryAuthority | None = None,
         owner_instance_id: str | None = None,
         session_operation_lease_seconds: int = 30,
     ) -> None:
+        from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
+
         if (plugin_snapshot_factory is None) != (operator_profile_registry is None):
             raise ValueError("plugin_snapshot_factory and operator_profile_registry must be configured together")
         if plugin_snapshot_factory is not None and catalog is None:
@@ -3415,11 +4490,21 @@ class SessionServiceImpl:
             else:
                 raise NotImplementedError(f"session operation authority not implemented for dialect {engine.dialect.name}")
         self._session_operation_authority = session_operation_authority
+        self._audit_access_log_authority = audit_access_log_authority or RepositoryAuditAccessLogAuthority(engine)
+        self._skill_markdown_history_authority = skill_markdown_history_authority or RepositorySkillMarkdownHistoryAuthority(engine)
 
     @property
     def session_operation_authority(self) -> SessionOperationAuthority:
         """Return the handle-free authority shared by session service callers."""
         return self._session_operation_authority
+
+    @property
+    def session_operation_owner_instance_id(self) -> str:
+        return self._owner_instance_id
+
+    @property
+    def session_operation_lease_seconds(self) -> int:
+        return self._session_operation_lease_seconds
 
     def _validate_patched_composition_state(
         self,
@@ -3612,6 +4697,125 @@ class SessionServiceImpl:
             raise AuditIntegrityError("Guided operation database clock returned a non-datetime value")
         return SessionServiceImpl._ensure_utc(value)
 
+    def _require_session_fork_authority_on_connection(
+        self,
+        conn: Connection,
+        authority: SessionForkAuthority,
+    ) -> tuple[Any, datetime]:
+        """Validate parent, child, and guided authority under one pair lock."""
+        if type(authority) is not SessionForkAuthority:
+            raise TypeError("fork authority must be exact")
+        now = self._guided_database_now(conn)
+        for context in (
+            authority.parent.parent_context,
+            authority.child_context,
+        ):
+            fence = context.fence
+            exact = conn.execute(
+                select(session_operation_fences_table.c.session_id).where(
+                    session_operation_fences_table.c.session_id == fence.session_id,
+                    session_operation_fences_table.c.operation_id == fence.operation_id,
+                    session_operation_fences_table.c.lease_token == fence.lease_token,
+                    session_operation_fences_table.c.operation_epoch == fence.operation_epoch,
+                    session_operation_fences_table.c.operation_kind == context.operation_kind.value,
+                    session_operation_fences_table.c.released_at.is_(None),
+                    session_operation_fences_table.c.lease_expires_at > now,
+                )
+            ).one_or_none()
+            if exact is None:
+                raise GuidedOperationFenceLostError(authority.parent.guided_fence)
+        return self.require_guided_operation_fence_on_connection(
+            conn,
+            authority.parent.guided_fence,
+        )
+
+    def _require_session_operation_context_on_connection(
+        self,
+        conn: Connection,
+        context: SessionOperationContext,
+        *,
+        session_id: str,
+        expected_kind: SessionOperationKind,
+        now: datetime,
+        guided_fence: GuidedOperationFence | None = None,
+    ) -> None:
+        """Validate one exact current session authority in the caller transaction."""
+        if (
+            type(context) is not SessionOperationContext
+            or context.operation_kind is not expected_kind
+            or context.fence.session_id != session_id
+        ):
+            if guided_fence is not None:
+                raise GuidedOperationFenceLostError(guided_fence)
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        fence = context.fence
+        exact = conn.execute(
+            select(session_operation_fences_table.c.session_id).where(
+                session_operation_fences_table.c.session_id == fence.session_id,
+                session_operation_fences_table.c.operation_id == fence.operation_id,
+                session_operation_fences_table.c.lease_token == fence.lease_token,
+                session_operation_fences_table.c.operation_epoch == fence.operation_epoch,
+                session_operation_fences_table.c.operation_kind == expected_kind.value,
+                session_operation_fences_table.c.released_at.is_(None),
+                session_operation_fences_table.c.lease_expires_at > now,
+            )
+        ).one_or_none()
+        if exact is None:
+            if guided_fence is not None:
+                raise GuidedOperationFenceLostError(guided_fence)
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+
+    def require_guided_operation_authority_on_connection(
+        self,
+        conn: Connection,
+        fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[RowMapping, datetime]:
+        """Validate the exact session and guided pair under one session lock."""
+        row, now = self.require_guided_operation_fence_on_connection(conn, fence)
+        expected_kind = SessionOperationKind.SESSION_FORK if row["kind"] == "session_fork" else SessionOperationKind.COMPOSE
+        self._require_session_operation_context_on_connection(
+            conn,
+            session_operation_context,
+            session_id=str(fence.session_id),
+            expected_kind=expected_kind,
+            now=now,
+            guided_fence=fence,
+        )
+        return row, now
+
+    @contextlib.contextmanager
+    def _session_composer_mutation_transaction(
+        self,
+        conn: Connection,
+        *,
+        session_id: str,
+        session_operation_context: SessionOperationContext,
+        expected_kind: SessionOperationKind,
+    ) -> Iterator[_SessionComposerMutationTransaction]:
+        """Yield a lifetime-checked ordinary Composer mutation capability."""
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        now = self._guided_database_now(conn)
+        self._require_session_operation_context_on_connection(
+            conn,
+            session_operation_context,
+            session_id=session_id,
+            expected_kind=expected_kind,
+            now=now,
+        )
+        transaction = _SessionComposerMutationTransaction(
+            self,
+            conn,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            expected_kind=expected_kind,
+        )
+        try:
+            yield transaction
+        finally:
+            transaction._close()
+
     @staticmethod
     def _validate_guided_hash(value: str, *, label: str) -> None:
         if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
@@ -3636,11 +4840,11 @@ class SessionServiceImpl:
         SessionServiceImpl._validate_guided_hash(request_hash, label="guided operation request_hash")
 
     @staticmethod
-    def _insert_guided_operation_event(
-        conn: Connection,
+    def _guided_operation_event_values(
         *,
         session_id: str,
         operation_id: str,
+        sequence: int,
         event_kind: Literal["claimed", "renewed", "taken_over", "completed", "failed"],
         actor: str,
         attempt: int,
@@ -3649,32 +4853,101 @@ class SessionServiceImpl:
         request_hash: str,
         failure_audit_cohort: GuidedFailureAuditCohort | None,
         occurred_at: datetime,
-    ) -> None:
+    ) -> dict[str, Any]:
+        """Build one immutable event row without owning or executing DML."""
         if event_kind == "failed" and type(failure_audit_cohort) is not GuidedFailureAuditCohort:
             raise AuditIntegrityError("failed guided operation event must carry exactly one failure audit cohort commitment")
         if event_kind != "failed" and failure_audit_cohort is not None:
             raise AuditIntegrityError("non-failed guided operation event must not carry a failure audit cohort commitment")
+        return {
+            "session_id": session_id,
+            "operation_id": operation_id,
+            "sequence": sequence,
+            "event_kind": event_kind,
+            "actor": actor,
+            "attempt": attempt,
+            "prior_attempt": prior_attempt,
+            "lease_expires_at": lease_expires_at,
+            "request_hash": request_hash,
+            "failure_audit_cohort": (failure_audit_cohort.envelope() if failure_audit_cohort is not None else None),
+            "occurred_at": occurred_at,
+        }
+
+    def _record_guided_fork_child_terminal_event(
+        self,
+        conn: Connection,
+        *,
+        authority: SessionForkAuthority,
+        session_id: str,
+        operation_id: str,
+        event_kind: Literal["completed"],
+        actor: str,
+        attempt: int,
+        prior_attempt: None,
+        lease_expires_at: None,
+        request_hash: str,
+        failure_audit_cohort: None,
+        occurred_at: datetime,
+    ) -> None:
+        """Append the staged child's synthetic terminal event under fork authority."""
+        if type(authority) is not SessionForkAuthority:
+            raise TypeError("authority must be an exact SessionForkAuthority")
+        if session_id != authority.child_context.fence.session_id or event_kind != "completed":
+            raise AuditIntegrityError("fork child guided event is not bound to the exact child authority")
+        self._require_session_fork_authority_on_connection(conn, authority)
         next_sequence = conn.execute(
             select(func.coalesce(func.max(guided_operation_events_table.c.sequence), 0) + 1).where(
                 guided_operation_events_table.c.session_id == session_id,
                 guided_operation_events_table.c.operation_id == operation_id,
             )
         ).scalar_one()
+        self._require_session_fork_authority_on_connection(conn, authority)
         conn.execute(
             insert(guided_operation_events_table).values(
-                session_id=session_id,
-                operation_id=operation_id,
-                sequence=next_sequence,
-                event_kind=event_kind,
-                actor=actor,
-                attempt=attempt,
-                prior_attempt=prior_attempt,
-                lease_expires_at=lease_expires_at,
-                request_hash=request_hash,
-                failure_audit_cohort=(failure_audit_cohort.envelope() if failure_audit_cohort is not None else None),
-                occurred_at=occurred_at,
+                **self._guided_operation_event_values(
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    sequence=int(next_sequence),
+                    event_kind=event_kind,
+                    actor=actor,
+                    attempt=attempt,
+                    prior_attempt=prior_attempt,
+                    lease_expires_at=lease_expires_at,
+                    request_hash=request_hash,
+                    failure_audit_cohort=failure_audit_cohort,
+                    occurred_at=occurred_at,
+                )
             )
         )
+
+    @contextlib.contextmanager
+    def _guided_session_mutation_transaction(
+        self,
+        conn: Connection,
+        *,
+        guided_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
+    ) -> Iterator[_GuidedSessionMutationTransaction]:
+        """Yield an exact dual-fenced capability inside the caller transaction."""
+        if type(guided_fence) is not GuidedOperationFence:
+            raise TypeError("guided_fence must be an exact GuidedOperationFence")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        self.require_guided_operation_authority_on_connection(
+            conn,
+            guided_fence,
+            session_operation_context,
+        )
+        transaction = _GuidedSessionMutationTransaction(
+            self,
+            conn,
+            guided_fence=guided_fence,
+            session_operation_context=session_operation_context,
+        )
+        try:
+            yield transaction
+        finally:
+            transaction._close()
 
     @staticmethod
     def _validate_guided_operation_row(
@@ -3912,6 +5185,7 @@ class SessionServiceImpl:
         request_hash: str,
         actor: str,
         lease_seconds: int,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationOutcome:
         """Claim, join, replay, or take over one normalized operation."""
         self._validate_guided_identity(operation_id=operation_id, kind=kind, request_hash=request_hash)
@@ -3922,6 +5196,13 @@ class SessionServiceImpl:
         def _sync() -> GuidedOperationOutcome:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
                 now = self._guided_database_now(conn)
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    session_operation_context,
+                    session_id=sid,
+                    expected_kind=(SessionOperationKind.SESSION_FORK if kind == "session_fork" else SessionOperationKind.COMPOSE),
+                    now=now,
+                )
                 row, block = self._read_guided_operation_authority(
                     conn,
                     session_id=sid,
@@ -3958,21 +5239,23 @@ class SessionServiceImpl:
                             updated_at=now,
                         )
                     )
-                    self._insert_guided_operation_event(
+                    fence = GuidedOperationFence(session_id, operation_id, lease_token, 1)
+                    with self._guided_session_mutation_transaction(
                         conn,
-                        session_id=sid,
-                        operation_id=operation_id,
-                        event_kind="claimed",
-                        actor=actor,
-                        attempt=1,
-                        prior_attempt=None,
-                        lease_expires_at=lease_expires_at,
-                        request_hash=request_hash,
-                        failure_audit_cohort=None,
-                        occurred_at=now,
-                    )
+                        guided_fence=fence,
+                        session_operation_context=session_operation_context,
+                    ) as mutation:
+                        mutation.guided.record_nonterminal_event(
+                            event_kind="claimed",
+                            actor=actor,
+                            attempt=1,
+                            prior_attempt=None,
+                            lease_expires_at=lease_expires_at,
+                            request_hash=request_hash,
+                            occurred_at=now,
+                        )
                     return GuidedOperationClaimed(
-                        fence=GuidedOperationFence(session_id, operation_id, lease_token, 1),
+                        fence=fence,
                         lease_expires_at=lease_expires_at,
                     )
                 self._validate_guided_operation_row(
@@ -4020,21 +5303,23 @@ class SessionServiceImpl:
                 ).rowcount
                 if changed != 1:
                     raise AuditIntegrityError("Guided operation takeover lost its locked compare-and-swap")
-                self._insert_guided_operation_event(
+                fence = GuidedOperationFence(session_id, operation_id, lease_token, next_attempt)
+                with self._guided_session_mutation_transaction(
                     conn,
-                    session_id=sid,
-                    operation_id=operation_id,
-                    event_kind="taken_over",
-                    actor=actor,
-                    attempt=next_attempt,
-                    prior_attempt=prior_attempt,
-                    lease_expires_at=lease_expires_at,
-                    request_hash=request_hash,
-                    failure_audit_cohort=None,
-                    occurred_at=now,
-                )
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.record_nonterminal_event(
+                        event_kind="taken_over",
+                        actor=actor,
+                        attempt=next_attempt,
+                        prior_attempt=prior_attempt,
+                        lease_expires_at=lease_expires_at,
+                        request_hash=request_hash,
+                        occurred_at=now,
+                    )
                 return GuidedOperationTakenOver(
-                    fence=GuidedOperationFence(session_id, operation_id, lease_token, next_attempt),
+                    fence=fence,
                     prior_attempt=prior_attempt,
                     lease_expires_at=lease_expires_at,
                 )
@@ -4094,22 +5379,91 @@ class SessionServiceImpl:
             await self._run_sync(_sync),
         )
 
+    async def get_guided_start_reconciliation(
+        self,
+        *,
+        session_id: UUID,
+        operation_id: str,
+    ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None:
+        """Inspect cold-start custody without entering a write transaction."""
+        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 128:
+            raise ValueError("guided operation id must be a non-empty string of at most 128 characters")
+        sid = str(session_id)
+
+        def _sync() -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None:
+            with self._engine.connect() as conn:
+                now = self._guided_database_now(conn)
+                row, block = self._read_guided_operation_authority(
+                    conn,
+                    session_id=sid,
+                    operation_id=operation_id,
+                )
+            if row is None:
+                if block is None:
+                    return None
+                self._validate_guided_operation_admission_block_row(
+                    block,
+                    expected_session_id=sid,
+                    expected_operation_id=operation_id,
+                )
+                return GuidedOperationFailed(failure_code="request_cancelled")
+            self._validate_guided_operation_row(
+                row,
+                expected_session_id=sid,
+                expected_operation_id=operation_id,
+            )
+            if row["kind"] != "guided_start":
+                raise self._guided_conflict(session_id=session_id, operation_id=operation_id)
+            if row["status"] in {"completed", "failed"}:
+                return self._guided_terminal_outcome(row)
+            if row["status"] != "in_progress":
+                raise AuditIntegrityError("Tier 1: guided operation has an invalid status")
+            expiry = self._guided_in_progress_expiry(row)
+            attempt = row["attempt"]
+            if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+                raise AuditIntegrityError("Tier 1: guided operation has an invalid attempt")
+            return GuidedOperationActive(
+                attempt=attempt,
+                lease_expires_at=expiry,
+                expired=expiry <= now,
+            )
+
+        return cast(
+            "GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None",
+            await self._run_sync(_sync),
+        )
+
     async def reconcile_guided_start_operation(
         self,
         *,
         session_id: UUID,
         operation_id: str,
+        observed_attempt: int | None,
         actor: str,
-    ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed:
-        """Read one guided-start outcome, abandoning an expired exact attempt."""
+        lease_seconds: int,
+        session_operation_context: SessionOperationContext,
+    ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None:
+        """Seal one observed missing/expired guided start under both authorities."""
         if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 128:
             raise ValueError("guided operation id must be a non-empty string of at most 128 characters")
+        if observed_attempt is not None and (
+            not isinstance(observed_attempt, int) or isinstance(observed_attempt, bool) or observed_attempt < 1
+        ):
+            raise ValueError("observed_attempt must be None or a positive exact integer")
         self._validate_guided_actor(actor)
+        self._validate_guided_lease_seconds(lease_seconds)
         sid = str(session_id)
 
-        def _sync() -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed:
+        def _sync() -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
                 now = self._guided_database_now(conn)
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    session_operation_context,
+                    session_id=sid,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=now,
+                )
                 row, block = self._read_guided_operation_authority(
                     conn,
                     session_id=sid,
@@ -4123,6 +5477,8 @@ class SessionServiceImpl:
                             expected_operation_id=operation_id,
                         )
                         return GuidedOperationFailed(failure_code="request_cancelled")
+                    if observed_attempt is not None:
+                        return None
                     parent = conn.execute(
                         select(sessions_table.c.id, sessions_table.c.archived_at).where(sessions_table.c.id == sid)
                     ).one_or_none()
@@ -4154,54 +5510,65 @@ class SessionServiceImpl:
                 attempt = row["attempt"]
                 if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
                     raise AuditIntegrityError("Tier 1: guided operation has an invalid attempt")
-                if expiry > now:
-                    return GuidedOperationActive(attempt=attempt, lease_expires_at=expiry)
+                if observed_attempt != attempt or expiry > now:
+                    return GuidedOperationActive(
+                        attempt=attempt,
+                        lease_expires_at=expiry,
+                        expired=expiry <= now,
+                    )
 
-                lease_token = row["lease_token"]
-                assert isinstance(lease_token, str)
+                prior_token = row["lease_token"]
+                assert isinstance(prior_token, str)
+                next_attempt = attempt + 1
+                lease_token = uuid.uuid4().hex
+                lease_expires_at = now + timedelta(seconds=lease_seconds)
                 changed = conn.execute(
                     update(guided_operations_table)
                     .where(
                         guided_operations_table.c.session_id == sid,
                         guided_operations_table.c.operation_id == operation_id,
                         guided_operations_table.c.status == "in_progress",
-                        guided_operations_table.c.lease_token == lease_token,
+                        guided_operations_table.c.lease_token == prior_token,
                         guided_operations_table.c.attempt == attempt,
                         guided_operations_table.c.lease_expires_at <= now,
                     )
                     .values(
-                        status="failed",
-                        lease_token=None,
-                        lease_expires_at=None,
-                        proposal_id=None,
-                        result_kind=None,
-                        result_state_id=None,
-                        result_session_id=None,
-                        response_hash=None,
-                        failure_code="request_cancelled",
-                        settled_at=now,
+                        lease_token=lease_token,
+                        lease_expires_at=lease_expires_at,
+                        attempt=next_attempt,
                         updated_at=now,
                     )
                 ).rowcount
                 if changed != 1:
                     raise AuditIntegrityError("Guided operation reconciliation lost its locked compare-and-swap")
-                self._insert_guided_operation_event(
-                    conn,
-                    session_id=sid,
+                fence = GuidedOperationFence(
+                    session_id=session_id,
                     operation_id=operation_id,
-                    event_kind="failed",
-                    actor=actor,
-                    attempt=attempt,
-                    prior_attempt=None,
-                    lease_expires_at=None,
-                    request_hash=row["request_hash"],
-                    failure_audit_cohort=GuidedFailureAuditCohort.empty(),
-                    occurred_at=now,
+                    lease_token=lease_token,
+                    attempt=next_attempt,
                 )
-                return GuidedOperationFailed(failure_code="request_cancelled")
+                with self._guided_session_mutation_transaction(
+                    conn,
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.record_nonterminal_event(
+                        event_kind="taken_over",
+                        actor=actor,
+                        attempt=next_attempt,
+                        prior_attempt=attempt,
+                        lease_expires_at=lease_expires_at,
+                        request_hash=row["request_hash"],
+                        occurred_at=now,
+                    )
+                    return mutation.guided.fail(
+                        failure_code="request_cancelled",
+                        actor=actor,
+                        failure_audit_cohort=GuidedFailureAuditCohort.empty(),
+                    )
 
         return cast(
-            "GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed",
+            "GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None",
             await self._run_sync(_sync),
         )
 
@@ -4246,6 +5613,7 @@ class SessionServiceImpl:
         *,
         actor: str,
         lease_seconds: int,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationFence:
         self._validate_guided_actor(actor)
         self._validate_guided_lease_seconds(lease_seconds)
@@ -4253,7 +5621,11 @@ class SessionServiceImpl:
 
         def _sync() -> GuidedOperationFence:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                row, now = self.require_guided_operation_fence_on_connection(conn, fence)
+                row, now = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    fence,
+                    session_operation_context,
+                )
                 lease_expires_at = now + timedelta(seconds=lease_seconds)
                 changed = conn.execute(
                     update(guided_operations_table)
@@ -4269,19 +5641,20 @@ class SessionServiceImpl:
                 ).rowcount
                 if changed != 1:
                     raise GuidedOperationFenceLostError(fence)
-                self._insert_guided_operation_event(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    session_id=sid,
-                    operation_id=fence.operation_id,
-                    event_kind="renewed",
-                    actor=actor,
-                    attempt=fence.attempt,
-                    prior_attempt=None,
-                    lease_expires_at=lease_expires_at,
-                    request_hash=row["request_hash"],
-                    failure_audit_cohort=None,
-                    occurred_at=now,
-                )
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.record_nonterminal_event(
+                        event_kind="renewed",
+                        actor=actor,
+                        attempt=fence.attempt,
+                        prior_attempt=None,
+                        lease_expires_at=lease_expires_at,
+                        request_hash=row["request_hash"],
+                        occurred_at=now,
+                    )
                 return fence
 
         return cast("GuidedOperationFence", await self._run_sync(_sync))
@@ -4295,44 +5668,6 @@ class SessionServiceImpl:
             raise AuditIntegrityError(f"Guided operation {label} is already bound to a different row")
         return requested_value
 
-    def bind_guided_operation_on_connection(
-        self,
-        conn: Connection,
-        fence: GuidedOperationFence,
-        *,
-        originating_message_id: UUID | None = None,
-        proposal_id: UUID | None = None,
-        result_state_id: UUID | None = None,
-        result_session_id: UUID | None = None,
-    ) -> None:
-        """Bind resumable row ids under the exact fence and caller transaction."""
-        row, now = self.require_guided_operation_fence_on_connection(conn, fence)
-        values = {
-            "originating_message_id": self._merge_guided_binding(
-                current=row["originating_message_id"], requested=originating_message_id, label="originating message"
-            ),
-            "proposal_id": self._merge_guided_binding(current=row["proposal_id"], requested=proposal_id, label="proposal"),
-            "result_state_id": self._merge_guided_binding(current=row["result_state_id"], requested=result_state_id, label="result state"),
-            "result_session_id": self._merge_guided_binding(
-                current=row["result_session_id"], requested=result_session_id, label="result session"
-            ),
-            "updated_at": now,
-        }
-        changed = conn.execute(
-            update(guided_operations_table)
-            .where(
-                guided_operations_table.c.session_id == str(fence.session_id),
-                guided_operations_table.c.operation_id == fence.operation_id,
-                guided_operations_table.c.status == "in_progress",
-                guided_operations_table.c.lease_token == fence.lease_token,
-                guided_operations_table.c.attempt == fence.attempt,
-                guided_operations_table.c.lease_expires_at > now,
-            )
-            .values(**values)
-        ).rowcount
-        if changed != 1:
-            raise GuidedOperationFenceLostError(fence)
-
     async def bind_guided_operation(
         self,
         fence: GuidedOperationFence,
@@ -4341,14 +5676,21 @@ class SessionServiceImpl:
         proposal_id: UUID | None = None,
         result_state_id: UUID | None = None,
         result_session_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         sid = str(fence.session_id)
 
         def _sync() -> None:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                self.bind_guided_operation_on_connection(
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._guided_session_mutation_transaction(
                     conn,
-                    fence,
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation,
+            ):
+                mutation.guided.bind(
                     originating_message_id=originating_message_id,
                     proposal_id=proposal_id,
                     result_state_id=result_state_id,
@@ -4436,88 +5778,6 @@ class SessionServiceImpl:
             )
         raise TypeError("unsupported guided operation result locator")
 
-    def complete_guided_operation_on_connection(
-        self,
-        conn: Connection,
-        fence: GuidedOperationFence,
-        *,
-        result: GuidedOperationResult,
-        response_hash: str,
-        actor: str,
-    ) -> GuidedOperationCompleted:
-        """Settle a successful result and append its event in one transaction."""
-        self._validate_guided_actor(actor)
-        self._validate_guided_hash(response_hash, label="guided operation response_hash")
-        row, now = self.require_guided_operation_fence_on_connection(conn, fence)
-        if isinstance(result, GuidedSessionResult):
-            parent = (
-                conn.execute(
-                    select(
-                        sessions_table.c.user_id,
-                        sessions_table.c.auth_provider_type,
-                    ).where(sessions_table.c.id == str(fence.session_id))
-                )
-                .mappings()
-                .one_or_none()
-            )
-            child = (
-                conn.execute(
-                    select(
-                        sessions_table.c.user_id,
-                        sessions_table.c.auth_provider_type,
-                        sessions_table.c.forked_from_session_id,
-                    ).where(sessions_table.c.id == str(result.session_id))
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if (
-                parent is None
-                or child is None
-                or child["forked_from_session_id"] != str(fence.session_id)
-                or child["user_id"] != parent["user_id"]
-                or child["auth_provider_type"] != parent["auth_provider_type"]
-            ):
-                raise AuditIntegrityError("Guided fork result session failed lineage or principal custody validation")
-        locator_values, normalized = self._guided_completion_values(row=row, result=result)
-        changed = conn.execute(
-            update(guided_operations_table)
-            .where(
-                guided_operations_table.c.session_id == str(fence.session_id),
-                guided_operations_table.c.operation_id == fence.operation_id,
-                guided_operations_table.c.status == "in_progress",
-                guided_operations_table.c.lease_token == fence.lease_token,
-                guided_operations_table.c.attempt == fence.attempt,
-                guided_operations_table.c.lease_expires_at > now,
-            )
-            .values(
-                status="completed",
-                lease_token=None,
-                lease_expires_at=None,
-                response_hash=response_hash,
-                failure_code=None,
-                settled_at=now,
-                updated_at=now,
-                **locator_values,
-            )
-        ).rowcount
-        if changed != 1:
-            raise GuidedOperationFenceLostError(fence)
-        self._insert_guided_operation_event(
-            conn,
-            session_id=str(fence.session_id),
-            operation_id=fence.operation_id,
-            event_kind="completed",
-            actor=actor,
-            attempt=fence.attempt,
-            prior_attempt=None,
-            lease_expires_at=None,
-            request_hash=row["request_hash"],
-            failure_audit_cohort=None,
-            occurred_at=now,
-        )
-        return GuidedOperationCompleted(result=normalized, response_hash=response_hash)
-
     async def complete_guided_operation(
         self,
         fence: GuidedOperationFence,
@@ -4525,75 +5785,23 @@ class SessionServiceImpl:
         result: GuidedOperationResult,
         response_hash: str,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationCompleted:
         sid = str(fence.session_id)
 
         def _sync() -> GuidedOperationCompleted:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                return self.complete_guided_operation_on_connection(
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._guided_session_mutation_transaction(
                     conn,
-                    fence,
-                    result=result,
-                    response_hash=response_hash,
-                    actor=actor,
-                )
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation,
+            ):
+                return mutation.guided.complete(result=result, response_hash=response_hash, actor=actor)
 
         return cast("GuidedOperationCompleted", await self._run_sync(_sync))
-
-    def fail_guided_operation_on_connection(
-        self,
-        conn: Connection,
-        fence: GuidedOperationFence,
-        *,
-        failure_code: GuidedOperationFailureCode,
-        actor: str,
-        failure_audit_cohort: GuidedFailureAuditCohort,
-    ) -> GuidedOperationFailed:
-        """Clear partial locators and settle one closed safe failure atomically."""
-        self._validate_guided_actor(actor)
-        if failure_code not in GUIDED_OPERATION_FAILURE_CODE_VALUES:
-            raise ValueError("unsupported guided operation failure code")
-        row, now = self.require_guided_operation_fence_on_connection(conn, fence)
-        changed = conn.execute(
-            update(guided_operations_table)
-            .where(
-                guided_operations_table.c.session_id == str(fence.session_id),
-                guided_operations_table.c.operation_id == fence.operation_id,
-                guided_operations_table.c.status == "in_progress",
-                guided_operations_table.c.lease_token == fence.lease_token,
-                guided_operations_table.c.attempt == fence.attempt,
-                guided_operations_table.c.lease_expires_at > now,
-            )
-            .values(
-                status="failed",
-                lease_token=None,
-                lease_expires_at=None,
-                proposal_id=None,
-                result_kind=None,
-                result_state_id=None,
-                result_session_id=None,
-                response_hash=None,
-                failure_code=failure_code,
-                settled_at=now,
-                updated_at=now,
-            )
-        ).rowcount
-        if changed != 1:
-            raise GuidedOperationFenceLostError(fence)
-        self._insert_guided_operation_event(
-            conn,
-            session_id=str(fence.session_id),
-            operation_id=fence.operation_id,
-            event_kind="failed",
-            actor=actor,
-            attempt=fence.attempt,
-            prior_attempt=None,
-            lease_expires_at=None,
-            request_hash=row["request_hash"],
-            failure_audit_cohort=failure_audit_cohort,
-            occurred_at=now,
-        )
-        return GuidedOperationFailed(failure_code=failure_code)
 
     async def fail_guided_operation(
         self,
@@ -4601,14 +5809,21 @@ class SessionServiceImpl:
         *,
         failure_code: GuidedOperationFailureCode,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationFailed:
         sid = str(fence.session_id)
 
         def _sync() -> GuidedOperationFailed:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                return self.fail_guided_operation_on_connection(
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._guided_session_mutation_transaction(
                     conn,
-                    fence,
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation,
+            ):
+                return mutation.guided.fail(
                     failure_code=failure_code,
                     actor=actor,
                     failure_audit_cohort=GuidedFailureAuditCohort.empty(),
@@ -4616,9 +5831,40 @@ class SessionServiceImpl:
 
         return cast("GuidedOperationFailed", await self._run_sync(_sync))
 
+    async def fail_guided_fork_operation(
+        self,
+        authority: SessionForkAuthority,
+        *,
+        failure_code: GuidedOperationFailureCode,
+        actor: str,
+    ) -> GuidedOperationFailed:
+        """Fail a fork only while its exact parent, child, and guided fences live."""
+        if type(authority) is not SessionForkAuthority:
+            raise TypeError("authority must be an exact SessionForkAuthority")
+        parent_id = authority.parent.parent_context.fence.session_id
+        child_id = authority.child_context.fence.session_id
+
+        def _sync() -> GuidedOperationFailed:
+            with self._session_pair_locked_begin(parent_id, child_id) as conn:
+                self._require_session_fork_authority_on_connection(conn, authority)
+                with self._guided_session_mutation_transaction(
+                    conn,
+                    guided_fence=authority.parent.guided_fence,
+                    session_operation_context=authority.parent.parent_context,
+                ) as mutation:
+                    return mutation.guided.fail(
+                        failure_code=failure_code,
+                        actor=actor,
+                        failure_audit_cohort=GuidedFailureAuditCohort.empty(),
+                    )
+
+        return cast("GuidedOperationFailed", await self._run_sync(_sync))
+
     async def fail_guided_operation_with_audit(
         self,
         command: GuidedOperationFailureCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationFailed:
         """Atomically persist sanitized evidence and settle one closed failure."""
 
@@ -4634,9 +5880,13 @@ class SessionServiceImpl:
 
         def _sync() -> GuidedOperationFailed:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                operation, _database_now = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    command.fence,
+                    session_operation_context,
+                )
                 audit_records: tuple[ChatMessageRecord, ...] = ()
                 if audit_rows:
-                    operation, _database_now = self.require_guided_operation_fence_on_connection(conn, command.fence)
                     lineage = GuidedFailureAuditLineage.from_authority(
                         session_id=command.fence.session_id,
                         operation_id=command.fence.operation_id,
@@ -4660,13 +5910,16 @@ class SessionServiceImpl:
                         created_at=now,
                     )
                     conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
-                return self.fail_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    command.fence,
-                    failure_code=command.failure_code,
-                    actor=command.actor,
-                    failure_audit_cohort=GuidedFailureAuditCohort.from_records(audit_records),
-                )
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    return mutation.guided.fail(
+                        failure_code=command.failure_code,
+                        actor=command.actor,
+                        failure_audit_cohort=GuidedFailureAuditCohort.from_records(audit_records),
+                    )
 
         return cast("GuidedOperationFailed", await self._run_sync(_sync))
 
@@ -5416,123 +6669,273 @@ class SessionServiceImpl:
         ]
 
     async def archive_session(self, session_id: UUID) -> None:
-        """Delete a session and cascade to all related records and files.
-
-        Filesystem cleanup is staged before the DB delete so the service can
-        restore the original blob directory if the transaction fails. After the
-        DB commit, any purge failure leaves the staged directory in a recoverable
-        quarantine path instead of raising after the session is already gone.
-        """
+        """Archive through one exact DB fence and durable filesystem obligation."""
         sid = str(session_id)
 
-        def _sync() -> None:
-            blob_dir = self._data_dir / "blobs" / sid if self._data_dir is not None else None
-            staged_blob_dir = self._data_dir / ".archive_quarantine" / sid if self._data_dir is not None else None
+        def decide_and_soft_archive(transaction: SessionOperationMutationTransaction) -> SessionArchiveDisposition:
+            disposition = transaction.session.decide_and_soft_archive(archived_at=self._now())
+            if disposition is SessionArchiveDisposition.SOFT_ARCHIVED:
+                transaction.composer_progress.retire_session_progress()
+            return disposition
 
-            try:
-                with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                    active_guided_kind = conn.execute(
-                        select(guided_operations_table.c.kind)
-                        .where(
-                            guided_operations_table.c.session_id == sid,
-                            guided_operations_table.c.status == "in_progress",
-                        )
-                        .limit(1)
-                    ).scalar_one_or_none()
-                    if active_guided_kind is not None:
-                        raise SessionGuidedOperationInProgressError(
-                            session_id=session_id,
-                            kind=cast("GuidedOperationKind", active_guided_kind),
-                        )
-                    durable_history_exists = (
-                        conn.execute(select(runs_table.c.id).where(runs_table.c.session_id == sid).limit(1)).first() is not None
-                        or conn.execute(
-                            select(composer_completion_events_table.c.id)
-                            .where(composer_completion_events_table.c.session_id == sid)
-                            .limit(1)
-                        ).first()
-                        is not None
-                        or conn.execute(
-                            select(guided_operations_table.c.operation_id)
-                            .where(
-                                guided_operations_table.c.session_id == sid,
-                                guided_operations_table.c.kind == "session_fork",
-                                guided_operations_table.c.status.in_(["completed", "failed"]),
-                            )
-                            .limit(1)
-                        ).first()
-                        is not None
-                        or conn.execute(
-                            select(guided_operations_table.c.operation_id)
-                            .where(
-                                guided_operations_table.c.kind == "session_fork",
-                                guided_operations_table.c.status == "completed",
-                                guided_operations_table.c.result_session_id == sid,
-                            )
-                            .limit(1)
-                        ).first()
-                        is not None
-                    )
-                    if durable_history_exists:
-                        now = self._now()
-                        result = conn.execute(
-                            update(sessions_table).where(sessions_table.c.id == sid).values(archived_at=now, updated_at=now)
-                        )
-                        if result.rowcount == 0:
-                            raise SessionNotFoundError(session_id)
-                        return
-                    # The DB guard above and filesystem quarantine happen while
-                    # the same session lock is held. A fork cannot freeze plan
-                    # bytes and then race an archive that temporarily removes
-                    # them before the in-progress operation is observed.
-                    if blob_dir is not None and staged_blob_dir is not None and blob_dir.is_dir():
-                        staged_blob_dir.parent.mkdir(parents=True, exist_ok=True)
-                        if staged_blob_dir.exists():
-                            raise OSError(
-                                f"archive_session({sid}): quarantine path {staged_blob_dir} already exists. "
-                                "Manual cleanup of the stale staged blob directory is required before archive can proceed."
-                            )
-                        blob_dir.rename(staged_blob_dir)
-                    # Session archival is the only supported transcript purge:
-                    # delete the parent row and let the schema-owned cascades
-                    # remove session-scoped children. Direct chat-message
-                    # deletes are blocked by trg_chat_messages_no_delete.
-                    deleted = conn.execute(delete(sessions_table).where(sessions_table.c.id == sid))
-                    if deleted.rowcount != 1:
-                        raise SessionNotFoundError(session_id)
-            except Exception as primary_exc:
-                if blob_dir is not None and staged_blob_dir is not None and staged_blob_dir.exists():
+        try:
+            lease = await SessionOperationLease.acquire(
+                self._session_operation_authority,
+                session_id=session_id,
+                operation_kind=SessionOperationKind.ARCHIVE,
+                owner_instance_id=self._owner_instance_id,
+                lease_seconds=self._session_operation_lease_seconds,
+            )
+        except SessionOperationFenceLost as error:
+            if error.reason is FenceLossReason.MISSING:
+                raise SessionNotFoundError(session_id) from error
+            raise
+
+        data_dir = self._data_dir
+        identity = ArchiveQuarantineIdentity(
+            session_id=session_id,
+            operation_id=UUID(lease.context.fence.operation_id),
+            operation_epoch=lease.context.fence.operation_epoch,
+        )
+        canonical = data_dir / "blobs" / sid if data_dir is not None else None
+        current_obligation_may_exist = False
+        current_stage_attempted = False
+        authority_uncertain = False
+
+        async def run_owned_phase[T](
+            coroutine_factory: Callable[[], Coroutine[Any, Any, T]],
+            *,
+            name: str,
+        ) -> T:
+            """Shield and join one lease-owned phase before cancellation resumes."""
+
+            async def protect_inner_phase() -> T:
+                inner_task = asyncio.create_task(coroutine_factory(), name=f"{name}-inner")
+                try:
+                    return cast("T", await asyncio.shield(inner_task))
+                except asyncio.CancelledError:
+                    while not inner_task.done():
+                        try:
+                            await asyncio.shield(inner_task)
+                        except asyncio.CancelledError:
+                            continue
                     try:
-                        blob_dir.parent.mkdir(parents=True, exist_ok=True)
-                        staged_blob_dir.rename(blob_dir)
-                    except OSError as restore_exc:
-                        primary_exc.add_note(
-                            f"RecoveryFailed[{type(restore_exc).__name__}]: "
-                            f"could not restore staged blob directory for session {sid} "
-                            f"from {staged_blob_dir} to {blob_dir} after archive rollback "
-                            f"({restore_exc}). Manual cleanup required."
-                        )
+                        result = inner_task.result()
+                    except BaseException:
+                        lease.raise_if_lost()
+                        raise
+                    lease.raise_if_lost()
+                    return result
+
+            task = lease.create_task(protect_inner_phase(), name=name)
+            try:
+                return cast("T", await asyncio.shield(task))
+            except asyncio.CancelledError as cancellation:
+                current_task = asyncio.current_task()
+                if current_task is None or current_task.cancelling() == 0:
+                    lease.raise_if_lost()
+                    raise
+                try:
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            continue
+                    task.result()
+                except BaseException as phase_error:
+                    cancellation.add_note(f"Session archive phase also failed with {type(phase_error).__name__}.")
                 raise
 
-            # After commit, the delete succeeded from the caller's perspective.
-            # If the final purge fails, keep the staged directory in quarantine
-            # for manual cleanup and raise so the operator sees the cleanup
-            # failure. The session rows may already be gone, but silently
-            # returning here would hide the orphaned quarantine state.
-            if staged_blob_dir is not None and staged_blob_dir.exists():
+        async def checkpoint() -> None:
+            nonlocal authority_uncertain
+            try:
+                lease.raise_if_lost()
+                await run_sync_in_worker(
+                    self._session_operation_authority.compare_and_swap,
+                    lease.context,
+                )
+            except BaseException:
+                authority_uncertain = True
+                raise
+
+        async def reconcile_prior_manifests() -> None:
+            assert data_dir is not None
+            assert canonical is not None
+            manifests = await run_sync_in_worker(
+                list_archive_quarantine_manifests,
+                data_dir,
+                session_id,
+            )
+            for manifest in manifests:
+                relation = await run_sync_in_worker(
+                    self._session_operation_authority.classify_archive_manifest,
+                    lease.context,
+                    manifest_operation_id=manifest.identity.operation_id,
+                    manifest_operation_epoch=manifest.identity.operation_epoch,
+                )
+                if type(relation) is not ArchiveManifestRelation:
+                    raise AuditIntegrityError("archive manifest classifier returned an invalid relation")
+                await checkpoint()
+                await run_sync_in_worker(
+                    restore_archive_quarantine,
+                    data_dir,
+                    manifest.identity,
+                    canonical,
+                )
+                await checkpoint()
+                await run_sync_in_worker(
+                    retire_archive_quarantine,
+                    data_dir,
+                    manifest.identity,
+                )
+
+        async def prepare_current_manifest() -> None:
+            nonlocal current_obligation_may_exist
+            assert data_dir is not None
+            assert canonical is not None
+            source_present = await run_sync_in_worker(
+                canonical_archive_present,
+                data_dir,
+                identity,
+                canonical,
+            )
+            await checkpoint()
+            current_obligation_may_exist = True
+            await run_sync_in_worker(
+                prepare_archive_quarantine,
+                data_dir,
+                identity,
+                source_present=source_present,
+            )
+            await checkpoint()
+
+        async def stage_current_payload() -> None:
+            nonlocal current_stage_attempted
+            assert data_dir is not None
+            assert canonical is not None
+            await checkpoint()
+            current_stage_attempted = True
+            await run_sync_in_worker(
+                stage_archive_quarantine,
+                data_dir,
+                identity,
+                canonical,
+            )
+            await checkpoint()
+
+        async def restore_current() -> None:
+            assert data_dir is not None
+            assert canonical is not None
+            await checkpoint()
+            await run_sync_in_worker(
+                restore_archive_quarantine,
+                data_dir,
+                identity,
+                canonical,
+            )
+            await checkpoint()
+            await run_sync_in_worker(
+                retire_archive_quarantine,
+                data_dir,
+                identity,
+            )
+
+        async def finalize_consumed() -> None:
+            assert data_dir is not None
+            assert canonical is not None
+            try:
+                await run_sync_in_worker(
+                    purge_archive_quarantine,
+                    data_dir,
+                    identity,
+                    canonical,
+                )
+                await run_sync_in_worker(
+                    retire_archive_quarantine,
+                    data_dir,
+                    identity,
+                )
+            except BaseException:
+                raise QuarantineCleanupError("Session archive committed, but quarantine cleanup remains pending.") from None
+
+        async def compensate_precommit() -> None:
+            """Restore only while exact authority remains provably current."""
+            nonlocal authority_uncertain
+            assert data_dir is not None
+            assert canonical is not None
+            try:
+                await checkpoint()
+                if current_stage_attempted:
+                    await run_sync_in_worker(
+                        restore_archive_quarantine,
+                        data_dir,
+                        identity,
+                        canonical,
+                    )
+                    await checkpoint()
+                await run_sync_in_worker(
+                    retire_archive_quarantine,
+                    data_dir,
+                    identity,
+                )
+            except BaseException:
+                authority_uncertain = True
+                raise
+
+        try:
+            archive_disposition = await run_owned_phase(
+                lambda: run_sync_in_worker(
+                    self._session_operation_authority.mutate,
+                    lease.context,
+                    decide_and_soft_archive,
+                ),
+                name="session-archive-decision",
+            )
+            if archive_disposition is SessionArchiveDisposition.SOFT_ARCHIVED:
+                await lease.close()
+                return
+
+            if data_dir is None:
+                await lease.consume_archive()
+                return
+
+            await run_owned_phase(
+                reconcile_prior_manifests,
+                name="session-archive-quarantine-reconcile-prior",
+            )
+            await run_owned_phase(
+                prepare_current_manifest,
+                name="session-archive-quarantine-prepare",
+            )
+            await run_owned_phase(
+                stage_current_payload,
+                name="session-archive-quarantine-stage",
+            )
+            await run_owned_phase(
+                checkpoint,
+                name="session-archive-quarantine-pre-delete-checkpoint",
+            )
+            await lease.consume_archive(
+                restore_current=restore_current,
+                finalize_consumed=finalize_consumed,
+            )
+        except BaseException as primary_error:
+            if not lease.closed:
+                if data_dir is not None and current_obligation_may_exist and not authority_uncertain:
+                    try:
+                        await run_owned_phase(
+                            compensate_precommit,
+                            name="session-archive-quarantine-precommit-compensation",
+                        )
+                    except BaseException as compensation_error:
+                        if compensation_error is not primary_error:
+                            primary_error.add_note(f"Session archive compensation also failed with {type(compensation_error).__name__}.")
                 try:
-                    shutil.rmtree(staged_blob_dir)
-                except OSError as exc:
-                    raise QuarantineCleanupError(
-                        f"archive_session({sid}): session delete committed but quarantine cleanup failed for "
-                        f"{staged_blob_dir}. Manual cleanup of the staged blob directory is required."
-                    ) from exc
-
-                quarantine_root = staged_blob_dir.parent
-                with contextlib.suppress(OSError):
-                    quarantine_root.rmdir()
-
-        await self._run_sync(_sync)
+                    await lease.close()
+                except BaseException as close_error:
+                    if close_error is not primary_error:
+                        primary_error.add_note(f"Session archive lease cleanup also failed with {type(close_error).__name__}.")
+            raise
 
     async def get_composer_preferences(self, session_id: UUID) -> ComposerSessionPreferencesRecord:
         """Fetch composer trust/scaffolding preferences for a session."""
@@ -5557,6 +6960,7 @@ class SessionServiceImpl:
         trust_mode: ComposerTrustMode,
         density_default: ComposerDensityDefault,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> ComposerSessionPreferencesTransition:
         """Update composer preferences and append the audit event first.
 
@@ -5577,64 +6981,26 @@ class SessionServiceImpl:
         find the same value in the audit row, satisfying the
         audit-primacy superset rule.
         """
-        now = self._now()
         sid = str(session_id)
+        event_id = str(uuid.uuid4())
 
         def _sync() -> ComposerSessionPreferencesTransition:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                # B2 (load-bearing): load the prior record inside the same
-                # transaction as the audit insert and the state update.
-                # A concurrent PATCH cannot interpose because the per-
-                # session write lock above serialises writes for this
-                # ``sid`` and the SELECT runs inside the same connection
-                # as the UPDATE.
-                prior_row = conn.execute(select(sessions_table).where(sessions_table.c.id == sid)).one()
-                prior_record = ComposerSessionPreferencesRecord(
-                    session_id=UUID(prior_row.id),
-                    trust_mode=prior_row.trust_mode,
-                    density_default=prior_row.density_default,
-                    interpretation_review_disabled=bool(prior_row.interpretation_review_disabled),
-                    updated_at=self._ensure_utc(prior_row.updated_at),
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ) as transaction,
+            ):
+                return transaction.session.update_composer_preferences(
+                    event_id=event_id,
+                    trust_mode=trust_mode,
+                    density_default=density_default,
+                    actor=actor,
                 )
-                # Audit fires before state mutation per CLAUDE.md
-                # §"Telemetry and Logging" primacy rule. B1 (load-bearing):
-                # the payload now carries ``prior_trust_mode`` so a
-                # downstream telemetry counter emitting
-                # ``{from_mode, to_mode}`` attributes remains a strict
-                # subset of audit-recorded reality.
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=str(uuid.uuid4()),
-                        session_id=sid,
-                        proposal_id=None,
-                        event_type="trust_mode.changed",
-                        actor=actor,
-                        payload={
-                            "trust_mode": trust_mode,
-                            "prior_trust_mode": prior_record.trust_mode,
-                            "density_default": density_default,
-                        },
-                        created_at=now,
-                    )
-                )
-                conn.execute(
-                    update(sessions_table)
-                    .where(sessions_table.c.id == sid)
-                    .values(
-                        trust_mode=trust_mode,
-                        density_default=density_default,
-                        updated_at=now,
-                    )
-                )
-                row = conn.execute(select(sessions_table).where(sessions_table.c.id == sid)).one()
-                current_record = ComposerSessionPreferencesRecord(
-                    session_id=UUID(row.id),
-                    trust_mode=row.trust_mode,
-                    density_default=row.density_default,
-                    interpretation_review_disabled=bool(row.interpretation_review_disabled),
-                    updated_at=self._ensure_utc(row.updated_at),
-                )
-                return ComposerSessionPreferencesTransition(prior=prior_record, current=current_record)
 
         return cast(ComposerSessionPreferencesTransition, await self._run_sync(_sync))
 
@@ -5657,6 +7023,7 @@ class SessionServiceImpl:
         composer_provider: str | None = None,
         composer_skill_hash: str | None = None,
         tool_arguments_hash: str | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord:
         """Create a pending composer proposal and its forward audit event."""
         composer_provenance = _normalize_proposal_composer_provenance(
@@ -5666,63 +7033,36 @@ class SessionServiceImpl:
             composer_skill_hash=composer_skill_hash,
             tool_arguments_hash=tool_arguments_hash,
         )
-        now = self._now()
         sid = str(session_id)
-        umid = str(user_message_id) if user_message_id is not None else None
         proposal_id = str(uuid.uuid4())
         event_id = str(uuid.uuid4())
 
         def _sync() -> CompositionProposalRecord:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                validate_proposal_blob_references(
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
                     conn,
                     session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ) as transaction,
+            ):
+                return transaction.composer.create_composition_proposal(
+                    proposal_id=proposal_id,
+                    event_id=event_id,
+                    tool_call_id=tool_call_id,
                     tool_name=tool_name,
-                    arguments=arguments_json,
+                    summary=summary,
+                    rationale=rationale,
+                    affects=affects,
+                    arguments_json=arguments_json,
+                    arguments_redacted_json=arguments_redacted_json,
+                    base_state_id=base_state_id,
+                    actor=actor,
+                    user_message_id=user_message_id,
+                    composer_provenance=composer_provenance,
                 )
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=event_id,
-                        session_id=sid,
-                        proposal_id=proposal_id,
-                        event_type="proposal.created",
-                        actor=actor,
-                        payload={
-                            "schema": _TOOL_PROPOSAL_CREATED_SCHEMA,
-                            "tool_call_id": tool_call_id,
-                            "tool_name": tool_name,
-                            "status": "pending",
-                        },
-                        created_at=now,
-                    )
-                )
-                conn.execute(
-                    insert(composition_proposals_table).values(
-                        id=proposal_id,
-                        session_id=sid,
-                        tool_call_id=tool_call_id,
-                        user_message_id=umid,
-                        composer_model_identifier=composer_provenance["composer_model_identifier"],
-                        composer_model_version=composer_provenance["composer_model_version"],
-                        composer_provider=composer_provenance["composer_provider"],
-                        composer_skill_hash=composer_provenance["composer_skill_hash"],
-                        tool_arguments_hash=composer_provenance["tool_arguments_hash"],
-                        tool_name=tool_name,
-                        status="pending",
-                        summary=summary,
-                        rationale=rationale,
-                        affects=list(affects),
-                        arguments_json=deep_thaw(arguments_json),
-                        arguments_redacted_json=deep_thaw(arguments_redacted_json),
-                        base_state_id=str(base_state_id) if base_state_id else None,
-                        committed_state_id=None,
-                        audit_event_id=event_id,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == proposal_id)).one()
-                return _proposal_record_from_row(row)
 
         return cast(CompositionProposalRecord, await self._run_sync(_sync))
 
@@ -5741,6 +7081,7 @@ class SessionServiceImpl:
         composer_provider: str,
         user_message_id: UUID | None = None,
         supersedes_proposal_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord:
         """Atomically create one canonical pipeline row + bound event."""
         if type(plan) is not PipelinePlanResult:
@@ -5779,109 +7120,35 @@ class SessionServiceImpl:
             arguments_redacted_json=arguments_redacted_json,
             supersedes_proposal_id=supersedes_proposal_id,
         )
-        now = self._now()
         sid = str(session_id)
         proposal_id = str(uuid.uuid4())
         event_id = str(uuid.uuid4())
 
         def _sync() -> CompositionProposalRecord:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                current_row = conn.execute(
-                    select(composition_states_table)
-                    .where(composition_states_table.c.session_id == sid)
-                    .order_by(desc(composition_states_table.c.version))
-                    .limit(1)
-                ).one_or_none()
-                if type(proposal.base) is AbsentBase:
-                    if current_row is not None:
-                        raise StaleComposeStateError("pipeline proposal absent base conflicts with current state")
-                    base_state_id = None
-                elif type(proposal.base) is PresentBase:
-                    if current_row is None or current_row.id != str(proposal.base.state_id):
-                        raise StaleComposeStateError("pipeline proposal present base state changed before creation")
-                    current_record = self._row_to_state_record(current_row)
-                    if composition_content_hash(state_from_record(current_record)) != proposal.base.composition_content_hash:
-                        raise StaleComposeStateError("pipeline proposal present base content changed before creation")
-                    base_state_id = str(proposal.base.state_id)
-                else:
-                    raise AuditIntegrityError("pipeline proposal base is malformed")
-
-                if supersedes_proposal_id is not None:
-                    superseded = conn.execute(
-                        select(composition_proposals_table)
-                        .where(composition_proposals_table.c.id == str(supersedes_proposal_id))
-                        .where(composition_proposals_table.c.session_id == sid)
-                    ).one_or_none()
-                    if superseded is None:
-                        raise AuditIntegrityError("superseded pipeline proposal is not owned by this session")
-                    superseded_events = conn.execute(
-                        select(proposal_events_table)
-                        .where(proposal_events_table.c.session_id == sid)
-                        .where(proposal_events_table.c.proposal_id == str(supersedes_proposal_id))
-                        .where(proposal_events_table.c.event_type == "proposal.created")
-                    ).fetchall()
-                    if len(superseded_events) != 1:
-                        raise AuditIntegrityError("superseded pipeline proposal has invalid creation authority")
-                    superseded_payload = superseded_events[0].payload
-                    if (
-                        not isinstance(superseded_payload, Mapping)
-                        or superseded_payload.get("schema") != _PIPELINE_CREATED_SCHEMA
-                        or superseded_payload.get("draft_hash") != proposal.supersedes_draft_hash
-                    ):
-                        raise AuditIntegrityError("superseded pipeline proposal draft binding mismatch")
-
-                validate_proposal_blob_references(
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
                     conn,
                     session_id=sid,
-                    tool_name="set_pipeline",
-                    arguments=deep_thaw(proposal.pipeline),
-                )
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=event_id,
-                        session_id=sid,
-                        proposal_id=proposal_id,
-                        event_type="proposal.created",
-                        actor=actor,
-                        payload=payload,
-                        created_at=now,
-                    )
-                )
-                conn.execute(
-                    insert(composition_proposals_table).values(
-                        id=proposal_id,
-                        session_id=sid,
-                        tool_call_id=plan.tool_call_id,
-                        user_message_id=str(user_message_id) if user_message_id is not None else None,
-                        composer_model_identifier=normalized["composer_model_identifier"],
-                        composer_model_version=normalized["composer_model_version"],
-                        composer_provider=normalized["composer_provider"],
-                        composer_skill_hash=normalized["composer_skill_hash"],
-                        tool_arguments_hash=normalized["tool_arguments_hash"],
-                        tool_name="set_pipeline",
-                        status="pending",
-                        summary=summary,
-                        rationale=rationale,
-                        affects=list(affects),
-                        arguments_json=deep_thaw(proposal.pipeline),
-                        arguments_redacted_json=deep_thaw(arguments_redacted_json),
-                        base_state_id=base_state_id,
-                        committed_state_id=None,
-                        audit_event_id=event_id,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == proposal_id)).one()
-                record = _proposal_record_from_row(row)
-                authority = AuthoritativePipelineProposal(
-                    row=record,
-                    proposal=proposal,
-                    creation_event_id=UUID(event_id),
-                    custody_result=plan.custody_result,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ) as transaction,
+            ):
+                return transaction.composer.create_pipeline_composition_proposal(
+                    proposal_id=proposal_id,
+                    event_id=event_id,
+                    plan=plan,
+                    summary=summary,
+                    rationale=rationale,
+                    affects=affects,
+                    arguments_redacted_json=arguments_redacted_json,
+                    actor=actor,
+                    normalized_provenance=normalized,
+                    payload=payload,
+                    user_message_id=user_message_id,
                     supersedes_proposal_id=supersedes_proposal_id,
                 )
-                return replace(record, pipeline_metadata=_pipeline_public_metadata(authority))
 
         record = cast(CompositionProposalRecord, await self._run_sync(_sync))
         _PIPELINE_PLANNER_COUNTER.add(1, {"surface": proposal.surface.value, "result": "proposal_created"})
@@ -6378,14 +7645,24 @@ class SessionServiceImpl:
         session_id: UUID,
         proposal_id: UUID,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord:
         """Reject a pending proposal by appending an event, then updating status."""
-        now = self._now()
         sid = str(session_id)
         pid = str(proposal_id)
+        event_id = str(uuid.uuid4())
 
         def _sync() -> CompositionProposalRecord:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.PROPOSAL,
+                ) as transaction,
+            ):
                 row = conn.execute(
                     select(composition_proposals_table)
                     .where(composition_proposals_table.c.id == pid)
@@ -6396,84 +7673,81 @@ class SessionServiceImpl:
                 if row.status != "pending":
                     raise ValueError(f"Proposal {pid} must be pending to reject; got {row.status!r}")
 
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=str(uuid.uuid4()),
-                        session_id=sid,
-                        proposal_id=pid,
-                        event_type="proposal.rejected",
-                        actor=actor,
-                        payload={"status": "rejected"},
-                        created_at=now,
-                    )
-                )
-                conn.execute(
-                    update(composition_proposals_table)
-                    .where(composition_proposals_table.c.id == pid)
-                    .where(composition_proposals_table.c.session_id == sid)
-                    .values(
-                        status="rejected",
-                        updated_at=now,
-                    )
+                transaction.composer.reject_pending_proposal(
+                    proposal_id=pid,
+                    event_id=event_id,
+                    actor=actor,
                 )
                 updated_row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == pid)).one()
                 return _proposal_record_from_row(updated_row)
 
         return cast(CompositionProposalRecord, await self._run_sync(_sync))
 
-    async def mark_composition_proposal_committed(
+    async def accept_composition_proposal(
         self,
         *,
         session_id: UUID,
         proposal_id: UUID,
-        committed_state_id: UUID,
+        expected_current_state_id: UUID | None,
+        state: CompositionStateData | None,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord:
-        """Commit a pending proposal by appending an event, then updating status."""
-        now = self._now()
+        """Accept one ordinary proposal and its optional new state atomically."""
+        if expected_current_state_id is not None and type(expected_current_state_id) is not UUID:
+            raise TypeError("expected_current_state_id must be an exact UUID or None")
+        if state is not None and type(state) is not CompositionStateData:
+            raise TypeError("state must be an exact CompositionStateData or None")
         sid = str(session_id)
         pid = str(proposal_id)
-        state_id = str(committed_state_id)
+        event_id = str(uuid.uuid4())
 
         def _sync() -> CompositionProposalRecord:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                row = conn.execute(
-                    select(composition_proposals_table)
-                    .where(composition_proposals_table.c.id == pid)
-                    .where(composition_proposals_table.c.session_id == sid)
-                ).one_or_none()
-                if row is None:
-                    raise KeyError(pid)
-                if row.status != "pending":
-                    raise ValueError(f"Proposal {pid} must be pending to commit; got {row.status!r}")
-
-                event_id = str(uuid.uuid4())
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=event_id,
-                        session_id=sid,
-                        proposal_id=pid,
-                        event_type="proposal.accepted",
-                        actor=actor,
-                        payload={"committed_state_id": state_id},
-                        created_at=now,
-                    )
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.PROPOSAL,
+                ) as transaction,
+            ):
+                return transaction.composer.accept_pending_ordinary_proposal(
+                    proposal_id=pid,
+                    event_id=event_id,
+                    expected_current_state_id=expected_current_state_id,
+                    state=state,
+                    actor=actor,
                 )
-                conn.execute(
-                    update(composition_proposals_table)
-                    .where(composition_proposals_table.c.id == pid)
-                    .where(composition_proposals_table.c.session_id == sid)
-                    .values(
-                        status="committed",
-                        committed_state_id=state_id,
-                        audit_event_id=event_id,
-                        updated_at=now,
-                    )
-                )
-                updated_row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == pid)).one()
-                return _proposal_record_from_row(updated_row)
 
         return cast(CompositionProposalRecord, await self._run_sync(_sync))
+
+    async def has_applied_blob_proposal_effect(
+        self,
+        *,
+        session_id: UUID,
+        proposal_id: UUID,
+        session_operation_context: SessionOperationContext,
+    ) -> bool:
+        """Verify whether the exact proposal already committed its blob effect."""
+        sid = str(session_id)
+        pid = str(proposal_id)
+
+        def _sync() -> bool:
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.PROPOSAL,
+                ) as transaction,
+            ):
+                return transaction.composer.has_applied_blob_effect(proposal_id=pid)
+
+        return cast(bool, await self._run_sync(_sync))
 
     async def list_proposal_events(
         self,
@@ -6483,11 +7757,21 @@ class SessionServiceImpl:
         sid = str(session_id)
 
         def _sync() -> list[ProposalEventRecord]:
+            lifecycle_group = func.coalesce(proposal_events_table.c.proposal_id, proposal_events_table.c.id)
+            terminal_phase = case(
+                (proposal_events_table.c.event_type.in_(("proposal.accepted", "proposal.rejected")), 1),
+                else_=0,
+            )
             with self._engine.begin() as conn:
                 rows = conn.execute(
                     select(proposal_events_table)
                     .where(proposal_events_table.c.session_id == sid)
-                    .order_by(proposal_events_table.c.created_at, proposal_events_table.c.id)
+                    .order_by(
+                        proposal_events_table.c.created_at,
+                        lifecycle_group,
+                        terminal_phase,
+                        proposal_events_table.c.id,
+                    )
                 ).fetchall()
                 return [_proposal_event_record_from_row(row) for row in rows]
 
@@ -7574,7 +8858,6 @@ class SessionServiceImpl:
         skill_hash: str,
         filename: str,
         content: str,
-        first_seen_at: datetime | None = None,
     ) -> bool:
         """Best-effort INSERT-OR-IGNORE into ``skill_markdown_history`` (F-5c).
 
@@ -7603,37 +8886,15 @@ class SessionServiceImpl:
         DB-side anomaly. The caller's discipline (passing values from
         ``load_skill_with_hash``) ensures atomic consistency.
         """
-        now = self._ensure_utc(first_seen_at) if first_seen_at is not None else self._now()
-
-        def _sync() -> bool:
-            values = {
-                "hash": skill_hash,
-                "filename": filename,
-                "content": content,
-                "first_seen_at": now,
-            }
-            with self._engine.begin() as conn:
-                dialect = conn.dialect.name
-                stmt: Any
-                if dialect == "sqlite":
-                    stmt = sqlite_insert(skill_markdown_history_table).values(**values)
-                elif dialect == "postgresql":
-                    stmt = postgresql_insert(skill_markdown_history_table).values(**values)
-                else:
-                    raise NotImplementedError(
-                        "skill_markdown_history requires an atomic insert-or-ignore for session database "
-                        f"dialect {dialect!r}; supported dialects: sqlite, postgresql"
-                    )
-                stmt = stmt.on_conflict_do_nothing(index_elements=[skill_markdown_history_table.c.hash]).returning(
-                    skill_markdown_history_table.c.hash
-                )
-                result = conn.execute(stmt)
-                # ``RETURNING`` yields the hash only when an INSERT occurred;
-                # conflict-ignored writes yield no row. This remains truthful
-                # across both supported drivers without relying on rowcount.
-                return result.scalar_one_or_none() is not None
-
-        return cast(bool, await self._run_sync(_sync))
+        return cast(
+            bool,
+            await self._run_sync(
+                self._skill_markdown_history_authority.upsert_exact,
+                skill_hash=skill_hash,
+                filename=filename,
+                content=content,
+            ),
+        )
 
     async def record_auto_interpreted_no_surfaces_event(
         self,
@@ -8053,6 +9314,7 @@ class SessionServiceImpl:
         *,
         session_id: str,
         requesting_principal: str,
+        auth_provider_type: AuthProviderType,
         request_path: str,
         query_args: Mapping[str, str],
         ip_address: str | None,
@@ -8067,21 +9329,18 @@ class SessionServiceImpl:
         """
 
         allowed_query_args = self._validate_audit_grade_query_args(query_args)
-        now = self._now()
         try:
-            with self._engine.begin() as conn:
-                conn.execute(
-                    audit_access_log_table.insert().values(
-                        id=str(uuid.uuid4()),
-                        timestamp=now,
-                        session_id=session_id,
-                        requesting_principal=requesting_principal,
-                        request_path=request_path,
-                        query_args=allowed_query_args,
-                        ip_address=ip_address,
-                        writer_principal=AUDIT_GRADE_VIEW_WRITER_PRINCIPAL,
-                    )
-                )
+            self._audit_access_log_authority.record_audit_grade_view(
+                session_id=session_id,
+                requesting_principal=requesting_principal,
+                auth_provider_type=auth_provider_type,
+                request_path=request_path,
+                query_args=allowed_query_args,
+                ip_address=ip_address,
+            )
+        except AuditAccessLogWriteError:
+            self._telemetry.audit_access_log_write_failed_total.add(1)
+            raise
         except SQLAlchemyError as exc:
             self._telemetry.audit_access_log_write_failed_total.add(1)
             raise AuditAccessLogWriteError("audit_access_log write failed for audit-grade messages view") from exc
@@ -8092,6 +9351,7 @@ class SessionServiceImpl:
         *,
         session_id: str,
         requesting_principal: str,
+        auth_provider_type: AuthProviderType,
         request_path: str,
         query_args: Mapping[str, str],
         ip_address: str | None,
@@ -8102,6 +9362,7 @@ class SessionServiceImpl:
             self.record_audit_grade_view,
             session_id=session_id,
             requesting_principal=requesting_principal,
+            auth_provider_type=auth_provider_type,
             request_path=request_path,
             query_args=query_args,
             ip_address=ip_address,
@@ -8363,6 +9624,8 @@ class SessionServiceImpl:
         session_id: UUID,
         state_id: UUID,
         pipeline_yaml: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> RunRecord:
         """Create a new pending run, enforcing one active run per session (B6).
 
@@ -8373,65 +9636,18 @@ class SessionServiceImpl:
         """
         run_id = uuid.uuid4()
         now = self._now()
-        sid = str(session_id)
-        state_sid = str(state_id)
-
-        def _sync() -> None:
-            with self._engine.begin() as conn:
-                _assert_state_in_session(
-                    conn,
-                    state_id=state_sid,
-                    expected_session_id=sid,
-                    caller="create_run",
-                )
-
-                # Early-out: check before INSERT to give a clear error message
-                active = conn.execute(
-                    select(runs_table.c.id).where(
-                        runs_table.c.session_id == sid,
-                        runs_table.c.status.in_(["pending", "running"]),
-                    )
-                ).fetchone()
-
-                if active is not None:
-                    raise RunAlreadyActiveError(sid)
-
-                try:
-                    conn.execute(
-                        insert(runs_table).values(
-                            id=str(run_id),
-                            session_id=sid,
-                            state_id=state_sid,
-                            status="pending",
-                            started_at=now,
-                            rows_processed=0,
-                            rows_failed=0,
-                            pipeline_yaml=pipeline_yaml,
-                        )
-                    )
-                except IntegrityError as exc:
-                    # The pre-check for active runs passed, but a concurrent insert
-                    # hit the partial unique index. This is genuinely "run already active."
-                    raise RunAlreadyActiveError(sid) from exc
-
-        await self._run_sync(_sync)
-
-        return RunRecord(
-            id=run_id,
-            session_id=session_id,
-            state_id=state_id,
-            status="pending",
-            started_at=now,
-            finished_at=None,
-            rows_processed=0,
-            rows_succeeded=0,
-            rows_failed=0,
-            rows_routed_success=0,
-            rows_routed_failure=0,
-            rows_quarantined=0,
-            error=None,
-            landscape_run_id=None,
-            pipeline_yaml=pipeline_yaml,
+        return cast(
+            "RunRecord",
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.runs.create_pending_run(
+                    run_id=run_id,
+                    state_id=state_id,
+                    pipeline_yaml=pipeline_yaml,
+                    started_at=now,
+                ),
+            ),
         )
 
     async def get_run(self, run_id: UUID) -> RunRecord:
@@ -8468,55 +9684,33 @@ class SessionServiceImpl:
         timestamp: datetime,
         event_type: SessionRunEventType,
         data: Mapping[str, Any],
+        session_operation_context: SessionOperationContext,
     ) -> RunEventRecord:
         """Append a structured run event for websocket replay and audit inspection."""
-        if event_type not in SESSION_RUN_EVENT_TYPE_VALUES:
+        if type(run_id) is not UUID:
+            raise TypeError("run_id must be an exact UUID")
+        if type(timestamp) is not datetime:
+            raise TypeError("timestamp must be an exact datetime")
+        if timestamp.utcoffset() is None:
+            raise ValueError("timestamp must be timezone-aware")
+        timestamp = timestamp.astimezone(UTC)
+        event_type_value: object = event_type
+        if type(event_type_value) is not str or event_type_value not in SESSION_RUN_EVENT_TYPE_VALUES:
             raise AuditIntegrityError(
                 f"Tier 1: run_events.event_type is {event_type!r}, expected one of {sorted(SESSION_RUN_EVENT_TYPE_VALUES)}"
             )
-        event_id = uuid.uuid4()
-        rid = str(run_id)
-        payload = deep_thaw(dict(data))
-
-        def _sync() -> tuple[str, int]:
-            with self._engine.connect() as lookup_conn:
-                found_session_id = lookup_conn.execute(select(runs_table.c.session_id).where(runs_table.c.id == rid)).scalar_one_or_none()
-            if found_session_id is None:
-                raise ValueError(f"Run {run_id} not found")
-            session_id = str(found_session_id)
-            with self._session_process_locked_begin(session_id) as conn:
-                with self._session_write_lock(conn, session_id):
-                    locked_session_id = conn.execute(select(runs_table.c.session_id).where(runs_table.c.id == rid)).scalar_one_or_none()
-                    if locked_session_id != session_id:
-                        raise ValueError(f"Run {run_id} not found")
-                    sequence = (
-                        int(
-                            conn.execute(
-                                select(func.coalesce(func.max(run_events_table.c.sequence), 0)).where(run_events_table.c.run_id == rid)
-                            ).scalar_one()
-                        )
-                        + 1
-                    )
-                    conn.execute(
-                        insert(run_events_table).values(
-                            id=str(event_id),
-                            run_id=rid,
-                            sequence=sequence,
-                            timestamp=timestamp,
-                            event_type=event_type,
-                            data=payload,
-                        )
-                    )
-                return session_id, sequence
-
-        _session_id, sequence = await self._run_sync(_sync)
-        return RunEventRecord(
-            id=event_id,
-            run_id=run_id,
-            sequence=sequence,
-            timestamp=timestamp,
-            event_type=event_type,
-            data=cast(Mapping[str, Any], payload),
+        return cast(
+            "RunEventRecord",
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.runs.append_run_event(
+                    run_id=run_id,
+                    timestamp=timestamp,
+                    event_type=event_type,
+                    data=data,
+                ),
+            ),
         )
 
     async def list_run_events(self, run_id: UUID) -> list[RunEventRecord]:
@@ -8544,6 +9738,8 @@ class SessionServiceImpl:
         rows_routed_success: int | None = None,
         rows_routed_failure: int | None = None,
         rows_quarantined: int | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Update a run's status and optional fields.
 
@@ -8553,62 +9749,25 @@ class SessionServiceImpl:
         the column when not None. Raises ValueError if run not found or
         transition is illegal.
         """
-        now = self._now()
-        rid = str(run_id)
-
-        def _sync() -> None:
-            with self._engine.begin() as conn:
-                # Read current state for transition + write-once validation
-                current = conn.execute(
-                    select(
-                        runs_table.c.status,
-                        runs_table.c.landscape_run_id,
-                    ).where(runs_table.c.id == rid)
-                ).fetchone()
-
-                if current is None:
-                    raise ValueError(f"Run not found: {run_id}")
-
-                # D3: Enforce legal transitions — direct access; KeyError = Tier 1 crash.
-                # Use the narrow subclass so the cancelled-race recovery in
-                # ExecutionService can match identity, not message.  See
-                # IllegalRunTransitionError docstring for the full rationale.
-                current_status = current.status
-                allowed = LEGAL_RUN_TRANSITIONS[current_status]
-                if status not in allowed:
-                    raise IllegalRunTransitionError(current_status, status, allowed)
-
-                # D4: landscape_run_id is write-once
-                if landscape_run_id is not None and current.landscape_run_id is not None:
-                    raise ValueError(f"landscape_run_id already set to {current.landscape_run_id!r}; cannot overwrite")
-                if status in OPERATOR_COMPLETION_RUN_STATUS_VALUES and not (landscape_run_id or current.landscape_run_id):
-                    raise ValueError(f"{status} status requires landscape_run_id")
-                if status == "failed" and not error:
-                    raise ValueError("failed status requires error")
-
-                values: dict[str, Any] = {"status": status}
-                if status in SESSION_TERMINAL_RUN_STATUS_VALUES:
-                    values["finished_at"] = now
-                if error is not None:
-                    values["error"] = error
-                if landscape_run_id is not None:
-                    values["landscape_run_id"] = landscape_run_id
-                if rows_processed is not None:
-                    values["rows_processed"] = rows_processed
-                if rows_succeeded is not None:
-                    values["rows_succeeded"] = rows_succeeded
-                if rows_failed is not None:
-                    values["rows_failed"] = rows_failed
-                if rows_routed_success is not None:
-                    values["rows_routed_success"] = rows_routed_success
-                if rows_routed_failure is not None:
-                    values["rows_routed_failure"] = rows_routed_failure
-                if rows_quarantined is not None:
-                    values["rows_quarantined"] = rows_quarantined
-
-                conn.execute(update(runs_table).where(runs_table.c.id == rid).values(**values))
-
-        await self._run_sync(_sync)
+        try:
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.runs.transition_run_status(
+                    run_id=run_id,
+                    status=status,
+                    error=error,
+                    landscape_run_id=landscape_run_id,
+                    rows_processed=rows_processed,
+                    rows_succeeded=rows_succeeded,
+                    rows_failed=rows_failed,
+                    rows_routed_success=rows_routed_success,
+                    rows_routed_failure=rows_routed_failure,
+                    rows_quarantined=rows_quarantined,
+                ),
+            )
+        except SessionDerivedCustodyError:
+            raise ValueError(f"Run not found: {run_id}") from None
 
     async def record_blob_inline_resolutions(
         self,
@@ -8616,6 +9775,7 @@ class SessionServiceImpl:
         run_id: UUID,
         resolutions: Sequence[ResolvedBlobContent],
         attempt: int = 1,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Write audit rows for runtime-resolved inline blob content.
 
@@ -8624,33 +9784,27 @@ class SessionServiceImpl:
         Tier-1 anomaly and propagates as ``AuditIntegrityError``.
         """
         if not resolutions:
-            return
-
-        run_id_str = str(run_id)
-        now = self._now()
-
-        def _sync() -> None:
-            rows = [
-                {
-                    "run_id": run_id_str,
-                    "attempt": attempt,
-                    "field_path": resolution.field_path,
-                    "blob_id": str(resolution.blob_id),
-                    "content_hash": resolution.content_hash,
-                    "byte_length": resolution.byte_length,
-                    "mime_type": resolution.mime_type,
-                    "encoding": resolution.encoding,
-                    "resolved_at": now,
-                }
-                for resolution in resolutions
-            ]
             try:
-                with self._engine.begin() as conn:
-                    conn.execute(insert(blob_inline_resolutions_table), rows)
+                await self._run_sync(
+                    self._session_operation_authority.compare_and_swap,
+                    session_operation_context,
+                )
             except SQLAlchemyError as exc:
-                raise AuditIntegrityError(f"Tier 1: failed to record blob_inline_resolutions for run {run_id_str}: {exc}") from exc
-
-        await self._run_sync(_sync)
+                raise AuditIntegrityError(f"failed to record blob_inline_resolutions for run {run_id}") from exc
+            return
+        try:
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.blobs.insert_blob_inline_resolutions(
+                    run_id=run_id,
+                    attempt=attempt,
+                    resolutions=resolutions,
+                    resolved_at=self._now(),
+                ),
+            )
+        except SQLAlchemyError as exc:
+            raise AuditIntegrityError(f"failed to record blob_inline_resolutions for run {run_id}") from exc
 
     async def get_active_run(
         self,
@@ -8843,6 +9997,7 @@ class SessionServiceImpl:
         expected_current_state_version: int,
         actor: str,
         response_hash_factory: Callable[[CompositionStateRecord], str],
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord:
         """Copy one checkpoint and settle its retry operation atomically.
 
@@ -8859,7 +10014,7 @@ class SessionServiceImpl:
 
         def _sync() -> CompositionStateRecord:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                self.require_guided_operation_fence_on_connection(conn, fence)
+                self.require_guided_operation_authority_on_connection(conn, fence, session_operation_context)
                 self._require_guided_expected_current_state_on_connection(
                     conn,
                     session_id=sid,
@@ -8964,42 +10119,16 @@ class SessionServiceImpl:
                 # write.  A malformed ref, event, row, or reviewed-facts
                 # binding therefore rolls the whole revert back untouched.
                 for authority in pending_authorities:
-                    _require_no_active_guided_confirmation_admission(
+                    with self._guided_session_mutation_transaction(
                         conn,
-                        session_id=sid,
-                        proposal_id=str(authority.row.id),
-                        now=now,
-                    )
-                    event_id = str(uuid.uuid4())
-                    conn.execute(
-                        insert(proposal_events_table).values(
-                            id=event_id,
-                            session_id=sid,
-                            proposal_id=str(authority.row.id),
-                            event_type="proposal.rejected",
+                        guided_fence=fence,
+                        session_operation_context=session_operation_context,
+                    ) as mutation:
+                        mutation.composer.reject_pending_proposal(
+                            authority=authority,
                             actor=actor,
-                            payload=_pipeline_rejected_payload(
-                                authority=authority,
-                                reason="superseded",
-                                dispatch=None,
-                            ),
                             created_at=now,
                         )
-                    )
-                    updated = conn.execute(
-                        update(composition_proposals_table)
-                        .where(composition_proposals_table.c.session_id == sid)
-                        .where(composition_proposals_table.c.id == str(authority.row.id))
-                        .where(composition_proposals_table.c.status == "pending")
-                        .values(
-                            status="rejected",
-                            committed_state_id=None,
-                            audit_event_id=event_id,
-                            updated_at=now,
-                        )
-                    )
-                    if updated.rowcount != 1:
-                        raise AuditIntegrityError("state revert lost pending pipeline proposal authority")
 
                 reverted_composer_meta = deep_thaw(target_record.composer_meta)
                 if type(reverted_composer_meta) is dict:
@@ -9077,18 +10206,17 @@ class SessionServiceImpl:
                 conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
 
                 response_hash = response_hash_factory(record)
-                self.bind_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    fence,
-                    result_state_id=record.id,
-                )
-                self.complete_guided_operation_on_connection(
-                    conn,
-                    fence,
-                    result=GuidedCompositionStateResult(state_id=record.id),
-                    response_hash=response_hash,
-                    actor=actor,
-                )
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(result_state_id=record.id)
+                    mutation.guided.complete(
+                        result=GuidedCompositionStateResult(state_id=record.id),
+                        response_hash=response_hash,
+                        actor=actor,
+                    )
                 return record
 
         return cast("CompositionStateRecord", await self._run_sync(_sync))
@@ -9219,6 +10347,7 @@ class SessionServiceImpl:
         audit_evidence: GuidedAuditEvidence | None = None,
         originating_message: GuidedOriginatingUserMessageDraft | None = None,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedStartStateOutcome:
         """Atomically seed an empty session or settle its exact guided head.
 
@@ -9240,7 +10369,7 @@ class SessionServiceImpl:
 
         def _sync() -> GuidedStartStateOutcome:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                self.require_guided_operation_fence_on_connection(conn, fence)
+                self.require_guided_operation_authority_on_connection(conn, fence, session_operation_context)
                 current_row = conn.execute(
                     select(composition_states_table)
                     .where(composition_states_table.c.session_id == sid)
@@ -9313,19 +10442,20 @@ class SessionServiceImpl:
                         raise AuditIntegrityError("guided live start root intent row failed custody verification")
 
                 response_hash = response_hash_factory(record)
-                self.bind_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    fence,
-                    originating_message_id=(originating_message.message_id if originating_message is not None else None),
-                    result_state_id=record.id,
-                )
-                self.complete_guided_operation_on_connection(
-                    conn,
-                    fence,
-                    result=GuidedCompositionStateResult(state_id=record.id),
-                    response_hash=response_hash,
-                    actor=actor,
-                )
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(
+                        originating_message_id=(originating_message.message_id if originating_message is not None else None),
+                        result_state_id=record.id,
+                    )
+                    mutation.guided.complete(
+                        result=GuidedCompositionStateResult(state_id=record.id),
+                        response_hash=response_hash,
+                        actor=actor,
+                    )
                 return outcome
 
         return cast("GuidedStartStateOutcome", await self._run_sync(_sync))
@@ -9344,6 +10474,7 @@ class SessionServiceImpl:
         payloads: tuple[PreparedGuidedJsonPayload, ...] = (),
         audit_evidence: GuidedAuditEvidence | None = None,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord:
         """Persist one guided checkpoint and its replay settlement atomically."""
 
@@ -9359,7 +10490,7 @@ class SessionServiceImpl:
 
         def _sync() -> CompositionStateRecord:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                self.require_guided_operation_fence_on_connection(conn, fence)
+                self.require_guided_operation_authority_on_connection(conn, fence, session_operation_context)
                 self._require_guided_expected_current_state_on_connection(
                     conn,
                     session_id=sid,
@@ -9407,14 +10538,17 @@ class SessionServiceImpl:
                 if row_count:
                     conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
                 response_hash = response_hash_factory(record)
-                self.bind_guided_operation_on_connection(conn, fence, result_state_id=record.id)
-                self.complete_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    fence,
-                    result=GuidedCompositionStateResult(state_id=record.id),
-                    response_hash=response_hash,
-                    actor=actor,
-                )
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(result_state_id=record.id)
+                    mutation.guided.complete(
+                        result=GuidedCompositionStateResult(state_id=record.id),
+                        response_hash=response_hash,
+                        actor=actor,
+                    )
                 return record
 
         return cast("CompositionStateRecord", await self._run_sync(_sync))
@@ -9424,6 +10558,7 @@ class SessionServiceImpl:
         command: GuidedStateOperationCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedStateOperationSettlement:
         """Commit one RESPOND/CHAT state and its evidence under one live fence."""
 
@@ -9459,7 +10594,11 @@ class SessionServiceImpl:
 
         def _sync() -> GuidedStateOperationSettlement:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                operation_row, _database_now = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                operation_row, _database_now = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    command.fence,
+                    session_operation_context,
+                )
                 if operation_row["kind"] != command.response.kind:
                     raise AuditIntegrityError("Guided response descriptor kind does not match the reserved operation")
                 self._require_guided_expected_current_state_on_connection(
@@ -9541,12 +10680,16 @@ class SessionServiceImpl:
                 primary_state = self._row_to_state_record(primary_row)
 
                 if invalidated_authority is not None:
-                    _reject_guided_pending_proposal(
+                    with self._guided_session_mutation_transaction(
                         conn,
-                        authority=invalidated_authority,
-                        actor=command.actor,
-                        created_at=now,
-                    )
+                        guided_fence=command.fence,
+                        session_operation_context=session_operation_context,
+                    ) as mutation:
+                        mutation.composer.reject_pending_proposal(
+                            authority=invalidated_authority,
+                            actor=command.actor,
+                            created_at=now,
+                        )
 
                 row_count = len(audit_rows) + (1 if command.originating_message is not None else 0)
                 sequence_no = self._reserve_sequence_range(conn, sid, count=row_count) if row_count else None
@@ -9631,21 +10774,22 @@ class SessionServiceImpl:
                 response = project_guided_response(result_state, payloads=command.payloads)
                 projected_json = response_json(response)
                 response_hash = guided_response_projection_hash(response)
-                self.bind_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    command.fence,
-                    originating_message_id=(command.originating_message.message_id if command.originating_message is not None else None),
-                    result_state_id=result_state.id,
-                )
-                self.complete_guided_operation_on_connection(
-                    conn,
-                    command.fence,
-                    result=GuidedCompositionStateResult(
-                        state_id=result_state.id,
-                    ),
-                    response_hash=response_hash,
-                    actor=command.actor,
-                )
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(
+                        originating_message_id=(
+                            command.originating_message.message_id if command.originating_message is not None else None
+                        ),
+                        result_state_id=result_state.id,
+                    )
+                    mutation.guided.complete(
+                        result=GuidedCompositionStateResult(state_id=result_state.id),
+                        response_hash=response_hash,
+                        actor=command.actor,
+                    )
                 return GuidedStateOperationSettlement(
                     primary_state=primary_state,
                     result_state=result_state,
@@ -9661,6 +10805,8 @@ class SessionServiceImpl:
     async def stage_guided_full_pipeline_proposal(
         self,
         command: GuidedFullPipelineProposalStageCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedFullPipelineProposalStageSettlement:
         """Publish one guided-full proposal and its replay locator atomically."""
 
@@ -9720,7 +10866,11 @@ class SessionServiceImpl:
 
         def _sync() -> GuidedFullPipelineProposalStageSettlement:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                operation_row, _database_now = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                operation_row, _database_now = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    command.fence,
+                    session_operation_context,
+                )
                 if operation_row["kind"] != "guided_plan":
                     raise AuditIntegrityError("guided-full stage requires a guided_plan operation")
                 current_row = conn.execute(
@@ -9852,21 +11002,20 @@ class SessionServiceImpl:
                 response = project_composition_proposal(proposal_record)
                 projected_json = response_json(response)
                 response_hash = guided_response_projection_hash(response)
-                self.bind_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    command.fence,
-                    originating_message_id=command.originating_message.message_id,
-                )
-                self.complete_guided_operation_on_connection(
-                    conn,
-                    command.fence,
-                    result=GuidedPipelineProposalResult(
-                        proposal_id=command.proposal_id,
-                        checkpoint_state_id=checkpoint.id,
-                    ),
-                    response_hash=response_hash,
-                    actor=command.actor,
-                )
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(originating_message_id=command.originating_message.message_id)
+                    mutation.guided.complete(
+                        result=GuidedPipelineProposalResult(
+                            proposal_id=command.proposal_id,
+                            checkpoint_state_id=checkpoint.id,
+                        ),
+                        response_hash=response_hash,
+                        actor=command.actor,
+                    )
                 return GuidedFullPipelineProposalStageSettlement(
                     checkpoint_state=checkpoint,
                     proposal=proposal_record,
@@ -9886,6 +11035,7 @@ class SessionServiceImpl:
         command: GuidedPipelineProposalStageCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement:
         """Atomically publish one pending guided checkpoint and its authority."""
 
@@ -10056,7 +11206,11 @@ class SessionServiceImpl:
 
         def _sync() -> GuidedPipelineProposalStageSettlement:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                operation_row, _database_now = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                operation_row, _database_now = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    command.fence,
+                    session_operation_context,
+                )
                 if operation_row["kind"] != "guided_respond":
                     raise AuditIntegrityError("guided proposal stage requires a guided_respond operation")
                 self._require_guided_expected_current_state_on_connection(
@@ -10171,42 +11325,16 @@ class SessionServiceImpl:
                         or superseded_authority.proposal.draft_hash != proposal.supersedes_draft_hash
                     ):
                         raise AuditIntegrityError("guided proposal revision predecessor is no longer pending")
-                    _require_no_active_guided_confirmation_admission(
+                    with self._guided_session_mutation_transaction(
                         conn,
-                        session_id=sid,
-                        proposal_id=str(command.supersedes_proposal_id),
-                        now=now,
-                    )
-                    superseded_event_id = str(uuid.uuid4())
-                    conn.execute(
-                        insert(proposal_events_table).values(
-                            id=superseded_event_id,
-                            session_id=sid,
-                            proposal_id=str(command.supersedes_proposal_id),
-                            event_type="proposal.rejected",
+                        guided_fence=command.fence,
+                        session_operation_context=session_operation_context,
+                    ) as mutation:
+                        mutation.composer.reject_pending_proposal(
+                            authority=superseded_authority,
                             actor=command.actor,
-                            payload=_pipeline_rejected_payload(
-                                authority=superseded_authority,
-                                reason="superseded",
-                                dispatch=None,
-                            ),
                             created_at=now,
                         )
-                    )
-                    updated_predecessor = conn.execute(
-                        update(composition_proposals_table)
-                        .where(composition_proposals_table.c.session_id == sid)
-                        .where(composition_proposals_table.c.id == str(command.supersedes_proposal_id))
-                        .where(composition_proposals_table.c.status == "pending")
-                        .values(
-                            status="rejected",
-                            committed_state_id=None,
-                            audit_event_id=superseded_event_id,
-                            updated_at=now,
-                        )
-                    )
-                    if updated_predecessor.rowcount != 1:
-                        raise AuditIntegrityError("guided proposal revision predecessor changed during settlement")
 
                 validate_proposal_blob_references(
                     conn,
@@ -10308,23 +11436,26 @@ class SessionServiceImpl:
                 response = project_guided_response(result_state, payloads=command.payloads)
                 projected_json = response_json(response)
                 response_hash = guided_response_projection_hash(response)
-                self.bind_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    command.fence,
-                    originating_message_id=(command.originating_message.message_id if command.originating_message is not None else None),
-                    proposal_id=command.proposal_id,
-                    result_state_id=result_state.id,
-                )
-                self.complete_guided_operation_on_connection(
-                    conn,
-                    command.fence,
-                    result=GuidedCompositionStateResult(
-                        state_id=result_state.id,
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(
+                        originating_message_id=(
+                            command.originating_message.message_id if command.originating_message is not None else None
+                        ),
                         proposal_id=command.proposal_id,
-                    ),
-                    response_hash=response_hash,
-                    actor=command.actor,
-                )
+                        result_state_id=result_state.id,
+                    )
+                    mutation.guided.complete(
+                        result=GuidedCompositionStateResult(
+                            state_id=result_state.id,
+                            proposal_id=command.proposal_id,
+                        ),
+                        response_hash=response_hash,
+                        actor=command.actor,
+                    )
                 return GuidedPipelineProposalStageSettlement(
                     result_state=result_state,
                     proposal=proposal_record,
@@ -10338,127 +11469,12 @@ class SessionServiceImpl:
         _PIPELINE_CUSTODY_COUNTER.add(1, {"surface": proposal.surface.value, "result": command.plan.custody_result})
         return settlement
 
-    async def reconcile_rejected_guided_pipeline_proposal(
-        self,
-        *,
-        session_id: UUID,
-        expected_current_state_id: UUID,
-        proposal_id: UUID,
-        draft_hash: str,
-        reviewed_facts: Mapping[str, Any],
-    ) -> CompositionStateRecord:
-        """Clear an explicitly terminal guided reference under one DB lock."""
-
-        sid = str(session_id)
-        pid = str(proposal_id)
-        now = self._now()
-
-        def _sync() -> CompositionStateRecord:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                current_row = conn.execute(
-                    select(composition_states_table)
-                    .where(composition_states_table.c.session_id == sid)
-                    .order_by(desc(composition_states_table.c.version))
-                    .limit(1)
-                ).one_or_none()
-                if current_row is None or current_row.id != str(expected_current_state_id):
-                    raise AuditIntegrityError("guided rejected-proposal reconciliation current state changed")
-                proposal_row = conn.execute(
-                    select(composition_proposals_table)
-                    .where(composition_proposals_table.c.session_id == sid)
-                    .where(composition_proposals_table.c.id == pid)
-                ).one_or_none()
-                if proposal_row is None:
-                    raise AuditIntegrityError("guided rejected-proposal authority is missing or cross-session")
-                creation_rows = conn.execute(
-                    select(proposal_events_table)
-                    .where(proposal_events_table.c.session_id == sid)
-                    .where(proposal_events_table.c.proposal_id == pid)
-                    .where(proposal_events_table.c.event_type == "proposal.created")
-                ).fetchall()
-                if len(creation_rows) != 1:
-                    raise AuditIntegrityError("guided rejected proposal must have one creation event")
-                authority = _restore_authoritative_pipeline_proposal(
-                    conn=conn,
-                    row=_proposal_record_from_row(proposal_row),
-                    creation_event=_proposal_event_record_from_row(creation_rows[0]),
-                    reviewed_facts=reviewed_facts,
-                )
-                _verify_pipeline_lifecycle_authority(conn, service=self, authority=authority)
-                if authority.row.status != "rejected" or authority.proposal.draft_hash != draft_hash:
-                    raise AuditIntegrityError("guided rejected-proposal authority is not the expected terminal draft")
-                terminal_rows = conn.execute(
-                    select(proposal_events_table)
-                    .where(proposal_events_table.c.session_id == sid)
-                    .where(proposal_events_table.c.proposal_id == pid)
-                    .where(proposal_events_table.c.event_type == "proposal.rejected")
-                ).fetchall()
-                if len(terminal_rows) != 1 or terminal_rows[0].payload.get("reason_code") not in {
-                    "operator_rejected",
-                    "superseded",
-                }:
-                    raise AuditIntegrityError("guided proposal terminal reason is not reconcilable")
-
-                current_record = self._row_to_state_record(current_row)
-                current_state = state_from_record(current_record)
-                guided = current_state.guided_session
-                if guided is None or guided.active_proposal is None:
-                    raise AuditIntegrityError("guided rejected-proposal reference is missing")
-                active = guided.active_proposal
-                if (
-                    active.proposal_id != proposal_id
-                    or active.draft_hash != draft_hash
-                    or active.base != authority.proposal.base
-                    or active.reviewed_anchor_hash != authority.proposal.reviewed_anchor_hash
-                    or active.covered_deferred_intent_ids != authority.proposal.covered_deferred_intent_ids
-                ):
-                    raise AuditIntegrityError("guided rejected-proposal reference differs from authority")
-                from elspeth.web.composer.guided.protocol import TurnType
-                from elspeth.web.composer.guided.state_machine import GuidedSession
-
-                if (
-                    not guided.history
-                    or guided.history[-1].turn_type is not TurnType.PROPOSE_PIPELINE
-                    or guided.history[-1].response_hash is not None
-                ):
-                    raise AuditIntegrityError("guided rejected proposal has no active proposal occurrence")
-
-                cleared = replace(
-                    guided,
-                    history=guided.history[:-1],
-                    active_proposal=None,
-                    active_edit_target=None,
-                )
-                if type(cleared) is not GuidedSession:  # pragma: no cover - replace contract
-                    raise AuditIntegrityError("guided rejected-proposal reconciliation lost checkpoint type")
-                state_dict = current_state.to_dict()
-                data = CompositionStateData(
-                    sources=state_dict["sources"],
-                    nodes=state_dict["nodes"],
-                    edges=state_dict["edges"],
-                    outputs=state_dict["outputs"],
-                    metadata_=state_dict["metadata"],
-                    is_valid=current_record.is_valid,
-                    validation_errors=current_record.validation_errors,
-                    composer_meta={"guided_session": cleared.to_dict()},
-                )
-                state_id = self._insert_composition_state(
-                    conn,
-                    session_id=sid,
-                    payload=StatePayload(data=data, derived_from_state_id=str(current_record.id)),
-                    provenance="convergence_persist",
-                    created_at=now,
-                )
-                row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == state_id)).one()
-                return self._row_to_state_record(row)
-
-        return cast("CompositionStateRecord", await self._run_sync(_sync))
-
     async def back_edit_guided_pipeline_proposal(
         self,
         command: GuidedPipelineProposalBackEditCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement:
         """Atomically supersede one proposal and rewind to a component edit."""
 
@@ -10509,7 +11525,11 @@ class SessionServiceImpl:
 
         def _sync() -> GuidedPipelineProposalStageSettlement:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                operation_row, _ = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                operation_row, _ = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    command.fence,
+                    session_operation_context,
+                )
                 if operation_row["kind"] != "guided_respond":
                     raise AuditIntegrityError("guided proposal back-edit requires guided_respond")
                 self._require_guided_expected_current_state_on_connection(
@@ -10694,19 +11714,17 @@ class SessionServiceImpl:
                 response = project_guided_response(result_state, payloads=command.payloads)
                 projected_json = response_json(response)
                 response_hash = guided_response_projection_hash(response)
-                self.bind_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    command.fence,
-                    proposal_id=command.proposal_id,
-                    result_state_id=result_state.id,
-                )
-                self.complete_guided_operation_on_connection(
-                    conn,
-                    command.fence,
-                    result=GuidedCompositionStateResult(state_id=result_state.id, proposal_id=command.proposal_id),
-                    response_hash=response_hash,
-                    actor=command.actor,
-                )
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(proposal_id=command.proposal_id, result_state_id=result_state.id)
+                    mutation.guided.complete(
+                        result=GuidedCompositionStateResult(state_id=result_state.id, proposal_id=command.proposal_id),
+                        response_hash=response_hash,
+                        actor=command.actor,
+                    )
                 updated_row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == pid)).one()
                 proposal_record = replace(
                     _proposal_record_from_row(updated_row),
@@ -10727,6 +11745,8 @@ class SessionServiceImpl:
     async def reject_guided_pipeline_proposal(
         self,
         command: GuidedPipelineProposalRejectCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement:
         """Atomically reject one pending guided proposal and clear its ref."""
 
@@ -10738,7 +11758,11 @@ class SessionServiceImpl:
 
         def _sync() -> GuidedPipelineProposalStageSettlement:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                operation_row, _ = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                operation_row, _ = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    command.fence,
+                    session_operation_context,
+                )
                 if operation_row["kind"] != "guided_respond":
                     raise AuditIntegrityError("guided proposal rejection requires guided_respond")
                 self._require_guided_expected_current_state_on_connection(
@@ -10851,19 +11875,17 @@ class SessionServiceImpl:
                 response = project_guided_response(result_state, payloads=())
                 projected_json = response_json(response)
                 response_hash = guided_response_projection_hash(response)
-                self.bind_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    command.fence,
-                    proposal_id=command.proposal_id,
-                    result_state_id=result_state.id,
-                )
-                self.complete_guided_operation_on_connection(
-                    conn,
-                    command.fence,
-                    result=GuidedCompositionStateResult(state_id=result_state.id, proposal_id=command.proposal_id),
-                    response_hash=response_hash,
-                    actor=command.actor,
-                )
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(proposal_id=command.proposal_id, result_state_id=result_state.id)
+                    mutation.guided.complete(
+                        result=GuidedCompositionStateResult(state_id=result_state.id, proposal_id=command.proposal_id),
+                        response_hash=response_hash,
+                        actor=command.actor,
+                    )
                 return GuidedPipelineProposalStageSettlement(
                     result_state=result_state,
                     proposal=proposal_record,
@@ -10941,6 +11963,8 @@ class SessionServiceImpl:
     async def admit_guided_pipeline_confirmation(
         self,
         command: GuidedPipelineConfirmationAdmissionCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> PipelineDispatchRecovery | None:
         """Acquire the proposal fence before any set_pipeline dispatch."""
 
@@ -10950,7 +11974,11 @@ class SessionServiceImpl:
 
         def _sync() -> PipelineDispatchRecovery | None:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                operation, now = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                operation, now = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    command.fence,
+                    session_operation_context,
+                )
                 if operation["kind"] != "guided_respond":
                     raise AuditIntegrityError("guided confirmation admission requires guided_respond")
                 self._require_guided_expected_current_state_on_connection(
@@ -10981,29 +12009,12 @@ class SessionServiceImpl:
                 ):
                     raise GuidedOperationSettlementConflictError()
 
-                conn.execute(
-                    update(guided_operations_table)
-                    .where(
-                        guided_operations_table.c.session_id == sid,
-                        guided_operations_table.c.proposal_id == str(command.proposal_id),
-                        guided_operations_table.c.status == "in_progress",
-                        guided_operations_table.c.lease_expires_at <= now,
-                    )
-                    .values(proposal_id=None, updated_at=now)
-                )
-                owner = conn.execute(
-                    select(guided_operations_table.c.operation_id)
-                    .where(
-                        guided_operations_table.c.session_id == sid,
-                        guided_operations_table.c.proposal_id == str(command.proposal_id),
-                        guided_operations_table.c.status == "in_progress",
-                        guided_operations_table.c.lease_expires_at > now,
-                    )
-                    .limit(1)
-                ).scalar_one_or_none()
-                if owner is not None and owner != command.fence.operation_id:
-                    raise GuidedOperationSettlementConflictError()
-                self.bind_guided_operation_on_connection(conn, command.fence, proposal_id=command.proposal_id)
+                with self._guided_session_mutation_transaction(
+                    conn,
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.claim_confirmation(proposal_id=command.proposal_id, now=now)
                 return self._pipeline_dispatch_recovery_on_connection(conn, authority=authority)
 
         try:
@@ -11014,6 +12025,8 @@ class SessionServiceImpl:
     async def record_guided_pipeline_dispatch(
         self,
         command: GuidedPipelineDispatchRecordCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> PipelineDispatchRecovery:
         """Durably record the successful dispatch before final publication."""
 
@@ -11029,7 +12042,11 @@ class SessionServiceImpl:
 
         def _sync() -> PipelineDispatchRecovery:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                operation, _database_now = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                operation, _database_now = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    command.fence,
+                    session_operation_context,
+                )
                 if operation["kind"] != "guided_respond" or operation["proposal_id"] != str(command.proposal_id):
                     raise GuidedOperationSettlementConflictError()
                 self._require_guided_expected_current_state_on_connection(
@@ -11079,6 +12096,7 @@ class SessionServiceImpl:
         command: GuidedPipelineProposalAcceptCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement:
         """Atomically publish accepted state, terminal event, and operation."""
 
@@ -11100,7 +12118,11 @@ class SessionServiceImpl:
 
         def _sync() -> GuidedPipelineProposalStageSettlement:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                operation_row, _ = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                operation_row, _ = self.require_guided_operation_authority_on_connection(
+                    conn,
+                    command.fence,
+                    session_operation_context,
+                )
                 if operation_row["kind"] != "guided_respond" or operation_row["proposal_id"] != pid:
                     raise AuditIntegrityError("guided proposal acceptance requires guided_respond")
                 self._require_guided_expected_current_state_on_connection(
@@ -11259,19 +12281,17 @@ class SessionServiceImpl:
                 response = project_guided_response(result_state, payloads=command.payloads)
                 projected_json = response_json(response)
                 response_hash = guided_response_projection_hash(response)
-                self.bind_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    command.fence,
-                    proposal_id=command.proposal_id,
-                    result_state_id=result_state.id,
-                )
-                self.complete_guided_operation_on_connection(
-                    conn,
-                    command.fence,
-                    result=GuidedCompositionStateResult(state_id=result_state.id, proposal_id=command.proposal_id),
-                    response_hash=response_hash,
-                    actor=command.actor,
-                )
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(proposal_id=command.proposal_id, result_state_id=result_state.id)
+                    mutation.guided.complete(
+                        result=GuidedCompositionStateResult(state_id=result_state.id, proposal_id=command.proposal_id),
+                        response_hash=response_hash,
+                        actor=command.actor,
+                    )
                 return GuidedPipelineProposalStageSettlement(
                     result_state=result_state,
                     proposal=proposal_record,
@@ -11293,6 +12313,7 @@ class SessionServiceImpl:
         expected_current_state_version: int,
         actor: str,
         response_hash_factory: Callable[[CompositionStateRecord], str],
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord:
         """Settle a no-op/idempotent surface against one immutable state."""
 
@@ -11300,7 +12321,7 @@ class SessionServiceImpl:
 
         def _sync() -> CompositionStateRecord:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                self.require_guided_operation_fence_on_connection(conn, fence)
+                self.require_guided_operation_authority_on_connection(conn, fence, session_operation_context)
                 if state_id != expected_current_state_id:
                     raise ValueError("existing guided operation result must be the expected current state")
                 self._require_guided_expected_current_state_on_connection(
@@ -11318,14 +12339,17 @@ class SessionServiceImpl:
                     raise AuditIntegrityError("Guided operation result state is absent from its session")
                 record = self._row_to_state_record(row)
                 response_hash = response_hash_factory(record)
-                self.bind_guided_operation_on_connection(conn, fence, result_state_id=record.id)
-                self.complete_guided_operation_on_connection(
+                with self._guided_session_mutation_transaction(
                     conn,
-                    fence,
-                    result=GuidedCompositionStateResult(state_id=record.id),
-                    response_hash=response_hash,
-                    actor=actor,
-                )
+                    guided_fence=fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.bind(result_state_id=record.id)
+                    mutation.guided.complete(
+                        result=GuidedCompositionStateResult(state_id=record.id),
+                        response_hash=response_hash,
+                        actor=actor,
+                    )
                 return record
 
         return cast("CompositionStateRecord", await self._run_sync(_sync))
@@ -11607,20 +12631,21 @@ class SessionServiceImpl:
 
         return cast(int, await self._run_sync(_sync))
 
-    def _load_staged_fork_on_connection(
+    def _load_staged_fork_from_transaction(
         self,
-        conn: Connection,
+        transaction: SessionForkCreationTransaction,
         *,
         parent_session_id: UUID,
         child_session_id: UUID,
         operation_id: str,
         fork_message_id: UUID,
         new_message_content: str,
+        authority: SessionForkAuthority,
     ) -> StagedForkSession:
-        parent_row = conn.execute(
-            select(sessions_table.c.user_id, sessions_table.c.auth_provider_type).where(sessions_table.c.id == str(parent_session_id))
-        ).one_or_none()
-        child_row = conn.execute(select(sessions_table).where(sessions_table.c.id == str(child_session_id))).one_or_none()
+        if not isinstance(transaction, SessionForkCreationTransaction):
+            raise TypeError("transaction must implement SessionForkCreationTransaction")
+        parent_row = transaction.read_parent_session()
+        child_row, rows, state_row = transaction.read_child_snapshot()
         if (
             child_row is None
             or child_row.archived_at is None
@@ -11632,11 +12657,6 @@ class SessionServiceImpl:
         ):
             raise AuditIntegrityError("Guided fork bound child failed archived lineage, principal, or fork message validation")
 
-        rows = conn.execute(
-            select(chat_messages_table)
-            .where(chat_messages_table.c.session_id == str(child_session_id))
-            .order_by(chat_messages_table.c.sequence_no)
-        ).all()
         plan_candidates: list[tuple[BlobForkPlanEntry, ...]] = []
         public_messages: list[ChatMessageRecord] = []
         for row in rows:
@@ -11673,12 +12693,6 @@ class SessionServiceImpl:
         ):
             raise AuditIntegrityError("Guided fork bound child edited message validation failed")
 
-        state_row = conn.execute(
-            select(composition_states_table)
-            .where(composition_states_table.c.session_id == str(child_session_id))
-            .order_by(composition_states_table.c.version.desc())
-            .limit(1)
-        ).one_or_none()
         state = self._row_to_state_record(state_row) if state_row is not None else None
         if edited_message.composition_state_id != (state.id if state is not None else None):
             raise AuditIntegrityError("Guided fork bound child edited message does not reference its staged current state")
@@ -11687,11 +12701,12 @@ class SessionServiceImpl:
             messages=tuple(public_messages),
             state=state,
             blob_plan=plan_candidates[0],
+            authority=authority,
         )
 
     async def fork_session(
         self,
-        fence: GuidedOperationFence,
+        authority: SessionForkParentAuthority,
         *,
         fork_message_id: UUID,
         new_message_content: str,
@@ -11717,9 +12732,11 @@ class SessionServiceImpl:
         from elspeth.web.sessions.protocol import InvalidForkTargetError
 
         # Load source data (read-only, outside the write transaction)
-        if type(fence) is not GuidedOperationFence:
-            raise TypeError("fork_session fence must be an exact GuidedOperationFence")
+        if type(authority) is not SessionForkParentAuthority:
+            raise TypeError("fork_session authority must be an exact SessionForkParentAuthority")
+        fence = authority.guided_fence
         source_session_id = fence.session_id
+        source_session = await self.get_session(source_session_id)
         source_messages = await self.get_messages(source_session_id, limit=None)
 
         # Find the fork message — must be a user message
@@ -11748,8 +12765,6 @@ class SessionServiceImpl:
             )
 
         # Prepare IDs and timestamps upfront
-        new_session_id = uuid.uuid4()
-        new_session_id_str = str(new_session_id)
         now = self._now()
         # Prepare state copy if needed
         copied_state_id = uuid.uuid4() if source_state_record is not None else None
@@ -11765,7 +12780,7 @@ class SessionServiceImpl:
         # so get_messages() ordering is deterministic.  Stamping all rows
         # with `now` would make them indistinguishable by timestamp and
         # produce non-deterministic ordering on subsequent reads.
-        msg_records_data: list[dict[str, Any]] = []
+        child_messages: list[SessionForkChildMessageCreation] = []
         for msg in messages_to_copy:
             copied_msg_id = source_to_copied_message_id[str(msg.id)]
 
@@ -11787,44 +12802,40 @@ class SessionServiceImpl:
                     raise RuntimeError(f"fork slice excludes parent assistant of tool message id={msg.id}")
                 copied_parent_assistant_id = source_to_copied_message_id[parent_key]
 
-            msg_records_data.append(
-                {
-                    "id": copied_msg_id,
-                    "session_id": new_session_id_str,
-                    "role": msg.role,
-                    "content": msg.content,
-                    # raw_content preserves audit provenance for intercepted assistant turns
-                    "raw_content": msg.raw_content,
-                    "tool_calls": deep_thaw(msg.tool_calls) if msg.tool_calls else None,
-                    "tool_call_id": msg.tool_call_id,
-                    "parent_assistant_id": copied_parent_assistant_id,
+            child_messages.append(
+                SessionForkChildMessageCreation(
+                    id=UUID(copied_msg_id),
+                    role=msg.role,
+                    content=msg.content,
+                    raw_content=msg.raw_content,
+                    tool_calls=msg.tool_calls,
+                    tool_call_id=msg.tool_call_id,
+                    parent_assistant_id=(UUID(copied_parent_assistant_id) if copied_parent_assistant_id is not None else None),
                     # Preserve the source row's stored writer; deriving from
                     # role would fabricate provenance for any source row whose
-                    # writer differs from the role-keyed default (admin tool,
-                    # future re-classifications, etc.).
-                    "writer_principal": msg.writer_principal,
-                    "created_at": msg.created_at,
-                    "composition_state_id": None,  # Don't reference source session states
-                }
+                    # writer differs from the role-keyed default.
+                    writer_principal=msg.writer_principal,
+                    created_at=msg.created_at,
+                    composition_state_id=None,
+                )
             )
         # System message — no raw_content (synthetic, not from the LLM).
         # writer_principal="session_fork" because this row is unambiguously
         # authored by the fork operation, not by any route handler.
         system_msg_id = str(uuid.uuid4())
-        msg_records_data.append(
-            {
-                "id": system_msg_id,
-                "session_id": new_session_id_str,
-                "role": "system",
-                "content": "Conversation forked from an earlier point.",
-                "raw_content": None,
-                "tool_calls": None,
-                "tool_call_id": None,
-                "parent_assistant_id": None,
-                "writer_principal": "session_fork",
-                "created_at": now,
-                "composition_state_id": None,
-            }
+        child_messages.append(
+            SessionForkChildMessageCreation(
+                id=UUID(system_msg_id),
+                role="system",
+                content="Conversation forked from an earlier point.",
+                raw_content=None,
+                tool_calls=None,
+                tool_call_id=None,
+                parent_assistant_id=None,
+                writer_principal="session_fork",
+                created_at=now,
+                composition_state_id=None,
+            )
         )
         # New edited user message — provenance points to COPIED state, not source.
         # created_at = now is correct here: ordering is enforced by sequence_no
@@ -11833,195 +12844,176 @@ class SessionServiceImpl:
         # SQLite same-microsecond ordering ambiguity is no longer needed.
         # raw_content is None: this is a new user-authored message, not an LLM turn.
         new_user_msg_id = str(uuid.uuid4())
-        msg_records_data.append(
-            {
-                "id": new_user_msg_id,
-                "session_id": new_session_id_str,
-                "role": "user",
-                "content": new_message_content,
-                "raw_content": None,
-                "tool_calls": None,
-                "tool_call_id": None,
-                "parent_assistant_id": None,
-                "writer_principal": "session_fork",
-                "created_at": now,
-                "composition_state_id": copied_state_id_str,
-            }
+        child_messages.append(
+            SessionForkChildMessageCreation(
+                id=UUID(new_user_msg_id),
+                role="user",
+                content=new_message_content,
+                raw_content=None,
+                tool_calls=None,
+                tool_call_id=None,
+                parent_assistant_id=None,
+                writer_principal="session_fork",
+                created_at=now,
+                composition_state_id=(UUID(copied_state_id_str) if copied_state_id_str is not None else None),
+            )
         )
 
-        def _sync() -> StagedForkSession:
+        def _sync(
+            transaction: SessionForkCreationTransaction,
+            fork_authority: SessionForkAuthority,
+        ) -> StagedForkSession:
             """Create+bind or reload exactly one child under the parent fence."""
             parent_session_id_str = str(source_session_id)
-            with self._session_process_locked_begin(parent_session_id_str) as conn, self._session_write_lock(conn, parent_session_id_str):
-                operation, _database_now = self.require_guided_operation_fence_on_connection(conn, fence)
-                if operation["kind"] != "session_fork":
-                    raise AuditIntegrityError("fork_session fence is not bound to session_fork")
-                bound_child_id = operation["result_session_id"]
-                if bound_child_id is not None:
-                    if operation["originating_message_id"] != str(fork_message_id):
-                        raise AuditIntegrityError("Guided fork bound child has a different fork message binding")
-                    return self._load_staged_fork_on_connection(
-                        conn,
-                        parent_session_id=source_session_id,
-                        child_session_id=UUID(bound_child_id),
-                        operation_id=fence.operation_id,
-                        fork_message_id=fork_message_id,
-                        new_message_content=new_message_content,
-                    )
-
-                parent_row = conn.execute(select(sessions_table).where(sessions_table.c.id == parent_session_id_str)).one_or_none()
-                fork_row = conn.execute(
-                    select(chat_messages_table).where(
-                        chat_messages_table.c.id == str(fork_message_id),
-                        chat_messages_table.c.session_id == parent_session_id_str,
-                    )
-                ).one_or_none()
-                if parent_row is None or parent_row.archived_at is not None:
-                    raise AuditIntegrityError("Guided fork parent failed active custody validation")
-                if (
-                    fork_row is None
-                    or fork_row.role != "user"
-                    or fork_row.composition_state_id != (str(source_state_record.id) if source_state_record is not None else None)
-                ):
-                    raise AuditIntegrityError("Guided fork message changed before staging")
-
-                locked_source_state: CompositionStateRecord | None = None
-                forked_composer_meta: dict[str, Any] | None = None
-                if source_state_record is not None:
-                    locked_source_row = conn.execute(
-                        select(composition_states_table)
-                        .where(composition_states_table.c.id == str(source_state_record.id))
-                        .where(composition_states_table.c.session_id == parent_session_id_str)
-                    ).one_or_none()
-                    if locked_source_row is None:
-                        raise AuditIntegrityError("Guided fork source checkpoint is missing or cross-session")
-                    locked_source_state = self._row_to_state_record(locked_source_row)
-                    forked_composer_meta = _strip_guided_profile_in_meta(
-                        locked_source_state.composer_meta,
-                        source_to_copied_message_id,
-                        source_messages_by_id,
-                    )
-                    source_meta = deep_thaw(locked_source_state.composer_meta)
-                    if type(source_meta) is dict and source_meta.get("guided_session") is not None:
-                        from elspeth.web.composer.guided.errors import InvariantError
-                        from elspeth.web.composer.guided.state_machine import GuidedSession
-
-                        try:
-                            source_guided = GuidedSession.from_dict(source_meta["guided_session"])
-                        except (InvariantError, KeyError, TypeError, ValueError) as exc:
-                            raise AuditIntegrityError("fork guided schema-10 authority is malformed") from exc
-                        _require_pending_guided_checkpoint_proposal_authority(
-                            conn,
-                            service=self,
-                            session_id=parent_session_id_str,
-                            checkpoint=locked_source_state,
-                            guided=source_guided,
-                            role="fork source",
-                        )
-                        if source_guided.root_intent_message_id is not None:
-                            _verify_guided_root_message_authority(
-                                conn,
-                                service=self,
-                                session_id=parent_session_id_str,
-                                guided=source_guided,
-                            )
-
-                plan = tuple(
-                    BlobForkPlanEntry(
-                        source_blob_id=UUID(row.id),
-                        target_blob_id=fork_blob_id(
-                            target_session_id=new_session_id,
-                            source_blob_id=UUID(row.id),
-                        ),
-                        content_hash=row.content_hash,
-                        size_bytes=row.size_bytes,
-                    )
-                    for row in conn.execute(
-                        select(blobs_table.c.id, blobs_table.c.content_hash, blobs_table.c.size_bytes)
-                        .where(
-                            blobs_table.c.session_id == parent_session_id_str,
-                            blobs_table.c.status == "ready",
-                        )
-                        .order_by(blobs_table.c.id)
-                    ).all()
-                )
-                plan_message = {
-                    "id": str(uuid.uuid4()),
-                    "session_id": new_session_id_str,
-                    "role": "audit",
-                    "content": _fork_blob_plan_content(
-                        source_session_id=source_session_id,
-                        child_session_id=new_session_id,
-                        operation_id=fence.operation_id,
-                        entries=plan,
-                    ),
-                    "raw_content": None,
-                    "tool_calls": None,
-                    "tool_call_id": None,
-                    "parent_assistant_id": None,
-                    "writer_principal": "session_fork",
-                    "created_at": now,
-                    "composition_state_id": None,
-                }
-                rows_to_insert = [dict(record) for record in msg_records_data]
-                rows_to_insert.append(plan_message)
-
-                conn.execute(
-                    insert(sessions_table).values(
-                        id=new_session_id_str,
-                        user_id=parent_row.user_id,
-                        auth_provider_type=parent_row.auth_provider_type,
-                        title=f"{parent_row.title} (fork)",
-                        created_at=now,
-                        updated_at=now,
-                        archived_at=now,
-                        forked_from_session_id=parent_session_id_str,
-                        forked_from_message_id=str(fork_message_id),
-                    )
-                )
-                with self._session_write_lock(conn, new_session_id_str):
-                    if locked_source_state is not None and copied_state_id_str is not None:
-                        self._insert_composition_state(
-                            conn,
-                            session_id=new_session_id_str,
-                            payload=StatePayload(
-                                data=CompositionStateData(
-                                    sources=locked_source_state.sources,
-                                    nodes=locked_source_state.nodes,
-                                    edges=locked_source_state.edges,
-                                    outputs=locked_source_state.outputs,
-                                    metadata_=locked_source_state.metadata_,
-                                    is_valid=locked_source_state.is_valid,
-                                    validation_errors=locked_source_state.validation_errors,
-                                    composer_meta=forked_composer_meta,
-                                ),
-                                derived_from_state_id=None,
-                            ),
-                            provenance="session_fork",
-                            created_at=now,
-                            state_id=copied_state_id_str,
-                        )
-                    base_seq = self._reserve_sequence_range(conn, new_session_id_str, count=len(rows_to_insert))
-                    for sequence_offset, record in enumerate(rows_to_insert):
-                        record["sequence_no"] = base_seq + sequence_offset
-                    conn.execute(insert(chat_messages_table), rows_to_insert)
-
-                self.bind_guided_operation_on_connection(
-                    conn,
-                    fence,
-                    originating_message_id=fork_message_id,
-                    result_session_id=new_session_id,
-                )
-                return self._load_staged_fork_on_connection(
-                    conn,
+            new_session_id = UUID(fork_authority.child_context.fence.session_id)
+            operation, _database_now = transaction.require_parent_guided_operation(fence)
+            if operation["kind"] != "session_fork":
+                raise AuditIntegrityError("fork_session fence is not bound to session_fork")
+            bound_child_id = operation["result_session_id"]
+            if bound_child_id is not None:
+                if operation["originating_message_id"] != str(fork_message_id):
+                    raise AuditIntegrityError("Guided fork bound child has a different fork message binding")
+                return self._load_staged_fork_from_transaction(
+                    transaction,
                     parent_session_id=source_session_id,
-                    child_session_id=new_session_id,
+                    child_session_id=UUID(bound_child_id),
                     operation_id=fence.operation_id,
                     fork_message_id=fork_message_id,
                     new_message_content=new_message_content,
+                    authority=fork_authority,
                 )
 
-        return cast("StagedForkSession", await self._run_sync(_sync))
+            parent_row = transaction.read_parent_session()
+            fork_row = transaction.read_parent_message(fork_message_id)
+            if parent_row is None or parent_row.archived_at is not None:
+                raise AuditIntegrityError("Guided fork parent failed active custody validation")
+            if (
+                fork_row is None
+                or fork_row.role != "user"
+                or fork_row.composition_state_id != (str(source_state_record.id) if source_state_record is not None else None)
+            ):
+                raise AuditIntegrityError("Guided fork message changed before staging")
+
+            locked_source_state: CompositionStateRecord | None = None
+            forked_composer_meta: dict[str, Any] | None = None
+            if source_state_record is not None:
+                locked_source_row = transaction.read_parent_state(source_state_record.id)
+                if locked_source_row is None:
+                    raise AuditIntegrityError("Guided fork source checkpoint is missing or cross-session")
+                locked_source_state = self._row_to_state_record(locked_source_row)
+                forked_composer_meta = _strip_guided_profile_in_meta(
+                    locked_source_state.composer_meta,
+                    source_to_copied_message_id,
+                    source_messages_by_id,
+                )
+                source_meta = deep_thaw(locked_source_state.composer_meta)
+                if type(source_meta) is dict and source_meta.get("guided_session") is not None:
+                    from elspeth.web.composer.guided.errors import InvariantError
+                    from elspeth.web.composer.guided.state_machine import GuidedSession
+
+                    try:
+                        source_guided = GuidedSession.from_dict(source_meta["guided_session"])
+                    except (
+                        InvariantError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        raise AuditIntegrityError("fork guided schema-10 authority is malformed") from exc
+                    _require_pending_guided_checkpoint_proposal_authority(
+                        transaction,
+                        service=self,
+                        session_id=parent_session_id_str,
+                        checkpoint=locked_source_state,
+                        guided=source_guided,
+                        role="fork source",
+                    )
+                    if source_guided.root_intent_message_id is not None:
+                        _verify_guided_root_message_authority(
+                            transaction,
+                            service=self,
+                            session_id=parent_session_id_str,
+                            guided=source_guided,
+                        )
+
+            plan = tuple(
+                BlobForkPlanEntry(
+                    source_blob_id=UUID(row.id),
+                    target_blob_id=fork_blob_id(
+                        target_session_id=new_session_id,
+                        source_blob_id=UUID(row.id),
+                    ),
+                    source_storage_path=row.storage_path,
+                    content_hash=row.content_hash,
+                    size_bytes=row.size_bytes,
+                )
+                for row in transaction.read_parent_ready_blobs()
+            )
+            plan_message = SessionForkChildMessageCreation(
+                id=uuid.uuid4(),
+                role="audit",
+                content=_fork_blob_plan_content(
+                    source_session_id=source_session_id,
+                    child_session_id=new_session_id,
+                    operation_id=fence.operation_id,
+                    entries=plan,
+                ),
+                raw_content=None,
+                tool_calls=None,
+                tool_call_id=None,
+                parent_assistant_id=None,
+                writer_principal="session_fork",
+                created_at=now,
+                composition_state_id=None,
+            )
+
+            if locked_source_state is not None and copied_state_id is not None:
+                transaction.child_mutations.insert_child_state(
+                    SessionForkChildStateCreation(
+                        id=copied_state_id,
+                        data=CompositionStateData(
+                            sources=locked_source_state.sources,
+                            nodes=locked_source_state.nodes,
+                            edges=locked_source_state.edges,
+                            outputs=locked_source_state.outputs,
+                            metadata_=locked_source_state.metadata_,
+                            is_valid=locked_source_state.is_valid,
+                            validation_errors=locked_source_state.validation_errors,
+                            composer_meta=forked_composer_meta,
+                        ),
+                        created_at=now,
+                    )
+                )
+            transaction.child_mutations.append_child_messages((*child_messages, plan_message))
+            transaction.parent_guided_mutations.bind_guided_fork(
+                originating_message_id=fork_message_id,
+            )
+            return self._load_staged_fork_from_transaction(
+                transaction,
+                parent_session_id=source_session_id,
+                child_session_id=new_session_id,
+                operation_id=fence.operation_id,
+                fork_message_id=fork_message_id,
+                new_message_content=new_message_content,
+                authority=fork_authority,
+            )
+
+        return cast(
+            "StagedForkSession",
+            await self._run_sync(
+                self._session_operation_authority.mutate_fork_creation,
+                authority,
+                SessionForkChildCreation(
+                    user_id=source_session.user_id,
+                    auth_provider_type=source_session.auth_provider_type,
+                    title=f"{source_session.title} (fork)",
+                    created_at=now,
+                    archived_at=now,
+                    forked_from_message_id=fork_message_id,
+                ),
+                mutation=_sync,
+            ),
+        )
 
     async def settle_guided_fork_operation(
         self,
@@ -12035,7 +13027,10 @@ class SessionServiceImpl:
 
         def _sync() -> SessionRecord:
             with self._session_pair_locked_begin(parent_session_id_str, child_session_id_str) as conn:
-                operation, now = self.require_guided_operation_fence_on_connection(conn, command.fence)
+                operation, now = self._require_session_fork_authority_on_connection(
+                    conn,
+                    command.authority,
+                )
                 if operation["kind"] != "session_fork" or operation["result_session_id"] != child_session_id_str:
                     raise AuditIntegrityError("Guided fork settlement child is not bound to the exact operation fence")
                 parent = conn.execute(
@@ -12152,6 +13147,20 @@ class SessionServiceImpl:
                     operation_id=command.fence.operation_id,
                     state_payload=settlement_state,
                 )
+
+                # The guided locator terminalizes first in SQL statement order.
+                # All child rewrites and activation remain in this transaction,
+                # so a later failure rolls the terminal row back atomically.
+                with self._guided_session_mutation_transaction(
+                    conn,
+                    guided_fence=command.fence,
+                    session_operation_context=command.authority.parent.parent_context,
+                ) as mutation:
+                    mutation.guided.complete(
+                        result=GuidedSessionResult(session_id=command.child_session_id),
+                        response_hash=command.response_hash,
+                        actor=command.actor,
+                    )
 
                 if command.rewritten_state is not None and command.rewritten_state_id is not None:
                     # Detach the edited message from the staged state and delete
@@ -12271,8 +13280,9 @@ class SessionServiceImpl:
                             settled_at=now,
                         )
                     )
-                    self._insert_guided_operation_event(
+                    self._record_guided_fork_child_terminal_event(
                         conn,
+                        authority=command.authority,
                         session_id=child_session_id_str,
                         operation_id=child_start_operation_id,
                         event_kind="completed",
@@ -12311,13 +13321,6 @@ class SessionServiceImpl:
                 if activated.rowcount != 1:
                     raise AuditIntegrityError("Guided fork settlement lost archived-to-active compare-and-swap")
 
-                self.complete_guided_operation_on_connection(
-                    conn,
-                    command.fence,
-                    result=GuidedSessionResult(session_id=command.child_session_id),
-                    response_hash=command.response_hash,
-                    actor=command.actor,
-                )
                 settled_row = conn.execute(select(sessions_table).where(sessions_table.c.id == child_session_id_str)).one()
                 return self._row_to_session_record(settled_row)
 

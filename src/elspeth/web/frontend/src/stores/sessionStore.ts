@@ -486,8 +486,7 @@ function sleep(ms: number): Promise<void> {
  * Block until the server side of a cancelled compose turn has settled.
  *
  * The client's abort rejects the fetch immediately, but the server is
- * still working: the aborted route may be queued on the per-session
- * compose lock with nothing published yet, and once composing, the
+ * still working once it owns the session's exact COMPOSE operation. The
  * dispatch+persist critical section is shielded (deferred cancellation —
  * see _await_tool_turn_with_deferred_cancellation in composer/service.py),
  * so the in-flight tool finishes and P4 publishes its results BEFORE the
@@ -495,13 +494,12 @@ function sleep(ms: number): Promise<void> {
  * durable writes (user row, state advances) with no later refresh.
  *
  * Settlement is QUIESCENCE, not phase: `inflight_requests === 0` on the
- * progress snapshot — the count of compose requests currently inside the
- * route for this session, maintained by the server across the whole
- * request lifecycle (see _track_compose_inflight). The narrative phase
- * cannot carry this signal: after an immediate Stop or for a request
- * queued behind another turn, the registry still holds the PREVIOUS
- * turn's terminal snapshot, which is indistinguishable from real
- * settlement by phase alone.
+ * progress snapshot. The server reconstructs this count from incomplete
+ * durable request rows joined to their exact current, live COMPOSE fence;
+ * `finish_request` completes the row before that fence is released. A route
+ * waiting to acquire COMPOSE authority is deliberately not reported as live.
+ * The narrative phase cannot carry the settlement signal because the latest
+ * terminal snapshot remains visible independently of fenced request liveness.
  *
  * The wait ends on SEMANTIC conditions only, matching the server's own
  * unboundedness (a wall-clock budget would silently reopen the race for

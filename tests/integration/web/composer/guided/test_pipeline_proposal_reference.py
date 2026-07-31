@@ -10,7 +10,8 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import event as sqlalchemy_event
+from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -37,6 +38,7 @@ from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_payloads import prepare_guided_json_payload
 from elspeth.web.sessions.models import (
+    chat_messages_table,
     composition_proposals_table,
     composition_states_table,
     guided_operations_table,
@@ -46,6 +48,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     GuidedOperationClaimed,
     GuidedOperationSettlementConflictError,
+    GuidedPipelineProposalRejectCommand,
     GuidedPipelineProposalStageCommand,
     GuidedReplayTurn,
     GuidedResponseDescriptor,
@@ -54,6 +57,7 @@ from elspeth.web.sessions.routes._helpers import _initial_composition_state_with
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 SOURCE_ID = "00000000-0000-4000-8000-000000000201"
 OUTPUT_ID = "00000000-0000-4000-8000-000000000202"
@@ -74,7 +78,11 @@ def service() -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    return SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.guided.proposal"))
+    return DualFencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.guided.proposal"),
+    )
 
 
 def _guided() -> GuidedSession:
@@ -732,130 +740,182 @@ def test_revision_old_status_drift_rolls_back_successor_cohort(
     assert predecessor_events[-1].payload["reason_code"] == "operator_rejected"
 
 
-async def _stage_and_reject(
+async def _staged_reject_command(
     service: SessionServiceImpl,
     payload_store: FilesystemPayloadStore,
-    *,
-    reason: str,
-) -> tuple[GuidedPipelineProposalStageCommand, UUID]:
+) -> tuple[GuidedPipelineProposalRejectCommand, UUID]:
     command, session_id = await _command(service, payload_store)
-    await service.stage_guided_pipeline_proposal(command, payload_store=payload_store)
-    await service.reject_pipeline_composition_proposal(
+    staged = await service.stage_guided_pipeline_proposal(command, payload_store=payload_store)
+    operation_id = str(uuid4())
+    outcome = await service.reserve_guided_operation(
         session_id=session_id,
-        proposal_id=command.proposal_id,
-        draft_hash=command.plan.proposal.draft_hash,
-        reviewed_facts=guided_private_reviewed_facts(_guided()),
-        reason=reason,  # type: ignore[arg-type]
-        dispatch=None,
+        operation_id=operation_id,
+        kind="guided_respond",
+        request_hash=stable_hash({"operation_id": operation_id}),
         actor="test",
+        lease_seconds=300,
     )
-    return command, session_id
-
-
-@pytest.mark.parametrize("reason", ("operator_rejected", "superseded"))
-def test_reconcile_exact_explicit_rejection_clears_reference_and_occurrence(
-    service: SessionServiceImpl,
-    tmp_path: Path,
-    reason: str,
-) -> None:
-    payload_store = FilesystemPayloadStore(tmp_path / reason)
-    command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason=reason))
-
-    reconciled = asyncio.run(
-        service.reconcile_rejected_guided_pipeline_proposal(
-            session_id=session_id,
-            expected_current_state_id=command.checkpoint_state_id,
+    assert isinstance(outcome, GuidedOperationClaimed)
+    return (
+        GuidedPipelineProposalRejectCommand(
+            fence=outcome.fence,
+            expected_current_state_id=staged.result_state.id,
+            expected_current_state_version=staged.result_state.version,
             proposal_id=command.proposal_id,
             draft_hash=command.plan.proposal.draft_hash,
             reviewed_facts=guided_private_reviewed_facts(_guided()),
-        )
+            actor="composer_route",
+            response=GuidedResponseDescriptor(
+                kind="guided_respond",
+                next_turn=None,
+                assistant_turn_seq=None,
+            ),
+        ),
+        session_id,
     )
 
-    guided = _state_from_record(reconciled).guided_session
+
+def test_dual_fenced_rejection_allocates_exactly_next_version_without_consuming_message_sequence(
+    service: SessionServiceImpl,
+    tmp_path: Path,
+) -> None:
+    payload_store = FilesystemPayloadStore(tmp_path / "valid-rejection")
+    command, session_id = asyncio.run(_staged_reject_command(service, payload_store))
+    with service._engine.connect() as conn:
+        before_count = conn.scalar(
+            select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
+        )
+        before_sequence = conn.scalar(
+            select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(chat_messages_table.c.session_id == str(session_id))
+        )
+
+    rejected = asyncio.run(service.reject_guided_pipeline_proposal(command))
+
+    assert before_count is not None
+    assert rejected.result_state.version == command.expected_current_state_version + 1
+    with service._engine.connect() as conn:
+        after_count = conn.scalar(
+            select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
+        )
+        after_sequence = conn.scalar(
+            select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(chat_messages_table.c.session_id == str(session_id))
+        )
+    assert after_count == before_count + 1
+    assert after_sequence == before_sequence
+    guided = _state_from_record(rejected.result_state).guided_session
     assert guided is not None
     assert guided.active_proposal is None
     assert guided.active_edit_target is None
     assert not guided.history
-    assert reconciled.derived_from_state_id == command.checkpoint_state_id
 
 
-@pytest.mark.parametrize("tamper", ("missing", "cross_session", "draft", "duplicate_event", "committed"))
-def test_reconcile_missing_cross_session_or_altered_authority_is_a_hard_conflict(
+@pytest.mark.parametrize("drift", ("stale_command_current_db", "current_command_stale_db"))
+def test_dual_fenced_rejection_state_mismatch_changes_nothing_and_consumes_no_sequence(
     service: SessionServiceImpl,
     tmp_path: Path,
-    tamper: str,
+    drift: str,
 ) -> None:
-    payload_store = FilesystemPayloadStore(tmp_path / tamper)
-    command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
-    reconcile_session_id = session_id
-    expected_state_id = command.checkpoint_state_id
-    proposal_id = command.proposal_id
-    draft_hash = command.plan.proposal.draft_hash
+    payload_store = FilesystemPayloadStore(tmp_path / drift)
+    command, session_id = asyncio.run(_staged_reject_command(service, payload_store))
+    if drift == "stale_command_current_db":
+        prior = asyncio.run(service.get_state(command.expected_current_state_id))
+        assert prior.derived_from_state_id is not None
+        command = replace(
+            command,
+            expected_current_state_id=prior.derived_from_state_id,
+            expected_current_state_version=command.expected_current_state_version - 1,
+        )
+    else:
+        current = asyncio.run(service.get_current_state(session_id))
+        assert current is not None
+        current_guided = _state_from_record(current).guided_session
+        assert current_guided is not None
+        asyncio.run(
+            service.save_composition_state(
+                session_id,
+                _state_data(current_guided),
+                provenance="convergence_persist",
+            )
+        )
 
-    if tamper == "missing":
-        proposal_id = uuid4()
-    elif tamper == "cross_session":
-        other = asyncio.run(service.create_session("alice", "other", "local"))
-        other_state = asyncio.run(service.save_composition_state(other.id, _state_data(_guided()), provenance="session_seed"))
-        reconcile_session_id = other.id
-        expected_state_id = other_state.id
-    elif tamper == "draft":
-        draft_hash = "f" * 64
-    elif tamper == "duplicate_event":
-        event = asyncio.run(service.list_proposal_events(session_id))[0]
-        with service._engine.begin() as conn:
-            conn.execute(
-                insert(proposal_events_table).values(
-                    id=str(uuid4()),
-                    session_id=str(session_id),
-                    proposal_id=str(command.proposal_id),
-                    event_type="proposal.created",
-                    actor="tamper",
-                    payload=deep_thaw(event.payload),
-                    created_at=event.created_at,
+    with service._engine.connect() as conn:
+        before_count = conn.scalar(
+            select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
+        )
+        before_max_version = conn.scalar(
+            select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == str(session_id))
+        )
+        before_sequence = conn.scalar(
+            select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(chat_messages_table.c.session_id == str(session_id))
+        )
+
+    with pytest.raises((AuditIntegrityError, GuidedOperationSettlementConflictError)):
+        asyncio.run(service.reject_guided_pipeline_proposal(command))
+
+    with service._engine.connect() as conn:
+        assert (
+            conn.scalar(
+                select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
+            )
+            == before_count
+        )
+        assert (
+            conn.scalar(
+                select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == str(session_id))
+            )
+            == before_max_version
+        )
+        assert (
+            conn.scalar(
+                select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(
+                    chat_messages_table.c.session_id == str(session_id)
                 )
             )
-    else:
-        with service._engine.begin() as conn:
-            conn.execute(
-                update(composition_proposals_table)
-                .where(composition_proposals_table.c.id == str(command.proposal_id))
-                .values(status="committed", committed_state_id=str(command.checkpoint_state_id))
-            )
-
-    with pytest.raises((AuditIntegrityError, KeyError)):
-        asyncio.run(
-            service.reconcile_rejected_guided_pipeline_proposal(
-                session_id=reconcile_session_id,
-                expected_current_state_id=expected_state_id,
-                proposal_id=proposal_id,
-                draft_hash=draft_hash,
-                reviewed_facts=guided_private_reviewed_facts(_guided()),
-            )
+            == before_sequence
         )
+        proposal_status = conn.scalar(
+            select(composition_proposals_table.c.status).where(composition_proposals_table.c.id == str(command.proposal_id))
+        )
+    assert proposal_status == "pending"
 
 
-def test_reconcile_checkpoint_fault_keeps_active_reference(service: SessionServiceImpl, tmp_path: Path, monkeypatch) -> None:
-    payload_store = FilesystemPayloadStore(tmp_path / "fault")
-    command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
+def test_rejected_proposal_authority_reads_are_zero_dml_and_leave_checkpoint_unchanged(
+    service: SessionServiceImpl,
+    tmp_path: Path,
+) -> None:
+    payload_store = FilesystemPayloadStore(tmp_path / "rejected-read")
+    stage_command, session_id = asyncio.run(_command(service, payload_store))
+    staged = asyncio.run(service.stage_guided_pipeline_proposal(stage_command, payload_store=payload_store))
+    asyncio.run(
+        service.reject_pipeline_composition_proposal(
+            session_id=session_id,
+            proposal_id=stage_command.proposal_id,
+            draft_hash=stage_command.plan.proposal.draft_hash,
+            reviewed_facts=guided_private_reviewed_facts(_guided()),
+            reason="operator_rejected",
+            dispatch=None,
+            actor="test",
+        )
+    )
+    statements: list[str] = []
 
-    def fail_insert(*_args, **_kwargs):
-        raise RuntimeError("synthetic checkpoint failure")
+    def observe_dml(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if statement.lstrip().partition(" ")[0].upper() in {"INSERT", "UPDATE", "DELETE"}:
+            statements.append(statement)
 
-    monkeypatch.setattr(service, "_insert_composition_state", fail_insert)
-    with pytest.raises(RuntimeError, match="synthetic checkpoint failure"):
-        asyncio.run(
-            service.reconcile_rejected_guided_pipeline_proposal(
+    sqlalchemy_event.listen(service._engine, "before_cursor_execute", observe_dml)
+    try:
+        current = asyncio.run(service.get_current_state(session_id))
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
                 session_id=session_id,
-                expected_current_state_id=command.checkpoint_state_id,
-                proposal_id=command.proposal_id,
-                draft_hash=command.plan.proposal.draft_hash,
+                proposal_id=stage_command.proposal_id,
                 reviewed_facts=guided_private_reviewed_facts(_guided()),
             )
         )
+    finally:
+        sqlalchemy_event.remove(service._engine, "before_cursor_execute", observe_dml)
 
-    current = asyncio.run(service.get_current_state(session_id))
-    assert current is not None and current.id == command.checkpoint_state_id
-    guided = _state_from_record(current).guided_session
-    assert guided is not None and guided.active_proposal is not None
-    assert guided.active_proposal.proposal_id == command.proposal_id
+    assert current is not None and current.id == staged.result_state.id
+    assert authority.row.status == "rejected"
+    assert statements == []

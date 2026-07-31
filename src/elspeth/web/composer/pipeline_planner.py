@@ -34,6 +34,7 @@ from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -245,6 +246,7 @@ class PlannerCustodyConfig:
     max_storage_per_session: int
     secret_service: WebSecretResolver | None
     runtime_preflight: RuntimePreflight | None
+    session_operation_context: SessionOperationContext | None = None
     write_fence: BlobGuidedOperationWriteFence | None = None
 
     def __post_init__(self) -> None:
@@ -252,6 +254,8 @@ class PlannerCustodyConfig:
             raise ValueError("data_dir must be a non-empty exact string")
         if type(self.max_storage_per_session) is not int or self.max_storage_per_session <= 0:
             raise ValueError("max_storage_per_session must be a positive exact integer")
+        if self.session_operation_context is not None and type(self.session_operation_context) is not SessionOperationContext:
+            raise TypeError("PlannerCustodyConfig.session_operation_context must be an exact SessionOperationContext")
         if self.write_fence is not None and type(self.write_fence) is not BlobGuidedOperationWriteFence:
             raise TypeError("PlannerCustodyConfig.write_fence must be an exact BlobGuidedOperationWriteFence")
 
@@ -1122,6 +1126,8 @@ async def _build_valid_pipeline_plan(
     if candidate.prepared_inline_blob is not None:
         if custody_config.session_engine is None:
             raise AuditIntegrityError("inline pipeline custody requires session_engine")
+        if custody_config.session_operation_context is None:
+            raise AuditIntegrityError("inline pipeline custody requires session operation authority")
         preparation = prepare_pipeline_custody(
             pipeline,
             candidate.prepared_inline_blob,
@@ -1133,6 +1139,7 @@ async def _build_valid_pipeline_plan(
                 engine=custody_config.session_engine,
                 data_dir=custody_config.data_dir,
                 max_storage_per_session=custody_config.max_storage_per_session,
+                session_operation_context=custody_config.session_operation_context,
                 write_fence=custody_config.write_fence,
             )
         )

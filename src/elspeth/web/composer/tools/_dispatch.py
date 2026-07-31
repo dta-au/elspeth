@@ -21,12 +21,14 @@ import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from typing import Any, Final, cast
+from uuid import UUID
 
 from jsonschema import Draft202012Validator
 from sqlalchemy import Engine
 
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
@@ -48,6 +50,7 @@ from elspeth.web.composer.tools._registry import (
     _BLOB_DISCOVERY_TOOLS,
     _BLOB_MUTATION_TOOL_NAMES,
     _BLOB_MUTATION_TOOLS,
+    _BLOB_STORE_ONLY_MUTATION_TOOL_NAMES,
     _DISCOVERY_TOOL_NAMES,
     _DISCOVERY_TOOLS,
     _MUTATION_TOOL_NAMES,
@@ -65,6 +68,7 @@ from elspeth.web.composer.tools.sessions import (
     ADVISOR_TRIGGER_VALUES,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.sessions.protocol import SessionOperationAuthority
 
 __all__ = [
     "_inject_prior_validation",
@@ -73,6 +77,18 @@ __all__ = [
     "get_discovery_tool_definitions",
     "get_tool_definitions",
 ]
+
+_COMPOSER_TOOL_OPERATION_KINDS = frozenset(
+    {
+        SessionOperationKind.COMPOSE,
+        SessionOperationKind.PROPOSAL,
+    }
+)
+
+
+def _is_exact_session_operation_context(value: object) -> bool:
+    """Keep subclass rejection explicit at the public dispatch boundary."""
+    return type(value) is SessionOperationContext
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +582,8 @@ def execute_tool(
     data_dir: str | None = None,
     session_engine: Engine | None = None,
     session_id: str | None = None,
+    session_operation_authority: SessionOperationAuthority | None = None,
+    session_operation_context: SessionOperationContext | None = None,
     secret_service: WebSecretResolver | None = None,
     user_id: str | None = None,
     baseline: CompositionState | None = None,
@@ -579,6 +597,7 @@ def execute_tool(
     composer_provider: str | None = None,
     composer_skill_hash: str | None = None,
     tool_arguments_hash: str | None = None,
+    _accepting_proposal_id: UUID | None = None,
     reviewed_source_authority: ReviewedSourceAuthority | None = None,
     validate_arguments: bool = False,
     require_data_dir_for_paths: bool = False,
@@ -655,6 +674,8 @@ def execute_tool(
         _interpretation_requirements_are_internal: Private server-owned
             proposal revalidation seam. It is not a declared tool argument
             and must remain false for public LLM/MCP dispatch.
+        _accepting_proposal_id: Private server-owned identity of the exact
+            pending proposal whose accepted blob mutation is being executed.
     """
     if catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
@@ -688,6 +709,32 @@ def execute_tool(
             catalog,
         )
 
+    operation_context_error: str | None = None
+    if (session_operation_authority is None) is not (session_operation_context is None):
+        operation_context_error = "Composer session operation authority and context must be provided together."
+    elif session_operation_context is not None:
+        if not _is_exact_session_operation_context(session_operation_context):
+            operation_context_error = "Composer session operation context must be exact."
+        elif session_operation_context.operation_kind not in _COMPOSER_TOOL_OPERATION_KINDS:
+            operation_context_error = "Composer tools require a COMPOSE or PROPOSAL session operation context."
+        elif session_id is None or session_operation_context.fence.session_id != session_id:
+            operation_context_error = "Composer session operation context does not own the dispatched session."
+        elif not isinstance(session_operation_authority, SessionOperationAuthority):
+            operation_context_error = "Composer session operation authority does not implement the closed authority protocol."
+        elif _accepting_proposal_id is not None and (
+            type(_accepting_proposal_id) is not UUID or session_operation_context.operation_kind is not SessionOperationKind.PROPOSAL
+        ):
+            operation_context_error = "Accepting proposal identity requires exact PROPOSAL session operation authority."
+    elif _accepting_proposal_id is not None:
+        operation_context_error = "Accepting proposal identity requires exact PROPOSAL session operation authority."
+    elif tool_name in _BLOB_STORE_ONLY_MUTATION_TOOL_NAMES:
+        operation_context_error = "Blob mutation tools require session operation authority context."
+    if operation_context_error is not None:
+        return normalize_tool_result_validation(
+            _failure_result(state, operation_context_error),
+            catalog,
+        )
+
     # ``current_validation`` carries the live state's ValidationSummary
     # into ``diff_pipeline`` so its delta against the baseline is computed
     # using the caller's pre-mutation validation rather than re-running
@@ -700,6 +747,8 @@ def execute_tool(
         require_data_dir_for_paths=require_data_dir_for_paths,
         session_engine=session_engine,
         session_id=session_id,
+        session_operation_authority=session_operation_authority,
+        session_operation_context=session_operation_context,
         secret_service=secret_service,
         user_id=user_id,
         baseline=baseline,
@@ -713,6 +762,7 @@ def execute_tool(
         composer_provider=composer_provider,
         composer_skill_hash=composer_skill_hash,
         tool_arguments_hash=tool_arguments_hash,
+        accepting_proposal_id=_accepting_proposal_id,
         reviewed_source_authority=reviewed_source_authority,
         _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
     )

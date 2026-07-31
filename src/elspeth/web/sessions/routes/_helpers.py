@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import json
 import sys
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from datetime import UTC, datetime
@@ -41,6 +41,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import stable_hash
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape.database import LandscapeDB
@@ -304,21 +305,19 @@ def _request_plugin_policy_context(
 def _composer_progress_sink(
     registry: ComposerProgressRegistry,
     *,
-    session_id: str,
-    request_id: str | None,
+    session_operation_context: SessionOperationContext,
+    request_id: str,
     user_id: str,
 ) -> ComposerProgressSink:
-    """Bind a registry sink to one session/request/user.
+    """Bind a registry sink to one exact COMPOSE operation/request/user.
 
-    ``user_id`` flows into the registry's internal user index so the
-    /_active in-flight enumeration endpoint can scope cross-session
-    visibility to the authenticated principal that initiated the
-    composer request.
+    Every nested composer publish remains an awaited mutation under the same
+    exact operation fence as the route that owns the request.
     """
 
     async def _publish(event: ComposerProgressEvent) -> None:
         await registry.publish(
-            session_id=session_id,
+            session_operation_context=session_operation_context,
             request_id=request_id,
             user_id=user_id,
             event=event,
@@ -330,17 +329,41 @@ def _composer_progress_sink(
 async def _publish_progress(
     registry: ComposerProgressRegistry,
     *,
-    session_id: str,
-    request_id: str | None,
+    session_operation_context: SessionOperationContext,
+    request_id: str,
     user_id: str,
     event: ComposerProgressEvent,
+    start_request: bool = False,
 ) -> None:
-    await registry.publish(
-        session_id=session_id,
-        request_id=request_id,
-        user_id=user_id,
-        event=event,
-    )
+    if start_request:
+        await registry.start_request(
+            session_operation_context=session_operation_context,
+            request_id=request_id,
+            user_id=user_id,
+            event=event,
+        )
+    else:
+        await registry.publish(
+            session_operation_context=session_operation_context,
+            request_id=request_id,
+            user_id=user_id,
+            event=event,
+        )
+
+
+async def _join_progress_write(write: Awaitable[Any]) -> Any:
+    """Shield one progress write and join it before its COMPOSE lease closes."""
+    task = asyncio.ensure_future(write)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        task.result()
+        raise
 
 
 def _session_response(session: SessionRecord) -> SessionResponse:
@@ -1568,40 +1591,6 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
             watcher.cancel()
 
 
-async def _track_compose_inflight(
-    session_id: UUID,
-    request: Request,
-) -> AsyncIterator[None]:
-    """Count this request in the session's in-flight compose tally.
-
-    FastAPI yield-dependency wired into ``send_message`` and ``/recompose``.
-    The count spans the ENTIRE request — including the wait on the
-    per-session compose lock, before any progress snapshot is published —
-    and is decremented only when the request's exit stack closes, i.e.
-    after the route has fully unwound (success, HTTP error, or the
-    disconnect-cancel path).
-
-    The SPA's post-abort reconciliation treats a zero count on the
-    ``/composer-progress`` snapshot as its ONLY settlement signal
-    (elspeth-06a23adfcc): phase-based inference races requests that have
-    not yet published progress (queued on the lock, immediate Stop), where
-    the registry still holds the previous turn's terminal snapshot.
-
-    Keyed by the raw path ``session_id`` (pre-ownership-check): a request
-    rejected by the ownership guard still transits the counter briefly,
-    which is harmless — the counter only ever delays a resync while
-    non-zero, and rejected requests decrement within the same request
-    lifecycle.
-    """
-    registry = _get_composer_progress_registry(request)
-    sid = str(session_id)
-    registry.begin_request(sid)
-    try:
-        yield
-    finally:
-        registry.end_request(sid)
-
-
 async def _persist_chat_turns(
     service: SessionServiceProtocol,
     session_id: UUID,
@@ -2555,6 +2544,7 @@ async def _inspect_latest_ready_session_blob(
     *,
     filename: str | None = None,
     source_plugin: str | None = None,
+    session_operation_context: SessionOperationContext,
 ) -> SourceInspectionFacts | None:
     """Inspect the newest matching ready blob for Step-1 schema prefill.
 
@@ -2572,7 +2562,10 @@ async def _inspect_latest_ready_session_blob(
             continue
         if filename is not None and record.filename != filename:
             continue
-        content = await blob_service.read_blob_content(record.id)
+        content = await blob_service.read_blob_content(
+            record.id,
+            session_operation_context=session_operation_context,
+        )
         facts = inspect_blob_content(
             content=content,
             filename=record.filename,
@@ -2705,6 +2698,7 @@ __all__ = [
     "SQLAlchemyError",
     "SendMessageRequest",
     "Sequence",
+    "SessionOperationContext",
     "SessionRecord",
     "SessionResponse",
     "SessionServiceProtocol",
@@ -2767,6 +2761,7 @@ __all__ = [
     "_is_client_disconnect_cancel",
     "_is_composer_audit_tool_message",
     "_is_composer_llm_audit_tool_message",
+    "_join_progress_write",
     "_litellm_error_detail",
     "_llm_calls_from_exception",
     "_message_response",
@@ -2788,7 +2783,6 @@ __all__ = [
     "_state_data_from_composer_state",
     "_state_from_record",
     "_state_response",
-    "_track_compose_inflight",
     "_validate_run_status_accounting_for_list",
     "_verify_session_ownership",
     "_workflow_profile_response",

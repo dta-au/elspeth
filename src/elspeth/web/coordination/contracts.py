@@ -15,6 +15,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import final
 
+from elspeth.contracts.session_operation import (
+    SessionOperationContext as SessionOperationContext,
+)
+from elspeth.contracts.session_operation import SessionOperationFence as SessionOperationFence
+from elspeth.contracts.session_operation import SessionOperationKind as SessionOperationKind
+
 WEB_COORDINATION_PROTOCOL_VERSION = 1
 
 PROTOCOL_BUMP_REQUIRED_CHANGES: frozenset[str] = frozenset(
@@ -46,13 +52,22 @@ class InstanceState(StrEnum):
     STOPPED = "stopped"
 
 
-class SessionOperationKind(StrEnum):
-    CREATE = "create"
-    COMPOSE = "compose"
-    PROPOSAL = "proposal"
-    EXECUTE = "execute"
-    ARCHIVE = "archive"
-    PROGRESS = "progress"
+class ArchiveDeleteReconciliation(StrEnum):
+    CURRENT = "current"
+    CONSUMED = "consumed"
+
+
+class ArchiveManifestRelation(StrEnum):
+    CURRENT_OPERATION = "current_operation"
+    STALE_OPERATION = "stale_operation"
+
+
+class SessionOperationLeaseDisposition(StrEnum):
+    ACTIVE = "active"
+    RELEASED = "released"
+    CONSUMED = "consumed"
+    LOST = "lost"
+    UNKNOWN = "unknown"
 
 
 class StartPermitState(StrEnum):
@@ -126,21 +141,6 @@ class CompatibilityKey:
 
 @final
 @dataclass(frozen=True, slots=True)
-class SessionOperationFence:
-    session_id: str
-    operation_id: str
-    lease_token: str
-    operation_epoch: int
-
-    def __post_init__(self) -> None:
-        _require_nonblank(self.session_id, "SessionOperationFence.session_id")
-        _require_nonblank(self.operation_id, "SessionOperationFence.operation_id")
-        _require_nonblank(self.lease_token, "SessionOperationFence.lease_token")
-        _require_positive_int(self.operation_epoch, "SessionOperationFence.operation_epoch")
-
-
-@final
-@dataclass(frozen=True, slots=True)
 class RunOwnershipFence:
     run_id: str
     owner_instance_id: str
@@ -166,6 +166,13 @@ class _LeakSafeCoordinationError(RuntimeError):
 
 class SessionOperationFenceLost(_LeakSafeCoordinationError):
     _AUTHORITY = "session operation"
+
+
+class SessionOperationTerminalOutcomeUnknown(RuntimeError):
+    """Leak-safe terminal error for an archive outcome the authority cannot prove."""
+
+    def __init__(self) -> None:
+        super().__init__("session operation terminal outcome is unknown")
 
 
 class RunOwnershipFenceLost(_LeakSafeCoordinationError):

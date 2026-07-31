@@ -10,24 +10,37 @@ The L0-suitable progress contracts (``ComposerProgressEvent``,
 ``ComposerProgressSink``, ``COMPOSER_PROGRESS_MAX_EVIDENCE``,
 ``NON_TERMINAL_PROGRESS_PHASES``) live in
 ``elspeth.contracts.composer_progress``.  This module owns only the
-L3-dependent residue: the in-memory ``ComposerProgressRegistry`` (which
-uses threading), the snapshot subclass that joins event with session
-identity, and the per-phase event factory functions whose copy
-references tool names from ``elspeth.web.composer.tools``.
+L3-dependent residue: the durable ``ComposerProgressRegistry``, the snapshot
+subclass that joins event with session identity, and the per-phase event
+factory functions whose copy references tool names from
+``elspeth.web.composer.tools``.
 """
 
 from __future__ import annotations
 
-import threading
-from datetime import UTC, datetime, timedelta
-from typing import Literal
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Literal
+
+from sqlalchemy import Connection, Engine, func, select
+from sqlalchemy.sql.selectable import ScalarSelect
 
 from elspeth.contracts.composer_progress import (
-    NON_TERMINAL_PROGRESS_PHASES,
     ComposerProgressEvent,
     ComposerProgressSink,
 )
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.tools import is_discovery_tool
+from elspeth.web.sessions.models import (
+    composer_inflight_requests_table,
+    composer_progress_snapshots_table,
+    session_operation_fences_table,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from elspeth.web.sessions.protocol import SessionOperationAuthority
 
 __all__ = [
     "ComposerProgressRegistry",
@@ -49,9 +62,8 @@ class ComposerProgressSnapshot(ComposerProgressEvent):
     session_id: str
     request_id: str | None
     updated_at: datetime
-    # Live count of compose requests (send_message / recompose) currently
-    # inside the route for this session — including time spent queued on
-    # the per-session compose lock, before any progress is published.
+    # Live count of compose requests (send_message / recompose) that have
+    # acquired the exact COMPOSE operation and durably started a request.
     # Enriched at read time by the registry (see get_latest); the SPA's
     # post-abort reconciliation treats zero as its only settlement signal
     # (elspeth-06a23adfcc) because the phase alone cannot distinguish an
@@ -60,150 +72,278 @@ class ComposerProgressSnapshot(ComposerProgressEvent):
 
 
 class ComposerProgressRegistry:
-    """In-memory latest-progress registry keyed by session id.
+    """Durable latest-value register for exactly fenced composer progress.
 
-    The registry intentionally stores one bounded snapshot per session, not an
-    append-only log. The immutable session/chat tables remain the source of
-    truth for persisted conversation history.
-
-    The registry also maintains a parallel session_id -> user_id index used
-    only by ``list_active`` to scope cross-session enumeration to the
-    authenticated user. user_id is intentionally NOT a field on
-    ComposerProgressSnapshot — the per-session GET endpoint already
-    authenticates the caller against session ownership, so leaking the
-    user_id back through the snapshot body would be redundant and would
-    couple the public progress contract to auth identity.
+    Writes are capabilities of the owning COMPOSE operation transaction. The
+    registry never opens an independent write transaction and keeps no local
+    correctness cache. Reads may use any engine connected to the Sessions
+    database and reconstruct liveness by joining an incomplete request to its
+    exact current, live COMPOSE fence.
     """
 
-    def __init__(self) -> None:
-        self._snapshots: dict[str, ComposerProgressSnapshot] = {}
-        self._user_index: dict[str, str] = {}
-        self._inflight: dict[str, int] = {}
-        self._lock = threading.Lock()
+    def __init__(
+        self,
+        engine: Engine,
+        session_operation_authority: SessionOperationAuthority,
+        notify_committed: Callable[[ComposerProgressSnapshot], Awaitable[None]] | None = None,
+    ) -> None:
+        self._engine = engine
+        self._session_operation_authority = session_operation_authority
+        self._notify_committed = notify_committed
 
-    def begin_request(self, session_id: str) -> None:
-        """Count one compose request as in flight for ``session_id``.
+    @staticmethod
+    def _validate_write(
+        session_operation_context: SessionOperationContext,
+        *,
+        request_id: str,
+        user_id: str,
+        event: ComposerProgressEvent | None,
+    ) -> None:
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise AuditIntegrityError("composer progress writes require COMPOSE authority")
+        if type(request_id) is not str or not request_id.strip():
+            raise ValueError("request_id must be a nonblank exact string")
+        if type(user_id) is not str or not user_id.strip():
+            raise ValueError("user_id must be a nonblank exact string")
+        if event is not None and type(event) is not ComposerProgressEvent:
+            raise TypeError("event must be an exact ComposerProgressEvent")
 
-        Called at route entry (before the compose-lock wait) by the
-        ``_track_compose_inflight`` dependency; paired with
-        :meth:`end_request` at request teardown.
-        """
-        with self._lock:
-            self._inflight[session_id] = self._inflight.get(session_id, 0) + 1
+    @staticmethod
+    def _write_timestamp(result: object) -> datetime:
+        if type(result) is not datetime:
+            raise RuntimeError("composer progress mutation did not return its durable timestamp")
+        return _ensure_utc(result)
 
-    def end_request(self, session_id: str) -> None:
-        """Release one in-flight compose request for ``session_id``."""
-        with self._lock:
-            remaining = self._inflight.get(session_id, 0) - 1
-            if remaining > 0:
-                self._inflight[session_id] = remaining
-            else:
-                self._inflight.pop(session_id, None)
+    @staticmethod
+    def _snapshot(
+        context: SessionOperationContext,
+        *,
+        request_id: str,
+        event: ComposerProgressEvent,
+        updated_at: datetime,
+        inflight_requests: int,
+    ) -> ComposerProgressSnapshot:
+        return ComposerProgressSnapshot(
+            session_id=context.fence.session_id,
+            request_id=request_id,
+            phase=event.phase,
+            headline=event.headline,
+            evidence=event.evidence,
+            likely_next=event.likely_next,
+            reason=event.reason,
+            updated_at=updated_at,
+            inflight_requests=inflight_requests,
+        )
+
+    async def _notify(self, snapshot: ComposerProgressSnapshot) -> None:
+        if self._notify_committed is not None:
+            await self._notify_committed(snapshot)
+
+    async def start_request(
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        request_id: str,
+        user_id: str,
+        event: ComposerProgressEvent,
+    ) -> ComposerProgressSnapshot:
+        """Atomically create exact-fence liveness and the first snapshot."""
+        self._validate_write(
+            session_operation_context,
+            request_id=request_id,
+            user_id=user_id,
+            event=event,
+        )
+
+        def mutate(transaction: Any) -> object:
+            return transaction.composer_progress.start_request(
+                request_id=request_id,
+                user_id=user_id,
+                event=event,
+            )
+
+        updated_at = self._write_timestamp(self._session_operation_authority.mutate(session_operation_context, mutate))
+        snapshot = self._snapshot(
+            session_operation_context,
+            request_id=request_id,
+            event=event,
+            updated_at=updated_at,
+            inflight_requests=1,
+        )
+        await self._notify(snapshot)
+        return snapshot
 
     async def publish(
         self,
         *,
-        session_id: str,
-        request_id: str | None,
+        session_operation_context: SessionOperationContext,
+        request_id: str,
         user_id: str,
         event: ComposerProgressEvent,
     ) -> ComposerProgressSnapshot:
-        """Store and return the latest progress snapshot for a session.
+        """Publish one latest snapshot under the request's exact live fence."""
+        self._validate_write(
+            session_operation_context,
+            request_id=request_id,
+            user_id=user_id,
+            event=event,
+        )
 
-        ``user_id`` is recorded in the registry's internal user index so
-        :meth:`list_active` can scope cross-session enumeration to one
-        authenticated principal. It is NOT written into the snapshot body
-        returned to the SPA.
-        """
-        with self._lock:
-            updated_at = self._next_timestamp(session_id)
-            snapshot = ComposerProgressSnapshot(
-                session_id=session_id,
+        def mutate(transaction: Any) -> object:
+            return transaction.composer_progress.publish_progress(
                 request_id=request_id,
-                phase=event.phase,
-                headline=event.headline,
-                evidence=event.evidence,
-                likely_next=event.likely_next,
-                reason=event.reason,
-                updated_at=updated_at,
+                user_id=user_id,
+                event=event,
             )
-            self._snapshots[session_id] = snapshot
-            self._user_index[session_id] = user_id
-            return snapshot
+
+        updated_at = self._write_timestamp(self._session_operation_authority.mutate(session_operation_context, mutate))
+        snapshot = self._snapshot(
+            session_operation_context,
+            request_id=request_id,
+            event=event,
+            updated_at=updated_at,
+            inflight_requests=1,
+        )
+        await self._notify(snapshot)
+        return snapshot
+
+    async def finish_request(
+        self,
+        *,
+        session_operation_context: SessionOperationContext,
+        request_id: str,
+        user_id: str,
+        terminal_event: ComposerProgressEvent | None = None,
+    ) -> ComposerProgressSnapshot:
+        """Atomically terminalize request liveness and optionally its snapshot."""
+        self._validate_write(
+            session_operation_context,
+            request_id=request_id,
+            user_id=user_id,
+            event=terminal_event,
+        )
+
+        def mutate(transaction: Any) -> object:
+            return transaction.composer_progress.finish_request(
+                request_id=request_id,
+                user_id=user_id,
+                terminal_event=terminal_event,
+            )
+
+        updated_at = self._write_timestamp(self._session_operation_authority.mutate(session_operation_context, mutate))
+        if terminal_event is None:
+            snapshot = await self.get_latest(session_operation_context.fence.session_id)
+            if snapshot.request_id != request_id:
+                raise AuditIntegrityError("finished composer request is not the durable latest snapshot")
+            snapshot = snapshot.model_copy(update={"updated_at": updated_at, "inflight_requests": 0})
+        else:
+            snapshot = self._snapshot(
+                session_operation_context,
+                request_id=request_id,
+                event=terminal_event,
+                updated_at=updated_at,
+                inflight_requests=0,
+            )
+        await self._notify(snapshot)
+        return snapshot
 
     async def get_latest(self, session_id: str) -> ComposerProgressSnapshot:
-        """Return latest progress or a neutral idle snapshot.
-
-        The snapshot is enriched with the CURRENT in-flight request count —
-        not the count at publish time — so a poller always observes the
-        live quiescence state alongside the last narrative phase.
-        """
-        with self._lock:
-            snapshot = self._snapshots.get(session_id) or _idle_snapshot(session_id)
-            return self._with_live_inflight(session_id, snapshot)
-
-    def _with_live_inflight(self, session_id: str, snapshot: ComposerProgressSnapshot) -> ComposerProgressSnapshot:
-        """Overlay the live in-flight count onto a stored snapshot.
-
-        Stored snapshots carry the field's default (0) from publish();
-        every read surface must overlay the CURRENT count or it reports
-        an actively composing session as quiescent. Caller must hold
-        ``self._lock``.
-        """
-        inflight = self._inflight.get(session_id, 0)
-        if snapshot.inflight_requests == inflight:
-            return snapshot
-        return snapshot.model_copy(update={"inflight_requests": inflight})
+        """Return the durable latest snapshot with exact-fence liveness."""
+        if type(session_id) is not str or not session_id.strip():
+            raise ValueError("session_id must be a nonblank exact string")
+        with self._engine.connect() as connection:
+            inflight = _live_request_count_expression(connection)
+            row = (
+                connection.execute(
+                    select(
+                        composer_progress_snapshots_table,
+                        inflight.label("inflight_requests"),
+                    ).where(composer_progress_snapshots_table.c.session_id == session_id)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return _idle_snapshot(session_id)
+        return _snapshot_from_row(row, inflight_requests=int(row["inflight_requests"]))
 
     async def list_active(self, *, user_id: str) -> tuple[ComposerProgressSnapshot, ...]:
-        """Return non-terminal snapshots for one user's sessions.
-
-        "Non-terminal" means the composer is still working (starting,
-        calling_model, using_tools, validating, saving). Snapshots whose
-        phase is idle/complete/failed/cancelled are excluded — those
-        sessions are no longer in flight.
-
-        Filtered by ``user_id`` against the internal user index so a
-        caller cannot enumerate other users' sessions even if they hold
-        the same registry reference. The ordering is by updated_at
-        (oldest first) so an operator's view shows the most-stuck
-        request at the top, which is the typical triage starting point.
-
-        Indexes _user_index directly (not via ``.get``) — publish() and
-        clear() maintain the invariant that every session_id in
-        _snapshots also has an entry in _user_index. A KeyError here
-        would be a registry bug, not user input, and crashing surfaces
-        it instead of silently returning empty results.
-        """
-        with self._lock:
-            owned = (
-                self._with_live_inflight(sid, snap)
-                for sid, snap in self._snapshots.items()
-                if self._user_index[sid] == user_id and snap.phase in NON_TERMINAL_PROGRESS_PHASES
+        """Return durable snapshots with a currently live exact request."""
+        if type(user_id) is not str or not user_id.strip():
+            raise ValueError("user_id must be a nonblank exact string")
+        with self._engine.connect() as connection:
+            inflight = _live_request_count_expression(connection)
+            rows = (
+                connection.execute(
+                    select(
+                        composer_progress_snapshots_table,
+                        inflight.label("inflight_requests"),
+                    ).where(
+                        composer_progress_snapshots_table.c.user_id == user_id,
+                        inflight > 0,
+                    )
+                )
+                .mappings()
+                .all()
             )
-            return tuple(sorted(owned, key=lambda snap: snap.updated_at))
+        active = [_snapshot_from_row(row, inflight_requests=int(row["inflight_requests"])) for row in rows]
+        return tuple(sorted(active, key=lambda snapshot: snapshot.updated_at))
 
-    async def clear(self, session_id: str) -> None:
-        """Remove a session snapshot and its user-index entry.
 
-        Idempotent — clear() is called from session archival regardless of
-        whether the registry ever held a snapshot for that session, so the
-        ``in`` guard is the offensive-programming-compliant way to express
-        "remove if present" without using ``dict.pop(default)``.
-        """
-        with self._lock:
-            if session_id in self._snapshots:
-                del self._snapshots[session_id]
-            if session_id in self._user_index:
-                del self._user_index[session_id]
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
-    def _next_timestamp(self, session_id: str) -> datetime:
-        now = datetime.now(UTC)
-        if session_id in self._snapshots:
-            previous = self._snapshots[session_id].updated_at
-            if now <= previous:
-                return previous + timedelta(microseconds=1)
-        return now
+
+def _live_request_count_expression(connection: Connection) -> ScalarSelect[int]:
+    if connection.dialect.name not in {"postgresql", "sqlite"}:
+        raise NotImplementedError(f"composer progress database time is not implemented for {connection.dialect.name}")
+    database_now = func.current_timestamp()
+    return (
+        select(func.count())
+        .select_from(
+            composer_inflight_requests_table.join(
+                session_operation_fences_table,
+                composer_inflight_requests_table.c.session_id == session_operation_fences_table.c.session_id,
+            )
+        )
+        .where(
+            composer_inflight_requests_table.c.session_id == composer_progress_snapshots_table.c.session_id,
+            composer_inflight_requests_table.c.request_id == composer_progress_snapshots_table.c.request_id,
+            composer_inflight_requests_table.c.user_id == composer_progress_snapshots_table.c.user_id,
+            composer_inflight_requests_table.c.completed_at.is_(None),
+            composer_inflight_requests_table.c.expires_at > database_now,
+            composer_inflight_requests_table.c.operation_id == composer_progress_snapshots_table.c.operation_id,
+            composer_inflight_requests_table.c.operation_epoch == composer_progress_snapshots_table.c.operation_epoch,
+            composer_inflight_requests_table.c.operation_id == session_operation_fences_table.c.operation_id,
+            composer_inflight_requests_table.c.operation_epoch == session_operation_fences_table.c.operation_epoch,
+            session_operation_fences_table.c.operation_kind == SessionOperationKind.COMPOSE.value,
+            session_operation_fences_table.c.released_at.is_(None),
+            session_operation_fences_table.c.lease_expires_at > database_now,
+        )
+        .correlate(composer_progress_snapshots_table)
+        .scalar_subquery()
+    )
+
+
+def _snapshot_from_row(row: Any, *, inflight_requests: int) -> ComposerProgressSnapshot:
+    evidence = row["evidence"]
+    if type(evidence) is not list:
+        raise AuditIntegrityError("durable composer progress evidence is malformed")
+    return ComposerProgressSnapshot(
+        session_id=str(row["session_id"]),
+        request_id=str(row["request_id"]) if row["request_id"] is not None else None,
+        phase=row["phase"],
+        headline=row["headline"],
+        evidence=tuple(evidence),
+        likely_next=row["likely_next"],
+        reason=row["reason"],
+        updated_at=_ensure_utc(row["updated_at"]),
+        inflight_requests=inflight_requests,
+    )
 
 
 def convergence_progress_event(

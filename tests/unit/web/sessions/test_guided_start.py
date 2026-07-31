@@ -32,9 +32,9 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import composition_states_table, guided_operation_events_table, guided_operations_table
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 class _CatalogServiceFake:
@@ -87,7 +87,7 @@ def _make_app(tmp_path, user_id="alice", database_url: str | None = None):
     else:
         engine = create_session_engine(database_url)
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -122,7 +122,10 @@ def _make_app(tmp_path, user_id="alice", database_url: str | None = None):
     # None resolver means "shield unavailable" (a missing key is a wiring error).
     app.state.scoped_secret_resolver = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=service.session_operation_authority,
+    )
     app.include_router(create_session_router())
     return app, service
 
@@ -175,6 +178,46 @@ async def test_guided_start_seeds_tutorial_profile_and_persists(tmp_path) -> Non
     get_resp = client.get(f"/api/sessions/{session.id}/guided")
     assert get_resp.status_code == 200
     assert get_resp.json()["guided_session"]["profile"] == {"coaching": True, "bookends": True}
+
+
+@pytest.mark.asyncio
+async def test_guided_start_reconciliation_reads_active_attempt_without_acquiring_compose(tmp_path) -> None:
+    from elspeth.web.sessions.routes._helpers import _SessionComposeLockRegistry
+
+    app, service = _make_app(tmp_path)
+    registry = _SessionComposeLockRegistry()
+    app.state.session_compose_lock_registry = registry
+    session = await service.create_session("alice", "T", "local")
+    operation_id = str(uuid.uuid4())
+    claim = await service.reserve_guided_operation(
+        session_id=session.id,
+        operation_id=operation_id,
+        kind="guided_start",
+        request_hash="c" * 64,
+        actor="worker",
+        lease_seconds=300,
+    )
+    assert claim.fence.attempt == 1
+    compose_lock = await registry.get_lock(str(session.id))
+    await compose_lock.acquire()
+
+    try:
+        with (
+            patch.object(service, "get_guided_start_reconciliation", wraps=service.get_guided_start_reconciliation) as read,
+            patch.object(service, "reconcile_guided_start_operation", wraps=service.reconcile_guided_start_operation) as mutate,
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                response = await asyncio.wait_for(
+                    client.post(f"/api/sessions/{session.id}/guided/start/{operation_id}/reconcile"),
+                    timeout=1,
+                )
+    finally:
+        compose_lock.release()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "in_progress"}
+    read.assert_awaited_once()
+    mutate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1046,6 +1089,8 @@ async def test_guided_start_takes_over_expired_lease_and_stale_worker_cannot_set
                 "operation_id": operation_id,
             },
         )
+    stale_session_context = await service._guided_test_context(session.id, "guided_start")
+    await service._run_sync(service.session_operation_authority.release, stale_session_context)
 
     with patch.object(service, "renew_guided_operation", wraps=service.renew_guided_operation) as renew:
         takeover = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
@@ -1076,7 +1121,7 @@ async def test_guided_start_rejoins_after_fence_loss_without_polling_under_lock(
     original_renew = service.renew_guided_operation
     renew_calls = 0
 
-    async def lose_first_fence(fence, *, actor, lease_seconds):
+    async def lose_first_fence(fence, *, actor, lease_seconds, session_operation_context):
         nonlocal renew_calls
         renew_calls += 1
         if renew_calls == 1:
@@ -1093,7 +1138,12 @@ async def test_guided_start_rejoins_after_fence_loss_without_polling_under_lock(
                     },
                 )
             raise GuidedOperationFenceLostError(fence)
-        return await original_renew(fence, actor=actor, lease_seconds=lease_seconds)
+        return await original_renew(
+            fence,
+            actor=actor,
+            lease_seconds=lease_seconds,
+            session_operation_context=session_operation_context,
+        )
 
     with patch.object(service, "renew_guided_operation", side_effect=lose_first_fence):
         response = client.post(

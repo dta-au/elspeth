@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -10,11 +11,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 from unittest.mock import MagicMock, call, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import event, select
+from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
@@ -285,8 +286,67 @@ def execute_tool(
     **kwargs: Any,
 ) -> ToolResult:
     """Invoke the strict dispatcher through an explicit test trust boundary."""
+    owned_authority = None
+    owned_context = None
     if kwargs.get("data_dir") is not None and "session_id" not in kwargs:
         kwargs["session_id"] = "test-session"
+    if (
+        tool_name in {"create_blob", "update_blob", "delete_blob"}
+        and kwargs.get("session_engine") is not None
+        and kwargs.get("session_id") is not None
+        and kwargs.get("session_operation_authority") is None
+    ):
+        from datetime import UTC, datetime
+
+        from elspeth.contracts.session_operation import SessionOperationKind
+        from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+        from elspeth.web.sessions.models import blobs_table, session_operation_fences_table
+
+        engine = kwargs["session_engine"]
+        session_id = kwargs["session_id"]
+        with engine.begin() as conn:
+            if (
+                conn.execute(
+                    select(session_operation_fences_table.c.session_id).where(session_operation_fences_table.c.session_id == session_id)
+                ).one_or_none()
+                is None
+            ):
+                now = datetime.now(UTC)
+                conn.execute(
+                    session_operation_fences_table.insert().values(
+                        session_id=session_id,
+                        operation_id=f"test-bootstrap-{uuid4()}",
+                        lease_token=f"test-bootstrap-token-{uuid4()}",
+                        operation_kind=SessionOperationKind.CREATE.value,
+                        owner_instance_id="composer-tool-test-bootstrap",
+                        operation_epoch=1,
+                        lease_expires_at=now,
+                        released_at=now,
+                    )
+                )
+        authority = SQLiteLocalSessionOperationAuthority(engine)
+        context = authority.acquire(
+            session_id=UUID(session_id),
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=f"composer-tool-test-{uuid4()}",
+            lease_seconds=30,
+        )
+        kwargs["session_operation_authority"] = authority
+        kwargs["session_operation_context"] = context
+        owned_authority = authority
+        owned_context = context
+        if kwargs.get("data_dir") is None and tool_name in {"update_blob", "delete_blob"}:
+            with engine.connect() as conn:
+                storage_path = conn.execute(
+                    select(blobs_table.c.storage_path)
+                    .where(
+                        blobs_table.c.session_id == session_id,
+                        blobs_table.c.id == arguments.get("blob_id"),
+                    )
+                    .limit(1)
+                ).scalar_one_or_none()
+            if storage_path is not None:
+                kwargs["data_dir"] = str(Path(storage_path).resolve().parents[2])
     supplied_snapshot = kwargs.pop("plugin_snapshot", None)
     if isinstance(catalog, PolicyCatalogView):
         if not isinstance(supplied_snapshot, PluginAvailabilitySnapshot):
@@ -298,14 +358,18 @@ def execute_tool(
             raise AssertionError("a snapshot requires its matching policy catalog")
         snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
         policy_catalog = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    return _execute_tool(
-        tool_name,
-        arguments,
-        state,
-        policy_catalog,
-        plugin_snapshot=snapshot,
-        **kwargs,
-    )
+    try:
+        return _execute_tool(
+            tool_name,
+            arguments,
+            state,
+            policy_catalog,
+            plugin_snapshot=snapshot,
+            **kwargs,
+        )
+    finally:
+        if owned_authority is not None and owned_context is not None:
+            owned_authority.release(owned_context)
 
 
 def _trained_tool_context(catalog: CatalogService | None = None, **kwargs: Any) -> Any:
@@ -4666,8 +4730,8 @@ class TestBlobTools:
         data_dir = str(tmp_path)
         original_write = blob_service._atomic_write_blob
 
-        def _write_then_fail(path: Path, content: bytes) -> None:
-            original_write(path, content)
+        def _write_then_fail(path: Path, content: bytes, **kwargs: Any) -> None:
+            original_write(path, content, **kwargs)
             raise RuntimeError("simulated interruption after file publication")
 
         with (
@@ -4688,10 +4752,20 @@ class TestBlobTools:
                 **_verbatim_blob_context(self.engine, self.session_id, "a,b\n1,2"),
             )
 
-        # Storage file must have been cleaned up
+        # The exact pending reservation must track any bytes published before
+        # the interruption; recovery may then retire both together.
         blob_dir = tmp_path / "blobs" / self.session_id
         remaining = list(blob_dir.glob("*")) if blob_dir.exists() else []
-        assert remaining == [], f"Orphaned files after interrupted publication: {remaining}"
+        assert len(remaining) == 1
+        with self.engine.connect() as conn:
+            pending = conn.execute(
+                select(blobs_table.c.storage_path, blobs_table.c.status).where(
+                    blobs_table.c.session_id == self.session_id,
+                    blobs_table.c.storage_path == str(remaining[0]),
+                )
+            ).one()
+        assert pending.status == "pending"
+        assert pending.storage_path == str(remaining[0])
 
     def test_update_blob_restores_old_content_on_db_failure(self, tmp_path: Path) -> None:
         """DB failure during update_blob must restore the original file content."""
@@ -4721,7 +4795,7 @@ class TestBlobTools:
                     filename="test.csv",
                     mime_type="text/csv",
                     size_bytes=len(original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=hashlib.sha256(original_content).hexdigest(),
                     storage_path=str(storage_path),
                     created_at=now,
                     created_by="user",
@@ -4730,14 +4804,12 @@ class TestBlobTools:
                 )
             )
 
-        # Patch session_engine.begin() to raise AFTER the file is overwritten.
-        # The update function reads old content, writes new content, THEN enters
-        # the DB transaction.  We need the DB part to fail.
+        # Fail the typed metadata replacement before the callback swaps the
+        # prepared file into the canonical path.
         provenance_context = _verbatim_blob_context(self.engine, self.session_id, "new,content\n3,4")
         with (
-            patch.object(
-                self.engine,
-                "begin",
+            patch(
+                "elspeth.web.coordination.repository._RepositoryBlobMutations.prepare_blob_replacement",
                 side_effect=RuntimeError("simulated DB failure"),
             ),
             pytest.raises(RuntimeError, match="simulated DB failure"),
@@ -4835,8 +4907,8 @@ class TestDeleteBlobActiveRunGuard:
                     session_id=self.session_id,
                     filename="data.csv",
                     mime_type="text/csv",
-                    size_bytes=100,
-                    content_hash=_STUB_SHA256,
+                    size_bytes=len(self.storage_path.read_bytes()),
+                    content_hash=hashlib.sha256(self.storage_path.read_bytes()).hexdigest(),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -5268,7 +5340,7 @@ class TestUpdateBlobQuota:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=hashlib.sha256(self.original_content).hexdigest(),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -5300,40 +5372,6 @@ class TestUpdateBlobQuota:
 
         assert quota_error is None
         assert locked_sessions == [self.session_id]
-
-    def test_update_locks_session_before_current_size_delta_read(self, monkeypatch) -> None:
-        """The quota lock must cover the current-size read used for update deltas."""
-        from elspeth.web.composer.tools import blobs as composer_blob_tools
-
-        events: list[str] = []
-        original_lock = composer_blob_tools._lock_session_for_blob_quota
-
-        def recording_lock(conn, session_id: str) -> None:
-            events.append("lock")
-            original_lock(conn, session_id)
-
-        def record_size_read(_conn, _cursor, statement: str, _parameters, _context, _executemany) -> None:
-            normalized = " ".join(statement.lower().split())
-            if normalized.startswith("select blobs.size_bytes") and "from blobs" in normalized:
-                events.append("size_read")
-
-        monkeypatch.setattr(composer_blob_tools, "_lock_session_for_blob_quota", recording_lock)
-        event.listen(self.engine, "before_cursor_execute", record_size_read)
-        try:
-            result = execute_tool(
-                "update_blob",
-                {"blob_id": self.blob_id, "content": "larger content"},
-                _empty_state(),
-                _mock_catalog(),
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "larger content"),
-            )
-        finally:
-            event.remove(self.engine, "before_cursor_execute", record_size_read)
-
-        assert result.success is True
-        assert events[:2] == ["lock", "size_read"]
 
     def test_update_within_quota_succeeds(self) -> None:
         state = _empty_state()
@@ -5605,7 +5643,7 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=hashlib.sha256(self.original_content).hexdigest(),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -5630,8 +5668,6 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
         """
         from unittest.mock import patch
 
-        from elspeth.web.composer.tools import _execute_update_blob
-
         primary_message = "primary-db-fault"
 
         def _raise_primary(*_args: Any, **_kwargs: Any) -> str | None:
@@ -5655,19 +5691,21 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
         catalog = _mock_catalog()
 
         with (
-            patch("elspeth.web.composer.tools.blobs._check_blob_quota", side_effect=_raise_primary),
+            patch(
+                "elspeth.web.coordination.repository._RepositoryBlobMutations.prepare_blob_replacement",
+                side_effect=_raise_primary,
+            ),
             patch.object(Path, "write_bytes", _tripwire_write_bytes),
             pytest.raises(RuntimeError, match=primary_message) as exc_info,
         ):
-            _execute_update_blob(
+            execute_tool(
+                "update_blob",
                 {"blob_id": self.blob_id, "content": "x" * 100},
                 state,
-                _trained_tool_context(
-                    catalog,
-                    session_engine=self.engine,
-                    session_id=self.session_id,
-                    **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-                ),
+                catalog,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
             )
 
         # Headline is the primary RuntimeError.
@@ -5696,8 +5734,6 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
         """
         from unittest.mock import patch
 
-        from elspeth.web.composer.tools import _execute_update_blob
-
         primary_message = "primary-db-fault-clean-exit"
 
         def _raise_primary(*_args: Any, **_kwargs: Any) -> str | None:
@@ -5707,18 +5743,20 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
         catalog = _mock_catalog()
 
         with (
-            patch("elspeth.web.composer.tools.blobs._check_blob_quota", side_effect=_raise_primary),
+            patch(
+                "elspeth.web.coordination.repository._RepositoryBlobMutations.prepare_blob_replacement",
+                side_effect=_raise_primary,
+            ),
             pytest.raises(RuntimeError, match=primary_message) as exc_info,
         ):
-            _execute_update_blob(
+            execute_tool(
+                "update_blob",
                 {"blob_id": self.blob_id, "content": "x" * 100},
                 state,
-                _trained_tool_context(
-                    catalog,
-                    session_engine=self.engine,
-                    session_id=self.session_id,
-                    **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-                ),
+                catalog,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
             )
 
         assert self.storage_path.read_bytes() == self.original_content
@@ -5726,80 +5764,6 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
         assert not any("Rollback failed" in n for n in notes), f"Spurious rollback note attached on clean DB failure: {notes!r}"
         leftovers = [p for p in self.storage_path.parent.iterdir() if p != self.storage_path]
         assert leftovers == [], f"Tempfile leaked: {leftovers}"
-
-
-class TestSessionBlobLockRegistry:
-    """``_session_blob_lock`` must return a stable lock per session_id.
-
-    The lock identity is the contract the ``_execute_update_blob``
-    critical section depends on: two threads asking for the same
-    session_id's lock must receive the SAME ``threading.Lock`` instance
-    so acquiring it in one thread blocks the other.  A broken registry
-    that returned fresh locks on every call would offer no
-    serialisation at all — correctness would silently regress to the
-    pre-I4 race.
-    """
-
-    def test_same_session_returns_identical_lock(self) -> None:
-        """Two lookups for the same session_id must return the same lock."""
-        from elspeth.web.composer.tools import _session_blob_lock
-
-        session_id = "test-session-identity"
-        first = _session_blob_lock(session_id)
-        second = _session_blob_lock(session_id)
-        assert first is second, (
-            "Session lock registry returned a DIFFERENT lock for the same session_id; two concurrent updaters would not serialise."
-        )
-
-    def test_different_sessions_return_distinct_locks(self) -> None:
-        """Different session_ids must map to different locks (no global bottleneck)."""
-        from elspeth.web.composer.tools import _session_blob_lock
-
-        lock_a = _session_blob_lock("session-A")
-        lock_b = _session_blob_lock("session-B")
-        assert lock_a is not lock_b, (
-            "Session lock registry returned the SAME lock for different session_ids; unrelated sessions would contend."
-        )
-
-    def test_concurrent_lookups_converge_on_single_lock(self) -> None:
-        """Under concurrent first-access, all threads must receive the same lock.
-
-        Regression guard for the double-checked-locking implementation
-        in ``_session_blob_lock``.  Without the registry mutex, two
-        threads asking for a not-yet-present session_id at the same
-        time could each install a different lock and half the callers
-        would serialise against one instance while the other half
-        serialise against the other — the race the I4 fix closes would
-        persist across threads partitioned by lock identity.
-        """
-        import threading as stdlib_threading
-        from uuid import uuid4
-
-        from elspeth.web.composer.tools import _session_blob_lock
-
-        session_id = f"concurrent-{uuid4()}"
-        start = stdlib_threading.Event()
-        locks: list[Any] = []
-        lock_guard = stdlib_threading.Lock()
-
-        def worker() -> None:
-            start.wait()
-            lock = _session_blob_lock(session_id)
-            with lock_guard:
-                locks.append(lock)
-
-        threads = [stdlib_threading.Thread(target=worker) for _ in range(16)]
-        for t in threads:
-            t.start()
-        start.set()
-        for t in threads:
-            t.join()
-
-        assert len(locks) == 16
-        assert all(lock is locks[0] for lock in locks), (
-            "Concurrent _session_blob_lock callers received distinct lock instances; "
-            "the registry mutex is missing or double-checked locking is broken."
-        )
 
 
 class TestUpdateBlobSessionLockSerialisation:
@@ -5831,7 +5795,7 @@ class TestUpdateBlobSessionLockSerialisation:
         )
         initialize_session_schema(self.engine)
 
-        self.session_id = f"lock-serialise-{uuid4()}"
+        self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
         self.data_dir = str(tmp_path)
         now = datetime.now(UTC)
@@ -5860,7 +5824,7 @@ class TestUpdateBlobSessionLockSerialisation:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=hashlib.sha256(self.original_content).hexdigest(),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -5888,9 +5852,8 @@ class TestUpdateBlobSessionLockSerialisation:
         """
         import threading as stdlib_threading
 
-        from elspeth.web.composer.tools import _session_blob_lock
+        from elspeth.web.sessions.locking import filesystem_session_lock
 
-        lock = _session_blob_lock(self.session_id)
         started = stdlib_threading.Event()
         completed = stdlib_threading.Event()
         result_holder: list[Any] = []
@@ -5911,8 +5874,7 @@ class TestUpdateBlobSessionLockSerialisation:
             finally:
                 completed.set()
 
-        lock.acquire()
-        try:
+        with filesystem_session_lock(Path(self.data_dir), self.session_id):
             t = stdlib_threading.Thread(target=worker, daemon=True)
             t.start()
             # Probe first: the worker must actually enter its body
@@ -5929,11 +5891,9 @@ class TestUpdateBlobSessionLockSerialisation:
             blocked = not completed.wait(timeout=1.0)
             assert blocked, (
                 "update_blob completed while the session lock was held externally; "
-                "the tool did not acquire _session_blob_lock before _sync_get_blob, "
+                "the tool did not acquire filesystem_session_lock before its fenced read, "
                 "reopening the I4 file/DB rollback race."
             )
-        finally:
-            lock.release()
 
         assert completed.wait(timeout=2.0), "update_blob did not complete within 2s after session lock was released"
         t.join(timeout=2.0)
@@ -6010,7 +5970,7 @@ class TestUpdateBlobQuotaRollbackDivergence:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=hashlib.sha256(self.original_content).hexdigest(),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -12349,7 +12309,7 @@ class TestUpdateBlobActiveRunGuard:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=hashlib.sha256(self.original_content).hexdigest(),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -12536,7 +12496,7 @@ class TestUpdateBlobActiveRunGuard:
         assert self.storage_path.read_bytes() == self.original_content
         with self.engine.begin() as conn:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
-        assert row.content_hash == _STUB_SHA256
+        assert row.content_hash == hashlib.sha256(self.original_content).hexdigest()
 
     def test_update_rejected_when_blob_is_current_source_blob_ref(self) -> None:
         """A blob-backed source locks the blob content hash stamped in source_authoring."""
@@ -12574,7 +12534,7 @@ class TestUpdateBlobActiveRunGuard:
         assert self.storage_path.read_bytes() == self.original_content
         with self.engine.begin() as conn:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
-        assert row.content_hash == _STUB_SHA256
+        assert row.content_hash == hashlib.sha256(self.original_content).hexdigest()
 
     def test_unbound_update_recomputes_composer_provenance(self) -> None:
         """Unbound blob updates that author new bytes refresh blob provenance."""
@@ -12796,7 +12756,7 @@ class TestUpdateBlobAtomicWrite:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=hashlib.sha256(self.original_content).hexdigest(),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -12893,13 +12853,11 @@ class TestUpdateBlobAtomicWrite:
         catalog = _mock_catalog()
         provenance_context = _verbatim_blob_context(self.engine, self.session_id, "new")
 
-        # Force a DB failure by making begin() raise.  This fires
-        # BEFORE any UPDATE / os.replace, so no file mutation can
-        # have occurred.
+        # Force the typed metadata replacement to fail before the callback
+        # reaches os.replace, so no canonical file mutation can occur.
         with (
-            patch.object(
-                self.engine,
-                "begin",
+            patch(
+                "elspeth.web.coordination.repository._RepositoryBlobMutations.prepare_blob_replacement",
                 side_effect=RuntimeError("simulated DB failure"),
             ),
             pytest.raises(RuntimeError, match="simulated DB failure"),

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import pipeline_planner
@@ -34,6 +34,7 @@ from elspeth.web.composer.protocol import ComposerService
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import GuidedOperationFence
 
 
@@ -48,7 +49,8 @@ def test_guided_full_controller_owns_no_topology_constructor() -> None:
     assert "solve_chain" not in source
 
 
-def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
+@pytest.mark.asyncio
+async def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
     composer_test_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -82,7 +84,8 @@ def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
         snapshot,
         app.state.operator_profile_registry,
     )
-    session_id = uuid4()
+    session = await app.state.session_service.create_session("alice", "Shared planner", "local")
+    session_id = session.id
     checkpoint_id = uuid4()
     message_id = uuid4()
     state = CompositionState(
@@ -126,28 +129,35 @@ def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
         )
 
     monkeypatch.setattr(service_module, "plan_pipeline", fake_plan_pipeline)
-    result, catalog_ids = asyncio.run(
-        service.plan_guided_full_pipeline(
-            intent="Build a complete pipeline.",
-            current_state=state,
-            originating_message=PlannerOriginatingMessage(
-                session_id=str(session_id),
-                message_id=str(message_id),
-                content="Build a complete pipeline.",
-                user_id="alice",
-            ),
-            base=base,
-            policy_catalog=policy_catalog,
-            plugin_snapshot=snapshot,
-            recorder=BufferingRecorder(),
-            operation_fence=GuidedOperationFence(
-                session_id=session_id,
-                operation_id="00000000-0000-4000-8000-000000000041",
-                lease_token="runtime-identity-proof",
-                attempt=1,
-            ),
-        )
+    operation_lease = await SessionOperationLease.acquire(
+        app.state.session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=app.state.session_service.session_operation_owner_instance_id,
+        lease_seconds=app.state.session_service.session_operation_lease_seconds,
     )
+    result, catalog_ids = await service.plan_guided_full_pipeline(
+        intent="Build a complete pipeline.",
+        current_state=state,
+        originating_message=PlannerOriginatingMessage(
+            session_id=str(session_id),
+            message_id=str(message_id),
+            content="Build a complete pipeline.",
+            user_id="alice",
+        ),
+        base=base,
+        policy_catalog=policy_catalog,
+        plugin_snapshot=snapshot,
+        recorder=BufferingRecorder(),
+        operation_fence=GuidedOperationFence(
+            session_id=session_id,
+            operation_id="00000000-0000-4000-8000-000000000041",
+            lease_token="runtime-identity-proof",
+            attempt=1,
+        ),
+        session_operation_context=operation_lease.context,
+    )
+    await operation_lease.close()
 
     assert result.proposal.surface is PlannerSurface.GUIDED_FULL
     assert len(captured) == 1

@@ -14,6 +14,7 @@ from sqlalchemy.pool import QueuePool
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     SESSION_SCHEMA_EPOCH,
+    blob_deletion_cleanups_table,
     blobs_table,
     composer_progress_snapshots_table,
     composition_states_table,
@@ -162,8 +163,108 @@ def test_initialize_session_schema_creates_current_schema_without_alembic_table(
         "session_id",
         "storage_path",
         "tombstone_path",
+        "operation_id",
+        "operation_epoch",
+        "operation_kind",
+        "phase",
+        "blob_snapshot_hash",
+        "expected_file_present",
+        "expected_file_size",
+        "expected_file_hash",
         "created_at",
+        "updated_at",
     }
+
+
+def _blob_deletion_cleanup_values(session_id: str) -> dict[str, object]:
+    now = datetime.now(UTC)
+    blob_id = str(uuid.uuid4())
+    storage_path = f"/data/blobs/{session_id}/{blob_id}_artifact.txt"
+    return {
+        "blob_id": blob_id,
+        "session_id": session_id,
+        "storage_path": storage_path,
+        "tombstone_path": f"{storage_path}.delete-operation",
+        "operation_id": "operation-1",
+        "operation_epoch": 1,
+        "operation_kind": "archive",
+        "phase": "intent",
+        "blob_snapshot_hash": "a" * 64,
+        "expected_file_present": True,
+        "expected_file_size": 4,
+        "expected_file_hash": "b" * 64,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"operation_kind": "execute"},
+        {"phase": "deleted"},
+        {"blob_snapshot_hash": "A" * 64},
+        {"expected_file_hash": "B" * 64},
+        {"storage_path": " "},
+        {"tombstone_path": "\t"},
+        {"expected_file_present": False},
+        {"expected_file_present": False, "expected_file_size": None},
+        {"expected_file_present": True, "expected_file_size": None, "expected_file_hash": None},
+        {"updated_at": datetime(2000, 1, 1, tzinfo=UTC)},
+    ],
+)
+def test_blob_deletion_cleanup_rejects_invalid_exact_ledger_constraints(
+    engine,
+    overrides: dict[str, object],
+) -> None:
+    with engine.begin() as conn:
+        session_id, _state_id = _seed_session_state(conn)
+        values = _blob_deletion_cleanup_values(session_id)
+        values.update(overrides)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(blob_deletion_cleanups_table).values(**values))
+
+
+@pytest.mark.parametrize(
+    "custody",
+    [
+        {"custody_operation_id": "operation-1"},
+        {"custody_operation_epoch": 1},
+        {"custody_operation_kind": "create"},
+        {
+            "custody_operation_id": "operation-1",
+            "custody_operation_epoch": 1,
+            "custody_operation_kind": "blob_read",
+        },
+        {
+            "custody_operation_id": "\t",
+            "custody_operation_epoch": 1,
+            "custody_operation_kind": "create",
+        },
+    ],
+)
+def test_blob_reservation_rejects_partial_or_invalid_custody(
+    engine,
+    custody: dict[str, object],
+) -> None:
+    with engine.begin() as conn:
+        session_id, _state_id = _seed_session_state(conn)
+        values: dict[str, object] = {
+            "id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "filename": "artifact.txt",
+            "mime_type": "text/plain",
+            "size_bytes": 4,
+            "content_hash": "a" * 64,
+            "storage_path": f"/data/blobs/{session_id}/artifact.txt",
+            "created_at": datetime.now(UTC),
+            "created_by": "user",
+            "status": "pending",
+            "creation_modality": "verbatim",
+        }
+        values.update(custody)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(blobs_table).values(**values))
 
 
 def test_epoch_37_coordination_tables_and_expiry_indexes_are_exact() -> None:
@@ -247,6 +348,10 @@ def test_epoch_37_coordination_check_constraints_are_exact() -> None:
             "ck_run_execution_inputs_positive_schema_version",
             "ck_run_execution_inputs_run_id_nonblank",
             "ck_run_execution_inputs_sha256_identities",
+        },
+        "run_events": {
+            "ck_run_events_positive_sequence",
+            "ck_run_events_type",
         },
         "websocket_tickets": {
             "ck_websocket_tickets_auth_provider_type",
@@ -435,6 +540,54 @@ def test_session_operation_fence_rejects_ascii_whitespace_authority(engine) -> N
                     lease_token="\n",
                     operation_kind="execute",
                     owner_instance_id="\r",
+                    operation_epoch=1,
+                    lease_expires_at=now,
+                )
+            )
+
+
+def test_epoch_37_session_operation_kind_check_accepts_exact_closed_vocabulary(engine) -> None:
+    expected_sql = "operation_kind IN ('create', 'compose', 'proposal', 'execute', 'archive', 'progress', 'blob_read', 'session_fork')"
+    checks = {check["name"]: check["sqltext"] for check in inspect(engine).get_check_constraints("session_operation_fences")}
+    assert checks["ck_session_operation_fences_kind"] == expected_sql
+
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        session_id, _ = _seed_session_state(conn)
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=session_id,
+                operation_id="blob-read-operation",
+                lease_token="blob-read-lease",
+                operation_kind="blob_read",
+                owner_instance_id="instance-a",
+                operation_epoch=1,
+                lease_expires_at=now,
+            )
+        )
+        session_id, _ = _seed_session_state(conn)
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=session_id,
+                operation_id="session-fork-operation",
+                lease_token="session-fork-lease",
+                operation_kind="session_fork",
+                owner_instance_id="instance-a",
+                operation_epoch=2,
+                lease_expires_at=now,
+            )
+        )
+
+    with engine.begin() as conn:
+        session_id, _ = _seed_session_state(conn)
+        with pytest.raises(IntegrityError, match="ck_session_operation_fences_kind"):
+            conn.execute(
+                insert(session_operation_fences_table).values(
+                    session_id=session_id,
+                    operation_id="unknown-operation",
+                    lease_token="unknown-lease",
+                    operation_kind="unknown",
+                    owner_instance_id="instance-a",
                     operation_epoch=1,
                     lease_expires_at=now,
                 )

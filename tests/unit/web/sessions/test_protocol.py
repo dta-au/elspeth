@@ -3,31 +3,265 @@
 from __future__ import annotations
 
 import inspect
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast, get_args
 from uuid import uuid4
 
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.coordination.contracts import (
+    SessionOperationContext,
+    SessionOperationFence,
+    SessionOperationKind,
+)
+from elspeth.web.sessions import protocol as session_protocol
 from elspeth.web.sessions.protocol import (
     LEGAL_RUN_TRANSITIONS,
     OPERATOR_COMPLETION_RUN_STATUS_VALUES,
     SESSION_RUN_STATUS_VALUES,
     SESSION_TERMINAL_RUN_STATUS_VALUES,
+    AuditAccessLogAuthority,
     ChatMessageRecord,
     CompositionStateData,
     CompositionStateRecord,
+    GuidedOperationFence,
     GuidedPipelineProposalAcceptCommand,
     RunAlreadyActiveError,
+    RunEventRecord,
     RunRecord,
+    SessionForkAuthority,
+    SessionForkChildCreation,
+    SessionForkCreationTransaction,
+    SessionForkParentAuthority,
+    SessionOperationAuthority,
     SessionRecord,
     SessionRunStatus,
 )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("id", "not-a-uuid"),
+        ("run_id", "not-a-uuid"),
+        ("sequence", True),
+        ("sequence", 0),
+        ("timestamp", datetime.now(UTC).replace(tzinfo=None)),
+        ("event_type", "unknown"),
+        ("data", []),
+    ),
+)
+def test_run_event_record_rejects_malformed_audit_values(field: str, value: object) -> None:
+    values: dict[str, object] = {
+        "id": uuid4(),
+        "run_id": uuid4(),
+        "sequence": 1,
+        "timestamp": datetime.now(UTC),
+        "event_type": "progress",
+        "data": {},
+    }
+    values[field] = value
+
+    with pytest.raises(AuditIntegrityError):
+        RunEventRecord(**values)  # type: ignore[arg-type]
+
+
+def test_run_event_record_normalizes_time_and_detaches_nested_payload() -> None:
+    payload = {"nested": {"items": [1, 2]}}
+    record = RunEventRecord(
+        id=uuid4(),
+        run_id=uuid4(),
+        sequence=1,
+        timestamp=datetime.now(timezone(timedelta(hours=9))),
+        event_type="progress",
+        data=payload,
+    )
+
+    payload["nested"]["items"][0] = 9
+    assert record.timestamp.tzinfo is UTC
+    assert record.data["nested"]["items"] == (1, 2)
+    with pytest.raises(TypeError):
+        record.data["nested"]["items"][0] = 9  # type: ignore[index]
+
+
+def _session_context(
+    session_id: str,
+    *,
+    operation_id: str = "session-operation",
+    epoch: int = 2,
+    kind: SessionOperationKind = SessionOperationKind.SESSION_FORK,
+) -> SessionOperationContext:
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=session_id,
+            operation_id=operation_id,
+            lease_token=f"lease-{session_id}",
+            operation_epoch=epoch,
+        ),
+        operation_kind=kind,
+    )
+
+
+def _guided_fence(session_id: str, *, operation_id: str = "guided-operation") -> GuidedOperationFence:
+    return GuidedOperationFence(
+        session_id=uuid4().__class__(session_id),
+        operation_id=operation_id,
+        lease_token="guided-lease",
+        attempt=1,
+    )
+
+
+def test_session_fork_parent_authority_is_exact_immutable_and_cross_bound() -> None:
+    parent_id = str(uuid4())
+    guided = _guided_fence(parent_id)
+    authority = SessionForkParentAuthority(
+        parent_context=_session_context(parent_id),
+        guided_fence=guided,
+    )
+
+    assert authority.parent_context.fence.session_id == parent_id
+    assert authority.guided_fence is guided
+    with pytest.raises(AttributeError):
+        authority.guided_fence = guided  # type: ignore[misc]
+    with pytest.raises(AuditIntegrityError, match="same parent session"):
+        SessionForkParentAuthority(
+            parent_context=_session_context(parent_id),
+            guided_fence=_guided_fence(str(uuid4())),
+        )
+
+
+def test_session_fork_parent_authority_requires_exact_session_fork_context() -> None:
+    parent_id = str(uuid4())
+    with pytest.raises(AuditIntegrityError, match="SESSION_FORK"):
+        SessionForkParentAuthority(
+            parent_context=_session_context(parent_id, kind=SessionOperationKind.ARCHIVE),
+            guided_fence=_guided_fence(parent_id),
+        )
+    with pytest.raises(AuditIntegrityError, match="exact"):
+        SessionForkParentAuthority(  # type: ignore[arg-type]
+            parent_context=object(),
+            guided_fence=_guided_fence(parent_id),
+        )
+
+
+def test_session_fork_authority_exactly_binds_parent_child_and_guided() -> None:
+    parent_id = str(uuid4())
+    child_id = str(uuid4())
+    parent = SessionForkParentAuthority(
+        parent_context=_session_context(parent_id),
+        guided_fence=_guided_fence(parent_id),
+    )
+    authority = SessionForkAuthority(
+        parent=parent,
+        child_context=_session_context(child_id),
+    )
+
+    assert authority.parent is parent
+    assert authority.child_context.fence.session_id == child_id
+    with pytest.raises(AuditIntegrityError, match="different sessions"):
+        SessionForkAuthority(parent=parent, child_context=_session_context(parent_id))
+    with pytest.raises(AuditIntegrityError, match="epoch 2"):
+        SessionForkAuthority(
+            parent=parent,
+            child_context=_session_context(child_id, epoch=1),
+        )
+
+
 def test_guided_pipeline_accept_command_has_no_dead_proposal_projection() -> None:
     assert "proposal_payload" not in inspect.signature(GuidedPipelineProposalAcceptCommand).parameters
+
+
+def test_session_operation_authority_exposes_context_as_sole_action_capability() -> None:
+    SessionForkChildMutations = session_protocol.SessionForkChildMutations
+    SessionForkParentGuidedMutations = session_protocol.SessionForkParentGuidedMutations
+    acquire = inspect.signature(SessionOperationAuthority.acquire)
+    assert acquire.return_annotation == "SessionOperationContext"
+
+    for method_name in ("renew", "compare_and_swap", "mutate", "release", "archive_delete"):
+        signature = inspect.signature(getattr(SessionOperationAuthority, method_name))
+        assert "context" in signature.parameters
+        assert "fence" not in signature.parameters
+
+    assert inspect.signature(SessionOperationAuthority.renew).return_annotation == "SessionOperationContext"
+    reconciliation = inspect.signature(SessionOperationAuthority.reconcile_archive_delete)
+    assert reconciliation.return_annotation == "ArchiveDeleteReconciliation"
+    assert tuple(reconciliation.parameters) == ("self", "context")
+
+    fork_creation = inspect.signature(SessionOperationAuthority.mutate_fork_creation)
+    assert "connection" not in fork_creation.parameters
+    assert "engine" not in fork_creation.parameters
+    assert tuple(fork_creation.parameters) == ("self", "parent_authority", "child", "mutation")
+    assert fork_creation.parameters["mutation"].annotation == ("Callable[[SessionForkCreationTransaction, SessionForkAuthority], T]")
+
+    transaction_surface = {
+        name for name, value in inspect.getmembers(SessionForkCreationTransaction, inspect.isfunction) if not name.startswith("_")
+    }
+    assert transaction_surface == {
+        "count_parent_proposal_terminal_events",
+        "read_child_snapshot",
+        "read_parent_guided_root_authority",
+        "read_parent_message",
+        "read_parent_proposal",
+        "read_parent_proposal_creation_events",
+        "read_parent_ready_blobs",
+        "read_parent_session",
+        "read_parent_state",
+        "require_parent_guided_operation",
+    }
+    assert isinstance(SessionForkCreationTransaction.__dict__["child_mutations"], property)
+    assert isinstance(SessionForkCreationTransaction.__dict__["parent_guided_mutations"], property)
+    assert "execute" not in transaction_surface
+
+    child_surface = {name for name, value in inspect.getmembers(SessionForkChildMutations, inspect.isfunction) if not name.startswith("_")}
+    assert child_surface == {"append_child_messages", "insert_child_state"}
+    parent_guided_surface = {
+        name for name, value in inspect.getmembers(SessionForkParentGuidedMutations, inspect.isfunction) if not name.startswith("_")
+    }
+    assert parent_guided_surface == {"bind_guided_fork"}
+    assert tuple(inspect.signature(SessionForkParentGuidedMutations.bind_guided_fork).parameters) == (
+        "self",
+        "originating_message_id",
+    )
+
+    for protocol in (SessionForkChildMutations, SessionForkParentGuidedMutations):
+        assert getattr(protocol, "_is_runtime_protocol", False) is False
+        with pytest.raises(TypeError, match="runtime_checkable"):
+            isinstance(object(), protocol)
+    assert getattr(SessionForkCreationTransaction, "_is_runtime_protocol", False) is True
+
+    forbidden_names = {"connection", "engine", "execute"}
+    for protocol in (SessionForkCreationTransaction, SessionForkChildMutations, SessionForkParentGuidedMutations):
+        assert forbidden_names.isdisjoint(protocol.__dict__)
+
+
+def test_audit_access_log_authority_is_handle_free_and_pins_server_owned_fields() -> None:
+    signature = inspect.signature(AuditAccessLogAuthority.record_audit_grade_view)
+
+    assert tuple(signature.parameters) == (
+        "self",
+        "session_id",
+        "requesting_principal",
+        "auth_provider_type",
+        "request_path",
+        "query_args",
+        "ip_address",
+    )
+    assert "engine" not in signature.parameters
+    assert "connection" not in signature.parameters
+    assert "timestamp" not in signature.parameters
+    assert "writer_principal" not in signature.parameters
+    assert signature.return_annotation == "AuditAccessLogRecord"
+
+
+def test_fork_creation_transaction_server_mints_child_authority() -> None:
+    fork_creation = inspect.signature(SessionOperationAuthority.mutate_fork_creation)
+    assert "candidate_child_session_id" not in fork_creation.parameters
+    assert "owner_instance_id" not in fork_creation.parameters
+    assert "lease_seconds" not in fork_creation.parameters
+    assert {"candidate_child_session_id", "owner_instance_id", "lease_seconds"}.isdisjoint(
+        inspect.signature(SessionForkChildCreation).parameters
+    )
 
 
 def _run_record(**overrides: object) -> RunRecord:

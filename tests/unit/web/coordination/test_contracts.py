@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields
+from typing import cast
 
 import pytest
 
+import elspeth.web.coordination as coordination
+import elspeth.web.coordination.contracts as coordination_contracts
 from elspeth.web.coordination.contracts import (
     PROTOCOL_BUMP_NOT_REQUIRED_CHANGES,
     PROTOCOL_BUMP_REQUIRED_CHANGES,
     WEB_COORDINATION_PROTOCOL_VERSION,
+    ArchiveDeleteReconciliation,
+    ArchiveManifestRelation,
     CancellationSource,
     CompatibilityKey,
     FenceLossReason,
@@ -20,6 +25,8 @@ from elspeth.web.coordination.contracts import (
     SessionOperationFence,
     SessionOperationFenceLost,
     SessionOperationKind,
+    SessionOperationLeaseDisposition,
+    SessionOperationTerminalOutcomeUnknown,
     StartPermitState,
 )
 
@@ -114,6 +121,8 @@ def test_coordination_state_and_reason_enums_are_bounded() -> None:
         "execute",
         "archive",
         "progress",
+        "blob_read",
+        "session_fork",
     }
     assert {item.value for item in StartPermitState} == {
         "pending",
@@ -133,6 +142,84 @@ def test_coordination_state_and_reason_enums_are_bounded() -> None:
     }
     assert {item.value for item in CancellationSource} == {"user", "operator", "shutdown", "reconciler"}
     assert "unknown" in {item.value for item in RecoveryRequiredReason}
+    assert {item.value for item in ArchiveDeleteReconciliation} == {"current", "consumed"}
+    assert {item.value for item in ArchiveManifestRelation} == {
+        "current_operation",
+        "stale_operation",
+    }
+    assert {item.value for item in SessionOperationLeaseDisposition} == {
+        "active",
+        "released",
+        "consumed",
+        "lost",
+        "unknown",
+    }
+
+
+def test_session_operation_context_is_final_frozen_slotted_and_retains_exact_fence_identity() -> None:
+    fence = SessionOperationFence(
+        session_id="session-identifier",
+        operation_id="operation-identifier",
+        lease_token="lease-identifier",
+        operation_epoch=3,
+    )
+
+    context = coordination_contracts.SessionOperationContext(
+        fence=fence,
+        operation_kind=SessionOperationKind.BLOB_READ,
+    )
+
+    assert tuple(field.name for field in fields(coordination_contracts.SessionOperationContext)) == (
+        "fence",
+        "operation_kind",
+    )
+    assert context.fence is fence
+    assert context.operation_kind is SessionOperationKind.BLOB_READ
+    assert context.__class__.__final__ is True
+    assert not hasattr(context, "__dict__")
+    assert coordination.SessionOperationContext is coordination_contracts.SessionOperationContext
+    with pytest.raises(FrozenInstanceError):
+        context.operation_kind = SessionOperationKind.COMPOSE  # type: ignore[misc]
+
+
+def test_session_operation_context_rejects_non_exact_field_types_without_identifier_leakage() -> None:
+    class DerivedFence(SessionOperationFence):
+        pass
+
+    derived_fence = DerivedFence(
+        session_id="secret-session-identifier",
+        operation_id="secret-operation-identifier",
+        lease_token="secret-lease-identifier",
+        operation_epoch=3,
+    )
+    with pytest.raises(TypeError) as fence_error:
+        coordination_contracts.SessionOperationContext(
+            fence=derived_fence,
+            operation_kind=SessionOperationKind.BLOB_READ,
+        )
+
+    exact_fence = SessionOperationFence(
+        session_id="other-secret-session",
+        operation_id="other-secret-operation",
+        lease_token="other-secret-lease",
+        operation_epoch=4,
+    )
+    with pytest.raises(TypeError) as kind_error:
+        coordination_contracts.SessionOperationContext(
+            fence=exact_fence,
+            operation_kind=cast("SessionOperationKind", "blob_read"),
+        )
+
+    rendered = f"{fence_error.value!s} {fence_error.value!r} {kind_error.value!s} {kind_error.value!r}"
+    for identifier in (
+        "secret-session-identifier",
+        "secret-operation-identifier",
+        "secret-lease-identifier",
+        "other-secret-session",
+        "other-secret-operation",
+        "other-secret-lease",
+    ):
+        assert identifier not in rendered
 
 
 def test_fence_loss_errors_are_low_cardinality_and_leak_safe() -> None:
@@ -140,6 +227,18 @@ def test_fence_loss_errors_are_low_cardinality_and_leak_safe() -> None:
 
     rendered = f"{error!s} {error!r}"
     assert "token_mismatch" in rendered
+    assert "session-" not in rendered
+    assert "operation-" not in rendered
+    assert "lease_token" not in rendered
+
+
+def test_terminal_outcome_unknown_is_identifier_free_and_accepts_no_context() -> None:
+    error = SessionOperationTerminalOutcomeUnknown()
+
+    assert str(error) == "session operation terminal outcome is unknown"
+    with pytest.raises(TypeError):
+        SessionOperationTerminalOutcomeUnknown("secret-session")  # type: ignore[call-arg]
+    rendered = f"{error!s} {error!r}"
     assert "session-" not in rendered
     assert "operation-" not in rendered
     assert "lease_token" not in rendered

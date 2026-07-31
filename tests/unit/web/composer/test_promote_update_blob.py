@@ -21,6 +21,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import func, insert, select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -33,9 +34,10 @@ from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _execute_create_blob, _execute_update_blob
 from elspeth.web.composer.tools._common import ToolContext as _ToolContext
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import chat_messages_table, sessions_table
+from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 
@@ -63,27 +65,28 @@ def ToolContext(*, catalog: CatalogService, **kwargs: Any) -> _ToolContext:
     )
 
 
-def _session_engine_with_session() -> tuple[Any, str]:
+def _session_engine_with_session() -> tuple[Any, str, SQLiteLocalSessionOperationAuthority, Any]:
     engine = create_session_engine(
         "sqlite:///:memory:",
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    session_id = str(uuid4())
-    now = datetime.now(UTC)
-    with engine.begin() as conn:
-        conn.execute(
-            sessions_table.insert().values(
-                id=session_id,
-                user_id="test-user",
-                auth_provider_type="local",
-                title="Test Session",
-                created_at=now,
-                updated_at=now,
-            )
-        )
-    return engine, session_id
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = authority.create_session_with_initial_fence(
+        user_id="test-user",
+        title="Test Session",
+        auth_provider_type="local",
+        owner_instance_id="promote-update-blob-bootstrap",
+        lease_seconds=30,
+    )
+    operation_context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="promote-update-blob-test",
+        lease_seconds=30,
+    )
+    return engine, str(session.id), authority, operation_context
 
 
 def _insert_user_message(engine: Any, session_id: str, content: str) -> str:
@@ -136,22 +139,25 @@ def test_update_blob_manifest_entry_is_type_driven() -> None:
 
 
 class TestPromoteUpdateBlobArgErrorRouting:
-    def test_empty_arguments_raise_tool_argument_error(self) -> None:
+    def test_empty_arguments_raise_tool_argument_error(self, tmp_path: Path) -> None:
         """A bare ``{}`` is missing both required fields."""
-        engine, session_id = _session_engine_with_session()
+        engine, session_id, authority, operation_context = _session_engine_with_session()
         with pytest.raises(ToolArgumentError) as exc_info:
             _execute_update_blob(
                 {},
                 _empty_state(),
                 ToolContext(
                     catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_authority=authority,
+                    session_operation_context=operation_context,
                 ),
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
-    def test_wrong_type_content_raises_tool_argument_error(self) -> None:
+    def test_wrong_type_content_raises_tool_argument_error(self, tmp_path: Path) -> None:
         """Pydantic rejects ``content: int`` before the handler acquires the session lock.
 
         Validation MUST run before the file-mutation critical section
@@ -159,36 +165,42 @@ class TestPromoteUpdateBlobArgErrorRouting:
         would issue an unnecessary filesystem write over an unmodified
         file on a pure argument-validation failure.
         """
-        engine, session_id = _session_engine_with_session()
+        engine, session_id, authority, operation_context = _session_engine_with_session()
         with pytest.raises(ToolArgumentError) as exc_info:
             _execute_update_blob(
                 {"blob_id": "anything", "content": 42},
                 _empty_state(),
                 ToolContext(
                     catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_authority=authority,
+                    session_operation_context=operation_context,
                 ),
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
-    def test_missing_blob_id_raises_tool_argument_error(self) -> None:
-        engine, session_id = _session_engine_with_session()
+    def test_missing_blob_id_raises_tool_argument_error(self, tmp_path: Path) -> None:
+        engine, session_id, authority, operation_context = _session_engine_with_session()
         with pytest.raises(ToolArgumentError) as exc_info:
             _execute_update_blob(
                 {"content": "new content"},
                 _empty_state(),
                 ToolContext(
                     catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_authority=authority,
+                    session_operation_context=operation_context,
                 ),
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
-    def test_extra_field_raises_tool_argument_error(self) -> None:
+    def test_extra_field_raises_tool_argument_error(self, tmp_path: Path) -> None:
         """extra='forbid' rejects fields belonging to neighbouring tools."""
-        engine, session_id = _session_engine_with_session()
+        engine, session_id, authority, operation_context = _session_engine_with_session()
         with pytest.raises(ToolArgumentError) as exc_info:
             _execute_update_blob(
                 {
@@ -199,15 +211,18 @@ class TestPromoteUpdateBlobArgErrorRouting:
                 _empty_state(),
                 ToolContext(
                     catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_authority=authority,
+                    session_operation_context=operation_context,
                 ),
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
     def test_valid_arguments_dispatch_normally(self, tmp_path: Path) -> None:
         """Functional smoke: a valid call updates an existing blob's content."""
-        engine, session_id = _session_engine_with_session()
+        engine, session_id, authority, operation_context = _session_engine_with_session()
         catalog = _mock_catalog()
 
         # Bootstrap an existing blob via create_blob (also a Task 13 promoted
@@ -222,6 +237,8 @@ class TestPromoteUpdateBlobArgErrorRouting:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
+                session_operation_authority=authority,
+                session_operation_context=operation_context,
                 user_message_id=user_message_id,
                 user_message_content=user_message_content,
             ),
@@ -239,6 +256,8 @@ class TestPromoteUpdateBlobArgErrorRouting:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
+                session_operation_authority=authority,
+                session_operation_context=operation_context,
                 user_message_id=update_user_message_id,
                 user_message_content=update_user_message_content,
             ),

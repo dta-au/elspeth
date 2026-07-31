@@ -72,3 +72,10 @@ ELSPETH_ROUTING_GROUP_LOCK_CLASSID: int = 0x524F5554
 # collisions only over-serialize unrelated lineages and cannot weaken
 # the registry's insert-once guarantee.
 ELSPETH_AUDIT_EXPORT_LOCK_CLASSID: int = 0x41455850
+
+# 0x50524546 = ASCII "PREF". Used by RepositoryUserPreferenceAuthority
+# to serialize the read-resolve-upsert transition for one user_id. The
+# advisory lock precedes the prior-row read so concurrent creation of an
+# absent row is serialized too; SELECT FOR UPDATE cannot lock a missing row.
+# This immutable value is on-the-wire ABI under the module commitment above.
+ELSPETH_USER_PREFERENCES_LOCK_CLASSID: int = 0x50524546

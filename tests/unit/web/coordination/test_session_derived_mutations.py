@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import Engine, func, insert, select
 
+from elspeth.contracts.blobs import blob_record_snapshot_hash
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.coordination.contracts import SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.repository import SessionDerivedCustodyError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -17,6 +20,7 @@ from elspeth.web.sessions.models import (
     blob_run_links_table,
     blobs_table,
     composition_states_table,
+    proposal_blob_effect_receipts_table,
     run_events_table,
     runs_table,
 )
@@ -121,7 +125,7 @@ def test_derived_mutations_reject_foreign_parents_and_raw_execute(engine: Engine
     with pytest.raises(SessionDerivedCustodyError, match="derived record is unavailable"):
         authority.mutate(
             fence,
-            lambda transaction: transaction.append_run_event(
+            lambda transaction: transaction.runs.append_run_event(
                 run_id=foreign_run,
                 timestamp=datetime.now(UTC),
                 event_type="progress",
@@ -131,7 +135,7 @@ def test_derived_mutations_reject_foreign_parents_and_raw_execute(engine: Engine
     with pytest.raises(SessionDerivedCustodyError, match="derived record is unavailable"):
         authority.mutate(
             fence,
-            lambda transaction: transaction.insert_blob_run_link(
+            lambda transaction: transaction.blobs.insert_blob_run_link(
                 blob_id=foreign_blob,
                 run_id=_owned_run,
                 direction="input",
@@ -140,30 +144,315 @@ def test_derived_mutations_reject_foreign_parents_and_raw_execute(engine: Engine
     with pytest.raises(SessionDerivedCustodyError, match="derived record is unavailable"):
         authority.mutate(
             fence,
-            lambda transaction: transaction.insert_blob_run_link(
+            lambda transaction: transaction.blobs.insert_blob_run_link(
                 blob_id=owned_blob,
                 run_id=foreign_run,
                 direction="input",
             ),
         )
-    with pytest.raises(ValueError, match="directly session-scoped"):
-        authority.mutate(
-            fence,
-            lambda transaction: transaction.execute(
-                insert(run_events_table).values(
-                    id=str(uuid4()),
-                    run_id=str(_owned_run),
-                    sequence=1,
-                    timestamp=datetime.now(UTC),
-                    event_type="progress",
-                    data={},
-                )
-            ),
-        )
+
+    def assert_no_raw_execute(transaction) -> None:
+        assert not hasattr(transaction, "execute")
+        assert not hasattr(transaction.runs, "execute")
+
+    authority.mutate(fence, assert_no_raw_execute)
 
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(run_events_table)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(blob_run_links_table)).scalar_one() == 0
+
+
+def test_compose_prepares_durable_blob_replacement_intent(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="durable replacement")
+    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    with engine.begin() as conn:
+        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+    context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    expected = authority.mutate(context, lambda transaction: transaction.blobs.read_blob(blob_id=blob_id))
+    replacement = replace(expected, size_bytes=7, content_hash="b" * 64)
+
+    plan = authority.mutate(
+        context,
+        lambda transaction: transaction.blobs.prepare_blob_replacement(
+            replacement_id=uuid4(),
+            expected=expected,
+            replacement=replacement,
+            staging_path=f"{expected.storage_path}.replacement-stage",
+            backup_path=f"{expected.storage_path}.replacement-backup",
+            max_storage_per_session=100,
+            accepting_proposal_id=None,
+        ),
+    )
+
+    assert plan.phase == "intent"
+    assert plan.old_blob == expected
+    assert plan.replacement_blob == replacement
+    assert plan.operation_id == context.fence.operation_id
+    assert plan.operation_epoch == context.fence.operation_epoch
+    assert plan.operation_kind is SessionOperationKind.COMPOSE
+
+
+def test_non_proposal_blob_mutations_cannot_inherit_proposal_retention_exclusion(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="non-proposal retention exclusion")
+    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    with engine.begin() as conn:
+        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+    context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    expected = authority.mutate(context, lambda transaction: transaction.blobs.read_blob(blob_id=blob_id))
+    replacement = replace(expected, size_bytes=7, content_hash="b" * 64)
+    asserted_proposal_id = uuid4()
+
+    with pytest.raises(AuditIntegrityError, match="non-proposal blob replacement cannot exclude proposal retention"):
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.prepare_blob_replacement(
+                replacement_id=uuid4(),
+                expected=expected,
+                replacement=replacement,
+                staging_path=f"{expected.storage_path}.replacement-stage",
+                backup_path=f"{expected.storage_path}.replacement-backup",
+                max_storage_per_session=100,
+                accepting_proposal_id=asserted_proposal_id,
+            ),
+        )
+    with pytest.raises(AuditIntegrityError, match="non-proposal blob deletion cannot exclude proposal retention"):
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.prepare_blob_deletion(
+                blob_id=blob_id,
+                tombstone_path=f"{expected.storage_path}.delete",
+                blob_snapshot_hash=blob_record_snapshot_hash(expected),
+                expected_file_present=True,
+                expected_file_size=expected.size_bytes,
+                expected_file_hash=expected.content_hash,
+                accepting_proposal_id=asserted_proposal_id,
+            ),
+        )
+
+
+def test_blob_replacement_ledger_commits_exact_metadata_and_retires(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="replacement lifecycle")
+    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    with engine.begin() as conn:
+        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+    context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    expected = authority.mutate(context, lambda transaction: transaction.blobs.read_blob(blob_id=blob_id))
+    replacement = replace(expected, size_bytes=7, content_hash="b" * 64)
+    replacement_id = uuid4()
+    plan = authority.mutate(
+        context,
+        lambda transaction: transaction.blobs.prepare_blob_replacement(
+            replacement_id=replacement_id,
+            expected=expected,
+            replacement=replacement,
+            staging_path=f"{expected.storage_path}.{replacement_id}.stage",
+            backup_path=f"{expected.storage_path}.{replacement_id}.backup",
+            max_storage_per_session=100,
+            accepting_proposal_id=None,
+        ),
+    )
+
+    assert (
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.read_blob_replacement(blob_id=blob_id),
+        )
+        == plan
+    )
+    assert authority.mutate(context, lambda transaction: transaction.blobs.list_blob_replacements()) == (plan,)
+    staged = authority.mutate(
+        context,
+        lambda transaction: transaction.blobs.mark_blob_replacement_staged(plan=plan),
+    )
+    assert staged.phase == "swap_pending"
+    committed = authority.mutate(
+        context,
+        lambda transaction: transaction.blobs.commit_blob_replacement(
+            plan=staged,
+            max_storage_per_session=100,
+            accepting_proposal_id=None,
+        ),
+    )
+    assert committed.phase == "purge_pending"
+    assert authority.mutate(context, lambda transaction: transaction.blobs.read_blob(blob_id=blob_id)) == replacement
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(proposal_blob_effect_receipts_table)).scalar_one() == 0
+    assert (
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.retire_blob_replacement(plan=committed),
+        )
+        is True
+    )
+    assert (
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.read_blob_replacement(blob_id=blob_id),
+        )
+        is None
+    )
+
+
+def test_blob_deletion_and_replacement_ledgers_exclude_each_other_and_invocations(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="replacement exclusion")
+    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    with engine.begin() as conn:
+        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+    context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    expected = authority.mutate(context, lambda transaction: transaction.blobs.read_blob(blob_id=blob_id))
+    replacement = replace(expected, size_bytes=7, content_hash="b" * 64)
+    replacement_id = uuid4()
+    plan = authority.mutate(
+        context,
+        lambda transaction: transaction.blobs.prepare_blob_replacement(
+            replacement_id=replacement_id,
+            expected=expected,
+            replacement=replacement,
+            staging_path=f"{expected.storage_path}.{replacement_id}.stage",
+            backup_path=f"{expected.storage_path}.{replacement_id}.backup",
+            max_storage_per_session=100,
+            accepting_proposal_id=None,
+        ),
+    )
+    with pytest.raises(AuditIntegrityError, match="different blob replacement invocation"):
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.prepare_blob_replacement(
+                replacement_id=uuid4(),
+                expected=expected,
+                replacement=replacement,
+                staging_path=f"{expected.storage_path}.other.stage",
+                backup_path=f"{expected.storage_path}.other.backup",
+                max_storage_per_session=100,
+                accepting_proposal_id=None,
+            ),
+        )
+    with pytest.raises(AuditIntegrityError, match="replacement is in progress"):
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.prepare_blob_deletion(
+                blob_id=blob_id,
+                tombstone_path=f"{expected.storage_path}.delete",
+                blob_snapshot_hash=blob_record_snapshot_hash(expected),
+                expected_file_present=True,
+                expected_file_size=expected.size_bytes,
+                expected_file_hash=expected.content_hash,
+                accepting_proposal_id=None,
+            ),
+        )
+    assert (
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.abort_blob_replacement(plan=plan),
+        )
+        is True
+    )
+    deletion = authority.mutate(
+        context,
+        lambda transaction: transaction.blobs.prepare_blob_deletion(
+            blob_id=blob_id,
+            tombstone_path=f"{expected.storage_path}.delete",
+            blob_snapshot_hash=blob_record_snapshot_hash(expected),
+            expected_file_present=True,
+            expected_file_size=expected.size_bytes,
+            expected_file_hash=expected.content_hash,
+            accepting_proposal_id=None,
+        ),
+    )
+    with pytest.raises(AuditIntegrityError, match="deletion is in progress"):
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.prepare_blob_replacement(
+                replacement_id=uuid4(),
+                expected=expected,
+                replacement=replacement,
+                staging_path=f"{expected.storage_path}.third.stage",
+                backup_path=f"{expected.storage_path}.third.backup",
+                max_storage_per_session=100,
+                accepting_proposal_id=None,
+            ),
+        )
+    assert (
+        authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.abort_blob_deletion(plan=deletion),
+        )
+        is True
+    )
+
+
+def test_ready_blob_replacement_rejects_wrong_kind_and_quota_without_row_delta(engine: Engine) -> None:
+    from elspeth.contracts.blobs import BlobQuotaExceededError
+
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="replace guards")
+    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    with engine.begin() as conn:
+        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+
+    execute_context = _acquire(authority, session_id=session.id)
+    expected = authority.mutate(execute_context, lambda transaction: transaction.blobs.read_blob(blob_id=blob_id))
+    replacement = replace(expected, size_bytes=7, content_hash="b" * 64)
+    with pytest.raises(AuditIntegrityError, match="operation kind"):
+        authority.mutate(
+            execute_context,
+            lambda transaction: transaction.blobs.prepare_blob_replacement(
+                replacement_id=uuid4(),
+                expected=expected,
+                replacement=replacement,
+                staging_path=f"{expected.storage_path}.wrong-kind.stage",
+                backup_path=f"{expected.storage_path}.wrong-kind.backup",
+                max_storage_per_session=100,
+                accepting_proposal_id=None,
+            ),
+        )
+    authority.release(execute_context)
+
+    compose_context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    with pytest.raises(BlobQuotaExceededError):
+        authority.mutate(
+            compose_context,
+            lambda transaction: transaction.blobs.prepare_blob_replacement(
+                replacement_id=uuid4(),
+                expected=expected,
+                replacement=replacement,
+                staging_path=f"{expected.storage_path}.quota.stage",
+                backup_path=f"{expected.storage_path}.quota.backup",
+                max_storage_per_session=6,
+                accepting_proposal_id=None,
+            ),
+        )
+    observed = authority.mutate(compose_context, lambda transaction: transaction.blobs.read_blob(blob_id=blob_id))
+    assert observed == expected
 
 
 def test_inline_resolution_batch_rolls_back_when_one_blob_is_foreign(engine: Engine) -> None:
@@ -195,7 +484,7 @@ def test_inline_resolution_batch_rolls_back_when_one_blob_is_foreign(engine: Eng
     with pytest.raises(SessionDerivedCustodyError, match="derived record is unavailable"):
         authority.mutate(
             fence,
-            lambda transaction: transaction.insert_blob_inline_resolutions(
+            lambda transaction: transaction.blobs.insert_blob_inline_resolutions(
                 run_id=owned_run,
                 attempt=1,
                 resolutions=resolutions,
@@ -214,7 +503,7 @@ def test_stale_event_writer_consumes_no_sequence(engine: Engine) -> None:
     stale = _acquire(authority, session_id=session.id)
     first = authority.mutate(
         stale,
-        lambda transaction: transaction.append_run_event(
+        lambda transaction: transaction.runs.append_run_event(
             run_id=run_id,
             timestamp=datetime.now(UTC),
             event_type="progress",
@@ -227,7 +516,7 @@ def test_stale_event_writer_consumes_no_sequence(engine: Engine) -> None:
     with pytest.raises(SessionOperationFenceLost):
         authority.mutate(
             stale,
-            lambda transaction: transaction.append_run_event(
+            lambda transaction: transaction.runs.append_run_event(
                 run_id=run_id,
                 timestamp=datetime.now(UTC),
                 event_type="progress",
@@ -236,18 +525,125 @@ def test_stale_event_writer_consumes_no_sequence(engine: Engine) -> None:
         )
     second = authority.mutate(
         current,
-        lambda transaction: transaction.append_run_event(
+        lambda transaction: transaction.runs.append_run_event(
             run_id=run_id,
             timestamp=datetime.now(UTC),
             event_type="completed",
             data={"step": 2},
         ),
     )
-    replay = authority.mutate(current, lambda transaction: transaction.list_run_events_after(run_id=run_id, after_sequence=0))
+    replay = authority.mutate(current, lambda transaction: transaction.runs.list_run_events_after(run_id=run_id, after_sequence=0))
 
     assert (first.sequence, second.sequence) == (1, 2)
     assert tuple(event.sequence for event in replay) == (1, 2)
     assert tuple(event.data["step"] for event in replay) == (1, 2)
+
+
+def test_run_event_replay_rejects_hidden_nonpositive_sequence(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="invalid sequence")
+    run_id, _blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA ignore_check_constraints = ON")
+        try:
+            conn.execute(
+                insert(run_events_table).values(
+                    id=str(uuid4()),
+                    run_id=str(run_id),
+                    sequence=0,
+                    timestamp=datetime.now(UTC),
+                    event_type="progress",
+                    data={"hidden": True},
+                )
+            )
+        finally:
+            conn.exec_driver_sql("PRAGMA ignore_check_constraints = OFF")
+    fence = _acquire(authority, session_id=session.id)
+
+    with pytest.raises(AuditIntegrityError, match="sequence"):
+        authority.mutate(fence, lambda transaction: transaction.runs.list_run_events_after(run_id=run_id, after_sequence=0))
+
+
+def test_run_event_replay_rejects_noncontiguous_sequence(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="sequence gap")
+    run_id, _blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(run_events_table),
+            (
+                {
+                    "id": str(uuid4()),
+                    "run_id": str(run_id),
+                    "sequence": 1,
+                    "timestamp": datetime.now(UTC),
+                    "event_type": "progress",
+                    "data": {"step": 1},
+                },
+                {
+                    "id": str(uuid4()),
+                    "run_id": str(run_id),
+                    "sequence": 3,
+                    "timestamp": datetime.now(UTC),
+                    "event_type": "completed",
+                    "data": {"step": 3},
+                },
+            ),
+        )
+    fence = _acquire(authority, session_id=session.id)
+
+    with pytest.raises(AuditIntegrityError, match="sequence"):
+        authority.mutate(fence, lambda transaction: transaction.runs.list_run_events_after(run_id=run_id, after_sequence=0))
+
+
+def test_run_event_append_rejects_naive_timestamp_before_write(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="naive timestamp")
+    run_id, _blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    fence = _acquire(authority, session_id=session.id)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        authority.mutate(
+            fence,
+            lambda transaction: transaction.runs.append_run_event(
+                run_id=run_id,
+                timestamp=datetime.now(UTC).replace(tzinfo=None),
+                event_type="progress",
+                data={},
+            ),
+        )
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(run_events_table)).scalar_one() == 0
+
+
+def test_run_event_immediate_and_replay_records_are_canonical_and_deeply_immutable(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="canonical event")
+    run_id, _blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    fence = _acquire(authority, session_id=session.id)
+    payload = {"nested": {"steps": [1, 2]}}
+    non_utc = datetime.now(timezone(timedelta(hours=9)))
+
+    immediate = authority.mutate(
+        fence,
+        lambda transaction: transaction.runs.append_run_event(
+            run_id=run_id,
+            timestamp=non_utc,
+            event_type="progress",
+            data=payload,
+        ),
+    )
+    replay = authority.mutate(
+        fence,
+        lambda transaction: transaction.runs.list_run_events_after(run_id=run_id, after_sequence=0),
+    )
+
+    assert replay == (immediate,)
+    assert immediate.timestamp.tzinfo is UTC
+    with pytest.raises(TypeError):
+        immediate.data["nested"]["steps"][0] = 9  # type: ignore[index]
+    payload["nested"]["steps"][0] = 9
+    assert immediate.data["nested"]["steps"] == (1, 2)
 
 
 def test_output_reads_fail_closed_on_cross_session_link(engine: Engine) -> None:
@@ -259,18 +655,18 @@ def test_output_reads_fail_closed_on_cross_session_link(engine: Engine) -> None:
     fence = _acquire(authority, session_id=owned.id)
     inserted = authority.mutate(
         fence,
-        lambda transaction: transaction.insert_blob_run_link(blob_id=owned_blob, run_id=owned_run, direction="output"),
+        lambda transaction: transaction.blobs.insert_blob_run_link(blob_id=owned_blob, run_id=owned_run, direction="output"),
     )
     duplicate = authority.mutate(
         fence,
-        lambda transaction: transaction.insert_blob_run_link(blob_id=owned_blob, run_id=owned_run, direction="output"),
+        lambda transaction: transaction.blobs.insert_blob_run_link(blob_id=owned_blob, run_id=owned_run, direction="output"),
     )
-    links = authority.mutate(fence, lambda transaction: transaction.list_blob_run_links(blob_id=owned_blob))
+    links = authority.mutate(fence, lambda transaction: transaction.blobs.list_blob_run_links(blob_id=owned_blob))
     with engine.begin() as conn:
         conn.execute(insert(blob_run_links_table).values(blob_id=str(foreign_blob), run_id=str(owned_run), direction="output"))
 
     with pytest.raises(SessionDerivedCustodyError, match="derived record is unavailable"):
-        authority.mutate(fence, lambda transaction: transaction.list_run_output_blobs(run_id=owned_run))
+        authority.mutate(fence, lambda transaction: transaction.blobs.list_run_output_blobs(run_id=owned_run))
 
     assert inserted is True
     assert duplicate is False

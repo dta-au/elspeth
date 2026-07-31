@@ -27,6 +27,8 @@ content-addressing covers the readiness fingerprint.
 
 from __future__ import annotations
 
+import contextlib
+import inspect
 import json
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -40,19 +42,22 @@ import yaml
 from sqlalchemy import select, text
 
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot, ReadinessRow
+from elspeth.web.coordination import repository as coordination_repository
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     composer_completion_events_table,
     composition_states_table,
-    sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from elspeth.web.shareable_reviews.models import CompositionStateResponse
 from elspeth.web.shareable_reviews.service import (
     CompositionNotRunnableError,
@@ -61,6 +66,11 @@ from elspeth.web.shareable_reviews.service import (
 from elspeth.web.shareable_reviews.signer import InvalidToken, ShareTokenPayload, ShareTokenSigner
 
 _VALID_SIGNING_KEY = b"k" * 32
+
+
+def test_service_requires_explicit_session_operation_authority_dependency() -> None:
+    parameters = inspect.signature(ShareableReviewService).parameters
+    assert "session_operation_authority" in parameters
 
 
 def _ready_readiness() -> ValidationReadiness:
@@ -157,6 +167,7 @@ class _FakeExecutionService:
     # must thread the owning session id so the session-scoped sink allowlist
     # (blobs/<session_id>/) matches /validate and /execute.
     validate_state_session_ids: list[UUID | None] = field(default_factory=list)
+    validate_state_operation_contexts: list[SessionOperationContext] = field(default_factory=list)
 
     async def validate(self, session_id: UUID, *, user_id: str | None = None) -> ValidationResult:
         self.validate_await_count += 1
@@ -168,9 +179,11 @@ class _FakeExecutionService:
         *,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> ValidationResult:
         self.validate_state_await_count += 1
         self.validate_state_session_ids.append(session_id)
+        self.validate_state_operation_contexts.append(session_operation_context)
         return self.validation
 
 
@@ -178,9 +191,17 @@ class _FakeExecutionService:
 class _FakeReadinessService:
     snapshot: AuditReadinessSnapshot
     compute_snapshot_await_count: int = 0
+    session_operation_contexts: list[SessionOperationContext] = field(default_factory=list)
 
-    async def compute_snapshot(self, *, session_id: UUID, user_id: str) -> AuditReadinessSnapshot:
+    async def compute_snapshot(
+        self,
+        *,
+        session_id: UUID,
+        user_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> AuditReadinessSnapshot:
         self.compute_snapshot_await_count += 1
+        self.session_operation_contexts.append(session_operation_context)
         return self.snapshot
 
     def reset_counts(self) -> None:
@@ -245,25 +266,27 @@ def state_record(session_id: UUID, state_id: UUID) -> _StateRecord:
 
 
 @pytest.fixture
-def session_engine_with_row(engine, session_record: _SessionRecord, state_record: _StateRecord):
+def session_engine_with_row(
+    engine,
+    session_record: _SessionRecord,
+    state_record: _StateRecord,
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Insert parent sessions + composition_states rows so FK constraints on
     composer_completion_events resolve.
     """
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    monkeypatch.setattr(coordination_repository, "_new_session_id", lambda: session_record.id)
+    created = authority.create_session_with_initial_fence(
+        user_id=session_record.user_id,
+        title="t",
+        auth_provider_type="local",
+        owner_instance_id="shareable-review-test",
+        lease_seconds=30,
+    )
+    assert created.id == session_record.id
     now = datetime.now(UTC)
     with engine.begin() as conn:
-        conn.execute(
-            sessions_table.insert().values(
-                id=str(session_record.id),
-                user_id=session_record.user_id,
-                auth_provider_type="local",
-                title="t",
-                trust_mode="auto_commit",
-                density_default="high",
-                created_at=now,
-                updated_at=now,
-                interpretation_review_disabled=False,
-            )
-        )
         conn.execute(
             composition_states_table.insert().values(
                 id=str(state_record.id),
@@ -284,6 +307,26 @@ def session_engine_with_row(engine, session_record: _SessionRecord, state_record
             )
         )
     return engine
+
+
+@pytest.fixture
+def session_operation_context(
+    session_engine_with_row,
+    session_record: _SessionRecord,
+):
+    """Acquire one real BLOB_READ context for the full mark operation."""
+    authority = SQLiteLocalSessionOperationAuthority(session_engine_with_row)
+    context = authority.acquire(
+        session_id=session_record.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id="shareable-review-test",
+        lease_seconds=30,
+    )
+    try:
+        yield context
+    finally:
+        with contextlib.suppress(SessionOperationFenceLost):
+            authority.release(context)
 
 
 def _ok_validation() -> ValidationResult:
@@ -386,6 +429,7 @@ def _build_service(
         signer=signer,
         settings=settings,
         sessions_db_engine=engine,
+        session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
         payload_store=payload_store,
         telemetry=telemetry,
     )
@@ -402,6 +446,7 @@ async def test_mark_ready_for_review_happy_path(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     snapshot = _readiness_snapshot(session_record.id)
     service, *_ = _build_service(
@@ -413,7 +458,9 @@ async def test_mark_ready_for_review_happy_path(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     assert response.token
     assert response.payload_digest.startswith("sha256:")
     # Blob is in the payload store (hex digest without prefix).
@@ -441,6 +488,7 @@ async def test_mark_ready_for_review_passes_session_id_to_validation(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """validate_state must receive the owning session id.
 
@@ -450,7 +498,7 @@ async def test_mark_ready_for_review_passes_session_id_to_validation(
     blob subtree — a state /validate and /execute both accept.
     """
     snapshot = _readiness_snapshot(session_record.id)
-    service, _, execution_service, _ = _build_service(
+    service, _, execution_service, readiness_service = _build_service(
         engine=session_engine_with_row,
         payload_store=payload_store,
         signer=signer,
@@ -459,8 +507,12 @@ async def test_mark_ready_for_review_passes_session_id_to_validation(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     assert execution_service.validate_state_session_ids == [session_record.id]
+    assert execution_service.validate_state_operation_contexts == [session_operation_context]
+    assert readiness_service.session_operation_contexts == [session_operation_context]
 
 
 @pytest.mark.asyncio
@@ -470,6 +522,7 @@ async def test_mark_ready_for_review_yaml_strips_blob_bound_source_storage_path(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     storage_path = "/data/blobs/session/98b1357d_contact_form_submissions.csv"
     blob_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
@@ -505,7 +558,9 @@ async def test_mark_ready_for_review_yaml_strips_blob_bound_source_storage_path(
         readiness=_readiness_snapshot(session_record.id),
     )
 
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
 
     payload = json.loads(payload_store.retrieve(response.payload_digest.removeprefix("sha256:")).decode("utf-8"))
     assert storage_path not in payload["yaml"]
@@ -523,6 +578,7 @@ async def test_share_snapshot_uses_one_recursive_public_projection(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """Every stored/resolved representation must exclude private source facts.
 
@@ -645,7 +701,9 @@ async def test_share_snapshot_uses_one_recursive_public_projection(
         readiness=readiness,
     )
 
-    marked = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    marked = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     stored = json.loads(payload_store.retrieve(marked.payload_digest.removeprefix("sha256:")))
     resolved = await service.resolve_token(token=marked.token, requesting_user_id="reviewer")
     representations = (
@@ -687,6 +745,7 @@ async def test_share_content_is_invariant_to_unrelated_owner_secret_inventory(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """Owner-global inventory changes must not alter composition-scoped shares."""
 
@@ -711,7 +770,9 @@ async def test_share_content_is_invariant_to_unrelated_owner_secret_inventory(
         validation=_ok_validation(),
         readiness=readiness_with_inventory_count(1),
     )
-    before_mark = await before.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    before_mark = await before.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
 
     after, *_ = _build_service(
         engine=session_engine_with_row,
@@ -722,7 +783,9 @@ async def test_share_content_is_invariant_to_unrelated_owner_secret_inventory(
         validation=_ok_validation(),
         readiness=readiness_with_inventory_count(9),
     )
-    after_mark = await after.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    after_mark = await after.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
 
     assert after_mark.payload_digest == before_mark.payload_digest
     assert payload_store.retrieve(after_mark.payload_digest.removeprefix("sha256:")) == payload_store.retrieve(
@@ -731,7 +794,14 @@ async def test_share_content_is_invariant_to_unrelated_owner_secret_inventory(
 
 
 @pytest.mark.asyncio
-async def test_mark_ready_for_review_fails_validation(session_engine_with_row, payload_store, signer, session_record, state_record):
+async def test_mark_ready_for_review_fails_validation(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
     service, *_ = _build_service(
         engine=session_engine_with_row,
         payload_store=payload_store,
@@ -742,7 +812,9 @@ async def test_mark_ready_for_review_fails_validation(session_engine_with_row, p
         readiness=_readiness_snapshot(session_record.id),
     )
     with pytest.raises(CompositionNotRunnableError):
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(
+            session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+        )
     # No audit row was written, no blob was stored.
     with session_engine_with_row.connect() as conn:
         rows = conn.execute(select(composer_completion_events_table)).all()
@@ -751,7 +823,12 @@ async def test_mark_ready_for_review_fails_validation(session_engine_with_row, p
 
 @pytest.mark.asyncio
 async def test_mark_ready_for_review_blocks_error_readiness_row(
-    session_engine_with_row, payload_store, signer, session_record, state_record
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """Sharing a state with status='error' on any readiness row is share-theatre."""
     snapshot = _readiness_snapshot(session_record.id, error_row=True)
@@ -765,12 +842,19 @@ async def test_mark_ready_for_review_blocks_error_readiness_row(
         readiness=snapshot,
     )
     with pytest.raises(CompositionNotRunnableError):
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(
+            session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+        )
 
 
 @pytest.mark.asyncio
 async def test_mark_ready_for_review_allows_warning_readiness_row(
-    session_engine_with_row, payload_store, signer, session_record, state_record
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """status='warning' (e.g. pending llm_interpretations) is NOT a blocker."""
     snapshot = _readiness_snapshot(session_record.id, warning_row=True)
@@ -783,13 +867,21 @@ async def test_mark_ready_for_review_allows_warning_readiness_row(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     assert response.token
 
 
 @pytest.mark.asyncio
 async def test_mark_ready_for_review_audit_first_ordering(
-    session_engine_with_row, payload_store, signer, session_record, state_record, monkeypatch
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    monkeypatch,
 ):
     """If the audit insert fails, no blob is ever written.
 
@@ -827,7 +919,9 @@ async def test_mark_ready_for_review_audit_first_ordering(
         conn.execute(text("DELETE FROM sessions WHERE id = :id"), {"id": str(session_record.id)})
 
     with pytest.raises(Exception):  # noqa: B017 — any IntegrityError variant fails the request
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(
+            session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+        )
     # CRITICAL: no blob was written.
     assert store_calls == [], "audit insert must precede blob write — blob should not exist when audit fails"
 
@@ -875,6 +969,7 @@ async def test_get_shareable_link_rejects_state_drift_even_when_digest_matches(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """The prior mark must match both current state_id and payload_digest."""
     snapshot = _readiness_snapshot(session_record.id)
@@ -888,7 +983,9 @@ async def test_get_shareable_link_rejects_state_drift_even_when_digest_matches(
         readiness=snapshot,
     )
 
-    await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
 
     drifted_state = replace(state_record, id=uuid4())
     session_service.current_state = drifted_state
@@ -906,6 +1003,7 @@ async def test_get_shareable_link_requires_existing_mark_ready_blob(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """An audit attempt row without the blob is not a successful share mark."""
     snapshot = _readiness_snapshot(session_record.id)
@@ -918,7 +1016,9 @@ async def test_get_shareable_link_requires_existing_mark_ready_blob(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     payload_store.delete(response.payload_digest.removeprefix("sha256:"))
 
     with pytest.raises(CompositionNotRunnableError) as exc_info:
@@ -934,6 +1034,7 @@ async def test_get_shareable_link_remints_with_stable_digest(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """Two get_shareable_link calls on an unchanged state yield identical digests
     but different token strings (different nonce each call). Re-minting writes
@@ -949,7 +1050,9 @@ async def test_get_shareable_link_remints_with_stable_digest(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    marked = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    marked = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     r1 = await service.get_shareable_link(session_id=session_record.id, user_id=session_record.user_id)
     r2 = await service.get_shareable_link(session_id=session_record.id, user_id=session_record.user_id)
     assert r1.payload_digest == marked.payload_digest
@@ -980,6 +1083,7 @@ async def test_get_shareable_link_requires_mark_ready_event(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     service, _ss, execution_service, readiness_service = _build_service(
         engine=session_engine_with_row,
@@ -1005,6 +1109,7 @@ async def test_mark_ready_for_review_rejects_readiness_snapshot_drift(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     service, _ss, _es, _rs = _build_service(
         engine=session_engine_with_row,
@@ -1017,7 +1122,120 @@ async def test_mark_ready_for_review_rejects_readiness_snapshot_drift(
     )
 
     with pytest.raises(CompositionNotRunnableError, match="composition changed"):
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(
+            session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+        )
+
+
+@pytest.mark.asyncio
+async def test_mark_ready_for_review_rejects_state_superseded_after_readiness_without_side_effects(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service, _ss, _es, _readiness_service = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id, version=state_record.version),
+    )
+    original_store = payload_store.store
+    store_calls: list[bytes] = []
+
+    def tracking_store(content: bytes) -> str:
+        store_calls.append(content)
+        return original_store(content)
+
+    async def supersede_after_readiness(self, **_kwargs):  # type: ignore[no-untyped-def]
+        with session_engine_with_row.begin() as conn:
+            conn.execute(
+                composition_states_table.insert().values(
+                    id=str(uuid4()),
+                    session_id=str(session_record.id),
+                    version=state_record.version + 1,
+                    source=None,
+                    sources=None,
+                    nodes=[],
+                    edges=[],
+                    outputs=[],
+                    metadata_={"name": "Superseding state", "description": ""},
+                    is_valid=True,
+                    validation_errors=None,
+                    composer_meta=None,
+                    created_at=datetime.now(UTC),
+                    derived_from_state_id=str(state_record.id),
+                    provenance="tool_call",
+                )
+            )
+        return self.snapshot
+
+    monkeypatch.setattr(payload_store, "store", tracking_store)
+    monkeypatch.setattr(_FakeReadinessService, "compute_snapshot", supersede_after_readiness)
+
+    with pytest.raises(CompositionNotRunnableError) as exc_info:
+        await service.mark_ready_for_review(
+            session_id=session_record.id,
+            user_id=session_record.user_id,
+            session_operation_context=session_operation_context,
+        )
+
+    assert exc_info.value.reason == "readiness_state_drift"
+    assert store_calls == []
+    assert observed_value(service._telemetry.session_completed_total) == 0
+    with session_engine_with_row.connect() as conn:
+        assert conn.execute(select(composer_completion_events_table)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_mark_ready_for_review_stale_authority_has_no_audit_blob_token_or_telemetry(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+    authority = SQLiteLocalSessionOperationAuthority(session_engine_with_row)
+    authority.release(session_operation_context)
+    successor = authority.acquire(
+        session_id=session_record.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id="shareable-review-test-successor",
+        lease_seconds=30,
+    )
+    store_calls: list[bytes] = []
+    monkeypatch.setattr(payload_store, "store", lambda content: store_calls.append(content))
+    try:
+        with pytest.raises(SessionOperationFenceLost):
+            await service.mark_ready_for_review(
+                session_id=session_record.id,
+                user_id=session_record.user_id,
+                session_operation_context=session_operation_context,
+            )
+    finally:
+        authority.release(successor)
+
+    assert store_calls == []
+    assert observed_value(service._telemetry.session_completed_total) == 0
+    with session_engine_with_row.connect() as conn:
+        assert conn.execute(select(composer_completion_events_table)).all() == []
 
 
 @pytest.mark.asyncio
@@ -1027,6 +1245,7 @@ async def test_resolve_token_returns_frozen_snapshot(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """resolve_token returns the mark-time audit_readiness even if the live state shifts."""
     mark_time_snapshot = _readiness_snapshot(session_record.id, version=3)
@@ -1039,7 +1258,9 @@ async def test_resolve_token_returns_frozen_snapshot(
         validation=_ok_validation(),
         readiness=mark_time_snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     # Mutate the readiness fake so a re-fetch would return a different snapshot.
     later_snapshot = _readiness_snapshot(session_record.id, version=99)
     readiness_service.snapshot = later_snapshot
@@ -1059,6 +1280,7 @@ async def test_resolve_token_projects_legacy_signed_blob_without_mutating_eviden
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """Outstanding pre-fix blobs are projected only after signature/digest verification."""
     service, *_ = _build_service(
@@ -1157,6 +1379,7 @@ async def test_resolve_token_rejects_tampered_token(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     service, *_ = _build_service(
         engine=session_engine_with_row,
@@ -1167,7 +1390,9 @@ async def test_resolve_token_rejects_tampered_token(
         validation=_ok_validation(),
         readiness=_readiness_snapshot(session_record.id),
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     tampered = response.token[:-2] + ("aa" if response.token[-2:] != "aa" else "bb")
     with pytest.raises(InvalidToken):
         await service.resolve_token(token=tampered, requesting_user_id="bob")
@@ -1180,6 +1405,7 @@ async def test_resolve_token_rejects_expired_token(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """Override the lifetime to negative so the minted token is born expired."""
     snapshot = _readiness_snapshot(session_record.id)
@@ -1193,7 +1419,9 @@ async def test_resolve_token_rejects_expired_token(
         readiness=snapshot,
     )
     service._settings.shareable_link_lifetime_seconds = -1  # type: ignore[attr-defined]
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     with pytest.raises(InvalidToken, match="expired"):
         await service.resolve_token(token=response.token, requesting_user_id="bob")
 
@@ -1205,6 +1433,7 @@ async def test_resolve_token_blob_expired_raises_not_found(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """Token verifies but payload_store has expired the blob → 404 path."""
     snapshot = _readiness_snapshot(session_record.id)
@@ -1217,7 +1446,9 @@ async def test_resolve_token_blob_expired_raises_not_found(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     # Delete the blob.
     digest_hex = response.payload_digest.removeprefix("sha256:")
     payload_store.delete(digest_hex)
@@ -1232,6 +1463,7 @@ async def test_resolve_token_does_not_call_readiness_service(
     signer,
     session_record,
     state_record,
+    session_operation_context: SessionOperationContext,
 ):
     """Frozen-at-mark-time discipline: resolve never calls compute_snapshot."""
     snapshot = _readiness_snapshot(session_record.id)
@@ -1244,7 +1476,9 @@ async def test_resolve_token_does_not_call_readiness_service(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id, user_id=session_record.user_id, session_operation_context=session_operation_context
+    )
     readiness_service.reset_counts()
     await service.resolve_token(token=response.token, requesting_user_id="bob")
     assert readiness_service.compute_snapshot_await_count == 0

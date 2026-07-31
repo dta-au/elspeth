@@ -14,6 +14,7 @@ from fastapi import HTTPException, Request
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.web.composer.guided.audit import emit_intent_cancelled
 from elspeth.web.composer.guided.chat_solver import DeferredIntentManagementChatRequest, Step1SourceChatResolution
@@ -24,6 +25,7 @@ from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.guided.stage_transitions import AnsweredTurn, transition_source_plugin_reselection
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions._guided_step_chat import (
     GuidedStepChatEmptyResult,
     GuidedStepChatOnlyResult,
@@ -82,6 +84,7 @@ from .._helpers import (
     _get_session_compose_lock_registry,
     _inspect_latest_ready_session_blob,
     _is_client_disconnect_cancel,
+    _join_progress_write,
     _publish_progress,
     _replace,
     _request_plugin_policy_context,
@@ -97,6 +100,7 @@ from .._helpers import (
 from ..guided_operations import (
     GuidedOperationExpired,
     GuidedOperationLease,
+    guided_operation_lease_guard,
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
@@ -407,6 +411,7 @@ async def _step_1_inline_source_inspection_facts(
     session_id: UUID,
     resolution: Step1SourceChatResolution,
     source_description: str,
+    session_operation_context: SessionOperationContext,
 ) -> SourceInspectionFacts | None:
     """Materialize inline resolve_source content as an upload-equivalent blob.
 
@@ -426,7 +431,11 @@ async def _step_1_inline_source_inspection_facts(
     only exists after this operation settles. The LLM authorship breadcrumb
     lives in ``source_description`` instead.
     """
-    facts = await _inspect_latest_ready_session_blob(blob_service, session_id)
+    facts = await _inspect_latest_ready_session_blob(
+        blob_service,
+        session_id,
+        session_operation_context=session_operation_context,
+    )
     if facts is None:
         content = resolution.content.encode("utf-8")
         record = await blob_service.create_blob(
@@ -436,6 +445,7 @@ async def _step_1_inline_source_inspection_facts(
             resolution.mime_type,
             created_by="assistant",
             source_description=source_description,
+            session_operation_context=session_operation_context,
         )
         facts = inspect_blob_content(
             content=content,
@@ -597,6 +607,7 @@ async def post_guided_chat_schema8(
                     raise AuditIntegrityError("Guided Chat reservation returned no lease")
                 return reserved
 
+            lease_guard = guided_operation_lease_guard(service=service, lease=reserved)
             recorder = BufferingRecorder()
             attempt_message_id = uuid4()
             originating_message = GuidedOriginatingUserMessageDraft(
@@ -608,13 +619,13 @@ async def post_guided_chat_schema8(
             try:
                 progress_sink = _composer_progress_sink(
                     progress_registry,
-                    session_id=str(session_id),
+                    session_operation_context=reserved.session_operation_context,
                     request_id=body.operation_id,
                     user_id=str(user.user_id),
                 )
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session_id),
+                    session_operation_context=reserved.session_operation_context,
                     request_id=body.operation_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -623,6 +634,7 @@ async def post_guided_chat_schema8(
                         evidence=("The message and current turn token were accepted.",),
                         likely_next="ELSPETH will prepare a bounded guided response.",
                     ),
+                    start_request=True,
                 )
                 progress_started = True
                 settings = request.app.state.settings
@@ -635,6 +647,7 @@ async def post_guided_chat_schema8(
                             plugin_hint=guided_route._step_1_plugin_hint(frozen.guided),
                             blob_service=request.app.state.blob_service,
                             session_id=session_id,
+                            session_operation_context=reserved.session_operation_context,
                         )
                     uploaded_mismatch_facts = (
                         uploaded_candidate[1] if uploaded_candidate is not None and uploaded_candidate[0] is None else None
@@ -718,7 +731,12 @@ async def post_guided_chat_schema8(
                         )
 
                 async with compose_lock:
-                    fence = await service.renew_guided_operation(reserved.fence, actor="composer_route", lease_seconds=300)
+                    fence = await service.renew_guided_operation(
+                        reserved.fence,
+                        actor="composer_route",
+                        lease_seconds=300,
+                        session_operation_context=reserved.session_operation_context,
+                    )
                     current_record = await service.get_current_state(session_id)
                     if (current_record is None) != (frozen.state_record is None):
                         raise GuidedOperationSettlementConflictError()
@@ -780,6 +798,7 @@ async def post_guided_chat_schema8(
                                     f"(LLM-generated; model {settings.composer_model}; "
                                     f"operation {body.operation_id})."
                                 ),
+                                session_operation_context=reserved.session_operation_context,
                             )
                         except (BlobQuotaExceededError, UnicodeEncodeError) as materialize_exc:
                             source_resolution = None
@@ -807,6 +826,7 @@ async def post_guided_chat_schema8(
                             request.app.state.blob_service,
                             session_id,
                             source_plugin=source_plugin_reselection,
+                            session_operation_context=reserved.session_operation_context,
                         )
                     sink_prefill_options: dict[str, Any] | None = None
                     if (
@@ -1057,7 +1077,7 @@ async def post_guided_chat_schema8(
                     )
                     await _publish_progress(
                         progress_registry,
-                        session_id=str(session_id),
+                        session_operation_context=reserved.session_operation_context,
                         request_id=body.operation_id,
                         user_id=str(user.user_id),
                         event=ComposerProgressEvent(
@@ -1094,12 +1114,13 @@ async def post_guided_chat_schema8(
                             invalidated_pending_proposal=invalidated_pending_proposal,
                         ),
                         payload_store=payload_store,
+                        session_operation_context=reserved.session_operation_context,
                     )
                     response = response_from_record(settlement.result_state)
 
                 await _publish_progress(
                     progress_registry,
-                    session_id=str(session_id),
+                    session_operation_context=reserved.session_operation_context,
                     request_id=body.operation_id,
                     user_id=str(user.user_id),
                     event=ComposerProgressEvent(
@@ -1126,15 +1147,16 @@ async def post_guided_chat_schema8(
                                     llm_calls=recorder.llm_calls,
                                     chat_turns=recorder.chat_turns,
                                 ),
-                            )
+                            ),
+                            session_operation_context=reserved.session_operation_context,
                         )
                     )
                 if progress_started:
                     with contextlib.suppress(Exception):
-                        await asyncio.shield(
+                        await _join_progress_write(
                             _publish_progress(
                                 progress_registry,
-                                session_id=str(session_id),
+                                session_operation_context=reserved.session_operation_context,
                                 request_id=body.operation_id,
                                 user_id=str(user.user_id),
                                 event=client_cancelled_progress_event(),
@@ -1171,12 +1193,27 @@ async def post_guided_chat_schema8(
                                 llm_calls=recorder.llm_calls,
                                 chat_turns=recorder.chat_turns,
                             ),
-                        )
+                        ),
+                        session_operation_context=reserved.session_operation_context,
                     )
                 except GuidedOperationFenceLostError:
                     rejoin_after_lock = True
                 else:
                     raise_guided_operation_failure(failed)
+            finally:
+                try:
+                    if progress_started:
+                        with contextlib.suppress(SessionOperationFenceLost):
+                            await _join_progress_write(
+                                progress_registry.finish_request(
+                                    session_operation_context=reserved.session_operation_context,
+                                    request_id=body.operation_id,
+                                    user_id=user.user_id,
+                                    terminal_event=None,
+                                )
+                            )
+                finally:
+                    await lease_guard.finish_active_exception()
         if rejoin_after_lock:
             joined = await reserve_or_replay_guided_operation(
                 service=service,
@@ -1185,9 +1222,13 @@ async def post_guided_chat_schema8(
                 request=body,
                 replay=replay,
                 reserve_if_absent=False,
+                takeover_expired=False,
             )
             if joined is None:
                 raise AuditIntegrityError("Guided Chat fence was lost without a joinable winner")
+            if isinstance(joined, GuidedOperationExpired):
+                pending = joined
+                continue
             if isinstance(joined, GuidedOperationLease):
                 pending = joined
                 continue

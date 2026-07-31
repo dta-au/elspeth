@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import os
 import threading
+import traceback
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,13 +19,27 @@ import structlog
 from fastapi import FastAPI
 from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.pool import StaticPool
+from starlette.requests import Request as StarletteRequest
 
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.blobs.protocol import fork_blob_id
+from elspeth.web.blobs.protocol import (
+    BlobForkCleanupError,
+    BlobForkCleanupResult,
+    BlobForkFenceLostError,
+    fork_blob_id,
+)
 from elspeth.web.blobs.routes import create_blobs_router
-from elspeth.web.blobs.service import BlobServiceImpl
+from elspeth.web.blobs.service import (
+    BlobServiceImpl,
+    _atomic_write_blob,
+    _await_fork_copy_io_with_checkpoints,
+    _ForkCopyWriteAuthority,
+)
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.sessions import service as session_service_module
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -31,6 +48,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     guided_operations_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import (
@@ -40,20 +58,116 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationTakenOver,
     GuidedOriginatingUserMessageDraft,
     InvalidForkTargetError,
+    SessionForkParentAuthority,
 )
 from elspeth.web.sessions.routes import create_session_router
+from elspeth.web.sessions.routes import sessions as session_routes
 from elspeth.web.sessions.routes.guided_operations import guided_response_hash
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.schemas import ForkSessionResponse
+from elspeth.web.sessions.schemas import ForkSessionRequest, ForkSessionResponse
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _FORK_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 _FORK_OUTPUT_ID = "22222222-2222-4222-8222-222222222222"
 _FORK_INTENT_ID = "33333333-3333-4333-8333-333333333333"
 _FORK_HASH_A = "a" * 64
 _FORK_HASH_B = "b" * 64
+
+
+async def _create_test_blob(
+    session_service: SessionServiceImpl,
+    blob_service: BlobServiceImpl,
+    session_id: uuid.UUID,
+    filename: str,
+    content: bytes,
+    mime_type: str,
+):
+    """Create a fixture blob under a real, exact CREATE authority."""
+    context = await session_service._run_sync(
+        lambda: session_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.CREATE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await blob_service.create_blob(
+            session_id,
+            filename,
+            content,
+            mime_type,
+            session_operation_context=context,
+        )
+    finally:
+        await session_service._run_sync(
+            session_service.session_operation_authority.release,
+            context,
+        )
+
+
+async def _read_test_blob(
+    session_service: SessionServiceImpl,
+    blob_service: BlobServiceImpl,
+    session_id: uuid.UUID,
+    blob_id: uuid.UUID,
+    *,
+    content: bool,
+):
+    """Read fixture metadata or bytes under a real, exact BLOB_READ authority."""
+    context = await session_service._run_sync(
+        lambda: session_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        if content:
+            return await blob_service.read_blob_content(
+                blob_id,
+                session_operation_context=context,
+            )
+        return await blob_service.get_blob(
+            blob_id,
+            session_operation_context=context,
+        )
+    finally:
+        await session_service._run_sync(
+            session_service.session_operation_authority.release,
+            context,
+        )
+
+
+async def _create_test_run(
+    session_service: SessionServiceImpl,
+    session_id: uuid.UUID,
+    state_id: uuid.UUID,
+):
+    """Create a fixture run under a real, exact EXECUTE authority."""
+    context = await session_service._run_sync(
+        lambda: session_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await session_service.create_run(
+            session_id,
+            state_id,
+            session_operation_context=context,
+        )
+    finally:
+        await session_service._run_sync(
+            session_service.session_operation_authority.release,
+            context,
+        )
 
 
 def _guided_fork_checkpoint(
@@ -256,11 +370,40 @@ def engine():
 
 @pytest.fixture
 def service(engine):
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
     )
+
+
+def test_staged_fork_loader_accepts_only_transaction_facade_and_rejects_raw_connection(service) -> None:
+    assert not hasattr(SessionServiceImpl, "_load_staged_fork_on_connection")
+    loader = service._load_staged_fork_from_transaction
+    assert inspect.signature(loader).parameters["transaction"].annotation == "SessionForkCreationTransaction"
+
+    with service._engine.connect() as connection, pytest.raises(TypeError, match="SessionForkCreationTransaction"):
+        loader(
+            connection,
+            parent_session_id=uuid.uuid4(),
+            child_session_id=uuid.uuid4(),
+            operation_id=str(uuid.uuid4()),
+            fork_message_id=uuid.uuid4(),
+            new_message_content="edited",
+            authority=object(),
+        )
+
+
+def test_real_raw_callers_keep_their_transaction_union_surface() -> None:
+    helper_parameters = {
+        "_verify_pipeline_lifecycle_authority": "conn",
+        "_verify_guided_root_message_authority": "conn",
+        "_restore_authoritative_pipeline_proposal": "conn",
+        "_require_pending_guided_checkpoint_proposal_authority": "conn",
+    }
+    for helper_name, parameter_name in helper_parameters.items():
+        helper = getattr(session_service_module, helper_name)
+        assert inspect.signature(helper).parameters[parameter_name].annotation == ("Connection | SessionForkCreationTransaction")
 
 
 async def _fork_session(
@@ -276,33 +419,57 @@ async def _fork_session(
     parent = await service.get_session(source_session_id)
     assert parent.user_id == user_id
     assert parent.auth_provider_type == auth_provider_type
-    reserved = await service.reserve_guided_operation(
-        session_id=source_session_id,
-        operation_id=str(uuid.uuid4()),
-        kind="session_fork",
-        request_hash="a" * 64,
-        actor="composer_route",
-        lease_seconds=300,
-    )
-    assert type(reserved) in {GuidedOperationClaimed, GuidedOperationTakenOver}
-    staged = await service.fork_session(
-        reserved.fence,
-        fork_message_id=fork_message_id,
-        new_message_content=new_message_content,
-    )
-    active = await service.settle_guided_fork_operation(
-        GuidedForkSettlementCommand(
-            fence=reserved.fence,
-            child_session_id=staged.session.id,
-            expected_current_state_id=staged.state.id if staged.state is not None else None,
-            edited_message_id=staged.messages[-1].id,
-            rewritten_state_id=None,
-            rewritten_state=None,
-            response_hash="b" * 64,
-            actor="composer_route",
+    parent_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=source_session_id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
         )
     )
-    return active, list(staged.messages), staged.state
+    staged = None
+    try:
+        reserved = await service.reserve_guided_operation(
+            session_id=source_session_id,
+            operation_id=str(uuid.uuid4()),
+            kind="session_fork",
+            request_hash="a" * 64,
+            actor="composer_route",
+            lease_seconds=300,
+            session_operation_context=parent_context,
+        )
+        assert type(reserved) in {GuidedOperationClaimed, GuidedOperationTakenOver}
+        parent_authority = SessionForkParentAuthority(
+            parent_context=parent_context,
+            guided_fence=reserved.fence,
+        )
+        staged = await service.fork_session(
+            parent_authority,
+            fork_message_id=fork_message_id,
+            new_message_content=new_message_content,
+        )
+        active = await service.settle_guided_fork_operation(
+            GuidedForkSettlementCommand(
+                authority=staged.authority,
+                expected_current_state_id=staged.state.id if staged.state is not None else None,
+                edited_message_id=staged.messages[-1].id,
+                rewritten_state_id=None,
+                rewritten_state=None,
+                response_hash="b" * 64,
+                actor="composer_route",
+            )
+        )
+        return active, list(staged.messages), staged.state
+    finally:
+        if staged is not None:
+            await service._run_sync(
+                service.session_operation_authority.release,
+                staged.authority.child_context,
+            )
+        await service._run_sync(
+            service.session_operation_authority.release,
+            parent_context,
+        )
 
 
 async def _complete_guided_start_authority(
@@ -1780,7 +1947,7 @@ class TestForkSession:
         await service.add_message(session.id, "user", "Hello", composition_state_id=state.id, writer_principal="route_user_message")
         msg = await service.add_message(session.id, "user", "World", composition_state_id=state.id, writer_principal="route_user_message")
 
-        await service.create_run(session.id, state.id)
+        await _create_test_run(service, session.id, state.id)
 
         child_session, _, _ = await _fork_session(
             service,
@@ -1940,7 +2107,7 @@ def _make_fork_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1994,13 +2161,369 @@ class TestForkEndpoint:
     """Route-level tests for POST /api/sessions/{id}/fork."""
 
     @pytest.mark.asyncio
+    async def test_copy_cancellation_marks_authority_lost_and_joins_worker_before_escape(
+        self,
+    ) -> None:
+        """Cancellation cannot let a fork-copy worker outlive route custody."""
+        worker_started = threading.Event()
+        allow_worker_finish = threading.Event()
+        worker_finished = threading.Event()
+
+        def blocked_copy_worker() -> str:
+            worker_started.set()
+            assert allow_worker_finish.wait(timeout=5)
+            worker_finished.set()
+            return "copied"
+
+        class _Guided:
+            operation_id = str(uuid.uuid4())
+            attempt = 1
+
+        class _Parent:
+            guided_fence = _Guided()
+
+        class _Authority:
+            parent = _Parent()
+
+        write_authority = _ForkCopyWriteAuthority(_Authority())  # type: ignore[arg-type]
+
+        async def checkpoint() -> None:
+            return None
+
+        copy_task = asyncio.create_task(
+            _await_fork_copy_io_with_checkpoints(
+                run_sync_in_worker(blocked_copy_worker),
+                checkpoint=checkpoint,
+                write_authority=write_authority,
+            )
+        )
+        assert await asyncio.to_thread(worker_started.wait, 5)
+        copy_task.cancel("cancel blocked fork copy")
+        for _ in range(10):
+            await asyncio.sleep(0)
+        cancellation_escaped_before_worker = copy_task.done()
+        allow_worker_finish.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await asyncio.wait_for(copy_task, timeout=5)
+        assert await asyncio.to_thread(worker_finished.wait, 5)
+
+        assert not cancellation_escaped_before_worker
+        assert caught.value.args == ("cancel blocked fork copy",)
+        with pytest.raises(BlobForkFenceLostError):
+            write_authority.require()
+
+    @pytest.mark.asyncio
+    async def test_copy_cancellation_redacts_post_publish_rollback_failure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Rollback diagnostics retain stable custody identity, never raw OS text."""
+        child_session_id = uuid.uuid4()
+        blob_id = uuid.uuid4()
+        storage = tmp_path / "blobs" / str(child_session_id) / f"{blob_id}_sensitive-source-name.csv"
+        rename_entered = threading.Event()
+        allow_rename = threading.Event()
+        original_replace = os.replace
+        original_unlink = Path.unlink
+        rollback_secret = "rollback-token=super-secret-credential"  # secret-scan: allow-this-line
+
+        class _Guided:
+            operation_id = str(uuid.uuid4())
+            attempt = 1
+
+        class _Parent:
+            guided_fence = _Guided()
+
+        class _Authority:
+            parent = _Parent()
+
+        write_authority = _ForkCopyWriteAuthority(_Authority())  # type: ignore[arg-type]
+
+        def paused_target_replace(
+            source: str | os.PathLike[str],
+            target: str | os.PathLike[str],
+        ) -> None:
+            source_path = Path(source)
+            if source_path.name.endswith(".custody.tmp"):
+                rename_entered.set()
+                assert allow_rename.wait(timeout=5)
+            original_replace(source, target)
+
+        def fail_published_rollback_unlink(
+            path: Path,
+            missing_ok: bool = False,
+        ) -> None:
+            if path == storage:
+                raise PermissionError(f"unlink denied for {storage} ({rollback_secret})")
+            original_unlink(path, missing_ok=missing_ok)
+
+        async def checkpoint() -> None:
+            return None
+
+        with (
+            patch(
+                "elspeth.web.blobs.service.os.replace",
+                paused_target_replace,
+            ),
+            patch.object(Path, "unlink", fail_published_rollback_unlink),
+        ):
+            copy_task = asyncio.create_task(
+                _await_fork_copy_io_with_checkpoints(
+                    run_sync_in_worker(
+                        lambda: _atomic_write_blob(
+                            storage,
+                            b"fork bytes",
+                            write_guard=write_authority.require,
+                        )
+                    ),
+                    checkpoint=checkpoint,
+                    write_authority=write_authority,
+                )
+            )
+            assert await asyncio.to_thread(rename_entered.wait, 5)
+            copy_task.cancel("cancel during published fork rollback")
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not copy_task.done()
+            allow_rename.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await asyncio.wait_for(copy_task, timeout=5)
+
+        cancellation = caught.value
+        assert cancellation.args == ("cancel during published fork rollback",)
+        assert type(cancellation.__cause__) is BlobForkFenceLostError
+        fence_loss = cancellation.__cause__
+        notes = getattr(fence_loss, "__notes__", [])
+        assert any("RecoveryFailed[PermissionError]" in note for note in notes)
+        assert any(str(child_session_id) in note for note in notes)
+        assert any(str(blob_id) in note for note in notes)
+        visible = "\n".join(
+            (
+                str(cancellation),
+                repr(cancellation),
+                str(fence_loss),
+                repr(fence_loss),
+                *getattr(cancellation, "__notes__", []),
+                *notes,
+                *traceback.format_exception(cancellation),
+                *(
+                    repr(linked)
+                    for linked in (
+                        cancellation.__cause__,
+                        cancellation.__context__,
+                        fence_loss.__cause__,
+                        fence_loss.__context__,
+                    )
+                    if linked is not None
+                ),
+            )
+        )
+        assert rollback_secret not in visible
+        assert str(storage) not in visible
+        assert "sensitive-source-name.csv" not in visible
+        assert storage.read_bytes() == b"fork bytes"
+        assert not storage.with_name(f".{storage.name}.custody.tmp").exists()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_target_rename_rolls_back_publish_before_reverse_close(
+        self,
+        tmp_path,
+    ) -> None:
+        """A cancelled route joins guarded rename and publishes no stale child bytes."""
+        app, service, blob_service = _make_fork_app(tmp_path)
+        parent = await service.create_session("alice", "Parent", "local")
+        source_blob = await _create_test_blob(
+            service,
+            blob_service,
+            parent.id,
+            "source.csv",
+            b"x\n1\n",
+            "text/csv",
+        )
+        message = await service.add_message(
+            parent.id,
+            "user",
+            "fork",
+            writer_principal="route_user_message",
+        )
+        operation_id = str(uuid.uuid4())
+        rename_entered = threading.Event()
+        allow_rename = threading.Event()
+        rename_finished = threading.Event()
+        original_replace = os.replace
+        target_path: Path | None = None
+
+        def paused_target_replace(
+            source: str | os.PathLike[str],
+            target: str | os.PathLike[str],
+        ) -> None:
+            nonlocal target_path
+            source_path = Path(source)
+            candidate = Path(target)
+            if source_path.name.endswith(".custody.tmp"):
+                target_path = candidate
+                rename_entered.set()
+                assert allow_rename.wait(timeout=5)
+                original_replace(source, target)
+                rename_finished.set()
+                return
+            original_replace(source, target)
+
+        fork_route = next(route for route in app.routes if getattr(route, "name", None) == "fork_from_message")
+        request = StarletteRequest({"type": "http", "app": app})
+        body = ForkSessionRequest(
+            operation_id=operation_id,
+            from_message_id=message.id,
+            new_message_content="edited",
+        )
+        identity = UserIdentity(user_id="alice", username="alice")
+
+        with patch("elspeth.web.blobs.service.os.replace", paused_target_replace):
+            route_task = asyncio.create_task(fork_route.endpoint(parent.id, body, request, identity))
+            assert await asyncio.to_thread(rename_entered.wait, 5)
+            assert target_path is not None
+            with service._engine.connect() as conn:
+                child_id = conn.execute(
+                    select(guided_operations_table.c.result_session_id).where(
+                        guided_operations_table.c.session_id == str(parent.id),
+                        guided_operations_table.c.operation_id == operation_id,
+                    )
+                ).scalar_one()
+            assert target_path.parent.name == child_id
+
+            route_task.cancel("cancel during fork target rename")
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not route_task.done()
+            with service._engine.connect() as conn:
+                live_releases = conn.execute(
+                    select(
+                        session_operation_fences_table.c.session_id,
+                        session_operation_fences_table.c.released_at,
+                    ).where(session_operation_fences_table.c.session_id.in_((str(parent.id), child_id)))
+                ).all()
+            assert all(row.released_at is None for row in live_releases)
+
+            allow_rename.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await asyncio.wait_for(route_task, timeout=5)
+
+        assert caught.value.args == ("cancel during fork target rename",)
+        assert rename_finished.is_set()
+        assert target_path is not None
+        assert not target_path.exists()
+        assert not tuple(target_path.parent.glob(".*.custody.tmp"))
+        assert Path(source_blob.storage_path).read_bytes() == b"x\n1\n"
+        with service._engine.connect() as conn:
+            releases = conn.execute(
+                select(
+                    session_operation_fences_table.c.session_id,
+                    session_operation_fences_table.c.released_at,
+                ).where(session_operation_fences_table.c.session_id.in_((str(parent.id), child_id)))
+            ).all()
+        released_at = {row.session_id: row.released_at for row in releases}
+        assert released_at[child_id] is not None
+        assert released_at[str(parent.id)] is not None
+        assert released_at[child_id] <= released_at[str(parent.id)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "cancel_before_commit",
+        [True, False],
+        ids=["before-child-commit", "after-child-commit"],
+    )
+    async def test_stage_cancellation_joins_adopts_child_then_reverse_closes(
+        self,
+        tmp_path,
+        cancel_before_commit: bool,
+    ) -> None:
+        """Request cancellation cannot strand stage-created child authority."""
+        app, service, _blob_service = _make_fork_app(tmp_path)
+        parent = await service.create_session("alice", "Parent", "local")
+        message = await service.add_message(
+            parent.id,
+            "user",
+            "fork",
+            writer_principal="route_user_message",
+        )
+        operation_id = str(uuid.uuid4())
+        cancellation_boundary = asyncio.Event()
+        allow_stage_return = asyncio.Event()
+        original_fork_session = service.fork_session
+
+        async def committed_then_paused(*args: Any, **kwargs: Any):
+            if cancel_before_commit:
+                cancellation_boundary.set()
+                await allow_stage_return.wait()
+            staged = await original_fork_session(*args, **kwargs)
+            if not cancel_before_commit:
+                cancellation_boundary.set()
+                await allow_stage_return.wait()
+            return staged
+
+        fork_route = next(route for route in app.routes if getattr(route, "name", None) == "fork_from_message")
+        request = StarletteRequest({"type": "http", "app": app})
+        body = ForkSessionRequest(
+            operation_id=operation_id,
+            from_message_id=message.id,
+            new_message_content="edited",
+        )
+        identity = UserIdentity(user_id="alice", username="alice")
+        observed_close_primaries: list[BaseException | None] = []
+        original_close_leases = session_routes._close_fork_operation_leases
+
+        async def observe_close_primary(*args: Any, **kwargs: Any) -> None:
+            observed_close_primaries.append(args[2])
+            await original_close_leases(*args, **kwargs)
+
+        with (
+            patch.object(service, "fork_session", new=committed_then_paused),
+            patch.object(
+                session_routes,
+                "_close_fork_operation_leases",
+                new=observe_close_primary,
+            ),
+        ):
+            route_task = asyncio.create_task(fork_route.endpoint(parent.id, body, request, identity))
+            await asyncio.wait_for(cancellation_boundary.wait(), timeout=5)
+            cancellation_message = "cancel before child commit" if cancel_before_commit else "cancel after child commit"
+            route_task.cancel(cancellation_message)
+            await asyncio.sleep(0)
+            cancellation_was_deferred = not route_task.done()
+            allow_stage_return.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await asyncio.wait_for(route_task, timeout=5)
+
+        assert cancellation_was_deferred
+        assert caught.value.args == (cancellation_message,)
+        assert observed_close_primaries == [caught.value]
+        with service._engine.connect() as conn:
+            child_id = conn.execute(
+                select(guided_operations_table.c.result_session_id).where(
+                    guided_operations_table.c.session_id == str(parent.id),
+                    guided_operations_table.c.operation_id == operation_id,
+                )
+            ).scalar_one()
+            releases = conn.execute(
+                select(
+                    session_operation_fences_table.c.session_id,
+                    session_operation_fences_table.c.released_at,
+                ).where(session_operation_fences_table.c.session_id.in_((str(parent.id), child_id)))
+            ).all()
+        released_at = {row.session_id: row.released_at for row in releases}
+        assert released_at[child_id] is not None
+        assert released_at[str(parent.id)] is not None
+        assert released_at[child_id] <= released_at[str(parent.id)]
+
+    @pytest.mark.asyncio
     async def test_partial_copy_stale_worker_takeover_completes_without_stale_cleanup(self, tmp_path) -> None:
         """A worker fenced after one copy joins the takeover winner without compensating it."""
 
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
         source_blobs = [
-            await blob_service.create_blob(parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv") for index in range(2)
+            await _create_test_blob(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
+            for index in range(2)
         ]
         message = await service.add_message(
             parent.id,
@@ -2073,13 +2596,25 @@ class TestForkEndpoint:
                     == 1
                 )
             with service._engine.begin() as conn:
+                expired_at = datetime.now(UTC) - timedelta(seconds=1)
                 conn.execute(
                     update(guided_operations_table)
                     .where(
                         guided_operations_table.c.session_id == str(parent.id),
                         guided_operations_table.c.operation_id == operation_id,
                     )
-                    .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+                    .values(lease_expires_at=expired_at)
+                )
+                conn.execute(
+                    update(session_operation_fences_table)
+                    .where(
+                        session_operation_fences_table.c.session_id.in_([str(parent.id), str(child_id)]),
+                        session_operation_fences_table.c.operation_kind == SessionOperationKind.SESSION_FORK.value,
+                    )
+                    .values(
+                        lease_expires_at=expired_at,
+                        released_at=expired_at,
+                    )
                 )
 
             winner_response = await asyncio.to_thread(
@@ -2122,7 +2657,7 @@ class TestForkEndpoint:
 
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
-        await blob_service.create_blob(parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
+        await _create_test_blob(service, blob_service, parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
         message = await service.add_message(
             parent.id,
             "user",
@@ -2181,6 +2716,10 @@ class TestForkEndpoint:
         tampered = client.post(f"/api/sessions/{parent.id}/fork", json=body)
         assert tampered.status_code == 500
 
+        await service.archive_session(parent.id)
+        archived_retry = client.post(f"/api/sessions/{parent.id}/fork", json=body)
+        assert archived_retry.status_code == 404
+
     @pytest.mark.asyncio
     async def test_partial_copy_failure_cleans_exact_cohort_once_and_replays_terminal_failure(self, tmp_path) -> None:
         """The fail-CAS winner cleans copied blobs once while retaining strict evidence."""
@@ -2188,7 +2727,8 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
         source_blobs = [
-            await blob_service.create_blob(parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv") for index in range(2)
+            await _create_test_blob(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
+            for index in range(2)
         ]
         message = await service.add_message(
             parent.id,
@@ -2289,11 +2829,27 @@ class TestForkEndpoint:
 
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
+        source_blob = await _create_test_blob(
+            service,
+            blob_service,
+            parent.id,
+            "staged.csv",
+            b"private staged bytes",
+            "text/csv",
+        )
         fork_message = await service.add_message(
             parent.id,
             "user",
             "fork",
             writer_principal="route_user_message",
+        )
+        parent_context = await service._run_sync(
+            lambda: service.session_operation_authority.acquire(
+                session_id=parent.id,
+                operation_kind=SessionOperationKind.SESSION_FORK,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            )
         )
         claimed = await service.reserve_guided_operation(
             session_id=parent.id,
@@ -2302,19 +2858,32 @@ class TestForkEndpoint:
             request_hash="a" * 64,
             actor="test",
             lease_seconds=300,
+            session_operation_context=parent_context,
         )
         assert isinstance(claimed, GuidedOperationClaimed)
         staged = await service.fork_session(
-            claimed.fence,
+            SessionForkParentAuthority(
+                parent_context=parent_context,
+                guided_fence=claimed.fence,
+            ),
             fork_message_id=fork_message.id,
             new_message_content="edited",
         )
-        staged_blob = await blob_service.create_blob(
+
+        async def checkpoint() -> None:
+            await service._run_sync(
+                service.session_operation_authority.validate_fork_child_lease,
+                staged.authority,
+            )
+
+        copied = await blob_service.copy_blobs_for_fork(
+            parent.id,
             staged.session.id,
-            "staged.csv",
-            b"private staged bytes",
-            "text/csv",
+            staged.blob_plan,
+            staged.authority,
+            checkpoint=checkpoint,
         )
+        staged_blob = copied[source_blob.id]
         client = TestClient(app)
 
         listed = client.get("/api/sessions?include_archived=true")
@@ -2348,7 +2917,14 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
         root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
-        parent_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
+        parent_blob = await _create_test_blob(
+            service,
+            blob_service,
+            parent.id,
+            "orders.csv",
+            b"id,name\n1,Ada\n",
+            "text/csv",
+        )
         stable_id = str(uuid.uuid4())
         guided = GuidedSession(
             step=GuidedStep.STEP_1_SOURCE,
@@ -2439,9 +3015,15 @@ class TestForkEndpoint:
         assert child_intent.options["blob_ref"] == child_blob_id
         assert child_intent.options["path"] == f"blob:{child_blob_id}"
         assert child_intent.sample_rows == ({"id": 1, "name": "Ada"},)
-        child_blob = await blob_service.get_blob(uuid.UUID(child_blob_id))
+        child_blob = await _read_test_blob(
+            service,
+            blob_service,
+            child_id,
+            uuid.UUID(child_blob_id),
+            content=False,
+        )
         assert child_blob.session_id == child_id
-        assert await blob_service.read_blob_content(child_blob.id) == b"id,name\n1,Ada\n"
+        assert await _read_test_blob(service, blob_service, child_id, child_blob.id, content=True) == b"id,name\n1,Ada\n"
 
         committed = transition_source_inspection_review(
             child_guided,
@@ -2501,7 +3083,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        blob = await blob_service.create_blob(
+        blob = await _create_test_blob(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -2618,7 +3202,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(
+        await _create_test_blob(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b,c\n1,2,3",
@@ -2645,7 +3231,7 @@ class TestForkEndpoint:
         assert new_blobs[0].session_id == new_session_id
 
         # Verify content matches
-        content = await blob_service.read_blob_content(new_blobs[0].id)
+        content = await _read_test_blob(service, blob_service, new_session_id, new_blobs[0].id, content=True)
         assert content == b"a,b,c\n1,2,3"
 
     @pytest.mark.asyncio
@@ -2664,7 +3250,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        original_blob = await blob_service.create_blob(
+        original_blob = await _create_test_blob(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b,c\n1,2,3",
@@ -2721,7 +3309,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        original_blob = await blob_service.create_blob(
+        original_blob = await _create_test_blob(
+            service,
+            blob_service,
             session.id,
             "prompt.txt",
             b"Classify this row.",
@@ -2908,7 +3498,7 @@ class TestForkEndpoint:
             poolclass=StaticPool,
         )
         initialize_session_schema(engine)
-        session_service = SessionServiceImpl(
+        session_service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -2946,7 +3536,9 @@ class TestForkEndpoint:
 
         # Create source session with blobs using the generous-quota service
         session = await session_service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(
+        await _create_test_blob(
+            session_service,
+            blob_service,
             session.id,
             "big.csv",
             b"x" * 200,
@@ -3038,7 +3630,9 @@ class TestForkEndpoint:
         )
 
         # Create a blob so blob_map is non-empty (triggers the rewrite path).
-        await blob_service.create_blob(
+        await _create_test_blob(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -3090,7 +3684,9 @@ class TestForkEndpoint:
             writer_principal="route_user_message",
         )
 
-        await blob_service.create_blob(
+        await _create_test_blob(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -3123,7 +3719,7 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
 
         session = await service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(session.id, "data.csv", b"a,b\n1,2", "text/csv")
+        await _create_test_blob(service, blob_service, session.id, "data.csv", b"a,b\n1,2", "text/csv")
         msg = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
 
         # Use raise_server_exceptions=False so the 500 is returned as an
@@ -3166,7 +3762,9 @@ class TestForkEndpoint:
         session = await service.create_session("alice", "Original", "local")
 
         # Save a state with a blob_ref so the rewrite path is triggered
-        blob = await blob_service.create_blob(
+        blob = await _create_test_blob(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -3237,11 +3835,13 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
 
         session = await service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(session.id, "data.csv", b"a,b\n1,2", "text/csv")
+        await _create_test_blob(service, blob_service, session.id, "data.csv", b"a,b\n1,2", "text/csv")
         msg = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
 
         primary = RuntimeError("disk I/O error during blob copy")
-        cleanup = OSError("permission denied removing blob dir")
+        cleanup_secret = "cleanup-token=super-secret-credential"  # secret-scan: allow-this-line
+        cleanup_detail = f"permission denied removing blob dir ({cleanup_secret})"
+        cleanup = PermissionError(cleanup_detail)
 
         # Default raise_server_exceptions=True propagates the exact
         # exception object so __notes__ is inspectable.
@@ -3278,9 +3878,101 @@ class TestForkEndpoint:
 
         # RecoveryFailed[...] note identifies residual copied-blob custody.
         notes = getattr(primary, "__notes__", [])
-        assert any("RecoveryFailed[OSError]" in note for note in notes), f"expected RecoveryFailed[OSError] note, got: {notes!r}"
-        assert any("permission denied removing blob dir" in note for note in notes)
+        assert any("RecoveryFailed[PermissionError]" in note for note in notes), (
+            f"expected RecoveryFailed[PermissionError] note, got: {notes!r}"
+        )
         assert any("fork blob cleanup failed" in note.lower() for note in notes)
+        visible = "\n".join(
+            (
+                str(primary),
+                repr(primary),
+                response.text,
+                *notes,
+                *traceback.format_exception(primary),
+                *(repr(linked) for linked in (primary.__cause__, primary.__context__) if linked is not None),
+            )
+        )
+        assert cleanup_secret not in visible
+        assert cleanup_detail not in visible
+        assert primary.__cause__ is not cleanup
+        assert primary.__context__ is not cleanup
+
+    @pytest.mark.asyncio
+    async def test_fork_cleanup_result_note_ignores_untrusted_detail(self, tmp_path) -> None:
+        app, service, blob_service = _make_fork_app(tmp_path)
+        session = await service.create_session("alice", "Original", "local")
+        await _create_test_blob(
+            service,
+            blob_service,
+            session.id,
+            "data.csv",
+            b"a,b\n1,2",
+            "text/csv",
+        )
+        msg = await service.add_message(
+            session.id,
+            "user",
+            "Go",
+            writer_principal="route_user_message",
+        )
+        primary = RuntimeError("disk I/O error during blob copy")
+        residual_blob_id = uuid.uuid4()
+        cleanup_secret = "cleanup-result-token=super-secret-credential"  # secret-scan: allow-this-line
+        client = TestClient(app)
+
+        async def fail_copy_blobs_for_fork(*args: Any, **kwargs: Any) -> None:
+            raise primary
+
+        async def return_cleanup_error(
+            *args: Any,
+            **kwargs: Any,
+        ) -> BlobForkCleanupResult:
+            return BlobForkCleanupResult(
+                deleted_ids=(),
+                errors=(
+                    BlobForkCleanupError(
+                        blob_id=residual_blob_id,
+                        exc_type="PermissionError",
+                        detail=cleanup_secret,
+                    ),
+                ),
+            )
+
+        with (
+            patch.object(
+                blob_service,
+                "copy_blobs_for_fork",
+                new=fail_copy_blobs_for_fork,
+            ),
+            patch.object(
+                blob_service,
+                "cleanup_blobs_for_fork",
+                new=return_cleanup_error,
+            ),
+        ):
+            response = client.post(
+                f"/api/sessions/{session.id}/fork",
+                json={
+                    "operation_id": str(uuid.uuid4()),
+                    "from_message_id": str(msg.id),
+                    "new_message_content": "Go edited",
+                },
+            )
+
+        assert response.status_code == 500
+        notes = getattr(primary, "__notes__", [])
+        assert any("RecoveryFailed[PermissionError]" in note for note in notes)
+        assert any(str(residual_blob_id) in note for note in notes)
+        visible = "\n".join(
+            (
+                str(primary),
+                repr(primary),
+                response.text,
+                *notes,
+                *traceback.format_exception(primary),
+            )
+        )
+        assert cleanup_secret not in visible
 
     @pytest.mark.asyncio
     async def test_fork_top_level_blob_ref_without_copied_blob_fails_closed(self, tmp_path) -> None:

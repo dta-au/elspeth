@@ -19,6 +19,7 @@ from elspeth.contracts.enums import Determinism
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.plugin_protocols import SinkProtocol, SourceProtocol, TransformProtocol
 from elspeth.contracts.secrets import SecretInventoryItem
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.sink_effect_diagnostics import load_sink_effect_recovery_history
 from elspeth.web.audit_readiness.models import (
@@ -442,6 +443,7 @@ class _ExecutionServiceLike(Protocol):
         *,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> ValidationResult: ...
 
 
@@ -510,7 +512,13 @@ class ReadinessService:
             state_from_record if state_from_record is not None else _default_state_from_record
         )
 
-    async def compute_snapshot(self, *, session_id: UUID, user_id: str) -> AuditReadinessSnapshot:
+    async def compute_snapshot(
+        self,
+        *,
+        session_id: UUID,
+        user_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> AuditReadinessSnapshot:
         """Return the six-row snapshot.
 
         Raises:
@@ -526,7 +534,12 @@ class ReadinessService:
         # that the llm_interpretations row scopes its event lookup to.
         composition_state_id: UUID = record.id
         state: CompositionState = self._state_from_record(record)
-        validation = await self._execution_service.validate_state(state, user_id=user_id, session_id=session_id)
+        validation = await self._execution_service.validate_state(
+            state,
+            user_id=user_id,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
         # Pre-fetch interpretation-event signal for the llm_interpretations
         # row. Two separate reads because:
         #

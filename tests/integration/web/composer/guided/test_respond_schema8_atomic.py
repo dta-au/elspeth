@@ -21,6 +21,7 @@ from elspeth.contracts.blobs import BlobNotFoundError, BlobStateError
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import (
     GuidedStep,
@@ -41,9 +42,10 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.pipeline_proposal import AbsentBase
 from elspeth.web.composer.source_inspection import SourceInspectionFacts
+from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_replay import guided_turn_token, load_guided_json_payload
-from elspeth.web.sessions.models import guided_operations_table
+from elspeth.web.sessions.models import guided_operations_table, session_operation_fences_table
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationTakenOver
 from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
 from elspeth.web.sessions.routes.composer import guided as guided_route
@@ -154,7 +156,13 @@ class _ReadRaceBlobService:
         del limit, offset
         return [self._record]
 
-    async def read_blob_content(self, _blob_id: UUID) -> bytes:
+    async def read_blob_content(
+        self,
+        _blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> bytes:
+        assert type(session_operation_context) is SessionOperationContext
         if isinstance(self._outcome, Exception):
             raise self._outcome
         return self._outcome
@@ -528,7 +536,7 @@ def test_source_selection_rejects_blob_identity_outside_ready_session_set_before
 
 
 @pytest.mark.parametrize("failure_kind", ("deleted", "not_ready"))
-def test_source_selection_maps_list_to_read_lifecycle_drift_before_reservation(
+def test_source_selection_maps_fenced_list_to_read_lifecycle_drift_to_stale_conflict(
     composer_test_client: TestClient,
     failure_kind: str,
 ) -> None:
@@ -540,7 +548,7 @@ def test_source_selection_maps_list_to_read_lifecycle_drift_before_reservation(
     assert uploaded.status_code == 201, uploaded.json()
     blob_id = UUID(uploaded.json()["id"])
     original_blob_service = composer_test_client.app.state.blob_service
-    record = asyncio.run(original_blob_service.get_blob(blob_id))
+    record = next(record for record in asyncio.run(original_blob_service.list_blobs(UUID(session_id), limit=None)) if record.id == blob_id)
     secret_canary = "private-race-detail"
     failure: Exception
     if failure_kind == "deleted":
@@ -558,10 +566,10 @@ def test_source_selection_maps_list_to_read_lifecycle_drift_before_reservation(
     finally:
         composer_test_client.app.state.blob_service = original_blob_service
 
-    assert response.status_code == 400, response.json()
-    assert response.json()["detail"] == "Selected source blob is no longer a ready upload for this session."
+    assert response.status_code == 409, response.json()
+    assert response.json()["detail"]["failure_code"] == "stale_conflict"
     assert secret_canary not in response.text
-    assert _respond_operation_count(composer_test_client, session_id) == 0
+    assert _respond_operation_count(composer_test_client, session_id) == 1
 
 
 def test_source_selection_fails_closed_when_read_bytes_do_not_match_listed_hash(
@@ -575,7 +583,7 @@ def test_source_selection_fails_closed_when_read_bytes_do_not_match_listed_hash(
     assert uploaded.status_code == 201, uploaded.json()
     blob_id = UUID(uploaded.json()["id"])
     original_blob_service = composer_test_client.app.state.blob_service
-    record = asyncio.run(original_blob_service.get_blob(blob_id))
+    record = next(record for record in asyncio.run(original_blob_service.list_blobs(UUID(session_id), limit=None)) if record.id == blob_id)
     composer_test_client.app.state.blob_service = _ReadRaceBlobService(record, b"changed_id\n2\n")
     turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
 
@@ -588,8 +596,8 @@ def test_source_selection_fails_closed_when_read_bytes_do_not_match_listed_hash(
         composer_test_client.app.state.blob_service = original_blob_service
 
     assert response.status_code == 500, response.json()
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
-    assert _respond_operation_count(composer_test_client, session_id) == 0
+    assert response.json()["detail"]["failure_code"] == "integrity_error"
+    assert _respond_operation_count(composer_test_client, session_id) == 1
 
 
 @pytest.mark.parametrize(
@@ -672,7 +680,7 @@ def test_step4_closed_actions_reject_source_blob_identity_before_reservation(
     assert _respond_operation_count(composer_test_client, session_id) == operation_count_before
 
 
-def test_preflight_and_settlement_share_one_server_identity_and_inspection_authority(
+def test_preflight_defers_inspection_until_reserved_settlement(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -697,12 +705,19 @@ def test_preflight_and_settlement_share_one_server_identity_and_inspection_autho
         return original_answer(*args, **kwargs)
 
     inspection_calls = 0
+    inspection_contexts: list[SessionOperationContext] = []
 
     async def inspect_once(*_args: object, **_kwargs: object) -> SourceInspectionFacts:
         nonlocal inspection_calls
         inspection_calls += 1
         if inspection_calls > 1:
             raise AssertionError("settlement re-read mutable inspection authority")
+        context = _kwargs["session_operation_context"]
+        assert type(context) is SessionOperationContext
+        inspection_contexts.append(context)
+        assert context.fence.session_id == session_id
+        assert context.operation_kind is SessionOperationKind.COMPOSE
+        assert _respond_operation_count(composer_test_client, session_id) == 1
         return facts
 
     monkeypatch.setattr(guided_route, "_schema8_answer_and_project_next", capture_authority)
@@ -712,9 +727,11 @@ def test_preflight_and_settlement_share_one_server_identity_and_inspection_autho
 
     assert response.status_code == 200, response.json()
     assert inspection_calls == 1
+    assert len(inspection_contexts) == 1
     assert len(captured) == 2
-    assert captured[0] == captured[1]
-    stable_id, captured_facts = captured[0]
+    assert captured[0][0] == captured[1][0]
+    assert captured[0][1] is None
+    stable_id, captured_facts = captured[1]
     assert captured_facts is facts
     assert stable_id != UUID(body["operation_id"])
     assert stable_id != UUID(int=0)
@@ -981,20 +998,34 @@ def test_expired_operation_is_not_taken_over_before_live_preflight(
     body["turn_token"] = "0" * 64
     request_model = guided_route.GuidedRespondRequest.model_validate(body, strict=True)
     service = composer_test_client.app.state.session_service
-    claim = asyncio.run(
-        service.reserve_guided_operation(
-            session_id=UUID(session_id),
-            operation_id=body["operation_id"],
-            kind="guided_respond",
-            request_hash=guided_operation_request_hash(
+    session_context = asyncio.run(
+        service._run_sync(
+            lambda: service.session_operation_authority.acquire(
                 session_id=UUID(session_id),
-                kind="guided_respond",
-                request=request_model,
-            ),
-            actor="composer_route",
-            lease_seconds=300,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            )
         )
     )
+    try:
+        claim = asyncio.run(
+            service.reserve_guided_operation(
+                session_id=UUID(session_id),
+                operation_id=body["operation_id"],
+                kind="guided_respond",
+                request_hash=guided_operation_request_hash(
+                    session_id=UUID(session_id),
+                    kind="guided_respond",
+                    request=request_model,
+                ),
+                actor="composer_route",
+                lease_seconds=300,
+                session_operation_context=session_context,
+            )
+        )
+    finally:
+        asyncio.run(service._run_sync(service.session_operation_authority.release, session_context))
     assert isinstance(claim, GuidedOperationClaimed)
     with composer_test_client.app.state.session_engine.begin() as connection:
         connection.execute(
@@ -1921,6 +1952,11 @@ def test_route_takeover_uses_live_fence_and_stale_worker_joins_winner(
                         "session_id": session_id,
                         "operation_id": body["operation_id"],
                     },
+                )
+                connection.execute(
+                    session_operation_fences_table.update()
+                    .where(session_operation_fences_table.c.session_id == session_id)
+                    .values(released_at=datetime.now(UTC))
                 )
             winner = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
             await asyncio.wait_for(takeover_reserved.wait(), timeout=3)

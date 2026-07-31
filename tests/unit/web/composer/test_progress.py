@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import inspect
 from typing import Any, cast
 
 import pytest
@@ -10,11 +10,11 @@ from pydantic import ValidationError
 
 from elspeth.contracts.composer_progress import (
     COMPOSER_PROGRESS_MAX_EVIDENCE,
-    NON_TERMINAL_PROGRESS_PHASES,
     ComposerProgressEvent,
 )
 from elspeth.web.composer.progress import (
     ComposerProgressRegistry,
+    _live_request_count_expression,
     client_cancelled_progress_event,
     convergence_progress_event,
 )
@@ -170,300 +170,25 @@ class TestConvergenceProgressEvent:
         )
 
 
-class TestComposerProgressRegistry:
-    @pytest.mark.asyncio
-    async def test_returns_idle_snapshot_when_session_has_no_progress(self) -> None:
-        registry = ComposerProgressRegistry()
+def test_durable_reads_bind_snapshot_and_liveness_in_one_exact_statement() -> None:
+    """A takeover cannot label snapshot A live using request/fence B."""
+    for method in (ComposerProgressRegistry.get_latest, ComposerProgressRegistry.list_active):
+        source = inspect.getsource(method)
+        assert source.count("connection.execute(") == 1
+        assert "_live_request_count_expression(connection)" in source
+        assert "_database_now" not in source
+        assert "_live_request_count(" not in source
 
-        snapshot = await registry.get_latest("session-1")
-
-        assert snapshot.session_id == "session-1"
-        assert snapshot.request_id is None
-        assert snapshot.phase == "idle"
-        assert snapshot.headline == "No active composer work."
-        assert snapshot.evidence == ()
-        assert snapshot.reason == "composer_idle"
-
-    @pytest.mark.asyncio
-    async def test_keeps_only_latest_snapshot_per_session(self) -> None:
-        registry = ComposerProgressRegistry()
-
-        first = await registry.publish(
-            session_id="session-1",
-            request_id="message-1",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="starting",
-                headline="I'm reading your request and current pipeline.",
-                evidence=("The request was accepted.",),
-            ),
-        )
-        second = await registry.publish(
-            session_id="session-1",
-            request_id="message-1",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="calling_model",
-                headline="I'm asking the model to choose the next pipeline change.",
-                evidence=("The composer prompt was built.",),
-            ),
-        )
-
-        latest = await registry.get_latest("session-1")
-
-        assert first.updated_at < second.updated_at
-        assert latest == second
-        assert latest.phase == "calling_model"
-
-    @pytest.mark.asyncio
-    async def test_inflight_request_count_enriches_snapshots(self) -> None:
-        """Snapshots report the session's live in-flight compose request count.
-
-        The count is the SPA's correlated settlement signal after a client
-        abort: the phase alone cannot distinguish "the aborted route is
-        still running (queued on the compose lock / not yet published)"
-        from "everything settled" — the registry may hold the PREVIOUS
-        turn's terminal snapshot in both cases. Zero in-flight requests is
-        the only reliable quiescence condition.
-        """
-        registry = ComposerProgressRegistry()
-
-        assert (await registry.get_latest("session-1")).inflight_requests == 0
-
-        registry.begin_request("session-1")
-        assert (await registry.get_latest("session-1")).inflight_requests == 1
-
-        # A second tab's request queued on the compose lock counts too.
-        registry.begin_request("session-1")
-        assert (await registry.get_latest("session-1")).inflight_requests == 2
-        # Sessions are independent.
-        assert (await registry.get_latest("session-2")).inflight_requests == 0
-
-        registry.end_request("session-1")
-        registry.end_request("session-1")
-        assert (await registry.get_latest("session-1")).inflight_requests == 0
-
-        # Published snapshots are enriched at read time with the live count,
-        # not the count at publish time.
-        await registry.publish(
-            session_id="session-1",
-            request_id="message-1",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="complete",
-                headline="The requested pipeline change is finished.",
-                evidence=("The state was saved.",),
-            ),
-        )
-        registry.begin_request("session-1")
-        enriched = await registry.get_latest("session-1")
-        assert enriched.phase == "complete"
-        assert enriched.inflight_requests == 1
-        registry.end_request("session-1")
-
-    @pytest.mark.asyncio
-    async def test_list_active_snapshots_carry_live_inflight_count(self) -> None:
-        """The operator /_active view reports the LIVE count, not publish-time zero.
-
-        Stored snapshots are created by publish() where inflight_requests
-        defaults to 0; serving them raw from list_active() would show an
-        actively composing session with a zero count, contradicting the
-        live-count contract the per-session GET provides.
-        """
-        registry = ComposerProgressRegistry()
-        await registry.publish(
-            session_id="session-1",
-            request_id="message-1",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="using_tools",
-                headline="I'm applying the requested pipeline changes.",
-                evidence=("A tool call is running.",),
-            ),
-        )
-        registry.begin_request("session-1")
-        try:
-            active = await registry.list_active(user_id="user-1")
-            assert len(active) == 1
-            assert active[0].inflight_requests == 1
-        finally:
-            registry.end_request("session-1")
-
-    @pytest.mark.asyncio
-    async def test_clear_removes_session_snapshot(self) -> None:
-        registry = ComposerProgressRegistry()
-        await registry.publish(
-            session_id="session-1",
-            request_id="message-1",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="failed",
-                headline="The composer could not finish this request.",
-                evidence=("The safe failure path was reached.",),
-                reason="service_setup_failed",
-            ),
-        )
-
-        await registry.clear("session-1")
-        snapshot = await registry.get_latest("session-1")
-
-        assert snapshot.phase == "idle"
-        assert snapshot.updated_at <= datetime.now(UTC)
-
-    @pytest.mark.asyncio
-    async def test_list_active_returns_only_non_terminal_phases(self) -> None:
-        """list_active is the cross-session enumeration primitive used by /_active."""
-        registry = ComposerProgressRegistry()
-        # Two non-terminal sessions for user-1 and one terminated session.
-        await registry.publish(
-            session_id="session-running-1",
-            request_id="msg-1",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="calling_model",
-                headline="The model is composing.",
-                evidence=("Prompt was built.",),
-            ),
-        )
-        await registry.publish(
-            session_id="session-running-2",
-            request_id="msg-2",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="using_tools",
-                headline="The model is using tools.",
-                evidence=("A tool call started.",),
-            ),
-        )
-        await registry.publish(
-            session_id="session-done",
-            request_id="msg-3",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="complete",
-                headline="The composer response is ready.",
-                evidence=("The assistant response was saved.",),
-                reason="composer_complete",
-            ),
-        )
-
-        active = await registry.list_active(user_id="user-1")
-
-        assert {snap.session_id for snap in active} == {"session-running-1", "session-running-2"}
-        assert all(snap.phase in NON_TERMINAL_PROGRESS_PHASES for snap in active)
-
-    @pytest.mark.asyncio
-    async def test_list_active_scopes_to_user_id(self) -> None:
-        """A caller cannot enumerate other users' in-flight sessions.
-
-        The internal user index is the only mechanism enforcing this — there
-        is no DB lookup at the endpoint, so this scoping must be airtight.
-        """
-        registry = ComposerProgressRegistry()
-        await registry.publish(
-            session_id="session-mine",
-            request_id="msg-1",
-            user_id="user-alice",
-            event=ComposerProgressEvent(
-                phase="calling_model",
-                headline="The model is composing.",
-                evidence=("Prompt built.",),
-            ),
-        )
-        await registry.publish(
-            session_id="session-yours",
-            request_id="msg-2",
-            user_id="user-bob",
-            event=ComposerProgressEvent(
-                phase="calling_model",
-                headline="Different user's request.",
-                evidence=("Prompt built.",),
-            ),
-        )
-
-        alice_active = await registry.list_active(user_id="user-alice")
-        bob_active = await registry.list_active(user_id="user-bob")
-
-        assert {snap.session_id for snap in alice_active} == {"session-mine"}
-        assert {snap.session_id for snap in bob_active} == {"session-yours"}
-
-    @pytest.mark.asyncio
-    async def test_list_active_orders_oldest_first(self) -> None:
-        """Triage order: longest-running request at the top, like a DB lock list."""
-        registry = ComposerProgressRegistry()
-        await registry.publish(
-            session_id="session-old",
-            request_id="msg-old",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="calling_model",
-                headline="Older request.",
-                evidence=("Already in flight.",),
-            ),
-        )
-        await registry.publish(
-            session_id="session-new",
-            request_id="msg-new",
-            user_id="user-1",
-            event=ComposerProgressEvent(
-                phase="calling_model",
-                headline="Newer request.",
-                evidence=("Just started.",),
-            ),
-        )
-
-        active = await registry.list_active(user_id="user-1")
-
-        assert [snap.session_id for snap in active] == ["session-old", "session-new"]
-
-    @pytest.mark.asyncio
-    async def test_list_active_excludes_cancelled_phase(self) -> None:
-        """A cancelled session is no longer in flight — pin this regression guard."""
-        registry = ComposerProgressRegistry()
-        await registry.publish(
-            session_id="session-cancelled",
-            request_id="msg-1",
-            user_id="user-1",
-            event=client_cancelled_progress_event(),
-        )
-
-        active = await registry.list_active(user_id="user-1")
-
-        assert active == ()
-
-    @pytest.mark.asyncio
-    async def test_clear_purges_user_index(self) -> None:
-        """Clearing a session must drop its user-index entry too.
-
-        Otherwise a re-published snapshot under the same session_id but a
-        different user_id (e.g., session ownership transfer in a future
-        feature) would still surface to the original user via list_active.
-        """
-        registry = ComposerProgressRegistry()
-        await registry.publish(
-            session_id="session-shared-id",
-            request_id="msg-1",
-            user_id="user-alice",
-            event=ComposerProgressEvent(
-                phase="calling_model",
-                headline="Alice's request.",
-                evidence=("Prompt built.",),
-            ),
-        )
-        await registry.clear("session-shared-id")
-        await registry.publish(
-            session_id="session-shared-id",
-            request_id="msg-2",
-            user_id="user-bob",
-            event=ComposerProgressEvent(
-                phase="calling_model",
-                headline="Bob's request after Alice's was cleared.",
-                evidence=("Prompt built.",),
-            ),
-        )
-
-        alice_active = await registry.list_active(user_id="user-alice")
-        bob_active = await registry.list_active(user_id="user-bob")
-
-        assert alice_active == ()
-        assert {snap.session_id for snap in bob_active} == {"session-shared-id"}
+    correlation = inspect.getsource(_live_request_count_expression)
+    for exact_binding in (
+        "composer_inflight_requests_table.c.session_id == composer_progress_snapshots_table.c.session_id",
+        "composer_inflight_requests_table.c.request_id == composer_progress_snapshots_table.c.request_id",
+        "composer_inflight_requests_table.c.user_id == composer_progress_snapshots_table.c.user_id",
+        "composer_inflight_requests_table.c.operation_id == composer_progress_snapshots_table.c.operation_id",
+        "composer_inflight_requests_table.c.operation_epoch == composer_progress_snapshots_table.c.operation_epoch",
+        "composer_inflight_requests_table.c.operation_id == session_operation_fences_table.c.operation_id",
+        "composer_inflight_requests_table.c.operation_epoch == session_operation_fences_table.c.operation_epoch",
+    ):
+        assert exact_binding in correlation
+    assert ".correlate(composer_progress_snapshots_table)" in correlation
+    assert "func.current_timestamp()" in correlation

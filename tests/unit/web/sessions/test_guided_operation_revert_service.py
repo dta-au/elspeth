@@ -67,6 +67,7 @@ from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -82,7 +83,7 @@ def engine():
 
 @pytest.fixture
 def service(engine):
-    return SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    return DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
 
 
 @pytest.fixture
@@ -114,7 +115,7 @@ def durable_engine(request: pytest.FixtureRequest, tmp_path: Path):
 
 
 def _service_for(engine: Any) -> SessionServiceImpl:
-    return SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.revert-race"))
+    return DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.revert-race"))
 
 
 async def _revert_at_current(
@@ -614,6 +615,79 @@ async def test_revert_older_guided_proposal_checkpoint_rejects_pending_and_scrub
     assert restored.transition_consumed is False
     assert restored.active_proposal is None
     assert restored.active_edit_target is None
+
+
+@pytest.mark.asyncio
+async def test_future_skewed_event_clock_cannot_clear_live_confirmation_or_reject_proposal(service, engine) -> None:
+    session = await service.create_session("alice", "Clock-skewed revert", "local")
+    target = await service.save_composition_state(
+        session.id,
+        CompositionStateData(
+            composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
+            metadata_={"name": "Guided target", "description": ""},
+            is_valid=True,
+        ),
+        provenance="session_seed",
+    )
+    proposal, target = await _attach_pending_guided_pipeline_proposal(
+        service,
+        session_id=session.id,
+        state=target,
+        guided=GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS),
+    )
+    await service.save_composition_state(
+        session.id,
+        CompositionStateData(
+            composer_meta={"guided_session": None},
+            metadata_={"name": "Current freeform", "description": ""},
+            is_valid=True,
+        ),
+        provenance="session_seed",
+    )
+    confirmation = await service.reserve_guided_operation(
+        session_id=session.id,
+        operation_id="live-confirmation",
+        kind="guided_respond",
+        request_hash="c" * 64,
+        actor="confirmation-route",
+        lease_seconds=60,
+    )
+    assert isinstance(confirmation, GuidedOperationClaimed)
+    await service.bind_guided_operation(confirmation.fence, proposal_id=proposal.id)
+    revert_fence = await _claim(service, session.id, operation_id="clock-skewed-revert")
+
+    future_event_time = datetime.now(UTC) + timedelta(days=365)
+    with (
+        patch.object(service, "_now", return_value=future_event_time),
+        pytest.raises(GuidedOperationSettlementConflictError),
+    ):
+        await _revert_at_current(
+            service,
+            revert_fence,
+            state_id=target.id,
+            actor="route",
+            response_hash_factory=lambda state: stable_hash({"state_id": str(state.id)}),
+        )
+
+    with engine.begin() as conn:
+        live_confirmation = conn.execute(
+            select(guided_operations_table.c.proposal_id).where(
+                guided_operations_table.c.session_id == str(session.id),
+                guided_operations_table.c.operation_id == confirmation.fence.operation_id,
+            )
+        ).one()
+        proposal_status = conn.execute(
+            select(composition_proposals_table.c.status).where(composition_proposals_table.c.id == str(proposal.id))
+        ).scalar_one()
+        rejection_count = conn.execute(
+            select(func.count())
+            .select_from(proposal_events_table)
+            .where(proposal_events_table.c.proposal_id == str(proposal.id))
+            .where(proposal_events_table.c.event_type == "proposal.rejected")
+        ).scalar_one()
+    assert live_confirmation.proposal_id == str(proposal.id)
+    assert proposal_status == "pending"
+    assert rejection_count == 0
 
 
 @pytest.mark.asyncio
@@ -1645,8 +1719,8 @@ async def test_guided_start_atomic_seed_does_not_treat_generic_integrity_error_a
 
 @pytest.mark.asyncio
 async def test_guided_start_atomic_seed_serializes_two_sqlite_services(file_engine) -> None:
-    service_a = SessionServiceImpl(file_engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.a"))
-    service_b = SessionServiceImpl(file_engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.b"))
+    service_a = DualFencedSessionServiceHarness(file_engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.a"))
+    service_b = DualFencedSessionServiceHarness(file_engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.b"))
     session = await service_a.create_session("alice", "Pipeline", "local")
     fence_a = await _claim(
         service_a,

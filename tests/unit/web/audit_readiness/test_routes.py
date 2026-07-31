@@ -7,13 +7,19 @@ from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
+from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.audit_readiness.routes import create_audit_readiness_router
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination import repository as coordination_repository
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
+from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import SessionRecord
+from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -41,19 +47,52 @@ _SESSION_ID = UUID("11111111-1111-1111-1111-111111111111")
 
 
 class _SessionService:
-    async def get_session(self, session_id: UUID) -> SessionRecord:
-        return SessionRecord(
-            id=session_id,
-            user_id="alice",
-            auth_provider_type="local",
-            title="Test",
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
+    def __init__(self) -> None:
+        self._engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
         )
+        initialize_session_schema(self._engine)
+        self._authority = SQLiteLocalSessionOperationAuthority(self._engine)
+        new_session_id = coordination_repository._new_session_id
+        coordination_repository._new_session_id = lambda: _SESSION_ID
+        try:
+            self._record = self._authority.create_session_with_initial_fence(
+                user_id="alice",
+                title="Test",
+                auth_provider_type="local",
+                owner_instance_id="readiness-route-test",
+                lease_seconds=30,
+            )
+        finally:
+            coordination_repository._new_session_id = new_session_id
+
+    @property
+    def session_operation_authority(self) -> SQLiteLocalSessionOperationAuthority:
+        return self._authority
+
+    @property
+    def session_operation_owner_instance_id(self) -> str:
+        return "readiness-route-test"
+
+    @property
+    def session_operation_lease_seconds(self) -> int:
+        return 30
+
+    async def get_session(self, session_id: UUID) -> SessionRecord:
+        assert session_id == _SESSION_ID
+        return self._record
 
 
 class _ExplodingReadinessService:
-    async def compute_snapshot(self, *, session_id: UUID, user_id: str):
+    async def compute_snapshot(
+        self,
+        *,
+        session_id: UUID,
+        user_id: str,
+        session_operation_context: SessionOperationContext,
+    ):
         raise LookupError("internal dict lookup exploded")
 
 
@@ -134,7 +173,13 @@ def test_snapshot_composition_state_not_found_does_not_emit_fetch_failure() -> N
     from elspeth.web.audit_readiness.service import CompositionStateNotFoundError
 
     class _NotFoundReadinessService:
-        async def compute_snapshot(self, *, session_id: UUID, user_id: str):
+        async def compute_snapshot(
+            self,
+            *,
+            session_id: UUID,
+            user_id: str,
+            session_operation_context: SessionOperationContext,
+        ):
             raise CompositionStateNotFoundError(str(session_id))
 
     app = FastAPI()

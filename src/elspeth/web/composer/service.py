@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 import structlog
 from opentelemetry import metrics
-from sqlalchemy import Engine, update
+from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
@@ -52,6 +52,7 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json
 from elspeth.core.templates import extract_jinja2_fields
@@ -156,6 +157,7 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     normalize_tool_result_validation,
 )
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -189,7 +191,6 @@ from elspeth.web.interpretation_state import (
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
-from elspeth.web.sessions.models import sessions_table
 from elspeth.web.validation import _redact_sensitive_content
 
 slog = structlog.get_logger()
@@ -1345,6 +1346,7 @@ class ComposerServiceImpl:
         initial_state: CompositionState | None = None,
         user_message_id: str | None = None,
         message: str = "one-turn compose-loop test driver",
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposeLoopTestResult:
         """Drive exactly one compose-loop turn for compose-loop tests.
 
@@ -1387,6 +1389,7 @@ class ComposerServiceImpl:
                 deadline=asyncio.get_event_loop().time() + self._timeout_seconds,
                 plugin_snapshot=plugin_snapshot,
                 policy_catalog=policy_catalog,
+                session_operation_context=session_operation_context,
             )
         finally:
             self._call_llm = original_call_llm  # type: ignore[method-assign]
@@ -2175,6 +2178,7 @@ class ComposerServiceImpl:
         progress: ComposerProgressSink | None = None,
         guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -2200,6 +2204,13 @@ class ComposerServiceImpl:
         """
         if not self._availability.available:
             raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
+        if session_operation_context is not None:
+            if type(session_operation_context) is not SessionOperationContext:
+                raise TypeError("session_operation_context must be an exact SessionOperationContext")
+            if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+                raise ValueError("composer custody requires COMPOSE session authority")
+            if session_id is None or session_operation_context.fence.session_id != session_id:
+                raise AuditIntegrityError("Composer session authority targets a different session")
 
         deadline = asyncio.get_event_loop().time() + self._timeout_seconds
         from litellm.exceptions import APIError as LiteLLMAPIError
@@ -2228,6 +2239,7 @@ class ComposerServiceImpl:
                     recorder=recorder,
                     plugin_snapshot=plugin_snapshot,
                     policy_catalog=policy_catalog,
+                    session_operation_context=session_operation_context,
                 )
             return await self._compose_loop(
                 message,
@@ -2243,6 +2255,7 @@ class ComposerServiceImpl:
                 recorder=recorder,
                 plugin_snapshot=plugin_snapshot,
                 policy_catalog=policy_catalog,
+                session_operation_context=session_operation_context,
             )
         except ComposerConvergenceError as exc:
             await emit_progress(
@@ -2261,11 +2274,11 @@ class ComposerServiceImpl:
             # Here we only add the session-row audit breadcrumb (updated_at
             # bump — richer crash-marker columns tracked as a follow-up
             # migration: elspeth-23b0987938).
-            if self._session_engine is not None and session_id is not None:
+            if self._sessions_service is not None and session_id is not None and session_operation_context is not None:
                 try:
                     # Offload to a worker — _persist_crashed_session
-                    # executes a synchronous SQLAlchemy ``Engine.begin()``
-                    # + UPDATE, which would otherwise block the event
+                    # executes the synchronous fenced transaction + UPDATE,
+                    # which would otherwise block the event
                     # loop for the duration of the DB round-trip,
                     # stalling websocket heartbeats, rate-limit checks,
                     # and concurrent progress broadcasts. Symmetric with
@@ -2274,16 +2287,16 @@ class ComposerServiceImpl:
                     # file runs through run_sync_in_worker, and this
                     # crash-path call was missed when it was hoisted
                     # out of the main loop.
-                    await run_sync_in_worker(self._persist_crashed_session, session_id)
-                except (SQLAlchemyError, OSError) as audit_failure:
+                    await run_sync_in_worker(self._persist_crashed_session, session_operation_context)
+                except (SQLAlchemyError, OSError, SessionOperationFenceLost) as audit_failure:
                     # Audit-persistence is best-effort on the crash path —
                     # failure to persist MUST NOT mask the original plugin
                     # bug. Log via slog.error (audit system itself is failing
                     # here, which is one of the permitted slog use cases).
                     #
-                    # Catch is narrowed to (SQLAlchemyError, OSError) so that
-                    # programmer-bug exceptions propagate instead of being
-                    # laundered as "audit failure".
+                    # Catch is narrowed to expected storage failures and an
+                    # exact lost fence so programmer-bug exceptions propagate
+                    # instead of being laundered as "audit failure".
                     #
                     # exc_info is deliberately omitted: exception messages
                     # may carry DB URLs, filesystem paths, or secret fragments.
@@ -2359,6 +2372,7 @@ class ComposerServiceImpl:
         plugin_snapshot: PluginAvailabilitySnapshot,
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]]:
         """Plan one ordinary guided-full proposal through the canonical core."""
@@ -2369,8 +2383,14 @@ class ComposerServiceImpl:
             raise TypeError("recorder must be an exact BufferingRecorder")
         if type(operation_fence) is not GuidedOperationFence:
             raise TypeError("operation_fence must be an exact GuidedOperationFence")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise ValueError("guided-full planner requires COMPOSE session authority")
         if str(operation_fence.session_id) != originating_message.session_id:
             raise AuditIntegrityError("guided-full planner operation fence targets a different session")
+        if session_operation_context.fence.session_id != originating_message.session_id:
+            raise AuditIntegrityError("guided-full planner session authority targets a different session")
         if policy_catalog.snapshot is not plugin_snapshot:
             raise ValueError("plugin_snapshot_catalog_mismatch")
         if not self._availability.available:
@@ -2424,6 +2444,7 @@ class ComposerServiceImpl:
                 max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
                 secret_service=self._secret_service,
                 runtime_preflight=None,
+                session_operation_context=session_operation_context,
                 write_fence=BlobGuidedOperationWriteFence(
                     session_id=operation_fence.session_id,
                     operation_id=operation_fence.operation_id,
@@ -2463,6 +2484,7 @@ class ComposerServiceImpl:
         supersedes_draft_hash: str | None,
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]]:
@@ -2488,10 +2510,16 @@ class ComposerServiceImpl:
 
         if type(operation_fence) is not GuidedOperationFence:
             raise TypeError("operation_fence must be an exact GuidedOperationFence")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise ValueError("guided planner requires COMPOSE session authority")
         if correction_target is not None and type(correction_target) is not GuidedCorrectionTarget:
             raise TypeError("correction_target must be an exact GuidedCorrectionTarget or None")
         if str(operation_fence.session_id) != originating_message.session_id:
             raise AuditIntegrityError("guided planner operation fence targets a different session")
+        if session_operation_context.fence.session_id != originating_message.session_id:
+            raise AuditIntegrityError("guided planner session authority targets a different session")
         if guided.active_proposal is not None:
             raise AuditIntegrityError("guided planning requires no active proposal")
         if guided.pending_source_intents or guided.pending_output_intents:
@@ -2530,6 +2558,7 @@ class ComposerServiceImpl:
             max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
             secret_service=self._secret_service,
             runtime_preflight=None,
+            session_operation_context=session_operation_context,
             write_fence=BlobGuidedOperationWriteFence(
                 session_id=operation_fence.session_id,
                 operation_id=operation_fence.operation_id,
@@ -2746,6 +2775,7 @@ class ComposerServiceImpl:
         user_id: str | None,
         trust_mode: Literal["auto_commit", "explicit_approve"],
         recorder: BufferingRecorder,
+        session_operation_context: SessionOperationContext,
     ) -> ComposerResult:
         """Persist planner evidence, then create one reviewable proposal row."""
 
@@ -2780,6 +2810,7 @@ class ComposerServiceImpl:
                 composer_model_version=plan.model_version,
                 composer_provider=plan.provider,
                 user_message_id=user_message_id,
+                session_operation_context=session_operation_context,
             )
         )
         if deferred is not None:
@@ -2822,6 +2853,7 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder,
         plugin_snapshot: PluginAvailabilitySnapshot,
         policy_catalog: PolicyCatalogView,
+        session_operation_context: SessionOperationContext | None,
     ) -> ComposerResult:
         """Build one canonical full-pipeline proposal for an empty topology."""
 
@@ -2847,6 +2879,7 @@ class ComposerServiceImpl:
             max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
             secret_service=self._secret_service,
             runtime_preflight=None,
+            session_operation_context=session_operation_context,
         )
         plan: PipelinePlanResult | None = None
         planner_llm_start = len(recorder.llm_calls)
@@ -3000,6 +3033,12 @@ class ComposerServiceImpl:
                         raise
                     raise deferred from exc
                 raise
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Pipeline proposal staging requires exact session operation authority")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise ValueError("pipeline proposal staging requires COMPOSE session authority")
+        if session_operation_context.fence.session_id != str(session_uuid):
+            raise AuditIntegrityError("Pipeline proposal staging authority targets a different session")
         return await self._stage_pipeline_plan(
             plan=plan,
             state=state,
@@ -3009,6 +3048,7 @@ class ComposerServiceImpl:
             user_id=user_id,
             trust_mode=preferences.trust_mode,
             recorder=recorder,
+            session_operation_context=session_operation_context,
         )
 
     async def _call_model_turn(
@@ -3117,6 +3157,7 @@ class ComposerServiceImpl:
         discovery_cache: dict[str, _CachedDiscoveryPayload],
         runtime_preflight_cache: _RuntimePreflightCache,
         session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         user_id: str | None,
         user_message_id: str | None,
         user_message_content: str | None,
@@ -3152,6 +3193,7 @@ class ComposerServiceImpl:
             discovery_cache=discovery_cache,
             runtime_preflight_cache=runtime_preflight_cache,
             session_id=session_id,
+            session_operation_context=session_operation_context,
             user_id=user_id,
             user_message_id=user_message_id,
             user_message_content=user_message_content,
@@ -3983,6 +4025,7 @@ class ComposerServiceImpl:
         *,
         plugin_snapshot: PluginAvailabilitySnapshot,
         policy_catalog: PolicyCatalogView,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
         """Inner composition loop with dual-counter budget tracking.
 
@@ -4205,6 +4248,7 @@ class ComposerServiceImpl:
                     discovery_cache=discovery_cache,
                     runtime_preflight_cache=runtime_preflight_cache,
                     session_id=session_id,
+                    session_operation_context=session_operation_context,
                     user_id=user_id,
                     user_message_id=user_message_id,
                     user_message_content=message,
@@ -4364,7 +4408,7 @@ class ComposerServiceImpl:
                 return classify.result
             continue
 
-    def _persist_crashed_session(self, session_id: str) -> None:
+    def _persist_crashed_session(self, session_operation_context: SessionOperationContext) -> None:
         """Best-effort timestamp bump to mark that a compose session crashed.
 
         NOTE: The sessions-table schema does not yet have a dedicated crash
@@ -4379,27 +4423,25 @@ class ComposerServiceImpl:
         the crash via the slog.error emission at the call site, which
         includes session_id and exc_class in structured fields.
 
-        Signature intentionally minimal — only the data that actually gets
-        persisted is accepted. When the schema migration lands, this
-        method's signature expands to take last_state and exc_class, and
-        callers are updated at that point. Today, the caller passes
-        session_id and logs the rest via slog.
+        Signature intentionally minimal — the exact COMPOSE authority is the
+        only input. The bound session identity and database timestamp stay
+        private to the fenced transaction.
 
-        The caller's outer try/except absorbs any failure — this method
-        MUST NOT mask the original plugin-bug exception if persistence
-        itself fails.
+        The caller absorbs expected storage and fence loss failures so they do
+        not mask the original plugin crash; programmer bugs still propagate.
         """
         # Offensive guard (explicit raise, not assert): ``python -O`` strips
         # assert statements, so a caller that somehow reaches this method
-        # with ``_session_engine is None`` would silently no-op under the
+        # with ``_sessions_service is None`` would silently no-op under the
         # optimised interpreter — turning a recoverable audit failure into
         # a missed ``updated_at`` write with no trace.  A typed
         # ``RuntimeError`` always fires.
-        if self._session_engine is None:
-            raise RuntimeError("_persist_crashed_session must only be called when session_engine is set")
-        now = datetime.now(UTC)
-        with self._session_engine.begin() as conn:
-            conn.execute(update(sessions_table).where(sessions_table.c.id == session_id).values(updated_at=now))
+        if self._sessions_service is None:
+            raise RuntimeError("_persist_crashed_session requires sessions_service")
+        self._sessions_service.session_operation_authority.mutate(
+            session_operation_context,
+            lambda transaction: transaction.session.record_plugin_crash_breadcrumb(),
+        )
 
     def _schemas_loaded_for_session(self, session_id: str | None) -> frozenset[tuple[str, str]]:
         """Return the immutable view of plugins whose schema has loaded.

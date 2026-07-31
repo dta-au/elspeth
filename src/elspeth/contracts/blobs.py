@@ -11,7 +11,8 @@ down instead of importing upward from L3.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import ClassVar, Literal, Protocol, get_args, runtime_checkable
@@ -20,6 +21,7 @@ from uuid import UUID, uuid5
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 
 AllowedMimeType = Literal[
     "text/csv",
@@ -38,6 +40,8 @@ BlobStatus = Literal["ready", "pending", "error"]
 FinalizeBlobStatus = Literal["ready", "error"]
 BlobCreator = Literal["user", "assistant", "pipeline"]
 BlobRunLinkDirection = Literal["input", "output"]
+BlobDeletionPhase = Literal["intent", "staged", "purge_pending"]
+BlobReplacementPhase = Literal["intent", "swap_pending", "purge_pending"]
 
 # Runtime frozensets are derived from the Literal aliases so static and
 # runtime views share one edit site. These mirror DB CHECK constraints
@@ -75,12 +79,15 @@ class BlobForkPlanEntry:
 
     source_blob_id: UUID
     target_blob_id: UUID
+    source_storage_path: str
     content_hash: str
     size_bytes: int
 
     def __post_init__(self) -> None:
         if type(self.source_blob_id) is not UUID or type(self.target_blob_id) is not UUID:
             raise TypeError("BlobForkPlanEntry ids must be exact UUID values")
+        if type(self.source_storage_path) is not str or not self.source_storage_path.strip():
+            raise ValueError("BlobForkPlanEntry.source_storage_path must be nonblank")
         if (
             type(self.content_hash) is not str
             or len(self.content_hash) != 64
@@ -89,27 +96,6 @@ class BlobForkPlanEntry:
             raise ValueError("BlobForkPlanEntry.content_hash must be lowercase SHA-256")
         if type(self.size_bytes) is not int or self.size_bytes < 0:
             raise TypeError("BlobForkPlanEntry.size_bytes must be a non-negative exact integer")
-
-
-@dataclass(frozen=True, slots=True)
-class BlobForkWriteFence:
-    """Exact guided-operation lease authorizing staged-child blob writes."""
-
-    source_session_id: UUID
-    target_session_id: UUID
-    operation_id: str
-    lease_token: str
-    attempt: int
-
-    def __post_init__(self) -> None:
-        if type(self.source_session_id) is not UUID or type(self.target_session_id) is not UUID:
-            raise TypeError("BlobForkWriteFence session ids must be exact UUID values")
-        if type(self.operation_id) is not str or not 1 <= len(self.operation_id) <= 128:
-            raise ValueError("BlobForkWriteFence.operation_id must be a non-empty bounded string")
-        if type(self.lease_token) is not str or not 1 <= len(self.lease_token) <= 256:
-            raise ValueError("BlobForkWriteFence.lease_token must be a non-empty bounded string")
-        if type(self.attempt) is not int or self.attempt < 1:
-            raise TypeError("BlobForkWriteFence.attempt must be a positive exact integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +178,193 @@ class BlobRunLinkRecord:
     blob_id: UUID
     run_id: UUID
     direction: BlobRunLinkDirection
+
+
+@dataclass(frozen=True, slots=True)
+class BlobDeletionPlan:
+    """Durable, operation-qualified filesystem deletion obligation."""
+
+    blob_id: UUID
+    session_id: UUID
+    storage_path: str
+    tombstone_path: str
+    operation_id: str
+    operation_epoch: int
+    operation_kind: SessionOperationKind
+    phase: BlobDeletionPhase
+    blob_snapshot_hash: str
+    expected_file_present: bool
+    expected_file_size: int | None
+    expected_file_hash: str | None
+    created_at: datetime
+    updated_at: datetime
+    blob: BlobRecord | None
+
+    def __post_init__(self) -> None:
+        if type(self.blob_id) is not UUID or type(self.session_id) is not UUID:
+            raise TypeError("BlobDeletionPlan identities must be exact UUID values")
+        if type(self.storage_path) is not str or not self.storage_path.strip():
+            raise ValueError("BlobDeletionPlan.storage_path must be nonblank")
+        if type(self.tombstone_path) is not str or not self.tombstone_path.strip():
+            raise ValueError("BlobDeletionPlan.tombstone_path must be nonblank")
+        if self.storage_path == self.tombstone_path:
+            raise ValueError("BlobDeletionPlan paths must differ")
+        if type(self.operation_id) is not str or not self.operation_id.strip():
+            raise ValueError("BlobDeletionPlan.operation_id must be nonblank")
+        if type(self.operation_epoch) is not int or self.operation_epoch < 1:
+            raise ValueError("BlobDeletionPlan.operation_epoch must be positive")
+        if type(self.operation_kind) is not SessionOperationKind or self.operation_kind not in {
+            SessionOperationKind.ARCHIVE,
+            SessionOperationKind.COMPOSE,
+            SessionOperationKind.PROPOSAL,
+            SessionOperationKind.SESSION_FORK,
+        }:
+            raise ValueError("BlobDeletionPlan.operation_kind is invalid")
+        if self.phase not in {"intent", "staged", "purge_pending"}:
+            raise ValueError("BlobDeletionPlan.phase is invalid")
+        if (
+            type(self.blob_snapshot_hash) is not str
+            or len(self.blob_snapshot_hash) != 64
+            or any(character not in "0123456789abcdef" for character in self.blob_snapshot_hash)
+        ):
+            raise ValueError("BlobDeletionPlan.blob_snapshot_hash must be lowercase SHA-256")
+        if type(self.expected_file_present) is not bool:
+            raise TypeError("BlobDeletionPlan.expected_file_present must be bool")
+        if self.expected_file_present:
+            if type(self.expected_file_size) is not int or self.expected_file_size < 0:
+                raise ValueError("BlobDeletionPlan.expected_file_size must be non-negative when bytes are present")
+            if (
+                type(self.expected_file_hash) is not str
+                or len(self.expected_file_hash) != 64
+                or any(character not in "0123456789abcdef" for character in self.expected_file_hash)
+            ):
+                raise ValueError("BlobDeletionPlan.expected_file_hash must be lowercase SHA-256 when bytes are present")
+        elif self.expected_file_size is not None or self.expected_file_hash is not None:
+            raise ValueError("BlobDeletionPlan absent-file evidence must not carry size or hash")
+        if type(self.created_at) is not datetime or type(self.updated_at) is not datetime:
+            raise TypeError("BlobDeletionPlan timestamps must be exact datetimes")
+        if self.created_at.utcoffset() is None or self.updated_at.utcoffset() is None:
+            raise ValueError("BlobDeletionPlan timestamps must be timezone-aware")
+        if self.updated_at < self.created_at:
+            raise ValueError("BlobDeletionPlan.updated_at must not precede created_at")
+        if self.blob is not None and (type(self.blob) is not BlobRecord or self.blob.id != self.blob_id):
+            raise ValueError("BlobDeletionPlan.blob must match blob_id")
+
+
+@dataclass(frozen=True, slots=True)
+class BlobReplacementPlan:
+    """Durable, invocation-qualified filesystem replacement obligation."""
+
+    replacement_id: UUID
+    blob_id: UUID
+    session_id: UUID
+    storage_path: str
+    staging_path: str
+    backup_path: str
+    operation_id: str
+    operation_epoch: int
+    operation_kind: SessionOperationKind
+    lease_token: str
+    owner_instance_id: str
+    phase: BlobReplacementPhase
+    old_blob_snapshot_hash: str
+    replacement_blob_snapshot_hash: str
+    created_at: datetime
+    updated_at: datetime
+    old_blob: BlobRecord
+    replacement_blob: BlobRecord
+
+    def __post_init__(self) -> None:
+        if type(self.replacement_id) is not UUID or type(self.blob_id) is not UUID or type(self.session_id) is not UUID:
+            raise TypeError("BlobReplacementPlan identities must be exact UUID values")
+        for field_name in ("storage_path", "staging_path", "backup_path", "operation_id", "lease_token", "owner_instance_id"):
+            value = getattr(self, field_name)
+            if type(value) is not str or not value.strip():
+                raise ValueError(f"BlobReplacementPlan.{field_name} must be nonblank")
+        if len({self.storage_path, self.staging_path, self.backup_path}) != 3:
+            raise ValueError("BlobReplacementPlan paths must be distinct")
+        if type(self.operation_epoch) is not int or self.operation_epoch < 1:
+            raise ValueError("BlobReplacementPlan.operation_epoch must be positive")
+        if type(self.operation_kind) is not SessionOperationKind or self.operation_kind not in {
+            SessionOperationKind.COMPOSE,
+            SessionOperationKind.PROPOSAL,
+        }:
+            raise ValueError("BlobReplacementPlan.operation_kind must be COMPOSE or PROPOSAL")
+        if self.phase not in {"intent", "swap_pending", "purge_pending"}:
+            raise ValueError("BlobReplacementPlan.phase is invalid")
+        for field_name in ("old_blob_snapshot_hash", "replacement_blob_snapshot_hash"):
+            value = getattr(self, field_name)
+            if type(value) is not str or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"BlobReplacementPlan.{field_name} must be lowercase SHA-256")
+        if type(self.created_at) is not datetime or type(self.updated_at) is not datetime:
+            raise TypeError("BlobReplacementPlan timestamps must be exact datetimes")
+        if self.created_at.utcoffset() is None or self.updated_at.utcoffset() is None:
+            raise ValueError("BlobReplacementPlan timestamps must be timezone-aware")
+        if self.updated_at < self.created_at:
+            raise ValueError("BlobReplacementPlan.updated_at must not precede created_at")
+        if type(self.old_blob) is not BlobRecord or type(self.replacement_blob) is not BlobRecord:
+            raise TypeError("BlobReplacementPlan snapshots must be exact BlobRecord values")
+        if self.old_blob.id != self.blob_id or self.replacement_blob.id != self.blob_id:
+            raise ValueError("BlobReplacementPlan snapshots must match blob_id")
+        if self.old_blob.session_id != self.session_id or self.replacement_blob.session_id != self.session_id:
+            raise ValueError("BlobReplacementPlan snapshots must match session_id")
+        if self.old_blob.storage_path != self.storage_path or self.replacement_blob.storage_path != self.storage_path:
+            raise ValueError("BlobReplacementPlan snapshots must match storage_path")
+        if blob_record_snapshot_hash(self.old_blob) != self.old_blob_snapshot_hash:
+            raise ValueError("BlobReplacementPlan old snapshot hash does not match metadata")
+        if blob_record_snapshot_hash(self.replacement_blob) != self.replacement_blob_snapshot_hash:
+            raise ValueError("BlobReplacementPlan replacement snapshot hash does not match metadata")
+
+
+@dataclass(frozen=True, slots=True)
+class BlobCreationObligation:
+    """Exact pending reservation left for a later current operation."""
+
+    record: BlobRecord
+    operation_id: str
+    operation_epoch: int
+    operation_kind: SessionOperationKind
+
+    def __post_init__(self) -> None:
+        if type(self.record) is not BlobRecord or self.record.status != "pending":
+            raise ValueError("BlobCreationObligation.record must be an exact pending blob")
+        if type(self.operation_id) is not str or not self.operation_id.strip():
+            raise ValueError("BlobCreationObligation.operation_id must be nonblank")
+        if type(self.operation_epoch) is not int or self.operation_epoch < 1:
+            raise ValueError("BlobCreationObligation.operation_epoch must be positive")
+        if type(self.operation_kind) is not SessionOperationKind or self.operation_kind not in {
+            SessionOperationKind.CREATE,
+            SessionOperationKind.COMPOSE,
+            SessionOperationKind.PROPOSAL,
+        }:
+            raise ValueError("BlobCreationObligation.operation_kind is invalid")
+
+
+def blob_record_snapshot_hash(record: BlobRecord) -> str:
+    """Hash every persisted blob field used by deletion admission."""
+    if type(record) is not BlobRecord:
+        raise TypeError("record must be an exact BlobRecord")
+    payload = {
+        "id": str(record.id),
+        "session_id": str(record.session_id),
+        "filename": record.filename,
+        "mime_type": record.mime_type,
+        "size_bytes": record.size_bytes,
+        "content_hash": record.content_hash,
+        "storage_path": record.storage_path,
+        "created_at": record.created_at.isoformat(),
+        "created_by": record.created_by,
+        "source_description": record.source_description,
+        "status": record.status,
+        "creation_modality": record.creation_modality.value,
+        "created_from_message_id": record.created_from_message_id,
+        "creating_model_identifier": record.creating_model_identifier,
+        "creating_model_version": record.creating_model_version,
+        "creating_provider": record.creating_provider,
+        "creating_composer_skill_hash": record.creating_composer_skill_hash,
+        "creating_arguments_hash": record.creating_arguments_hash,
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 def _guard_frozen_attr(instance: Exception, name: str, value: object) -> None:
@@ -424,6 +597,8 @@ class BlobServiceProtocol(Protocol):
         mime_type: AllowedMimeType,
         created_by: BlobCreator = "user",
         source_description: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobRecord:
         """Create a blob from content bytes.
 
@@ -436,6 +611,7 @@ class BlobServiceProtocol(Protocol):
         self,
         request: InlineCustodyRequest,
         *,
+        session_operation_context: SessionOperationContext,
         write_fence: BlobGuidedOperationWriteFence | None = None,
     ) -> BlobRecord:
         """Idempotently materialize one deterministic inline-source blob."""
@@ -448,6 +624,8 @@ class BlobServiceProtocol(Protocol):
         mime_type: AllowedMimeType,
         created_by: BlobCreator = "pipeline",
         source_description: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobRecord:
         """Reserve a pending output blob.
 
@@ -462,11 +640,18 @@ class BlobServiceProtocol(Protocol):
         status: FinalizeBlobStatus,
         size_bytes: int | None = None,
         content_hash: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobRecord:
         """Update a pending blob to ready or error after execution."""
         ...
 
-    async def get_blob(self, blob_id: UUID) -> BlobRecord:
+    async def get_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord:
         """Get blob metadata. Raises ``BlobNotFoundError`` if missing."""
         ...
 
@@ -479,7 +664,12 @@ class BlobServiceProtocol(Protocol):
         """List blobs for a session, newest first."""
         ...
 
-    async def delete_blob(self, blob_id: UUID) -> None:
+    async def delete_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
         """Delete blob metadata and backing file.
 
         Raises ``BlobActiveRunError`` if linked to an active run,
@@ -488,7 +678,12 @@ class BlobServiceProtocol(Protocol):
         """
         ...
 
-    async def read_blob_content(self, blob_id: UUID) -> bytes:
+    async def read_blob_content(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> bytes:
         """Read the raw content of a ready blob.
 
         Only ready blobs are readable. The stored hash is verified before
@@ -498,11 +693,23 @@ class BlobServiceProtocol(Protocol):
         """
         ...
 
+    async def read_blob_preview(
+        self,
+        blob_id: UUID,
+        *,
+        limit_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, bool]:
+        """Read a bounded prefix of a ready blob under exact authority."""
+        ...
+
     async def link_blob_to_run(
         self,
         blob_id: UUID,
         run_id: UUID,
         direction: BlobRunLinkDirection,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Record a blob-to-run linkage.
 
@@ -518,35 +725,12 @@ class BlobServiceProtocol(Protocol):
         """Get all run links for a blob."""
         ...
 
-    async def copy_blobs_for_fork(
-        self,
-        source_session_id: UUID,
-        target_session_id: UUID,
-        plan: tuple[BlobForkPlanEntry, ...],
-        write_fence: BlobForkWriteFence,
-        *,
-        checkpoint: Callable[[], Awaitable[None]],
-    ) -> dict[UUID, BlobRecord]:
-        """Copy exactly the frozen plan from source to target session.
-
-        ``checkpoint`` is awaited around each potentially long content copy so
-        the caller can renew and verify its guided-operation fence.
-        """
-        ...
-
-    async def cleanup_blobs_for_fork(
-        self,
-        source_session_id: UUID,
-        target_session_id: UUID,
-        operation_id: str,
-    ) -> BlobForkCleanupResult:
-        """Clean blobs from the named source's same-principal fork child."""
-        ...
-
     async def finalize_run_output_blobs(
         self,
         run_id: UUID,
         success: bool,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobFinalizationResult:
         """Finalize pending output blobs for a completed or failed run.
 

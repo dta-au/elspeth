@@ -23,6 +23,15 @@ def _hold_sqlite_session_lock(database_url: str, entered: object, release: objec
         engine.dispose()
 
 
+def _hold_filesystem_session_lock(root: str, entered: object, release: object) -> None:
+    from elspeth.web.sessions.locking import filesystem_session_lock
+
+    with filesystem_session_lock(Path(root), "shared-session"):
+        entered.put("entered")  # type: ignore[attr-defined]
+        if not release.wait(timeout=15):  # type: ignore[attr-defined]
+            raise RuntimeError("release barrier timed out")
+
+
 def test_sqlite_session_lock_excludes_separate_processes(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'locking.sqlite3'}"
     context = multiprocessing.get_context("spawn")
@@ -74,3 +83,51 @@ def test_file_backed_sqlite_session_lock_is_same_thread_reentrant(tmp_path: Path
         assert not thread.is_alive()
     finally:
         engine.dispose()
+
+
+def test_filesystem_session_lock_excludes_separate_processes(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    entered = context.Queue()
+    first_release = context.Event()
+    second_release = context.Event()
+    first = context.Process(target=_hold_filesystem_session_lock, args=(str(tmp_path), entered, first_release))
+    second = context.Process(target=_hold_filesystem_session_lock, args=(str(tmp_path), entered, second_release))
+
+    first.start()
+    assert entered.get(timeout=10) == "entered"
+    second.start()
+    try:
+        try:
+            entered.get(timeout=0.5)
+        except queue.Empty:
+            pass
+        else:
+            raise AssertionError("second process entered the same filesystem-session critical section")
+
+        first_release.set()
+        first.join(timeout=10)
+        assert first.exitcode == 0
+        assert entered.get(timeout=10) == "entered"
+    finally:
+        first_release.set()
+        second_release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+    assert second.exitcode == 0
+
+
+def test_filesystem_session_lock_is_same_thread_reentrant(tmp_path: Path) -> None:
+    from elspeth.web.sessions.locking import filesystem_session_lock
+
+    completed = threading.Event()
+
+    def _nest_lock() -> None:
+        with filesystem_session_lock(tmp_path, "shared-session"):  # noqa: SIM117 - nesting is the behavior under test
+            with filesystem_session_lock(tmp_path, "shared-session"):
+                completed.set()
+
+    thread = threading.Thread(target=_nest_lock, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+    assert completed.is_set(), "nested same-thread filesystem flock self-blocked"
+    assert not thread.is_alive()

@@ -18,7 +18,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import insert, inspect, select, text
+from sqlalchemy import func, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.web.sessions.engine import create_session_engine
@@ -1109,6 +1109,6 @@ class TestSkillMarkdownHistory:
                     hash="d" * 64,
                     filename="pipeline_composer.md",
                     content="# composer skill",
-                    first_seen_at=datetime.now(UTC),
+                    first_seen_at=func.current_timestamp(),
                 )
             )

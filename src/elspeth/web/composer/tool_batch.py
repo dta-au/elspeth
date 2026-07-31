@@ -24,6 +24,7 @@ from uuid import UUID
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
@@ -231,6 +232,7 @@ async def _try_finalize_proposal_custody(
     engine: Engine,
     data_dir: str | Path,
     max_storage_per_session: int,
+    session_operation_context: SessionOperationContext,
 ) -> Literal["ready", "quota_exceeded"]:
     """Return an explicit quota outcome while preserving other failures."""
     try:
@@ -239,6 +241,7 @@ async def _try_finalize_proposal_custody(
             engine=engine,
             data_dir=data_dir,
             max_storage_per_session=max_storage_per_session,
+            session_operation_context=session_operation_context,
         )
     except BlobQuotaExceededError:
         return "quota_exceeded"
@@ -306,6 +309,7 @@ class ToolBatchContext:
     discovery_cache: dict[str, _CachedDiscoveryPayload]
     runtime_preflight_cache: _RuntimePreflightCache
     session_id: str | None
+    session_operation_context: SessionOperationContext | None
     user_id: str | None
     user_message_id: str | None
     user_message_content: str | None
@@ -880,6 +884,8 @@ async def run_tool_batch(
                     if proposal_acceptable and candidate.prepared_inline_blob is not None:
                         if session_id is None or ctx.service._session_engine is None:
                             raise AuditIntegrityError("Inline proposal custody requires session context")
+                        if ctx.session_operation_context is None:
+                            raise AuditIntegrityError("Inline proposal custody requires session operation authority")
                         custody = prepare_pipeline_custody(
                             arguments,
                             candidate.prepared_inline_blob,
@@ -908,6 +914,7 @@ async def run_tool_batch(
                             engine=ctx.service._session_engine,
                             data_dir=ctx.service._data_dir,
                             max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
+                            session_operation_context=ctx.session_operation_context,
                         )
                         if custody_outcome == "quota_exceeded":
                             proposal_acceptable = False
@@ -988,6 +995,8 @@ async def run_tool_batch(
                         redacted_arguments = None
 
             if redacted_arguments is not None:
+                if type(ctx.session_operation_context) is not SessionOperationContext:
+                    raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
                 proposal_summary = build_tool_proposal_summary(
                     tool_name=tool_name,
                     arguments=arguments,
@@ -1010,6 +1019,7 @@ async def run_tool_batch(
                     composer_provider=ctx.service._availability.provider or "unknown",
                     composer_skill_hash=ctx.service._composer_skill_hash,
                     tool_arguments_hash=audit.arguments_hash,
+                    session_operation_context=ctx.session_operation_context,
                 )
                 proposals_this_turn += 1
                 proposal_payload = {
@@ -1569,6 +1579,10 @@ async def run_tool_batch(
                 data_dir=ctx.service._data_dir,
                 session_engine=ctx.service._session_engine,
                 session_id=session_id,
+                session_operation_authority=(
+                    ctx.turn_sessions_service.session_operation_authority if ctx.turn_sessions_service is not None else None
+                ),
+                session_operation_context=ctx.session_operation_context,
                 secret_service=ctx.service._secret_service,
                 user_id=user_id,
                 prior_validation=_last_validation,

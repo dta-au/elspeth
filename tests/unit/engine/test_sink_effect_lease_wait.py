@@ -281,6 +281,77 @@ def test_coordination_latch_interrupts_wait_before_reclaim(
         db.close()
 
 
+def test_coordination_latch_is_rechecked_immediately_before_payload_and_adapter_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each new irreversible cohort needs a fresh proof, not one admission check."""
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 1)
+    request = _execution_request(run_id, sink_id, members)
+    target = DuplicateObservableTarget()
+    sink = DuplicateObservableSink(target)
+    guarded = False
+    observed: list[str] = []
+
+    def latch() -> None:
+        nonlocal guarded
+        guarded = True
+
+    def consume_guard(name: str) -> None:
+        nonlocal guarded
+        assert guarded, f"{name} started without a fresh coordination-latch proof"
+        guarded = False
+        observed.append(name)
+
+    store = factory.payload_store
+    assert store is not None
+    original_store = store.store
+    original_inspect = sink.inspect_effect
+    original_prepare = sink.prepare_effect
+    original_commit = sink.commit_effect
+
+    def guarded_store(content: bytes) -> str:
+        consume_guard("payload_store.store")
+        return original_store(content)
+
+    def guarded_inspect(request, ctx):  # type: ignore[no-untyped-def]
+        consume_guard("inspect_effect")
+        return original_inspect(request, ctx)
+
+    def guarded_prepare(request, ctx):  # type: ignore[no-untyped-def]
+        consume_guard("prepare_effect")
+        return original_prepare(request, ctx)
+
+    def guarded_commit(plan, ctx):  # type: ignore[no-untyped-def]
+        consume_guard("commit_effect")
+        return original_commit(plan, ctx)
+
+    monkeypatch.setattr(store, "store", guarded_store)
+    monkeypatch.setattr(sink, "inspect_effect", guarded_inspect)
+    monkeypatch.setattr(sink, "prepare_effect", guarded_prepare)
+    monkeypatch.setattr(sink, "commit_effect", guarded_commit)
+    try:
+        result = SinkEffectCoordinator(
+            factory=factory,
+            worker_id="guarded-worker",
+            check_coordination_latch=latch,
+        ).execute(request, sink)
+
+        assert result.effect.state is SinkEffectState.FINALIZED
+        assert observed == [
+            "payload_store.store",
+            "inspect_effect",
+            "prepare_effect",
+            "commit_effect",
+        ]
+        assert target.publication_count == 1
+    finally:
+        db.close()
+
+
 def test_corrupt_effect_state_during_authoritative_poll_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

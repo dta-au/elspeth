@@ -27,6 +27,8 @@ else:
 
 _SQLITE_SESSION_LOCKS_GUARD = threading.RLock()
 _SQLITE_SESSION_LOCKS: dict[tuple[tuple[str, ...], str], threading.RLock] = {}
+_FILESYSTEM_SESSION_LOCKS_GUARD = threading.RLock()
+_FILESYSTEM_SESSION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 
 
 class _SQLiteFlockLeaseState(threading.local):
@@ -37,6 +39,69 @@ class _SQLiteFlockLeaseState(threading.local):
 
 
 _SQLITE_FLOCK_LEASE_STATE = _SQLiteFlockLeaseState()
+
+
+class _FilesystemFlockLeaseState(threading.local):
+    """Per-thread depth for re-entrant data-directory lock leases."""
+
+    def __init__(self) -> None:
+        self.leases: dict[tuple[str, str], tuple[int, int]] = {}
+
+
+_FILESYSTEM_FLOCK_LEASE_STATE = _FilesystemFlockLeaseState()
+
+
+@contextlib.contextmanager
+def filesystem_session_lock(root: Path, session_id: str) -> Iterator[None]:
+    """Exclude filesystem phases for one session without a DB connection.
+
+    This lock is dialect-independent: PostgreSQL transaction locks cannot span
+    a closed database phase and subsequent local filesystem I/O. Callers must
+    acquire this file-only lock before any database/session lock.
+    """
+    resolved_root = root.expanduser().resolve()
+    resolved_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_dir = resolved_root / ".session-file-locks"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    lock_dir_stat = lock_dir.lstat()
+    if stat.S_ISLNK(lock_dir_stat.st_mode) or not stat.S_ISDIR(lock_dir_stat.st_mode):
+        raise AuditIntegrityError("Filesystem session lock directory is not a real directory")
+    if lock_dir.resolve().parent != resolved_root:
+        raise AuditIntegrityError("Filesystem session lock directory escaped its configured root")
+    session_digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    lease_key = (str(resolved_root), session_digest)
+    with _FILESYSTEM_SESSION_LOCKS_GUARD:
+        mutex = _FILESYSTEM_SESSION_LOCKS.setdefault(lease_key, threading.RLock())
+    with mutex:
+        if _fcntl is None:
+            raise AuditIntegrityError("Filesystem session locking requires POSIX flock support")
+        leases = _FILESYSTEM_FLOCK_LEASE_STATE.leases
+        if lease_key in leases:
+            descriptor, depth = leases[lease_key]
+            leases[lease_key] = (descriptor, depth + 1)
+            try:
+                yield
+            finally:
+                leases[lease_key] = (descriptor, depth)
+            return
+        lock_path = lock_dir / f"{session_digest}.lock"
+        flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise AuditIntegrityError("Filesystem session lock sidecar is not a regular file")
+            try:
+                _fcntl.flock(descriptor, _fcntl.LOCK_EX)
+            except OSError as exc:
+                raise AuditIntegrityError("Unable to acquire filesystem session lock") from exc
+            leases[lease_key] = (descriptor, 1)
+            try:
+                yield
+            finally:
+                del leases[lease_key]
+                _fcntl.flock(descriptor, _fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def database_lock_identity(engine: Engine) -> tuple[str, ...]:

@@ -10,8 +10,10 @@ from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.protocol import RunRecord
@@ -85,7 +87,13 @@ class ExecutionService(Protocol):
     execute() returns immediately; the pipeline runs in a background thread.
     """
 
-    async def validate(self, session_id: UUID, *, user_id: str | None = None) -> ValidationResult:
+    async def validate(
+        self,
+        session_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+    ) -> ValidationResult:
         """Async dry-run validation using real engine code paths.
 
         Loads the current CompositionState for the session, generates YAML,
@@ -104,6 +112,7 @@ class ExecutionService(Protocol):
         self,
         state: CompositionState,
         *,
+        session_operation_context: SessionOperationContext,
         user_id: str | None = None,
         session_id: UUID | None = None,
     ) -> ValidationResult:
@@ -122,6 +131,7 @@ class ExecutionService(Protocol):
         session_id: UUID,
         state_id: UUID | None = None,
         *,
+        session_operation_lease: SessionOperationLease,
         user_id: str | None = None,
         auth_provider_type: str | None = None,
         fanout_ack_token: str | None = None,
