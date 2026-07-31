@@ -80,8 +80,10 @@ export function buildEntityNames(data: WireStageData): Map<string, string> {
   return names;
 }
 
-/** Plain-language connection state: "(contract unchecked)" is engineer
- *  register; a first-run user reads "not yet checked". */
+/** Plain-language connection state, the register-shifted sibling of
+ *  ``rawEdgeRow``'s parenthesised technical status: a first-run user reads
+ *  "not yet checked" where the raw row says "no required fields — contract
+ *  not applicable". */
 function edgeStatus(edge: WireEdge): string {
   if (edge.satisfied === true) return "connected";
   if (edge.satisfied === false) return "not connected correctly";
