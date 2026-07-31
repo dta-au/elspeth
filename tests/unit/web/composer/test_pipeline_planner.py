@@ -5306,6 +5306,25 @@ class TestStatedThresholdDetector:
     @pytest.mark.parametrize(
         "instruction",
         [
+            # Comparison wording bound to a number, but about a LIMIT, not a
+            # route. Firing here would tell a model to author a gate condition
+            # for a pipeline that never asked for one — and a compliant model
+            # would turn a correct fan-out into a wrong pipeline.
+            "Summarise each row in under 50 words, then fan out to both sinks.",
+            "Truncate descriptions over 40 characters and write both copies.",
+            "Keep at most 100 rows and fan every row out to both sinks.",
+            "Use a temperature below 0.5 for the summariser.",
+        ],
+    )
+    def test_limit_prose_without_routing_language_is_not_detected(self, instruction: str) -> None:
+        """Both halves must hold: a comparison AND routing intent."""
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
+
+        assert _stated_threshold_in(instruction) is None
+
+    @pytest.mark.parametrize(
+        "instruction",
+        [
             "Fan out every row to both sinks.",
             "Wire the source -> summarise -> json sink.",
             "Add the transform above the gate.",

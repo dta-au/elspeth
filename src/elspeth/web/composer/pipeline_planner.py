@@ -763,13 +763,29 @@ _STATED_THRESHOLD_PATTERN: Final[re.Pattern[str]] = re.compile(
 )
 
 
-def _stated_threshold_in(instruction: str) -> str | None:
-    """Return the comparison the instruction states, or None.
+# Routing intent. A comparison alone is not enough: "summarise each row in
+# under 50 words" and "keep at most 100 rows" bind comparison wording to a
+# number while asking for nothing about routing, and firing on those would
+# tell the model to author a gate condition a correct pipeline never needed —
+# turning a right answer into a wrong one. Both halves must hold.
+_ROUTING_INTENT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:route|routes|routed|routing|send|sends|sent|go to|goes to|split|splits|gate|divert|diverts|separate|separates)\b",
+    re.IGNORECASE,
+)
 
-    Deliberately conservative: a comparison is recognized only when an
-    operator (or comparison wording) is bound to a literal number, and the
-    matched span is returned verbatim so the repair feedback can quote it.
+
+def _stated_threshold_in(instruction: str) -> str | None:
+    """Return the routing comparison the instruction states, or None.
+
+    Deliberately conservative on both axes: a comparison is recognized only
+    when an operator (or comparison wording) is bound to a literal number, AND
+    the instruction asks for routing at all. The matched comparison span is
+    returned verbatim so the repair feedback can quote it. False negatives are
+    the safe direction here — the non-blocking fan-out advisory still names
+    the shape at review.
     """
+    if _ROUTING_INTENT_PATTERN.search(instruction) is None:
+        return None
     match = _STATED_THRESHOLD_PATTERN.search(instruction)
     return match.group(0).strip() if match is not None else None
 

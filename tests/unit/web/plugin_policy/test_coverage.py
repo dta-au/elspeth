@@ -1114,3 +1114,29 @@ def test_all_fields_control_is_credited_for_output_coverage_too() -> None:
     )
 
     assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+
+
+def test_external_call_below_the_shield_is_not_reported_as_a_scope_failure() -> None:
+    """The scope diagnosis must not claim a broken topology is already right.
+
+    A ``web_scrape`` between the shield and the LLM reintroduces unscanned
+    content, so no shield scope — not even ``all`` — can cover this node. The
+    diagnosis must stay ``input_not_dominated``: telling the author "the wiring
+    is already right, widen the control's fields" would send them round a
+    repair that cannot land.
+    """
+    state = _state(
+        _shield("shield", "raw", "fetch_in"),
+        _node("fetch", "web_scrape", "fetch_in", "llm_in"),
+        _llm_with_template("Classify: {{ text }}"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+    # No field sets are asserted for a topology failure — naming a control
+    # that does not dominate would be a second false statement.
+    assert findings[0].scanned_fields == ()
